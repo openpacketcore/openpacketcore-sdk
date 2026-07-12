@@ -20,6 +20,7 @@ insecure-test = []
 [dependencies]
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros"] }
 serde = { workspace = true, features = ["derive"] }
@@ -30,10 +31,10 @@ futures-util = "0.3"
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 uuid = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
-opc-types = { path = "../opc-types", version = "0.2.0" }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }
 bytes = { workspace = true }
 futures-util = "0.3"

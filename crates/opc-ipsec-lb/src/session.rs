@@ -686,12 +686,13 @@ mod tests {
     use std::time::Duration;
 
     use opc_session_store::{
-        BackendCapabilities, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-        EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedSessionReplica, Generation,
-        LeaseGuard, OwnerId, QuorumReplicaDescriptor, QuorumReplicaMember, QuorumSessionStore,
-        QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-        ReplicaId, ReplicaTlsIdentity, SessionBackend, SessionLeaseManager, SessionOp,
-        SessionOpResult, SessionStore, StateType, StoredSessionRecord, ValidatedQuorumTopology,
+        BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
+        CompareAndSetResult, EncryptedSessionPayload, FakeSessionBackend, FenceToken,
+        FencedSessionReplica, Generation, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
+        QuorumReplicaMember, QuorumSessionStore, QuorumTopologyConfig, ReplicaBackingIdentity,
+        ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend,
+        SessionLeaseManager, SessionOp, SessionOpResult, SessionStore, StateType,
+        StoredSessionRecord, ValidatedQuorumTopology,
     };
     use tokio::sync::{Barrier, Notify};
 
@@ -893,6 +894,10 @@ mod tests {
     {
         fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
             self.inner.backend_instance_identity()
+        }
+
+        fn peer_binding(&self) -> Option<BackendPeerBinding> {
+            self.inner.peer_binding()
         }
 
         async fn capabilities(&self) -> BackendCapabilities {

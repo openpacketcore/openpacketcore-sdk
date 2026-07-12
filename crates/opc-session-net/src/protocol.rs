@@ -13,11 +13,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ProtocolError;
 
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 3;
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 8 * 1024;
 pub const MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE: usize = 512;
+pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/3";
 
-/// Architecture-independent restore-scan request carried by protocol v2.
+/// Redaction-safe reason a v3 Hello was rejected before backend dispatch.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HelloRejectReason {
+    /// A required field was absent, malformed, or outside its fixed bound.
+    Malformed,
+    /// The authenticated peer did not match the configured membership scope.
+    Authentication,
+}
+
+/// Architecture-independent restore-scan request carried by protocol v3.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RestoreScanWireRequest {
     scope: RestoreScanScope,
@@ -86,7 +98,17 @@ impl TryFrom<RestoreScanWireRequest> for RestoreScanRequest {
 pub enum Request {
     Hello {
         contract_version: u32,
+        /// Stable client replica ID. The v2 field name is retained solely so
+        /// mixed versions can exchange a clean version mismatch.
         node_id: String,
+        #[serde(default)]
+        expected_server_replica_id: Option<String>,
+        #[serde(default)]
+        cluster_id: Option<String>,
+        #[serde(default)]
+        configuration_id: Option<String>,
+        #[serde(default)]
+        handshake_nonce: Option<uuid::Uuid>,
     },
     Capabilities,
     Get {
@@ -144,6 +166,19 @@ pub enum Request {
 pub enum Response {
     HelloAck {
         contract_version: u32,
+        #[serde(default)]
+        server_replica_id: Option<String>,
+        #[serde(default)]
+        accepted_client_replica_id: Option<String>,
+        #[serde(default)]
+        cluster_id: Option<String>,
+        #[serde(default)]
+        configuration_id: Option<String>,
+        #[serde(default)]
+        handshake_nonce: Option<uuid::Uuid>,
+    },
+    HelloRejected {
+        reason: HelloRejectReason,
     },
     Capabilities(BackendCapabilities),
     Get(Result<Option<StoredSessionRecord>, opc_session_store::error::StoreError>),
@@ -314,8 +349,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restore_scan_protocol_v2_frames_round_trip() {
-        assert_eq!(CONTRACT_VERSION, 2);
+    fn restore_scan_protocol_v3_frames_round_trip() {
+        assert_eq!(CONTRACT_VERSION, 3);
 
         let domain_request = RestoreScanRequest {
             scope: RestoreScanScope::all(),

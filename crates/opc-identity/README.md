@@ -10,8 +10,9 @@ for TLS and service clients.
 
 ## API Shape
 
-- `WorkloadIdentity::from_cert_der` extracts and validates the SPIFFE ID from a
-  leaf certificate.
+- `extract_spiffe_id_from_cert_der` extracts exactly one canonical SPIFFE URI
+  SAN from a leaf certificate; missing, malformed, duplicate, or ambiguous URI
+  SANs fail closed. `WorkloadIdentity::from_cert_der` uses the same primitive.
 - `build_identity_state` validates the leaf chain against active trust bundles
   and checks that the private key matches the leaf.
 - `SvidWatcher::new(socket_path, initial_bundles)` reads length-prefixed JSON

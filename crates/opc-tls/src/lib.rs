@@ -4,11 +4,15 @@
 
 #![forbid(unsafe_code)]
 
-use opc_identity::{IdentityState, TrustBundle, TrustDomain, WorkloadIdentity};
-use opc_types::{InstanceId, NfKind, TenantId};
+use opc_identity::{
+    extract_spiffe_id_from_cert_der, IdentityState, SpiffeSanError, TrustBundle, TrustDomain,
+    WorkloadIdentity,
+};
+use opc_types::{InstanceId, NfKind, SpiffeId, TenantId};
 use rustls::DistinguishedName;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -359,6 +363,124 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
 pub type ServerConfig = rustls::ServerConfig;
 pub type ClientConfig = rustls::ClientConfig;
 
+/// A rustls client configuration built with mandatory SPIFFE peer
+/// authentication and a reloadable client SVID.
+///
+/// Construction is intentionally limited to
+/// [`TlsConfigBuilder::build_authenticated_client_config`]. The wrapped
+/// configuration is opaque so APIs that require authenticated mTLS can accept
+/// this type instead of an arbitrary rustls configuration.
+#[derive(Clone)]
+pub struct AuthenticatedClientConfig {
+    config: Arc<rustls::ClientConfig>,
+}
+
+impl AuthenticatedClientConfig {
+    /// Clone the shared rustls configuration for a connection or connector.
+    pub fn rustls_config(&self) -> Arc<rustls::ClientConfig> {
+        Arc::clone(&self.config)
+    }
+}
+
+impl fmt::Debug for AuthenticatedClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthenticatedClientConfig([redacted])")
+    }
+}
+
+/// A rustls server configuration built with mandatory SPIFFE client
+/// authentication and a reloadable server SVID.
+///
+/// Construction is intentionally limited to
+/// [`TlsConfigBuilder::build_authenticated_server_config`].
+#[derive(Clone)]
+pub struct AuthenticatedServerConfig {
+    config: Arc<rustls::ServerConfig>,
+}
+
+impl AuthenticatedServerConfig {
+    /// Clone the shared rustls configuration for a connection or acceptor.
+    pub fn rustls_config(&self) -> Arc<rustls::ServerConfig> {
+        Arc::clone(&self.config)
+    }
+}
+
+impl fmt::Debug for AuthenticatedServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthenticatedServerConfig([redacted])")
+    }
+}
+
+/// Failure to recover the peer's canonical SPIFFE identity from a completed
+/// rustls connection.
+///
+/// No variant carries certificate bytes or identity text, keeping `Display`
+/// and `Debug` suitable for logs and protocol error mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PeerSpiffeIdentityError {
+    #[error("TLS handshake is incomplete")]
+    HandshakeIncomplete,
+    #[error("peer certificate is unavailable")]
+    PeerCertificateUnavailable,
+    #[error("peer certificate is malformed")]
+    MalformedCertificate,
+    #[error("peer certificate is missing a SPIFFE URI SAN")]
+    MissingSpiffeId,
+    #[error("peer certificate contains multiple URI SANs")]
+    MultipleUriSans,
+    #[error("peer certificate contains a malformed SPIFFE URI SAN")]
+    MalformedSpiffeId,
+}
+
+impl From<SpiffeSanError> for PeerSpiffeIdentityError {
+    fn from(error: SpiffeSanError) -> Self {
+        match error {
+            SpiffeSanError::MalformedCertificate => Self::MalformedCertificate,
+            SpiffeSanError::MissingSpiffeId => Self::MissingSpiffeId,
+            SpiffeSanError::MultipleUriSans => Self::MultipleUriSans,
+            SpiffeSanError::MalformedSpiffeId => Self::MalformedSpiffeId,
+            _ => Self::MalformedSpiffeId,
+        }
+    }
+}
+
+fn peer_spiffe_id(
+    is_handshaking: bool,
+    peer_certificates: Option<&[CertificateDer<'static>]>,
+) -> Result<SpiffeId, PeerSpiffeIdentityError> {
+    if is_handshaking {
+        return Err(PeerSpiffeIdentityError::HandshakeIncomplete);
+    }
+
+    let leaf = peer_certificates
+        .and_then(|chain| chain.first())
+        .ok_or(PeerSpiffeIdentityError::PeerCertificateUnavailable)?;
+    extract_spiffe_id_from_cert_der(leaf.as_ref()).map_err(Into::into)
+}
+
+/// Extract the server SPIFFE ID presented on a completed rustls client
+/// connection.
+///
+/// The result is authenticated only when `connection` was created from an
+/// [`AuthenticatedClientConfig`].
+pub fn peer_spiffe_id_from_client_connection(
+    connection: &rustls::ClientConnection,
+) -> Result<SpiffeId, PeerSpiffeIdentityError> {
+    peer_spiffe_id(connection.is_handshaking(), connection.peer_certificates())
+}
+
+/// Extract the client SPIFFE ID presented on a completed rustls server
+/// connection.
+///
+/// The result is authenticated only when `connection` was created from an
+/// [`AuthenticatedServerConfig`].
+pub fn peer_spiffe_id_from_server_connection(
+    connection: &rustls::ServerConnection,
+) -> Result<SpiffeId, PeerSpiffeIdentityError> {
+    peer_spiffe_id(connection.is_handshaking(), connection.peer_certificates())
+}
+
 pub struct TlsConfigBuilder {
     state_rx: watch::Receiver<Option<IdentityState>>,
     policy: PeerPolicy,
@@ -428,6 +550,17 @@ impl TlsConfigBuilder {
         Ok(client_config)
     }
 
+    /// Build an opaque client configuration that proves it was constructed
+    /// with this crate's SPIFFE verifier and reloadable client SVID resolver.
+    pub fn build_authenticated_client_config(
+        self,
+    ) -> Result<AuthenticatedClientConfig, rustls::Error> {
+        let config = self.build_client_config()?;
+        Ok(AuthenticatedClientConfig {
+            config: Arc::new(config),
+        })
+    }
+
     pub fn build_server_config(self) -> Result<rustls::ServerConfig, rustls::Error> {
         self.validate_peer_policy()?;
 
@@ -456,6 +589,17 @@ impl TlsConfigBuilder {
         Ok(server_config)
     }
 
+    /// Build an opaque server configuration that proves it was constructed
+    /// with this crate's SPIFFE verifier and mandatory client SVID resolver.
+    pub fn build_authenticated_server_config(
+        self,
+    ) -> Result<AuthenticatedServerConfig, rustls::Error> {
+        let config = self.build_server_config()?;
+        Ok(AuthenticatedServerConfig {
+            config: Arc::new(config),
+        })
+    }
+
     fn validate_peer_policy(&self) -> Result<(), rustls::Error> {
         if self.policy.is_unconstrained() && !self.allow_unconstrained_peer_policy {
             return Err(rustls::Error::General(
@@ -471,8 +615,10 @@ impl TlsConfigBuilder {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
-    use opc_identity::{Namespace, ServiceAccount};
+    use opc_identity::{build_identity_state, Namespace, ServiceAccount, TrustBundleSet};
     use opc_types::{SpiffeId, Timestamp};
+    use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::io::Cursor;
 
     fn workload(td: &str, tenant: &str, nf: &str, inst: &str) -> WorkloadIdentity {
         WorkloadIdentity {
@@ -492,6 +638,69 @@ mod policy_tests {
 
     fn td_set(v: &str) -> HashSet<TrustDomain> {
         HashSet::from([TrustDomain::new(v).unwrap()])
+    }
+
+    fn test_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        (params.self_signed(&key).unwrap(), key)
+    }
+
+    fn identity_state(
+        spiffe_id: &str,
+        ca: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+    ) -> IdentityState {
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::Ia5String::try_from(spiffe_id).unwrap(),
+        ));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, ca, ca_key).unwrap();
+        let trust_domain = TrustDomain::new("example.test").unwrap();
+        let mut trust_bundles = TrustBundleSet::new();
+        trust_bundles.insert(TrustBundle {
+            trust_domain,
+            certificates: vec![ca.der().clone()],
+        });
+
+        build_identity_state(
+            vec![cert.der().clone(), ca.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            trust_bundles,
+        )
+        .unwrap()
+    }
+
+    fn complete_handshake(
+        client: &mut rustls::ClientConnection,
+        server: &mut rustls::ServerConnection,
+    ) {
+        for _ in 0..32 {
+            let mut made_progress = false;
+
+            let mut client_flight = Vec::new();
+            if client.write_tls(&mut client_flight).unwrap() > 0 {
+                made_progress = true;
+                server.read_tls(&mut Cursor::new(client_flight)).unwrap();
+                server.process_new_packets().unwrap();
+            }
+
+            let mut server_flight = Vec::new();
+            if server.write_tls(&mut server_flight).unwrap() > 0 {
+                made_progress = true;
+                client.read_tls(&mut Cursor::new(server_flight)).unwrap();
+                client.process_new_packets().unwrap();
+            }
+
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return;
+            }
+            assert!(made_progress, "TLS handshake stopped making progress");
+        }
+
+        panic!("TLS handshake did not complete within the bounded exchange");
     }
 
     #[test]
@@ -566,6 +775,111 @@ mod policy_tests {
             .build_server_config();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn authenticated_config_wrappers_are_cloneable_and_redacted() {
+        let (_client_tx, client_rx) = watch::channel(None);
+        let client = TlsConfigBuilder::new(client_rx)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .unwrap();
+        let (_server_tx, server_rx) = watch::channel(None);
+        let server = TlsConfigBuilder::new(server_rx)
+            .allow_any_trusted_peer()
+            .build_authenticated_server_config()
+            .unwrap();
+
+        assert_eq!(
+            format!("{client:?}"),
+            "AuthenticatedClientConfig([redacted])"
+        );
+        assert_eq!(
+            format!("{server:?}"),
+            "AuthenticatedServerConfig([redacted])"
+        );
+        assert!(Arc::strong_count(&client.clone().rustls_config()) >= 2);
+        assert!(Arc::strong_count(&server.clone().rustls_config()) >= 2);
+    }
+
+    #[test]
+    fn peer_identity_helpers_reject_incomplete_connections() {
+        let (_client_tx, client_rx) = watch::channel(None);
+        let client_config = TlsConfigBuilder::new(client_rx)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .unwrap();
+        let mut client = rustls::ClientConnection::new(
+            client_config.rustls_config(),
+            ServerName::try_from("localhost").unwrap().to_owned(),
+        )
+        .unwrap();
+        let (_server_tx, server_rx) = watch::channel(None);
+        let server_config = TlsConfigBuilder::new(server_rx)
+            .allow_any_trusted_peer()
+            .build_authenticated_server_config()
+            .unwrap();
+        let server = rustls::ServerConnection::new(server_config.rustls_config()).unwrap();
+
+        assert_eq!(
+            peer_spiffe_id_from_client_connection(&client),
+            Err(PeerSpiffeIdentityError::HandshakeIncomplete)
+        );
+        assert_eq!(
+            peer_spiffe_id_from_server_connection(&server),
+            Err(PeerSpiffeIdentityError::HandshakeIncomplete)
+        );
+
+        // The client stays in handshaking state even after emitting its first
+        // flight, so helpers cannot accidentally treat "started" as complete.
+        let mut first_flight = Vec::new();
+        client.write_tls(&mut first_flight).unwrap();
+        assert!(!first_flight.is_empty());
+        assert_eq!(
+            peer_spiffe_id_from_client_connection(&client),
+            Err(PeerSpiffeIdentityError::HandshakeIncomplete)
+        );
+    }
+
+    #[test]
+    fn peer_identity_helpers_extract_each_completed_connection_peer() {
+        const CLIENT_ID: &str =
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/client-0";
+        const SERVER_ID: &str =
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/server-0";
+
+        let (ca, ca_key) = test_ca();
+        let (_client_tx, client_rx) = watch::channel(Some(identity_state(CLIENT_ID, &ca, &ca_key)));
+        let (_server_tx, server_rx) = watch::channel(Some(identity_state(SERVER_ID, &ca, &ca_key)));
+        let client_config = TlsConfigBuilder::new(client_rx)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .unwrap();
+        let server_config = TlsConfigBuilder::new(server_rx)
+            .allow_any_trusted_peer()
+            .build_authenticated_server_config()
+            .unwrap();
+        let mut client = rustls::ClientConnection::new(
+            client_config.rustls_config(),
+            ServerName::try_from("localhost").unwrap().to_owned(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(server_config.rustls_config()).unwrap();
+
+        complete_handshake(&mut client, &mut server);
+
+        assert_eq!(
+            peer_spiffe_id_from_client_connection(&client)
+                .unwrap()
+                .as_str(),
+            SERVER_ID
+        );
+        assert_eq!(
+            peer_spiffe_id_from_server_connection(&server)
+                .unwrap()
+                .as_str(),
+            CLIENT_ID
+        );
     }
 
     #[test]

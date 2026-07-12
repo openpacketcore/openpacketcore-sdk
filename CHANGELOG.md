@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint, expected TLS identity, failure domain, backing identity, and exact
   local-self selection. An explicit lab singleton reports `single-replica`,
   never quorum HA.
+- `opc-session-store`/`opc-session-net`: redaction-safe authenticated peer
+  bindings connect each remote adapter to the local and remote descriptor
+  fingerprints, exact TLS identity, configured member count, and one immutable
+  cluster/configuration scope during topology admission.
 - `opc-sa-mirror` (RFC 015): experimental live SA keymat mirroring for
   near-hitless IPsec failover in which keys never persist — producer/sink/
   takeover ports, an in-memory standby holder with epoch anti-rollback and
@@ -109,12 +113,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backends. External backend adapters used as votes must return
   `Some(BackendInstanceIdentity)`; forwarding wrappers must delegate it, and
   the default `None` fails topology admission.
-- **BREAKING — `opc-session-net`:** the wire contract is now v2 for remote
-  restore scans. The exact-version Hello handshake rejects v1/v2 peers, so all
-  clients and servers require a coordinated upgrade; mixed-version rolling
-  upgrades are unsupported. Public `Request`/`Response` and `StoreError` enums
-  also gain restore-scan variants, so external exhaustive matches must add
-  arms for them.
+- **BREAKING — `opc-session-net`:** the wire contract is now v3 for remote
+  restore scans and authenticated replica identity. Production constructors
+  accept opaque authenticated TLS configs plus bindings derived from one
+  immutable manifest; the manifest hashes the cluster ID, explicit generation,
+  and complete descriptor set. The exact v3 ALPN and handshake have no v2
+  fallback, so all clients and servers require a coordinated upgrade and mixed
+  v2/v3 rolling upgrades are unsupported. Public `Request`/`Response` enums
+  gain handshake and restore-scan variants, while `StoreError` gains
+  restore-scan variants, so external exhaustive matches must add arms for
+  them.
 - Documentation and package metadata now distinguish scoped implementation
   evidence, Cargo publication eligibility, and production maturity. Historical
   status snapshots, release-evidence primitives, and conditional
@@ -153,6 +161,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conditional codec candidate.
 
 ### Security
+- `opc-session-net`: bind every production connection's live certificate
+  SPIFFE URI to the claimed stable `ReplicaId`, expected opposite replica,
+  cluster, and complete-manifest configuration ID before backend dispatch; the
+  client verifies its fresh challenge is echoed by the server. DNS/FQDN/IP
+  aliases and resolver overrides remain routing
+  only. Wrong, ambiguous, malformed, cross-cluster, and stale-configuration
+  identities fail closed, while raw Rustls configs can no longer enter the
+  production session client/server constructors. Session caches, tickets,
+  resumption, early data, and 0-RTT are disabled so reconnects revalidate live
+  SVIDs instead of cached certificates. This closes #125 identity
+  binding only; it does not provide consensus, durable commit authority, or
+  fork recovery.
 - `opc-ipsec-lb`: require an RFC 6311-style outbound IV forward-jump for both
   persisted and live-mirrored same-SPI failover state, with protocol-matched
   64-bit counter evidence, explicit ESP peer receive-lag bounds, checked
@@ -200,11 +220,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AMF-lite now keeps traffic readiness behind a continuously supervised
   session-store gate, and low-cardinality metrics expose probe outcomes,
   configured/freshly-reachable/agreeing/required counts, the majority-visible
-  prefix, and bounded failure reasons. This closes #124 only; authenticated
-  identity (#125), durable authority and operator-safe
-  fork recovery (#127–#129), majority-authoritative restore (#133), and
-  wire/model hardening (#134/#135) remain production blockers. Oversized-TTL and
-  zero-replication-sequence panic elimination remain tracked by #137/#138.
+  prefix, and bounded failure reasons. This closes #124 only; durable authority
+  and operator-safe fork recovery (#127–#129), majority-authoritative restore
+  (#133), and wire/model hardening (#134/#135) remain production blockers.
+  Oversized-TTL and zero-replication-sequence panic elimination remain tracked
+  by #137/#138.
 - `opc-session-store`: quorum construction now rejects empty/undersized/even HA
   membership, missing or ambiguous self, duplicate logical IDs, canonical
   endpoints, declared TLS identities, failure domains, backing identities, and
@@ -216,14 +236,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mTLS SQLite regression proves that bare logical self is independent from FQDN
   endpoints. This closes #123 configured-topology admission only. Fresh
   durable readiness was scoped separately to #124 and is described above;
-  #125, #127–#129, #133–#135, and #137/#138 remain production blockers.
+  #127–#129, #133–#135, and #137/#138 remain production blockers.
 - `opc-session-net`: remote backends and replication servers now carry
   validated cursor-paged restore scans, shorten multi-record pages to the
   effective client/server frame limit, and return a typed error when one
   record cannot fit. This implements the transport parity tracked by #126; it
   does not implement bounded majority-authoritative restore (#133), fixed-width
   wire stabilization (#134), invariant-safe model decoding (#135), or session
-  HA qualification (#125, #127–#129).
+  HA qualification (#127–#129).
 - `opc-persist`: standalone default-feature test builds no longer depend on
   fault-injection symbols that exist only with `dangerous-test-hooks`; CI now
   compiles the default package contract before workspace all-feature unification

@@ -7,19 +7,29 @@ Experimental network transport for remote session-store replicas.
 `opc-session-net` exposes a length-prefixed JSON protocol between
 `RemoteSessionBackend` clients and `SessionReplicationServer` instances. It
 lets a `SessionBackend` or quorum coordinator call a remote replica using the
-same session-store traits. Protocol v2 carries cursor-paged
-`SessionBackend::scan_restore_records` calls, so remote replicas no longer fall
-through to the trait's unsupported-operation default.
+same session-store traits. Protocol v3 carries cursor-paged
+`SessionBackend::scan_restore_records` calls and binds every production
+connection to one authenticated member of one immutable replication manifest.
 
 ## API Shape
 
-- `RemoteSessionBackend::new(addr, tls_config, deadline)` creates an mTLS
-  client that implements `SessionBackend` and `SessionLeaseManager`.
+- `SessionReplicationManifest::try_new` validates one cluster ID, one
+  operator-controlled configuration generation, and the complete replica
+  descriptor set. It derives an order-independent configuration ID from the
+  cluster, generation, and every descriptor field.
+- `SessionReplicationManifest::bind_local` selects the exact local
+  `ReplicaId`; `LocalReplicaBinding::bind_remote` derives the only supported
+  production client binding for an admitted peer.
+- `RemoteSessionBackend::new(binding, tls_config, deadline)` creates an mTLS
+  client that implements `SessionBackend` and `SessionLeaseManager`. The
+  endpoint comes from the binding; `new_with_resolver` may override address
+  resolution, but not identity.
 - `RemoteSessionBackend::new_insecure` exists only behind the `insecure-test`
   feature.
 - `with_max_frame_size` overrides the default 1 MiB frame limit.
-- `SessionReplicationServer::new(backend, tls_config)` creates an mTLS server
-  over an `Arc<dyn SessionStoreBackend>`.
+- `SessionReplicationServer::new(backend, tls_config, binding)` creates an mTLS
+  server over an `Arc<dyn SessionStoreBackend>` and the exact local manifest
+  member.
 - `SessionReplicationServer::new_insecure` exists only behind the
   `insecure-test` feature.
 - `with_idle_timeout`, `with_max_connections`, and `with_max_frame_size`
@@ -41,59 +51,87 @@ through to the trait's unsupported-operation default.
   public protocol layer.
 
 ```rust,ignore
-use opc_session_net::RemoteSessionBackend;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use opc_session_net::{RemoteSessionBackend, SessionReplicationManifest};
+use opc_session_store::ReplicaId;
 use std::time::Duration;
 
-let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
-let tls_config: Arc<opc_tls::ClientConfig> = product_tls_config;
-let remote = RemoteSessionBackend::new(addr, tls_config, Some(Duration::from_secs(2)));
+let manifest: std::sync::Arc<SessionReplicationManifest> = validated_manifest;
+let local = manifest.bind_local(ReplicaId::new("epdg-app-0")?)?;
+let peer = local.bind_remote(ReplicaId::new("epdg-app-1")?)?;
+let tls_config = opc_tls::TlsConfigBuilder::new(identity_state_rx)
+    .with_policy(replication_peer_policy)
+    .build_authenticated_client_config()?;
+let remote = RemoteSessionBackend::new(
+    peer,
+    tls_config,
+    Some(Duration::from_secs(2)),
+);
 let _remote = remote.with_max_frame_size(1024 * 1024);
 ```
 
 ## Relationships
 
 - Implements `opc-session-store` backend and lease traits over the wire.
-- Uses `opc-tls` Rustls configs for production mTLS transport.
+- Uses the opaque authenticated client/server configs from `opc-tls` for
+  production mTLS transport. The session transport sets and requires its exact
+  v3 ALPN value.
 - Intended to be composed under `QuorumSessionStore` or other store callers.
 - HA-shaped composition must use `ValidatedQuorumTopology`; logical replica
   ID, dial endpoint, expected TLS identity, failure domain, backing identity,
-  and exact local self are independent inputs.
+  and exact local self remain independent descriptor fields.
 
 ## Status Notes
 
 - `publish = false`.
 - The transport is experimental.
-- Production client and server construction requires authenticated TLS.
+- Production client and server construction requires opaque
+  `AuthenticatedClientConfig`/`AuthenticatedServerConfig` values built by
+  `opc-tls`; raw Rustls configs cannot enter these constructors.
 - Plaintext client/server support is test-only and gated behind
   `insecure-test`.
-- The wire contract version is `2`; the default max frame size is 1 MiB.
-- The Hello handshake requires an exact version match. Protocol v1 and v2
-  peers do not interoperate, so all session-net clients and servers require a
-  coordinated upgrade; mixed-version rolling upgrades are unsupported.
+- The wire contract version is `3`; the default max frame size is 1 MiB.
+- The v3 handshake extracts the canonical SPIFFE URI from the live peer
+  certificate and requires it to match the claimed stable `ReplicaId` in the
+  manifest. Client and server also verify the expected opposite replica,
+  cluster ID, and configuration ID; the client verifies its fresh challenge is
+  echoed by the server. Wrong, missing,
+  ambiguous, malformed, cross-cluster, or stale configuration identities fail
+  before backend dispatch.
+- Session-net disables TLS session caches, tickets, resumption, early data, and
+  0-RTT. Every reconnect pays for a full mutual-TLS handshake so SVID rotation
+  cannot reuse a cached peer certificate or authority decision.
+- The configuration ID is a SHA-256 digest of the cluster ID, explicit
+  generation, and the full sorted descriptor set. Changing a member ID,
+  endpoint, TLS identity, failure domain, backing identity, cluster, or
+  generation changes the authenticated scope.
+- Protocol v3 has no production fallback to v2. The exact-version handshake
+  and v3-only ALPN require a coordinated stop/upgrade/start of every
+  session-net participant; mixed v2/v3 fleets are unsupported.
+- DNS names and resolver overrides select only where to dial. FQDN, short-name,
+  IP, and alias changes do not alter the expected `ReplicaId`, certificate
+  SPIFFE identity, or manifest scope.
 - `capabilities()` is descriptive admission evidence and may fall back to a
   previously successful negotiation after a disconnect. It is not a liveness
   or durable-readiness signal; replicated callers must use the fresh
   replication-head probe and require a distinct agreeing majority.
-- Restore scan is a bulk enumeration boundary. Production authorization still
-  depends on binding authenticated peer identity to authorized replica
-  membership (#125).
-- Configured topology admission rejects duplicate declared vote identities,
-  canonical endpoints, and duplicate process-local adapter instances, plus a
-  missing or ambiguous local member. It cannot detect dishonest backing labels,
-  independently constructed clients targeting one store through DNS aliases,
-  or a mismatch between declarations and the live mTLS peer; that authenticated
-  authorization remains #125.
+- Remote adapters expose redaction-safe peer-binding evidence to
+  `ValidatedQuorumTopology`. Admission verifies the local and remote IDs,
+  expected TLS identity, local and remote descriptor fingerprints, configured
+  member count, and one shared configuration scope before counting the adapter
+  as a vote. A local in-process backend need not present network-peer evidence.
+- Peer binding is static admission evidence, not current health. Capability
+  declarations and a successful handshake do not replace
+  `QuorumSessionStore::probe_durable_readiness` or continuous traffic gating.
 - Remote scan and fresh-probe transport parity do not by themselves qualify
-  networked session HA for production. Authenticated identity binding, durable
-  authority, fork recovery, bounded majority-authoritative restore,
+  networked session HA for production. Protocol v3 authenticates membership;
+  it does not establish consensus, durable sequence/commit authority,
+  fork reconciliation, or majority-authoritative restore. Those properties,
   fixed-width wire DTOs, and model-level decode invariants remain open in
-  #125, #127–#129, and #133–#135.
+  #127–#129 and #133–#135.
 
 ## Roadmap
 
-- Close #125, #127–#129, and #133–#135; add distributed failure and soak
+- Close #127–#129 and #133–#135; add distributed failure and soak
   evidence before treating this as production transport.
 - Keep plaintext transport limited to tests.
 - Keep the server wrapping `SessionStoreBackend` rather than owning storage.
@@ -102,6 +140,9 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 
 - Source checked: `Cargo.toml`, `src/lib.rs`, client, server, protocol, and
   tests.
+- `tests/authenticated_replica_identity.rs` covers exact identity, routing
+  aliases, certificate/claim/scope mismatches, downgrade and malformed Hello,
+  reconnect/rotation, relabeling, and replayed challenge responses over mTLS.
 - Run with: `cargo test -p opc-session-net --all-features`.
 
 ## License

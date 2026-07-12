@@ -21,6 +21,7 @@ use crate::{
     model::{FenceToken, Generation, OwnerId, SessionKey},
     record::{EncryptedSessionPayload, StoredSessionRecord},
     restore::{RestoreScanPage, RestoreScanRequest},
+    topology::{ReplicaId, ReplicaTlsIdentity},
 };
 
 /// Per-watcher buffer size for replication watch streams.
@@ -283,6 +284,20 @@ pub trait SessionBackend: Send + Sync {
         None
     }
 
+    /// Immutable configured identity scope for a peer-authenticated adapter.
+    ///
+    /// The default is deliberately absent. A network adapter may return a
+    /// binding only when every connection and reconnect verifies the declared
+    /// peer before exposing backend operations. Forwarding wrappers must
+    /// delegate this value unchanged.
+    ///
+    /// This is composition evidence, not a cached liveness result. Validated
+    /// topology compares it with the member descriptor, while fresh readiness
+    /// still performs a real backend request.
+    fn peer_binding(&self) -> Option<BackendPeerBinding> {
+        None
+    }
+
     /// Return the capability declaration for this backend.
     async fn capabilities(&self) -> BackendCapabilities;
 
@@ -416,6 +431,122 @@ impl BackendInstanceIdentity {
 impl std::fmt::Debug for BackendInstanceIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("BackendInstanceIdentity(<redacted>)")
+    }
+}
+
+/// Fixed-width identity shared by all peer bindings in one configured scope.
+///
+/// Network adapters use this value to bind connections to one cluster and
+/// configuration generation. Its contents are intentionally opaque to the
+/// session-store core and redacted from diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BackendPeerScopeIdentity([u8; 32]);
+
+impl BackendPeerScopeIdentity {
+    /// Construct an opaque scope identity from its fixed-width representation.
+    pub const fn new(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+
+    /// Return the fixed-width representation for protocol adapters.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for BackendPeerScopeIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BackendPeerScopeIdentity(<redacted>)")
+    }
+}
+
+/// Configured peer identity exposed by an authenticated backend adapter.
+///
+/// The binding connects one local topology member to one remote member under a
+/// shared cluster/configuration scope. It contains no runtime health state and
+/// does not replace a fresh authenticated request. Debug output deliberately
+/// hides descriptor fingerprints and all identity values.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BackendPeerBinding {
+    local_replica_id: ReplicaId,
+    remote_replica_id: ReplicaId,
+    remote_tls_identity: ReplicaTlsIdentity,
+    local_descriptor_fingerprint: [u8; 32],
+    remote_descriptor_fingerprint: [u8; 32],
+    configured_member_count: u16,
+    scope: BackendPeerScopeIdentity,
+}
+
+impl BackendPeerBinding {
+    /// Construct immutable composition evidence for one peer adapter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        local_replica_id: ReplicaId,
+        remote_replica_id: ReplicaId,
+        remote_tls_identity: ReplicaTlsIdentity,
+        local_descriptor_fingerprint: [u8; 32],
+        remote_descriptor_fingerprint: [u8; 32],
+        configured_member_count: u16,
+        scope: BackendPeerScopeIdentity,
+    ) -> Self {
+        Self {
+            local_replica_id,
+            remote_replica_id,
+            remote_tls_identity,
+            local_descriptor_fingerprint,
+            remote_descriptor_fingerprint,
+            configured_member_count,
+            scope,
+        }
+    }
+
+    /// Configured local logical replica identity.
+    pub const fn local_replica_id(&self) -> &ReplicaId {
+        &self.local_replica_id
+    }
+
+    /// Authenticated remote logical replica identity.
+    pub const fn remote_replica_id(&self) -> &ReplicaId {
+        &self.remote_replica_id
+    }
+
+    /// Exact TLS identity expected from the remote replica.
+    pub const fn remote_tls_identity(&self) -> &ReplicaTlsIdentity {
+        &self.remote_tls_identity
+    }
+
+    /// Fingerprint of the configured local descriptor.
+    pub const fn local_descriptor_fingerprint(&self) -> &[u8; 32] {
+        &self.local_descriptor_fingerprint
+    }
+
+    /// Fingerprint of the configured remote descriptor.
+    pub const fn remote_descriptor_fingerprint(&self) -> &[u8; 32] {
+        &self.remote_descriptor_fingerprint
+    }
+
+    /// Configured voting-member count under this binding.
+    pub const fn configured_member_count(&self) -> u16 {
+        self.configured_member_count
+    }
+
+    /// Shared cluster/configuration scope.
+    pub const fn scope(&self) -> &BackendPeerScopeIdentity {
+        &self.scope
+    }
+}
+
+impl std::fmt::Debug for BackendPeerBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendPeerBinding")
+            .field("local_replica_id", &self.local_replica_id)
+            .field("remote_replica_id", &self.remote_replica_id)
+            .field("remote_tls_identity", &self.remote_tls_identity)
+            .field("local_descriptor_fingerprint", &"<redacted>")
+            .field("remote_descriptor_fingerprint", &"<redacted>")
+            .field("configured_member_count", &self.configured_member_count)
+            .field("scope", &self.scope)
+            .finish()
     }
 }
 
@@ -719,6 +850,10 @@ where
 {
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         self.inner.backend_instance_identity()
+    }
+
+    fn peer_binding(&self) -> Option<BackendPeerBinding> {
+        self.inner.peer_binding()
     }
 
     async fn capabilities(&self) -> BackendCapabilities {
@@ -1268,6 +1403,10 @@ where
 {
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         self.inner.backend_instance_identity()
+    }
+
+    fn peer_binding(&self) -> Option<BackendPeerBinding> {
+        self.inner.peer_binding()
     }
 
     async fn capabilities(&self) -> BackendCapabilities {

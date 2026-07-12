@@ -16,6 +16,13 @@ use tokio::sync::{broadcast, watch};
 use x509_parser::prelude::*;
 use zeroize::{Zeroize, Zeroizing};
 
+/// Maximum encoded length accepted for a SPIFFE URI SAN.
+///
+/// Certificate inputs are untrusted. Keeping the identity bounded also makes
+/// it safe for callers to carry the validated value into fixed-size protocol
+/// handshakes and topology manifests.
+pub const MAX_SPIFFE_ID_URI_LEN: usize = 2_048;
+
 pub mod file_svid;
 pub use file_svid::FileSvidSource;
 
@@ -217,13 +224,70 @@ pub struct WorkloadIdentity {
     pub expires_at: Timestamp,
 }
 
+/// Failure to extract one canonical OpenPacketCore SPIFFE ID from an X.509
+/// certificate.
+///
+/// The variants intentionally contain no certificate or identity material so
+/// both `Display` and `Debug` are safe to use at an untrusted-input boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SpiffeSanError {
+    #[error("malformed X.509 certificate")]
+    MalformedCertificate,
+    #[error("certificate is missing a SPIFFE URI SAN")]
+    MissingSpiffeId,
+    #[error("certificate contains multiple URI SANs")]
+    MultipleUriSans,
+    #[error("certificate contains a malformed SPIFFE URI SAN")]
+    MalformedSpiffeId,
+}
+
+/// Extract exactly one canonical, bounded OpenPacketCore SPIFFE ID from an
+/// X.509 certificate's Subject Alternative Name extension.
+///
+/// Non-URI SAN entries are ignored. A certificate with more than one URI SAN
+/// is rejected even when only one is a SPIFFE URI, so callers never select an
+/// identity from an ambiguous X.509-SVID.
+pub fn extract_spiffe_id_from_cert_der(cert_der: &[u8]) -> Result<SpiffeId, SpiffeSanError> {
+    let (remaining, x509) =
+        X509Certificate::from_der(cert_der).map_err(|_| SpiffeSanError::MalformedCertificate)?;
+    if !remaining.is_empty() {
+        return Err(SpiffeSanError::MalformedCertificate);
+    }
+
+    let san = x509
+        .subject_alternative_name()
+        .map_err(|_| SpiffeSanError::MalformedCertificate)?
+        .ok_or(SpiffeSanError::MissingSpiffeId)?;
+
+    let mut candidate = None;
+    for name in &san.value.general_names {
+        let GeneralName::URI(uri) = name else {
+            continue;
+        };
+        if candidate.replace(*uri).is_some() {
+            return Err(SpiffeSanError::MultipleUriSans);
+        }
+    }
+
+    let candidate = candidate.ok_or(SpiffeSanError::MissingSpiffeId)?;
+    if candidate.len() > MAX_SPIFFE_ID_URI_LEN {
+        return Err(SpiffeSanError::MalformedSpiffeId);
+    }
+
+    SpiffeId::new(candidate).map_err(|_| SpiffeSanError::MalformedSpiffeId)
+}
+
 impl WorkloadIdentity {
     pub fn from_cert_der(
         cert_der: &[u8],
         active_bundles: &TrustBundleSet,
     ) -> Result<Self, IdentityReloadError> {
-        let (_, x509) = X509Certificate::from_der(cert_der)
+        let (remaining, x509) = X509Certificate::from_der(cert_der)
             .map_err(|_| IdentityReloadError::MalformedSpiffeId)?;
+        if !remaining.is_empty() {
+            return Err(IdentityReloadError::MalformedSpiffeId);
+        }
 
         let not_before_secs = x509.validity().not_before.timestamp();
         let not_after_secs = x509.validity().not_after.timestamp();
@@ -240,23 +304,8 @@ impl WorkloadIdentity {
             .map_err(|_| IdentityReloadError::MalformedSpiffeId)?;
         let expires_at = Timestamp::from_offset_datetime(dt);
 
-        let mut spiffe_id_str = None;
-        for ext in x509.extensions() {
-            if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
-                for name in &san.general_names {
-                    if let GeneralName::URI(uri) = name {
-                        if uri.starts_with("spiffe://") {
-                            spiffe_id_str = Some((*uri).to_string());
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let spiffe_id_str = spiffe_id_str.ok_or(IdentityReloadError::MalformedSpiffeId)?;
-        let spiffe_id =
-            SpiffeId::new(&spiffe_id_str).map_err(|_| IdentityReloadError::MalformedSpiffeId)?;
+        let spiffe_id = extract_spiffe_id_from_cert_der(cert_der)
+            .map_err(|_| IdentityReloadError::MalformedSpiffeId)?;
 
         let trust_domain_str = spiffe_id.trust_domain();
         let trust_domain = TrustDomain::new(trust_domain_str)
@@ -624,5 +673,133 @@ impl SvidWatcher {
                 return Err(IdentityReloadError::SocketUnavailable);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spiffe_san_tests {
+    use super::*;
+    use rcgen::{CertificateParams, KeyPair, SanType};
+
+    const SPIFFE_ID: &str =
+        "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/smf-0";
+    const OTHER_SPIFFE_ID: &str =
+        "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/smf-1";
+
+    fn certificate_with_uris(uris: &[&str]) -> Vec<u8> {
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = uris
+            .iter()
+            .map(|uri| SanType::URI(rcgen::Ia5String::try_from(*uri).unwrap()))
+            .collect();
+        let key = KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().der().to_vec()
+    }
+
+    #[test]
+    fn strict_extractor_accepts_one_canonical_spiffe_uri() {
+        let cert = certificate_with_uris(&[SPIFFE_ID]);
+
+        let actual = extract_spiffe_id_from_cert_der(&cert).unwrap();
+
+        assert_eq!(actual.as_str(), SPIFFE_ID);
+    }
+
+    #[test]
+    fn strict_extractor_rejects_missing_spiffe_uri() {
+        let cert = certificate_with_uris(&[]);
+
+        assert_eq!(
+            extract_spiffe_id_from_cert_der(&cert),
+            Err(SpiffeSanError::MissingSpiffeId)
+        );
+    }
+
+    #[test]
+    fn strict_extractor_rejects_multiple_spiffe_uris() {
+        let cert = certificate_with_uris(&[SPIFFE_ID, OTHER_SPIFFE_ID]);
+
+        assert_eq!(
+            extract_spiffe_id_from_cert_der(&cert),
+            Err(SpiffeSanError::MultipleUriSans)
+        );
+    }
+
+    #[test]
+    fn strict_extractor_rejects_spiffe_plus_non_spiffe_uri() {
+        let cert = certificate_with_uris(&[SPIFFE_ID, "https://service.example.test"]);
+
+        assert_eq!(
+            extract_spiffe_id_from_cert_der(&cert),
+            Err(SpiffeSanError::MultipleUriSans)
+        );
+    }
+
+    #[test]
+    fn strict_extractor_rejects_noncanonical_spiffe_uri() {
+        let cert = certificate_with_uris(&[
+            "SPIFFE://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/smf-0",
+        ]);
+
+        assert_eq!(
+            extract_spiffe_id_from_cert_der(&cert),
+            Err(SpiffeSanError::MalformedSpiffeId)
+        );
+    }
+
+    #[test]
+    fn strict_extractor_rejects_oversized_uri_san() {
+        let prefix = "spiffe://example.test/tenant/tenant-a/ns/";
+        let suffix = "/sa/session/nf/smf/instance/smf-0";
+        let uri_with_len = |len: usize| {
+            let namespace_len = len
+                .checked_sub(prefix.len() + suffix.len())
+                .expect("test URI length");
+            format!("{prefix}{}{suffix}", "a".repeat(namespace_len))
+        };
+        let at_limit = uri_with_len(MAX_SPIFFE_ID_URI_LEN);
+        assert_eq!(at_limit.len(), MAX_SPIFFE_ID_URI_LEN);
+        let at_limit_cert = certificate_with_uris(&[&at_limit]);
+        assert_eq!(
+            extract_spiffe_id_from_cert_der(&at_limit_cert)
+                .expect("maximum-sized canonical SPIFFE ID")
+                .as_str(),
+            at_limit
+        );
+
+        let oversized = uri_with_len(MAX_SPIFFE_ID_URI_LEN + 1);
+        let cert = certificate_with_uris(&[&oversized]);
+
+        assert_eq!(
+            extract_spiffe_id_from_cert_der(&cert),
+            Err(SpiffeSanError::MalformedSpiffeId)
+        );
+    }
+
+    #[test]
+    fn strict_extractor_rejects_trailing_certificate_data() {
+        let mut cert = certificate_with_uris(&[SPIFFE_ID]);
+        cert.push(0);
+
+        assert_eq!(
+            extract_spiffe_id_from_cert_der(&cert),
+            Err(SpiffeSanError::MalformedCertificate)
+        );
+    }
+
+    #[test]
+    fn workload_identity_reuses_strict_san_cardinality() {
+        let cert = certificate_with_uris(&[SPIFFE_ID, OTHER_SPIFFE_ID]);
+        let trust_domain = TrustDomain::new("example.test").unwrap();
+        let mut bundles = TrustBundleSet::new();
+        bundles.insert(TrustBundle {
+            trust_domain,
+            certificates: Vec::new(),
+        });
+
+        assert_eq!(
+            WorkloadIdentity::from_cert_der(&cert, &bundles),
+            Err(IdentityReloadError::MalformedSpiffeId)
+        );
     }
 }

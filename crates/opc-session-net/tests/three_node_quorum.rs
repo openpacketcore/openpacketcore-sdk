@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -5,7 +6,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
-use opc_session_net::{RemoteAddrResolver, RemoteSessionBackend, SessionReplicationServer};
+use opc_session_net::{
+    LocalReplicaBinding, RemoteAddrResolver, RemoteReplicaBinding, RemoteSessionBackend,
+    SessionClusterId, SessionConfigurationGeneration, SessionReplicationManifest,
+    SessionReplicationServer,
+};
 use opc_session_store::backend::{
     CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
 };
@@ -23,35 +28,46 @@ use opc_session_store::{
     ReplicaReadinessFailure, ReplicaTlsIdentity, RestoreScanCursor, RestoreScanRequest,
     RestoreScanScope, SqliteSessionBackend, StoreError, ValidatedQuorumTopology,
 };
-use opc_tls::TlsConfigBuilder;
+use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
 #[derive(Clone)]
 struct TestMtls {
-    server_config: Arc<opc_tls::ServerConfig>,
-    client_config: Arc<opc_tls::ClientConfig>,
+    manifest: Arc<SessionReplicationManifest>,
+    replicas: Arc<BTreeMap<ReplicaId, TestReplicaMtls>>,
+}
+
+#[derive(Clone)]
+struct TestReplicaMtls {
+    server_config: AuthenticatedServerConfig,
+    client_config: AuthenticatedClientConfig,
 }
 
 fn topology_replica_id(index: usize) -> ReplicaId {
     ReplicaId::new(format!("test-replica-{index}")).expect("test replica ID")
 }
 
+fn topology_spiffe_id(index: usize) -> String {
+    format!(
+        "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/test-replica-{index}"
+    )
+}
+
+fn topology_descriptor(index: usize) -> QuorumReplicaDescriptor {
+    QuorumReplicaDescriptor::new(
+        topology_replica_id(index),
+        ReplicaEndpoint::new(format!("test-replica-{index}.invalid"), 7443).expect("test endpoint"),
+        ReplicaTlsIdentity::new(topology_spiffe_id(index)).expect("test TLS identity"),
+        ReplicaFailureDomain::new(format!("test-failure-domain-{index}"))
+            .expect("test failure domain"),
+        ReplicaBackingIdentity::new(format!("test-backing-{index}"))
+            .expect("test backing identity"),
+    )
+}
+
 fn topology_member(replica: FencedSessionReplica) -> QuorumReplicaMember {
     let index = replica.id;
-    QuorumReplicaMember::new(
-        QuorumReplicaDescriptor::new(
-            topology_replica_id(index),
-            ReplicaEndpoint::new(format!("test-replica-{index}.invalid"), 7443)
-                .expect("test endpoint"),
-            ReplicaTlsIdentity::new(format!("spiffe://test/session/replica/{index}"))
-                .expect("test TLS identity"),
-            ReplicaFailureDomain::new(format!("test-failure-domain-{index}"))
-                .expect("test failure domain"),
-            ReplicaBackingIdentity::new(format!("test-backing-{index}"))
-                .expect("test backing identity"),
-        ),
-        replica,
-    )
+    QuorumReplicaMember::new(topology_descriptor(index), replica)
 }
 
 fn validated_quorum(
@@ -119,51 +135,152 @@ fn test_record(
     }
 }
 
+impl TestMtls {
+    fn standard() -> Self {
+        Self::from_descriptors((1..=3).map(topology_descriptor).collect())
+    }
+
+    fn from_descriptors(descriptors: Vec<QuorumReplicaDescriptor>) -> Self {
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Session Net Test CA");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+        let mut replicas = BTreeMap::new();
+
+        for descriptor in &descriptors {
+            let (cert, key) = signed_leaf(
+                &ca_cert,
+                &ca_key,
+                descriptor.replica_id().as_str(),
+                descriptor.tls_identity().as_str(),
+            );
+            let state = identity_state_from_pem(
+                &(cert.pem() + &ca_cert.pem()),
+                &key.serialize_pem(),
+                &ca_cert.pem(),
+            );
+            let (_state_tx, state_rx) = tokio::sync::watch::channel(Some(state));
+            let server_config = TlsConfigBuilder::new(state_rx.clone())
+                .allow_any_trusted_peer()
+                .build_authenticated_server_config()
+                .expect("authenticated server TLS config");
+            let client_config = TlsConfigBuilder::new(state_rx)
+                .allow_any_trusted_peer()
+                .build_authenticated_client_config()
+                .expect("authenticated client TLS config");
+            replicas.insert(
+                descriptor.replica_id().clone(),
+                TestReplicaMtls {
+                    server_config,
+                    client_config,
+                },
+            );
+        }
+
+        let manifest = Arc::new(
+            SessionReplicationManifest::try_new(
+                SessionClusterId::new("session-net-integration").expect("test cluster ID"),
+                SessionConfigurationGeneration::new("v3").expect("test configuration generation"),
+                descriptors,
+            )
+            .expect("test session replication manifest"),
+        );
+        Self {
+            manifest,
+            replicas: Arc::new(replicas),
+        }
+    }
+
+    fn local_binding(&self, index: usize) -> LocalReplicaBinding {
+        self.local_binding_for(&topology_replica_id(index))
+    }
+
+    fn local_binding_for(&self, replica_id: &ReplicaId) -> LocalReplicaBinding {
+        self.manifest
+            .bind_local(replica_id.clone())
+            .expect("test local replica binding")
+    }
+
+    fn remote_binding(&self, local_index: usize, remote_index: usize) -> RemoteReplicaBinding {
+        self.local_binding(local_index)
+            .bind_remote(topology_replica_id(remote_index))
+            .expect("test remote replica binding")
+    }
+
+    fn server_config(&self, index: usize) -> AuthenticatedServerConfig {
+        self.server_config_for(&topology_replica_id(index))
+    }
+
+    fn server_config_for(&self, replica_id: &ReplicaId) -> AuthenticatedServerConfig {
+        self.replicas
+            .get(replica_id)
+            .expect("test server TLS config")
+            .server_config
+            .clone()
+    }
+
+    fn client_config(&self, index: usize) -> AuthenticatedClientConfig {
+        self.client_config_for(&topology_replica_id(index))
+    }
+
+    fn client_config_for(&self, replica_id: &ReplicaId) -> AuthenticatedClientConfig {
+        self.replicas
+            .get(replica_id)
+            .expect("test client TLS config")
+            .client_config
+            .clone()
+    }
+}
+
 fn mtls_configs() -> TestMtls {
-    let ca_key = rcgen::KeyPair::generate().expect("ca key");
-    let mut ca_params = rcgen::CertificateParams::default();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "Session Net Test CA");
-    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+    TestMtls::standard()
+}
 
-    let (server_cert, server_key) = signed_leaf(
-        &ca_cert,
-        &ca_key,
-        "Session Server",
-        "spiffe://test-domain/tenant/test/ns/default/sa/session-server/nf/smf/instance/0",
-    );
-    let (client_cert, client_key) = signed_leaf(
-        &ca_cert,
-        &ca_key,
-        "Session Client",
-        "spiffe://test-domain/tenant/test/ns/default/sa/session-client/nf/smf/instance/0",
-    );
-    let server_state = identity_state_from_pem(
-        &(server_cert.pem() + &ca_cert.pem()),
-        &server_key.serialize_pem(),
-        &ca_cert.pem(),
-    );
-    let client_state = identity_state_from_pem(
-        &(client_cert.pem() + &ca_cert.pem()),
-        &client_key.serialize_pem(),
-        &ca_cert.pem(),
-    );
-    let (_server_tx, server_rx) = tokio::sync::watch::channel(Some(server_state));
-    let (_client_tx, client_rx) = tokio::sync::watch::channel(Some(client_state));
-    let server_config = TlsConfigBuilder::new(server_rx)
-        .allow_any_trusted_peer()
-        .build_server_config()
-        .expect("server tls config");
-    let client_config = TlsConfigBuilder::new(client_rx)
-        .allow_any_trusted_peer()
-        .build_client_config()
-        .expect("client tls config");
+fn pinned_resolver(addr: SocketAddr) -> RemoteAddrResolver {
+    Arc::new(move || Box::pin(async move { Ok(addr) }))
+}
 
-    TestMtls {
-        server_config: Arc::new(server_config),
-        client_config: Arc::new(client_config),
+fn remote_backend(
+    mtls: &TestMtls,
+    local_index: usize,
+    remote_index: usize,
+    addr: SocketAddr,
+    deadline: Option<Duration>,
+) -> RemoteSessionBackend {
+    RemoteSessionBackend::new_with_resolver(
+        mtls.remote_binding(local_index, remote_index),
+        pinned_resolver(addr),
+        mtls.client_config(local_index),
+        deadline,
+    )
+}
+
+#[cfg(feature = "insecure-test")]
+fn hello_ack_for(
+    request: &opc_session_net::Request,
+    contract_version: u32,
+) -> opc_session_net::Response {
+    let opc_session_net::Request::Hello {
+        node_id,
+        expected_server_replica_id,
+        cluster_id,
+        configuration_id,
+        handshake_nonce,
+        ..
+    } = request
+    else {
+        panic!("test handshake helper requires a hello request");
+    };
+    opc_session_net::Response::HelloAck {
+        contract_version,
+        server_replica_id: expected_server_replica_id.clone(),
+        accepted_client_replica_id: Some(node_id.clone()),
+        cluster_id: cluster_id.clone(),
+        configuration_id: configuration_id.clone(),
+        handshake_nonce: *handshake_nonce,
     }
 }
 
@@ -208,24 +325,40 @@ fn identity_state_from_pem(
 
 async fn start_server(
     mtls: &TestMtls,
+    server_index: usize,
 ) -> (
     SocketAddr,
     FakeSessionBackend,
     opc_session_net::server::ServerHandle,
 ) {
     let backend = FakeSessionBackend::new();
-    start_server_with_backend(mtls, backend).await
+    start_server_with_backend(mtls, server_index, backend).await
 }
 
 async fn start_server_with_backend<B>(
     mtls: &TestMtls,
+    server_index: usize,
     backend: B,
 ) -> (SocketAddr, B, opc_session_net::server::ServerHandle)
 where
     B: SessionStoreBackend + Clone + 'static,
 {
-    let server =
-        SessionReplicationServer::new(Arc::new(backend.clone()), mtls.server_config.clone());
+    start_server_with_backend_for(mtls, topology_replica_id(server_index), backend).await
+}
+
+async fn start_server_with_backend_for<B>(
+    mtls: &TestMtls,
+    server_replica_id: ReplicaId,
+    backend: B,
+) -> (SocketAddr, B, opc_session_net::server::ServerHandle)
+where
+    B: SessionStoreBackend + Clone + 'static,
+{
+    let server = SessionReplicationServer::new(
+        Arc::new(backend.clone()),
+        mtls.server_config_for(&server_replica_id),
+        mtls.local_binding_for(&server_replica_id),
+    );
     let (handle, addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
     (addr, backend, handle)
 }
@@ -233,8 +366,8 @@ where
 #[tokio::test]
 async fn remote_restore_scan_round_trips_scope_and_pagination_over_mtls() {
     let mtls = mtls_configs();
-    let (addr, backend, handle) = start_server(&mtls).await;
-    let remote = RemoteSessionBackend::new(addr, mtls.client_config.clone(), None);
+    let (addr, backend, handle) = start_server(&mtls, 2).await;
+    let remote = remote_backend(&mtls, 1, 2, addr, None);
 
     assert!(remote.capabilities().await.restore_scan);
     let empty = remote
@@ -306,12 +439,8 @@ async fn remote_restore_scan_round_trips_scope_and_pagination_over_mtls() {
         CompareAndSetResult::Success
     );
 
-    let small_frame_remote = RemoteSessionBackend::new(
-        addr,
-        mtls.client_config.clone(),
-        Some(Duration::from_secs(1)),
-    )
-    .with_max_frame_size(512);
+    let small_frame_remote =
+        remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(1))).with_max_frame_size(512);
     let oversized = small_frame_remote
         .scan_restore_records(RestoreScanRequest {
             scope: RestoreScanScope::all(),
@@ -334,8 +463,8 @@ async fn remote_restore_capability_matches_executable_backend_support() {
     let mut capabilities = BackendCapabilities::all_enabled();
     capabilities.restore_scan = false;
     let backend = FakeSessionBackend::with_capabilities(capabilities);
-    let (addr, _backend, handle) = start_server_with_backend(&mtls, backend).await;
-    let remote = RemoteSessionBackend::new(addr, mtls.client_config.clone(), None);
+    let (addr, _backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let remote = remote_backend(&mtls, 1, 2, addr, None);
 
     assert!(!remote.capabilities().await.restore_scan);
     assert_eq!(
@@ -352,13 +481,9 @@ async fn remote_restore_capability_matches_executable_backend_support() {
 #[tokio::test]
 async fn unusable_client_or_server_frame_bound_masks_restore_capability() {
     let mtls = mtls_configs();
-    let (addr, _backend, handle) = start_server(&mtls).await;
-    let constrained_client = RemoteSessionBackend::new(
-        addr,
-        mtls.client_config.clone(),
-        Some(Duration::from_secs(1)),
-    )
-    .with_max_frame_size(511);
+    let (addr, _backend, handle) = start_server(&mtls, 2).await;
+    let constrained_client =
+        remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(1))).with_max_frame_size(511);
 
     assert!(!constrained_client.capabilities().await.restore_scan);
     assert_eq!(
@@ -371,14 +496,14 @@ async fn unusable_client_or_server_frame_bound_masks_restore_capability() {
     handle.abort();
 
     let backend = FakeSessionBackend::new();
-    let server = SessionReplicationServer::new(Arc::new(backend), mtls.server_config.clone())
-        .with_max_frame_size(511);
+    let server = SessionReplicationServer::new(
+        Arc::new(backend),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_frame_size(511);
     let (server_handle, server_addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
-    let default_client = RemoteSessionBackend::new(
-        server_addr,
-        mtls.client_config.clone(),
-        Some(Duration::from_secs(1)),
-    );
+    let default_client = remote_backend(&mtls, 1, 2, server_addr, Some(Duration::from_secs(1)));
 
     assert!(!default_client.capabilities().await.restore_scan);
     server_handle.abort();
@@ -386,77 +511,74 @@ async fn unusable_client_or_server_frame_bound_masks_restore_capability() {
 
 #[tokio::test]
 async fn validated_bare_self_and_fqdn_peers_restore_over_mtls_sqlite_replicas() {
-    let mtls = mtls_configs();
-    let local = Arc::new(SqliteSessionBackend::in_memory().expect("local SQLite"));
-    let (addr1, _backend1, handle1) = start_server_with_backend(
-        &mtls,
-        SqliteSessionBackend::in_memory().expect("remote SQLite 1"),
-    )
-    .await;
-    let (addr2, _backend2, handle2) = start_server_with_backend(
-        &mtls,
-        SqliteSessionBackend::in_memory().expect("remote SQLite 2"),
-    )
-    .await;
     let peer1_host = "epdg-app-1.epdg-app-quorum.epdg-gateway.svc.cluster.local";
     let peer2_host = "epdg-app-2.epdg-app-quorum.epdg-gateway.svc.cluster.local";
-    let resolver1: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(addr1) }));
-    let resolver2: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(addr2) }));
-    let remote1 = Arc::new(RemoteSessionBackend::new_with_resolver(
-        peer1_host.to_string(),
-        resolver1,
-        mtls.client_config.clone(),
-        Some(Duration::from_millis(300)),
-    ));
-    let remote2 = Arc::new(RemoteSessionBackend::new_with_resolver(
-        peer2_host.to_string(),
-        resolver2,
-        mtls.client_config.clone(),
-        Some(Duration::from_millis(300)),
-    ));
     let logical_self = ReplicaId::new("epdg-app-0").expect("bare logical self");
-    let member = |slot,
-                  id: ReplicaId,
-                  host: &str,
-                  port,
-                  tls_identity: &str,
-                  backend: Arc<dyn SessionStoreBackend>| {
-        QuorumReplicaMember::new(
-            QuorumReplicaDescriptor::new(
-                id,
-                ReplicaEndpoint::new(host, port).expect("FQDN endpoint"),
-                ReplicaTlsIdentity::new(tls_identity).expect("declared TLS identity"),
-                ReplicaFailureDomain::new(format!("pod/epdg-app-{slot}")).expect("failure domain"),
-                ReplicaBackingIdentity::new(format!("pvc/session-store-{slot}"))
-                    .expect("backing identity"),
-            ),
-            FencedSessionReplica::new(slot, backend),
+    let peer1_id = ReplicaId::new("epdg-app-1").expect("peer ID");
+    let peer2_id = ReplicaId::new("epdg-app-2").expect("peer ID");
+    let descriptor = |slot: usize, replica_id: ReplicaId, host: &str| {
+        QuorumReplicaDescriptor::new(
+            replica_id,
+            ReplicaEndpoint::new(host, 7443).expect("FQDN endpoint"),
+            ReplicaTlsIdentity::new(format!(
+                "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/epdg-app-{slot}"
+            ))
+            .expect("declared TLS identity"),
+            ReplicaFailureDomain::new(format!("pod/epdg-app-{slot}"))
+                .expect("failure domain"),
+            ReplicaBackingIdentity::new(format!("pvc/session-store-{slot}"))
+                .expect("backing identity"),
         )
     };
-    let members = vec![
-        member(
+    let descriptors = vec![
+        descriptor(
             0,
             logical_self.clone(),
             "epdg-app-0.epdg-app-quorum.epdg-gateway.svc.cluster.local",
-            7443,
-            "spiffe://test/session/epdg-app-0",
-            local,
         ),
-        member(
-            1,
-            ReplicaId::new("epdg-app-1").expect("peer ID"),
-            peer1_host,
-            addr1.port(),
-            "spiffe://test/session/epdg-app-1",
-            remote1,
+        descriptor(1, peer1_id.clone(), peer1_host),
+        descriptor(2, peer2_id.clone(), peer2_host),
+    ];
+    let mtls = TestMtls::from_descriptors(descriptors.clone());
+    let local = Arc::new(SqliteSessionBackend::in_memory().expect("local SQLite"));
+    let (addr1, _backend1, handle1) = start_server_with_backend_for(
+        &mtls,
+        peer1_id.clone(),
+        SqliteSessionBackend::in_memory().expect("remote SQLite 1"),
+    )
+    .await;
+    let (addr2, _backend2, handle2) = start_server_with_backend_for(
+        &mtls,
+        peer2_id.clone(),
+        SqliteSessionBackend::in_memory().expect("remote SQLite 2"),
+    )
+    .await;
+    let local_binding = mtls.local_binding_for(&logical_self);
+    let remote1 = Arc::new(RemoteSessionBackend::new_with_resolver(
+        local_binding
+            .bind_remote(peer1_id.clone())
+            .expect("peer 1 binding"),
+        pinned_resolver(addr1),
+        mtls.client_config_for(&logical_self),
+        Some(Duration::from_millis(300)),
+    ));
+    let remote2 = Arc::new(RemoteSessionBackend::new_with_resolver(
+        local_binding
+            .bind_remote(peer2_id.clone())
+            .expect("peer 2 binding"),
+        pinned_resolver(addr2),
+        mtls.client_config_for(&logical_self),
+        Some(Duration::from_millis(300)),
+    ));
+    let members = vec![
+        QuorumReplicaMember::new(descriptors[0].clone(), FencedSessionReplica::new(0, local)),
+        QuorumReplicaMember::new(
+            descriptors[1].clone(),
+            FencedSessionReplica::new(1, remote1),
         ),
-        member(
-            2,
-            ReplicaId::new("epdg-app-2").expect("peer ID"),
-            peer2_host,
-            addr2.port(),
-            "spiffe://test/session/epdg-app-2",
-            remote2,
+        QuorumReplicaMember::new(
+            descriptors[2].clone(),
+            FencedSessionReplica::new(2, remote2),
         ),
     ];
     let topology =
@@ -472,6 +594,15 @@ async fn validated_bare_self_and_fqdn_peers_restore_over_mtls_sqlite_replicas() 
     assert_eq!(readiness.agreeing_voters(), 3);
     assert_eq!(readiness.required_quorum(), 2);
     assert_eq!(readiness.majority_visible_prefix_index(), Some(0));
+    assert_eq!(
+        readiness
+            .replica_observations()
+            .iter()
+            .map(|observation| observation.replica_id().as_str())
+            .collect::<Vec<_>>(),
+        vec![logical_self.as_str(), peer1_id.as_str(), peer2_id.as_str()],
+        "readiness must report authenticated stable IDs, never endpoint aliases"
+    );
 
     let empty = quorum
         .scan_restore_records(RestoreScanRequest::all(2))
@@ -555,9 +686,13 @@ async fn stalled_connection_is_reaped_after_idle_timeout() {
 
     let backend = FakeSessionBackend::new();
     let mtls = mtls_configs();
-    let server = SessionReplicationServer::new(Arc::new(backend), mtls.server_config.clone())
-        .with_max_connections(1)
-        .with_idle_timeout(Duration::from_millis(150));
+    let server = SessionReplicationServer::new(
+        Arc::new(backend),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_max_connections(1)
+    .with_idle_timeout(Duration::from_millis(150));
     let (handle, addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
 
     // Connect and send only a partial length prefix (2 of 4 bytes), then stall
@@ -592,6 +727,10 @@ async fn incompatible_client_receives_server_contract_before_disconnect() {
         &Request::Hello {
             contract_version: CONTRACT_VERSION - 1,
             node_id: "old-client".to_string(),
+            expected_server_replica_id: None,
+            cluster_id: None,
+            configuration_id: None,
+            handshake_nonce: None,
         },
     )
     .await
@@ -600,7 +739,10 @@ async fn incompatible_client_receives_server_contract_before_disconnect() {
     let response: Response = read_frame(&mut stream, 1024).await.unwrap();
     assert!(matches!(
         response,
-        Response::HelloAck { contract_version } if contract_version == CONTRACT_VERSION
+        Response::HelloAck {
+            contract_version,
+            ..
+        } if contract_version == CONTRACT_VERSION
     ));
 
     handle.abort();
@@ -610,9 +752,12 @@ async fn incompatible_client_receives_server_contract_before_disconnect() {
 async fn plaintext_rebuild_is_rejected_before_backend_dispatch() {
     let mtls = mtls_configs();
     let backend = FakeSessionBackend::new();
-    let server =
-        SessionReplicationServer::new(Arc::new(backend.clone()), mtls.server_config.clone())
-            .with_idle_timeout(Duration::from_millis(150));
+    let server = SessionReplicationServer::new(
+        Arc::new(backend.clone()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_idle_timeout(Duration::from_millis(150));
     let (handle, addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -621,6 +766,10 @@ async fn plaintext_rebuild_is_rejected_before_backend_dispatch() {
         &opc_session_net::Request::Hello {
             contract_version: opc_session_net::protocol::CONTRACT_VERSION,
             node_id: "plaintext-peer".to_string(),
+            expected_server_replica_id: None,
+            cluster_id: None,
+            configuration_id: None,
+            handshake_nonce: None,
         },
     )
     .await;
@@ -654,26 +803,14 @@ async fn plaintext_rebuild_is_rejected_before_backend_dispatch() {
 async fn test_three_node_quorum_kill_and_restart() {
     // 1. Spin up 3 servers
     let mtls = mtls_configs();
-    let (addr1, backend1, handle1) = start_server(&mtls).await;
-    let (addr2, _backend2, handle2) = start_server(&mtls).await;
-    let (addr3, _backend3, handle3) = start_server(&mtls).await;
+    let (addr1, backend1, handle1) = start_server(&mtls, 1).await;
+    let (addr2, _backend2, handle2) = start_server(&mtls, 2).await;
+    let (addr3, _backend3, handle3) = start_server(&mtls, 3).await;
 
     // 2. Create 3 remote clients
-    let remote1 = Arc::new(RemoteSessionBackend::new(
-        addr1,
-        mtls.client_config.clone(),
-        None,
-    ));
-    let remote2 = Arc::new(RemoteSessionBackend::new(
-        addr2,
-        mtls.client_config.clone(),
-        None,
-    ));
-    let remote3 = Arc::new(RemoteSessionBackend::new(
-        addr3,
-        mtls.client_config.clone(),
-        None,
-    ));
+    let remote1 = Arc::new(remote_backend(&mtls, 1, 1, addr1, None));
+    let remote2 = Arc::new(remote_backend(&mtls, 1, 2, addr2, None));
+    let remote3 = Arc::new(remote_backend(&mtls, 1, 3, addr3, None));
 
     // 3. Wrap in quorum replicas
     let replica1 = FencedSessionReplica::new(1, remote1.clone());
@@ -763,16 +900,15 @@ async fn test_three_node_quorum_kill_and_restart() {
     );
 
     // 7. Restart the server
-    let server1_new =
-        SessionReplicationServer::new(Arc::new(backend1.clone()), mtls.server_config.clone());
+    let server1_new = SessionReplicationServer::new(
+        Arc::new(backend1.clone()),
+        mtls.server_config(1),
+        mtls.local_binding(1),
+    );
     let (handle1_new, addr1_new) = server1_new.listen(addr1).await.unwrap();
 
     // Update the remote to point to the new address
-    let remote1_new = Arc::new(RemoteSessionBackend::new(
-        addr1_new,
-        mtls.client_config.clone(),
-        None,
-    ));
+    let remote1_new = Arc::new(remote_backend(&mtls, 1, 1, addr1_new, None));
     let replica1_new = FencedSessionReplica::new(1, remote1_new.clone());
 
     // Create a new quorum with the restarted replica
@@ -810,12 +946,8 @@ async fn test_three_node_quorum_kill_and_restart() {
 #[tokio::test]
 async fn test_persistent_connection_reconnect_after_restart() {
     let mtls = mtls_configs();
-    let (addr, backend, handle) = start_server(&mtls).await;
-    let remote = Arc::new(RemoteSessionBackend::new(
-        addr,
-        mtls.client_config.clone(),
-        None,
-    ));
+    let (addr, backend, handle) = start_server(&mtls, 2).await;
+    let remote = Arc::new(remote_backend(&mtls, 1, 2, addr, None));
 
     // Warm up the persistent connection.
     let key = test_key();
@@ -826,8 +958,11 @@ async fn test_persistent_connection_reconnect_after_restart() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Restart a server on the same address with the same backend state.
-    let server =
-        SessionReplicationServer::new(Arc::new(backend.clone()), mtls.server_config.clone());
+    let server = SessionReplicationServer::new(
+        Arc::new(backend.clone()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    );
     let (handle_new, _addr_new) = server.listen(addr).await.unwrap();
 
     // The next request must transparently reconnect rather than fail.
@@ -839,12 +974,8 @@ async fn test_persistent_connection_reconnect_after_restart() {
 #[tokio::test]
 async fn capabilities_uses_cached_success_after_disconnect() {
     let mtls = mtls_configs();
-    let (addr, _backend, handle) = start_server(&mtls).await;
-    let remote = RemoteSessionBackend::new(
-        addr,
-        mtls.client_config.clone(),
-        Some(Duration::from_millis(200)),
-    );
+    let (addr, _backend, handle) = start_server(&mtls, 2).await;
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_millis(200)));
 
     let warmed = remote.capabilities().await;
     assert!(
@@ -860,19 +991,21 @@ async fn capabilities_uses_cached_success_after_disconnect() {
     expected.restore_scan = false;
     assert_eq!(
         after_disconnect, expected,
-        "cached backend features may survive transport loss, but v2-only restore support must be masked without a fresh negotiation"
+        "cached backend features may survive transport loss, but restore support must be masked without a fresh negotiation"
     );
 }
 
 #[tokio::test]
 async fn test_in_flight_request_surfaces_error_on_disconnect() {
     let mtls = mtls_configs();
-    let (addr, _backend, handle) = start_server(&mtls).await;
+    let (addr, _backend, handle) = start_server(&mtls, 2).await;
 
     // Short deadline so reconnect attempts expire before any restart.
-    let remote = Arc::new(RemoteSessionBackend::new(
+    let remote = Arc::new(remote_backend(
+        &mtls,
+        1,
+        2,
         addr,
-        mtls.client_config.clone(),
         Some(Duration::from_millis(300)),
     ));
 
@@ -927,14 +1060,9 @@ async fn direct_cas_retry_after_dropped_response_reports_success() {
                     let (mut r, mut w) = stream.into_split();
                     let hello: Request = read_frame(&mut r, 1 << 20).await.unwrap();
                     assert!(matches!(hello, Request::Hello { .. }));
-                    write_frame(
-                        &mut w,
-                        &Response::HelloAck {
-                            contract_version: CONTRACT_VERSION,
-                        },
-                    )
-                    .await
-                    .unwrap();
+                    write_frame(&mut w, &hello_ack_for(&hello, CONTRACT_VERSION))
+                        .await
+                        .unwrap();
 
                     loop {
                         let req: Request = match read_frame(&mut r, 1 << 20).await {
@@ -1012,25 +1140,13 @@ async fn direct_cas_retry_after_dropped_response_reports_success() {
 #[tokio::test]
 async fn test_batch_and_delete() {
     let mtls = mtls_configs();
-    let (addr1, _backend1, handle1) = start_server(&mtls).await;
-    let (addr2, _backend2, handle2) = start_server(&mtls).await;
-    let (addr3, _backend3, handle3) = start_server(&mtls).await;
+    let (addr1, _backend1, handle1) = start_server(&mtls, 1).await;
+    let (addr2, _backend2, handle2) = start_server(&mtls, 2).await;
+    let (addr3, _backend3, handle3) = start_server(&mtls, 3).await;
 
-    let remote1 = Arc::new(RemoteSessionBackend::new(
-        addr1,
-        mtls.client_config.clone(),
-        None,
-    ));
-    let remote2 = Arc::new(RemoteSessionBackend::new(
-        addr2,
-        mtls.client_config.clone(),
-        None,
-    ));
-    let remote3 = Arc::new(RemoteSessionBackend::new(
-        addr3,
-        mtls.client_config.clone(),
-        None,
-    ));
+    let remote1 = Arc::new(remote_backend(&mtls, 1, 1, addr1, None));
+    let remote2 = Arc::new(remote_backend(&mtls, 1, 2, addr2, None));
+    let remote3 = Arc::new(remote_backend(&mtls, 1, 3, addr3, None));
 
     let replica1 = FencedSessionReplica::new(1, remote1);
     let replica2 = FencedSessionReplica::new(2, remote2);
@@ -1090,25 +1206,13 @@ async fn test_batch_and_delete() {
 #[tokio::test]
 async fn test_replication_log_and_watch() {
     let mtls = mtls_configs();
-    let (addr1, _backend1, handle1) = start_server(&mtls).await;
-    let (addr2, _backend2, handle2) = start_server(&mtls).await;
-    let (addr3, _backend3, handle3) = start_server(&mtls).await;
+    let (addr1, _backend1, handle1) = start_server(&mtls, 1).await;
+    let (addr2, _backend2, handle2) = start_server(&mtls, 2).await;
+    let (addr3, _backend3, handle3) = start_server(&mtls, 3).await;
 
-    let remote1 = Arc::new(RemoteSessionBackend::new(
-        addr1,
-        mtls.client_config.clone(),
-        None,
-    ));
-    let remote2 = Arc::new(RemoteSessionBackend::new(
-        addr2,
-        mtls.client_config.clone(),
-        None,
-    ));
-    let remote3 = Arc::new(RemoteSessionBackend::new(
-        addr3,
-        mtls.client_config.clone(),
-        None,
-    ));
+    let remote1 = Arc::new(remote_backend(&mtls, 1, 1, addr1, None));
+    let remote2 = Arc::new(remote_backend(&mtls, 1, 2, addr2, None));
+    let remote3 = Arc::new(remote_backend(&mtls, 1, 3, addr3, None));
 
     let replica1 = FencedSessionReplica::new(1, remote1);
     let replica2 = FencedSessionReplica::new(2, remote2);
@@ -1183,14 +1287,9 @@ async fn test_timeout_mid_exchange_forces_reconnect() {
                     Err(_) => return,
                 };
                 assert!(matches!(hello, Request::Hello { .. }));
-                write_frame(
-                    &mut w,
-                    &Response::HelloAck {
-                        contract_version: CONTRACT_VERSION,
-                    },
-                )
-                .await
-                .unwrap();
+                write_frame(&mut w, &hello_ack_for(&hello, CONTRACT_VERSION))
+                    .await
+                    .unwrap();
 
                 loop {
                     let req: Request = match read_frame(&mut r, 1 << 20).await {
@@ -1246,8 +1345,7 @@ async fn durable_readiness_probe_classifies_tls_accept_then_close_as_transport()
     });
 
     let mtls = mtls_configs();
-    let remote =
-        RemoteSessionBackend::new(addr, mtls.client_config, Some(Duration::from_millis(250)));
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_millis(250)));
 
     assert_eq!(
         remote.probe_replication_head().await,
@@ -1281,7 +1379,7 @@ async fn durable_readiness_probe_classifies_stalled_peer_as_timeout() {
 #[cfg(feature = "insecure-test")]
 async fn durable_readiness_probe_classifies_version_mismatch_as_protocol() {
     use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
-    use opc_session_net::{Request, Response};
+    use opc_session_net::Request;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1293,14 +1391,9 @@ async fn durable_readiness_probe_classifies_version_mismatch_as_protocol() {
             .await
             .expect("read client hello");
         assert!(matches!(hello, Request::Hello { .. }));
-        write_frame(
-            &mut stream,
-            &Response::HelloAck {
-                contract_version: CONTRACT_VERSION - 1,
-            },
-        )
-        .await
-        .expect("write incompatible hello response");
+        write_frame(&mut stream, &hello_ack_for(&hello, CONTRACT_VERSION - 1))
+            .await
+            .expect("write incompatible hello response");
     });
     let remote = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
 
@@ -1327,14 +1420,9 @@ async fn durable_readiness_probe_classifies_redacted_remote_rejection_as_backend
             .await
             .expect("read client hello");
         assert!(matches!(hello, Request::Hello { .. }));
-        write_frame(
-            &mut stream,
-            &Response::HelloAck {
-                contract_version: CONTRACT_VERSION,
-            },
-        )
-        .await
-        .expect("write hello response");
+        write_frame(&mut stream, &hello_ack_for(&hello, CONTRACT_VERSION))
+            .await
+            .expect("write hello response");
         let probe: Request = read_frame(&mut stream, 1 << 20)
             .await
             .expect("read replication-head probe");
@@ -1375,14 +1463,9 @@ async fn durable_readiness_probe_classifies_redacted_generic_error_as_protocol()
             .await
             .expect("read client hello");
         assert!(matches!(hello, Request::Hello { .. }));
-        write_frame(
-            &mut stream,
-            &Response::HelloAck {
-                contract_version: CONTRACT_VERSION,
-            },
-        )
-        .await
-        .expect("write hello response");
+        write_frame(&mut stream, &hello_ack_for(&hello, CONTRACT_VERSION))
+            .await
+            .expect("write hello response");
         let probe: Request = read_frame(&mut stream, 1 << 20)
             .await
             .expect("read replication-head probe");
@@ -1426,14 +1509,9 @@ async fn cancelled_readiness_probe_drops_connection_before_the_next_probe() {
             .await
             .expect("read first client hello");
         assert!(matches!(hello, Request::Hello { .. }));
-        write_frame(
-            &mut first,
-            &Response::HelloAck {
-                contract_version: CONTRACT_VERSION,
-            },
-        )
-        .await
-        .expect("write first hello response");
+        write_frame(&mut first, &hello_ack_for(&hello, CONTRACT_VERSION))
+            .await
+            .expect("write first hello response");
         let probe: Request = read_frame(&mut first, 1 << 20)
             .await
             .expect("read first replication-head probe");
@@ -1454,14 +1532,9 @@ async fn cancelled_readiness_probe_drops_connection_before_the_next_probe() {
             .await
             .expect("read second client hello");
         assert!(matches!(hello, Request::Hello { .. }));
-        write_frame(
-            &mut second,
-            &Response::HelloAck {
-                contract_version: CONTRACT_VERSION,
-            },
-        )
-        .await
-        .expect("write second hello response");
+        write_frame(&mut second, &hello_ack_for(&hello, CONTRACT_VERSION))
+            .await
+            .expect("write second hello response");
         let probe: Request = read_frame(&mut second, 1 << 20)
             .await
             .expect("read second replication-head probe");
@@ -1508,22 +1581,28 @@ async fn cancelled_readiness_probe_drops_connection_before_the_next_probe() {
 #[tokio::test]
 async fn cached_capabilities_do_not_substitute_for_fresh_quorum_evidence() {
     let mtls = mtls_configs();
-    let (addr1, _backend1, handle1) = start_server(&mtls).await;
-    let (addr2, _backend2, handle2) = start_server(&mtls).await;
-    let (addr3, _backend3, handle3) = start_server(&mtls).await;
-    let remote1 = Arc::new(RemoteSessionBackend::new(
+    let (addr1, _backend1, handle1) = start_server(&mtls, 1).await;
+    let (addr2, _backend2, handle2) = start_server(&mtls, 2).await;
+    let (addr3, _backend3, handle3) = start_server(&mtls, 3).await;
+    let remote1 = Arc::new(remote_backend(
+        &mtls,
+        1,
+        1,
         addr1,
-        mtls.client_config.clone(),
         Some(Duration::from_millis(200)),
     ));
-    let remote2 = Arc::new(RemoteSessionBackend::new(
+    let remote2 = Arc::new(remote_backend(
+        &mtls,
+        1,
+        2,
         addr2,
-        mtls.client_config.clone(),
         Some(Duration::from_millis(200)),
     ));
-    let remote3 = Arc::new(RemoteSessionBackend::new(
+    let remote3 = Arc::new(remote_backend(
+        &mtls,
+        1,
+        3,
         addr3,
-        mtls.client_config.clone(),
         Some(Duration::from_millis(200)),
     ));
     let quorum = validated_quorum(
@@ -1662,33 +1741,42 @@ async fn durable_readiness_adaptively_pages_a_log_larger_than_one_wire_frame() {
     }
 
     let mtls = mtls_configs();
-    let (addr1, _backend1, handle1) = start_server_with_backend(&mtls, backends[0].clone()).await;
-    let (addr2, _backend2, handle2) = start_server_with_backend(&mtls, backends[1].clone()).await;
-    let (addr3, _backend3, handle3) = start_server_with_backend(&mtls, backends[2].clone()).await;
+    let (addr1, _backend1, handle1) =
+        start_server_with_backend(&mtls, 1, backends[0].clone()).await;
+    let (addr2, _backend2, handle2) =
+        start_server_with_backend(&mtls, 2, backends[1].clone()).await;
+    let (addr3, _backend3, handle3) =
+        start_server_with_backend(&mtls, 3, backends[2].clone()).await;
     let quorum = validated_quorum(
         1,
         vec![
             FencedSessionReplica::new(
                 1,
-                Arc::new(RemoteSessionBackend::new(
+                Arc::new(remote_backend(
+                    &mtls,
+                    1,
+                    1,
                     addr1,
-                    mtls.client_config.clone(),
                     Some(Duration::from_secs(2)),
                 )),
             ),
             FencedSessionReplica::new(
                 2,
-                Arc::new(RemoteSessionBackend::new(
+                Arc::new(remote_backend(
+                    &mtls,
+                    1,
+                    2,
                     addr2,
-                    mtls.client_config.clone(),
                     Some(Duration::from_secs(2)),
                 )),
             ),
             FencedSessionReplica::new(
                 3,
-                Arc::new(RemoteSessionBackend::new(
+                Arc::new(remote_backend(
+                    &mtls,
+                    1,
+                    3,
                     addr3,
-                    mtls.client_config.clone(),
                     Some(Duration::from_secs(2)),
                 )),
             ),
@@ -1721,10 +1809,11 @@ async fn durable_readiness_adaptively_pages_a_log_larger_than_one_wire_frame() {
 async fn durable_readiness_probe_classifies_untrusted_peer_as_authentication() {
     let server_mtls = mtls_configs();
     let unrelated_client_mtls = mtls_configs();
-    let (addr, _backend, handle) = start_server(&server_mtls).await;
-    let remote = RemoteSessionBackend::new(
-        addr,
-        unrelated_client_mtls.client_config,
+    let (addr, _backend, handle) = start_server(&server_mtls, 2).await;
+    let remote = RemoteSessionBackend::new_with_resolver(
+        server_mtls.remote_binding(1, 2),
+        pinned_resolver(addr),
+        unrelated_client_mtls.client_config(1),
         Some(Duration::from_millis(400)),
     );
 

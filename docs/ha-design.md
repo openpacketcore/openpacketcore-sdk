@@ -91,9 +91,10 @@ Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload 
 The algorithm below describes intended and prototype-tested behavior; it is not
 yet durable distributed proof or a production deployment contract. Configured
 topology admission and fresh durable readiness are implemented. Authenticated
-identity (#125), durable sequencing and safe fork recovery (#127–#129), and
-bounded majority-authoritative restore (#133) remain open; wire-width and shared
-model-decoding hardening remain #134/#135, while oversized-TTL and
+identity binding is implemented in protocol v3; durable sequencing and safe
+fork recovery (#127–#129), and bounded majority-authoritative restore (#133)
+remain open. Wire-width and shared model-decoding hardening remain #134/#135,
+while oversized-TTL and
 zero-replication-sequence panic elimination remain #137/#138.
 
 `QuorumSessionStore` coordinates session leases and CAS mutations across a set of `SessionStoreBackend` replicas using quorum-backed ordered replication. It is not a Raft implementation; its target safety contract is a durable committed log prefix where an entry is authoritative only after the same sequence entry is present on a majority of replicas.
@@ -113,9 +114,13 @@ no hostname shortening or endpoint-as-identity inference occurs. The explicit
 lab singleton reports `single-replica`. The deprecated raw-vector constructor
 reports `unknown`, masks capabilities, and refuses operations.
 
-These checks prove configuration distinctness only. They do not prove fresh
-peer reachability, bind the declared identity to the mTLS peer (#125), or
-establish durable commit/repair/restore authority (#127/#128/#133).
+For authenticated network adapters, admission also verifies
+`BackendPeerBinding`: the configured local and remote IDs, exact remote TLS
+identity, both descriptor fingerprints, member count, and one shared opaque
+configuration scope must match the admitted topology. An in-process local
+backend may remain unbound. This is composition evidence, not fresh peer
+reachability or physical-store provenance, and it does not establish durable
+commit/repair/restore authority (#127/#128/#133).
 
 ### Fresh durable readiness
 
@@ -147,17 +152,32 @@ nor destructively rebuilds the replica. The observed index is deliberately
 called majority-visible rather than committed until #127/#128 establish durable
 commit and repair authority.
 
-### Network restore transport (protocol v2)
+### Authenticated network transport (protocol v3)
 
-`opc-session-net` protocol v2 carries validated restore-scan requests and pages
+`opc-session-net` protocol v3 carries validated restore-scan requests and pages
 to individual remote replicas. A server may shorten a multi-record page to the
 smaller client/server frame budget; callers resume from `next_cursor`, while a
-single record that cannot fit returns `RestoreScanResponseTooLarge`. The Hello
-handshake requires an exact version match, so v1/v2 peers require a coordinated
-upgrade and cannot form a mixed rolling deployment.
+single record that cannot fit returns `RestoreScanResponseTooLarge`.
+
+Every production participant is created with an opaque authenticated TLS
+config and a binding derived from one immutable `SessionReplicationManifest`.
+The manifest's configuration ID is an order-independent SHA-256 digest of the
+cluster ID, operator-controlled generation, and every field of every replica
+descriptor. During the v3 handshake, each side extracts the canonical SPIFFE
+URI from the live certificate and requires it to match the claimed stable
+`ReplicaId`, expected opposite member, cluster, and configuration ID before
+dispatch. The client verifies its fresh challenge is echoed by the server.
+DNS/FQDN/IP aliases and resolver overrides affect
+routing only; they never redefine replica identity.
+
+The exact v3 ALPN and handshake have no production fallback to v2. A v2-to-v3
+change is a coordinated stop/upgrade/start of all clients and servers, not a
+mixed-version rolling deployment.
 
 This closes per-replica transport parity only. Quorum selection/merge remains
 #133, while durable sequencing and repair authority remain #127/#128.
+Authenticated membership does not make protocol v3 a consensus algorithm and
+does not reconcile a divergent or forked log.
 
 ### Log & Replication Model
 - **Persisted Replica Logs**: The current coordinator assigns sequence numbers to replicated mutations (AcquireLease, RenewLease, ReleaseLease, CompareAndSet, DeleteFenced, RefreshTtl, Batch), and each accepting replica writes them to `session_replication_log`. Leader/term-gated global sequence authority remains #127.

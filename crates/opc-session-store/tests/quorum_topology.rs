@@ -2,12 +2,15 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use opc_session_store::{
-    FakeSessionBackend, FencedSessionReplica, LeaseError, OwnerId, QuorumReplicaDescriptor,
+    BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding, BackendPeerBindingField,
+    BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, FakeSessionBackend,
+    FencedSessionReplica, LeaseError, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
     QuorumReplicaMember, QuorumSessionStore, QuorumTopologyConfig, QuorumTopologyError,
     QuorumTopologyMode, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
     ReplicaTlsIdentity, ReplicaTopologyField, ReplicaTopologyFieldError, SessionBackend,
-    SessionKey, SessionKeyType, SessionLeaseManager, SessionStore, SessionStoreBackend,
-    SessionStorePlatformProfile, StoreError, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
+    SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionStore,
+    SessionStoreBackend, SessionStorePlatformProfile, StoreError, StoredSessionRecord,
+    ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use proptest::prelude::*;
@@ -58,6 +61,117 @@ fn validate_ha(
     ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new(local_replica_id, members))
 }
 
+#[derive(Clone)]
+struct PeerBoundBackend {
+    inner: FakeSessionBackend,
+    binding: BackendPeerBinding,
+}
+
+impl PeerBoundBackend {
+    fn new(binding: BackendPeerBinding) -> Self {
+        Self {
+            inner: FakeSessionBackend::new(),
+            binding,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for PeerBoundBackend {
+    fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
+        self.inner.backend_instance_identity()
+    }
+
+    fn peer_binding(&self) -> Option<BackendPeerBinding> {
+        Some(self.binding.clone())
+    }
+
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities().await
+    }
+
+    async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.inner.get(key).await
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.inner.compare_and_set(op).await
+    }
+
+    async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
+        self.inner.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        self.inner.batch(ops).await
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionLeaseManager for PeerBoundBackend {
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<LeaseGuard, LeaseError> {
+        self.inner.acquire(key, owner, ttl).await
+    }
+
+    async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
+        self.inner.renew(lease, ttl).await
+    }
+
+    async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
+        self.inner.release(lease).await
+    }
+}
+
+fn test_descriptors() -> Vec<QuorumReplicaDescriptor> {
+    (0..3)
+        .map(|index| descriptor(replica_id(index), index, index, index, index))
+        .collect()
+}
+
+fn valid_peer_binding(
+    descriptors: &[QuorumReplicaDescriptor],
+    remote_index: usize,
+    scope: BackendPeerScopeIdentity,
+) -> BackendPeerBinding {
+    BackendPeerBinding::new(
+        descriptors[0].replica_id().clone(),
+        descriptors[remote_index].replica_id().clone(),
+        descriptors[remote_index].tls_identity().clone(),
+        descriptors[0].configuration_fingerprint(),
+        descriptors[remote_index].configuration_fingerprint(),
+        3,
+        scope,
+    )
+}
+
+fn members_with_peer_bindings(
+    descriptors: &[QuorumReplicaDescriptor],
+    bindings: Vec<Option<BackendPeerBinding>>,
+) -> Vec<QuorumReplicaMember> {
+    descriptors
+        .iter()
+        .cloned()
+        .zip(bindings)
+        .enumerate()
+        .map(|(index, (descriptor, binding))| {
+            let backend: Arc<dyn SessionStoreBackend> = match binding {
+                Some(binding) => Arc::new(PeerBoundBackend::new(binding)),
+                None => Arc::new(FakeSessionBackend::new()),
+            };
+            QuorumReplicaMember::new(descriptor, FencedSessionReplica::new(index, backend))
+        })
+        .collect()
+}
+
 #[test]
 fn validated_ha_accepts_exactly_odd_memberships_of_at_least_three() {
     for count in 0..=(QUORUM_TOPOLOGY_MAX_MEMBERS + 2) {
@@ -86,6 +200,212 @@ fn validated_ha_accepts_exactly_odd_memberships_of_at_least_three() {
                 Some(QuorumTopologyError::HaMemberCountMustBeOdd { configured: count })
             );
         }
+    }
+}
+
+#[test]
+fn descriptor_configuration_fingerprint_is_fixed_deterministic_and_covers_every_field() {
+    let base = descriptor(replica_id(0), 0, 0, 0, 0);
+    let canonical_equivalent = QuorumReplicaDescriptor::new(
+        replica_id(0),
+        ReplicaEndpoint::new("REPLICA-0.TEST.INVALID.", 7443).expect("canonical endpoint"),
+        ReplicaTlsIdentity::new("spiffe://test/session/replica/0").expect("TLS identity"),
+        ReplicaFailureDomain::new("test-failure-domain-0").expect("failure domain"),
+        ReplicaBackingIdentity::new("test-backing-0").expect("backing identity"),
+    );
+    let variants = [
+        descriptor(replica_id(9), 0, 0, 0, 0),
+        descriptor(replica_id(0), 9, 0, 0, 0),
+        QuorumReplicaDescriptor::new(
+            replica_id(0),
+            ReplicaEndpoint::new("replica-0.test.invalid", 7444).expect("different port"),
+            ReplicaTlsIdentity::new("spiffe://test/session/replica/0").expect("TLS identity"),
+            ReplicaFailureDomain::new("test-failure-domain-0").expect("failure domain"),
+            ReplicaBackingIdentity::new("test-backing-0").expect("backing identity"),
+        ),
+        descriptor(replica_id(0), 0, 9, 0, 0),
+        descriptor(replica_id(0), 0, 0, 9, 0),
+        descriptor(replica_id(0), 0, 0, 0, 9),
+    ];
+
+    let fingerprint: [u8; 32] = base.configuration_fingerprint();
+    assert_eq!(fingerprint, base.configuration_fingerprint());
+    assert_eq!(
+        fingerprint,
+        canonical_equivalent.configuration_fingerprint()
+    );
+    for variant in variants {
+        assert_ne!(
+            fingerprint,
+            variant.configuration_fingerprint(),
+            "every descriptor field must affect the fingerprint"
+        );
+    }
+}
+
+#[test]
+fn authenticated_peer_bindings_admit_with_an_unbound_in_process_local_member() {
+    let descriptors = test_descriptors();
+    let scope = BackendPeerScopeIdentity::new([7; 32]);
+    let bindings = vec![
+        None,
+        Some(valid_peer_binding(&descriptors, 1, scope)),
+        Some(valid_peer_binding(&descriptors, 2, scope)),
+    ];
+
+    let topology = validate_ha(
+        descriptors[0].replica_id().clone(),
+        members_with_peer_bindings(&descriptors, bindings),
+    )
+    .expect("matching peer bindings must pass topology admission");
+    assert_eq!(topology.summary().configured_members(), 3);
+}
+
+#[test]
+fn one_peer_binding_requires_composition_evidence_for_every_remote_member() {
+    let descriptors = test_descriptors();
+    let scope = BackendPeerScopeIdentity::new([7; 32]);
+    let bindings = vec![None, Some(valid_peer_binding(&descriptors, 1, scope)), None];
+
+    assert_eq!(
+        validate_ha(
+            descriptors[0].replica_id().clone(),
+            members_with_peer_bindings(&descriptors, bindings),
+        )
+        .err(),
+        Some(QuorumTopologyError::MissingBackendPeerBinding)
+    );
+}
+
+#[test]
+fn peer_binding_mismatch_categories_are_typed_and_redacted() {
+    let descriptors = test_descriptors();
+    let scope = BackendPeerScopeIdentity::new([7; 32]);
+    let alternate_scope = BackendPeerScopeIdentity::new([8; 32]);
+    let local_fingerprint = descriptors[0].configuration_fingerprint();
+    let remote_fingerprint = descriptors[1].configuration_fingerprint();
+    let valid_second = valid_peer_binding(&descriptors, 2, scope);
+    let build = |local_id: ReplicaId,
+                 remote_id: ReplicaId,
+                 tls_identity: ReplicaTlsIdentity,
+                 local_descriptor_fingerprint: [u8; 32],
+                 remote_descriptor_fingerprint: [u8; 32],
+                 configured_member_count: u16,
+                 binding_scope: BackendPeerScopeIdentity| {
+        BackendPeerBinding::new(
+            local_id,
+            remote_id,
+            tls_identity,
+            local_descriptor_fingerprint,
+            remote_descriptor_fingerprint,
+            configured_member_count,
+            binding_scope,
+        )
+    };
+    let cases = vec![
+        (
+            build(
+                replica_id(9),
+                descriptors[1].replica_id().clone(),
+                descriptors[1].tls_identity().clone(),
+                local_fingerprint,
+                remote_fingerprint,
+                3,
+                scope,
+            ),
+            BackendPeerBindingField::LocalReplicaId,
+        ),
+        (
+            build(
+                descriptors[0].replica_id().clone(),
+                replica_id(9),
+                descriptors[1].tls_identity().clone(),
+                local_fingerprint,
+                remote_fingerprint,
+                3,
+                scope,
+            ),
+            BackendPeerBindingField::RemoteReplicaId,
+        ),
+        (
+            build(
+                descriptors[0].replica_id().clone(),
+                descriptors[1].replica_id().clone(),
+                ReplicaTlsIdentity::new("spiffe://private/wrong-peer").expect("wrong TLS ID"),
+                local_fingerprint,
+                remote_fingerprint,
+                3,
+                scope,
+            ),
+            BackendPeerBindingField::RemoteTlsIdentity,
+        ),
+        (
+            build(
+                descriptors[0].replica_id().clone(),
+                descriptors[1].replica_id().clone(),
+                descriptors[1].tls_identity().clone(),
+                [1; 32],
+                remote_fingerprint,
+                3,
+                scope,
+            ),
+            BackendPeerBindingField::LocalDescriptorFingerprint,
+        ),
+        (
+            build(
+                descriptors[0].replica_id().clone(),
+                descriptors[1].replica_id().clone(),
+                descriptors[1].tls_identity().clone(),
+                local_fingerprint,
+                [2; 32],
+                3,
+                scope,
+            ),
+            BackendPeerBindingField::RemoteDescriptorFingerprint,
+        ),
+        (
+            build(
+                descriptors[0].replica_id().clone(),
+                descriptors[1].replica_id().clone(),
+                descriptors[1].tls_identity().clone(),
+                local_fingerprint,
+                remote_fingerprint,
+                5,
+                scope,
+            ),
+            BackendPeerBindingField::ConfiguredMemberCount,
+        ),
+        (
+            build(
+                descriptors[0].replica_id().clone(),
+                descriptors[1].replica_id().clone(),
+                descriptors[1].tls_identity().clone(),
+                local_fingerprint,
+                remote_fingerprint,
+                3,
+                alternate_scope,
+            ),
+            BackendPeerBindingField::Scope,
+        ),
+    ];
+
+    for (first_binding, field) in cases {
+        let debug = format!("{first_binding:?}");
+        assert!(!debug.contains("private"));
+        let error = validate_ha(
+            descriptors[0].replica_id().clone(),
+            members_with_peer_bindings(
+                &descriptors,
+                vec![None, Some(first_binding), Some(valid_second.clone())],
+            ),
+        )
+        .err()
+        .expect("mismatched peer binding must fail topology admission");
+        assert_eq!(
+            error,
+            QuorumTopologyError::BackendPeerBindingMismatch { field }
+        );
+        assert!(!error.to_string().contains("spiffe://"));
     }
 }
 

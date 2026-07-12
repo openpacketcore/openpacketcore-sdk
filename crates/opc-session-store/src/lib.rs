@@ -42,9 +42,9 @@ pub mod store;
 pub mod topology;
 
 pub use backend::{
-    BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
-    RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp, SessionBackend, SessionOp,
-    SessionOpResult,
+    BackendInstanceIdentity, BackendPeerBinding, BackendPeerScopeIdentity, CompareAndSet,
+    CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend, ReplicationEntry,
+    ReplicationOp, SessionBackend, SessionOp, SessionOpResult,
 };
 pub use capability::{
     assert_backend_suitable_for_profile, assert_suitable_for,
@@ -85,9 +85,9 @@ pub use restore::{
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;
 pub use topology::{
-    QuorumReplicaDescriptor, QuorumReplicaMember, QuorumTopologyConfig, QuorumTopologyError,
-    QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField,
+    BackendPeerBindingField, QuorumReplicaDescriptor, QuorumReplicaMember, QuorumTopologyConfig,
+    QuorumTopologyError, QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField,
     ReplicaTopologyFieldError, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
     REPLICA_IDENTITY_MAX_BYTES, REPLICA_ID_MAX_BYTES,
 };

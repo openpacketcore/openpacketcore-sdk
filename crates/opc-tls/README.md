@@ -21,6 +21,15 @@ and instance metadata.
   current SVID certificate/key.
 - `SpiffeServerCertVerifier` and `SpiffeClientCertVerifier` validate peer SVIDs
   against trust bundles and policy.
+- `build_authenticated_client_config` and
+  `build_authenticated_server_config` return opaque, redaction-safe wrappers
+  proving that the config was built with this crate's SPIFFE verifier and
+  reloadable SVID resolver. Security-sensitive consumers such as
+  `opc-session-net` require these wrappers instead of raw Rustls configs.
+- `peer_spiffe_id_from_client_connection` and
+  `peer_spiffe_id_from_server_connection` extract the one canonical SPIFFE URI
+  from an established TLS connection. Missing, malformed, or ambiguous URI
+  SANs fail closed.
 - `ServerConfig` and `ClientConfig` are re-exported Rustls config aliases.
 
 ```rust,no_run
@@ -55,6 +64,9 @@ async fn build_configs(
 - Builds fail closed when the peer policy is unconstrained and
   `allow_any_trusted_peer` was not called.
 - Default client ALPN includes `h2` and `http/1.1`.
+- Protocol adapters may clone an authenticated wrapper and replace ALPN with
+  their exact application protocol; the wrapper does not authorize application
+  membership by itself.
 - Certificate/key rotation is driven by identity state updates; this crate does
   not fetch SVIDs itself.
 
