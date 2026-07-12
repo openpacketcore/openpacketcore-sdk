@@ -75,6 +75,37 @@ jobs:
       - name: Run consensus e2e tests (serial)
         run: cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
 
+  session-net-i686:
+    name: opc-session-net i686
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER: gcc
+      RUSTFLAGS: "-C link-arg=-m32"
+      TARGET_CC: gcc
+      TARGET_CFLAGS: "-m32"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install 32-bit system toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gcc-multilib
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-session-net-i686
+
+      - name: Run opc-session-net tests on i686
+        run: cargo test --locked -p opc-session-net --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
+
   feature-powerset:
     name: opc-sdk feature powerset
     runs-on: ubuntu-latest

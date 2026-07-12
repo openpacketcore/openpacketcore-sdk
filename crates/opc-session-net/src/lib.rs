@@ -3,9 +3,11 @@
 //! Provides a length-prefixed JSON wire protocol between a
 //! [`SessionReplicationServer`] and [`RemoteSessionBackend`]. Production
 //! endpoints derive their local/remote authority from one immutable
-//! [`SessionReplicationManifest`]; protocol v3 then binds the claimed stable
+//! [`SessionReplicationManifest`]; protocol v4 then binds the claimed stable
 //! replica IDs and manifest scope to the canonical SPIFFE identities extracted
-//! from the live mutual-TLS connection before any backend operation.
+//! from the live mutual-TLS connection before any backend operation. Peers must
+//! also prove the exact same [`ContractProfile`] before operation DTOs are
+//! decoded or backend work is dispatched.
 
 #![forbid(unsafe_code)]
 
@@ -21,5 +23,9 @@ pub use identity::{
     LocalReplicaBinding, RemoteReplicaBinding, SessionClusterId, SessionConfigurationGeneration,
     SessionConfigurationId, SessionManifestError, SessionReplicationManifest,
 };
-pub use protocol::{HelloRejectReason, Request, Response};
+pub use protocol::{
+    ContractProfile, HelloRejectReason, Request, Response, CURRENT_CONTRACT_PROFILE,
+    MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
+    MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
+};
 pub use server::SessionReplicationServer;

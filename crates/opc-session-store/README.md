@@ -73,8 +73,21 @@ evidence.
 - Restore APIs include `RestoreScanRequest`, `RestoreScanPage`,
   `RestoreBlockReason`, summaries, page-size constants, and
   `summarize_restore_records`.
-- `opc-session-net` protocol v3 lets an individual authenticated remote backend
+- `opc-session-net` protocol v4 lets an individual authenticated remote backend
   execute the same validated cursor-paged restore scan as a local backend.
+- The v4 adapter uses private fixed-width DTOs: `u32` request limits and
+  restore-response budget; `u64` restore cursors/counts, `max_value_bytes`, and
+  size-bearing store errors; checked conversion at both domain boundaries; and
+  independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
+  Its profile also pins wire-schema/error-set revisions 1 and the 128-byte
+  owner, custom-key, and state-type bounds.
+  Version/profile/authentication or malformed-handshake failure reports every
+  capability boolean false with `max_value_bytes = 0`; cached capabilities are
+  descriptive and never substitute for fresh quorum evidence.
+- The exact `opc-session-net/4` ALPN, version, and contract profile have no v3
+  fallback or downgrade negotiation. Public session-net `Request`/`Response`
+  remain, but `Hello`/`HelloAck` gain an optional `contract_profile`, so
+  exhaustive construction and matching must account for the new field.
 - `SessionStore<B>` wraps a backend in a typed store handle.
 
 ```rust,no_run
@@ -197,7 +210,7 @@ and payload semantics. Oversized/newly invalid phases or classifications that
 cannot be proven need an equally reviewed semantic migration or store
 replacement.
 
-Accepted protocol-v3 identities keep the same JSON string shape, but the Rust
+Accepted protocol-v4 identities keep the same JSON string shape, but the Rust
 API is source-breaking (`Other(String)` becomes
 `Other(CustomSessionKeyType)`, and `other` is fallible) and wire admission is
 semantically stricter. Handover decoding is also source-breaking:
@@ -205,12 +218,12 @@ semantically stricter. Handover decoding is also source-breaking:
 `HandoverEnvelopeDecodeError`, and `HandoverError` gains `InvalidEnvelope`.
 `pack_raw`/`pack_json` now write the versioned `OPCH` envelope; a compatible
 original or bare record rewrites to the versioned form on its next transition.
-An older v3 participant can emit an empty or oversized value that a new
-participant rejects. Do not use a mixed rolling deployment:
+An older v3 participant can emit an empty or oversized value that v4 rejects
+during exact contract negotiation. Do not use a mixed rolling deployment:
 stop writers and traffic, run both preflights, upgrade every session-net
 client/server/protection wrapper and every NF or product handover reader/writer,
-then restart and restore traffic. Prefer one coordinated rollout with #134 so
-the fixed-width DTO and handshake explicitly negotiate the identity contract.
+then restart and restore traffic. Protocol v4's fixed-width DTO and handshake
+now make the identity contract explicit.
 
 The persisted handover migration is one-way once any `OPCH` record or replayable
 copy is written: an older SDK reader treats the new envelope as opaque bare
@@ -218,8 +231,8 @@ copy is written: an older SDK reader treats the new envelope as opaque bare
 keeping the fleet drained and either restoring one coherent fleet-wide
 pre-upgrade checkpoint (explicitly accepting or reconciling all post-checkpoint
 mutations) or running a reviewed reverse migration over every live and
-replayable copy, including nested logs, snapshots, and restore sources. #134
-negotiation does not make an opaque `OPCH` payload readable by an older binary.
+replayable copy, including nested logs, snapshots, and restore sources. The v4
+handshake does not make an opaque `OPCH` payload readable by an older binary.
 
 ### Validated HA construction
 
@@ -358,11 +371,9 @@ so direct callers and peers that did not validate at their first boundary still
 fail closed.
 
 This is a compatibility boundary. The two public error enums gain new variants,
-and those variants can appear in protocol-v3 error responses. External
-exhaustive matches must add arms, and a session-net fleet must be upgraded as
-one coordinated same-v3 compatibility unit before relying on the typed wire
-error. For the TTL change alone, requests within the operation-tree contract
-retain their v3 shape. Before upgrading a store created by an older SDK, audit
+so external exhaustive matches must add arms. Protocol v4 maps them through
+private fixed-width error DTOs under pinned error revision 1; a v3 peer is not
+admitted. Before upgrading a store created by an older SDK, audit
 its persisted replication log for TTL-bearing
 operations above 365 days. Such legacy entries now fail closed during replay or
 rebuild; the SDK does not silently clamp or rewrite them. Replicated
@@ -397,10 +408,11 @@ complete returned page or watch item finishes before read-side transformation
 or caller exposure; the backend has necessarily already produced that read.
 Post-decode traversal and tree reassembly are iterative, and rejected owned
 trees are dismantled iteratively, so accepted transformation and consuming
-rejection do not recurse through the operation tree. Pre-allocation wire
-decoding still depends on the current frame/serde recursion guards; #134 must
-move the same limits into versioned DTO decoding before this becomes a complete
-wire-decoder work bound.
+rejection do not recurse through the operation tree. Protocol v4 carries the
+same depth-16/256-node rules in the exact contract profile and bounds its private
+DTO collections before domain construction. Batch requests admit at most 256
+operations; replication-log pages and rebuild prefixes admit at most 65,536
+entries. The configured frame limit remains a separate encoded-byte bound.
 `EncryptingSessionBackend` and `RemoteSealingSessionBackend` then transform
 every nested `CompareAndSet` record: replicate/rebuild paths encrypt or seal
 before backend delegation, while replication-log and watch paths decrypt or
@@ -415,15 +427,15 @@ successfully transformed. Failure returns an error instead of a partially
 decrypted/unsealed entry or page, although earlier provider calls—and earlier,
 separate watch items already yielded by the stream—may have occurred.
 
-This changes the confidentiality contract without changing the protocol-v3
-number. `StoreError` gains a serialized public variant, so exhaustive matches
-must add an arm and an older v3 peer cannot decode the new error. More
-importantly, an older wrapper does not protect deeply nested CAS records; a
-mixed old/new v3 fleet is therefore not confidentiality-safe. Upgrade every
-session-net client, server, and protection-wrapper participant as one
-coordinated fleet. Do not claim rolling compatibility. #134 must carry these
-limits and the error encoding into the versioned fixed-width DTO and handshake
-contract.
+This changed the confidentiality contract before the v4 boundary. `StoreError`
+gains a public variant, so exhaustive matches must add an arm, and an older v3
+peer cannot decode it. More importantly, an older wrapper does not protect
+deeply nested CAS records. Protocol v4 rejects the older wire participant and
+pins the two tree limits and error revision, but a session-net handshake cannot
+prove that the product actually installed an encryption/sealing wrapper.
+Upgrade every client, server, and protection-wrapper participant as one
+coordinated fleet, verify the composition, and do not claim rolling
+compatibility.
 
 The SDK does not discover or scrub historical nested plaintext automatically.
 Before upgrading, perform an offline audit of both operation-tree shape and
@@ -503,21 +515,23 @@ do not provide rotation evidence.
   networked HA.
 - Nested replicated CAS payloads are protected under the bounded iterative
   contract above. This is confidentiality and input-boundary hardening, not
-  consensus, durable authority, wire stabilization, or production HA.
+  consensus, durable authority, or production HA. Protocol v4 wire
+  stabilization does not attest wrapper composition.
 - The #135 identity/model boundary and offline SQLite audit are implemented,
   but do not establish durable sequencing, fork recovery, restore authority,
-  wire stabilization, seamless rotation, or production HA.
+  seamless rotation, or production HA. Fixed-width v4 wire admission is
+  implemented under #134.
 
 ## Roadmap
 
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
 - Complete durable sequencing and safe fork repair/recovery (#127–#129),
-  bounded majority-authoritative restore (#133), fixed-width wire stabilization
-  (#134), watch handoff correctness (#145), and absolute-expiry admission
-  (#148), then complete the production qualification profile and distributed
+  bounded majority-authoritative restore (#133), watch handoff correctness
+  (#145), and absolute-expiry admission (#148), then complete the production
+  qualification profile and distributed
   evidence—including seamless certificate, payload-protection-key, and
-  trust-bundle rotation—in #143.
+  trust-bundle rotation—under #158, with production evidence in #143.
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 

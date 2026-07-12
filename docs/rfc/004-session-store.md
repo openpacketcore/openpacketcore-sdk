@@ -150,7 +150,7 @@ and response decode. Invalid persisted or remote data MUST fail closed before
 mutation or caller exposure. Diagnostics MUST be fieldless or fixed and MUST
 NOT expose the owner, key type, stable ID, row, transaction, or raw entry.
 
-Valid protocol-v3 values retain their JSON string shape. This does not make the
+Valid protocol-v4 values retain their JSON string shape. This does not make the
 change rolling-compatible: replacing `Other(String)` with
 `Other(CustomSessionKeyType)` and making `SessionKeyType::other` fallible is a
 Rust source break. Both `HandoverEnvelope::unpack_raw` and
@@ -158,12 +158,12 @@ Rust source break. Both `HandoverEnvelope::unpack_raw` and
 `unpack_json` methods change their error type, and `HandoverError` adds an
 `InvalidEnvelope` variant. Packers now write the versioned `OPCH` form while
 readers retain a bounded original/bare migration path. Rejecting values an
-older v3 peer could emit is also a semantic-admission break. Until #134
-provides a versioned fixed-width DTO and
-handshake contract, operators MUST stop, upgrade, and restart every session-net
+older v3 peer could emit is also a semantic-admission break. Protocol v4 now
+binds that rule in its exact fixed-width DTO and handshake profile. Operators
+MUST stop, upgrade, and restart every session-net
 client, server, and protection wrapper plus every NF/product handover reader or
-writer as one coordinated unit. The #134 and #135 changes SHOULD be deployed
-together, but #134 does not make persisted `OPCH` bytes readable by old code.
+writer as one coordinated unit. The v4 handshake does not make persisted
+`OPCH` bytes readable by old code.
 
 ### 5.2 Bounded Legacy SQLite Audit
 
@@ -222,9 +222,10 @@ A rejected or unprovable value MUST be resolved by a reviewed product migration
 or store replacement before startup; automatic guessing/truncation is forbidden.
 
 This bounded identity admission closes #135's scoped model/persistence
-boundary. It does not prove durable commit authority (#127), fixed-width wire
-admission (#134), or production qualification and seamless certificate,
-payload-protection-key, and trust-bundle rotation (#143).
+boundary. Protocol-v4 fixed-width wire admission is implemented under #134,
+but neither change proves durable commit authority (#127) or production
+qualification and seamless certificate,
+payload-protection-key, and trust-bundle rotation (#158/#143).
 
 ## 6. Backend Capability Model
 
@@ -313,11 +314,10 @@ typed error on that authenticated connection. Repeating the check at each
 public or trust boundary is intentional: direct callers and older peers must
 fail closed even if an outer layer omitted validation.
 
-The new errors are public enum and serialized protocol-v3 variants. External
-exhaustive matches MUST be updated, and a session-net deployment MUST treat the
-change as a coordinated same-v3 fleet upgrade because an older v3 decoder
-cannot interpret a newly returned variant. The TTL request/response shape is
-unchanged for entries admitted by the operation-tree contract in §11.2.1.
+The new errors are public enum variants, so external exhaustive matches MUST be
+updated. Protocol v4 encodes them through private fixed-width DTOs under pinned
+error revision 1. An older v3 decoder is rejected during the exact handshake;
+deployments MUST use the coordinated v4 rollout in §12.3.
 
 ## 8. Record Format
 
@@ -596,15 +596,14 @@ call fails, the wrapper MUST return an error without exposing a partially
 transformed entry or page; earlier provider calls, and earlier independent
 watch items already yielded, MAY have occurred.
 
-This contract changes confidentiality semantics without changing the current
-protocol-v3 number. A v3 peer built before this rule cannot decode the new error
-and its wrapper may forward a deeply nested CAS in plaintext/unsealed form.
-Mixed old/new v3 fleets are therefore not confidentiality-safe and MUST NOT be
-deployed as a rolling upgrade. Operators MUST drain and upgrade every client,
-server, and protection-wrapper participant as one coordinated fleet. #134 MUST
-pin both limits and the error encoding in a versioned fixed-width wire DTO and
-handshake/compatibility contract; this section does not claim that work is
-complete.
+This contract changed confidentiality semantics before the v4 boundary. A v3
+peer built before this rule cannot decode the new error and its wrapper may
+forward a deeply nested CAS in plaintext/unsealed form. Protocol v4 rejects the
+older wire participant and pins both tree limits and error revision, but the
+handshake cannot attest that the product actually installed a protection
+wrapper. Operators MUST drain and upgrade every client, server, and
+protection-wrapper participant as one coordinated fleet and MUST verify wrapper
+composition before restoring traffic.
 
 Persisted historical nested plaintext/unsealed payloads are not detected or
 scrubbed automatically. Before upgrade, an operator MUST audit operation-tree
@@ -662,6 +661,58 @@ Decoders MUST:
 - Avoid borrowing data beyond the lifetime of the source buffer.
 - Avoid panics on corrupt data.
 - Support partial decode for lookup keys where useful.
+
+### 12.3 Session-Net Protocol v4
+
+`opc-session-net` MUST use the exact `opc-session-net/4` ALPN, contract version,
+and contract profile. It MUST NOT negotiate down to v3 or select a
+highest-common version. A mismatch MUST fail before backend dispatch, close the
+connection, and be non-retryable for that request.
+
+The public semantic `Request` and `Response` types remain available, but their
+Serde boundary MUST delegate to private fixed-width v4 DTOs. `Hello` and
+`HelloAck` add an optional `contract_profile`; exhaustive Rust construction and
+matching MUST account for the new field. The profile pins wire-schema and
+error-set revisions 1; owner, custom-key, and state-type bounds of 128 UTF-8
+bytes; the
+31,536,000-second session TTL maximum, restore-page maximum 1,024, and the
+depth-16/256-node replication-tree rules.
+
+The fixed-width mapping is:
+
+- restore/log request limits and the client restore-response budget: `u32`;
+- restore request/response cursors and restore excluded count: `u64`;
+- backend `max_value_bytes`: `u64`; and
+- `PayloadTooLarge.actual/max`, `RestoreScanPageTooLarge.requested/max`, and
+  `RestoreScanResponseTooLarge.max_bytes`: `u64`, including errors nested in
+  batch results.
+
+The restore wire page MUST omit `loaded_count` and `complete`; the receiver MUST
+derive them from the record vector and `next_cursor`. Conversion to or from a
+domain `usize` MUST be checked, and a non-representable value MUST fail before
+backend dispatch or caller exposure. Collection work MUST be bounded
+independently from encoded frame size: at most 256 batch operations, 1,024
+restore records, 65,536 replication-log entries, and 65,536 rebuild entries.
+The configured frame limit remains a separate encoded-byte bound.
+Protocol v4 width/collection stabilization does not yet enforce that budget or
+a write deadline on every ordinary server response/watch item; #159 owns that
+outbound resource and slow-reader contract.
+
+A fresh version/profile/authentication or malformed-handshake failure MUST clear
+the cached capabilities and report all capability booleans false with
+`max_value_bytes = 0`. A cache retained after transient transport loss is
+descriptive only and MUST NOT authorize a store operation, durable readiness,
+or traffic admission. Callers MUST use fresh bounded quorum evidence.
+
+The v3-to-v4 transition is a coordinated stop/upgrade/start, not a rolling
+deployment. Operators MUST drain traffic and writers; run the #135 identity
+audit and complete product-aware handover/nested-payload preflights; stop every
+session-net client, server, and protection wrapper plus every handover
+reader/writer; upgrade them together; verify exact-v4 authenticated restore/log
+traffic and fresh quorum evidence; and only then restore traffic. Once an
+`OPCH` value has been written, v3 rollback additionally requires a coherent
+drained checkpoint restore or reviewed reverse migration of every live and
+replayable record, log, snapshot, and restore source.
 
 ## 13. Local Cache
 
@@ -786,6 +837,12 @@ fencing.
   across direct, batch, replicated, persisted, and authenticated-wire paths;
   rejected values must have no partial effect.
 - Serialization corrupt input rejection.
+- Protocol-v4 golden frames with no target-width integer fields; checked
+  fixed-width maximum/overflow conversion; exact collection limits; omitted
+  restore fields recomputed; and size errors nested in batch results.
+- Exact-v4 handshake success plus v3 ALPN/version, profile, authentication,
+  malformed acknowledgement, and replay rejection before backend dispatch;
+  incompatible peers clear cached capabilities to all false/zero.
 - Exact 1-byte and 128-byte owner/custom-key acceptance, empty and 129-byte
   rejection, canonical reserved-name handling, string ordering, and hostile
   Serde/session-net decode rejection without raw-value disclosure.
@@ -812,6 +869,8 @@ fencing.
 - Backend restart with leases recovered or invalidated according to profile.
 - Geo-replication applies newer generation and rejects older generation.
 - Cache invalidation after remote update.
+- Coordinated v4 multi-replica admission and fresh-readiness behavior, including
+  fail-closed mixed-v3/v4 peers and non-authoritative cached capabilities.
 
 ### 17.3 Fault Injection
 

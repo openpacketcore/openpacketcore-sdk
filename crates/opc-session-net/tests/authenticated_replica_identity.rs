@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::protocol::{
-    read_frame, write_frame, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, SESSION_NET_ALPN,
+    read_frame, write_frame, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
+    SESSION_NET_ALPN,
 };
 use opc_session_net::{
     RemoteAddrResolver, RemoteReplicaBinding, RemoteSessionBackend, Request, Response,
@@ -173,6 +174,7 @@ fn successful_hello_ack(hello: &Request) -> Response {
     };
     Response::HelloAck {
         contract_version: CONTRACT_VERSION,
+        contract_profile: Some(CURRENT_CONTRACT_PROFILE),
         server_replica_id: expected_server_replica_id.clone(),
         accepted_client_replica_id: Some(node_id.clone()),
         cluster_id: cluster_id.clone(),
@@ -184,6 +186,7 @@ fn successful_hello_ack(hello: &Request) -> Response {
 fn hello_for(binding: &RemoteReplicaBinding) -> Request {
     Request::Hello {
         contract_version: CONTRACT_VERSION,
+        contract_profile: Some(CURRENT_CONTRACT_PROFILE),
         node_id: binding.local_replica_id().as_str().to_string(),
         expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
         cluster_id: Some(binding.cluster_id().as_str().to_string()),
@@ -350,6 +353,7 @@ async fn downgrade_and_malformed_hello_are_rejected_before_dispatch() {
         &mut legacy,
         &Request::Hello {
             contract_version: CONTRACT_VERSION - 1,
+            contract_profile: None,
             node_id: replica_id(1).as_str().to_string(),
             expected_server_replica_id: None,
             cluster_id: None,
@@ -366,16 +370,55 @@ async fn downgrade_and_malformed_hello_are_rejected_before_dispatch() {
         response,
         Response::HelloAck {
             contract_version: CONTRACT_VERSION,
+            contract_profile: Some(CURRENT_CONTRACT_PROFILE),
             server_replica_id: None,
             ..
         }
     ));
+
+    let binding = manifest
+        .bind_local(replica_id(1))
+        .expect("client binding")
+        .bind_remote(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let mut wrong_profile = CURRENT_CONTRACT_PROFILE;
+    wrong_profile.error_set_revision = wrong_profile.error_set_revision.saturating_add(1);
+    for incompatible_profile in [None, Some(wrong_profile)] {
+        let mut profile_mismatch = raw_tls_connection(addr, pki.client_config(1)).await;
+        let mut hello = hello_for(&binding);
+        let Request::Hello {
+            contract_profile, ..
+        } = &mut hello
+        else {
+            unreachable!("helper always returns Hello");
+        };
+        *contract_profile = incompatible_profile;
+        write_frame(&mut profile_mismatch, &hello)
+            .await
+            .expect("same-version incompatible-profile Hello");
+        let response: Response = read_frame(&mut profile_mismatch, DEFAULT_MAX_FRAME_SIZE)
+            .await
+            .expect("contract-profile rejection response");
+        assert!(matches!(
+            response,
+            Response::HelloAck {
+                contract_version: CONTRACT_VERSION,
+                contract_profile: Some(CURRENT_CONTRACT_PROFILE),
+                server_replica_id: None,
+                accepted_client_replica_id: None,
+                cluster_id: None,
+                configuration_id: None,
+                handshake_nonce: None,
+            }
+        ));
+    }
 
     let mut malformed = raw_tls_connection(addr, pki.client_config(1)).await;
     write_frame(
         &mut malformed,
         &Request::Hello {
             contract_version: CONTRACT_VERSION,
+            contract_profile: Some(CURRENT_CONTRACT_PROFILE),
             node_id: replica_id(1).as_str().to_string(),
             expected_server_replica_id: None,
             cluster_id: None,
@@ -536,7 +579,7 @@ async fn authenticated_handshake_then_stalled_operation_is_bounded() {
             .expect("server binding"),
         resolver(addr),
         pki.client_config(1),
-        Some(Duration::from_millis(100)),
+        Some(Duration::from_secs(2)),
     );
 
     assert_eq!(
@@ -554,7 +597,11 @@ async fn missing_or_wrong_alpn_fails_closed_on_both_sides() {
     let pki = TestPki::new();
     let manifest = manifest("cluster-a", "generation-7");
 
-    for server_alpn in [Vec::new(), vec![b"different-protocol".to_vec()]] {
+    for server_alpn in [
+        Vec::new(),
+        vec![b"different-protocol".to_vec()],
+        vec![b"opc-session-net/3".to_vec()],
+    ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("wrong-ALPN server listener");
@@ -580,13 +627,14 @@ async fn missing_or_wrong_alpn_fails_closed_on_both_sides() {
     }
 
     let (handle, server_addr) = start_server(&pki, &manifest).await;
-    let wrong_alpn_client = try_raw_tls_connection_with_alpn(
-        server_addr,
-        pki.client_config(1),
+    for client_alpn in [
         vec![b"different-protocol".to_vec()],
-    )
-    .await;
-    assert!(wrong_alpn_client.is_err());
+        vec![b"opc-session-net/3".to_vec()],
+    ] {
+        let wrong_alpn_client =
+            try_raw_tls_connection_with_alpn(server_addr, pki.client_config(1), client_alpn).await;
+        assert!(wrong_alpn_client.is_err());
+    }
     handle.abort();
 }
 

@@ -103,6 +103,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- **BREAKING — `opc-session-net`:** the wire contract is now v4. Public
+  `Request` and `Response` remain available, but their Serde implementations
+  delegate to private fixed-width DTOs; `Hello`/`HelloAck` gain an optional
+  `contract_profile`, so exhaustive construction and matching must initialize
+  or accept the new field. Restore cursors and response counters use `u64`;
+  request page/count limits use `u32`; capability and size-bearing store-error
+  values use `u64`; and restore `loaded_count`/`complete` are recomputed instead
+  of trusted from the peer. Independent work limits cap batch operations at
+  256, restore pages at 1,024 records, and replication-log pages and rebuild
+  prefixes at 65,536 entries, while the contract profile pins the existing
+  depth-16/256-node replication tree, 128-byte owner/custom-key/state-type
+  bounds, 31,536,000-second TTL maximum, and wire-schema/error-set revisions 1.
+  The exact `opc-session-net/4` ALPN,
+  version, and profile have no v3 fallback or downgrade negotiation: drain and
+  stop every client, server, and protection-wrapper participant, complete the
+  #135 identity/handover and nested-payload preflights, upgrade them together,
+  verify v4 authenticated restore/log traffic and fresh quorum evidence, then
+  restore traffic. Version/profile/authentication/malformed-handshake failures
+  clear cached capabilities and report every boolean false with
+  `max_value_bytes = 0`; any cache retained after transient transport loss is
+  descriptive only and cannot authorize a store operation or readiness. This
+  does not close #159's ordinary outbound-response frame/write-deadline gap.
 - **BREAKING — `opc-session-store`:** the deprecated raw-vector
   `QuorumSessionStore::new` remains source-compatible but is now deliberately
   non-operational: it advertises `unknown`, masks capabilities, and rejects
@@ -113,13 +135,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backends. External backend adapters used as votes must return
   `Some(BackendInstanceIdentity)`; forwarding wrappers must delegate it, and
   the default `None` fails topology admission.
-- **BREAKING — `opc-session-net`:** the wire contract is now v3 for remote
-  restore scans and authenticated replica identity. Production constructors
+- **BREAKING — `opc-session-net`:** protocol v3 introduced remote restore scans
+  and authenticated replica identity before the v4 boundary above. Production
+  constructors
   accept opaque authenticated TLS configs plus bindings derived from one
   immutable manifest; the manifest hashes the cluster ID, explicit generation,
-  and complete descriptor set. The exact v3 ALPN and handshake have no v2
-  fallback, so all clients and servers require a coordinated upgrade and mixed
-  v2/v3 rolling upgrades are unsupported. Public `Request`/`Response` enums
+  and complete descriptor set. The exact v3 ALPN and handshake had no v2
+  fallback, so that transition required a coordinated upgrade and did not
+  support mixed v2/v3 rolling upgrades. Public `Request`/`Response` enums
   gain handshake and restore-scan variants, while `StoreError` gains
   restore-scan, `InvalidReplicationSequence`, and `InvalidSessionTtl` variants,
   and `LeaseError` gains `InvalidSessionTtl`; external exhaustive matches must
@@ -138,8 +161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Mixed old/new v3 fleets are also not confidentiality-safe because an older
   wrapper may forward a deeply nested CAS without encryption/sealing. Upgrade
   every client, server, and wrapper participant as one coordinated fleet; do
-  not claim rolling compatibility. #134 must pin the limits and error encoding
-  in the versioned fixed-width DTO and handshake contract.
+  not claim rolling compatibility. Protocol v4 now pins these limits and the
+  error revision in its fixed-width DTO and handshake contract.
 - **BREAKING — `opc-session-store`/`opc-session-net`:** `OwnerId` and
   deployment-specific session-key type names now accept exactly 1 through 128
   UTF-8 encoded bytes. `SessionKeyType::Other(String)` is replaced by the
@@ -154,8 +177,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON retains its string shape, but this is a Rust source break and a stricter
   semantic-admission boundary: an older v3 participant may still emit values a
   new participant rejects. Drain and upgrade every session-net client, server,
-  and wrapper as one coordinated stop/upgrade/start; prefer deploying this
-  change together with #134's versioned fixed-width DTO and handshake work.
+  and wrapper as one coordinated stop/upgrade/start. Protocol v4 now makes this
+  identity admission part of the exact contract profile.
   `HandoverEnvelope::unpack_raw` and `HandoverSessionRecord::unpack_raw` now
   return `Result`; both types' public `unpack_json` methods use
   `HandoverEnvelopeDecodeError` instead of `serde_json::Error`; and
@@ -376,7 +399,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured/freshly-reachable/agreeing/required counts, the majority-visible
   prefix, and bounded failure reasons. This closes #124 only; durable authority
   and operator-safe fork recovery (#127–#129), majority-authoritative restore
-  (#133), and wire stabilization (#134) remain production blockers. #135's
+  (#133) remain production blockers. Protocol-v4 wire stabilization is now
+  implemented under #134; #135's
   scoped model/persistence admission is implemented above. Checked TTL and
   replication-sequence rejection are closed under #137/#138; production
   qualification remains #143.
@@ -391,15 +415,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mTLS SQLite regression proves that bare logical self is independent from FQDN
   endpoints. This closes #123 configured-topology admission only. Fresh
   durable readiness was scoped separately to #124 and is described above;
-  #127–#129, #133, and #134 remain production blockers; #135's scoped identity
+  #127–#129 and #133 remain production blockers; #134's fixed-width v4 wire
+  boundary and #135's scoped identity
   admission and #137/#138 input bounds are closed above, and the full
   qualification remains #143.
 - `opc-session-net`: remote backends and replication servers now carry
   validated cursor-paged restore scans, shorten multi-record pages to the
   effective client/server frame limit, and return a typed error when one
   record cannot fit. This implements the transport parity tracked by #126; it
-  does not implement bounded majority-authoritative restore (#133), fixed-width
-  wire stabilization (#134), or session HA qualification (#127–#129). #135's
+  does not implement bounded majority-authoritative restore (#133) or session
+  HA qualification (#127–#129). Fixed-width v4 admission is implemented under
+  #134; #135's
   scoped model/persistence admission is implemented above.
 - `opc-persist`: standalone default-feature test builds no longer depend on
   fault-injection symbols that exist only with `dangerous-test-hooks`; CI now
