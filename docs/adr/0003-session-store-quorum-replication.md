@@ -106,22 +106,38 @@ called majority-visible, not committed, because durable commit authority is not
 yet established.
 
 The current `QuorumSessionStore`/`opc-session-net` profile therefore remains
-experimental, not a production HA profile. Protocol v3 supplies authenticated,
-frame-bounded per-replica transport, but its exact-version handshake and ALPN
-require a coordinated v2-to-v3 stop/upgrade/start; mixed fleets are not
+experimental, not a production HA profile. Protocol v4 supplies authenticated,
+fixed-width, frame-bounded per-replica transport, but its exact
+`opc-session-net/4` ALPN, version, and contract profile require a coordinated
+v3-to-v4 stop/upgrade/start; mixed fleets and downgrade negotiation are not
 supported. This identity binding is not consensus or fork recovery. Durable
 commit authority, commit-proven repair, operator-safe fork recovery, and
 bounded majority-authoritative restore remain open in #127–#129 and #133.
-Fixed-width wire DTOs remain #134. Invariant-safe owner/key model decoding,
-bounded count-only SQLite admission, and typed-invalid handover rejection are
+Fixed-width private wire DTOs and checked domain conversion are implemented
+under #134. Invariant-safe owner/key model decoding, bounded count-only SQLite
+admission, and typed-invalid handover rejection are
 implemented under #135; checked TTL rejection is implemented under #137, and
 malformed sequence zero, checked increment, rebuild-prefix, SQLite
 signed-boundary, cache, and authenticated wire rejection are implemented under
-#138. Production
-qualification, including seamless credential/trust rotation, remains #143.
+#138. Production qualification, including seamless credential/trust rotation,
+remains #143.
 Watch handoff correctness (#145) and absolute-record-expiry admission (#148)
 also remain open. Bounded nested-CAS protection is implemented under #147;
 it does not change the profile's experimental status.
+
+The v4 wire uses `u32` for restore/log request limits and the client restore
+response budget; `u64` for restore cursors, excluded counts,
+`max_value_bytes`, and size-bearing store errors; and checked conversion before
+backend dispatch or caller exposure. It omits restore `loaded_count` and
+`complete` and recomputes them after decode. Independent limits admit 256 batch
+operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
+rebuild entries, in addition to the configured frame-size bound. The exact
+profile also pins wire-schema/error-set revisions 1, 128-byte
+owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
+31,536,000-second TTL maximum. Public
+`Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
+`contract_profile`; exhaustive construction and matching must account for the
+new field.
 
 ## Consequences
 
@@ -141,10 +157,9 @@ integer operations rather than floating point or panicking timestamp
 arithmetic. This prevents an oversized direct or authenticated input from
 unwinding a process, but supplies no consensus or commit proof.
 
-The new public and serialized error variants require exhaustive callers and
-all session-net participants to upgrade as one same-v3 compatibility unit;
-the TTL wire shape is unchanged for entries admitted by the operation-tree
-contract below. Operators must first audit persisted legacy
+The new public error variants require exhaustive callers. Protocol v4 carries
+them through private fixed-width error DTOs under pinned error revision 1, and
+rejects a v3 peer during negotiation. Operators must first audit persisted legacy
 replication logs: a TTL-bearing entry above 365 days now fails closed during
 replay/rebuild and is neither clamped nor rewritten automatically. Replicated
 deadline validation admits at most one microsecond above exact
@@ -155,11 +170,11 @@ Under #135, `OwnerId` and custom session-key names accept 1 through 128 UTF-8
 encoded bytes. `SessionKeyType::Other` now contains a validated
 `CustomSessionKeyType`; reserved names decode only to the canonical well-known
 variants, and ordering uses canonical string order. Serde, SQLite hydration,
-and session-net decode reuse that admission. Valid v3 JSON strings retain their
+and session-net decode reuse that admission. Valid identity JSON strings retain their
 shape, but Rust construction is source-breaking and semantic admission is
-stricter. An older v3 peer may emit values a new peer rejects, so all clients,
-servers, and wrappers require coordinated stop/upgrade/start. #135 should ship
-with #134's versioned DTO/handshake work where possible.
+stricter. An older v3 peer may emit values v4 rejects, so all clients, servers,
+and wrappers require coordinated stop/upgrade/start. Protocol v4's exact
+profile now binds this admission rule.
 
 Existing SQLite replicas must be drained and checked with
 `opc-session-store-audit identity-invariants` using explicit non-zero
@@ -185,8 +200,9 @@ coherent drained checkpoint restore or reviewed reverse migration of every
 record/log/snapshot/restore copy across every handover reader/writer.
 
 This closes the scoped #135 boundary, not durable authority or production HA.
-#127 and #134 remain open, and #143 still requires distributed qualification,
-including seamless SVID, payload-protection-key, and trust-bundle rotation.
+#127 remains open; #134 closes the fixed-width v4 wire boundary only, and #143
+still requires distributed qualification, including seamless SVID,
+payload-protection-key, and trust-bundle rotation.
 
 `MAX_REPLICATION_OPERATION_DEPTH` is 16 and
 `MAX_REPLICATION_OPERATIONS_PER_ENTRY` is 256. The root operation is depth 1,
@@ -202,13 +218,13 @@ Provider calls are sequential. A late provider failure may follow earlier
 provider calls, but it causes no backend delegation on writes and no partial
 entry/page exposure on reads.
 
-This adds a public and serialized error variant without changing the v3
-protocol number. An older peer cannot decode the error and, more critically,
-an older wrapper can forward deep plaintext/unsealed CAS payloads. Mixed v3
-fleets are not confidentiality-safe; all clients, servers, and wrapper
-participants require a coordinated upgrade, not a rolling compatibility claim.
-#134 must pin the limits and error representation in the versioned fixed-width
-DTO and handshake contract.
+This added a public error variant before the v4 boundary. An older peer cannot
+decode it and, more critically, an older wrapper can forward deep
+plaintext/unsealed CAS payloads. Protocol v4 rejects the older wire participant
+and pins the depth-16/256-node limits and error revision, but it cannot attest
+that a protection wrapper is actually installed. All clients, servers, and
+wrapper participants require a coordinated upgrade plus composition
+verification, not a rolling compatibility claim.
 
 Historical nested plaintext is not automatically scrubbed. Before upgrade,
 operators must audit persisted tree shape and payload encoding offline. An
@@ -224,9 +240,12 @@ production qualification owner, including separate proof of seamless SVID
 rotation, payload-protection key rotation, and trust-bundle rotation.
 
 Capability/profile validation and fresh readiness have different scopes. The
-former is static admission evidence. The latter is a bounded observation that
-can become stale immediately, so a CNF must gate traffic continuously and each
-authoritative operation must reassess quorum.
+former is static admission evidence. A v4 version/profile/authentication or
+malformed-handshake failure clears the remote cache and reports every capability
+boolean false with `max_value_bytes = 0`; a cache retained after transient
+transport loss remains descriptive only. Fresh readiness is a bounded
+observation that can become stale immediately, so a CNF must gate traffic
+continuously and each authoritative operation must reassess quorum.
 
 A product composes one descriptor per physical vote. For example, logical self
 `epdg-app-0` may select the member whose dial endpoint is the full

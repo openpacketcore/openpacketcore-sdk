@@ -164,15 +164,14 @@ complete phase of at most `HANDOVER_PHASE_HEADER_MAX_BYTES` (1,024 bytes) that
 is valid under the current model. Non-`OPCH` bare compatibility is governed by
 the exact classifier below; it is not a promise for arbitrary historical bytes.
 
-Valid owner/key-type values keep their protocol-v3 JSON string shape. That is
+Valid owner/key-type values keep their protocol-v4 JSON string shape. That is
 shape compatibility only: `SessionKeyType::Other(String)` changing to
 `Other(CustomSessionKeyType)` and the fallible `SessionKeyType::other` are Rust
 source breaks, while the new rejection of empty/oversized input is a semantic
-wire-admission break. An older v3 participant can send a value a new
-participant rejects. Do not roll mixed versions. Prefer combining #135 with
-#134's fixed-width DTO/handshake work; until that negotiation exists, use a
-coordinated stop/upgrade/start for every session-net client, server, and
-protection wrapper and every NF/product handover reader or writer.
+wire-admission break. An older v3 participant can send a value v4 rejects.
+Do not roll mixed versions. Protocol v4 now binds #135 in its exact fixed-width
+contract; use a coordinated stop/upgrade/start for every session-net client,
+server, and protection wrapper and every NF/product handover reader or writer.
 
 For every existing SQLite replica, the operator sequence is:
 
@@ -209,7 +208,7 @@ For every existing SQLite replica, the operator sequence is:
    whose classification cannot be proven.
 7. Upgrade every session-net client/server/protection wrapper and every
    NF/product handover reader/writer together. Verify the new binaries,
-   authenticated v3 handshakes, restore/log reads, and fresh quorum gate, then
+   authenticated v4 handshakes, restore/log reads, and fresh quorum gate, then
    restore traffic.
 
 The command opens only an existing database in read-only/query-only mode and
@@ -262,7 +261,7 @@ format migration: an older SDK silently treats `OPCH` as an opaque bare
 one coherent fleet-wide pre-upgrade checkpoint—accepting or reconciling loss of
 all post-checkpoint mutations—or reverse-migrates every affected live and
 replayable payload, including nested logs/snapshots/restore sources, under a
-reviewed procedure. #134's handshake does not make the opaque format backward
+reviewed procedure. The v4 handshake does not make the opaque format backward
 readable, and every handover reader/writer—not only session-net members—must be
 upgraded together.
 
@@ -299,12 +298,10 @@ deadline validation accepts at most one microsecond above the exact
 remain exact, this does not enlarge the 365-day bound, and larger mismatches
 fail closed.
 
-The two new public error variants also extend protocol-v3 serialized errors.
-Update exhaustive matches and upgrade all session-net participants as one
-coordinated same-v3 compatibility unit before relying on the typed response;
-an older v3 decoder cannot consume a newly returned variant. The TTL wire shape
-is otherwise compatible for entries admitted by the operation-tree contract
-below.
+The two new public error variants require exhaustive matches to be updated.
+Protocol v4 encodes them through private fixed-width DTOs under error revision
+1; an older v3 decoder is rejected during exact negotiation. Use the coordinated
+v4 rollout below before relying on typed responses.
 
 ### Nested replication payload admission and upgrade
 
@@ -325,14 +322,13 @@ calls may already have occurred, but no write is delegated to the backend and
 no partially transformed entry/page is exposed. An earlier independent watch
 item may already have been delivered.
 
-Treat this as a coordinated fleet migration, not a rolling upgrade. The
-protocol number remains v3, but an older peer cannot decode the new error and
-an older wrapper may forward a deeply nested CAS as plaintext/unsealed data.
-Mixed old/new v3 fleets are not confidentiality-safe. Drain traffic and
-writers, upgrade every client, server, and wrapper participant together, and
-only then restore service. #134 must pin these limits and the error encoding in
-the versioned fixed-width DTO and handshake contract; #147 does not establish
-wire-version compatibility by itself.
+Treat this as a coordinated fleet migration, not a rolling upgrade. An older
+v3 peer cannot decode the new error and an older wrapper may forward a deeply
+nested CAS as plaintext/unsealed data. Protocol v4 rejects the older wire
+participant and pins the limits/error revision, but cannot attest that the
+product actually installed a protection wrapper. Drain traffic and writers,
+upgrade every client, server, and wrapper participant together, verify the
+composition, and only then restore service.
 
 Before rollout, audit persisted replication-log tree shape and payload encoding
 offline without emitting payloads in logs or metrics. The SDK does not
@@ -402,9 +398,9 @@ not an ownership lease.
 5. **Declared Feature Envelope**: `QuorumSessionStore` advertises `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe available methods, not fresh peer-quorum evidence or production qualification. Use `probe_durable_readiness` for the current point-in-time result.
 6. **Bounded Protected Replication Trees**: Entry/prefix/page preflight enforces depth 16 and 256 total nodes, while encryption/sealing wrappers iteratively transform every nested CAS and stage writes before delegation. This is protection-boundary evidence, not durable commit or HA qualification.
 
-### Session transport v3 rollout boundary
+### Session transport v4 rollout boundary
 
-`opc-session-net` v3 carries cursor-paged remote restore scans and authenticated
+`opc-session-net` v4 carries cursor-paged remote restore scans and authenticated
 replica identity. Production constructors accept only opaque authenticated TLS
 configs. Both sides extract the canonical SPIFFE URI from the live peer
 certificate and require an exact match with the manifest's claimed stable
@@ -429,17 +425,32 @@ A successful restore page may be shorter than requested to fit the effective
 client/server frame limit; follow `next_cursor` until `complete`. A single
 record that cannot fit returns `RestoreScanResponseTooLarge`.
 
-The Hello handshake and ALPN require an exact version match. Treat v2-to-v3 as a
-coordinated outage: drain session traffic and writers, stop every session-net
-participant, upgrade them together, verify v3 authenticated handshakes and
-empty/multi-page scans on each replica, then restore traffic. There is no
-production v2 fallback; do not perform a mixed-version rolling upgrade.
+The exact `opc-session-net/4` ALPN, version, and contract profile have no v3
+fallback or highest-common-version downgrade. Treat v3-to-v4 as a coordinated
+outage: drain session traffic and writers; run the identity audit and complete
+handover/nested-payload preflights; stop every session-net client, server, and
+protection wrapper plus every product handover reader/writer; upgrade them
+together; verify v4 authenticated handshakes, empty/multi-page restore scans,
+bounded log/rebuild traffic, and fresh quorum evidence on each replica; then
+restore traffic. Do not perform a mixed-version rolling upgrade.
 
-The #147 limit/protection contract also requires a coordinated rollout even
-though both builds report v3. Mixed builds cannot negotiate the new limits, an
-old decoder cannot consume the typed limit error, and an old wrapper can leak a
-deep CAS payload. Do not treat this as same-v3 rolling compatibility; #134 must
-make the contract explicit in the versioned handshake/DTO model.
+Public `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
+`contract_profile`, so exhaustive construction and matching must account for
+the field. Private v4 DTOs use `u32` for restore/log request limits and the
+client restore response budget; `u64` for restore cursors/excluded counts,
+`max_value_bytes`, and size-bearing store errors; and checked conversion before
+dispatch/exposure. Restore `loaded_count` and `complete` are recomputed rather
+than trusted from the peer. Independent limits are 256 batch operations, 1,024
+restore records, 65,536 log entries, and 65,536 rebuild entries; the configured
+frame bound remains separate. Enforcing it and a write deadline across every
+ordinary response/watch item remains #159. The profile pins wire-schema/error-set revisions
+1, 128-byte owner/custom-key/state-type bounds, the 31,536,000-second TTL
+maximum, and depth-16/256-node trees.
+
+A fresh version/profile/authentication or malformed-handshake failure clears
+the capability cache and reports every boolean false with
+`max_value_bytes = 0`. A cache retained after transient transport loss is
+descriptive only and cannot authorize an operation, readiness, or traffic.
 
 DNS, FQDN, IP, and resolver aliases control only the dial address. They must
 not be used to derive or rewrite the logical `ReplicaId` or expected SPIFFE
@@ -452,15 +463,15 @@ This is not production HA qualification. Do not infer readiness from bind
 success, static profiles, or cached capabilities; use the fresh bounded probe
 and continuous gate. Do not use quorum restore as authority before
 #127/#133, treat current divergence repair as authoritative before #128, or
-auto-resolve a legacy fork before #129. Protocol v3 identity binding is not
-consensus or fork recovery. #135's invariant-safe model decoding and bounded
-offline identity audit are implemented; fixed-width wire DTOs remain #134.
+auto-resolve a legacy fork before #129. Protocol v4 identity/fixed-width
+binding is not consensus or fork recovery. #135's invariant-safe model decoding and bounded
+offline identity audit and #134's fixed-width v4 DTOs are implemented.
 Checked TTL and sequence boundaries now fail closed under #137/#138, and
 bounded nested protected-payload traversal is implemented under #147. Watch
 handoff and absolute-record-expiry admission remain
-#145/#148; seamless SVID rotation, payload-protection key rotation, and
-trust-bundle rotation plus the remaining distributed production evidence stay
-open in #143.
+#145/#148; seamless SVID/trust-bundle lifecycle is #158, outbound slow-reader
+and response-frame enforcement is #159, and the remaining distributed
+production evidence stays open in #143.
 
 ## Operator-facing SDK surfaces available now
 

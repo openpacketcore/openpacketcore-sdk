@@ -4,6 +4,10 @@ pub enum ProtocolError {
     FrameTooLarge(usize),
     #[error("version mismatch: local={local}, remote={remote}")]
     VersionMismatch { local: u32, remote: u32 },
+    #[error("session protocol contract profile mismatch")]
+    ContractMismatch,
+    #[error("session protocol value is outside the fixed-width contract")]
+    InvalidWireValue,
     #[error("peer authentication failed")]
     Authentication,
     #[error("unexpected protocol response")]

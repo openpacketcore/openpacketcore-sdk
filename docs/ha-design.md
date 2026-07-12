@@ -81,7 +81,7 @@ Rejoining replicas are caught up before they can participate as authoritative re
 - **Process-Level HA Test Harness (Milestone 4)**: The process-level HA test harness has been fully implemented and verified. This covers process campaigns, failovers, network partitions, and pending commits surviving process restarts.
 - **Out-of-Process Raft Joint Consensus Transitions**: Raft joint consensus transitions (voter membership changes) are fully implemented and verified out-of-process.
 
-Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload (`GAP-003-001`), KMS-backed durable key providers over mTLS TCP or local Unix-socket KMS agents (`GAP-003-004`), and storage-fault injection (`GAP-001-005`)—have been implemented and verified as reusable library mechanisms. That scoped closure does not qualify seamless session-net certificate/trust rotation; the service-level evidence remains #143.
+Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload (`GAP-003-001`), KMS-backed durable key providers over mTLS TCP or local Unix-socket KMS agents (`GAP-003-004`), and storage-fault injection (`GAP-001-005`)—have been implemented and verified as reusable library mechanisms. That scoped closure does not provide seamless session-net certificate/trust rotation; its lifecycle implementation is tracked by #158 and service-level qualification remains #143.
 
 
 ---
@@ -91,9 +91,11 @@ Platform hardening concerns—including TLS/SPIFFE SVID and bundle watch/reload 
 The algorithm below describes intended and prototype-tested behavior; it is not
 yet durable distributed proof or a production deployment contract. Configured
 topology admission and fresh durable readiness are implemented. Authenticated
-identity binding is implemented in protocol v3; durable sequencing and safe
+identity binding and fixed-width admission are implemented in protocol v4;
+durable sequencing and safe
 fork recovery (#127–#129), and bounded majority-authoritative restore (#133)
-remain open. Fixed-width wire DTOs remain #134. #135's structural owner/key
+remain open. #134's private fixed-width wire DTOs and checked conversions are
+implemented. #135's structural owner/key
 model, persistence/transport decode validation, bounded offline SQLite audit,
 and typed-invalid handover rejection are implemented. Checked session TTL and
 replication-sequence handling now fail closed at direct, wrapper, cache,
@@ -146,17 +148,17 @@ provenance. The identity audit does not classify live or nested-log payloads, so
 products must run the complete provenance-aware replay preflight in RFC 004
 §5.2/§10.3.
 
-Existing valid v3 values keep their JSON string shape, but source construction
+Existing valid v4 values keep their JSON string shape, but source construction
 and pattern matching change and admission is stricter. An older v3 member may
-emit an invalid value a new member rejects, so #135 is not a same-v3 rolling
-compatibility claim. Prefer deploying it together with #134. Until the
-fixed-width DTO and handshake negotiate the contract, drain and stop every
+emit an invalid value v4 rejects, so this is not a rolling-compatibility claim.
+The fixed-width DTO and handshake now bind the contract. Drain and stop every
 client, server, and wrapper plus every product handover reader/writer, audit
 identities and handover payloads, upgrade the complete fleet, and restart it
 together. Once any live or replayable `OPCH` copy is written, rollback to an
 older SDK requires a drained coherent fleet-wide checkpoint restore (with
 post-checkpoint mutation handling) or reviewed reverse migration of every live,
-log, snapshot, and restore copy; #134 does not make the format backward-readable.
+log, snapshot, and restore copy; the v4 handshake does not make the format
+backward-readable.
 
 The offline command is:
 
@@ -181,9 +183,10 @@ renames, repairs, or rewrites an invalid value. Use a reviewed
 semantic-preserving product migration or audited store replacement, then
 re-audit before startup.
 
-This is #135 boundary evidence, not durable consensus or production HA. #127,
-#134, and #143 remain open; #143 includes seamless SVID,
-payload-protection-key, and trust-bundle rotation under live distributed load.
+This is #135 boundary evidence, not durable consensus or production HA. #127
+and #143 remain open; #134 closes only fixed-width v4 admission. #143 includes
+seamless SVID, payload-protection-key, and trust-bundle rotation under live
+distributed load.
 
 ### Fresh durable readiness
 
@@ -230,10 +233,10 @@ TTL-bearing batch and replication entries, wrappers, quorum dispatch, local
 backends, and authenticated client/server admission. Here, effects means
 application/backend mutation or provider work: clients reject before
 resolution/dialing, while servers reject after request receipt but before
-backend dispatch and may return the typed response. The new public and
-serialized error variants require external exhaustive matches and a
-coordinated same-v3 fleet upgrade. The TTL wire shape is unchanged for entries
-admitted by the operation-tree contract below. Operators must audit legacy
+backend dispatch and may return the typed response. The new public error
+variants require external exhaustive matches. Protocol v4 maps them through
+private fixed-width DTOs under error revision 1 and rejects v3 peers during the
+exact handshake. Operators must audit legacy
 persisted logs before upgrade because a TTL-bearing entry
 above the bound now fails closed during replay/rebuild rather than being
 clamped or rewritten. Replicated deadline validation permits at most one
@@ -266,12 +269,13 @@ but a write performs no backend delegation and a read exposes no partially
 transformed entry/page; earlier independent watch items may already have been
 yielded.
 
-This is a breaking confidentiality contract within protocol v3. An older peer
+This was a breaking confidentiality contract before protocol v4. An older peer
 cannot decode the new error, and an older wrapper may forward a deep CAS as
-plaintext/unsealed data. Mixed versions are not confidentiality-safe and must
-not be called rolling-compatible. Drain and upgrade all clients, servers, and
-wrapper participants together. #134 still owns a versioned fixed-width DTO and
-handshake contract that pins these two limits and the error encoding.
+plaintext/unsealed data. Protocol v4 rejects the older wire participant and
+pins the limits/error revision, but cannot attest that a protection wrapper is
+actually installed. Drain and upgrade all clients, servers, and wrapper
+participants together, verify product composition, and do not call this
+rolling-compatible.
 
 Historical nested plaintext is not automatically scrubbed. Operators must
 audit persisted tree shape and payload encoding offline before upgrade. Entries
@@ -286,9 +290,9 @@ experimental and blocked on #143 and its other dependencies. Seamless SVID
 rotation, payload-protection key rotation, and trust-bundle rotation remain
 separate mandatory production qualifications.
 
-### Authenticated network transport (protocol v3)
+### Authenticated network transport (protocol v4)
 
-`opc-session-net` protocol v3 carries validated restore-scan requests and pages
+`opc-session-net` protocol v4 carries validated restore-scan requests and pages
 to individual remote replicas. A server may shorten a multi-record page to the
 smaller client/server frame budget; callers resume from `next_cursor`, while a
 single record that cannot fit returns `RestoreScanResponseTooLarge`.
@@ -297,28 +301,44 @@ Every production participant is created with an opaque authenticated TLS
 config and a binding derived from one immutable `SessionReplicationManifest`.
 The manifest's configuration ID is an order-independent SHA-256 digest of the
 cluster ID, operator-controlled generation, and every field of every replica
-descriptor. During the v3 handshake, each side extracts the canonical SPIFFE
+descriptor. During the v4 handshake, each side extracts the canonical SPIFFE
 URI from the live certificate and requires it to match the claimed stable
 `ReplicaId`, expected opposite member, cluster, and configuration ID before
 dispatch. The client verifies its fresh challenge is echoed by the server.
 DNS/FQDN/IP aliases and resolver overrides affect
 routing only; they never redefine replica identity.
 
-The exact v3 ALPN and handshake have no production fallback to v2. A v2-to-v3
-change is a coordinated stop/upgrade/start of all clients and servers, not a
-mixed-version rolling deployment.
+The exact `opc-session-net/4` ALPN, version, and contract profile have no
+production fallback to v3. A v3-to-v4 change is a coordinated
+stop/upgrade/start of all clients and servers, not a mixed-version rolling
+deployment or highest-common-version negotiation. Public `Request`/`Response`
+remain available, but `Hello`/`HelloAck` gain an optional `contract_profile`, so
+exhaustive construction and matching must account for the new field.
 
-#135 also requires that coordinated pattern even though accepted owner and key
-type values retain the v3 JSON shape. New model deserializers reject empty or
-oversized values before dispatch/exposure, while an older v3 peer can still
-emit them. Deploy #135 with #134 when possible; unchanged wire
-shape for valid values is not semantic negotiation.
+The private v4 DTOs use `u32` for restore/log request limits and the restore
+response budget, and `u64` for restore cursors/excluded counts,
+`max_value_bytes`, and size-bearing store errors. Restore `loaded_count` and
+`complete` are omitted and recomputed after decode. Independent work limits
+admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
+65,536 rebuild entries; the configured frame bound remains separate. The exact
+profile also pins wire-schema/error-set revisions 1, 128-byte
+owner/custom-key/state-type bounds, the 31,536,000-second TTL maximum, and
+depth-16/256-node replication trees.
 
-The #147 confidentiality contract is also coordinated even though both old and
-new builds identify as v3: mixed builds cannot negotiate the new operation-tree
-limits and are not confidentiality-safe. #134 must make that contract explicit
-in the versioned DTO/handshake rather than relying on an SDK-version
-assumption.
+A version/profile/authentication or malformed-handshake failure clears cached
+capabilities and reports every boolean false with `max_value_bytes = 0`.
+Capabilities retained after transient transport loss remain descriptive only;
+they never authorize a store operation or readiness. Use fresh bounded quorum
+evidence and continuous traffic gating.
+
+Before the v4 rollout, drain traffic and writers, run the #135 count-only
+identity audit, and preflight every live/replayable handover and nested-payload
+copy. Stop and upgrade every client, server, protection wrapper, and product
+handover reader/writer together; verify exact-v4 authenticated restore/log
+traffic and fresh quorum evidence before reopening traffic. Once `OPCH` has
+been written, rollback to a v3 binary additionally requires a coherent drained
+checkpoint restore or reviewed reverse migration of every live and replayable
+record, log, snapshot, and restore source.
 
 Session caches, tickets, resumption, early data, and 0-RTT are disabled, so a
 reconnect performs a full mutual-TLS certificate exchange. Production still
@@ -331,7 +351,7 @@ authentication-age policy.
 
 This closes per-replica transport parity only. Quorum selection/merge remains
 #133, while durable sequencing and repair authority remain #127/#128.
-Authenticated membership does not make protocol v3 a consensus algorithm and
+Authenticated membership does not make protocol v4 a consensus algorithm and
 does not reconcile a divergent or forked log.
 
 ### Log & Replication Model

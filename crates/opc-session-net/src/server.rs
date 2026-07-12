@@ -13,7 +13,6 @@ use opc_session_store::{
     validate_session_ttl, ReplicaId, RestoreScanCursor, RestoreScanPage, RestoreScanRequest,
 };
 use opc_types::SpiffeId;
-use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 use tracing;
@@ -21,9 +20,13 @@ use tracing;
 use crate::error::ProtocolError;
 use crate::identity::{LocalReplicaBinding, SessionClusterId};
 use crate::protocol::{
-    ensure_frame_fits, read_frame_within, write_frame, write_frame_within, HelloRejectReason,
-    Request, Response, CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE,
-    MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
+    ensure_frame_fits, ensure_restore_scan_success_frame_fits, read_frame_within,
+    read_request_frame_within, write_frame, write_frame_within, BootstrapHello, BootstrapHelloAck,
+    BootstrapRequest, BootstrapResponse, HelloRejectReason, InboundRequest, Request, Response,
+    CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE,
+    MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
+    MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
+    SESSION_NET_ALPN,
 };
 
 /// Handle to a running [`SessionReplicationServer`].
@@ -102,6 +105,17 @@ const DEFAULT_RESTORE_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::f
 const RESTORE_SCAN_CONCURRENCY: usize = 1;
 const CAS_IDEMPOTENCY_CACHE_CAPACITY: usize = 4096;
 
+fn capabilities_for_transport(
+    mut capabilities: opc_session_store::BackendCapabilities,
+    max_frame_size: usize,
+) -> opc_session_store::BackendCapabilities {
+    capabilities.max_value_bytes = capabilities.max_value_bytes.min(max_frame_size);
+    if max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
+        capabilities.restore_scan = false;
+    }
+    capabilities
+}
+
 #[derive(Clone)]
 struct DispatchConfig {
     binding: LocalReplicaBinding,
@@ -109,11 +123,6 @@ struct DispatchConfig {
     idle_timeout: std::time::Duration,
     restore_scan_timeout: std::time::Duration,
     restore_scan_slots: Arc<Semaphore>,
-}
-
-#[derive(Serialize)]
-enum RestoreScanResponseRef<'a> {
-    ScanRestoreRecords(Result<&'a RestoreScanPage, &'a StoreError>),
 }
 
 fn bounded_restore_scan_response(
@@ -131,8 +140,7 @@ fn bounded_restore_scan_response(
     }
 
     loop {
-        let response = RestoreScanResponseRef::ScanRestoreRecords(Ok(&page));
-        match ensure_frame_fits(&response, max_response_frame_size) {
+        match ensure_restore_scan_success_frame_fits(&page, max_response_frame_size) {
             Ok(()) => return Ok(Response::ScanRestoreRecords(Ok(page))),
             Err(ProtocolError::FrameTooLarge(_)) if page.records.len() > 1 => {
                 let retained = (page.records.len() / 2).max(1);
@@ -157,18 +165,6 @@ fn bounded_restore_scan_response(
             }
             Err(other) => return Err(other),
         }
-    }
-}
-
-fn discard_replication_payloads_from_request(request: Request) {
-    match request {
-        Request::ReplicateEntry { entry } => {
-            drop(entry.into_validated());
-        }
-        Request::RebuildReplicationState { entries } => {
-            drop(validate_replication_prefix_owned(entries));
-        }
-        _ => {}
     }
 }
 
@@ -540,121 +536,122 @@ where
     } = dispatch_config;
 
     // Hello handshake — bounded so a peer that connects and stalls is reaped.
-    let hello: Request = read_frame_within(
+    let hello: BootstrapRequest = read_frame_within(
         reader,
         max_frame_size.min(MAX_HANDSHAKE_FRAME_SIZE),
         idle_timeout,
     )
     .await?;
-    match hello {
-        Request::Hello {
-            contract_version,
-            node_id,
-            expected_server_replica_id,
-            cluster_id,
-            configuration_id,
-            handshake_nonce,
-        } => {
-            if contract_version != CONTRACT_VERSION {
-                write_frame_within(
-                    writer,
-                    &Response::HelloAck {
-                        contract_version: CONTRACT_VERSION,
-                        server_replica_id: None,
-                        accepted_client_replica_id: None,
-                        cluster_id: None,
-                        configuration_id: None,
-                        handshake_nonce: None,
-                    },
-                    idle_timeout,
-                )
-                .await?;
-                return Err(ProtocolError::VersionMismatch {
-                    local: CONTRACT_VERSION,
-                    remote: contract_version,
-                });
-            }
+    let BootstrapRequest::Hello(BootstrapHello {
+        contract_version,
+        node_id,
+        expected_server_replica_id,
+        cluster_id,
+        configuration_id,
+        handshake_nonce,
+        contract_profile,
+    }) = hello;
 
-            let Some(expected_server_replica_id) = expected_server_replica_id else {
-                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
-            };
-            let Some(cluster_id) = cluster_id else {
-                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
-            };
-            let Some(configuration_id) = configuration_id else {
-                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
-            };
-            let Some(handshake_nonce) = handshake_nonce else {
-                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
-            };
+    if contract_version != CONTRACT_VERSION {
+        write_bootstrap_ack(writer, None, None, None, None, None, idle_timeout).await?;
+        return Err(ProtocolError::VersionMismatch {
+            local: CONTRACT_VERSION,
+            remote: contract_version,
+        });
+    }
+    if contract_profile != Some(CURRENT_CONTRACT_PROFILE) {
+        write_bootstrap_ack(writer, None, None, None, None, None, idle_timeout).await?;
+        return Err(ProtocolError::ContractMismatch);
+    }
 
-            let client_replica_id = match ReplicaId::new(node_id) {
-                Ok(replica_id) => replica_id,
-                Err(_) => {
-                    return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
-                }
-            };
-            let expected_server_replica_id = match ReplicaId::new(expected_server_replica_id) {
-                Ok(replica_id) => replica_id,
-                Err(_) => {
-                    return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
-                }
-            };
-            if SessionClusterId::new(cluster_id.clone()).is_err()
-                || !is_configuration_id(&configuration_id)
-            {
-                return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
-            }
+    let Some(expected_server_replica_id) = expected_server_replica_id else {
+        return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+    };
+    let Some(cluster_id) = cluster_id else {
+        return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+    };
+    let Some(configuration_id) = configuration_id else {
+        return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+    };
+    let Some(handshake_nonce) = handshake_nonce else {
+        return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+    };
 
-            let configured_client_spiffe = binding.member_spiffe_id(&client_replica_id);
-            let authenticated_client_matches = match (&peer_identity, configured_client_spiffe) {
-                (ConnectionPeerIdentity::Authenticated(actual), Some(configured)) => {
-                    actual.as_str() == configured.as_str()
-                }
-                (ConnectionPeerIdentity::InsecureTest, Some(_)) => true,
-                _ => false,
-            };
-            let scope_matches = expected_server_replica_id == *binding.local_replica_id()
-                && cluster_id == binding.cluster_id().as_str()
-                && configuration_id == binding.configuration_id().to_hex();
-            if !authenticated_client_matches || !scope_matches {
-                return reject_hello(writer, HelloRejectReason::Authentication, idle_timeout).await;
-            }
-
-            write_frame_within(
-                writer,
-                &Response::HelloAck {
-                    contract_version: CONTRACT_VERSION,
-                    server_replica_id: Some(binding.local_replica_id().as_str().to_string()),
-                    accepted_client_replica_id: Some(client_replica_id.as_str().to_string()),
-                    cluster_id: Some(binding.cluster_id().as_str().to_string()),
-                    configuration_id: Some(binding.configuration_id().to_hex()),
-                    handshake_nonce: Some(handshake_nonce),
-                },
-                idle_timeout,
-            )
-            .await?;
-        }
-        request => {
-            discard_replication_payloads_from_request(request);
+    let client_replica_id = match ReplicaId::new(node_id) {
+        Ok(replica_id) => replica_id,
+        Err(_) => {
             return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
         }
+    };
+    let expected_server_replica_id = match ReplicaId::new(expected_server_replica_id) {
+        Ok(replica_id) => replica_id,
+        Err(_) => {
+            return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
+        }
+    };
+    if SessionClusterId::new(cluster_id.clone()).is_err() || !is_configuration_id(&configuration_id)
+    {
+        return reject_hello(writer, HelloRejectReason::Malformed, idle_timeout).await;
     }
+
+    let configured_client_spiffe = binding.member_spiffe_id(&client_replica_id);
+    let authenticated_client_matches = match (&peer_identity, configured_client_spiffe) {
+        (ConnectionPeerIdentity::Authenticated(actual), Some(configured)) => {
+            actual.as_str() == configured.as_str()
+        }
+        (ConnectionPeerIdentity::InsecureTest, Some(_)) => true,
+        _ => false,
+    };
+    let scope_matches = expected_server_replica_id == *binding.local_replica_id()
+        && cluster_id == binding.cluster_id().as_str()
+        && configuration_id == binding.configuration_id().to_hex();
+    if !authenticated_client_matches || !scope_matches {
+        return reject_hello(writer, HelloRejectReason::Authentication, idle_timeout).await;
+    }
+
+    write_bootstrap_ack(
+        writer,
+        Some(binding.local_replica_id().as_str().to_string()),
+        Some(client_replica_id.as_str().to_string()),
+        Some(binding.cluster_id().as_str().to_string()),
+        Some(binding.configuration_id().to_hex()),
+        Some(handshake_nonce),
+        idle_timeout,
+    )
+    .await?;
 
     // Dispatch loop
     loop {
-        let req: Request = match read_frame_within(reader, max_frame_size, idle_timeout).await {
-            Ok(r) => r,
+        let inbound = match read_request_frame_within(reader, max_frame_size, idle_timeout).await {
+            Ok(request) => request,
             Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
+        };
+        let req = match inbound {
+            InboundRequest::Operation(request) => request,
+            InboundRequest::ReplicateEntryOperationLimitExceeded => {
+                write_frame(
+                    writer,
+                    &Response::ReplicateEntry(Err(StoreError::ReplicationOperationLimitExceeded)),
+                )
+                .await?;
+                continue;
+            }
+            InboundRequest::RebuildReplicationStateOperationLimitExceeded => {
+                write_frame(
+                    writer,
+                    &Response::RebuildReplicationState(Err(
+                        StoreError::ReplicationOperationLimitExceeded,
+                    )),
+                )
+                .await?;
+                continue;
+            }
         };
 
         match req {
             Request::Capabilities => {
-                let mut caps = backend.capabilities().await;
-                if max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
-                    caps.restore_scan = false;
-                }
+                let caps = capabilities_for_transport(backend.capabilities().await, max_frame_size);
                 write_frame(writer, &Response::Capabilities(caps)).await?;
             }
             Request::Get { key } => {
@@ -695,9 +692,23 @@ where
                 write_frame(writer, &Response::RefreshTtl(res)).await?;
             }
             Request::Batch { ops } => {
-                let res = match ops.iter().try_for_each(|op| op.validate_ttls()) {
-                    Ok(()) => backend.batch(ops).await,
-                    Err(error) => Err(error),
+                let expected_results = ops.len();
+                let res = if expected_results > MAX_SESSION_NET_BATCH_OPERATIONS {
+                    Err(StoreError::ReplicationOperationLimitExceeded)
+                } else {
+                    match ops.iter().try_for_each(|op| op.validate_ttls()) {
+                        Ok(()) => match backend.batch(ops).await {
+                            Ok(results) if results.len() == expected_results => Ok(results),
+                            Ok(results) => {
+                                drop(results);
+                                Err(StoreError::BackendUnavailable(
+                                    "batch backend returned an invalid result count".to_string(),
+                                ))
+                            }
+                            Err(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
+                    }
                 };
                 write_frame(writer, &Response::Batch(res)).await?;
             }
@@ -763,9 +774,21 @@ where
                 write_frame(writer, &Response::MaxReplicationSequence(res)).await?;
             }
             Request::GetReplicationLog { start, limit } => {
-                let res = match backend.get_replication_log(start, limit).await {
-                    Ok(entries) => validate_replication_page_owned(entries),
-                    Err(error) => Err(error),
+                let res = if limit > MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES {
+                    Err(StoreError::ReplicationOperationLimitExceeded)
+                } else {
+                    match backend.get_replication_log(start, limit).await {
+                        Ok(entries) if entries.len() <= limit => {
+                            validate_replication_page_owned(entries)
+                        }
+                        Ok(entries) => {
+                            drop(validate_replication_page_owned(entries));
+                            Err(StoreError::BackendUnavailable(
+                                "replication backend returned an oversized page".to_string(),
+                            ))
+                        }
+                        Err(error) => Err(error),
+                    }
                 };
                 write_frame(writer, &Response::GetReplicationLog(res)).await?;
             }
@@ -777,9 +800,13 @@ where
                 write_frame(writer, &Response::ReplicateEntry(res)).await?;
             }
             Request::RebuildReplicationState { entries } => {
-                let res = match validate_replication_prefix_owned(entries) {
-                    Ok(entries) => backend.rebuild_replication_state(entries).await,
-                    Err(error) => Err(error),
+                let res = if entries.len() > MAX_SESSION_NET_REBUILD_ENTRIES {
+                    Err(StoreError::ReplicationOperationLimitExceeded)
+                } else {
+                    match validate_replication_prefix_owned(entries) {
+                        Ok(entries) => backend.rebuild_replication_state(entries).await,
+                        Err(error) => Err(error),
+                    }
                 };
                 write_frame(writer, &Response::RebuildReplicationState(res)).await?;
             }
@@ -836,6 +863,35 @@ fn is_configuration_id(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn write_bootstrap_ack<W>(
+    writer: &mut W,
+    server_replica_id: Option<String>,
+    accepted_client_replica_id: Option<String>,
+    cluster_id: Option<String>,
+    configuration_id: Option<String>,
+    handshake_nonce: Option<uuid::Uuid>,
+    timeout: std::time::Duration,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    write_frame_within(
+        writer,
+        &BootstrapResponse::HelloAck(BootstrapHelloAck {
+            contract_version: CONTRACT_VERSION,
+            server_replica_id,
+            accepted_client_replica_id,
+            cluster_id,
+            configuration_id,
+            handshake_nonce,
+            contract_profile: Some(CURRENT_CONTRACT_PROFILE),
+        }),
+        timeout,
+    )
+    .await
+}
+
 async fn reject_hello<W>(
     writer: &mut W,
     reason: HelloRejectReason,
@@ -844,7 +900,12 @@ async fn reject_hello<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    write_frame_within(writer, &Response::HelloRejected { reason }, timeout).await?;
+    write_frame_within(
+        writer,
+        &BootstrapResponse::HelloRejected { reason },
+        timeout,
+    )
+    .await?;
     Err(ProtocolError::Authentication)
 }
 
@@ -920,18 +981,6 @@ mod tests {
             response,
             Response::ScanRestoreRecords(Ok(page)) if page == expected_prefix
         ));
-    }
-
-    #[test]
-    fn borrowed_restore_response_has_the_owned_wire_shape() {
-        let page = RestoreScanPage::new(vec![restore_record(b"a", 8)], 0, None);
-        let borrowed = RestoreScanResponseRef::ScanRestoreRecords(Ok(&page));
-        let owned = Response::ScanRestoreRecords(Ok(page.clone()));
-
-        assert_eq!(
-            serde_json::to_vec(&borrowed).expect("encode borrowed response"),
-            serde_json::to_vec(&owned).expect("encode owned response")
-        );
     }
 
     #[test]

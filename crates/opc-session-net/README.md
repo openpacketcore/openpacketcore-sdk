@@ -7,7 +7,7 @@ Experimental network transport for remote session-store replicas.
 `opc-session-net` exposes a length-prefixed JSON protocol between
 `RemoteSessionBackend` clients and `SessionReplicationServer` instances. It
 lets a `SessionBackend` or quorum coordinator call a remote replica using the
-same session-store traits. Protocol v3 carries cursor-paged
+same session-store traits. Protocol v4 carries cursor-paged
 `SessionBackend::scan_restore_records` calls and binds every production
 connection to one authenticated member of one immutable replication manifest.
 
@@ -38,7 +38,8 @@ connection to one authenticated member of one immutable replication manifest.
 - `RemoteSessionBackend::scan_restore_records` validates requests and peer
   pages. The server may return fewer records than requested so the encoded
   response fits the smaller client/server frame limit; callers continue from
-  `next_cursor` until `complete`.
+  `next_cursor` until `complete`. The wire omits redundant `loaded_count` and
+  `complete` values and recomputes both from the records and cursor.
 - `SessionBackend::probe_replication_head` performs a fresh, deadline-bounded
   wire request. It does not consult the client's capability cache and reports
   transport, authentication, timeout, protocol, and backend failures through
@@ -53,6 +54,9 @@ connection to one authenticated member of one immutable replication manifest.
   enforce `MAX_REPLICATION_OPERATION_DEPTH` (16) and
   `MAX_REPLICATION_OPERATIONS_PER_ENTRY` (256). The root is depth 1 and every
   operation node, including `Batch`, counts toward the per-entry total.
+- Independent protocol work limits admit at most 256 batch operations, 1,024
+  restore records, 65,536 replication-log entries, and 65,536 rebuild entries.
+  These limits apply in addition to the configured encoded-frame bound.
 - Acquire, renew, TTL refresh, batch, and nested replication requests enforce
   `opc_session_store::MAX_SESSION_TTL` (365 days) before resolution or backend
   dispatch. Zero remains valid and means immediate expiry.
@@ -65,8 +69,10 @@ connection to one authenticated member of one immutable replication manifest.
   after the listener and every registered connection handler have stopped;
   use that barrier before deterministic restart or post-shutdown probes.
   `shutdown()` remains a graceful request, not a completion barrier.
-- `Request`, `Response`, `ProtocolError`, and protocol constants live in the
-  public protocol layer.
+- `Request`, `Response`, `HelloRejectReason`, `ProtocolError`, and protocol
+  constants remain in the public protocol layer. Public semantic frames use
+  custom Serde implementations backed by private v4 fixed-width DTOs rather
+  than serializing target-width domain integers directly.
 
 ```rust,ignore
 use opc_session_net::{RemoteSessionBackend, SessionReplicationManifest};
@@ -92,7 +98,7 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - Implements `opc-session-store` backend and lease traits over the wire.
 - Uses the opaque authenticated client/server configs from `opc-tls` for
   production mTLS transport. The session transport sets and requires its exact
-  v3 ALPN value.
+  v4 ALPN value.
 - Intended to be composed under `QuorumSessionStore` or other store callers.
 - HA-shaped composition must use `ValidatedQuorumTopology`; logical replica
   ID, dial endpoint, expected TLS identity, failure domain, backing identity,
@@ -107,8 +113,16 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
   `opc-tls`; raw Rustls configs cannot enter these constructors.
 - Plaintext client/server support is test-only and gated behind
   `insecure-test`.
-- The wire contract version is `3`; the default max frame size is 1 MiB.
-- The v3 handshake extracts the canonical SPIFFE URI from the live peer
+- The wire contract version is `4`; the default max frame size is 1 MiB.
+- Protocol v4 uses `u32` for restore/log request limits and the client restore
+  response budget; `u64` for restore cursors, excluded counts,
+  `max_value_bytes`, and size-bearing `StoreError` fields; and checked
+  conversion at both domain boundaries. Non-representable values fail before
+  backend dispatch or caller exposure. The frame-size limit remains a separate
+  encoded-byte bound. Enforcing that bound plus a write deadline on every
+  ordinary server response and watch item remains #159; v4 width stability is
+  not an outbound slow-reader/resource claim.
+- The v4 handshake extracts the canonical SPIFFE URI from the live peer
   certificate and requires it to match the claimed stable `ReplicaId` in the
   manifest. Client and server also verify the expected opposite replica,
   cluster ID, and configuration ID; the client verifies its fresh challenge is
@@ -122,45 +136,62 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
   qualification. A production CNF must support certificate and trust-bundle
   rotation without a service interruption, including trust overlap,
   long-lived-connection retirement, revocation, reconnect storms, and a
-  documented maximum authentication age. Distributed evidence for that
-  profile remains open in #143. The 365-day session TTL bound is unrelated to
+  documented maximum authentication age. The session-net lifecycle is #158
+  and distributed qualification remains #143. The 365-day session TTL bound is
+  unrelated to
   certificate lifetime, trust-bundle lifetime, or authentication age.
 - The configuration ID is a SHA-256 digest of the cluster ID, explicit
   generation, and the full sorted descriptor set. Changing a member ID,
   endpoint, TLS identity, failure domain, backing identity, cluster, or
   generation changes the authenticated scope.
-- Protocol v3 has no production fallback to v2. The exact-version handshake
-  and v3-only ALPN require a coordinated stop/upgrade/start of every
-  session-net participant; mixed v2/v3 fleets are unsupported.
-- #135 keeps the JSON shape of valid v3 owner and session-key type values as a
+- Protocol v4 has no production fallback to v3. The exact
+  `opc-session-net/4` ALPN, version, and contract profile require a coordinated
+  stop/upgrade/start of every session-net participant; mixed v3/v4 fleets are
+  unsupported and there is no highest-common-version downgrade negotiation.
+  `Hello` and `HelloAck` gain an optional `contract_profile`, which is a Rust
+  source break for exhaustive construction and matching even though public
+  `Request`/`Response` remain available.
+- The v4 profile pins wire-schema/error-set revisions 1, the 128-byte
+  owner/custom-key/state-type rules, depth-16/256-node replication trees,
+  31,536,000-second TTL maximum, and the collection limits above. A version or
+  profile mismatch is rejected before backend dispatch.
+- #135 kept the JSON shape of valid v3 owner and session-key type values as a
   string, but tightens semantic admission: owner IDs and custom key-type names
   must contain 1 through 128 UTF-8 encoded bytes. The five reserved key-type
   strings decode only to their canonical well-known variants; custom values
   are structurally wrapped and ordered by canonical string. This is also a
   Rust source break because `SessionKeyType::Other(String)` becomes
   `Other(CustomSessionKeyType)` and `SessionKeyType::other` is fallible. A
-  same-v3 peer built before #135 can still send an empty or oversized value
+  pre-v4 peer built before #135 can still send an empty or oversized value
   that a new peer rejects before dispatch, so unchanged valid JSON shape is not
   a rolling-compatibility claim.
-- Treat #135 as another coordinated stop/upgrade/start boundary. Drain traffic
-  and writers, audit every persisted SQLite replica with the count-only
-  `opc-session-store-audit identity-invariants` command, upgrade all clients,
-  servers, and protection wrappers together, verify authenticated handshakes
-  and representative restore/log reads, and only then restore traffic. Prefer
-  deploying #135 and #134 together so the fixed-width DTO and handshake can
-  state the admission contract explicitly. The audit and runtime never
+- Treat the v4 migration as a coordinated stop/upgrade/start boundary. Drain
+  traffic and writers, audit every persisted SQLite replica with the count-only
+  `opc-session-store-audit identity-invariants` command, and separately
+  preflight every live/replayable handover payload and nested payload-protection
+  boundary. Upgrade all clients, servers, protection wrappers, and product
+  handover readers/writers together; verify authenticated handshakes and
+  representative v4 restore/log reads; and only then restore traffic. The
+  fixed-width DTO and handshake now state the #135 admission contract
+  explicitly. The audit and runtime never
   truncate, rename, or rewrite rejected identities or log entries, and their
   errors do not expose the rejected raw value.
+- Once a live or replayable `OPCH` envelope has been written, a v3 rollback
+  requires a coherent drained pre-upgrade checkpoint restore or a reviewed
+  reverse migration of every live record, log, snapshot, and restore source.
+  Protocol negotiation cannot make the opaque handover format backward-readable.
 - DNS names and resolver overrides select only where to dial. FQDN, short-name,
   IP, and alias changes do not alter the expected `ReplicaId`, certificate
   SPIFFE identity, or manifest scope.
 - `capabilities()` is descriptive admission evidence. Clean transport loss or
-  timeout may fall back to a previously successful negotiation while masking
-  operations such as restore scan that require a fresh v3 handshake.
-  A fresh negotiation that fails authentication, reports an explicit version
-  mismatch, or is malformed or relabelled clears the entire cache instead.
-  Either outcome is non-authoritative: replicated callers must use the fresh
-  replication-head probe and require a distinct agreeing majority.
+  timeout may fall back to a previously successful exact-v4 negotiation while
+  masking operations such as restore scan that require a fresh handshake. A
+  fresh negotiation that fails authentication, version/profile comparison, or
+  malformed/relabelled acknowledgement clears the entire cache and returns all
+  capability booleans false with `max_value_bytes = 0`. Neither cached nor
+  cleared capabilities authorize an operation or readiness: replicated callers
+  must use the fresh replication-head probe and require a distinct agreeing
+  majority.
 - Remote adapters expose redaction-safe peer-binding evidence to
   `ValidatedQuorumTopology`. Admission verifies the local and remote IDs,
   expected TLS identity, local and remote descriptor fingerprints, configured
@@ -172,15 +203,15 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 - Replication entry sequence zero and malformed rebuild prefixes are rejected
   before dialing on the client and before backend dispatch on the server. The
   unit `InvalidReplicationSequence` error contains no peer-controlled data;
-  an authenticated server returns it as a typed v3 response and keeps the
+  an authenticated server returns it as a typed v4 response and keeps the
   connection usable. This is input-boundary safety, not sequence authority.
 - TTL-bearing requests above 365 days are rejected with
   `StoreError::InvalidSessionTtl` or `LeaseError::InvalidSessionTtl` before
   dialing on the client and before backend dispatch on the server. The exact
   maximum is accepted and zero means immediate expiry. The TTL request shape is
   unchanged for entries within the operation-tree contract. The new serialized
-  error variants require external exhaustive matches and a coordinated same-v3
-  fleet upgrade; an older v3 peer cannot decode a newly returned variant.
+  error variants require external exhaustive matches. Their wire representation
+  is pinned by v4 error revision 1; a v3 peer is rejected during negotiation.
   Legacy persisted replication logs must be
   audited before upgrade because an entry carrying a larger TTL now fails
   closed during replay or rebuild rather than being clamped. Cross-field
@@ -199,14 +230,14 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
   and transformation is staged: a late provider failure may follow earlier
   provider calls, but causes no backend delegation on writes and exposes no
   partially transformed entry/page on reads.
-- This is a breaking same-v3 confidentiality boundary, not rolling-compatible
-  hardening. An older v3 peer cannot decode the new error, and an older wrapper
+- This was a breaking same-v3 confidentiality boundary before v4. An older v3
+  peer cannot decode the new error, and an older wrapper
   can still forward a deeply nested CAS without protection. Mixed SDK versions
-  are therefore not confidentiality-safe even though the protocol number is
-  still 3. Drain and upgrade every client, server, and wrapper participant as
-  one coordinated fleet before restoring traffic. #134 must pin the two limits
-  and error representation in the versioned fixed-width DTO and handshake
-  contract; this change does not claim wire stabilization.
+  are therefore not confidentiality-safe. Protocol v4 rejects the older wire
+  participant and pins both tree limits and error revision, but it does not
+  attest that an encryption/sealing wrapper is actually wired. Drain and
+  upgrade every client, server, and wrapper participant as one coordinated
+  fleet and verify the product composition before restoring traffic.
 - Existing logs are not scrubbed automatically. Audit tree shape and payload
   encoding offline before upgrade. A plaintext/unsealed nested CAS within the
   new limits may use an explicit wrapper-mediated rewrite/rebuild. A historical
@@ -215,18 +246,19 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
   replace the store before starting the new SDK. Never clamp or split the entry
   ad hoc; a raw inner-backend rebuild preserves the protection gap.
 - Remote scan and fresh-probe transport parity do not by themselves qualify
-  networked session HA for production. Protocol v3 authenticates membership;
+  networked session HA for production. Protocol v4 authenticates membership;
   it does not establish consensus, durable sequence/commit authority,
-  fork reconciliation, or majority-authoritative restore. Those properties,
-  fixed-width wire DTOs remain open in #127–#129, #133, and #134. #135's
-  model-level decode boundary is implemented but does not provide any of those
+  fork reconciliation, or majority-authoritative restore. Those properties
+  remain open in #127–#129 and #133. #134's fixed-width v4 boundary and #135's
+  model-level decode boundary are implemented but do not provide any of those
   distributed properties.
 
 ## Roadmap
 
-- Close #127–#129, #133–#134, #145, and #148; add distributed failure and soak
+- Close #127–#129, #133, #145, #148, and #159; add distributed failure and soak
   evidence, including seamless SVID rotation, payload-protection key rotation,
-  and trust-bundle rotation qualification in #143, before treating this as
+  and trust-bundle rotation lifecycle work in #158 plus qualification in #143,
+  before treating this as
   production transport.
 - Keep plaintext transport limited to tests.
 - Keep the server wrapping `SessionStoreBackend` rather than owning storage.
@@ -235,7 +267,7 @@ let _remote = remote.with_max_frame_size(1024 * 1024);
 
 - Source checked: `Cargo.toml`, `src/lib.rs`, client, server, protocol, and
   tests.
-- `tests/authenticated_replica_identity.rs` covers exact identity, routing
+- `tests/authenticated_replica_identity.rs` covers exact v4 profile/identity, routing
   aliases, certificate/claim/scope mismatches, downgrade and malformed Hello,
   reconnect/rotation, relabeling, and replayed challenge responses over mTLS.
 - `tests/three_node_quorum.rs` covers typed TTL and replication-tree-limit

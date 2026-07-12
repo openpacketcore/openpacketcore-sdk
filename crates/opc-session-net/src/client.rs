@@ -30,9 +30,12 @@ use tokio::sync::Mutex;
 use crate::error::ProtocolError;
 use crate::identity::RemoteReplicaBinding;
 use crate::protocol::{
-    ensure_frame_fits, read_frame, write_frame, Request, Response, RestoreScanWireRequest,
-    CONTRACT_VERSION, DEFAULT_MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE,
-    MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
+    ensure_frame_fits, read_frame, read_response_frame, write_frame, BootstrapHello,
+    BootstrapRequest, BootstrapResponse, ContractProfile, Request, Response,
+    RestoreScanWireRequest, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
+    MAX_HANDSHAKE_FRAME_SIZE, MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
+    MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
+    SESSION_NET_ALPN,
 };
 
 /// Resolver callback used by [`RemoteSessionBackend::new_with_resolver`].
@@ -47,6 +50,7 @@ struct Connection {
     reader: Box<dyn AsyncRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     authenticated_peer: Option<ReplicaId>,
+    contract_profile: ContractProfile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +71,8 @@ impl RemoteRequestFailure {
             ProtocolError::BackendUnavailable(_) => Self::Backend,
             ProtocolError::FrameTooLarge(_)
             | ProtocolError::VersionMismatch { .. }
+            | ProtocolError::ContractMismatch
+            | ProtocolError::InvalidWireValue
             | ProtocolError::UnexpectedResponse
             | ProtocolError::Serialization(_) => Self::Protocol,
         }
@@ -84,6 +90,33 @@ impl RemoteRequestFailure {
             Self::Protocol => "protocol",
             Self::Backend => "backend",
         }
+    }
+}
+
+fn invalidates_negotiated_contract(error: &ProtocolError) -> bool {
+    matches!(
+        error,
+        ProtocolError::Authentication
+            | ProtocolError::VersionMismatch { .. }
+            | ProtocolError::ContractMismatch
+            | ProtocolError::InvalidWireValue
+            | ProtocolError::UnexpectedResponse
+            | ProtocolError::FrameTooLarge(_)
+            | ProtocolError::Serialization(_)
+    )
+}
+
+const fn unavailable_capabilities() -> BackendCapabilities {
+    BackendCapabilities {
+        atomic_compare_and_set: false,
+        monotonic_fencing_token: false,
+        per_key_ttl: false,
+        server_side_lease_expiry: false,
+        ordered_replication_log: false,
+        batch_write: false,
+        watch: false,
+        restore_scan: false,
+        max_value_bytes: 0,
     }
 }
 
@@ -237,19 +270,21 @@ async fn open_connection(
         }
 
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
-        perform_client_handshake(&mut reader, &mut writer, &binding).await?;
+        let contract_profile = perform_client_handshake(&mut reader, &mut writer, &binding).await?;
         Ok(Connection {
             reader: Box::new(reader),
             writer: Box::new(writer),
             authenticated_peer: Some(binding.remote_replica_id().clone()),
+            contract_profile,
         })
     } else {
         let (mut reader, mut writer) = tokio::io::split(tcp);
-        perform_client_handshake(&mut reader, &mut writer, &binding).await?;
+        let contract_profile = perform_client_handshake(&mut reader, &mut writer, &binding).await?;
         Ok(Connection {
             reader: Box::new(reader),
             writer: Box::new(writer),
             authenticated_peer: None,
+            contract_profile,
         })
     }
 }
@@ -258,7 +293,7 @@ async fn perform_client_handshake<R, W>(
     reader: &mut R,
     writer: &mut W,
     binding: &RemoteReplicaBinding,
-) -> Result<(), ProtocolError>
+) -> Result<ContractProfile, ProtocolError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -267,52 +302,45 @@ where
     let configuration_id = binding.configuration_id().to_hex();
     write_frame(
         writer,
-        &Request::Hello {
+        &BootstrapRequest::Hello(BootstrapHello {
             contract_version: CONTRACT_VERSION,
             node_id: binding.local_replica_id().as_str().to_string(),
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(configuration_id.clone()),
             handshake_nonce: Some(handshake_nonce),
-        },
+            contract_profile: Some(CURRENT_CONTRACT_PROFILE),
+        }),
     )
     .await?;
 
-    let ack: Response = read_frame(reader, MAX_HANDSHAKE_FRAME_SIZE).await?;
+    let ack: BootstrapResponse = read_frame(reader, MAX_HANDSHAKE_FRAME_SIZE).await?;
     match ack {
-        Response::HelloAck {
-            contract_version,
-            server_replica_id,
-            accepted_client_replica_id,
-            cluster_id,
-            configuration_id: accepted_configuration_id,
-            handshake_nonce: accepted_nonce,
-        } => {
-            if contract_version != CONTRACT_VERSION {
+        BootstrapResponse::HelloAck(ack) => {
+            if ack.contract_version != CONTRACT_VERSION {
                 return Err(ProtocolError::VersionMismatch {
                     local: CONTRACT_VERSION,
-                    remote: contract_version,
+                    remote: ack.contract_version,
                 });
             }
-            let identity_matches = server_replica_id.as_deref()
+            if ack.contract_profile != Some(CURRENT_CONTRACT_PROFILE) {
+                return Err(ProtocolError::ContractMismatch);
+            }
+            let identity_matches = ack.server_replica_id.as_deref()
                 == Some(binding.remote_replica_id().as_str())
-                && accepted_client_replica_id.as_deref()
+                && ack.accepted_client_replica_id.as_deref()
                     == Some(binding.local_replica_id().as_str())
-                && cluster_id.as_deref() == Some(binding.cluster_id().as_str())
-                && accepted_configuration_id.as_deref() == Some(configuration_id.as_str());
+                && ack.cluster_id.as_deref() == Some(binding.cluster_id().as_str())
+                && ack.configuration_id.as_deref() == Some(configuration_id.as_str());
             if !identity_matches {
                 return Err(ProtocolError::Authentication);
             }
-            if accepted_nonce != Some(handshake_nonce) {
+            if ack.handshake_nonce != Some(handshake_nonce) {
                 return Err(ProtocolError::UnexpectedResponse);
             }
-            Ok(())
+            Ok(CURRENT_CONTRACT_PROFILE)
         }
-        Response::HelloRejected { .. } => Err(ProtocolError::Authentication),
-        response => {
-            discard_replication_payloads_from_response(response);
-            Err(ProtocolError::UnexpectedResponse)
-        }
+        BootstrapResponse::HelloRejected { .. } => Err(ProtocolError::Authentication),
     }
 }
 
@@ -337,7 +365,7 @@ pub struct RemoteSessionBackend {
     deadline: Duration,
     max_frame_size: usize,
     conn: Arc<Mutex<Option<Connection>>>,
-    cached_capabilities: Arc<RwLock<Option<BackendCapabilities>>>,
+    cached_capabilities: Arc<RwLock<Option<(ContractProfile, BackendCapabilities)>>>,
 }
 
 impl std::fmt::Debug for RemoteSessionBackend {
@@ -457,6 +485,8 @@ impl RemoteSessionBackend {
         &self,
         req: Request,
     ) -> Result<Response, RemoteRequestFailure> {
+        ensure_frame_fits(&req, self.max_frame_size)
+            .map_err(|error| RemoteRequestFailure::from_protocol_error(&error))?;
         let mut last_failure = None;
         let mut request_in_flight = true;
         let attempts = async {
@@ -520,7 +550,12 @@ impl RemoteSessionBackend {
                 *guard = Some(conn);
                 Ok(resp)
             }
-            Err(e) => Err(e),
+            Err(error) => {
+                if invalidates_negotiated_contract(&error) {
+                    self.clear_cached_capabilities();
+                }
+                Err(error)
+            }
         }
     }
 
@@ -531,16 +566,7 @@ impl RemoteSessionBackend {
             self.binding.clone(),
         )
         .await;
-        if result.as_ref().is_err_and(|error| {
-            matches!(
-                error,
-                ProtocolError::Authentication
-                    | ProtocolError::VersionMismatch { .. }
-                    | ProtocolError::UnexpectedResponse
-                    | ProtocolError::FrameTooLarge(_)
-                    | ProtocolError::Serialization(_)
-            )
-        }) {
+        if result.as_ref().is_err_and(invalidates_negotiated_contract) {
             self.clear_cached_capabilities();
         }
         result
@@ -556,13 +582,16 @@ impl RemoteSessionBackend {
         {
             return Err(ProtocolError::Authentication);
         }
+        if conn.contract_profile != CURRENT_CONTRACT_PROFILE {
+            return Err(ProtocolError::ContractMismatch);
+        }
         write_frame(&mut conn.writer, req).await?;
-        read_frame(&mut conn.reader, self.max_frame_size).await
+        read_response_frame(&mut conn.reader, self.max_frame_size).await
     }
 
     fn remember_capabilities(&self, caps: BackendCapabilities) {
         if let Ok(mut cached) = self.cached_capabilities.write() {
-            *cached = Some(caps);
+            *cached = Some((CURRENT_CONTRACT_PROFILE, caps));
         }
     }
 
@@ -577,14 +606,16 @@ impl RemoteSessionBackend {
             .read()
             .ok()
             .and_then(|cached| *cached)
+            .and_then(|(profile, caps)| (profile == CURRENT_CONTRACT_PROFILE).then_some(caps))
     }
 
     fn capabilities_for_transport(
         &self,
         mut caps: BackendCapabilities,
-        fresh_v3_negotiation: bool,
+        fresh_v4_negotiation: bool,
     ) -> BackendCapabilities {
-        if !fresh_v3_negotiation || self.max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
+        caps.max_value_bytes = caps.max_value_bytes.min(self.max_frame_size);
+        if !fresh_v4_negotiation || self.max_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
             caps.restore_scan = false;
         }
         caps
@@ -602,9 +633,9 @@ impl RemoteSessionBackend {
             tracing::warn!(
                 target = %self.target,
                 reason,
-                "remote capabilities probe failed before any cached success; returning minimal capabilities"
+                "remote capabilities probe failed before any cached success; returning unavailable capabilities"
             );
-            BackendCapabilities::minimal()
+            unavailable_capabilities()
         }
     }
 
@@ -633,7 +664,14 @@ impl SessionBackend for RemoteSessionBackend {
             }
             Ok(response) => {
                 discard_replication_payloads_from_response(response);
-                self.capabilities_after_probe_failure("unexpected_response")
+                self.discard_connection().await;
+                self.clear_cached_capabilities();
+                tracing::warn!(
+                    target = %self.target,
+                    reason = "unexpected_response",
+                    "remote capabilities probe violated the negotiated contract; returning unavailable capabilities"
+                );
+                unavailable_capabilities()
             }
             Err(err) => {
                 let reason = store_error_kind(&err);
@@ -708,11 +746,24 @@ impl SessionBackend for RemoteSessionBackend {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        if ops.len() > MAX_SESSION_NET_BATCH_OPERATIONS {
+            return Err(StoreError::ReplicationOperationLimitExceeded);
+        }
         for op in &ops {
             op.validate_ttls()?;
         }
+        let expected_results = ops.len();
         match self.send_request_with_retry(Request::Batch { ops }).await? {
-            Response::Batch(res) => res,
+            Response::Batch(Ok(results)) if results.len() == expected_results => Ok(results),
+            Response::Batch(Ok(results)) => {
+                drop(results);
+                self.discard_connection().await;
+                self.clear_cached_capabilities();
+                Err(StoreError::BackendUnavailable(
+                    "remote batch response violated the protocol contract".to_string(),
+                ))
+            }
+            Response::Batch(Err(error)) => Err(error),
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
             response => {
                 discard_replication_payloads_from_response(response);
@@ -732,7 +783,11 @@ impl SessionBackend for RemoteSessionBackend {
             });
         }
         let wire_request = RestoreScanWireRequest::try_from(&request)?;
-        let max_response_frame_size = u32::try_from(self.max_frame_size).unwrap_or(u32::MAX);
+        let max_response_frame_size = u32::try_from(self.max_frame_size).map_err(|_| {
+            StoreError::InvalidRestoreScanRequest(
+                "configured response frame size exceeds the protocol range".to_string(),
+            )
+        })?;
         let outbound = Request::ScanRestoreRecords {
             request: wire_request,
             max_response_frame_size,
@@ -836,12 +891,23 @@ impl SessionBackend for RemoteSessionBackend {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        if limit > MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES {
+            return Err(StoreError::ReplicationOperationLimitExceeded);
+        }
         match self
             .send_request_with_retry(Request::GetReplicationLog { start, limit })
             .await?
         {
             Response::GetReplicationLog(res) => {
                 let entries = res?;
+                if entries.len() > limit {
+                    drop(validate_replication_page_owned(entries));
+                    self.discard_connection().await;
+                    self.clear_cached_capabilities();
+                    return Err(StoreError::BackendUnavailable(
+                        "remote replication page violated the protocol contract".to_string(),
+                    ));
+                }
                 validate_replication_page_owned(entries)
             }
             Response::Error { message } => Err(StoreError::BackendUnavailable(message)),
@@ -871,6 +937,9 @@ impl SessionBackend for RemoteSessionBackend {
         &self,
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
+        if entries.len() > MAX_SESSION_NET_REBUILD_ENTRIES {
+            return Err(StoreError::ReplicationOperationLimitExceeded);
+        }
         let entries = validate_replication_prefix_owned(entries)?;
         match self
             .send_request_with_retry(Request::RebuildReplicationState { entries })
@@ -1004,7 +1073,7 @@ async fn watch_connect_and_read(
     let open = async {
         let mut connection = open_connection(target, tls_config, binding).await?;
         write_frame(&mut connection.writer, &Request::Watch { start_sequence }).await?;
-        match read_frame::<_, Response>(&mut connection.reader, max_frame_size).await? {
+        match read_response_frame(&mut connection.reader, max_frame_size).await? {
             Response::WatchStream => Ok::<_, ProtocolError>(connection.reader),
             Response::Error { .. } => Err(ProtocolError::BackendUnavailable(
                 "watch request rejected".to_string(),
@@ -1030,7 +1099,7 @@ async fn watch_connect_and_read(
     };
 
     loop {
-        match read_frame::<_, Response>(&mut reader, max_frame_size).await {
+        match read_response_frame(&mut reader, max_frame_size).await {
             Ok(Response::WatchEntry(item)) => {
                 let item = item.and_then(ReplicationEntry::into_validated);
                 if tx.send(item).await.is_err() {
@@ -1123,6 +1192,7 @@ mod tests {
         };
         Response::HelloAck {
             contract_version: CONTRACT_VERSION,
+            contract_profile: Some(CURRENT_CONTRACT_PROFILE),
             server_replica_id: expected_server_replica_id.clone(),
             accepted_client_replica_id: Some(node_id.clone()),
             cluster_id: cluster_id.clone(),
@@ -1131,12 +1201,12 @@ mod tests {
         }
     }
 
-    fn forged_deadline_entry() -> ReplicationEntry {
+    fn valid_deadline_entry() -> ReplicationEntry {
         let timestamp =
             opc_types::Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
         let expires_at = opc_types::Timestamp::from_offset_datetime(
             time::OffsetDateTime::UNIX_EPOCH
-                .checked_add(time::Duration::seconds(61))
+                .checked_add(time::Duration::seconds(60))
                 .expect("representable test deadline"),
         );
         ReplicationEntry {
@@ -1158,6 +1228,22 @@ mod tests {
         }
     }
 
+    fn forge_deadline_in_wire_response(
+        mut response: serde_json::Value,
+        entry_pointer: &str,
+    ) -> serde_json::Value {
+        let forged_expires_at = opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH
+                .checked_add(time::Duration::seconds(61))
+                .expect("representable forged deadline"),
+        );
+        response
+            .pointer_mut(entry_pointer)
+            .expect("wire response entry")["operation_nodes"][0]["RefreshTtl"]["expires_at"] =
+            serde_json::to_value(forged_expires_at).expect("serialize forged deadline");
+        response
+    }
+
     fn operation_tree_at_depth(depth: usize) -> opc_session_store::ReplicationOp {
         let mut op = opc_session_store::ReplicationOp::Batch { ops: Vec::new() };
         for _ in 1..depth {
@@ -1166,17 +1252,17 @@ mod tests {
         op
     }
 
-    fn over_depth_replication_entry() -> ReplicationEntry {
+    fn replication_entry_at_depth(depth: usize) -> ReplicationEntry {
         ReplicationEntry {
             sequence: 1,
             tx_id: "over-depth-response".to_string(),
-            op: operation_tree_at_depth(MAX_REPLICATION_OPERATION_DEPTH + 1),
+            op: operation_tree_at_depth(depth),
             timestamp: opc_types::Timestamp::now_utc(),
         }
     }
 
-    fn over_count_replication_entry() -> ReplicationEntry {
-        let ops = (0..MAX_REPLICATION_OPERATIONS_PER_ENTRY)
+    fn replication_entry_at_operation_limit() -> ReplicationEntry {
+        let ops = (1..MAX_REPLICATION_OPERATIONS_PER_ENTRY)
             .map(|_| opc_session_store::ReplicationOp::Batch { ops: Vec::new() })
             .collect();
         ReplicationEntry {
@@ -1229,6 +1315,7 @@ mod tests {
                 &mut stream,
                 &Response::HelloAck {
                     contract_version: CONTRACT_VERSION - 1,
+                    contract_profile: None,
                     server_replica_id: None,
                     accepted_client_replica_id: None,
                     cluster_id: None,
@@ -1290,10 +1377,40 @@ mod tests {
         (addr, handle)
     }
 
+    async fn contract_profile_mismatch_server(
+        contract_profile: Option<ContractProfile>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            let mut ack = successful_hello_ack(&hello);
+            let Response::HelloAck {
+                contract_profile: accepted_profile,
+                ..
+            } = &mut ack
+            else {
+                unreachable!("helper always returns HelloAck");
+            };
+            *accepted_profile = contract_profile;
+            write_frame(&mut stream, &ack)
+                .await
+                .expect("write incompatible hello ack");
+        });
+        (addr, handle)
+    }
+
     #[tokio::test]
     async fn resolver_backend_reconnects_to_changed_address() {
         let caps_a = BackendCapabilities::minimal();
         let caps_b = BackendCapabilities::all_enabled();
+        let mut expected_caps_b = caps_b;
+        expected_caps_b.max_value_bytes = DEFAULT_MAX_FRAME_SIZE;
         let (addr_a, handle_a) = capability_server(caps_a).await;
         let (addr_b, handle_b) = capability_server(caps_b).await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1317,7 +1434,7 @@ mod tests {
         assert_eq!(backend.capabilities().await, caps_a);
         let _ = handle_a.await;
 
-        assert_eq!(backend.capabilities().await, caps_b);
+        assert_eq!(backend.capabilities().await, expected_caps_b);
         let _ = handle_b.await;
         assert!(calls.load(Ordering::SeqCst) >= 2);
     }
@@ -1381,7 +1498,7 @@ mod tests {
 
         assert_eq!(
             backend.capabilities().await,
-            BackendCapabilities::minimal(),
+            unavailable_capabilities(),
             "an explicitly incompatible protocol must clear the entire negotiated cache"
         );
         let _ = incompatible_handle.await;
@@ -1411,18 +1528,119 @@ mod tests {
                 Some(Duration::from_secs(1)),
             );
 
-            assert_eq!(
-                backend.capabilities().await,
-                BackendCapabilities::all_enabled()
-            );
+            let mut expected = BackendCapabilities::all_enabled();
+            expected.max_value_bytes = DEFAULT_MAX_FRAME_SIZE;
+            assert_eq!(backend.capabilities().await, expected);
             let _ = compatible_handle.await;
             assert_eq!(
                 backend.capabilities().await,
-                BackendCapabilities::minimal(),
+                unavailable_capabilities(),
                 "an invalid fresh HelloAck must clear every cached capability"
             );
             let _ = invalid_handle.await;
         }
+    }
+
+    #[tokio::test]
+    async fn missing_or_wrong_v4_contract_profile_clears_all_cached_capabilities() {
+        let mut wrong_profile = CURRENT_CONTRACT_PROFILE;
+        wrong_profile.error_set_revision = wrong_profile.error_set_revision.saturating_add(1);
+
+        for incompatible_profile in [None, Some(wrong_profile)] {
+            let (compatible_addr, compatible_handle) =
+                capability_server(BackendCapabilities::all_enabled()).await;
+            let (incompatible_addr, incompatible_handle) =
+                contract_profile_mismatch_server(incompatible_profile).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let resolver_calls = calls.clone();
+            let resolver: RemoteAddrResolver = Arc::new(move || {
+                let call = resolver_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        Ok(compatible_addr)
+                    } else {
+                        Ok(incompatible_addr)
+                    }
+                }
+                .boxed()
+            });
+            let backend = RemoteSessionBackend::new_insecure_with_resolver(
+                resolver,
+                Some(Duration::from_secs(1)),
+            );
+
+            assert!(backend.capabilities().await.restore_scan);
+            let _ = compatible_handle.await;
+            assert_eq!(
+                backend.capabilities().await,
+                unavailable_capabilities(),
+                "same-version peers with a missing or different contract profile must fail closed"
+            );
+            let _ = incompatible_handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_batch_response_count_discards_connection_and_capability_cache() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write hello ack");
+
+            let capabilities: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read capabilities request");
+            assert!(matches!(capabilities, Request::Capabilities));
+            write_frame(
+                &mut stream,
+                &Response::Capabilities(BackendCapabilities::all_enabled()),
+            )
+            .await
+            .expect("write capabilities response");
+
+            let batch: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read batch request");
+            assert!(matches!(batch, Request::Batch { ops } if ops.len() == 1));
+            write_frame(&mut stream, &Response::Batch(Ok(Vec::new())))
+                .await
+                .expect("write wrong-cardinality batch response");
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_millis(250)));
+
+        assert!(backend.capabilities().await.restore_scan);
+        let key = match valid_deadline_entry().op {
+            opc_session_store::ReplicationOp::RefreshTtl { key, .. } => key,
+            _ => unreachable!("fixture operation is fixed"),
+        };
+        let error = backend
+            .batch(vec![SessionOp::Get { key }])
+            .await
+            .expect_err("wrong response cardinality must fail closed");
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable(
+                "remote batch response violated the protocol contract".to_string()
+            )
+        );
+        assert!(
+            backend.conn.lock().await.is_none(),
+            "the violating connection must not return to the pool"
+        );
+        let _ = server.await;
+        assert_eq!(
+            backend.capabilities().await,
+            unavailable_capabilities(),
+            "a later failed probe must not reuse capabilities negotiated on the violating connection"
+        );
     }
 
     #[tokio::test]
@@ -1481,11 +1699,14 @@ mod tests {
                 .expect("read restore request");
             assert!(matches!(request, Request::ScanRestoreRecords { .. }));
 
-            let mut invalid_page = RestoreScanPage::new(Vec::new(), 0, None);
-            invalid_page.loaded_count = 1;
-            write_frame(&mut stream, &Response::ScanRestoreRecords(Ok(invalid_page)))
+            let mut invalid_page = serde_json::to_value(Response::ScanRestoreRecords(Ok(
+                RestoreScanPage::new(Vec::new(), 0, None),
+            )))
+            .expect("serialize valid restore page");
+            invalid_page["ScanRestoreRecords"]["Ok"]["loaded_count"] = serde_json::json!(1);
+            write_frame(&mut stream, &invalid_page)
                 .await
-                .expect("write invalid page");
+                .expect("write malformed restore-page wire response");
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
 
@@ -1493,7 +1714,12 @@ mod tests {
             .scan_restore_records(RestoreScanRequest::all(1))
             .await
             .expect_err("malformed peer page must fail closed");
-        assert!(matches!(error, StoreError::InvalidRestoreScanResponse(_)));
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable(
+                "remote session backend request failed: protocol".to_string()
+            )
+        );
         assert!(
             backend.conn.lock().await.is_none(),
             "a connection that returned a malformed page must not be reused"
@@ -1519,12 +1745,15 @@ mod tests {
                 .await
                 .expect("read replication-log request");
             assert!(matches!(request, Request::GetReplicationLog { .. }));
-            write_frame(
-                &mut stream,
-                &Response::GetReplicationLog(Ok(vec![forged_deadline_entry()])),
-            )
-            .await
-            .expect("write forged replication-log response");
+            let response =
+                serde_json::to_value(Response::GetReplicationLog(Ok(
+                    vec![valid_deadline_entry()],
+                )))
+                .expect("serialize valid replication-log response");
+            let response = forge_deadline_in_wire_response(response, "/GetReplicationLog/Ok/0");
+            write_frame(&mut stream, &response)
+                .await
+                .expect("write forged replication-log wire response");
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
 
@@ -1532,7 +1761,12 @@ mod tests {
             .get_replication_log(1, 1)
             .await
             .expect_err("forged response deadline must fail closed");
-        assert_eq!(error, StoreError::InvalidSessionTtl);
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable(
+                "remote session backend request failed: protocol".to_string()
+            )
+        );
         let _ = server.await;
     }
 
@@ -1557,12 +1791,12 @@ mod tests {
             write_frame(&mut stream, &Response::WatchStream)
                 .await
                 .expect("write watch acknowledgement");
-            write_frame(
-                &mut stream,
-                &Response::WatchEntry(Ok(forged_deadline_entry())),
-            )
-            .await
-            .expect("write forged watch entry");
+            let response = serde_json::to_value(Response::WatchEntry(Ok(valid_deadline_entry())))
+                .expect("serialize valid watch response");
+            let response = forge_deadline_in_wire_response(response, "/WatchEntry/Ok");
+            write_frame(&mut stream, &response)
+                .await
+                .expect("write forged watch wire response");
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
         let mut watch = backend.watch(1).await.expect("create watch stream");
@@ -1572,7 +1806,10 @@ mod tests {
             .expect("watch response deadline")
             .expect("watch error item")
             .expect_err("forged watch deadline must fail closed");
-        assert_eq!(error, StoreError::InvalidSessionTtl);
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable("remote session watch failed: protocol".to_string())
+        );
         let _ = server.await;
     }
 
@@ -1595,14 +1832,20 @@ mod tests {
                 .expect("read replication-log request");
             assert!(matches!(request, Request::GetReplicationLog { .. }));
 
-            let response = Response::GetReplicationLog(Ok(vec![over_depth_replication_entry()]));
+            let mut response = serde_json::to_value(Response::GetReplicationLog(Ok(vec![
+                replication_entry_at_depth(MAX_REPLICATION_OPERATION_DEPTH),
+            ])))
+            .expect("serialize exact-depth replication-log response");
+            let nodes = response["GetReplicationLog"]["Ok"][0]["operation_nodes"]
+                .as_array_mut()
+                .expect("flat replication operation nodes");
+            nodes.insert(
+                nodes.len() - 1,
+                serde_json::json!({"Batch": {"child_count": 1}}),
+            );
             write_frame(&mut stream, &response)
                 .await
-                .expect("write over-depth replication-log response");
-            let Response::GetReplicationLog(Ok(entries)) = response else {
-                unreachable!("test response shape is fixed")
-            };
-            drop(validate_replication_page_owned(entries));
+                .expect("write over-depth replication-log wire response");
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
 
@@ -1613,7 +1856,12 @@ mod tests {
                 panic!("an over-depth log entry must not be returned")
             }
         };
-        assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable(
+                "remote session backend request failed: protocol".to_string()
+            )
+        );
         let _ = server.await;
     }
 
@@ -1639,14 +1887,18 @@ mod tests {
                 .await
                 .expect("write watch acknowledgement");
 
-            let response = Response::WatchEntry(Ok(over_count_replication_entry()));
+            let mut response = serde_json::to_value(Response::WatchEntry(Ok(
+                replication_entry_at_operation_limit(),
+            )))
+            .expect("serialize maximum-width watch response");
+            let nodes = response["WatchEntry"]["Ok"]["operation_nodes"]
+                .as_array_mut()
+                .expect("flat replication operation nodes");
+            let leaf = nodes.last().expect("last operation node").clone();
+            nodes.push(leaf);
             write_frame(&mut stream, &response)
                 .await
-                .expect("write over-count watch entry");
-            let Response::WatchEntry(Ok(entry)) = response else {
-                unreachable!("test response shape is fixed")
-            };
-            drop(entry.into_validated());
+                .expect("write over-count watch wire response");
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
         let mut watch = backend.watch(1).await.expect("create watch stream");
@@ -1662,7 +1914,10 @@ mod tests {
                 panic!("an over-count watch entry must not be delivered")
             }
         };
-        assert_eq!(error, StoreError::ReplicationOperationLimitExceeded);
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable("remote session watch failed: protocol".to_string())
+        );
         let _ = server.await;
     }
 
@@ -1711,6 +1966,84 @@ mod tests {
             .await
             .expect_err("zero limit must fail validation");
         assert!(matches!(error, StoreError::InvalidRestoreScanRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn collection_limits_fail_before_resolving_or_dialing() {
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&resolve_calls);
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok("127.0.0.1:1".parse().expect("address")) }.boxed()
+        });
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(1)),
+        );
+
+        let key = match valid_deadline_entry().op {
+            opc_session_store::ReplicationOp::RefreshTtl { key, .. } => key,
+            _ => unreachable!("fixture operation is fixed"),
+        };
+        let batch_error = backend
+            .batch(vec![
+                SessionOp::Get { key };
+                MAX_SESSION_NET_BATCH_OPERATIONS + 1
+            ])
+            .await
+            .expect_err("oversized batch must fail locally");
+        assert_eq!(batch_error, StoreError::ReplicationOperationLimitExceeded);
+
+        let log_error = backend
+            .get_replication_log(1, MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES + 1)
+            .await
+            .expect_err("oversized log page must fail locally");
+        assert_eq!(log_error, StoreError::ReplicationOperationLimitExceeded);
+
+        let lightweight_entry = ReplicationEntry {
+            sequence: 1,
+            tx_id: String::new(),
+            op: opc_session_store::ReplicationOp::Batch { ops: Vec::new() },
+            timestamp: opc_types::Timestamp::now_utc(),
+        };
+        let rebuild_error = backend
+            .rebuild_replication_state(vec![lightweight_entry; MAX_SESSION_NET_REBUILD_ENTRIES + 1])
+            .await
+            .expect_err("oversized rebuild must fail locally");
+        assert_eq!(rebuild_error, StoreError::ReplicationOperationLimitExceeded);
+
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            0,
+            "collection preflight failures must not resolve or dial a peer"
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[tokio::test]
+    async fn restore_frame_size_beyond_u32_fails_before_resolving_or_dialing() {
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&resolve_calls);
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok("127.0.0.1:1".parse().expect("address")) }.boxed()
+        });
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(1)),
+        )
+        .with_max_frame_size(u32::MAX as usize + 1);
+
+        let error = backend
+            .scan_restore_records(RestoreScanRequest::all(1))
+            .await
+            .expect_err("an unrepresentable response frame size must fail locally");
+        assert!(matches!(error, StoreError::InvalidRestoreScanRequest(_)));
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            0,
+            "restore width preflight failure must not resolve or dial a peer"
+        );
     }
 
     #[test]

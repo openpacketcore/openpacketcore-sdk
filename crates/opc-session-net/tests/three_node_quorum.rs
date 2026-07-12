@@ -26,11 +26,11 @@ use opc_session_store::model::{
 use opc_session_store::quorum::{FencedSessionReplica, QuorumSessionStore, SessionStoreBackend};
 use opc_session_store::record::{EncryptedSessionPayload, StoredSessionRecord};
 use opc_session_store::{
-    validate_replication_prefix_owned, DurableReadinessOptions, DurableReadinessState,
-    QuorumReplicaDescriptor, QuorumReplicaMember, QuorumTopologyConfig, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity,
-    RestoreScanCursor, RestoreScanRequest, RestoreScanScope, SqliteSessionBackend, StoreError,
-    ValidatedQuorumTopology, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    DurableReadinessOptions, DurableReadinessState, QuorumReplicaDescriptor, QuorumReplicaMember,
+    QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
+    ReplicaReadinessFailure, ReplicaTlsIdentity, RestoreScanCursor, RestoreScanRequest,
+    RestoreScanScope, SqliteSessionBackend, StoreError, ValidatedQuorumTopology,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -215,6 +215,27 @@ fn over_count_replication_entry(sequence: u64) -> ReplicationEntry {
         op: ReplicationOp::Batch { ops },
         timestamp: Timestamp::now_utc(),
     }
+}
+
+fn wire_operation_nodes_mut<'a>(
+    request: &'a mut serde_json::Value,
+    entry_pointer: &str,
+) -> &'a mut Vec<serde_json::Value> {
+    request
+        .pointer_mut(entry_pointer)
+        .expect("wire replication entry")["operation_nodes"]
+        .as_array_mut()
+        .expect("flat wire replication operation nodes")
+}
+
+fn wire_refresh_ttl_node_mut<'a>(
+    request: &'a mut serde_json::Value,
+    entry_pointer: &str,
+) -> &'a mut serde_json::Value {
+    wire_operation_nodes_mut(request, entry_pointer)
+        .iter_mut()
+        .find(|node| node.get("RefreshTtl").is_some())
+        .expect("wire refresh-TTL operation node")
 }
 
 #[derive(Clone)]
@@ -579,6 +600,8 @@ fn hello_ack_for(
     };
     opc_session_net::Response::HelloAck {
         contract_version,
+        contract_profile: (contract_version == opc_session_net::protocol::CONTRACT_VERSION)
+            .then_some(opc_session_net::protocol::CURRENT_CONTRACT_PROFILE),
         server_replica_id: expected_server_replica_id.clone(),
         accepted_client_replica_id: Some(node_id.clone()),
         cluster_id: cluster_id.clone(),
@@ -916,6 +939,7 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
         &mut stream,
         &Request::Hello {
             contract_version: CONTRACT_VERSION,
+            contract_profile: Some(opc_session_net::protocol::CURRENT_CONTRACT_PROFILE),
             node_id: binding.local_replica_id().as_str().to_string(),
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
@@ -937,19 +961,19 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
         } if echoed == nonce
     ));
 
-    write_frame(
-        &mut stream,
-        &Request::ReplicateEntry {
-            entry: ReplicationEntry {
-                sequence: 0,
-                tx_id: "wire-transaction-canary".to_string(),
-                op: ReplicationOp::Batch { ops: Vec::new() },
-                timestamp: Timestamp::now_utc(),
-            },
+    let mut malformed = serde_json::to_value(Request::ReplicateEntry {
+        entry: ReplicationEntry {
+            sequence: 1,
+            tx_id: "wire-transaction-canary".to_string(),
+            op: ReplicationOp::Batch { ops: Vec::new() },
+            timestamp: Timestamp::now_utc(),
         },
-    )
-    .await
-    .expect("write malformed replication entry");
+    })
+    .expect("serialize valid replication entry");
+    malformed["ReplicateEntry"]["entry"]["sequence"] = serde_json::json!(0);
+    write_frame(&mut stream, &malformed)
+        .await
+        .expect("write zero-sequence replication wire entry");
     let rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read typed sequence rejection");
@@ -1029,6 +1053,7 @@ async fn authenticated_server_rejects_operation_limits_and_keeps_connection_usab
         &mut stream,
         &Request::Hello {
             contract_version: CONTRACT_VERSION,
+            contract_profile: Some(opc_session_net::protocol::CURRENT_CONTRACT_PROFILE),
             node_id: binding.local_replica_id().as_str().to_string(),
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
@@ -1050,16 +1075,23 @@ async fn authenticated_server_rejects_operation_limits_and_keeps_connection_usab
         } if echoed == nonce
     ));
 
-    let request = Request::ReplicateEntry {
-        entry: over_depth_replication_entry(1),
-    };
+    let mut request = serde_json::to_value(Request::ReplicateEntry {
+        entry: ReplicationEntry {
+            sequence: 1,
+            tx_id: "wire-over-depth".to_string(),
+            op: operation_tree_at_depth(MAX_REPLICATION_OPERATION_DEPTH),
+            timestamp: Timestamp::now_utc(),
+        },
+    })
+    .expect("serialize exact-depth replication entry");
+    let nodes = wire_operation_nodes_mut(&mut request, "/ReplicateEntry/entry");
+    nodes.insert(
+        nodes.len() - 1,
+        serde_json::json!({"Batch": {"child_count": 1}}),
+    );
     write_frame(&mut stream, &request)
         .await
-        .expect("write over-depth replication entry");
-    let Request::ReplicateEntry { entry } = request else {
-        unreachable!("test request shape is fixed")
-    };
-    drop(entry.into_validated());
+        .expect("write over-depth replication wire entry");
 
     let rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
@@ -1070,16 +1102,22 @@ async fn authenticated_server_rejects_operation_limits_and_keeps_connection_usab
     ));
     assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
 
-    let request = Request::RebuildReplicationState {
-        entries: vec![over_count_replication_entry(1)],
+    let mut exact_count = over_count_replication_entry(1);
+    let ReplicationOp::Batch { ops } = &mut exact_count.op else {
+        unreachable!("fixture operation is fixed");
     };
+    ops.pop().expect("remove one operation for exact limit");
+    let mut request = serde_json::to_value(Request::RebuildReplicationState {
+        entries: vec![exact_count],
+    })
+    .expect("serialize exact-width replication rebuild");
+    let nodes = wire_operation_nodes_mut(&mut request, "/RebuildReplicationState/entries/0");
+    let leaf = nodes.last().expect("last operation node").clone();
+    nodes[0]["Batch"]["child_count"] = serde_json::json!(MAX_REPLICATION_OPERATIONS_PER_ENTRY);
+    nodes.push(leaf);
     write_frame(&mut stream, &request)
         .await
-        .expect("write over-count replication rebuild");
-    let Request::RebuildReplicationState { entries } = request else {
-        unreachable!("test request shape is fixed")
-    };
-    drop(validate_replication_prefix_owned(entries));
+        .expect("write over-count replication rebuild wire request");
 
     let rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
@@ -1129,6 +1167,7 @@ async fn authenticated_server_rejects_malformed_backend_log_and_watch_output() {
         &mut stream,
         &Request::Hello {
             contract_version: CONTRACT_VERSION,
+            contract_profile: Some(opc_session_net::protocol::CURRENT_CONTRACT_PROFILE),
             node_id: binding.local_replica_id().as_str().to_string(),
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
@@ -1220,6 +1259,7 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
         &mut stream,
         &Request::Hello {
             contract_version: CONTRACT_VERSION,
+            contract_profile: Some(opc_session_net::protocol::CURRENT_CONTRACT_PROFILE),
             node_id: binding.local_replica_id().as_str().to_string(),
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
@@ -1342,16 +1382,17 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
         key.clone(),
         owner.clone(),
         lease.fence(),
-        Duration::MAX,
+        Duration::from_secs(60),
     );
-    write_frame(
-        &mut stream,
-        &Request::ReplicateEntry {
-            entry: nested.clone(),
-        },
-    )
-    .await
-    .expect("write invalid nested replicated TTL");
+    let mut replicate_request = serde_json::to_value(Request::ReplicateEntry {
+        entry: nested.clone(),
+    })
+    .expect("serialize valid nested replicated TTL");
+    wire_refresh_ttl_node_mut(&mut replicate_request, "/ReplicateEntry/entry")["RefreshTtl"]
+        ["ttl"] = serde_json::to_value(Duration::MAX).expect("serialize hostile TTL");
+    write_frame(&mut stream, &replicate_request)
+        .await
+        .expect("write invalid nested replicated TTL wire request");
     let replicate_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read typed replicated TTL rejection");
@@ -1361,14 +1402,15 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
     ));
     assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 0);
 
-    write_frame(
-        &mut stream,
-        &Request::RebuildReplicationState {
-            entries: vec![nested],
-        },
-    )
-    .await
-    .expect("write invalid nested rebuild TTL");
+    let mut rebuild_request = serde_json::to_value(Request::RebuildReplicationState {
+        entries: vec![nested],
+    })
+    .expect("serialize valid nested rebuild TTL");
+    wire_refresh_ttl_node_mut(&mut rebuild_request, "/RebuildReplicationState/entries/0")
+        ["RefreshTtl"]["ttl"] = serde_json::to_value(Duration::MAX).expect("serialize hostile TTL");
+    write_frame(&mut stream, &rebuild_request)
+        .await
+        .expect("write invalid nested rebuild TTL wire request");
     let rebuild_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read typed rebuild TTL rejection");
@@ -1378,14 +1420,26 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
     ));
     assert_eq!(backend.rebuild_calls.load(Ordering::SeqCst), 0);
 
-    write_frame(
-        &mut stream,
-        &Request::ReplicateEntry {
-            entry: forged_refresh_deadline_entry(1, key, owner, lease.fence()),
-        },
-    )
-    .await
-    .expect("write forged replicated deadline");
+    let mut deadline_entry = forged_refresh_deadline_entry(1, key, owner, lease.fence());
+    let valid_expires_at = deadline_entry.timestamp;
+    let forged_expires_at = match &mut deadline_entry.op {
+        ReplicationOp::RefreshTtl { expires_at, .. } => {
+            let forged = *expires_at;
+            *expires_at = valid_expires_at;
+            forged
+        }
+        _ => unreachable!("fixture operation is fixed"),
+    };
+    let mut forged_request = serde_json::to_value(Request::ReplicateEntry {
+        entry: deadline_entry,
+    })
+    .expect("serialize valid replicated deadline");
+    wire_refresh_ttl_node_mut(&mut forged_request, "/ReplicateEntry/entry")["RefreshTtl"]
+        ["expires_at"] =
+        serde_json::to_value(forged_expires_at).expect("serialize forged deadline");
+    write_frame(&mut stream, &forged_request)
+        .await
+        .expect("write forged replicated deadline wire request");
     let forged_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read typed forged-deadline rejection");
@@ -1769,6 +1823,7 @@ async fn incompatible_client_receives_server_contract_before_disconnect() {
         &mut stream,
         &Request::Hello {
             contract_version: CONTRACT_VERSION - 1,
+            contract_profile: None,
             node_id: "old-client".to_string(),
             expected_server_replica_id: None,
             cluster_id: None,
@@ -1808,6 +1863,7 @@ async fn plaintext_rebuild_is_rejected_before_backend_dispatch() {
         &mut stream,
         &opc_session_net::Request::Hello {
             contract_version: opc_session_net::protocol::CONTRACT_VERSION,
+            contract_profile: Some(opc_session_net::protocol::CURRENT_CONTRACT_PROFILE),
             node_id: "plaintext-peer".to_string(),
             expected_server_replica_id: None,
             cluster_id: None,
@@ -1990,7 +2046,7 @@ async fn test_three_node_quorum_kill_and_restart() {
 async fn abort_and_wait_releases_listener_and_registered_handlers() {
     let mtls = mtls_configs();
     let (addr, _backend, handle) = start_server(&mtls, 2).await;
-    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_millis(200)));
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_millis(750)));
     let key = test_key_with_stable_id(b"shutdown-barrier");
 
     assert_eq!(
@@ -2017,7 +2073,7 @@ async fn abort_and_wait_releases_listener_and_registered_handlers() {
 async fn cancelling_abort_and_wait_cannot_leave_handler_live() {
     let mtls = mtls_configs();
     let (addr, _backend, handle) = start_server(&mtls, 2).await;
-    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_millis(200)));
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_millis(750)));
     let key = test_key_with_stable_id(b"cancelled-shutdown-barrier");
 
     assert_eq!(
@@ -2074,7 +2130,7 @@ async fn test_persistent_connection_reconnect_after_restart() {
 async fn capabilities_uses_cached_success_after_disconnect() {
     let mtls = mtls_configs();
     let (addr, _backend, handle) = start_server(&mtls, 2).await;
-    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_millis(200)));
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2)));
 
     let warmed = remote.capabilities().await;
     assert!(
@@ -2686,21 +2742,21 @@ async fn cached_capabilities_do_not_substitute_for_fresh_quorum_evidence() {
         1,
         1,
         addr1,
-        Some(Duration::from_millis(200)),
+        Some(Duration::from_secs(2)),
     ));
     let remote2 = Arc::new(remote_backend(
         &mtls,
         1,
         2,
         addr2,
-        Some(Duration::from_millis(200)),
+        Some(Duration::from_secs(2)),
     ));
     let remote3 = Arc::new(remote_backend(
         &mtls,
         1,
         3,
         addr3,
-        Some(Duration::from_millis(200)),
+        Some(Duration::from_secs(2)),
     ));
     let quorum = validated_quorum(
         1,

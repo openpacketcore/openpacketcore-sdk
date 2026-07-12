@@ -38,7 +38,8 @@ pub const WATCH_CHANNEL_CAPACITY: usize = 64;
 /// cryptographic-provider work, and the built-in replay adapters bounded. It
 /// is deliberately not configurable per replica because different limits
 /// could make replicas disagree about the same ordered log entry. Versioned
-/// pre-allocation wire decoding remains part of #134.
+/// `opc-session-net` protocol v4 pins and enforces this limit during
+/// pre-allocation wire decoding.
 pub const MAX_REPLICATION_OPERATION_DEPTH: usize = 16;
 
 /// Maximum number of operation nodes in one replication entry.
