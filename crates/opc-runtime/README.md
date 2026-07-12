@@ -26,8 +26,10 @@ resource budgets, source admission, and deterministic test clocks.
 - Shutdown APIs include `ShutdownToken`, `ShutdownPhase`, and `DrainHook`.
 - Admission APIs include `SourceTokenBucketPolicy`,
   `SourceTokenBucket`, and `SourceAdmissionDecision`.
-- UDP helpers expose destination-address metadata where the platform supports
-  it.
+- UDP helpers receive the concrete local destination and can send a reply from
+  that exact endpoint. Linux and Android use per-datagram packet-info ancillary
+  data; platforms without it only allow the send when a concrete socket bind
+  already guarantees the requested source.
 - Feature `observability` adds `init_observability_logging`.
 
 ```rust,no_run
@@ -39,6 +41,40 @@ async fn start() -> Result<opc_runtime::RuntimeHandle, opc_runtime::RuntimeError
     Ok(runtime)
 }
 ```
+
+Pair the receive metadata with `send_to_from` for wildcard-bound VIP listeners:
+
+```rust,no_run
+use std::{io, net::SocketAddr};
+
+use opc_runtime::bind_udp_socket_with_destination_metadata;
+
+async fn receive_and_reply(bind: SocketAddr) -> io::Result<()> {
+    let socket = bind_udp_socket_with_destination_metadata(bind)?;
+    let mut payload = [0_u8; 2048];
+    let received = socket.recv_from_with_destination(&mut payload).await?;
+    let local_source = received
+        .local_destination()
+        .socket_addr_value()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "udp_destination_missing"))?;
+
+    socket
+        .send_to_from(
+            &payload[..received.bytes()],
+            received.source(),
+            local_source,
+        )
+        .await?;
+    Ok(())
+}
+```
+
+`send_to_from` rejects source/peer family mismatches, a source port different
+from the bound socket, unspecified/multicast/broadcast sources, non-local
+addresses, and oversized datagrams before sending. It never silently falls
+back to kernel source selection. Product code remains responsible for carrying
+the observed destination through every normal, replay, retransmit, and error
+reply path.
 
 ## Relationships
 

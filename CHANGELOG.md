@@ -210,6 +210,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-runtime`: wildcard-bound UDP listeners can now pair
+  `recv_from_with_destination` with `send_to_from` so Linux/Android replies use
+  the exact concrete destination address observed on receive as their source.
+  The bounded packet-info send rejects invalid family, port, source-address,
+  and payload selections; platforms without ancillary source selection fail
+  explicitly unless a concrete bind already guarantees the requested source.
+  This supplies the SDK primitive tracked by #141; each consuming CNF must
+  still thread the observed destination through every reply path and prove the
+  peer observes its floating VIP as the source.
 - `opc-session-store`/`opc-amf-lite`: durable readiness no longer succeeds from
   a bound server or cached capabilities while real quorum operations fail.
   Probes and operations use one store-level policy and the same fresh

@@ -1,7 +1,8 @@
-//! UDP receive helpers with local destination metadata.
+//! UDP receive and exact-source reply helpers with local destination metadata.
 //!
 //! These helpers are intended for protocols such as IKEv2 NAT detection where a
-//! datagram's concrete local destination address is part of protocol evidence.
+//! datagram's concrete local destination address is part of protocol evidence
+//! and must also be selected as the source of the corresponding reply.
 
 use std::{
     fmt, io,
@@ -9,6 +10,8 @@ use std::{
 };
 
 use tokio::net::UdpSocket;
+
+const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
 
 /// Bind a UDP socket that can report local destination metadata on receive.
 ///
@@ -88,6 +91,37 @@ impl UdpDestinationMetadataSocket {
         buffer: &mut [u8],
     ) -> io::Result<UdpReceivedDatagram> {
         recv_udp_datagram_with_destination(&self.socket, buffer).await
+    }
+
+    /// Send one UDP datagram to `peer` from the exact `local_source` endpoint.
+    ///
+    /// This is the symmetric reply operation for
+    /// [`Self::recv_from_with_destination`]. On Linux and Android it selects
+    /// the source address with packet-info ancillary data. Other platforms
+    /// only send when this socket is concretely bound to `local_source`; they
+    /// return [`io::ErrorKind::Unsupported`] when exact source selection cannot
+    /// be guaranteed.
+    ///
+    /// Payloads larger than 65,507 bytes are rejected before touching the
+    /// socket. `local_source` must use this socket's address family and bound
+    /// port. It must be a concrete, unicast, locally available address. An IPv6
+    /// link-local source must include its interface scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] for an invalid payload or source
+    /// selection, [`io::ErrorKind::AddrNotAvailable`] when the source is not
+    /// local to this socket, [`io::ErrorKind::Unsupported`] when the platform
+    /// cannot guarantee exact selection, or an operating-system send error.
+    pub async fn send_to_from(
+        &self,
+        buffer: &[u8],
+        peer: SocketAddr,
+        local_source: SocketAddr,
+    ) -> io::Result<usize> {
+        let socket_local = self.socket.local_addr()?;
+        validate_send_to_from(buffer.len(), socket_local, peer, local_source)?;
+        platform::send_udp_datagram_from(&self.socket, buffer, peer, local_source).await
     }
 }
 
@@ -244,6 +278,125 @@ fn is_concrete_ip(ip: IpAddr) -> bool {
     !ip.is_unspecified()
 }
 
+fn validate_send_to_from(
+    payload_len: usize,
+    socket_local: SocketAddr,
+    peer: SocketAddr,
+    local_source: SocketAddr,
+) -> io::Result<()> {
+    if payload_len > MAX_UDP_PAYLOAD_BYTES {
+        return Err(udp_error(
+            io::ErrorKind::InvalidInput,
+            "udp_payload_too_large",
+        ));
+    }
+    if !same_address_family(socket_local, peer) || !same_address_family(peer, local_source) {
+        return Err(udp_error(
+            io::ErrorKind::InvalidInput,
+            "udp_source_family_mismatch",
+        ));
+    }
+    if local_source.port() != socket_local.port() {
+        return Err(udp_error(
+            io::ErrorKind::InvalidInput,
+            "udp_source_port_mismatch",
+        ));
+    }
+    validate_source_ip(local_source)?;
+    if is_concrete_ip(socket_local.ip()) && socket_local.ip() != local_source.ip() {
+        return Err(udp_error(
+            io::ErrorKind::AddrNotAvailable,
+            "udp_source_bound_address_mismatch",
+        ));
+    }
+    if let (SocketAddr::V6(socket_local), SocketAddr::V6(local_source)) =
+        (socket_local, local_source)
+    {
+        if socket_local.ip().is_unicast_link_local()
+            && socket_local.scope_id() != 0
+            && socket_local.scope_id() != local_source.scope_id()
+        {
+            return Err(udp_error(
+                io::ErrorKind::AddrNotAvailable,
+                "udp_source_bound_address_mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_ip(local_source: SocketAddr) -> io::Result<()> {
+    match local_source {
+        SocketAddr::V4(source) => {
+            let ip = *source.ip();
+            if ip.is_unspecified() {
+                return Err(udp_error(
+                    io::ErrorKind::InvalidInput,
+                    "udp_source_unspecified",
+                ));
+            }
+            if ip.is_multicast() {
+                return Err(udp_error(
+                    io::ErrorKind::InvalidInput,
+                    "udp_source_multicast",
+                ));
+            }
+            if ip.is_broadcast() {
+                return Err(udp_error(
+                    io::ErrorKind::InvalidInput,
+                    "udp_source_broadcast",
+                ));
+            }
+        }
+        SocketAddr::V6(source) => {
+            let ip = *source.ip();
+            if ip.is_unspecified() {
+                return Err(udp_error(
+                    io::ErrorKind::InvalidInput,
+                    "udp_source_unspecified",
+                ));
+            }
+            if ip.is_multicast() {
+                return Err(udp_error(
+                    io::ErrorKind::InvalidInput,
+                    "udp_source_multicast",
+                ));
+            }
+            if ip.is_unicast_link_local() && source.scope_id() == 0 {
+                return Err(udp_error(
+                    io::ErrorKind::InvalidInput,
+                    "udp_source_scope_required",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+const fn same_address_family(left: SocketAddr, right: SocketAddr) -> bool {
+    matches!(
+        (left, right),
+        (SocketAddr::V4(_), SocketAddr::V4(_)) | (SocketAddr::V6(_), SocketAddr::V6(_))
+    )
+}
+
+fn udp_error(kind: io::ErrorKind, code: &'static str) -> io::Error {
+    io::Error::new(kind, code)
+}
+
+fn validate_complete_datagram(sent: usize, payload_len: usize) -> io::Result<usize> {
+    if sent == payload_len {
+        return Ok(sent);
+    }
+    if sent == 0 {
+        return Err(udp_error(
+            io::ErrorKind::WriteZero,
+            "udp_datagram_write_zero",
+        ));
+    }
+    Err(udp_error(io::ErrorKind::Other, "udp_datagram_partial_send"))
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod platform {
     use std::{
@@ -253,15 +406,16 @@ mod platform {
     };
 
     use nix::sys::socket::{
-        recvmsg, setsockopt,
+        recvmsg, sendmsg, setsockopt,
         sockopt::{Ipv4PacketInfo, Ipv6RecvPacketInfo},
-        ControlMessageOwned, MsgFlags, SockaddrStorage,
+        ControlMessage, ControlMessageOwned, MsgFlags, SockaddrIn, SockaddrIn6, SockaddrStorage,
     };
     use tokio::{io::Interest, net::UdpSocket};
 
     use super::{
-        fallback_local_destination, UdpDestinationMetadataSupport, UdpLocalDestination,
-        UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
+        fallback_local_destination, udp_error, validate_complete_datagram,
+        UdpDestinationMetadataSupport, UdpLocalDestination, UdpLocalDestinationUnavailableReason,
+        UdpReceivedDatagram,
     };
 
     pub(super) fn enable_destination_metadata(
@@ -286,6 +440,121 @@ mod platform {
         socket
             .async_io(Interest::READABLE, || recv_packet_info(socket, buffer))
             .await
+    }
+
+    pub(super) async fn send_udp_datagram_from(
+        socket: &UdpSocket,
+        buffer: &[u8],
+        peer: SocketAddr,
+        local_source: SocketAddr,
+    ) -> io::Result<usize> {
+        let interface_index = local_source_interface(local_source);
+        let sent = socket
+            .async_io(Interest::WRITABLE, || {
+                send_packet_info(socket, buffer, peer, local_source, interface_index)
+            })
+            .await?;
+        validate_complete_datagram(sent, buffer.len())
+    }
+
+    fn send_packet_info(
+        socket: &UdpSocket,
+        buffer: &[u8],
+        peer: SocketAddr,
+        local_source: SocketAddr,
+        interface_index: u32,
+    ) -> io::Result<usize> {
+        let iov = [io::IoSlice::new(buffer)];
+        match (peer, local_source) {
+            (SocketAddr::V4(peer), SocketAddr::V4(source)) => {
+                let interface_index = i32::try_from(interface_index).map_err(|_| {
+                    udp_error(io::ErrorKind::InvalidInput, "udp_source_interface_invalid")
+                })?;
+                let packet_info = nix::libc::in_pktinfo {
+                    ipi_ifindex: interface_index,
+                    ipi_spec_dst: nix::libc::in_addr {
+                        s_addr: u32::from_ne_bytes(source.ip().octets()),
+                    },
+                    ipi_addr: nix::libc::in_addr { s_addr: 0 },
+                };
+                let control = [ControlMessage::Ipv4PacketInfo(&packet_info)];
+                let peer = SockaddrIn::from(peer);
+                sendmsg(
+                    socket.as_raw_fd(),
+                    &iov,
+                    &control,
+                    MsgFlags::empty(),
+                    Some(&peer),
+                )
+                .map_err(|error| map_send_error(error, local_source))
+            }
+            (SocketAddr::V6(peer), SocketAddr::V6(source)) => {
+                let packet_info = nix::libc::in6_pktinfo {
+                    ipi6_addr: nix::libc::in6_addr {
+                        s6_addr: source.ip().octets(),
+                    },
+                    ipi6_ifindex: interface_index,
+                };
+                let control = [ControlMessage::Ipv6PacketInfo(&packet_info)];
+                let peer = SockaddrIn6::from(peer);
+                sendmsg(
+                    socket.as_raw_fd(),
+                    &iov,
+                    &control,
+                    MsgFlags::empty(),
+                    Some(&peer),
+                )
+                .map_err(|error| map_send_error(error, local_source))
+            }
+            _ => Err(udp_error(
+                io::ErrorKind::InvalidInput,
+                "udp_source_family_mismatch",
+            )),
+        }
+    }
+
+    const fn local_source_interface(local_source: SocketAddr) -> u32 {
+        match local_source {
+            SocketAddr::V4(_) => 0,
+            SocketAddr::V6(source) if source.ip().is_unicast_link_local() => source.scope_id(),
+            SocketAddr::V6(_) => 0,
+        }
+    }
+
+    fn map_send_error(error: nix::errno::Errno, local_source: SocketAddr) -> io::Error {
+        match error {
+            nix::errno::Errno::EADDRNOTAVAIL | nix::errno::Errno::ENODEV => {
+                udp_error(io::ErrorKind::AddrNotAvailable, "udp_source_not_local")
+            }
+            nix::errno::Errno::EINVAL | nix::errno::Errno::ENETUNREACH
+                if source_bind_probe(local_source) == Some(false) =>
+            {
+                udp_error(io::ErrorKind::AddrNotAvailable, "udp_source_not_local")
+            }
+            nix::errno::Errno::ENOPROTOOPT
+            | nix::errno::Errno::EPROTONOSUPPORT
+            | nix::errno::Errno::EOPNOTSUPP => udp_error(
+                io::ErrorKind::Unsupported,
+                "udp_source_selection_unsupported",
+            ),
+            nix::errno::Errno::EMSGSIZE => {
+                udp_error(io::ErrorKind::InvalidInput, "udp_payload_too_large")
+            }
+            other => io::Error::from(other),
+        }
+    }
+
+    fn source_bind_probe(mut local_source: SocketAddr) -> Option<bool> {
+        // Linux may report a non-local packet-info source as EINVAL or
+        // ENETUNREACH, which are also valid peer/path errors. Probe only after
+        // one of those failures so the success path remains one sendmsg and a
+        // reachable peer is not misreported as a source-selection failure.
+        local_source.set_port(0);
+        match std::net::UdpSocket::bind(local_source) {
+            Ok(_) => Some(true),
+            Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => Some(false),
+            Err(_) => None,
+        }
     }
 
     fn recv_packet_info(socket: &UdpSocket, buffer: &mut [u8]) -> io::Result<UdpReceivedDatagram> {
@@ -362,6 +631,43 @@ mod platform {
         }
         None
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::{io, net::SocketAddr};
+
+        use nix::errno::Errno;
+
+        use super::map_send_error;
+
+        fn local_source() -> SocketAddr {
+            "127.0.0.1:500".parse().expect("fixed local source")
+        }
+
+        #[test]
+        fn send_error_mapping_preserves_retry_and_normalizes_static_failures() {
+            let would_block = map_send_error(Errno::EAGAIN, local_source());
+            assert_eq!(would_block.kind(), io::ErrorKind::WouldBlock);
+
+            for errno in [
+                Errno::ENOPROTOOPT,
+                Errno::EPROTONOSUPPORT,
+                Errno::EOPNOTSUPP,
+            ] {
+                let unsupported = map_send_error(errno, local_source());
+                assert_eq!(unsupported.kind(), io::ErrorKind::Unsupported);
+                assert_eq!(unsupported.to_string(), "udp_source_selection_unsupported");
+            }
+
+            let unavailable = map_send_error(Errno::EADDRNOTAVAIL, local_source());
+            assert_eq!(unavailable.kind(), io::ErrorKind::AddrNotAvailable);
+            assert_eq!(unavailable.to_string(), "udp_source_not_local");
+
+            let oversized = map_send_error(Errno::EMSGSIZE, local_source());
+            assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(oversized.to_string(), "udp_payload_too_large");
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -371,8 +677,8 @@ mod platform {
     use tokio::net::UdpSocket;
 
     use super::{
-        fallback_local_destination, UdpDestinationMetadataSupport,
-        UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
+        fallback_local_destination, udp_error, validate_complete_datagram,
+        UdpDestinationMetadataSupport, UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
     };
 
     pub(super) fn enable_destination_metadata(
@@ -396,6 +702,22 @@ mod platform {
         Ok(UdpReceivedDatagram::new(bytes, source, local_destination))
     }
 
+    pub(super) async fn send_udp_datagram_from(
+        socket: &UdpSocket,
+        buffer: &[u8],
+        peer: SocketAddr,
+        local_source: SocketAddr,
+    ) -> io::Result<usize> {
+        if socket.local_addr()? != local_source {
+            return Err(udp_error(
+                io::ErrorKind::Unsupported,
+                "udp_source_selection_unsupported",
+            ));
+        }
+        let sent = socket.send_to(buffer, peer).await?;
+        validate_complete_datagram(sent, buffer.len())
+    }
+
     fn unspecified_like(source: SocketAddr) -> SocketAddr {
         match source {
             SocketAddr::V4(addr) => {
@@ -413,9 +735,22 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::{
-        fallback_local_destination, UdpLocalDestination, UdpLocalDestinationStatus,
-        UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
+        fallback_local_destination, validate_complete_datagram, UdpLocalDestination,
+        UdpLocalDestinationStatus, UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
     };
+
+    #[test]
+    fn datagram_send_result_must_cover_the_complete_payload() {
+        assert_eq!(validate_complete_datagram(4, 4).unwrap(), 4);
+
+        let write_zero = validate_complete_datagram(0, 4).unwrap_err();
+        assert_eq!(write_zero.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(write_zero.to_string(), "udp_datagram_write_zero");
+
+        let partial = validate_complete_datagram(3, 4).unwrap_err();
+        assert_eq!(partial.kind(), std::io::ErrorKind::Other);
+        assert_eq!(partial.to_string(), "udp_datagram_partial_send");
+    }
 
     #[test]
     fn concrete_local_addr_is_preserved_as_destination() {
