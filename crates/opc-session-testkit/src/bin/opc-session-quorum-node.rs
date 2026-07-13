@@ -41,6 +41,11 @@ const QUALIFICATION_KEY_BYTES: [u8; AES_256_GCM_SIV_KEY_LEN] = [0x5a; AES_256_GC
 
 type ProtectedStore = EncryptingSessionBackend<ConsensusSessionStore, MemoryKeyProvider>;
 
+struct QualificationLease {
+    guard: LeaseGuard,
+    released: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("qualification node failed")]
 struct NodeFailure;
@@ -49,7 +54,7 @@ struct QualificationNode {
     store: Arc<ConsensusSessionStore>,
     protected: ProtectedStore,
     server: Option<SessionConsensusServerHandle>,
-    leases: HashMap<String, LeaseGuard>,
+    leases: HashMap<String, QualificationLease>,
 }
 
 impl QualificationNode {
@@ -207,7 +212,13 @@ impl QualificationNode {
                 {
                     Ok(lease) => {
                         let fence = lease.fence().get();
-                        self.leases.insert(lease_handle, lease);
+                        self.leases.insert(
+                            lease_handle,
+                            QualificationLease {
+                                guard: lease,
+                                released: false,
+                            },
+                        );
                         QualificationNodeReply::LeaseAcquired { fence }
                     }
                     Err(error) => QualificationNodeReply::Error {
@@ -222,7 +233,11 @@ impl QualificationNode {
                 new_generation,
                 value,
             } => {
-                let Some(lease) = self.leases.get(&lease_handle).cloned() else {
+                let Some(lease) = self
+                    .leases
+                    .get(&lease_handle)
+                    .map(|lease| lease.guard.clone())
+                else {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::LeaseHandleMissing,
                     };
@@ -300,14 +315,21 @@ impl QualificationNode {
                 }
             }
             QualificationNodeCommand::Release { lease_handle } => {
-                let Some(lease) = self.leases.get(&lease_handle).cloned() else {
+                let Some(lease) = self
+                    .leases
+                    .get(&lease_handle)
+                    .filter(|lease| !lease.released)
+                    .map(|lease| lease.guard.clone())
+                else {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::LeaseHandleMissing,
                     };
                 };
                 match self.protected.release(lease).await {
                     Ok(()) => {
-                        remove_released_lease(&mut self.leases, &lease_handle, true);
+                        if let Some(lease) = self.leases.get_mut(&lease_handle) {
+                            mark_released_lease(&mut lease.released, true);
+                        }
                         QualificationNodeReply::Released
                     }
                     Err(error) => QualificationNodeReply::Error {
@@ -369,13 +391,9 @@ fn validate_new_lease_handle<T>(
     }
 }
 
-fn remove_released_lease<T>(
-    leases: &mut HashMap<String, T>,
-    lease_handle: &str,
-    release_succeeded: bool,
-) {
+fn mark_released_lease(released: &mut bool, release_succeeded: bool) {
     if release_succeeded {
-        leases.remove(lease_handle);
+        *released = true;
     }
 }
 
@@ -609,12 +627,17 @@ mod tests {
     }
 
     #[test]
-    fn release_removes_only_a_confirmed_successful_handle() {
-        let mut leases = HashMap::from([("lease".to_owned(), ())]);
-        remove_released_lease(&mut leases, "lease", false);
-        assert!(leases.contains_key("lease"));
-        remove_released_lease(&mut leases, "lease", true);
-        assert!(!leases.contains_key("lease"));
-        assert_eq!(validate_new_lease_handle(&leases, "lease"), Ok(()));
+    fn release_retains_a_bounded_handle_for_stale_fence_probes() {
+        let mut released = false;
+        mark_released_lease(&mut released, false);
+        assert!(!released);
+        mark_released_lease(&mut released, true);
+        assert!(released);
+
+        let leases = HashMap::from([("lease".to_owned(), ())]);
+        assert_eq!(
+            validate_new_lease_handle(&leases, "lease"),
+            Err(QualificationNodeErrorCode::LeaseHandleDuplicate)
+        );
     }
 }

@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -37,17 +37,18 @@ const LONG_LEASE_MILLIS: u64 = 60_000;
 const MAX_DATABASE_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PROVENANCE_COMMAND_BYTES: usize = 16 * 1024;
 const EVIDENCE_OUTPUT_DIRECTORY_ENV: &str = "OPC_SESSION_HA_EVIDENCE_DIR";
+const FAILURE_EVIDENCE_DIRECTORY_ENV: &str = "OPC_SESSION_HA_FAILURE_DIR";
 const FOUNDATION_RANDOM_SEED_BASE: u64 = 0x0143_0000;
 const MAX_FAILURE_STDERR_BYTES: usize = 4 * 1024;
 const MAX_FAILURE_STDERR_LINES: usize = 16;
-const FAULT_TARGET_NODE_INDEX: usize = 2;
+const FAULT_TARGET_CANDIDATES: [usize; 2] = [0, 2];
 
 #[derive(Debug)]
 enum HarnessError {
     Io,
     Protocol,
     Evidence,
-    Stage(HarnessStageFailure),
+    Stage(Box<HarnessStageFailure>),
 }
 
 impl From<std::io::Error> for HarnessError {
@@ -63,12 +64,27 @@ enum HarnessStage {
     InitialInitialize,
     InitialReadiness,
     Operation,
+    FollowerObservation,
     StopFollower,
     ContinuityReadiness,
     RestartBind,
     RestartConfigure,
     RestartInitialize,
     RestartReadiness,
+    ConfigurationEvidence,
+    HistoryEvidence,
+    ThresholdEvidence,
+    StorageEvidence,
+    CheckerSpawn,
+    CheckerExit,
+    CheckerOutputSize,
+    CheckerOutputJson,
+    CheckerResult,
+    CheckerArtifact,
+    CheckerFailureRetention,
+    DigestEvidence,
+    EvidenceValidation,
+    BundleEvidence,
     Cleanup,
 }
 
@@ -79,6 +95,7 @@ enum HarnessFailureKind {
     ProcessExited,
     Protocol,
     Io,
+    Evidence,
     ReadinessNotReady,
 }
 
@@ -90,6 +107,7 @@ struct HarnessStageFailure {
     readiness: Vec<ReadinessDiagnostic>,
     exit: Option<ExitDiagnostic>,
     stderr: Option<StderrDiagnostic>,
+    checker: Option<CheckerDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +145,54 @@ struct StderrDiagnostic {
     line_codes: Vec<StderrLineCode>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckerStatusDiagnostic {
+    Pass,
+    Fail,
+    Inconclusive,
+    InvalidInput,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckerFindingDiagnostic {
+    UnexpectedHistoryOperation,
+    MissingHistoryOperation,
+    DependentOnUnknownOutcome,
+    ScheduleHistoryMismatch,
+    LeaseExpiryAmbiguity,
+    UnknownOperationOutcome,
+    LeaseStateViolation,
+    FenceMonotonicityViolation,
+    LeaseReferenceViolation,
+    CasStateViolation,
+    LinearizableReadViolation,
+    Redacted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CheckerDiagnostic {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    status: CheckerStatusDiagnostic,
+    operations_checked: Option<u64>,
+    violation_codes: Vec<CheckerFindingDiagnostic>,
+    inconclusive_codes: Vec<CheckerFindingDiagnostic>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckerOutputDocument {
+    checker: String,
+    checker_version: String,
+    status: String,
+    operations_checked: u64,
+    violation_codes: Vec<String>,
+    inconclusive_codes: Vec<String>,
+}
+
 impl HarnessStageFailure {
     fn new(stage: HarnessStage, node_index: Option<usize>, kind: HarnessFailureKind) -> Self {
         Self {
@@ -136,11 +202,17 @@ impl HarnessStageFailure {
             readiness: Vec::new(),
             exit: None,
             stderr: None,
+            checker: None,
         }
     }
 
     fn with_readiness(mut self, readiness: Vec<ReadinessDiagnostic>) -> Self {
         self.readiness = readiness;
+        self
+    }
+
+    fn with_checker(mut self, checker: CheckerDiagnostic) -> Self {
+        self.checker = Some(checker);
         self
     }
 }
@@ -150,7 +222,83 @@ fn stage_error(
     node_index: Option<usize>,
     kind: HarnessFailureKind,
 ) -> HarnessError {
-    HarnessError::Stage(HarnessStageFailure::new(stage, node_index, kind))
+    HarnessError::Stage(Box::new(HarnessStageFailure::new(stage, node_index, kind)))
+}
+
+fn at_stage<T>(result: Result<T, HarnessError>, stage: HarnessStage) -> Result<T, HarnessError> {
+    result.map_err(|error| match error {
+        HarnessError::Io => stage_error(stage, None, HarnessFailureKind::Io),
+        HarnessError::Protocol => stage_error(stage, None, HarnessFailureKind::Protocol),
+        HarnessError::Evidence => stage_error(stage, None, HarnessFailureKind::Evidence),
+        HarnessError::Stage(_) => error,
+    })
+}
+
+fn checker_status(value: &str) -> CheckerStatusDiagnostic {
+    match value {
+        "pass" => CheckerStatusDiagnostic::Pass,
+        "fail" => CheckerStatusDiagnostic::Fail,
+        "inconclusive" => CheckerStatusDiagnostic::Inconclusive,
+        "invalid_input" => CheckerStatusDiagnostic::InvalidInput,
+        _ => CheckerStatusDiagnostic::Unknown,
+    }
+}
+
+fn checker_finding(value: &str) -> CheckerFindingDiagnostic {
+    match value {
+        "unexpected_history_operation" => CheckerFindingDiagnostic::UnexpectedHistoryOperation,
+        "missing_history_operation" => CheckerFindingDiagnostic::MissingHistoryOperation,
+        "dependent_on_unknown_outcome" => CheckerFindingDiagnostic::DependentOnUnknownOutcome,
+        "schedule_history_mismatch" => CheckerFindingDiagnostic::ScheduleHistoryMismatch,
+        "lease_expiry_ambiguity" => CheckerFindingDiagnostic::LeaseExpiryAmbiguity,
+        "unknown_operation_outcome" => CheckerFindingDiagnostic::UnknownOperationOutcome,
+        "lease_state_violation" => CheckerFindingDiagnostic::LeaseStateViolation,
+        "fence_monotonicity_violation" => CheckerFindingDiagnostic::FenceMonotonicityViolation,
+        "lease_reference_violation" => CheckerFindingDiagnostic::LeaseReferenceViolation,
+        "cas_state_violation" => CheckerFindingDiagnostic::CasStateViolation,
+        "linearizable_read_violation" => CheckerFindingDiagnostic::LinearizableReadViolation,
+        _ => CheckerFindingDiagnostic::Redacted,
+    }
+}
+
+fn checker_diagnostic(
+    document: &CheckerOutputDocument,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) -> CheckerDiagnostic {
+    CheckerDiagnostic {
+        exit_code,
+        signal,
+        status: checker_status(&document.status),
+        operations_checked: Some(document.operations_checked),
+        violation_codes: document
+            .violation_codes
+            .iter()
+            .map(|code| checker_finding(code))
+            .collect(),
+        inconclusive_codes: document
+            .inconclusive_codes
+            .iter()
+            .map(|code| checker_finding(code))
+            .collect(),
+    }
+}
+
+fn unknown_checker_diagnostic(exit_code: Option<i32>, signal: Option<i32>) -> CheckerDiagnostic {
+    CheckerDiagnostic {
+        exit_code,
+        signal,
+        status: CheckerStatusDiagnostic::Unknown,
+        operations_checked: None,
+        violation_codes: Vec::new(),
+        inconclusive_codes: Vec::new(),
+    }
+}
+
+fn checker_stage_error(stage: HarnessStage, checker: CheckerDiagnostic) -> HarnessError {
+    HarnessError::Stage(Box::new(
+        HarnessStageFailure::new(stage, None, HarnessFailureKind::Evidence).with_checker(checker),
+    ))
 }
 
 #[derive(Clone, Serialize)]
@@ -250,16 +398,39 @@ fn workload(member_count: usize) -> Vec<ScheduledInvocation> {
         (
             1,
             ScheduledOperation::LeaseAcquire {
+                key: "session-expiry".to_owned(),
+                owner: "owner-expiry-a".to_owned(),
+                ttl_millis: SHORT_LEASE_MILLIS,
+            },
+        ),
+        (
+            1,
+            ScheduledOperation::LeaseAcquire {
+                key: "session-expiry".to_owned(),
+                owner: "owner-expiry-b".to_owned(),
+                ttl_millis: LONG_LEASE_MILLIS,
+            },
+        ),
+        (
+            1,
+            ScheduledOperation::LeaseRelease {
+                key: "session-expiry".to_owned(),
+                lease_operation_id: "op-2".to_owned(),
+            },
+        ),
+        (
+            1,
+            ScheduledOperation::LeaseAcquire {
                 key: "session-a".to_owned(),
                 owner: "owner-a".to_owned(),
-                ttl_millis: SHORT_LEASE_MILLIS,
+                ttl_millis: LONG_LEASE_MILLIS,
             },
         ),
         (
             1,
             ScheduledOperation::CompareAndSet {
                 key: "session-a".to_owned(),
-                lease_operation_id: "op-1".to_owned(),
+                lease_operation_id: "op-4".to_owned(),
                 expected_generation: None,
                 new_generation: 1,
                 value: "qualification-value-1".to_owned(),
@@ -269,6 +440,13 @@ fn workload(member_count: usize) -> Vec<ScheduledInvocation> {
             2,
             ScheduledOperation::Read {
                 key: "session-a".to_owned(),
+            },
+        ),
+        (
+            1,
+            ScheduledOperation::LeaseRelease {
+                key: "session-a".to_owned(),
+                lease_operation_id: "op-4".to_owned(),
             },
         ),
         (
@@ -283,7 +461,7 @@ fn workload(member_count: usize) -> Vec<ScheduledInvocation> {
             1,
             ScheduledOperation::CompareAndSet {
                 key: "session-a".to_owned(),
-                lease_operation_id: "op-4".to_owned(),
+                lease_operation_id: "op-8".to_owned(),
                 expected_generation: Some(1),
                 new_generation: 2,
                 value: "qualification-value-2".to_owned(),
@@ -293,7 +471,7 @@ fn workload(member_count: usize) -> Vec<ScheduledInvocation> {
             1,
             ScheduledOperation::CompareAndSet {
                 key: "session-a".to_owned(),
-                lease_operation_id: "op-1".to_owned(),
+                lease_operation_id: "op-4".to_owned(),
                 expected_generation: Some(2),
                 new_generation: 3,
                 value: "qualification-stale-value".to_owned(),
@@ -309,14 +487,14 @@ fn workload(member_count: usize) -> Vec<ScheduledInvocation> {
             1,
             ScheduledOperation::CompareAndSet {
                 key: "session-a".to_owned(),
-                lease_operation_id: "op-4".to_owned(),
+                lease_operation_id: "op-8".to_owned(),
                 expected_generation: Some(2),
                 new_generation: 3,
                 value: "qualification-value-3".to_owned(),
             },
         ),
         (
-            0,
+            1,
             ScheduledOperation::Read {
                 key: "session-a".to_owned(),
             },
@@ -325,11 +503,11 @@ fn workload(member_count: usize) -> Vec<ScheduledInvocation> {
             1,
             ScheduledOperation::LeaseRelease {
                 key: "session-a".to_owned(),
-                lease_operation_id: "op-4".to_owned(),
+                lease_operation_id: "op-8".to_owned(),
             },
         ),
         (
-            FAULT_TARGET_NODE_INDEX,
+            2,
             ScheduledOperation::Read {
                 key: "session-a".to_owned(),
             },
@@ -435,6 +613,82 @@ fn write_private_json(path: &Path, value: &Value) -> Result<(), HarnessError> {
     let mut encoded = serde_json::to_vec(value).map_err(|_| HarnessError::Evidence)?;
     encoded.push(b'\n');
     write_private_bytes(path, &encoded)
+}
+
+fn preserve_checker_failure_bundle(
+    member_count: usize,
+    artifacts: &[(&str, &Path)],
+    stdout: &[u8],
+    stderr: &[u8],
+    checker: &CheckerDiagnostic,
+    child_cleanup_complete: bool,
+) -> Result<(), HarnessError> {
+    let Some(configured_root) = env::var_os(FAILURE_EVIDENCE_DIRECTORY_ENV) else {
+        return Ok(());
+    };
+    let configured_root = PathBuf::from(configured_root);
+    if !configured_root.is_absolute() {
+        return Err(HarnessError::Evidence);
+    }
+    let mut root_builder = DirBuilder::new();
+    root_builder.recursive(true).mode(0o700);
+    root_builder.create(&configured_root)?;
+    let canonical_root = fs::canonicalize(&configured_root)?;
+    let root_metadata = fs::symlink_metadata(&configured_root)?;
+    if canonical_root != configured_root
+        || root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+    {
+        return Err(HarnessError::Evidence);
+    }
+    fs::set_permissions(&canonical_root, Permissions::from_mode(0o700))?;
+
+    let nonce = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let destination = canonical_root.join(format!(
+        "{member_count}-node-{nonce}-{}",
+        std::process::id()
+    ));
+    let mut destination_builder = DirBuilder::new();
+    destination_builder.mode(0o700).create(&destination)?;
+    for (name, source) in artifacts {
+        if name.contains('/') {
+            return Err(HarnessError::Evidence);
+        }
+        let metadata = fs::symlink_metadata(source)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > 8 * 1024 * 1024
+        {
+            return Err(HarnessError::Evidence);
+        }
+        let target = destination.join(name);
+        fs::copy(source, &target)?;
+        fs::set_permissions(&target, Permissions::from_mode(0o600))?;
+        File::open(&target)?.sync_all()?;
+    }
+    write_private_bytes(
+        &destination.join("checker-stdout.bin"),
+        &stdout[..stdout.len().min(MAX_PROVENANCE_COMMAND_BYTES)],
+    )?;
+    write_private_bytes(
+        &destination.join("checker-stderr.bin"),
+        &stderr[..stderr.len().min(MAX_FAILURE_STDERR_BYTES)],
+    )?;
+    let metadata = json!({
+        "schema_version": "opc-session-ha-checker-failure/v1",
+        "topology_members": member_count,
+        "checker": serde_json::to_value(checker).map_err(|_| HarnessError::Evidence)?,
+        "stdout_total_bytes": stdout.len(),
+        "stdout_captured_bytes": stdout.len().min(MAX_PROVENANCE_COMMAND_BYTES),
+        "stderr_total_bytes": stderr.len(),
+        "stderr_captured_bytes": stderr.len().min(MAX_FAILURE_STDERR_BYTES),
+        "child_cleanup_complete": child_cleanup_complete,
+        "artifacts": artifacts.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+    });
+    write_private_json(&destination.join("failure.json"), &metadata)?;
+    File::open(&destination)?.sync_all()?;
+    File::open(&canonical_root)?.sync_all()?;
+    Ok(())
 }
 
 fn command_stdout(
@@ -702,24 +956,33 @@ fn validate_generated_evidence(
         return Err(HarnessError::Evidence);
     }
 
-    let expected_target = format!("node-{FAULT_TARGET_NODE_INDEX}");
     let faults = evidence["faults"]
         .as_array()
+        .ok_or(HarnessError::Evidence)?;
+    let first_fault = faults.first().ok_or(HarnessError::Evidence)?;
+    let expected_target = first_fault["target_process"]
+        .as_str()
+        .filter(|target| matches!(*target, "node-0" | "node-2"))
+        .ok_or(HarnessError::Evidence)?;
+    let expected_node_id = first_fault["observed_node_id"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or(HarnessError::Evidence)?;
+    let expected_leader_id = first_fault["observed_leader_id"]
+        .as_u64()
+        .filter(|value| *value > 0 && *value != expected_node_id)
+        .ok_or(HarnessError::Evidence)?;
+    let expected_term = first_fault["observed_term"]
+        .as_u64()
+        .filter(|value| *value > 0)
         .ok_or(HarnessError::Evidence)?;
     if faults.len() != 2
         || !faults.iter().all(|fault| {
             fault["target_process"] == expected_target
                 && fault["target_role"] == "follower"
-                && fault["observed_node_id"]
-                    .as_u64()
-                    .is_some_and(|value| value > 0)
-                && fault["observed_leader_id"]
-                    .as_u64()
-                    .is_some_and(|value| value > 0)
-                && fault["observed_node_id"] != fault["observed_leader_id"]
-                && fault["observed_term"]
-                    .as_u64()
-                    .is_some_and(|value| value > 0)
+                && fault["observed_node_id"].as_u64() == Some(expected_node_id)
+                && fault["observed_leader_id"].as_u64() == Some(expected_leader_id)
+                && fault["observed_term"].as_u64() == Some(expected_term)
         })
     {
         return Err(HarnessError::Evidence);
@@ -740,6 +1003,8 @@ fn validate_generated_evidence(
     };
     if !coverage.iter().any(|item| item == expected_topology)
         || coverage.iter().any(|item| item == other_topology)
+        || !coverage.iter().any(|item| item == "lease_expiry_reacquire")
+        || !coverage.iter().any(|item| item == "stale_fence_rejection")
         || !evidence["remaining_acceptance"]
             .as_array()
             .is_some_and(|items| {
@@ -884,7 +1149,22 @@ fn verify_retained_bundle(destination: &Path, member_count: usize) -> Result<(),
 
     let fault_schedule: Value = serde_json::from_slice(&fs::read(&fault_schedule_path)?)
         .map_err(|_| HarnessError::Evidence)?;
-    let expected_target = format!("node-{FAULT_TARGET_NODE_INDEX}");
+    let evidence_faults = evidence["faults"]
+        .as_array()
+        .ok_or(HarnessError::Evidence)?;
+    let evidence_fault = evidence_faults.first().ok_or(HarnessError::Evidence)?;
+    let expected_target = evidence_fault["target_process"]
+        .as_str()
+        .ok_or(HarnessError::Evidence)?;
+    let expected_node_id = evidence_fault["observed_node_id"]
+        .as_u64()
+        .ok_or(HarnessError::Evidence)?;
+    let expected_leader_id = evidence_fault["observed_leader_id"]
+        .as_u64()
+        .ok_or(HarnessError::Evidence)?;
+    let expected_term = evidence_fault["observed_term"]
+        .as_u64()
+        .ok_or(HarnessError::Evidence)?;
     if fault_schedule["schema_version"] != "opc-session-ha-fault-schedule/v1"
         || fault_schedule["topology_members"].as_u64() != Some(member_count as u64)
         || !fault_schedule["faults"].as_array().is_some_and(|faults| {
@@ -892,6 +1172,9 @@ fn verify_retained_bundle(destination: &Path, member_count: usize) -> Result<(),
                 && faults.iter().all(|fault| {
                     fault["target_process"] == expected_target
                         && fault["target_role"] == "follower"
+                        && fault["observed_node_id"].as_u64() == Some(expected_node_id)
+                        && fault["observed_leader_id"].as_u64() == Some(expected_leader_id)
+                        && fault["observed_term"].as_u64() == Some(expected_term)
                         && fault["bounded"] == true
                 })
         })
@@ -934,7 +1217,7 @@ fn verify_retained_bundle(destination: &Path, member_count: usize) -> Result<(),
         || !output.stderr.is_empty()
         || output.stdout != retained_output
         || checker_result["status"] != "pass"
-        || checker_result["operations_checked"].as_u64() != Some(11)
+        || checker_result["operations_checked"].as_u64() != Some(15)
     {
         return Err(HarnessError::Evidence);
     }
@@ -1125,7 +1408,7 @@ impl ChildNode {
         let mut failure = HarnessStageFailure::new(stage, Some(self.node_index), kind);
         failure.exit = exit;
         failure.stderr = stderr_diagnostic(&self.stderr_path);
-        HarnessError::Stage(failure)
+        HarnessError::Stage(Box::new(failure))
     }
 
     fn pid(&self) -> u32 {
@@ -1223,6 +1506,24 @@ fn wait_for_exit(
             return Err(HarnessFailureKind::Deadline);
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn child_processes_gone(pids: &[u32], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pids
+            .iter()
+            .all(|pid| !PathBuf::from(format!("/proc/{pid}")).exists())
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -1435,6 +1736,57 @@ fn sorted_readiness(readiness: &HashMap<usize, ReadinessDiagnostic>) -> Vec<Read
     readiness
 }
 
+fn readiness_map(readiness: &[ReadinessDiagnostic]) -> HashMap<usize, ReadinessDiagnostic> {
+    readiness
+        .iter()
+        .cloned()
+        .map(|diagnostic| (diagnostic.node_index, diagnostic))
+        .collect()
+}
+
+fn coherent_leader_snapshot(
+    readiness: &[ReadinessDiagnostic],
+    member_count: usize,
+) -> Option<(u64, u64)> {
+    if readiness.len() != member_count
+        || readiness
+            .iter()
+            .map(|diagnostic| diagnostic.node_index)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != member_count
+        || readiness
+            .iter()
+            .map(|diagnostic| diagnostic.node_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != member_count
+    {
+        return None;
+    }
+    let first = readiness.first()?;
+    let leader_id = first.leader_id?;
+    let term = first.term;
+    if leader_id == 0
+        || term == 0
+        || !readiness.iter().all(|diagnostic| {
+            diagnostic.ready
+                && diagnostic.reason_code == QualificationReadinessCode::Ready
+                && diagnostic.node_id > 0
+                && diagnostic.term == term
+                && diagnostic.leader_id == Some(leader_id)
+        })
+        || readiness
+            .iter()
+            .filter(|diagnostic| diagnostic.node_id == leader_id)
+            .count()
+            != 1
+    {
+        return None;
+    }
+    Some((leader_id, term))
+}
+
 fn with_readiness(
     error: HarnessError,
     readiness: &HashMap<usize, ReadinessDiagnostic>,
@@ -1452,10 +1804,10 @@ fn readiness_deadline(
     stage: HarnessStage,
     readiness: &HashMap<usize, ReadinessDiagnostic>,
 ) -> HarnessError {
-    HarnessError::Stage(
+    HarnessError::Stage(Box::new(
         HarnessStageFailure::new(stage, None, HarnessFailureKind::ReadinessNotReady)
             .with_readiness(sorted_readiness(readiness)),
-    )
+    ))
 }
 
 struct Fleet {
@@ -1719,26 +2071,26 @@ impl Fleet {
                         if configured_voters != self.nodes.len()
                             || required_quorum != (self.nodes.len() / 2) + 1
                         {
-                            return Err(HarnessError::Stage(
+                            return Err(HarnessError::Stage(Box::new(
                                 HarnessStageFailure::new(
                                     stage,
                                     Some(*node_index),
                                     HarnessFailureKind::Protocol,
                                 )
                                 .with_readiness(sorted_readiness(&last_readiness)),
-                            ));
+                            )));
                         }
                         ready &= node_ready && reason_code == QualificationReadinessCode::Ready;
                     }
                     _ => {
-                        return Err(HarnessError::Stage(
+                        return Err(HarnessError::Stage(Box::new(
                             HarnessStageFailure::new(
                                 stage,
                                 Some(*node_index),
                                 HarnessFailureKind::Protocol,
                             )
                             .with_readiness(sorted_readiness(&last_readiness)),
-                        ));
+                        )));
                     }
                 }
             }
@@ -1753,6 +2105,84 @@ impl Fleet {
                 Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
             );
         }
+    }
+
+    fn probe_readiness_round(
+        &mut self,
+        stage: HarnessStage,
+        deadline: Instant,
+    ) -> Result<Vec<ReadinessDiagnostic>, HarnessError> {
+        let node_indices = (0..self.nodes.len()).collect::<Vec<_>>();
+        let mut readiness = HashMap::new();
+        for node_index in &node_indices {
+            if Instant::now() >= deadline {
+                return Err(readiness_deadline(stage, &readiness));
+            }
+            let result = self.nodes[*node_index]
+                .as_mut()
+                .ok_or_else(|| {
+                    stage_error(stage, Some(*node_index), HarnessFailureKind::Disconnected)
+                })?
+                .send(&QualificationNodeCommand::Probe, stage);
+            if let Err(error) = result {
+                return Err(with_readiness(error, &readiness));
+            }
+        }
+        for node_index in node_indices {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(readiness_deadline(stage, &readiness));
+            }
+            let timeout = CHILD_REPLY_TIMEOUT.min(deadline.duration_since(now));
+            let node = self.nodes[node_index].as_mut().ok_or_else(|| {
+                stage_error(stage, Some(node_index), HarnessFailureKind::Disconnected)
+            })?;
+            let reply = match node.recv(stage, timeout) {
+                Ok(reply) => reply,
+                Err(error) => return Err(with_readiness(error, &readiness)),
+            };
+            let QualificationNodeReply::Readiness {
+                ready,
+                reason_code,
+                node_id,
+                term,
+                leader_id,
+                configured_voters,
+                required_quorum,
+                committed_index,
+                applied_index,
+            } = reply
+            else {
+                return Err(HarnessError::Stage(Box::new(
+                    HarnessStageFailure::new(stage, Some(node_index), HarnessFailureKind::Protocol)
+                        .with_readiness(sorted_readiness(&readiness)),
+                )));
+            };
+            readiness.insert(
+                node_index,
+                ReadinessDiagnostic {
+                    node_index,
+                    ready,
+                    reason_code,
+                    node_id,
+                    term,
+                    leader_id,
+                    configured_voters,
+                    required_quorum,
+                    committed_index,
+                    applied_index,
+                },
+            );
+            if configured_voters != self.nodes.len()
+                || required_quorum != (self.nodes.len() / 2) + 1
+            {
+                return Err(HarnessError::Stage(Box::new(
+                    HarnessStageFailure::new(stage, Some(node_index), HarnessFailureKind::Protocol)
+                        .with_readiness(sorted_readiness(&readiness)),
+                )));
+            }
+        }
+        Ok(sorted_readiness(&readiness))
     }
 
     fn invoke(
@@ -1772,41 +2202,56 @@ impl Fleet {
             .invoke(command, HarnessStage::Operation)
     }
 
-    fn observed_follower(&self, node_index: usize) -> Result<ReadinessDiagnostic, HarnessError> {
-        if self.last_readiness.len() != self.nodes.len() {
-            return Err(HarnessError::Evidence);
+    fn observe_stable_follower(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ReadinessDiagnostic, HarnessError> {
+        let deadline = Instant::now() + timeout;
+        let mut last_readiness;
+        loop {
+            let observed =
+                self.probe_readiness_round(HarnessStage::FollowerObservation, deadline)?;
+            last_readiness = observed.clone();
+            if let Some((leader_id, term)) = coherent_leader_snapshot(&observed, self.nodes.len()) {
+                let candidate = FAULT_TARGET_CANDIDATES.iter().find_map(|node_index| {
+                    observed
+                        .iter()
+                        .find(|diagnostic| diagnostic.node_index == *node_index)
+                        .filter(|diagnostic| diagnostic.node_id != leader_id)
+                        .cloned()
+                });
+                if let Some(candidate) = candidate {
+                    let confirmed =
+                        self.probe_readiness_round(HarnessStage::FollowerObservation, deadline)?;
+                    last_readiness = confirmed.clone();
+                    if coherent_leader_snapshot(&confirmed, self.nodes.len())
+                        == Some((leader_id, term))
+                    {
+                        if let Some(target) = confirmed
+                            .iter()
+                            .find(|diagnostic| {
+                                diagnostic.node_index == candidate.node_index
+                                    && diagnostic.node_id == candidate.node_id
+                                    && diagnostic.node_id != leader_id
+                            })
+                            .cloned()
+                        {
+                            self.last_readiness = confirmed;
+                            return Ok(target);
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(readiness_deadline(
+                    HarnessStage::FollowerObservation,
+                    &readiness_map(&last_readiness),
+                ));
+            }
+            thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
-        let leaders = self
-            .last_readiness
-            .iter()
-            .filter_map(|observation| observation.leader_id)
-            .collect::<BTreeSet<_>>();
-        let Some(leader_id) = leaders.iter().copied().next() else {
-            return Err(HarnessError::Evidence);
-        };
-        let local_leaders = self
-            .last_readiness
-            .iter()
-            .filter(|observation| observation.node_id == leader_id)
-            .count();
-        let target = self
-            .last_readiness
-            .iter()
-            .find(|observation| observation.node_index == node_index)
-            .cloned()
-            .ok_or(HarnessError::Evidence)?;
-        if leaders.len() != 1
-            || local_leaders != 1
-            || !self.last_readiness.iter().all(|observation| {
-                observation.ready
-                    && observation.reason_code == QualificationReadinessCode::Ready
-                    && observation.leader_id == Some(leader_id)
-            })
-            || target.node_id == leader_id
-        {
-            return Err(HarnessError::Evidence);
-        }
-        Ok(target)
     }
 
     fn stop_unclean(&mut self, node_index: usize) -> Result<(), HarnessError> {
@@ -1915,6 +2360,10 @@ impl Fleet {
                 child.stop_bounded();
             }
         }
+    }
+
+    fn pids(&self) -> Vec<u32> {
+        self.nodes.iter().flatten().map(ChildNode::pid).collect()
     }
 }
 
@@ -2131,10 +2580,14 @@ fn invoke_and_record(
     history: &mut HistoryWriter,
     scheduled: &ScheduledInvocation,
 ) -> Result<QualificationNodeReply, HarnessError> {
-    let started_ns = history.now_ns()?;
-    let reply = fleet.invoke(scheduled.node_index()?, &scheduled.command());
-    let completed_ns = history.now_ns()?;
-    history.record(scheduled, started_ns, completed_ns, reply.as_ref().ok())?;
+    let started_ns = at_stage(history.now_ns(), HarnessStage::HistoryEvidence)?;
+    let node_index = at_stage(scheduled.node_index(), HarnessStage::HistoryEvidence)?;
+    let reply = fleet.invoke(node_index, &scheduled.command());
+    let completed_ns = at_stage(history.now_ns(), HarnessStage::HistoryEvidence)?;
+    at_stage(
+        history.record(scheduled, started_ns, completed_ns, reply.as_ref().ok()),
+        HarnessStage::HistoryEvidence,
+    )?;
     reply
 }
 
@@ -2144,6 +2597,13 @@ fn assert_applied(reply: QualificationNodeReply, generation: u64) -> Result<(), 
             applied: true,
             current_generation: Some(current),
         } if current == generation => Ok(()),
+        _ => Err(HarnessError::Protocol),
+    }
+}
+
+fn acquired_fence(reply: QualificationNodeReply) -> Result<u64, HarnessError> {
+    match reply {
+        QualificationNodeReply::LeaseAcquired { fence } if fence > 0 => Ok(fence),
         _ => Err(HarnessError::Protocol),
     }
 }
@@ -2187,6 +2647,127 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
     let evidence_path = artifact_workspace.path().join("evidence.json");
     let schedule_sha256 = write_schedule(&schedule_path, &schedule)?;
 
+    let startup_started = Instant::now();
+    let mut fleet = Fleet::start(member_count, &schedule_sha256)?;
+    let startup_millis = at_stage(
+        duration_millis(startup_started.elapsed()),
+        HarnessStage::ThresholdEvidence,
+    )?;
+    let configuration_sha256 = at_stage(
+        fleet.configuration_sha256(),
+        HarnessStage::ConfigurationEvidence,
+    )?;
+    let storage_identity_sha256 = at_stage(
+        fleet.storage_identity_sha256(),
+        HarnessStage::ConfigurationEvidence,
+    )?;
+    let mut history = at_stage(
+        HistoryWriter::new(
+            &history_path,
+            schedule_sha256.clone(),
+            schedule[0].schedule_id.clone(),
+            schedule.len(),
+        ),
+        HarnessStage::HistoryEvidence,
+    )?;
+
+    let expiry_fence = at_stage(
+        acquired_fence(invoke_and_record(&mut fleet, &mut history, &schedule[0])?),
+        HarnessStage::Operation,
+    )?;
+    thread::sleep(LEASE_EXPIRY_WAIT);
+    let reacquired_expiry_fence = at_stage(
+        acquired_fence(invoke_and_record(&mut fleet, &mut history, &schedule[1])?),
+        HarnessStage::Operation,
+    )?;
+    if reacquired_expiry_fence <= expiry_fence {
+        return Err(stage_error(
+            HarnessStage::Operation,
+            None,
+            HarnessFailureKind::Protocol,
+        ));
+    }
+    if !matches!(
+        invoke_and_record(&mut fleet, &mut history, &schedule[2])?,
+        QualificationNodeReply::Released
+    ) {
+        return Err(stage_error(
+            HarnessStage::Operation,
+            None,
+            HarnessFailureKind::Protocol,
+        ));
+    }
+
+    let first_session_fence = at_stage(
+        acquired_fence(invoke_and_record(&mut fleet, &mut history, &schedule[3])?),
+        HarnessStage::Operation,
+    )?;
+    at_stage(
+        assert_applied(
+            invoke_and_record(&mut fleet, &mut history, &schedule[4])?,
+            1,
+        ),
+        HarnessStage::Operation,
+    )?;
+    at_stage(
+        assert_generation(
+            invoke_and_record(&mut fleet, &mut history, &schedule[5])?,
+            1,
+        ),
+        HarnessStage::Operation,
+    )?;
+
+    if !matches!(
+        invoke_and_record(&mut fleet, &mut history, &schedule[6])?,
+        QualificationNodeReply::Released
+    ) {
+        return Err(stage_error(
+            HarnessStage::Operation,
+            None,
+            HarnessFailureKind::Protocol,
+        ));
+    }
+    let second_session_fence = at_stage(
+        acquired_fence(invoke_and_record(&mut fleet, &mut history, &schedule[7])?),
+        HarnessStage::Operation,
+    )?;
+    if second_session_fence <= first_session_fence {
+        return Err(stage_error(
+            HarnessStage::Operation,
+            None,
+            HarnessFailureKind::Protocol,
+        ));
+    }
+    at_stage(
+        assert_applied(
+            invoke_and_record(&mut fleet, &mut history, &schedule[8])?,
+            2,
+        ),
+        HarnessStage::Operation,
+    )?;
+    match invoke_and_record(&mut fleet, &mut history, &schedule[9])? {
+        QualificationNodeReply::Error {
+            code: QualificationNodeErrorCode::MutationRejected,
+        } => {}
+        _ => {
+            return Err(stage_error(
+                HarnessStage::Operation,
+                None,
+                HarnessFailureKind::Protocol,
+            ));
+        }
+    }
+    at_stage(
+        assert_generation(
+            invoke_and_record(&mut fleet, &mut history, &schedule[10])?,
+            2,
+        ),
+        HarnessStage::Operation,
+    )?;
+
+    let observed_follower = fleet.observe_stable_follower(FLEET_READY_TIMEOUT)?;
+    let fault_target_node_index = observed_follower.node_index;
+    let fault_target_process = format!("node-{fault_target_node_index}");
     let fault_schedule = json!({
         "schema_version": "opc-session-ha-fault-schedule/v1",
         "topology_members": member_count,
@@ -2194,145 +2775,267 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
             {
                 "sequence": 1,
                 "kind": "process_stop",
-                "target_process": format!("node-{FAULT_TARGET_NODE_INDEX}"),
+                "target_process": fault_target_process.clone(),
                 "target_role": "follower",
+                "observed_node_id": observed_follower.node_id,
+                "observed_leader_id": observed_follower.leader_id,
+                "observed_term": observed_follower.term,
                 "bounded": true
             },
             {
                 "sequence": 2,
                 "kind": "process_restart",
-                "target_process": format!("node-{FAULT_TARGET_NODE_INDEX}"),
+                "target_process": fault_target_process.clone(),
                 "target_role": "follower",
+                "observed_node_id": observed_follower.node_id,
+                "observed_leader_id": observed_follower.leader_id,
+                "observed_term": observed_follower.term,
                 "bounded": true
             }
         ]
     });
-    write_private_json(&fault_schedule_path, &fault_schedule)?;
-    let fault_schedule_sha256 = aggregate_file_sha256(
-        FAULT_SCHEDULE_DIGEST_DOMAIN,
-        std::slice::from_ref(&fault_schedule_path),
+    at_stage(
+        write_private_json(&fault_schedule_path, &fault_schedule),
+        HarnessStage::DigestEvidence,
     )?;
-
-    let startup_started = Instant::now();
-    let mut fleet = Fleet::start(member_count, &schedule_sha256)?;
-    let startup_millis = duration_millis(startup_started.elapsed())?;
-    let configuration_sha256 = fleet.configuration_sha256()?;
-    let storage_identity_sha256 = fleet.storage_identity_sha256()?;
-    let mut history = HistoryWriter::new(
-        &history_path,
-        schedule_sha256.clone(),
-        schedule[0].schedule_id.clone(),
-        schedule.len(),
+    let fault_schedule_sha256 = at_stage(
+        aggregate_file_sha256(
+            FAULT_SCHEDULE_DIGEST_DOMAIN,
+            std::slice::from_ref(&fault_schedule_path),
+        ),
+        HarnessStage::DigestEvidence,
     )?;
-
-    match invoke_and_record(&mut fleet, &mut history, &schedule[0])? {
-        QualificationNodeReply::LeaseAcquired { fence } if fence > 0 => {}
-        _ => return Err(HarnessError::Protocol),
-    }
-    assert_applied(
-        invoke_and_record(&mut fleet, &mut history, &schedule[1])?,
-        1,
-    )?;
-    assert_generation(
-        invoke_and_record(&mut fleet, &mut history, &schedule[2])?,
-        1,
-    )?;
-
-    thread::sleep(LEASE_EXPIRY_WAIT);
-    match invoke_and_record(&mut fleet, &mut history, &schedule[3])? {
-        QualificationNodeReply::LeaseAcquired { fence } if fence > 1 => {}
-        _ => return Err(HarnessError::Protocol),
-    }
-    assert_applied(
-        invoke_and_record(&mut fleet, &mut history, &schedule[4])?,
-        2,
-    )?;
-    match invoke_and_record(&mut fleet, &mut history, &schedule[5])? {
-        QualificationNodeReply::Error {
-            code: QualificationNodeErrorCode::MutationRejected,
-        } => {}
-        _ => return Err(HarnessError::Protocol),
-    }
-    assert_generation(
-        invoke_and_record(&mut fleet, &mut history, &schedule[6])?,
-        2,
-    )?;
-
-    fleet.wait_ready(
-        &(0..member_count).collect::<Vec<_>>(),
-        HarnessStage::Operation,
-        FLEET_READY_TIMEOUT,
-    )?;
-    let observed_follower = fleet.observed_follower(FAULT_TARGET_NODE_INDEX)?;
     let continuity_started = Instant::now();
-    fleet.stop_unclean(FAULT_TARGET_NODE_INDEX)?;
+    fleet.stop_unclean(fault_target_node_index)?;
     fleet.wait_ready(
         &(0..member_count)
-            .filter(|node_index| *node_index != FAULT_TARGET_NODE_INDEX)
+            .filter(|node_index| *node_index != fault_target_node_index)
             .collect::<Vec<_>>(),
         HarnessStage::ContinuityReadiness,
         FLEET_READY_TIMEOUT,
     )?;
-    let single_member_stop_service_continuity_millis =
-        duration_millis(continuity_started.elapsed())?;
-    assert_applied(
-        invoke_and_record(&mut fleet, &mut history, &schedule[7])?,
-        3,
+    let single_member_stop_service_continuity_millis = at_stage(
+        duration_millis(continuity_started.elapsed()),
+        HarnessStage::ThresholdEvidence,
     )?;
-    assert_generation(
-        invoke_and_record(&mut fleet, &mut history, &schedule[8])?,
-        3,
+    at_stage(
+        assert_applied(
+            invoke_and_record(&mut fleet, &mut history, &schedule[11])?,
+            3,
+        ),
+        HarnessStage::Operation,
+    )?;
+    at_stage(
+        assert_generation(
+            invoke_and_record(&mut fleet, &mut history, &schedule[12])?,
+            3,
+        ),
+        HarnessStage::Operation,
     )?;
     if !matches!(
-        invoke_and_record(&mut fleet, &mut history, &schedule[9])?,
+        invoke_and_record(&mut fleet, &mut history, &schedule[13])?,
         QualificationNodeReply::Released
     ) {
-        return Err(HarnessError::Protocol);
+        return Err(stage_error(
+            HarnessStage::Operation,
+            None,
+            HarnessFailureKind::Protocol,
+        ));
     }
 
     let restart_started = Instant::now();
-    fleet.restart(FAULT_TARGET_NODE_INDEX)?;
-    let restart_catchup_millis = duration_millis(restart_started.elapsed())?;
-    assert_generation(
-        invoke_and_record(&mut fleet, &mut history, &schedule[10])?,
-        3,
+    at_stage(
+        fleet.restart(fault_target_node_index),
+        HarnessStage::ConfigurationEvidence,
     )?;
+    let restart_catchup_millis = at_stage(
+        duration_millis(restart_started.elapsed()),
+        HarnessStage::ThresholdEvidence,
+    )?;
+    at_stage(
+        assert_generation(
+            invoke_and_record(&mut fleet, &mut history, &schedule[14])?,
+            3,
+        ),
+        HarnessStage::Operation,
+    )?;
+    let child_pids = fleet.pids();
     fleet.shutdown_all();
-    fleet.assert_distinct_encrypted_storage()?;
+    let child_cleanup_complete = child_processes_gone(&child_pids, PROCESS_STOP_TIMEOUT);
+    if !child_cleanup_complete {
+        return Err(stage_error(
+            HarnessStage::Cleanup,
+            None,
+            HarnessFailureKind::Deadline,
+        ));
+    }
+    at_stage(
+        fleet.assert_distinct_encrypted_storage(),
+        HarnessStage::StorageEvidence,
+    )?;
 
-    let output = Command::new("python3")
+    let checker_failure_artifacts = [
+        ("schedule.jsonl", schedule_path.as_path()),
+        ("history.jsonl", history_path.as_path()),
+        ("fault-schedule.json", fault_schedule_path.as_path()),
+        (
+            "configuration-manifest.json",
+            fleet.configuration_manifest_path.as_path(),
+        ),
+    ];
+    let output = match Command::new("python3")
         .arg(&checker)
         .arg("--schedule")
         .arg(&schedule_path)
         .arg("--history")
         .arg(&history_path)
         .output()
-        .map_err(|_| HarnessError::Evidence)?;
-    if output.status.code() != Some(0)
-        || output.stdout.is_empty()
+    {
+        Ok(output) => output,
+        Err(_) => {
+            let diagnostic = unknown_checker_diagnostic(None, None);
+            at_stage(
+                preserve_checker_failure_bundle(
+                    member_count,
+                    &checker_failure_artifacts,
+                    &[],
+                    &[],
+                    &diagnostic,
+                    child_cleanup_complete,
+                ),
+                HarnessStage::CheckerFailureRetention,
+            )?;
+            return Err(checker_stage_error(HarnessStage::CheckerSpawn, diagnostic));
+        }
+    };
+    let exit_code = output.status.code();
+    let signal = output.status.signal();
+    if output.stdout.is_empty()
         || output.stdout.len() > MAX_PROVENANCE_COMMAND_BYTES
+        || output.stderr.len() > MAX_FAILURE_STDERR_BYTES
     {
-        return Err(HarnessError::Evidence);
+        let diagnostic = unknown_checker_diagnostic(exit_code, signal);
+        at_stage(
+            preserve_checker_failure_bundle(
+                member_count,
+                &checker_failure_artifacts,
+                &output.stdout,
+                &output.stderr,
+                &diagnostic,
+                child_cleanup_complete,
+            ),
+            HarnessStage::CheckerFailureRetention,
+        )?;
+        return Err(checker_stage_error(
+            HarnessStage::CheckerOutputSize,
+            diagnostic,
+        ));
     }
-    write_private_bytes(&checker_output_path, &output.stdout)?;
-    let result: Value =
-        serde_json::from_slice(&output.stdout).map_err(|_| HarnessError::Evidence)?;
-    if result["status"] != "pass"
-        || result["operations_checked"].as_u64() != Some(schedule.len() as u64)
-        || result["checker_version"] != "1"
-        || result["violation_codes"] != json!([])
-        || result["inconclusive_codes"] != json!([])
+    let document: CheckerOutputDocument = match serde_json::from_slice(&output.stdout) {
+        Ok(document) => document,
+        Err(_) => {
+            let diagnostic = unknown_checker_diagnostic(exit_code, signal);
+            at_stage(
+                preserve_checker_failure_bundle(
+                    member_count,
+                    &checker_failure_artifacts,
+                    &output.stdout,
+                    &output.stderr,
+                    &diagnostic,
+                    child_cleanup_complete,
+                ),
+                HarnessStage::CheckerFailureRetention,
+            )?;
+            return Err(checker_stage_error(
+                HarnessStage::CheckerOutputJson,
+                diagnostic,
+            ));
+        }
+    };
+    let diagnostic = checker_diagnostic(&document, exit_code, signal);
+    let output_shape_valid = document.checker == "check-session-ha-history.py"
+        && document.checker_version == "1"
+        && !matches!(diagnostic.status, CheckerStatusDiagnostic::Unknown)
+        && document.operations_checked <= schedule.len() as u64
+        && document.violation_codes.len() <= 16
+        && document.inconclusive_codes.len() <= 16
+        && document
+            .violation_codes
+            .iter()
+            .chain(&document.inconclusive_codes)
+            .all(|code| !code.is_empty() && code.len() <= 64);
+    if !output_shape_valid {
+        at_stage(
+            preserve_checker_failure_bundle(
+                member_count,
+                &checker_failure_artifacts,
+                &output.stdout,
+                &output.stderr,
+                &diagnostic,
+                child_cleanup_complete,
+            ),
+            HarnessStage::CheckerFailureRetention,
+        )?;
+        return Err(checker_stage_error(
+            HarnessStage::CheckerOutputJson,
+            diagnostic,
+        ));
+    }
+    let expected_exit = match diagnostic.status {
+        CheckerStatusDiagnostic::Pass => Some(0),
+        CheckerStatusDiagnostic::Fail => Some(1),
+        CheckerStatusDiagnostic::Inconclusive => Some(2),
+        CheckerStatusDiagnostic::InvalidInput => Some(3),
+        CheckerStatusDiagnostic::Unknown => None,
+    };
+    if exit_code != expected_exit || signal.is_some() || !output.stderr.is_empty() {
+        at_stage(
+            preserve_checker_failure_bundle(
+                member_count,
+                &checker_failure_artifacts,
+                &output.stdout,
+                &output.stderr,
+                &diagnostic,
+                child_cleanup_complete,
+            ),
+            HarnessStage::CheckerFailureRetention,
+        )?;
+        return Err(checker_stage_error(HarnessStage::CheckerExit, diagnostic));
+    }
+    if diagnostic.status != CheckerStatusDiagnostic::Pass
+        || document.operations_checked != schedule.len() as u64
+        || !document.violation_codes.is_empty()
+        || !document.inconclusive_codes.is_empty()
     {
-        return Err(HarnessError::Evidence);
+        at_stage(
+            preserve_checker_failure_bundle(
+                member_count,
+                &checker_failure_artifacts,
+                &output.stdout,
+                &output.stderr,
+                &diagnostic,
+                child_cleanup_complete,
+            ),
+            HarnessStage::CheckerFailureRetention,
+        )?;
+        return Err(checker_stage_error(HarnessStage::CheckerResult, diagnostic));
     }
+    at_stage(
+        write_private_bytes(&checker_output_path, &output.stdout),
+        HarnessStage::CheckerArtifact,
+    )?;
 
-    let (source_revision, source_tree_status) = source_provenance(&repository)?;
-    let environment = environment_evidence()?;
-    let binary_sha256 = sha256_file(&fleet.binary)?;
-    let profile_sha256 = sha256_file(&profile_path)?;
-    let history_sha256 = sha256_file(&history_path)?;
-    let checker_sha256 = sha256_file(&checker)?;
-    let checker_output_sha256 = sha256_file(&checker_output_path)?;
+    let (source_revision, source_tree_status) =
+        at_stage(source_provenance(&repository), HarnessStage::DigestEvidence)?;
+    let environment = at_stage(environment_evidence(), HarnessStage::DigestEvidence)?;
+    let binary_sha256 = at_stage(sha256_file(&fleet.binary), HarnessStage::DigestEvidence)?;
+    let profile_sha256 = at_stage(sha256_file(&profile_path), HarnessStage::DigestEvidence)?;
+    let history_sha256 = at_stage(sha256_file(&history_path), HarnessStage::DigestEvidence)?;
+    let checker_sha256 = at_stage(sha256_file(&checker), HarnessStage::DigestEvidence)?;
+    let checker_output_sha256 = at_stage(
+        sha256_file(&checker_output_path),
+        HarnessStage::DigestEvidence,
+    )?;
     let completed_at = OffsetDateTime::now_utc();
     let topology_coverage = if member_count == 3 {
         "three_node"
@@ -2380,7 +3083,7 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
         "faults": [
             {
                 "kind": "process_stop",
-                "target_process": format!("node-{FAULT_TARGET_NODE_INDEX}"),
+                "target_process": fault_target_process.clone(),
                 "target_role": "follower",
                 "observed_node_id": observed_follower.node_id,
                 "observed_leader_id": observed_follower.leader_id,
@@ -2389,7 +3092,7 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
             },
             {
                 "kind": "process_restart",
-                "target_process": format!("node-{FAULT_TARGET_NODE_INDEX}"),
+                "target_process": fault_target_process.clone(),
                 "target_role": "follower",
                 "observed_node_id": observed_follower.node_id,
                 "observed_leader_id": observed_follower.leader_id,
@@ -2431,6 +3134,7 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
             "profile_inventory",
             "independent_history_checker",
             "lease_acquire_release",
+            "lease_expiry_reacquire",
             "compare_and_set",
             "linearizable_read",
             "stale_fence_rejection",
@@ -2458,31 +3162,43 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
             "distributed_hkms_payload_key_rotation"
         ]
     });
-    validate_generated_evidence(&evidence, member_count, &profile)?;
-    write_private_json(&evidence_path, &evidence)?;
-    let retained_bundle = preserve_evidence_bundle(
-        member_count,
-        &[
-            ("evidence.json", evidence_path.as_path()),
-            ("profile.json", profile_path.as_path()),
-            ("profile.schema.json", profile_schema_path.as_path()),
-            ("evidence.schema.json", evidence_schema_path.as_path()),
-            ("schedule.schema.json", schedule_schema_path.as_path()),
-            ("history.schema.json", history_schema_path.as_path()),
-            (
-                "configuration-manifest.json",
-                fleet.configuration_manifest_path.as_path(),
-            ),
-            ("fault-schedule.json", fault_schedule_path.as_path()),
-            ("schedule.jsonl", schedule_path.as_path()),
-            ("history.jsonl", history_path.as_path()),
-            ("checker-output.json", checker_output_path.as_path()),
-            ("check-session-ha-history.py", checker.as_path()),
-            ("opc-session-quorum-node", fleet.binary.as_path()),
-        ],
+    at_stage(
+        validate_generated_evidence(&evidence, member_count, &profile),
+        HarnessStage::EvidenceValidation,
+    )?;
+    at_stage(
+        write_private_json(&evidence_path, &evidence),
+        HarnessStage::EvidenceValidation,
+    )?;
+    let retained_bundle = at_stage(
+        preserve_evidence_bundle(
+            member_count,
+            &[
+                ("evidence.json", evidence_path.as_path()),
+                ("profile.json", profile_path.as_path()),
+                ("profile.schema.json", profile_schema_path.as_path()),
+                ("evidence.schema.json", evidence_schema_path.as_path()),
+                ("schedule.schema.json", schedule_schema_path.as_path()),
+                ("history.schema.json", history_schema_path.as_path()),
+                (
+                    "configuration-manifest.json",
+                    fleet.configuration_manifest_path.as_path(),
+                ),
+                ("fault-schedule.json", fault_schedule_path.as_path()),
+                ("schedule.jsonl", schedule_path.as_path()),
+                ("history.jsonl", history_path.as_path()),
+                ("checker-output.json", checker_output_path.as_path()),
+                ("check-session-ha-history.py", checker.as_path()),
+                ("opc-session-quorum-node", fleet.binary.as_path()),
+            ],
+        ),
+        HarnessStage::BundleEvidence,
     )?;
     if let Some(retained_bundle) = retained_bundle {
-        verify_retained_bundle(&retained_bundle, member_count)?;
+        at_stage(
+            verify_retained_bundle(&retained_bundle, member_count),
+            HarnessStage::BundleEvidence,
+        )?;
     }
     Ok(())
 }
@@ -2491,6 +3207,72 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
 fn real_three_and_five_process_openraft_sqlite_stop_restart_foundation() {
     run_foundation(3).expect("three-process foundation evidence");
     run_foundation(5).expect("five-process foundation evidence");
+}
+
+#[test]
+fn foundation_schedule_separates_expiry_from_the_explicit_mutation_lease_handoff() {
+    let schedule = workload(3);
+    assert_eq!(schedule.len(), 15);
+    assert!(matches!(
+        &schedule[0].operation,
+        ScheduledOperation::LeaseAcquire {
+            key,
+            ttl_millis,
+            ..
+        } if key == "session-expiry" && *ttl_millis == SHORT_LEASE_MILLIS
+    ));
+    assert!(matches!(
+        &schedule[1].operation,
+        ScheduledOperation::LeaseAcquire {
+            key,
+            ttl_millis,
+            ..
+        } if key == "session-expiry" && *ttl_millis == LONG_LEASE_MILLIS
+    ));
+    assert!(matches!(
+        &schedule[2].operation,
+        ScheduledOperation::LeaseRelease {
+            lease_operation_id,
+            ..
+        } if lease_operation_id == "op-2"
+    ));
+    assert!(matches!(
+        &schedule[3].operation,
+        ScheduledOperation::LeaseAcquire {
+            owner,
+            ttl_millis,
+            ..
+        } if owner == "owner-a" && *ttl_millis == LONG_LEASE_MILLIS
+    ));
+    assert!(matches!(
+        &schedule[6].operation,
+        ScheduledOperation::LeaseRelease {
+            lease_operation_id,
+            ..
+        } if lease_operation_id == "op-4"
+    ));
+    assert!(matches!(
+        &schedule[7].operation,
+        ScheduledOperation::LeaseAcquire { owner, .. } if owner == "owner-b"
+    ));
+    assert!(matches!(
+        &schedule[8].operation,
+        ScheduledOperation::CompareAndSet {
+            lease_operation_id,
+            ..
+        } if lease_operation_id == "op-8"
+    ));
+    assert!(matches!(
+        &schedule[9].operation,
+        ScheduledOperation::CompareAndSet {
+            lease_operation_id,
+            ..
+        } if lease_operation_id == "op-4"
+    ));
+    assert!(schedule[11..=13]
+        .iter()
+        .all(|invocation| invocation.process_id == "node-1"));
+    assert_eq!(schedule[14].process_id, "node-2");
 }
 
 fn assert_process_gone(pid: u32) {

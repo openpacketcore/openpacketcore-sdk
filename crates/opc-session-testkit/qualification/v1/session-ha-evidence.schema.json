@@ -287,6 +287,7 @@
           "profile_inventory",
           "independent_history_checker",
           "lease_acquire_release",
+          "lease_expiry_reacquire",
           "compare_and_set",
           "linearizable_read",
           "stale_fence_rejection",

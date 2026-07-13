@@ -244,20 +244,32 @@ fn validate_exact_evidence_fields(evidence: &Value) -> Result<(), String> {
     let faults = evidence["faults"]
         .as_array()
         .ok_or_else(|| "fault evidence missing".to_owned())?;
+    let first_fault = faults
+        .first()
+        .ok_or_else(|| "fault evidence missing".to_owned())?;
+    let expected_target = first_fault["target_process"]
+        .as_str()
+        .filter(|target| matches!(*target, "node-0" | "node-2"))
+        .ok_or_else(|| "fault target is outside the bounded candidate set".to_owned())?;
+    let expected_node_id = first_fault["observed_node_id"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "fault observation node is invalid".to_owned())?;
+    let expected_leader_id = first_fault["observed_leader_id"]
+        .as_u64()
+        .filter(|value| *value > 0 && *value != expected_node_id)
+        .ok_or_else(|| "fault observation leader is invalid".to_owned())?;
+    let expected_term = first_fault["observed_term"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "fault observation term is invalid".to_owned())?;
     if faults.len() != 2
         || !faults.iter().all(|fault| {
-            fault["target_process"] == "node-2"
+            fault["target_process"] == expected_target
                 && fault["target_role"] == "follower"
-                && fault["observed_node_id"]
-                    .as_u64()
-                    .is_some_and(|value| value > 0)
-                && fault["observed_leader_id"]
-                    .as_u64()
-                    .is_some_and(|value| value > 0)
-                && fault["observed_node_id"] != fault["observed_leader_id"]
-                && fault["observed_term"]
-                    .as_u64()
-                    .is_some_and(|value| value > 0)
+                && fault["observed_node_id"].as_u64() == Some(expected_node_id)
+                && fault["observed_leader_id"].as_u64() == Some(expected_leader_id)
+                && fault["observed_term"].as_u64() == Some(expected_term)
         })
     {
         return Err("fault evidence does not identify an observed follower".to_owned());
