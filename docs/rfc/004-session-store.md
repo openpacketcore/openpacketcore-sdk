@@ -781,9 +781,11 @@ request.
 
 The public semantic `Request` and `Response` types remain available, but their
 Serde boundary MUST delegate to private fixed-width v4 DTOs. `Hello` and
-`HelloAck` add an optional `contract_profile`; exhaustive Rust construction and
-matching MUST account for the new field. The profile pins wire-schema and
-error-set revisions 2 and 1 respectively; owner, custom-key, and state-type
+`HelloAck` add an optional `contract_profile`; `HelloAck` also carries the
+server's optional `cas_idempotency_epoch`, and direct CAS carries an optional
+`idempotency_epoch`. Exhaustive Rust construction and matching MUST account for
+the new fields. The profile pins wire-schema revision 4 and error-set revision
+3; owner, custom-key, and state-type
 bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `max_frame_size = 16777216`;
 `stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
@@ -922,10 +924,26 @@ aggregate scales with the configured connection limit. #143 owns aggregate
 byte permits and distributed resource/soak qualification.
 
 Backend mutation and response delivery are not one transaction. A mutation MAY
-commit before response encoding, write, or flush fails. A client that receives
-no valid response MUST treat the outcome as ambiguous, use existing request-ID,
-idempotency, and fencing semantics, and perform an authoritative re-read before
-retrying; it MUST NOT infer rollback from an outbound rejection or timeout.
+commit before response encoding, write, or flush fails. Direct CAS idempotency
+MUST be keyed by the authenticated logical peer plus canonical request UUID and
+MUST bind a redaction-safe digest of the complete operation, cluster and
+configuration identity, monotonic configuration epoch, and server-issued
+process epoch. Same-scope exact duplicates MUST share one in-flight execution
+and replay the exact success or conflict. Reuse by another peer or operation
+MUST return `CasIdempotencyConflict` before backend dispatch. Cancellation MUST
+leave a tracked ambiguous tombstone, never an untracked in-flight entry.
+
+The compatibility cache MUST bound total and per-peer entries and bytes,
+retention age, and cleanup work. One peer MUST NOT evict another peer's active
+retry window. Restart or retention cleanup MUST rotate the process epoch, and
+an old epoch MUST return `CasIdempotencyOutcomeUnavailable` before mutation.
+Pressure that cannot retain a result MUST return the same typed unavailable
+outcome rather than evicting an active result and treating its UUID as new.
+The public client MUST NOT automatically resubmit a CAS after any ambiguous
+transport boundary. A caller that receives no valid response or the typed
+unavailable outcome MUST perform an authoritative re-read and derive a new
+mutation; it MUST NOT infer rollback or replay the historical operation under
+either the old or a fresh UUID.
 
 Outbound diagnostics SHOULD expose only bounded `response_family` categories
 and fixed reasons such as `frame_too_large`, `page_shortened`, `write_timeout`,

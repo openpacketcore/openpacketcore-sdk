@@ -135,6 +135,12 @@ pub enum SteeringBackendKind {
     VfXdp,
     /// NIC/DPU offload backend.
     NicOffload,
+    /// Floating-VIP delivery on a converged shared-L2 deployment.
+    ///
+    /// The VIP delivers packets to the selected node directly, so steering
+    /// mutations satisfy the backend contract as intentional no-ops rather
+    /// than programming a host, VF, or NIC datapath.
+    VipDelivered,
 }
 
 /// Capability and readiness probe for a steering backend.
@@ -144,7 +150,11 @@ pub struct SteeringProbe {
     pub kind: SteeringBackendKind,
     /// Platform can support this backend.
     pub platform_supported: bool,
-    /// Backend can mutate dataplane rules.
+    /// Backend can satisfy steering mutation requests.
+    ///
+    /// This means concrete datapath mutation for XDP/offload backends. For
+    /// [`SteeringBackendKind::VipDelivered`], mutations are intentional no-ops
+    /// because the floating VIP supplies delivery.
     pub mutation_ready: bool,
     /// Backend is key-material-free by construction.
     pub key_material_free: bool,
@@ -153,6 +163,22 @@ pub struct SteeringProbe {
 }
 
 impl SteeringProbe {
+    /// Probe result for floating-VIP delivery on a converged shared L2.
+    ///
+    /// This production tier satisfies steering mutations as intentional
+    /// no-ops. It does not claim host/VF XDP, NIC offload, or datapath rule
+    /// programming; packet delivery is supplied by the floating VIP.
+    #[must_use]
+    pub const fn vip_delivered() -> Self {
+        Self {
+            kind: SteeringBackendKind::VipDelivered,
+            platform_supported: true,
+            mutation_ready: true,
+            key_material_free: true,
+            details: Some("floating VIP supplies packet delivery; steering mutations are no-ops"),
+        }
+    }
+
     /// Probe result for a mock backend.
     #[must_use]
     pub const fn mock() -> Self {
@@ -262,6 +288,21 @@ mod tests {
         );
         assert!(!SteeringProbe::default().mutation_ready);
         assert_eq!(VipProbe::default().kind, VipAdvertiserKind::Unsupported);
+    }
+
+    #[test]
+    fn vip_delivered_probe_is_production_ready_without_datapath_claims() {
+        let probe = SteeringProbe::vip_delivered();
+
+        assert_eq!(probe.kind, SteeringBackendKind::VipDelivered);
+        assert_ne!(probe.kind, SteeringBackendKind::Mock);
+        assert!(probe.platform_supported);
+        assert!(probe.mutation_ready);
+        assert!(probe.key_material_free);
+        assert_eq!(
+            probe.details,
+            Some("floating VIP supplies packet delivery; steering mutations are no-ops")
+        );
     }
 
     #[test]

@@ -52,6 +52,7 @@ struct Connection {
     authenticated_peer: Option<ReplicaId>,
     contract_profile: ContractProfile,
     frame_limits: NegotiatedFrameLimits,
+    cas_idempotency_epoch: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,7 +304,7 @@ async fn open_connection(
         }
 
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
-        let (contract_profile, frame_limits) = perform_client_handshake(
+        let (contract_profile, frame_limits, cas_idempotency_epoch) = perform_client_handshake(
             &mut reader,
             &mut writer,
             &binding,
@@ -317,10 +318,11 @@ async fn open_connection(
             authenticated_peer: Some(binding.remote_replica_id().clone()),
             contract_profile,
             frame_limits,
+            cas_idempotency_epoch,
         })
     } else {
         let (mut reader, mut writer) = tokio::io::split(tcp);
-        let (contract_profile, frame_limits) = perform_client_handshake(
+        let (contract_profile, frame_limits, cas_idempotency_epoch) = perform_client_handshake(
             &mut reader,
             &mut writer,
             &binding,
@@ -334,6 +336,7 @@ async fn open_connection(
             authenticated_peer: None,
             contract_profile,
             frame_limits,
+            cas_idempotency_epoch,
         })
     }
 }
@@ -344,7 +347,7 @@ async fn perform_client_handshake<R, W>(
     binding: &RemoteReplicaBinding,
     requested_response_frame_size: usize,
     operation_deadline: tokio::time::Instant,
-) -> Result<(ContractProfile, NegotiatedFrameLimits), ProtocolError>
+) -> Result<(ContractProfile, NegotiatedFrameLimits, uuid::Uuid), ProtocolError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -360,6 +363,7 @@ where
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(configuration_id.clone()),
+            configuration_epoch: Some(binding.configuration_epoch().get()),
             handshake_nonce: Some(handshake_nonce),
             contract_profile: Some(CURRENT_CONTRACT_PROFILE),
             requested_response_frame_size: Some(requested_response_frame_size),
@@ -386,7 +390,8 @@ where
                 && ack.accepted_client_replica_id.as_deref()
                     == Some(binding.local_replica_id().as_str())
                 && ack.cluster_id.as_deref() == Some(binding.cluster_id().as_str())
-                && ack.configuration_id.as_deref() == Some(configuration_id.as_str());
+                && ack.configuration_id.as_deref() == Some(configuration_id.as_str())
+                && ack.configuration_epoch == Some(binding.configuration_epoch().get());
             if !identity_matches {
                 return Err(ProtocolError::Authentication);
             }
@@ -405,12 +410,16 @@ where
                     .ok_or(ProtocolError::ContractMismatch)?,
             )?
             .min(checked_frame_size(requested_response_frame_size)?);
+            let cas_idempotency_epoch = ack
+                .cas_idempotency_epoch
+                .ok_or(ProtocolError::ContractMismatch)?;
             Ok((
                 CURRENT_CONTRACT_PROFILE,
                 NegotiatedFrameLimits {
                     response_frame_size: accepted_response_frame_size,
                     request_frame_size,
                 },
+                cas_idempotency_epoch,
             ))
         }
         BootstrapResponse::HelloRejected { .. } => Err(ProtocolError::Authentication),
@@ -627,6 +636,30 @@ impl RemoteSessionBackend {
             .map(|response| response.response)
     }
 
+    /// Dispatch one mutation exactly once from the client's point of view.
+    ///
+    /// A transport failure may occur after the server crossed its mutation
+    /// boundary. Automatically reconnecting and resubmitting would be unsafe
+    /// once the server's bounded outcome window is unavailable (for example
+    /// after restart or pressure). The caller receives a typed unavailable
+    /// result and must re-read authoritative state before deriving a new CAS.
+    async fn send_mutation_once(&self, req: Request) -> Result<Response, StoreError> {
+        validate_request_profile(&req).map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
+        validate_request_payload_limit(&req, conservative_payload_budget(self.max_frame_size))?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.deadline)
+            .ok_or(StoreError::CasIdempotencyOutcomeUnavailable)?;
+        self.do_request(&req, deadline)
+            .await
+            .map(|response| response.response)
+            .map_err(|failure| match failure {
+                RemoteRequestFailure::PayloadTooLarge { actual, max } => {
+                    StoreError::PayloadTooLarge { actual, max }
+                }
+                _ => StoreError::CasIdempotencyOutcomeUnavailable,
+            })
+    }
+
     async fn send_request_with_retry_negotiated(
         &self,
         req: Request,
@@ -672,16 +705,24 @@ impl RemoteSessionBackend {
                 .map_err(|error| RemoteRequestFailure::from_protocol_error(&error))?,
         };
 
+        let request = match req {
+            Request::CompareAndSet { op, request_id, .. } => Request::CompareAndSet {
+                op: op.clone(),
+                request_id: request_id.clone(),
+                idempotency_epoch: Some(conn.cas_idempotency_epoch.hyphenated().to_string()),
+            },
+            _ => req.clone(),
+        };
         let transport_limit = conservative_payload_budget(conn.frame_limits.request_frame_size)
             .min(conservative_payload_budget(
                 conn.frame_limits.response_frame_size,
             ));
-        if let Err(error) = validate_request_payload_limit(req, transport_limit) {
+        if let Err(error) = validate_request_payload_limit(&request, transport_limit) {
             *guard = Some(conn);
             return Err(RemoteRequestFailure::from_store_preflight(error));
         }
 
-        match self.exchange(req, &mut conn, operation_deadline).await {
+        match self.exchange(&request, &mut conn, operation_deadline).await {
             Ok(resp) => {
                 let response = NegotiatedResponse {
                     response: resp,
@@ -919,13 +960,23 @@ impl SessionBackend for RemoteSessionBackend {
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
         let expected_key = op.key.clone();
-        match self
-            .send_request_with_retry(Request::CompareAndSet {
+        let response = self
+            .send_mutation_once(Request::CompareAndSet {
                 op,
                 request_id: Some(uuid::Uuid::new_v4().to_string()),
+                idempotency_epoch: None,
             })
-            .await?
-        {
+            .await?;
+        if matches!(
+            response,
+            Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable))
+        ) {
+            // The server rotated or lost the bounded retry epoch. Drop this
+            // connection so a separately derived future CAS must complete a
+            // new authenticated handshake and cannot carry the stale epoch.
+            self.conn.lock().await.take();
+        }
+        match response {
             Response::CompareAndSet(res)
                 if compare_and_set_result_matches_key(&expected_key, &res) =>
             {
@@ -1384,6 +1435,8 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::NotFound => "not_found",
         StoreError::StaleFence => "stale_fence",
         StoreError::CasConflict => "cas_conflict",
+        StoreError::CasIdempotencyConflict => "cas_idempotency_conflict",
+        StoreError::CasIdempotencyOutcomeUnavailable => "cas_idempotency_outcome_unavailable",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
@@ -1451,6 +1504,7 @@ mod tests {
             expected_server_replica_id,
             cluster_id,
             configuration_id,
+            configuration_epoch,
             handshake_nonce,
             ..
         } = hello
@@ -1464,7 +1518,9 @@ mod tests {
             accepted_client_replica_id: Some(node_id.clone()),
             cluster_id: cluster_id.clone(),
             configuration_id: configuration_id.clone(),
+            configuration_epoch: *configuration_epoch,
             handshake_nonce: *handshake_nonce,
+            cas_idempotency_epoch: Some(uuid::Uuid::from_u128(1)),
             accepted_response_frame_size: Some(accepted_response_frame_size),
             server_request_frame_size: Some(server_request_frame_size),
         }
@@ -1677,7 +1733,9 @@ mod tests {
                     accepted_client_replica_id: None,
                     cluster_id: None,
                     configuration_id: None,
+                    configuration_epoch: None,
                     handshake_nonce: None,
+                    cas_idempotency_epoch: None,
                     accepted_response_frame_size: None,
                     server_request_frame_size: None,
                 },
@@ -2088,6 +2146,7 @@ mod tests {
                 .send_request_classified(Request::CompareAndSet {
                     op,
                     request_id: Some("not-a-canonical-uuid".to_string()),
+                    idempotency_epoch: None,
                 })
                 .await,
             Err(RemoteRequestFailure::Protocol)

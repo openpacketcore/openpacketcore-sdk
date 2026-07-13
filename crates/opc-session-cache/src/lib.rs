@@ -674,6 +674,8 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::NotFound => "not_found",
         StoreError::StaleFence => "stale_fence",
         StoreError::CasConflict => "cas_conflict",
+        StoreError::CasIdempotencyConflict => "cas_idempotency_conflict",
+        StoreError::CasIdempotencyOutcomeUnavailable => "cas_idempotency_outcome_unavailable",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",

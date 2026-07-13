@@ -17,6 +17,9 @@ steer layer:
 - session-store backed ownership reads and fenced SA-owner promotion;
 - Host-XDP cross-node redirect config that fails closed unless mTLS/SPIFFE
   with no plaintext fallback is declared;
+- a `VipDelivered` production probe for converged shared-L2 deployments where
+  a floating VIP supplies packet delivery and steering mutations are
+  intentional no-ops;
 - NIC/DPU inline IPsec crypto offload posture validation for documented
   FIPS/HSM key-custody scope;
 - reusable ports for steering backends, VIP advertisement, ownership reads,
@@ -29,6 +32,12 @@ ports; SR-IOV, NIC offload, direct BGP speaker integrations, VRRP adapters, and
 live failover evidence remain product/lab tiers built behind the ports. A
 re-pin install never sets `forwarding_proven`; packet-flow proof must be
 injected by lab/product dataplane evidence.
+
+`SteeringProbe::vip_delivered()` is ready only for a product adapter that has
+already established floating-VIP delivery on the converged L2. It deliberately
+does not claim Host-XDP, VF-XDP, NIC offload, key custody, or datapath rule
+mutation. The default probe remains `Unsupported`; this constructor does not
+add a generic production no-op backend or select the tier automatically.
 
 Same-SPI resume supports ESP Child SAs with 64-bit ESN and IKE SAs with a
 64-bit AEAD explicit-IV counter; protocol-typed evidence must match the SA and

@@ -182,11 +182,12 @@ build.
 
 ### Outbound response contract
 
-Protocol v4 contract-profile wire-schema revision 3 retains revision 2's
-response budgets and adds the confidential authenticated snapshot-bound
+Protocol v4 contract-profile wire-schema revision 4 retains revision 3's
+confidential authenticated snapshot-bound
 restore cursor, explicit durable-page profile, fixed 4 MiB restore payload and
 8 MiB retained-page, 8 MiB examined-metadata, and 4,096 examined-candidate
-budgets, and error-set revision 2. Directional budgets are
+budgets, and adds exact configuration/process epoch binding for direct CAS.
+The error-set revision is 3. Directional budgets are
 part
 of the exact handshake. `requested_response_frame_size`,
 `accepted_response_frame_size`, and `server_request_frame_size` are public
@@ -204,6 +205,32 @@ the server request size independently bounds frames sent by that client. This
 supports unequal client/server settings without assuming either configured
 limit applies in both directions. A revision-2 or older v4 peer is incompatible even
 though the ALPN remains `opc-session-net/4`.
+
+Direct CAS uses a canonical request UUID plus the server's
+`cas_idempotency_epoch` from the authenticated `HelloAck`. The server binds
+that pair to the authenticated logical replica, exact cluster/configuration
+identity and monotonic configuration epoch, and a domain-separated SHA-256
+digest of the complete CAS. Exact successes and conflicts replay; another
+peer or operation reusing the UUID returns `CasIdempotencyConflict` before
+backend dispatch. Concurrent duplicates share one in-flight execution. If
+that execution is cancelled, or the bounded result cannot be retained, the
+entry becomes `CasIdempotencyOutcomeUnavailable` rather than being silently
+re-executed.
+
+The cache admits at most 4,096 total entries, 512 per authenticated peer,
+32 MiB total retained bytes, and 8 MiB per peer. Each request performs at most
+64 cleanup inspections. Results are retained for five minutes, then become
+small ambiguous tombstones; after the ten-minute tombstone interval the
+server rotates its process epoch and clears the cache only when no CAS is in
+flight. Restart also creates a fresh epoch. A request carrying an old epoch is
+therefore rejected before mutation. The public `RemoteSessionBackend` injects
+the live epoch internally and sends a direct CAS only once: transport loss
+after any write/read boundary returns the typed unavailable outcome. The CNF
+must authoritatively re-read and derive a new CAS; it must not resubmit the
+historical operation under either the old or a fresh UUID.
+Diagnostics use only the fixed reasons `stale_epoch`, `identity_reuse`,
+`ambiguous`, and `capacity`; they never include a peer, UUID, digest, key,
+owner, lease, record, or payload.
 
 The cursor's seek key and snapshot metadata remain confidential. Its one clear
 cumulative examined-row position is bound into cursor authentication and lets
@@ -360,13 +387,15 @@ campaigns.
   `opc-session-net/4` ALPN, version, and contract profile require a coordinated
   stop/upgrade/start of every session-net participant; mixed v3/v4 fleets are
   unsupported and there is no highest-common-version downgrade negotiation.
-  `Hello` and `HelloAck` gain optional `contract_profile` and directional-frame
-  fields, which is a Rust source break for exhaustive construction and matching
+  `Hello` and `HelloAck` gain optional `contract_profile`, exact
+  `configuration_epoch`, and directional-frame fields; `HelloAck` also gains
+  `cas_idempotency_epoch`, and direct CAS gains `idempotency_epoch`. These are
+  Rust source breaks for exhaustive construction and matching
   even though public `Request`/`Response` remain available. Revision 2 also
   adds public `ContractProfile::max_frame_size`, so external profile struct
   literals and exhaustive destructuring must be updated in the same
   coordinated change.
-- The v4 profile pins wire-schema revision 3 and error-set revision 2;
+- The v4 profile pins wire-schema revision 4 and error-set revision 3;
   `max_restore_scan_page_payload_bytes = 4194304`;
   `max_restore_scan_examined_rows = 4096`;
   `min_frame_size = 8192`; `max_frame_size = 16777216`; the 128-byte
@@ -375,7 +404,8 @@ campaigns.
   `cas_request_id_bytes = 36`; depth-16/256-node replication trees; the
   31,536,000-second TTL maximum; and the collection limits above. Transported
   stable IDs must contain 1 through 64 bytes, replication transaction IDs must
-  contain 1 through 128 UTF-8 bytes, and CAS request IDs, when present, must be
+  contain 1 through 128 UTF-8 bytes, and CAS request IDs and process epochs,
+  when present, must be
   canonical lowercase hyphenated UUIDs with the exact 36-byte encoding. A version or
   profile mismatch is rejected before backend dispatch.
 - #135 kept the JSON shape of valid v3 owner and session-key type values as a

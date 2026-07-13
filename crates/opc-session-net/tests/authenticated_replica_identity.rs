@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::protocol::{
     read_frame, write_frame, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
@@ -16,10 +17,13 @@ use opc_session_net::{
 };
 use opc_session_store::fake::FakeSessionBackend;
 use opc_session_store::{
+    CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, Generation, OwnerId,
     QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity, SessionBackend,
+    ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity, SessionBackend, SessionKey,
+    SessionKeyType, StateClass, StateType, StoredSessionRecord,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
+use opc_types::{NetworkFunctionKind, TenantId};
 
 const SERVER_REPLICA: u16 = 2;
 
@@ -105,11 +109,19 @@ fn descriptor(replica: u16) -> QuorumReplicaDescriptor {
 }
 
 fn manifest(cluster: &str, generation: &str) -> Arc<SessionReplicationManifest> {
+    manifest_with_epoch(cluster, generation, 1)
+}
+
+fn manifest_with_epoch(
+    cluster: &str,
+    generation: &str,
+    epoch: u64,
+) -> Arc<SessionReplicationManifest> {
     Arc::new(
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new(cluster).expect("cluster ID"),
             SessionConfigurationGeneration::new(generation).expect("configuration generation"),
-            SessionConfigurationEpoch::new(1).expect("configuration epoch"),
+            SessionConfigurationEpoch::new(epoch).expect("configuration epoch"),
             vec![descriptor(1), descriptor(2), descriptor(3)],
         )
         .expect("replication manifest"),
@@ -169,6 +181,7 @@ fn successful_hello_ack(hello: &Request) -> Response {
         expected_server_replica_id,
         cluster_id,
         configuration_id,
+        configuration_epoch,
         handshake_nonce,
         requested_response_frame_size,
         ..
@@ -183,7 +196,9 @@ fn successful_hello_ack(hello: &Request) -> Response {
         accepted_client_replica_id: Some(node_id.clone()),
         cluster_id: cluster_id.clone(),
         configuration_id: configuration_id.clone(),
+        configuration_epoch: *configuration_epoch,
         handshake_nonce: *handshake_nonce,
+        cas_idempotency_epoch: Some(uuid::Uuid::from_u128(1)),
         accepted_response_frame_size: *requested_response_frame_size,
         server_request_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
     }
@@ -197,6 +212,7 @@ fn hello_for(binding: &RemoteReplicaBinding) -> Request {
         expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
         cluster_id: Some(binding.cluster_id().as_str().to_string()),
         configuration_id: Some(binding.configuration_id().to_hex()),
+        configuration_epoch: Some(binding.configuration_epoch().get()),
         handshake_nonce: Some(uuid::Uuid::new_v4()),
         requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
     }
@@ -270,6 +286,19 @@ async fn certificate_claim_scope_and_server_mismatches_fail_closed() {
     );
     assert_eq!(
         wrong_generation.probe_replication_head().await,
+        Err(ReplicaReadinessFailure::Authentication)
+    );
+
+    let wrong_epoch_manifest = manifest_with_epoch("cluster-a", "generation-7", 2);
+    let wrong_epoch = remote(
+        &wrong_epoch_manifest,
+        1,
+        SERVER_REPLICA,
+        addr,
+        pki.client_config(1),
+    );
+    assert_eq!(
+        wrong_epoch.probe_replication_head().await,
         Err(ReplicaReadinessFailure::Authentication)
     );
 
@@ -365,6 +394,7 @@ async fn downgrade_and_malformed_hello_are_rejected_before_dispatch() {
             expected_server_replica_id: None,
             cluster_id: None,
             configuration_id: None,
+            configuration_epoch: None,
             handshake_nonce: None,
             requested_response_frame_size: None,
         },
@@ -432,6 +462,7 @@ async fn downgrade_and_malformed_hello_are_rejected_before_dispatch() {
             expected_server_replica_id: None,
             cluster_id: None,
             configuration_id: None,
+            configuration_epoch: None,
             handshake_nonce: None,
             requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
@@ -673,14 +704,95 @@ async fn server_revalidates_a_rotated_client_svid_instead_of_resuming_identity()
     let first_response: Response = read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("first Hello response");
-    assert!(matches!(
-        first_response,
+    let first_epoch = match first_response {
         Response::HelloAck {
             contract_version: CONTRACT_VERSION,
+            cas_idempotency_epoch: Some(epoch),
             ..
-        }
+        } => epoch,
+        other => panic!("unexpected first Hello response: {other:?}"),
+    };
+    let key = SessionKey {
+        tenant: TenantId::new("tenant-a").expect("tenant"),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(b"credential-rotation-cas"),
+    };
+    let owner = OwnerId::new("credential-rotation-owner").expect("owner");
+    write_frame(
+        &mut first,
+        &Request::AcquireLease {
+            key: key.clone(),
+            owner: owner.clone(),
+            ttl: Duration::from_secs(60),
+        },
+    )
+    .await
+    .expect("acquire request");
+    let lease = match read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("acquire response")
+    {
+        Response::AcquireLease(Ok(lease)) => lease,
+        other => panic!("unexpected acquire response: {other:?}"),
+    };
+    let operation = CompareAndSet {
+        key: key.clone(),
+        lease: lease.clone(),
+        expected_generation: None,
+        new_record: StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner,
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("credential-rotation").expect("state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"opaque-test-payload"),
+        },
+    };
+    let request_id = uuid::Uuid::new_v4().hyphenated().to_string();
+    let cas = Request::CompareAndSet {
+        op: operation,
+        request_id: Some(request_id),
+        idempotency_epoch: Some(first_epoch.hyphenated().to_string()),
+    };
+    write_frame(&mut first, &cas).await.expect("first CAS");
+    assert!(matches!(
+        read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
+            .await
+            .expect("first CAS response"),
+        Response::CompareAndSet(Ok(CompareAndSetResult::Success))
     ));
     drop(first);
+
+    identity_tx.send_replace(Some(pki.identity_state(1)));
+    let mut renewed = raw_tls_connection(addr, resumption_enabled_client.clone()).await;
+    write_frame(&mut renewed, &hello_for(&binding))
+        .await
+        .expect("renewed Hello");
+    let renewed_epoch = match read_frame(&mut renewed, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("renewed Hello response")
+    {
+        Response::HelloAck {
+            contract_version: CONTRACT_VERSION,
+            cas_idempotency_epoch: Some(epoch),
+            ..
+        } => epoch,
+        other => panic!("unexpected renewed Hello response: {other:?}"),
+    };
+    assert_eq!(renewed_epoch, first_epoch);
+    write_frame(&mut renewed, &cas)
+        .await
+        .expect("replayed CAS after SVID renewal");
+    assert!(matches!(
+        read_frame(&mut renewed, DEFAULT_MAX_FRAME_SIZE)
+            .await
+            .expect("replayed CAS response"),
+        Response::CompareAndSet(Ok(CompareAndSetResult::Success))
+    ));
+    drop(renewed);
 
     identity_tx.send_replace(Some(pki.identity_state(3)));
     let mut rotated = raw_tls_connection(addr, resumption_enabled_client).await;

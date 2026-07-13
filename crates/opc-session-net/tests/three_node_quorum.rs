@@ -514,7 +514,13 @@ impl SessionBackend for OversizedOutputBackend {
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
-        self.inner.compare_and_set(op).await
+        self.inner
+            .compare_and_set_calls
+            .fetch_add(1, Ordering::SeqCst);
+        assert_eq!(op.key, self.record.key);
+        Ok(CompareAndSetResult::Conflict {
+            current: Some(self.record.clone()),
+        })
     }
 
     async fn delete_fenced(&self, lease: &opc_session_store::LeaseGuard) -> Result<(), StoreError> {
@@ -815,6 +821,21 @@ async fn authenticated_raw_stream(
     addr: SocketAddr,
     response_frame_size: usize,
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    authenticated_raw_stream_with_epoch(mtls, local_index, remote_index, addr, response_frame_size)
+        .await
+        .0
+}
+
+async fn authenticated_raw_stream_with_epoch(
+    mtls: &TestMtls,
+    local_index: usize,
+    remote_index: usize,
+    addr: SocketAddr,
+    response_frame_size: usize,
+) -> (
+    tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    uuid::Uuid,
+) {
     use opc_session_net::protocol::{
         read_frame, write_frame, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, SESSION_NET_ALPN,
     };
@@ -849,6 +870,7 @@ async fn authenticated_raw_stream(
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(binding.configuration_id().to_hex()),
+            configuration_epoch: Some(binding.configuration_epoch().get()),
             handshake_nonce: Some(nonce),
             requested_response_frame_size: Some(requested_response_frame_size),
         },
@@ -858,16 +880,17 @@ async fn authenticated_raw_stream(
     let hello: Response = read_frame(&mut stream, response_frame_size)
         .await
         .expect("read authenticated raw hello acknowledgement");
-    assert!(matches!(
-        hello,
+    let epoch = match hello {
         Response::HelloAck {
             contract_version: CONTRACT_VERSION,
             handshake_nonce: Some(echoed),
             accepted_response_frame_size: Some(accepted),
+            cas_idempotency_epoch: Some(epoch),
             ..
-        } if echoed == nonce && accepted == requested_response_frame_size
-    ));
-    stream
+        } if echoed == nonce && accepted == requested_response_frame_size => epoch,
+        other => panic!("unexpected authenticated hello acknowledgement: {other:?}"),
+    };
+    (stream, epoch)
 }
 
 #[cfg(feature = "insecure-test")]
@@ -880,6 +903,7 @@ fn hello_ack_for(
         expected_server_replica_id,
         cluster_id,
         configuration_id,
+        configuration_epoch,
         handshake_nonce,
         requested_response_frame_size,
         ..
@@ -895,7 +919,9 @@ fn hello_ack_for(
         accepted_client_replica_id: Some(node_id.clone()),
         cluster_id: cluster_id.clone(),
         configuration_id: configuration_id.clone(),
+        configuration_epoch: *configuration_epoch,
         handshake_nonce: *handshake_nonce,
+        cas_idempotency_epoch: Some(uuid::Uuid::from_u128(1)),
         accepted_response_frame_size: (contract_version
             == opc_session_net::protocol::CONTRACT_VERSION)
             .then_some(
@@ -1242,6 +1268,7 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(binding.configuration_id().to_hex()),
+            configuration_epoch: Some(binding.configuration_epoch().get()),
             handshake_nonce: Some(nonce),
             requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
@@ -1357,6 +1384,7 @@ async fn authenticated_server_rejects_operation_limits_and_keeps_connection_usab
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(binding.configuration_id().to_hex()),
+            configuration_epoch: Some(binding.configuration_epoch().get()),
             handshake_nonce: Some(nonce),
             requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
@@ -1472,6 +1500,7 @@ async fn authenticated_server_rejects_malformed_backend_log_and_watch_output() {
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(binding.configuration_id().to_hex()),
+            configuration_epoch: Some(binding.configuration_epoch().get()),
             handshake_nonce: Some(nonce),
             requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
@@ -1565,6 +1594,7 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(binding.configuration_id().to_hex()),
+            configuration_epoch: Some(binding.configuration_epoch().get()),
             handshake_nonce: Some(nonce),
             requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
         },
@@ -2069,6 +2099,65 @@ async fn negotiated_response_limit_contains_malicious_backend_outputs_by_family(
 }
 
 #[tokio::test]
+async fn oversized_cas_outcome_is_typed_and_exact_retry_is_not_redispatched() {
+    use opc_session_net::protocol::{read_frame, write_frame, MIN_NEGOTIATED_FRAME_SIZE};
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let frame_budget = 2 * MIN_NEGOTIATED_FRAME_SIZE;
+    let key = test_key_with_stable_id(b"oversized-cas-outcome");
+    let owner = OwnerId::new("oversized-cas-owner").expect("oversized CAS owner");
+    let mut current = test_record(&key, &owner, FenceToken::new(1), Generation::new(1));
+    current.payload = EncryptedSessionPayload::new(vec![255; 4096]);
+    let backend = OversizedOutputBackend::new(current, Vec::new(), payload_replication_entry(1, 1));
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("seed oversized CAS lease");
+    backend
+        .inner
+        .compare_and_set_calls
+        .store(0, Ordering::SeqCst);
+    let operation = CompareAndSet {
+        key: key.clone(),
+        lease: lease.clone(),
+        expected_generation: None,
+        new_record: test_record(&key, &owner, lease.fence(), Generation::new(2)),
+    };
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let (mut stream, idempotency_epoch) =
+        authenticated_raw_stream_with_epoch(&mtls, 1, 2, addr, frame_budget).await;
+    let request = Request::CompareAndSet {
+        op: operation,
+        request_id: Some(uuid::Uuid::new_v4().hyphenated().to_string()),
+        idempotency_epoch: Some(idempotency_epoch.hyphenated().to_string()),
+    };
+
+    for _ in 0..2 {
+        write_frame(&mut stream, &request)
+            .await
+            .expect("write exact CAS attempt");
+        let response: Response = read_frame(&mut stream, frame_budget)
+            .await
+            .expect("read bounded CAS response");
+        assert!(
+            matches!(
+                &response,
+                Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable))
+            ),
+            "unexpected bounded CAS response: {response:?}"
+        );
+    }
+    assert_eq!(
+        backend.inner.compare_and_set_calls.load(Ordering::SeqCst),
+        1,
+        "the exact retry must replay the cached oversized outcome without backend redispatch"
+    );
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn hostile_cas_request_id_is_rejected_before_backend_or_idempotency_cache() {
     use opc_session_net::protocol::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
     use opc_session_net::{Request, Response};
@@ -2091,9 +2180,10 @@ async fn hostile_cas_request_id_is_rejected_before_backend_or_idempotency_cache(
     let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
 
     let request_id = uuid::Uuid::new_v4().hyphenated().to_string();
-    let valid_request = Request::CompareAndSet {
+    let mut valid_request = Request::CompareAndSet {
         op: operation,
         request_id: Some(request_id),
+        idempotency_epoch: None,
     };
     let mut hostile_wire =
         serde_json::to_value(&valid_request).expect("encode valid canonical CAS request");
@@ -2112,7 +2202,15 @@ async fn hostile_cas_request_id_is_rejected_before_backend_or_idempotency_cache(
     assert!(rejected.is_err());
     assert_eq!(backend.compare_and_set_calls.load(Ordering::SeqCst), 0);
 
-    let mut valid = authenticated_raw_stream(&mtls, 1, 2, addr, DEFAULT_MAX_FRAME_SIZE).await;
+    let (mut valid, epoch) =
+        authenticated_raw_stream_with_epoch(&mtls, 1, 2, addr, DEFAULT_MAX_FRAME_SIZE).await;
+    let Request::CompareAndSet {
+        idempotency_epoch, ..
+    } = &mut valid_request
+    else {
+        unreachable!("constructed CAS request changed family")
+    };
+    *idempotency_epoch = Some(epoch.to_string());
     for expected_backend_calls in [1, 1] {
         write_frame(&mut valid, &valid_request)
             .await
@@ -2319,7 +2417,8 @@ async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
         .listen("127.0.0.1:0".parse().unwrap())
         .await
         .expect("listen for payload preflight");
-    let mut stream = authenticated_raw_stream(&mtls, 1, 2, addr, frame_budget).await;
+    let (mut stream, idempotency_epoch) =
+        authenticated_raw_stream_with_epoch(&mtls, 1, 2, addr, frame_budget).await;
     let request_id = uuid::Uuid::new_v4().hyphenated().to_string();
 
     write_frame(
@@ -2327,6 +2426,7 @@ async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
         &Request::CompareAndSet {
             op: operation.clone(),
             request_id: Some(request_id.clone()),
+            idempotency_epoch: Some(idempotency_epoch.to_string()),
         },
     )
     .await
@@ -2406,6 +2506,7 @@ async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
         &Request::CompareAndSet {
             op: exact,
             request_id: Some(request_id),
+            idempotency_epoch: Some(idempotency_epoch.to_string()),
         },
     )
     .await
@@ -2822,6 +2923,7 @@ async fn incompatible_client_receives_server_contract_before_disconnect() {
             expected_server_replica_id: None,
             cluster_id: None,
             configuration_id: None,
+            configuration_epoch: None,
             handshake_nonce: None,
             requested_response_frame_size: None,
         },
@@ -2863,6 +2965,7 @@ async fn plaintext_rebuild_is_rejected_before_backend_dispatch() {
             expected_server_replica_id: None,
             cluster_id: None,
             configuration_id: None,
+            configuration_epoch: None,
             handshake_nonce: None,
             requested_response_frame_size: Some(
                 opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE as u32,
@@ -3040,7 +3143,7 @@ async fn test_request_after_shutdown_surfaces_error_within_deadline() {
 
 #[tokio::test]
 #[cfg(feature = "insecure-test")]
-async fn direct_cas_retry_after_dropped_response_reports_success() {
+async fn direct_cas_dropped_response_stops_unsafe_retry() {
     use opc_session_net::protocol::{read_frame, write_frame, CONTRACT_VERSION};
     use opc_session_net::{Request, Response};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3083,7 +3186,7 @@ async fn direct_cas_retry_after_dropped_response_reports_success() {
                                     .await
                                     .unwrap();
                             }
-                            Request::CompareAndSet { op, request_id } => {
+                            Request::CompareAndSet { op, request_id, .. } => {
                                 let request_id =
                                     request_id.expect("direct CAS must carry an idempotency key");
                                 let mut ids = cas_request_ids.lock().await;
@@ -3133,15 +3236,85 @@ async fn direct_cas_retry_after_dropped_response_reports_success() {
             expected_generation: None,
             new_record: test_record(&key, &owner, lease.fence(), Generation::new(1)),
         })
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(result, CompareAndSetResult::Success);
+    assert_eq!(result, Err(StoreError::CasIdempotencyOutcomeUnavailable));
     let ids = cas_request_ids.lock().await;
-    assert_eq!(ids.len(), 2);
-    assert_eq!(ids[0], ids[1], "retry must reuse the same CAS request id");
+    assert_eq!(ids.len(), 1, "ambiguous direct CAS must not be retried");
+    drop(ids);
+    assert!(backend
+        .get(&key)
+        .await
+        .expect("inspect backend effect")
+        .is_some());
 
     server.abort();
+}
+
+#[tokio::test]
+async fn historical_cas_is_rejected_after_server_restart_without_redispatch() {
+    use opc_session_net::protocol::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
+    use opc_session_net::{Request, Response};
+
+    let mtls = TestMtls::standard();
+    let backend = ReplicationDispatchSpy::new();
+    let key = test_key_with_stable_id(b"restart-ambiguous-cas");
+    let owner = OwnerId::new("restart-ambiguous-owner").expect("owner");
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("lease");
+    let operation = CompareAndSet {
+        key: key.clone(),
+        lease: lease.clone(),
+        expected_generation: None,
+        new_record: test_record(&key, &owner, lease.fence(), Generation::new(1)),
+    };
+    backend.compare_and_set_calls.store(0, Ordering::SeqCst);
+
+    let (first_addr, backend, first_handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let (mut first, first_epoch) =
+        authenticated_raw_stream_with_epoch(&mtls, 1, 2, first_addr, DEFAULT_MAX_FRAME_SIZE).await;
+    let historical = Request::CompareAndSet {
+        op: operation,
+        request_id: Some(uuid::Uuid::new_v4().hyphenated().to_string()),
+        idempotency_epoch: Some(first_epoch.hyphenated().to_string()),
+    };
+    write_frame(&mut first, &historical)
+        .await
+        .expect("send historical CAS");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if backend.get(&key).await.expect("inspect backend").is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("CAS effect before response is intentionally abandoned");
+    drop(first);
+    first_handle.abort_and_wait().await;
+
+    let (second_addr, backend, second_handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let (mut second, second_epoch) =
+        authenticated_raw_stream_with_epoch(&mtls, 1, 2, second_addr, DEFAULT_MAX_FRAME_SIZE).await;
+    assert_ne!(first_epoch, second_epoch);
+    write_frame(&mut second, &historical)
+        .await
+        .expect("send historical CAS after restart");
+    assert!(matches!(
+        read_frame(&mut second, DEFAULT_MAX_FRAME_SIZE)
+            .await
+            .expect("typed stale-epoch rejection"),
+        Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable))
+    ));
+    assert_eq!(
+        backend.compare_and_set_calls.load(Ordering::SeqCst),
+        1,
+        "historical CAS must not be dispatched after restart"
+    );
+    second_handle.abort_and_wait().await;
 }
 
 /// A deadline that fires mid-exchange must poison the connection: the next

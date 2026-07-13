@@ -22,12 +22,25 @@ use opc_ipsec_lb::{
     SameSpiResume, SelectionKey, SendIvCounter, SendIvCounterMode, SendIvForwardJump,
     SessionOwnershipKeyResolver, SessionOwnershipKeyspace, SessionStoreOwnershipSource, ShardId,
     ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind, SteerKey, SteeringBackend,
-    SteeringProbe, SteeringRule, SwuClassification, SwuClassifierConfig, SwuPacket,
-    TaggedSpiAllocator, TaggedSpiLayout, VipAdvertisement, VipAdvertiser,
+    SteeringBackendKind, SteeringProbe, SteeringRule, SwuClassification, SwuClassifierConfig,
+    SwuPacket, TaggedSpiAllocator, TaggedSpiLayout, VipAdvertisement, VipAdvertiser,
     MAX_ESP_SEND_IV_FORWARD_JUMP, MIN_SEND_IV_FORWARD_JUMP,
 };
 
 const IKE_HEADER_LEN: usize = 28;
+
+#[test]
+fn vip_delivered_probe_distinguishes_converged_production_from_mock_steering() {
+    let probe = SteeringProbe::vip_delivered();
+
+    assert_eq!(probe.kind, SteeringBackendKind::VipDelivered);
+    assert_ne!(probe.kind, SteeringBackendKind::Mock);
+    assert!(probe.platform_supported && probe.mutation_ready);
+    assert!(probe.key_material_free);
+    assert!(probe
+        .details
+        .is_some_and(|details| { details.contains("floating VIP") && details.contains("no-ops") }));
+}
 
 fn shards(count: u16) -> ShardSet {
     ShardSet::new((0..count).map(ShardId::new).collect()).unwrap()
