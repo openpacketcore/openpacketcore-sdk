@@ -709,9 +709,11 @@ bounded maximum-payload get/CAS/batch/log/restore/watch traffic, slow-reader slo
 recovery, and fresh quorum evidence on each replica; then
 restore traffic. Do not perform a mixed-version rolling upgrade.
 
-Public `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
-`contract_profile`, so exhaustive construction and matching must account for
-the field. Private v4 DTOs use `u32` for restore/log request limits and the
+Public `Request`/`Response` remain, but `Hello`/`HelloAck` gain optional
+`contract_profile` and `configuration_epoch`; `HelloAck` adds
+`cas_idempotency_epoch`, and direct CAS adds `idempotency_epoch`. Exhaustive
+construction and matching must account for the fields. Private v4 DTOs use
+`u32` for restore/log request limits and the
 client restore response budget; a confidential authenticated restore cursor;
 `u64` for
 excluded counts, `max_value_bytes`, and size-bearing store errors; and checked
@@ -722,7 +724,7 @@ live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
 configured frame bound remains
 separate. #159 now enforces that negotiated bound and one
 absolute write deadline across every ordinary response/watch item. The profile
-pins wire-schema revision 3, error-set revision 2,
+pins wire-schema revision 4, error-set revision 3,
 `max_restore_scan_examined_rows = 4096`,
 `min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
 owner/custom-key/state-type bounds,
@@ -757,9 +759,28 @@ an otherwise oversized page.
 
 A mutation may commit before response encoding or delivery fails. A disconnect,
 oversize fallback, or write timeout is an ambiguous result, not rollback proof.
-CNFs must recover through request-ID/idempotency and fencing semantics, then
-authoritatively re-read before retrying; blindly replaying lease or mutation
-requests is unsafe.
+For direct CAS on the quarantined compatibility transport, the server binds the
+canonical UUID to the authenticated logical peer, complete operation,
+cluster/configuration identity and monotonic epoch, and the process-scoped
+`cas_idempotency_epoch` returned by `HelloAck`. Exact success/conflict retries
+inside the bounded window replay once; mismatched reuse is
+`CasIdempotencyConflict`. Restart, retention rotation, pressure, or cancelled
+execution is `CasIdempotencyOutcomeUnavailable` before any historical request
+can be treated as new. The public client never automatically resubmits an
+ambiguous CAS. CNFs must authoritatively re-read and derive a new mutation;
+blindly replaying the operation under the old or a fresh UUID is unsafe.
+
+The server bounds the cache to 4,096 entries and 32 MiB total, 512 entries and
+8 MiB per authenticated peer, and 64 cleanup inspections per request. Results
+remain replayable for five minutes, then become ambiguous tombstones; after a
+further ten minutes the process epoch rotates and cleanup clears the cache only
+with no CAS in flight. One peer cannot evict another peer's active window.
+These are compatibility-transport safeguards, not a substitute for Openraft's
+atomically persisted production request outcomes.
+Direct-CAS rejection diagnostics are limited to `stale_epoch`,
+`identity_reuse`, `ambiguous`, and `capacity`. They must not carry peer or
+certificate identity, request UUID, digest, key, owner, lease, record, or
+payload fields.
 
 Alert and metric dimensions for outbound delivery must use the finite response
 families and fixed reasons `frame_too_large`, `page_shortened`, `write_timeout`,

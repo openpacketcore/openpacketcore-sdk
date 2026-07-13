@@ -26,6 +26,18 @@ pub enum StoreError {
     /// the mutation against the observed generation, and retry.
     #[error("compare-and-set conflict")]
     CasConflict,
+    /// An authenticated caller reused a compare-and-set idempotency identity
+    /// for another peer, configuration scope, or operation. Nothing was
+    /// mutated. The caller must generate a fresh request identity only after
+    /// re-deriving the operation from authoritative state.
+    #[error("compare-and-set idempotency identity was reused")]
+    CasIdempotencyConflict,
+    /// A compare-and-set may have reached its mutation boundary, but its exact
+    /// result is no longer available inside the negotiated retry window. The
+    /// caller MUST NOT resubmit the operation under this or a new request ID;
+    /// it must re-read authoritative state and re-derive any next mutation.
+    #[error("compare-and-set idempotency outcome is unavailable")]
+    CasIdempotencyOutcomeUnavailable,
     /// The operation requires a capability (named in the payload) that this
     /// backend did not declare in its `BackendCapabilities`. Retrying cannot
     /// succeed; choose a backend that satisfies the required profile.

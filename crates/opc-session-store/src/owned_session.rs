@@ -386,6 +386,12 @@ impl OwnedSessionMutationError {
             StoreError::CasConflict => Self::StoreRejected {
                 code: "cas-conflict",
             },
+            StoreError::CasIdempotencyConflict => Self::StoreRejected {
+                code: "cas-idempotency-conflict",
+            },
+            StoreError::CasIdempotencyOutcomeUnavailable => Self::StoreRejected {
+                code: "cas-idempotency-outcome-unavailable",
+            },
             StoreError::CapabilityNotSupported(_) => Self::StoreRejected {
                 code: "capability-not-supported",
             },

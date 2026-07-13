@@ -114,8 +114,8 @@ pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractPr
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
 
-const WIRE_SCHEMA_REVISION: u16 = 3;
-const ERROR_SET_REVISION: u16 = 2;
+const WIRE_SCHEMA_REVISION: u16 = 4;
+const ERROR_SET_REVISION: u16 = 3;
 
 /// Exact semantic and resource-bound contract required by protocol v4.
 ///
@@ -314,6 +314,8 @@ pub struct BootstrapHello {
     pub cluster_id: Option<String>,
     #[serde(default)]
     pub configuration_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_epoch: Option<u64>,
     #[serde(default)]
     pub handshake_nonce: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -336,8 +338,13 @@ pub struct BootstrapHelloAck {
     pub cluster_id: Option<String>,
     #[serde(default)]
     pub configuration_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_epoch: Option<u64>,
     #[serde(default)]
     pub handshake_nonce: Option<uuid::Uuid>,
+    /// Process-scoped server epoch that fences bounded direct-CAS retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cas_idempotency_epoch: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_profile: Option<ContractProfile>,
     /// Response-frame budget selected by the server for this connection.
@@ -356,7 +363,11 @@ struct BootstrapHelloAckRef<'a> {
     accepted_client_replica_id: Option<&'a str>,
     cluster_id: Option<&'a str>,
     configuration_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    configuration_epoch: Option<u64>,
     handshake_nonce: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cas_idempotency_epoch: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contract_profile: Option<ContractProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -497,6 +508,7 @@ pub enum Request {
         expected_server_replica_id: Option<String>,
         cluster_id: Option<String>,
         configuration_id: Option<String>,
+        configuration_epoch: Option<u64>,
         handshake_nonce: Option<uuid::Uuid>,
         contract_profile: Option<ContractProfile>,
         requested_response_frame_size: Option<u32>,
@@ -508,6 +520,8 @@ pub enum Request {
     CompareAndSet {
         op: CompareAndSet,
         request_id: Option<String>,
+        /// Server-issued process epoch from the authenticated bootstrap.
+        idempotency_epoch: Option<String>,
     },
     DeleteFenced {
         lease: LeaseGuard,
@@ -560,7 +574,9 @@ pub enum Response {
         accepted_client_replica_id: Option<String>,
         cluster_id: Option<String>,
         configuration_id: Option<String>,
+        configuration_epoch: Option<u64>,
         handshake_nonce: Option<uuid::Uuid>,
+        cas_idempotency_epoch: Option<uuid::Uuid>,
         contract_profile: Option<ContractProfile>,
         accepted_response_frame_size: Option<u32>,
         server_request_frame_size: Option<u32>,
@@ -933,10 +949,17 @@ pub(crate) fn validate_request_profile(request: &Request) -> Result<(), WireConv
             opc_session_store::validate_session_ttl(*ttl)
                 .map_err(|_| WireConversionError("session TTL violates the v4 transport profile"))
         }
-        Request::CompareAndSet { op, request_id } => {
+        Request::CompareAndSet {
+            op,
+            request_id,
+            idempotency_epoch,
+        } => {
             validate_compare_and_set_profile(op)?;
             if let Some(request_id) = request_id {
                 parse_canonical_cas_request_id(request_id)?;
+            }
+            if let Some(idempotency_epoch) = idempotency_epoch {
+                parse_canonical_cas_request_id(idempotency_epoch)?;
             }
             Ok(())
         }
@@ -1307,6 +1330,8 @@ enum WireStoreError {
     NotFound,
     StaleFence,
     CasConflict,
+    CasIdempotencyConflict,
+    CasIdempotencyOutcomeUnavailable,
     CapabilityNotSupported(String),
     BackendUnavailable(String),
     InvalidKey(String),
@@ -1333,6 +1358,8 @@ enum WireStoreErrorRef<'a> {
     NotFound,
     StaleFence,
     CasConflict,
+    CasIdempotencyConflict,
+    CasIdempotencyOutcomeUnavailable,
     CapabilityNotSupported(&'a str),
     BackendUnavailable(&'a str),
     InvalidKey(&'a str),
@@ -1374,6 +1401,8 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             StoreError::NotFound => Self::NotFound,
             StoreError::StaleFence => Self::StaleFence,
             StoreError::CasConflict => Self::CasConflict,
+            StoreError::CasIdempotencyConflict => Self::CasIdempotencyConflict,
+            StoreError::CasIdempotencyOutcomeUnavailable => Self::CasIdempotencyOutcomeUnavailable,
             StoreError::CapabilityNotSupported(message) => {
                 Self::CapabilityNotSupported(safe_capability_name(message))
             }
@@ -1429,6 +1458,10 @@ impl TryFrom<WireStoreError> for StoreError {
             WireStoreError::NotFound => Self::NotFound,
             WireStoreError::StaleFence => Self::StaleFence,
             WireStoreError::CasConflict => Self::CasConflict,
+            WireStoreError::CasIdempotencyConflict => Self::CasIdempotencyConflict,
+            WireStoreError::CasIdempotencyOutcomeUnavailable => {
+                Self::CasIdempotencyOutcomeUnavailable
+            }
             WireStoreError::CapabilityNotSupported(message) => {
                 Self::CapabilityNotSupported(safe_capability_name(&message).to_string())
             }
@@ -2094,6 +2127,8 @@ enum WireRequestRef<'a> {
     CompareAndSet {
         op: &'a CompareAndSet,
         request_id: Option<WireCasRequestId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        idempotency_epoch: Option<WireCasRequestId>,
     },
     DeleteFenced {
         lease: &'a LeaseGuard,
@@ -2151,6 +2186,8 @@ enum WireRequest {
         op: CompareAndSet,
         #[serde(default)]
         request_id: Option<WireCasRequestId>,
+        #[serde(default)]
+        idempotency_epoch: Option<WireCasRequestId>,
     },
     DeleteFenced {
         lease: LeaseGuard,
@@ -2207,6 +2244,7 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
                 expected_server_replica_id,
                 cluster_id,
                 configuration_id,
+                configuration_epoch,
                 handshake_nonce,
                 contract_profile,
                 requested_response_frame_size,
@@ -2216,19 +2254,30 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
                 expected_server_replica_id: expected_server_replica_id.clone(),
                 cluster_id: cluster_id.clone(),
                 configuration_id: configuration_id.clone(),
+                configuration_epoch: *configuration_epoch,
                 handshake_nonce: *handshake_nonce,
                 contract_profile: *contract_profile,
                 requested_response_frame_size: *requested_response_frame_size,
             }),
             Request::Capabilities => Self::Capabilities,
             Request::Get { key } => Self::Get { key },
-            Request::CompareAndSet { op, request_id } => Self::CompareAndSet {
+            Request::CompareAndSet {
+                op,
+                request_id,
+                idempotency_epoch,
+            } => Self::CompareAndSet {
                 op,
                 request_id: request_id
                     .as_deref()
                     .map(parse_canonical_cas_request_id)
                     .transpose()
                     .map_err(|_| WireConversionError("CAS request ID must be a valid UUID"))?
+                    .map(WireCasRequestId),
+                idempotency_epoch: idempotency_epoch
+                    .as_deref()
+                    .map(parse_canonical_cas_request_id)
+                    .transpose()
+                    .map_err(|_| WireConversionError("CAS epoch must be a valid UUID"))?
                     .map(WireCasRequestId),
             },
             Request::DeleteFenced { lease } => Self::DeleteFenced { lease },
@@ -2298,15 +2347,21 @@ impl TryFrom<WireRequest> for InboundRequest {
                 expected_server_replica_id: hello.expected_server_replica_id,
                 cluster_id: hello.cluster_id,
                 configuration_id: hello.configuration_id,
+                configuration_epoch: hello.configuration_epoch,
                 handshake_nonce: hello.handshake_nonce,
                 contract_profile: hello.contract_profile,
                 requested_response_frame_size: hello.requested_response_frame_size,
             },
             WireRequest::Capabilities => Request::Capabilities,
             WireRequest::Get { key } => Request::Get { key },
-            WireRequest::CompareAndSet { op, request_id } => Request::CompareAndSet {
+            WireRequest::CompareAndSet {
+                op,
+                request_id,
+                idempotency_epoch,
+            } => Request::CompareAndSet {
                 op,
                 request_id: request_id.map(|request_id| request_id.0.hyphenated().to_string()),
+                idempotency_epoch: idempotency_epoch.map(|epoch| epoch.0.hyphenated().to_string()),
             },
             WireRequest::DeleteFenced { lease } => Request::DeleteFenced { lease },
             WireRequest::RefreshTtl { lease, ttl } => Request::RefreshTtl { lease, ttl },
@@ -2417,6 +2472,7 @@ impl TryFrom<&Request> for BootstrapRequest {
                 expected_server_replica_id,
                 cluster_id,
                 configuration_id,
+                configuration_epoch,
                 handshake_nonce,
                 contract_profile,
                 requested_response_frame_size,
@@ -2426,6 +2482,7 @@ impl TryFrom<&Request> for BootstrapRequest {
                 expected_server_replica_id: expected_server_replica_id.clone(),
                 cluster_id: cluster_id.clone(),
                 configuration_id: configuration_id.clone(),
+                configuration_epoch: *configuration_epoch,
                 handshake_nonce: *handshake_nonce,
                 contract_profile: *contract_profile,
                 requested_response_frame_size: *requested_response_frame_size,
@@ -2444,6 +2501,7 @@ impl From<BootstrapRequest> for Request {
                 expected_server_replica_id: hello.expected_server_replica_id,
                 cluster_id: hello.cluster_id,
                 configuration_id: hello.configuration_id,
+                configuration_epoch: hello.configuration_epoch,
                 handshake_nonce: hello.handshake_nonce,
                 contract_profile: hello.contract_profile,
                 requested_response_frame_size: hello.requested_response_frame_size,
@@ -2643,7 +2701,9 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
                 accepted_client_replica_id,
                 cluster_id,
                 configuration_id,
+                configuration_epoch,
                 handshake_nonce,
+                cas_idempotency_epoch,
                 contract_profile,
                 accepted_response_frame_size,
                 server_request_frame_size,
@@ -2653,7 +2713,9 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
                 accepted_client_replica_id: accepted_client_replica_id.as_deref(),
                 cluster_id: cluster_id.as_deref(),
                 configuration_id: configuration_id.as_deref(),
+                configuration_epoch: *configuration_epoch,
                 handshake_nonce: *handshake_nonce,
+                cas_idempotency_epoch: *cas_idempotency_epoch,
                 contract_profile: *contract_profile,
                 accepted_response_frame_size: *accepted_response_frame_size,
                 server_request_frame_size: *server_request_frame_size,
@@ -2748,7 +2810,9 @@ impl TryFrom<WireResponse> for Response {
                 accepted_client_replica_id: hello.accepted_client_replica_id,
                 cluster_id: hello.cluster_id,
                 configuration_id: hello.configuration_id,
+                configuration_epoch: hello.configuration_epoch,
                 handshake_nonce: hello.handshake_nonce,
+                cas_idempotency_epoch: hello.cas_idempotency_epoch,
                 contract_profile: hello.contract_profile,
                 accepted_response_frame_size: hello.accepted_response_frame_size,
                 server_request_frame_size: hello.server_request_frame_size,
@@ -2847,7 +2911,9 @@ impl TryFrom<&Response> for BootstrapResponse {
                 accepted_client_replica_id,
                 cluster_id,
                 configuration_id,
+                configuration_epoch,
                 handshake_nonce,
+                cas_idempotency_epoch,
                 contract_profile,
                 accepted_response_frame_size,
                 server_request_frame_size,
@@ -2857,7 +2923,9 @@ impl TryFrom<&Response> for BootstrapResponse {
                 accepted_client_replica_id: accepted_client_replica_id.clone(),
                 cluster_id: cluster_id.clone(),
                 configuration_id: configuration_id.clone(),
+                configuration_epoch: *configuration_epoch,
                 handshake_nonce: *handshake_nonce,
+                cas_idempotency_epoch: *cas_idempotency_epoch,
                 contract_profile: *contract_profile,
                 accepted_response_frame_size: *accepted_response_frame_size,
                 server_request_frame_size: *server_request_frame_size,
@@ -2881,7 +2949,9 @@ impl From<BootstrapResponse> for Response {
                     accepted_client_replica_id: hello.accepted_client_replica_id,
                     cluster_id: hello.cluster_id,
                     configuration_id: hello.configuration_id,
+                    configuration_epoch: hello.configuration_epoch,
                     handshake_nonce: hello.handshake_nonce,
+                    cas_idempotency_epoch: hello.cas_idempotency_epoch,
                     contract_profile: hello.contract_profile,
                     accepted_response_frame_size: hello.accepted_response_frame_size,
                     server_request_frame_size: hello.server_request_frame_size,
@@ -3781,7 +3851,8 @@ mod tests {
     fn contract_profile_and_bootstrap_frames_are_exact_and_version_tolerant() {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/4");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
-        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 2);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 4);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 3);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
 
@@ -3789,8 +3860,8 @@ mod tests {
         assert_eq!(
             profile,
             serde_json::json!({
-                "wire_schema_revision": 3,
-                "error_set_revision": 2,
+                "wire_schema_revision": 4,
+                "error_set_revision": 3,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 4194304,
                 "max_restore_scan_page_retained_bytes": 8388608,
@@ -3849,7 +3920,9 @@ mod tests {
             accepted_client_replica_id: Some("replica-a".to_string()),
             cluster_id: Some("cluster-a".to_string()),
             configuration_id: Some("00".repeat(32)),
+            configuration_epoch: Some(1),
             handshake_nonce: Some(uuid::Uuid::nil()),
+            cas_idempotency_epoch: Some(uuid::Uuid::from_u128(1)),
             contract_profile: Some(CURRENT_CONTRACT_PROFILE),
             accepted_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
             server_request_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
@@ -3929,6 +4002,8 @@ mod tests {
             StoreError::NotFound,
             StoreError::StaleFence,
             StoreError::CasConflict,
+            StoreError::CasIdempotencyConflict,
+            StoreError::CasIdempotencyOutcomeUnavailable,
             StoreError::CapabilityNotSupported("capability".to_string()),
             StoreError::BackendUnavailable("backend".to_string()),
             StoreError::InvalidKey("invalid".to_string()),
@@ -4680,6 +4755,7 @@ mod tests {
         let canonical_request = Request::CompareAndSet {
             op: op.clone(),
             request_id: Some(canonical.clone()),
+            idempotency_epoch: Some(uuid::Uuid::from_u128(1).to_string()),
         };
         let encoded = serde_json::to_value(&canonical_request).expect("canonical request ID");
         let decoded: Request =
@@ -4695,6 +4771,7 @@ mod tests {
             serde_json::to_value(Request::CompareAndSet {
                 op: op.clone(),
                 request_id: Some(simple),
+                idempotency_epoch: None,
             })
             .is_err(),
             "non-canonical outbound UUID forms must fail closed"
@@ -4720,6 +4797,7 @@ mod tests {
             assert!(serde_json::to_vec(&Request::CompareAndSet {
                 op: op.clone(),
                 request_id: Some(invalid),
+                idempotency_epoch: None,
             })
             .is_err());
         }
@@ -4968,6 +5046,7 @@ mod tests {
                     new_record: max_record,
                 },
                 request_id: Some(uuid::Uuid::nil().to_string()),
+                idempotency_epoch: Some(uuid::Uuid::from_u128(1).to_string()),
             },
             frame_size,
         )
@@ -4997,6 +5076,7 @@ mod tests {
                 new_record: unequal_record,
             },
             request_id: Some(uuid::Uuid::nil().to_string()),
+            idempotency_epoch: Some(uuid::Uuid::from_u128(1).to_string()),
         };
         let minimum_cas_len = serde_json::to_vec(&minimum_cas)
             .expect("size minimum CAS")
@@ -5086,6 +5166,7 @@ mod tests {
                 json(Request::CompareAndSet {
                     op: cas.clone(),
                     request_id: Some(uuid::Uuid::nil().to_string()),
+                    idempotency_epoch: Some(uuid::Uuid::from_u128(1).to_string()),
                 }),
                 true,
             ),

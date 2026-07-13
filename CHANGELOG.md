@@ -27,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   material, and publishes an opaque monotonic generation with typed,
   redaction-safe availability/reason status. Existing file/socket source APIs
   and reload events remain source compatible.
+- **BREAKING — `opc-session-net`/`opc-session-store`:** direct CAS
+  idempotency in the quarantined protocol-v4 compatibility path is now scoped
+  by the authenticated logical replica, canonical request UUID, complete
+  operation digest, cluster/configuration identity, monotonic configuration
+  epoch, and a server-issued process epoch. Exact successes and conflicts
+  replay through one bounded single-flight cache; mismatched reuse fails typed
+  before backend dispatch, and cancelled work becomes an ambiguous tombstone.
+  Total and per-peer entries/bytes, retention, and cleanup work are fixed.
+  Restart, retention rotation, or pressure returns
+  `CasIdempotencyOutcomeUnavailable`; the public client performs no automatic
+  CAS resubmission after an ambiguous exchange and requires an authoritative
+  re-read before a newly derived mutation. The v4 error-set revision advances
+  to 3, `Hello`/`HelloAck` add `configuration_epoch`, `HelloAck` adds
+  `cas_idempotency_epoch`, direct CAS carries `idempotency_epoch`, and
+  exhaustive public frame construction/matching must
+  be updated in one coordinated stop/upgrade/start.
 - `opc-sctp`: `DiameterSctpAssociation::connect_with_config` now opens the
   existing Diameter-framed send/receive surface over an explicit
   `SctpConnectConfig`, including bounded static local and remote multihoming.
@@ -50,9 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RestoreScanPage` adds `cursor_profile`; exhaustive construction and matching
   must be updated.
 - **BREAKING — `opc-session-net`:** the quarantined v4 compatibility profile
-  advances to wire-schema revision 3 and error-set revision 2 for the
+  advances to wire-schema revision 4; error-set revision 3 includes the
   confidential restore token, explicit durable-page profile, examined/payload
-  contracts, and typed stale-cursor/work-budget errors. Local fake offset
+  contracts, typed stale-cursor/work-budget errors, and typed direct-CAS
+  idempotency outcomes. Local fake offset
   cursors are rejected remotely. Servers validate against the narrowed request
   actually dispatched and no longer fabricate shortened-page cursors when a
   backend page exceeds the negotiated frame; callers retry the same cursor with

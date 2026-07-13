@@ -1633,6 +1633,8 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::LeaseExpired
         | StoreError::PayloadTooLarge { .. } => true,
         StoreError::CapabilityNotSupported(_)
+        | StoreError::CasIdempotencyConflict
+        | StoreError::CasIdempotencyOutcomeUnavailable
         | StoreError::BackendUnavailable(_)
         | StoreError::InvalidReplicationSequence
         | StoreError::ReplicationOperationLimitExceeded
