@@ -20,10 +20,11 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     backend::{
-        next_replication_sequence, validate_replication_page_owned, validate_replication_prefix,
-        validate_replication_prefix_owned, validate_session_ops_ttls, BackendInstanceIdentity,
-        CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, ReplicationTxId,
-        SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        next_replication_sequence, validate_replication_log_page_owned,
+        validate_replication_prefix, validate_replication_prefix_owned, validate_session_ops_ttls,
+        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
+        ReplicationLogRange, ReplicationOp, ReplicationTxId, SessionBackend, SessionOp,
+        SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -937,23 +938,20 @@ impl SessionBackend for FakeSessionBackend {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let state = self.inner.lock().await;
-        if limit > 0
-            && start <= state.compacted_replication_sequence
-            && start <= state.last_replication_sequence
-        {
-            return Err(StoreError::BackendUnavailable(
-                "replication log compacted before requested start".into(),
-            ));
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
         }
+        let state = self.inner.lock().await;
+        range.ensure_not_compacted(state.compacted_replication_sequence)?;
         let entries: Vec<ReplicationEntry> = state
             .replication_log
             .iter()
-            .filter(|e| e.sequence >= start)
-            .take(limit)
+            .filter(|entry| entry.sequence >= range.first_sequence())
+            .take(range.limit())
             .cloned()
             .collect();
-        validate_replication_page_owned(entries)
+        validate_replication_log_page_owned(start, limit, entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {

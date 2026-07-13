@@ -678,7 +678,10 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
                 "session-store mutation outcome is unavailable",
             ),
         ),
-        StoreError::InvalidReplicationSequence => IpsecLbError::invalid_config(
+        StoreError::InvalidReplicationSequence
+        | StoreError::InvalidReplicationLogRange
+        | StoreError::ReplicationLogPageTooLarge { .. }
+        | StoreError::ReplicationLogCursorCompacted { .. } => IpsecLbError::invalid_config(
             "session_store.replication",
             "session-store replication metadata rejected",
         ),
@@ -2023,6 +2026,19 @@ mod tests {
             map_store_error(StoreError::ReplicationOperationLimitExceeded),
             IpsecLbError::InvalidConfig { .. }
         ));
+        for error in [
+            StoreError::InvalidReplicationLogRange,
+            StoreError::ReplicationLogPageTooLarge {
+                requested: 2,
+                max: 1,
+            },
+            StoreError::ReplicationLogCursorCompacted { resume_from: 2 },
+        ] {
+            assert!(matches!(
+                map_store_error(error),
+                IpsecLbError::InvalidConfig { .. }
+            ));
+        }
         assert!(matches!(
             map_lease_error(LeaseError::InvalidSessionTtl),
             IpsecLbError::InvalidConfig { .. }

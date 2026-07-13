@@ -177,7 +177,7 @@ backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile pins wire-schema revision 4, error-set revision 3, a 4 MiB restore
+profile pins wire-schema revision 4, error-set revision 4, a 4 MiB restore
 payload bound, 8 MiB retained-page and examined key/filter-metadata bounds,
 `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
@@ -187,7 +187,9 @@ owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
 `replication_tx_id_max_bytes = 128`, and `cas_request_id_bytes = 36`.
 Transported stable IDs contain 1 through 64 bytes, transaction IDs contain 1
 through 128 UTF-8 bytes, and CAS request IDs, when present, are canonical
-lowercase hyphenated UUIDs with the exact 36-byte encoding. Public
+lowercase hyphenated UUIDs with the exact 36-byte encoding. Error-set revision
+4 additionally carries checked replication-log range overflow, page-limit, and
+compacted-cursor outcomes; revision-3 peers are incompatible. Public
 `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
 `contract_profile`; exhaustive construction and matching must account for the
 new field. The public `ContractProfile::max_frame_size` field is also a Rust

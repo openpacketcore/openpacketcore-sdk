@@ -11,9 +11,10 @@ use async_trait::async_trait;
 use futures_util::{stream::BoxStream, StreamExt};
 
 use crate::backend::{
-    validate_replication_page_owned, validate_replication_prefix_owned, validate_session_ops_ttls,
-    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
-    ReplicationEntry, SessionBackend, SessionOp, SessionOpResult,
+    validate_replication_log_page_owned, validate_replication_prefix_owned,
+    validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
+    CompareAndSetResult, ReplicationEntry, ReplicationLogRange, SessionBackend, SessionOp,
+    SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
 use crate::error::{LeaseError, StoreError};
@@ -159,7 +160,15 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        validate_replication_page_owned(self.backend.get_replication_log(start, limit).await?)
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        validate_replication_log_page_owned(
+            start,
+            limit,
+            self.backend.get_replication_log(start, limit).await?,
+        )
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {

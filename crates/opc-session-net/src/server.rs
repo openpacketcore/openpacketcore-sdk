@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use opc_session_store::backend::{
-    validate_replication_page_owned, validate_replication_prefix_owned, CompareAndSet,
-    CompareAndSetResult, ReplicationEntry, ReplicationOp,
+    validate_replication_log_page_owned, validate_replication_page_owned,
+    validate_replication_prefix_owned, CompareAndSet, CompareAndSetResult, ReplicationEntry,
+    ReplicationLogRange, ReplicationOp,
 };
 use opc_session_store::error::{LeaseError, StoreError};
 use opc_session_store::quorum::SessionStoreBackend;
@@ -37,8 +38,7 @@ use crate::protocol::{
     BootstrapHelloAck, BootstrapRequest, BootstrapResponse, HelloRejectReason, InboundRequest,
     Request, Response, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
     MAX_HANDSHAKE_FRAME_SIZE, MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
-    MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES, MIN_NEGOTIATED_FRAME_SIZE,
-    MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
+    MIN_NEGOTIATED_FRAME_SIZE, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
 };
 
 /// Handle to a running [`SessionReplicationServer`].
@@ -2017,16 +2017,16 @@ where
                 .await?;
             }
             Request::GetReplicationLog { start, limit } => {
-                let backend_result = if limit > MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES {
-                    Err(StoreError::ReplicationOperationLimitExceeded)
-                } else {
-                    backend.get_replication_log(start, limit).await
+                let backend_result = match ReplicationLogRange::try_new(start, limit) {
+                    Err(error) => Err(error),
+                    Ok(range) if range.is_empty() => Ok(Vec::new()),
+                    Ok(_) => backend.get_replication_log(start, limit).await,
                 };
                 let deadline = response_write_deadline(idle_timeout)?;
                 check_response_write_control(deadline, &cancellation)?;
                 let res = match backend_result {
                     Ok(entries) if entries.len() <= limit => {
-                        validate_replication_page_owned(entries)
+                        validate_replication_log_page_owned(start, limit, entries)
                     }
                     Ok(entries) => {
                         drop(validate_replication_page_owned(entries));

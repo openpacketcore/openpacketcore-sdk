@@ -2002,7 +2002,7 @@ async fn legacy_log_tail_is_quarantined_cleared_and_old_cursors_fail_closed() {
         );
         assert!(matches!(
             backend.consensus_get_replication_log(1, 16).await,
-            Err(crate::StoreError::BackendUnavailable(_))
+            Err(crate::StoreError::ReplicationLogCursorCompacted { resume_from: 2 })
         ));
     }
 

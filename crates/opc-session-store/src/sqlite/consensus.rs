@@ -1636,6 +1636,9 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::CasIdempotencyOutcomeUnavailable
         | StoreError::BackendUnavailable(_)
         | StoreError::InvalidReplicationSequence
+        | StoreError::InvalidReplicationLogRange
+        | StoreError::ReplicationLogPageTooLarge { .. }
+        | StoreError::ReplicationLogCursorCompacted { .. }
         | StoreError::ReplicationOperationLimitExceeded
         | StoreError::Crypto(_)
         | StoreError::Serialization(_)

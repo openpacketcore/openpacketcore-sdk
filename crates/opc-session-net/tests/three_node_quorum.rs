@@ -20,7 +20,7 @@ use opc_session_store::backend::{
     CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
 };
 use opc_session_store::capability::BackendCapabilities;
-use opc_session_store::fake::FakeSessionBackend;
+use opc_session_store::fake::{FakeBackendLimits, FakeSessionBackend};
 use opc_session_store::lease::SessionLeaseManager;
 use opc_session_store::model::{
     FenceToken, Generation, OwnerId, SessionKey, SessionKeyType, StateClass, StateType,
@@ -30,8 +30,8 @@ use opc_session_store::record::{EncryptedSessionPayload, StoredSessionRecord};
 use opc_session_store::{
     QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
     ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity, RestoreScanRequest, RestoreScanScope,
-    SqliteSessionBackend, StoreError, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
-    MAX_REPLICATION_OPERATION_DEPTH,
+    SqliteSessionBackend, StoreError, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -462,6 +462,81 @@ impl SessionBackend for MalformedReplicationOutputBackend {
 
 #[async_trait::async_trait]
 impl SessionLeaseManager for MalformedReplicationOutputBackend {
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.acquire(key, owner, ttl).await
+    }
+
+    async fn renew(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.renew(lease, ttl).await
+    }
+
+    async fn release(
+        &self,
+        lease: opc_session_store::LeaseGuard,
+    ) -> Result<(), opc_session_store::LeaseError> {
+        self.inner.release(lease).await
+    }
+}
+
+#[derive(Clone)]
+struct WrongReplicationRangeBackend {
+    inner: FakeSessionBackend,
+    page: Arc<Vec<ReplicationEntry>>,
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for WrongReplicationRangeBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities().await
+    }
+
+    async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.inner.get(key).await
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.inner.compare_and_set(op).await
+    }
+
+    async fn delete_fenced(&self, lease: &opc_session_store::LeaseGuard) -> Result<(), StoreError> {
+        self.inner.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(
+        &self,
+        ops: Vec<opc_session_store::SessionOp>,
+    ) -> Result<Vec<opc_session_store::SessionOpResult>, StoreError> {
+        self.inner.batch(ops).await
+    }
+
+    async fn get_replication_log(
+        &self,
+        _start: u64,
+        _limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        Ok(self.page.as_ref().clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionLeaseManager for WrongReplicationRangeBackend {
     async fn acquire(
         &self,
         key: &SessionKey,
@@ -2312,6 +2387,75 @@ async fn replication_log_returns_the_largest_contiguous_prefix_for_the_peer_budg
 }
 
 #[tokio::test]
+async fn server_rejects_contiguous_backend_pages_before_or_after_the_requested_range() {
+    let mtls = mtls_configs();
+    for page in [
+        vec![
+            payload_replication_entry(1, 0),
+            payload_replication_entry(2, 0),
+        ],
+        vec![
+            payload_replication_entry(100, 0),
+            payload_replication_entry(101, 0),
+        ],
+    ] {
+        let backend = WrongReplicationRangeBackend {
+            inner: FakeSessionBackend::new(),
+            page: Arc::new(page),
+        };
+        let (addr, _backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+        let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2)));
+        assert_eq!(
+            remote
+                .get_replication_log(3, 2)
+                .await
+                .expect_err("server must reject a page outside the requested interval"),
+            StoreError::InvalidReplicationSequence
+        );
+        handle.abort_and_wait().await;
+    }
+}
+
+#[tokio::test]
+async fn compacted_replication_cursor_round_trips_with_the_exact_resume_point() {
+    let mtls = mtls_configs();
+    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
+        max_tracked_keys: 8,
+        max_replication_entries: 2,
+    });
+    for sequence in 1..=3 {
+        let mut entry = payload_replication_entry(sequence, 0);
+        entry.op = ReplicationOp::Batch { ops: Vec::new() };
+        backend
+            .replicate_entry(entry)
+            .await
+            .expect("seed compacting backend");
+    }
+    let (addr, _backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2)));
+
+    assert_eq!(
+        remote
+            .get_replication_log(0, 2)
+            .await
+            .expect_err("sequence one was compacted"),
+        StoreError::ReplicationLogCursorCompacted { resume_from: 2 }
+    );
+    let retained = remote
+        .get_replication_log(2, 2)
+        .await
+        .expect("resume at the first retained sequence");
+    assert_eq!(
+        retained
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn advertised_payload_limit_is_executable_with_unequal_peer_budgets() {
     let mtls = mtls_configs();
     let client_budget = opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE
@@ -2621,7 +2765,7 @@ async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
     assert_eq!(backend.replicate_calls.load(Ordering::SeqCst), 1);
 
     let rebuild_entries = backend
-        .get_replication_log(1, usize::MAX)
+        .get_replication_log(1, MAX_REPLICATION_LOG_PAGE_ENTRIES)
         .await
         .expect("read coherent exact-payload log for rebuild");
 

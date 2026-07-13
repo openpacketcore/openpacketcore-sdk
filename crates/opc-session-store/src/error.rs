@@ -59,6 +59,28 @@ pub enum StoreError {
     /// carries no caller-controlled value so it is safe to expose to peers.
     #[error("invalid replication sequence")]
     InvalidReplicationSequence,
+    /// A replication-log request cannot be represented without wrapping its
+    /// inclusive terminal sequence. Nothing was read or delegated.
+    #[error("invalid replication log range")]
+    InvalidReplicationLogRange,
+    /// A replication-log page request exceeds the model-wide entry limit.
+    /// Nothing was read or delegated.
+    #[error("replication log page too large: requested {requested} exceeds maximum {max}")]
+    ReplicationLogPageTooLarge {
+        /// Requested number of entries.
+        requested: usize,
+        /// Maximum supported number of entries.
+        max: usize,
+    },
+    /// The requested inclusive cursor has already been compacted. The caller
+    /// must obtain a coherent snapshot/rebuild through its existing authority
+    /// path and may resume incremental reads at `resume_from` only after that
+    /// state is installed.
+    #[error("replication log cursor was compacted; resume from {resume_from}")]
+    ReplicationLogCursorCompacted {
+        /// First retained sequence after the compacted interval.
+        resume_from: u64,
+    },
     /// A replication operation tree exceeded the SDK-wide depth or node-count
     /// limit. The error intentionally carries no observed count, depth, path,
     /// key, or transaction data, so it is safe to expose to authenticated

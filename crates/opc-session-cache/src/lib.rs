@@ -11,10 +11,11 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use opc_session_store::{
-    next_replication_sequence, validate_replication_page_owned, validate_replication_prefix_owned,
-    validate_session_ttl, BackendCapabilities, BackendInstanceIdentity, BackendPeerBinding,
-    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
-    SessionKey, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
+    next_replication_sequence, validate_replication_log_page_owned,
+    validate_replication_prefix_owned, validate_session_ttl, BackendCapabilities,
+    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
+    ReplicationEntry, ReplicationLogRange, ReplicationOp, SessionBackend, SessionKey, SessionOp,
+    SessionOpResult, StoreError, StoredSessionRecord,
 };
 
 /// A local, in-memory read-through session cache that stays coherent with the
@@ -582,8 +583,12 @@ impl SessionBackend for SessionCache {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
         let entries = self.backend.get_replication_log(start, limit).await?;
-        validate_replication_page_owned(entries)
+        validate_replication_log_page_owned(start, limit, entries)
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
@@ -680,6 +685,9 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
         StoreError::InvalidReplicationSequence => "invalid_replication_sequence",
+        StoreError::InvalidReplicationLogRange => "invalid_replication_log_range",
+        StoreError::ReplicationLogPageTooLarge { .. } => "replication_log_page_too_large",
+        StoreError::ReplicationLogCursorCompacted { .. } => "replication_log_cursor_compacted",
         StoreError::ReplicationOperationLimitExceeded => "replication_operation_limit_exceeded",
         StoreError::InvalidSessionTtl => "invalid_session_ttl",
         StoreError::LeaseHeld => "lease_held",
@@ -703,8 +711,8 @@ mod tests {
     use bytes::Bytes;
     use futures_util::{stream, StreamExt};
     use opc_session_store::{
-        EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId,
-        SessionKeyType, SessionLeaseManager, StateClass, StateType,
+        validate_replication_page_owned, EncryptedSessionPayload, FakeSessionBackend, FenceToken,
+        Generation, OwnerId, SessionKeyType, SessionLeaseManager, StateClass, StateType,
         MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -1215,6 +1223,21 @@ mod tests {
         assert_eq!(log_error, StoreError::ReplicationOperationLimitExceeded);
         let retained_entries = std::mem::take(&mut *backend.log_entries.lock().await);
         drop(validate_replication_page_owned(retained_entries));
+
+        backend.log_entries.lock().await.push(ReplicationEntry {
+            sequence: 100,
+            tx_id: "wrong-range".try_into().expect("valid transaction ID"),
+            op: ReplicationOp::Batch { ops: Vec::new() },
+            timestamp: Timestamp::now_utc(),
+        });
+        assert_eq!(
+            cache
+                .get_replication_log(2, 1)
+                .await
+                .expect_err("a cache wrapper must reject a page after its requested range"),
+            StoreError::InvalidReplicationSequence
+        );
+        backend.log_entries.lock().await.clear();
 
         let (entry_tx, entry_rx) = mpsc::unbounded_channel();
         let (yielded_tx, _yielded_rx) = mpsc::unbounded_channel();

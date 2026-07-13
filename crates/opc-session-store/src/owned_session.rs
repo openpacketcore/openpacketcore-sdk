@@ -376,6 +376,15 @@ impl OwnedSessionMutationError {
             StoreError::InvalidReplicationSequence => Self::StoreRejected {
                 code: "invalid-replication-sequence",
             },
+            StoreError::InvalidReplicationLogRange => Self::StoreRejected {
+                code: "invalid-replication-log-range",
+            },
+            StoreError::ReplicationLogPageTooLarge { .. } => Self::StoreRejected {
+                code: "replication-log-page-too-large",
+            },
+            StoreError::ReplicationLogCursorCompacted { .. } => Self::StoreRejected {
+                code: "replication-log-cursor-compacted",
+            },
             StoreError::ReplicationOperationLimitExceeded => Self::StoreRejected {
                 code: "replication-operation-limit-exceeded",
             },

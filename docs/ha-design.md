@@ -415,7 +415,7 @@ response budget, a confidential authenticated strictly bounded restore cursor, a
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 4, error-set revision 3, a 4 MiB restore
+profile pins wire-schema revision 4, error-set revision 4, a 4 MiB restore
 payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, the
 31,536,000-second TTL maximum, and
@@ -426,6 +426,8 @@ depth-16/256-node replication trees. Revision 2 also pins
 Transported stable IDs contain 1 through 64 bytes, transaction IDs contain 1
 through 128 UTF-8 bytes, and CAS request IDs, when present, use the canonical
 lowercase hyphenated 36-byte UUID encoding.
+Error-set revision 4 adds checked replication-log range overflow, page-limit,
+and compacted-cursor outcomes; a revision-3 peer is therefore incompatible.
 
 Every server response and watch item is fully bounded-encoded before a length
 prefix is emitted. Common non-pageable and complete-page successes use one

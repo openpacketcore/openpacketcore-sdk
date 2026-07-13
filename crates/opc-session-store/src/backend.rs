@@ -49,6 +49,13 @@ pub const MAX_REPLICATION_OPERATION_DEPTH: usize = 16;
 /// decision and a nested entry cannot trigger unbounded provider calls.
 pub const MAX_REPLICATION_OPERATIONS_PER_ENTRY: usize = 256;
 
+/// Maximum number of entries returned by one replication-log range request.
+///
+/// The limit is model-wide: direct adapters, wrappers, quorum-backed reads,
+/// and authenticated transport all enforce the same allocation and work
+/// boundary.
+pub const MAX_REPLICATION_LOG_PAGE_ENTRIES: usize = 65_536;
+
 /// Minimum UTF-8 width of a durable replication transaction identity.
 pub const REPLICATION_TX_ID_MIN_BYTES: usize = 1;
 
@@ -404,6 +411,133 @@ fn discard_replication_op_iteratively(root: ReplicationOp) {
 fn discard_replication_entries_iteratively(entries: Vec<ReplicationEntry>) {
     for entry in entries {
         entry.discard_operation_iteratively();
+    }
+}
+
+/// Checked inclusive interval for one replication-log page request.
+///
+/// Sequence zero is the empty-log head sentinel and normalizes to sequence
+/// one. A zero limit represents an empty interval. Non-empty intervals are
+/// inclusive from [`Self::first_sequence`] through [`Self::last_sequence`]
+/// and never wrap. This type describes only a local read range; it grants no
+/// sequencing, commit, compaction, or snapshot authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationLogRange {
+    first_sequence: u64,
+    last_sequence: Option<u64>,
+    limit: usize,
+}
+
+impl ReplicationLogRange {
+    /// Validate and normalize one replication-log range before backend I/O.
+    pub fn try_new(start: u64, limit: usize) -> Result<Self, StoreError> {
+        if limit > MAX_REPLICATION_LOG_PAGE_ENTRIES {
+            return Err(StoreError::ReplicationLogPageTooLarge {
+                requested: limit,
+                max: MAX_REPLICATION_LOG_PAGE_ENTRIES,
+            });
+        }
+        let first_sequence = start.max(1);
+        let last_sequence = if limit == 0 {
+            None
+        } else {
+            let offset =
+                u64::try_from(limit - 1).map_err(|_| StoreError::InvalidReplicationLogRange)?;
+            Some(
+                first_sequence
+                    .checked_add(offset)
+                    .ok_or(StoreError::InvalidReplicationLogRange)?,
+            )
+        };
+        Ok(Self {
+            first_sequence,
+            last_sequence,
+            limit,
+        })
+    }
+
+    /// First inclusive sequence after normalizing the zero sentinel to one.
+    pub const fn first_sequence(self) -> u64 {
+        self.first_sequence
+    }
+
+    /// Last inclusive sequence, or `None` for a zero-limit empty interval.
+    pub const fn last_sequence(self) -> Option<u64> {
+        self.last_sequence
+    }
+
+    /// Maximum number of entries admitted by this request.
+    pub const fn limit(self) -> usize {
+        self.limit
+    }
+
+    /// Whether this request describes an empty interval.
+    pub const fn is_empty(self) -> bool {
+        self.last_sequence.is_none()
+    }
+
+    /// Reject a cursor at or below a non-zero compaction floor.
+    ///
+    /// A zero-limit request is empty and succeeds without consulting the
+    /// floor. The typed resume point is always the first sequence after the
+    /// compacted interval.
+    pub fn ensure_not_compacted(self, compacted_through: u64) -> Result<(), StoreError> {
+        if !self.is_empty() && compacted_through != 0 && self.first_sequence <= compacted_through {
+            let resume_from = compacted_through.checked_add(1).ok_or_else(|| {
+                StoreError::BackendUnavailable("replication sequence exhausted".to_string())
+            })?;
+            return Err(StoreError::ReplicationLogCursorCompacted { resume_from });
+        }
+        Ok(())
+    }
+
+    /// Validate that a returned page is the exact available prefix of this
+    /// request rather than a page before or after it.
+    pub fn validate_page(self, entries: &[ReplicationEntry]) -> Result<(), StoreError> {
+        validate_replication_page(entries)?;
+        if entries.len() > self.limit {
+            return Err(StoreError::InvalidReplicationSequence);
+        }
+        let Some(first) = entries.first() else {
+            return Ok(());
+        };
+        let Some(last_sequence) = self.last_sequence else {
+            return Err(StoreError::InvalidReplicationSequence);
+        };
+        if first.sequence != self.first_sequence
+            || entries
+                .last()
+                .is_none_or(|last| last.sequence > last_sequence)
+        {
+            return Err(StoreError::InvalidReplicationSequence);
+        }
+        Ok(())
+    }
+}
+
+/// Validate a replication-log page against its checked requested interval.
+pub fn validate_replication_log_page(
+    start: u64,
+    limit: usize,
+    entries: &[ReplicationEntry],
+) -> Result<(), StoreError> {
+    ReplicationLogRange::try_new(start, limit)?.validate_page(entries)
+}
+
+/// Consume and validate a replication-log page against its requested range.
+///
+/// Rejected operation trees are dismantled iteratively before returning.
+pub fn validate_replication_log_page_owned(
+    start: u64,
+    limit: usize,
+    entries: Vec<ReplicationEntry>,
+) -> Result<Vec<ReplicationEntry>, StoreError> {
+    match validate_replication_log_page(start, limit, &entries) {
+        Ok(()) => Ok(entries),
+        Err(error) => {
+            discard_replication_entries_iteratively(entries);
+            Err(error)
+        }
     }
 }
 
@@ -901,12 +1035,24 @@ pub trait SessionBackend: Send + Sync {
             .map_err(|_| crate::readiness::ReplicaReadinessFailure::Backend)
     }
 
-    /// Retrieve log entries in the range [start, start + limit).
+    /// Retrieve the available prefix of a checked inclusive log range.
+    ///
+    /// `start == 0` normalizes to inclusive sequence one. A zero limit returns
+    /// an empty page without backend I/O. Empty logs, the terminal cursor, and
+    /// future cursors return an empty page. A non-empty page must start exactly
+    /// at the normalized cursor and remain within the checked interval; it may
+    /// be shorter only at the current head or an outer response-size boundary.
+    /// Compacted cursors return [`StoreError::ReplicationLogCursorCompacted`]
+    /// with the first retained resume point rather than silently skipping.
     async fn get_replication_log(
         &self,
-        _start: u64,
-        _limit: usize,
+        start: u64,
+        limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
         Err(StoreError::CapabilityNotSupported(
             "ordered_replication_log".into(),
         ))
@@ -1413,8 +1559,15 @@ where
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let entries =
-            validate_replication_page_owned(self.inner.get_replication_log(start, limit).await?)?;
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = validate_replication_log_page_owned(
+            start,
+            limit,
+            self.inner.get_replication_log(start, limit).await?,
+        )?;
         let mut decrypted = Vec::with_capacity(entries.len());
         for entry in entries {
             decrypted.push(
@@ -1826,8 +1979,15 @@ where
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let entries =
-            validate_replication_page_owned(self.inner.get_replication_log(start, limit).await?)?;
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = validate_replication_log_page_owned(
+            start,
+            limit,
+            self.inner.get_replication_log(start, limit).await?,
+        )?;
         let mut unsealed = Vec::with_capacity(entries.len());
         for entry in entries {
             unsealed.push(

@@ -7,7 +7,8 @@ use opc_session_store::{
     Clock, EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, OwnerId,
     ReplicationEntry, ReplicationOp, SessionKey, SessionKeyType, SessionStoreBackend,
     SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
-    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -356,7 +357,7 @@ fn seed_prefix(now: Timestamp, key: &SessionKey) -> Vec<ReplicationEntry> {
 
 async fn replication_log(backend: &dyn SessionStoreBackend) -> Vec<ReplicationEntry> {
     backend
-        .get_replication_log(1, usize::MAX)
+        .get_replication_log(1, MAX_REPLICATION_LOG_PAGE_ENTRIES)
         .await
         .expect("replication log")
 }

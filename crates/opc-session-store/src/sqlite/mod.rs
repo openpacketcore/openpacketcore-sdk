@@ -18,10 +18,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 
 use crate::{
     backend::{
-        validate_replication_page_owned, validate_replication_prefix_owned,
+        validate_replication_log_page_owned, validate_replication_prefix_owned,
         validate_session_ops_ttls, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-        ReplicationEntry, SessionBackend, SessionOp, SessionOpResult, REPLICATION_TX_ID_MAX_BYTES,
-        REPLICATION_TX_ID_MIN_BYTES, WATCH_CHANNEL_CAPACITY,
+        ReplicationEntry, ReplicationLogRange, SessionBackend, SessionOp, SessionOpResult,
+        REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -512,18 +512,19 @@ impl SqliteSessionBackend {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let Ok(sqlite_start) = i64::try_from(start) else {
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Ok(sqlite_start) = i64::try_from(range.first_sequence()) else {
             return Ok(Vec::new());
         };
-        let sqlite_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sqlite_limit =
+            i64::try_from(range.limit()).map_err(|_| StoreError::InvalidReplicationLogRange)?;
         let conn = self.conn.lock().await;
         let invalidation_floor = consensus::read_watch_cursor_invalidation_floor_sync(&conn)
             .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-        if invalidation_floor != 0 && start <= invalidation_floor {
-            return Err(StoreError::BackendUnavailable(
-                "replication log invalidated before requested start".into(),
-            ));
-        }
+        range.ensure_not_compacted(invalidation_floor)?;
         let mut stmt = conn
             .prepare(
                 r#"
@@ -568,7 +569,7 @@ impl SqliteSessionBackend {
                 &json,
             )?);
         }
-        validate_replication_page_owned(result)
+        validate_replication_log_page_owned(start, limit, result)
     }
 
     /// Subscribe to the committed application journal. The caller must first
@@ -830,10 +831,15 @@ impl SessionBackend for SqliteSessionBackend {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let Ok(sqlite_start) = i64::try_from(start) else {
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Ok(sqlite_start) = i64::try_from(range.first_sequence()) else {
             return Ok(Vec::new());
         };
-        let sqlite_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sqlite_limit =
+            i64::try_from(range.limit()).map_err(|_| StoreError::InvalidReplicationLogRange)?;
         let conn = self.conn.lock().await;
         let tx = standalone_transaction(&conn)?;
         let res = {
@@ -882,7 +888,7 @@ impl SessionBackend for SqliteSessionBackend {
                     &json,
                 )?);
             }
-            validate_replication_page_owned(res)?
+            validate_replication_log_page_owned(start, limit, res)?
         };
         tx.commit()
             .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;

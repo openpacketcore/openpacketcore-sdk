@@ -78,6 +78,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count-only `invalid_replication_tx_id_fields` migration signal. Follow the
   coordinated audit/remediation/restart/rollback runbook. This changes no
   payload envelope, AAD, HKMS call, or encryption-at-rest boundary.
+- **BREAKING — `opc-session-store`/`opc-session-cache`/`opc-session-net`:**
+  replication-log reads now use one checked `ReplicationLogRange` contract at
+  every adapter, wrapper, Openraft, cache, server, and client boundary.
+  Sequence zero aliases inclusive sequence one; zero-limit reads are empty
+  before I/O; non-empty pages must begin at the exact normalized cursor and
+  remain inside the checked interval; the model-wide page maximum is 65,536.
+  Overflow, one-over-limit, and compacted cursors have distinct typed errors,
+  including the exact post-snapshot resume point. A compatibility client drops
+  its connection and capability cache when a peer returns an otherwise
+  contiguous page before or after the request. Frame shortening still exposes
+  only the largest exact prefix. The v4 error-set revision advances to 4, so
+  legacy session-net participants require a coordinated stop/upgrade/start.
+  Production Openraft performs a linearizable barrier then reads one local
+  applied state; it never unions pages from replicas with different compaction
+  floors. This changes no commit authority, payload envelope, AAD, HKMS call,
+  encryption-at-rest boundary, restore cursor, or watch cursor contract.
 - `opc-identity`: a production `ProjectedSvidSource` for Kubernetes projected
   Secrets. It resolves one immutable `..data` target, detects and boundedly
   retries every mid-read generation switch, enforces exact file/total/
