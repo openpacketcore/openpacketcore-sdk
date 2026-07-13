@@ -12,8 +12,8 @@
 //! caller-keyed SA_INIT AES-GCM protected-payload open/seal helpers, typed
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
-//! RFC 7427 method 14) against caller-trusted keys, and product-neutral Child
-//! SA negotiation intent. It does not
+//! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY
+//! notifications, and product-neutral Child SA negotiation intent. It does not
 //! implement an IKE SA state machine, EAP-AKA, retransmission policy, cookie
 //! policy, Child SA installation, XFRM programming, or any 3GPP ePDG profile
 //! decisions.
@@ -25,6 +25,7 @@
 use opc_protocol::ValidationLevel;
 
 pub mod crypto;
+pub mod device_identity;
 pub mod exchange;
 pub mod fragmentation;
 pub mod header;
@@ -44,6 +45,11 @@ pub mod testkit;
 pub use crypto::{
     open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,
     ProtectedPayloadKind, ProtectedPayloadOpenError, ProtectedPayloadOpenFailure,
+};
+pub use device_identity::{
+    build_ikev2_device_identity_request, build_ikev2_device_identity_response,
+    decode_ikev2_device_identity_notify, Ikev2DeviceIdentity, Ikev2DeviceIdentityNotify,
+    Ikev2DeviceIdentityNotifyBuildError, Ikev2DeviceIdentityNotifyError, Ikev2DeviceIdentityType,
 };
 pub use exchange::{
     Ikev2ExchangeBoundaryState, Ikev2ExchangeDecision, Ikev2ExchangeInvalidReason,
@@ -114,14 +120,15 @@ pub use notify::{
     build_ike_sa_init_cookie_response, extract_ike_sa_init_cookie_notify, Ikev2CookieNotify,
     Ikev2CookieNotifyBuildError, Ikev2CookieNotifyExtractError, Ikev2NotifyPayload,
     Ikev2NotifyPayloadError, IKEV2_NOTIFY_AUTHENTICATION_FAILED, IKEV2_NOTIFY_CHILD_SA_NOT_FOUND,
-    IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2, IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION,
-    IKEV2_NOTIFY_FAILED_CP_REQUIRED, IKEV2_NOTIFY_INTERNAL_ADDRESS_FAILURE,
-    IKEV2_NOTIFY_INVALID_IKE_SPI, IKEV2_NOTIFY_INVALID_KE_PAYLOAD,
-    IKEV2_NOTIFY_INVALID_MAJOR_VERSION, IKEV2_NOTIFY_INVALID_MESSAGE_ID,
-    IKEV2_NOTIFY_INVALID_SELECTORS, IKEV2_NOTIFY_INVALID_SPI, IKEV2_NOTIFY_INVALID_SYNTAX,
-    IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP, IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
-    IKEV2_NOTIFY_NO_ADDITIONAL_SAS, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
-    IKEV2_NOTIFY_REKEY_SA, IKEV2_NOTIFY_SINGLE_PAIR_REQUIRED, IKEV2_NOTIFY_TEMPORARY_FAILURE,
+    IKEV2_NOTIFY_COOKIE, IKEV2_NOTIFY_COOKIE2, IKEV2_NOTIFY_DEVICE_IDENTITY,
+    IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION, IKEV2_NOTIFY_FAILED_CP_REQUIRED,
+    IKEV2_NOTIFY_INTERNAL_ADDRESS_FAILURE, IKEV2_NOTIFY_INVALID_IKE_SPI,
+    IKEV2_NOTIFY_INVALID_KE_PAYLOAD, IKEV2_NOTIFY_INVALID_MAJOR_VERSION,
+    IKEV2_NOTIFY_INVALID_MESSAGE_ID, IKEV2_NOTIFY_INVALID_SELECTORS, IKEV2_NOTIFY_INVALID_SPI,
+    IKEV2_NOTIFY_INVALID_SYNTAX, IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP,
+    IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, IKEV2_NOTIFY_NO_ADDITIONAL_SAS,
+    IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE, IKEV2_NOTIFY_REKEY_SA,
+    IKEV2_NOTIFY_SINGLE_PAIR_REQUIRED, IKEV2_NOTIFY_TEMPORARY_FAILURE,
     IKEV2_NOTIFY_TS_UNACCEPTABLE, IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
 };
 pub use payload::{

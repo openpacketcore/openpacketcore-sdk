@@ -12,8 +12,12 @@ use opc_ipsec_xfrm::{
     IKEV2_SECURITY_PROTOCOL_ID_ESP,
 };
 use opc_proto_diameter::apps::swm::{
-    build_swm_diameter_eap_request, parse_swm_diameter_eap_request, AuthRequestType,
-    SwmDiameterEapRequest, APPLICATION_ID as SWM_APPLICATION_ID, COMMAND_DIAMETER_EAP,
+    build_swm_diameter_eap_answer_for, build_swm_diameter_eap_request,
+    derive_unauthenticated_emergency_msk, parse_swm_diameter_eap_answer_envelope,
+    parse_swm_diameter_eap_request, parse_swm_diameter_eap_request_envelope, AuthRequestType,
+    SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmDiameterResult,
+    SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath, SwmEmergencyServices,
+    SwmTerminalInformation, APPLICATION_ID as SWM_APPLICATION_ID, COMMAND_DIAMETER_EAP,
 };
 use opc_proto_diameter::Message as DiameterMessage;
 use opc_proto_gtpv2c::{
@@ -21,13 +25,21 @@ use opc_proto_gtpv2c::{
     Procedure as Gtpv2cProcedure, S2bMessage,
 };
 use opc_proto_ikev2::{
-    Ikev2ChildSaNegotiation, Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE,
+    build_ike_auth_authentication_payload, build_ike_auth_identification_payload,
+    build_ikev2_device_identity_request, build_ikev2_device_identity_response,
+    compute_ike_auth_shared_key_mic, decode_ikev2_device_identity_notify,
+    derive_ike_sa_init_key_material, Ikev2AuthenticationPayloadBuild, Ikev2ChildSaNegotiation,
+    Ikev2DeviceIdentity, Ikev2DeviceIdentityNotify, Ikev2DeviceIdentityType, Ikev2DhGroup,
+    Ikev2EncryptionAlgorithm, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthPeer,
+    Ikev2IkeAuthSignedOctets, Ikev2NotifyPayload, Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile,
+    Ikev2TrafficSelectorBuild, IKEV2_AUTH_METHOD_SHARED_KEY_MIC, IKEV2_TS_IPV4_ADDR_RANGE,
 };
 use opc_protocol::{DecodeContext, EncodeContext};
 use opc_testbed::simulators::epc::{
     DiameterApplication, DiameterMessageView, DiameterPeerSimulator, DiameterPeerState,
     PeerMessageDirection, PgwS2bSimulator, PgwS2bState, S2bMessageView, S2bProcedure,
 };
+use opc_types::{Imei, Imei15};
 use time::OffsetDateTime;
 
 struct Gtpv2cS2bView<'a>(S2bMessage<'a>);
@@ -143,6 +155,8 @@ async fn epdg_sdk_protocol_xfrm_testbed_and_evidence_components_compose(
             user_name: Some("ue-redacted".into()),
             auth_request_type: AuthRequestType::AuthorizeAuthenticate,
             eap_payload: vec![0x02, 0x17, 0x00, 0x04].into(),
+            emergency_services: None,
+            terminal_information: None,
             state_avps: vec![b"opaque-redacted-state".to_vec()],
         },
         0x1111_2222,
@@ -307,6 +321,200 @@ async fn epdg_sdk_protocol_xfrm_testbed_and_evidence_components_compose(
         }],
     };
     evidence.validate_redaction()?;
+
+    Ok(())
+}
+
+#[test]
+fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
+) -> Result<(), Box<dyn Error>> {
+    let imei = Imei15::new("490154203237518")?;
+    let emergency_imsi_nai = "0234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org";
+    let eap_identity_len = u16::try_from(5 + emergency_imsi_nai.len())?;
+    let mut eap_identity = vec![0x02, 0x17];
+    eap_identity.extend_from_slice(&eap_identity_len.to_be_bytes());
+    eap_identity.push(0x01);
+    eap_identity.extend_from_slice(emergency_imsi_nai.as_bytes());
+    let mut initial_request = SwmDiameterEapRequest {
+        session_id: "sess;swm;emergency".into(),
+        auth_application_id: SWM_APPLICATION_ID.get(),
+        origin_host: "epdg.redacted.example".into(),
+        origin_realm: "visited.redacted.example".into(),
+        destination_realm: "home.redacted.example".into(),
+        destination_host: Some("aaa.redacted.example".into()),
+        user_name: Some(emergency_imsi_nai.into()),
+        auth_request_type: AuthRequestType::AuthorizeAuthenticate,
+        eap_payload: eap_identity.into(),
+        emergency_services: Some(SwmEmergencyServices::emergency_indication()),
+        terminal_information: None,
+        state_avps: Vec::new(),
+    };
+    let initial_owned = build_swm_diameter_eap_request(
+        &initial_request,
+        0x1000_0001,
+        0x2000_0001,
+        EncodeContext::default(),
+    )?;
+    let initial_message = DiameterMessage {
+        header: initial_owned.header.clone(),
+        raw_avps: &initial_owned.raw_avps,
+        tail: &[],
+    };
+    let initial_request_envelope =
+        parse_swm_diameter_eap_request_envelope(&initial_message, DecodeContext::conservative())?;
+    initial_request = initial_request_envelope.request().clone();
+
+    let identity_answer = SwmDiameterEapAnswer {
+        session_id: initial_request.session_id.clone(),
+        auth_application_id: SWM_APPLICATION_ID.get(),
+        auth_request_type: AuthRequestType::AuthorizeAuthenticate,
+        result: SwmDiameterResult::Experimental {
+            vendor_id: opc_proto_diameter::apps::VENDOR_ID_3GPP,
+            code: opc_proto_diameter::apps::swm::DIAMETER_ERROR_USER_UNKNOWN,
+        },
+        origin_host: "aaa.redacted.example".into(),
+        origin_realm: "home.redacted.example".into(),
+        user_name: None,
+        service_selection: None,
+        default_context_identifier: None,
+        apn_configurations: Vec::new(),
+        mobile_node_identifier: None,
+        eap_payload: None,
+        eap_reissued_payload: None,
+        error_message: None,
+        state_avps: Vec::new(),
+        eap_master_session_key: None,
+    };
+    let identity_owned = build_swm_diameter_eap_answer_for(
+        &initial_request_envelope,
+        &identity_answer,
+        EncodeContext::default(),
+    )?;
+    let identity_message = DiameterMessage {
+        header: identity_owned.header.clone(),
+        raw_avps: &identity_owned.raw_avps,
+        tail: &[],
+    };
+    let identity_answer_envelope =
+        parse_swm_diameter_eap_answer_envelope(&identity_message, DecodeContext::conservative())?;
+    assert!(identity_answer_envelope
+        .answer()
+        .result
+        .requests_emergency_identity_recovery());
+
+    let device_request = build_ikev2_device_identity_request(Ikev2DeviceIdentityType::Imei)?;
+    let device_request = Ikev2NotifyPayload::decode_body(&device_request)?;
+    assert_eq!(
+        decode_ikev2_device_identity_notify(device_request)?,
+        Ikev2DeviceIdentityNotify::Request(Ikev2DeviceIdentityType::Imei)
+    );
+    let device_response =
+        build_ikev2_device_identity_response(&Ikev2DeviceIdentity::Imei(imei.clone()))?;
+    let device_response = Ikev2NotifyPayload::decode_body(&device_response)?;
+    let recovered = decode_ikev2_device_identity_notify(device_response)?;
+    let recovered_imei = match recovered {
+        Ikev2DeviceIdentityNotify::Response(Ikev2DeviceIdentity::Imei(value)) => value,
+        _ => panic!("IMEI DEVICE_IDENTITY response must remain typed"),
+    };
+
+    let mut retry_request = initial_request.clone();
+    retry_request.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&recovered_imei),
+        software_version: None,
+    });
+    let retry_owned = build_swm_diameter_eap_request(
+        &retry_request,
+        0x1000_0003,
+        0x2000_0003,
+        EncodeContext::default(),
+    )?;
+    let retry_message = DiameterMessage {
+        header: retry_owned.header.clone(),
+        raw_avps: &retry_owned.raw_avps,
+        tail: &[],
+    };
+    let retry_request_envelope =
+        parse_swm_diameter_eap_request_envelope(&retry_message, DecodeContext::conservative())?;
+    let retry_request = retry_request_envelope.request();
+
+    let derived_msk = derive_unauthenticated_emergency_msk(&imei);
+    let final_answer = SwmDiameterEapAnswer {
+        session_id: retry_request.session_id.clone(),
+        auth_application_id: SWM_APPLICATION_ID.get(),
+        auth_request_type: AuthRequestType::AuthorizeAuthenticate,
+        result: SwmDiameterResult::Base(2001),
+        origin_host: "aaa.redacted.example".into(),
+        origin_realm: "home.redacted.example".into(),
+        user_name: None,
+        service_selection: None,
+        default_context_identifier: None,
+        apn_configurations: Vec::new(),
+        mobile_node_identifier: Some(format!("imei{}@sos.invalid", imei.as_str()).into()),
+        eap_payload: Some(vec![0x03, 0x17, 0x00, 0x04].into()),
+        eap_reissued_payload: None,
+        error_message: None,
+        state_avps: Vec::new(),
+        eap_master_session_key: Some(derived_msk.as_bytes().to_vec().into()),
+    };
+    let final_owned = build_swm_diameter_eap_answer_for(
+        &retry_request_envelope,
+        &final_answer,
+        EncodeContext::default(),
+    )?;
+    let final_message = DiameterMessage {
+        header: final_owned.header.clone(),
+        raw_avps: &final_owned.raw_avps,
+        tail: &[],
+    };
+    let final_answer_envelope =
+        parse_swm_diameter_eap_answer_envelope(&final_message, DecodeContext::conservative())?;
+    let initial_exchange = initial_request_envelope.correlate_answer(identity_answer_envelope)?;
+    let retry_exchange = retry_request_envelope.correlate_answer(final_answer_envelope)?;
+
+    let evidence = SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+        initial_exchange,
+        retry_exchange,
+        &imei,
+    )?;
+    assert_eq!(
+        evidence.path(),
+        SwmEmergencyAuthorizationPath::RecoveredDeviceIdentity
+    );
+
+    let profile = Ikev2SaInitCryptoProfile::new(
+        Ikev2PrfAlgorithm::HmacSha2_256,
+        Ikev2DhGroup::Ecp256,
+        Ikev2EncryptionAlgorithm::AesGcm16_128,
+    );
+    let key_material = derive_ike_sa_init_key_material(
+        profile,
+        [0x11; 8],
+        [0x22; 8],
+        &[0x33; 32],
+        &[0x44; 32],
+        &[0x55; 32],
+        None,
+    )?;
+    let identity_body = build_ike_auth_identification_payload(&Ikev2IdentificationPayloadBuild {
+        id_type: 2,
+        id_data: format!("imei{}@sos.invalid", imei.as_str()).into_bytes(),
+    })?;
+    let auth_data = compute_ike_auth_shared_key_mic(
+        profile,
+        &key_material,
+        Ikev2IkeAuthSignedOctets {
+            peer: Ikev2IkeAuthPeer::Initiator,
+            ike_sa_init_message: b"first-ike-sa-init-request-wire-bytes",
+            peer_nonce: &[0x77; 32],
+            identity_payload_body: &identity_body,
+        },
+        evidence.msk().as_bytes(),
+    )?;
+    let auth_body = build_ike_auth_authentication_payload(&Ikev2AuthenticationPayloadBuild {
+        auth_method: IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
+        auth_data,
+    })?;
+    assert_eq!(auth_body[0], IKEV2_AUTH_METHOD_SHARED_KEY_MIC);
 
     Ok(())
 }

@@ -16,6 +16,7 @@ mandatory AVPs, grouped depth bombs, bad padding, and reserved flag bits.
 """
 
 import hashlib
+import hmac
 import os
 import struct
 import sys
@@ -105,8 +106,13 @@ def u32(value: int) -> bytes:
     return struct.pack(">I", value)
 
 
-def self_test_avp_flag_validation() -> None:
-    """Assert corpus helper flag validation fails closed for invalid flags."""
+def unauthenticated_emergency_msk(imei: bytes) -> bytes:
+    """Derive the 32-octet MSK from 3GPP TS 33.402 Annex A.4."""
+    return hmac.new(imei, b"\x22unauth-emer\x00\x0b", hashlib.sha256).digest()
+
+
+def self_test_helpers() -> None:
+    """Assert corpus helpers fail closed and retain the published KDF vector."""
     avp(264, 0x40, b"x", None)
     avp(874, 0xC0, b"x", vendor=10415)
 
@@ -141,6 +147,13 @@ def self_test_avp_flag_validation() -> None:
                 f"vendor/V-bit mismatch 0x{flags:02x}, vendor={vendor} "
                 "was accepted by corpus helper"
             )
+
+    expected_msk = bytes.fromhex(
+        "e0331e121cc1b8f468f08e24f4e7b8dae3c8f7a8b5e7147613aedfce21d9d6ac"
+    )
+    actual_msk = unauthenticated_emergency_msk(b"490154203237518")
+    if not hmac.compare_digest(actual_msk, expected_msk):
+        raise AssertionError("TS 33.402 Annex A.4 emergency MSK vector changed")
 
 
 def main() -> None:
@@ -253,6 +266,7 @@ def main() -> None:
     der_avps += avp(283, 0x40, b"home.example", None)      # Destination-Realm §6.6
     # Auth-Request-Type AVP (code 274, M), AUTHORIZE_AUTHENTICATE = 3. RFC 6733 §8.7.
     der_avps += avp(274, 0x40, u32(3), None)
+    der_common_avps = der_avps
     # EAP-Payload AVP (code 462, M). RFC 4072 §4.1.
     der_avps += avp(462, 0x40, b"\x02\x17\x00\x08\x32\x01\x02\x03", None)
     write_corpus(
@@ -297,6 +311,100 @@ def main() -> None:
         "swm_dea_projected_apn_profile",
     )
 
+    # 10. SWm emergency DER. TS 29.273 §7.2.3.4 defines Emergency-Services
+    #     (code 1538) as a 3GPP vendor Unsigned32 with V=1, M=0, P=0; bit zero
+    #     requests an emergency PDN connection.
+    emergency_user_name = (
+        b"0234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org"
+    )
+    emergency_eap_identity = (
+        b"\x02\x17"
+        + struct.pack(">H", 5 + len(emergency_user_name))
+        + b"\x01"
+        + emergency_user_name
+    )
+    emergency_der = der_common_avps
+    emergency_der += avp(462, 0x40, emergency_eap_identity, None)
+    emergency_der += avp(1, 0x40, emergency_user_name, None)
+    emergency_der += avp(1538, 0x80, u32(1), vendor=10415)
+    write_corpus(
+        msg_dir,
+        header(0xC0, 268, 16777264, 0x9999999C, 0xAAAAAAAD, emergency_der),
+        "swm_der_emergency_indication",
+    )
+
+    # 11. TS 33.402 §13.3 identity-recovery DEA. Experimental-Result is a
+    #     grouped base AVP containing 3GPP Vendor-Id 10415 and result code
+    #     5001. It requests DEVICE_IDENTITY; it does not authorize access.
+    identity_required_dea = b""
+    identity_required_dea += avp(263, 0x40, b"sess;swm;001", None)
+    identity_required_dea += avp(258, 0x40, u32(16777264), None)
+    identity_required_dea += avp(274, 0x40, u32(3), None)
+    experimental_result = avp(266, 0x40, u32(10415), None)
+    experimental_result += avp(298, 0x40, u32(5001), None)
+    identity_required_dea += avp(297, 0x40, experimental_result, None)
+    identity_required_dea += avp(264, 0x40, b"aaa.home.example", None)
+    identity_required_dea += avp(296, 0x40, b"home.example", None)
+    write_corpus(
+        msg_dir,
+        header(
+            0x40,
+            268,
+            16777264,
+            0x9999999C,
+            0xAAAAAAAD,
+            identity_required_dea,
+        ),
+        "swm_dea_emergency_identity_required",
+    )
+
+    # 12. Correlated retry DER after DEVICE_IDENTITY recovery. The recovered
+    #     IMEI is carried in the TS 29.272 Terminal-Information grouped AVP;
+    #     the DER repeats the emergency indication.
+    imei = b"490154203237518"
+    emergency_nai = b"imei" + imei + b"@sos.invalid"
+    terminal_information = avp(1402, 0xC0, imei, vendor=10415)
+    emergency_retry_der = emergency_der
+    emergency_retry_der += avp(1401, 0xC0, terminal_information, vendor=10415)
+    write_corpus(
+        msg_dir,
+        header(
+            0xC0,
+            268,
+            16777264,
+            0x9999999E,
+            0xAAAAAAAF,
+            emergency_retry_der,
+        ),
+        "swm_der_emergency_terminal_information_retry",
+    )
+
+    # 13. Final DEA material for the correlated emergency exchange. Exact
+    #     DIAMETER_SUCCESS, EAP-Success, the IMEI-derived MSK, and the same
+    #     Emergency NAI are all required before ordinary method-2 IKE AUTH.
+    final_emergency_dea = b""
+    final_emergency_dea += avp(263, 0x40, b"sess;swm;001", None)
+    final_emergency_dea += avp(258, 0x40, u32(16777264), None)
+    final_emergency_dea += avp(274, 0x40, u32(3), None)
+    final_emergency_dea += avp(268, 0x40, u32(2001), None)
+    final_emergency_dea += avp(264, 0x40, b"aaa.home.example", None)
+    final_emergency_dea += avp(296, 0x40, b"home.example", None)
+    final_emergency_dea += avp(462, 0x40, b"\x03\x17\x00\x04", None)
+    final_emergency_dea += avp(464, 0x00, unauthenticated_emergency_msk(imei), None)
+    final_emergency_dea += avp(506, 0x40, emergency_nai, None)
+    write_corpus(
+        msg_dir,
+        header(
+            0x40,
+            268,
+            16777264,
+            0x9999999E,
+            0xAAAAAAAF,
+            final_emergency_dea,
+        ),
+        "swm_dea_emergency_final_success_material",
+    )
+
     # -------------------------------------------------------------------------
     # Malformed message seeds (must not panic the decode surface)
     # -------------------------------------------------------------------------
@@ -325,6 +433,21 @@ def main() -> None:
         msg_dir,
         header(0x80, 257, 0, 0x11111111, 0x22222222, dup_origin_host + dup_origin_host),
         "malformed_duplicate_mandatory_in_message",
+    )
+
+    # SWm Emergency-Services is a DER-only singleton.
+    duplicate_emergency = avp(1538, 0x80, u32(1), vendor=10415)
+    write_corpus(
+        msg_dir,
+        header(
+            0xC0,
+            268,
+            16777264,
+            0x999999A0,
+            0xAAAAAAB1,
+            emergency_der + duplicate_emergency,
+        ),
+        "malformed_swm_duplicate_emergency_services",
     )
 
     # Message containing a grouped Failed-AVP depth bomb.
@@ -428,8 +551,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("self-test", "--self-test"):
-        self_test_avp_flag_validation()
-        print("AVP flag validation self-test passed")
+        self_test_helpers()
+        print("Corpus helper self-test passed")
     else:
-        self_test_avp_flag_validation()
+        self_test_helpers()
         main()

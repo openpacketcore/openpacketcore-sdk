@@ -32,6 +32,10 @@ stack.
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
   helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
   selector/proposal helpers.
+- `device_identity` validates and builds TS 24.302 DEVICE_IDENTITY requests and
+  responses using the redaction-safe exact-15-digit `Imei15` and `Imeisv`
+  types. TBCD decoding preserves the received fifteenth IMEI digit (including
+  a spare zero or non-Luhn digit) and enforces the terminal filler nibble.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
 
@@ -68,6 +72,11 @@ The crate is experimental and `publish = false`. It has structural coverage and
 targeted crypto/helper tests for the documented scaffold, but it is not a full
 IKEv2 implementation. Certificate-chain, validity-period, name, and key-usage
 validation are caller responsibilities when using signature AUTH helpers.
+
+DEVICE_IDENTITY carries equipment identity only; it does not define or weaken
+IKE authentication. Emergency procedures continue to use the ordinary RFC 7296
+method-2 shared-key AUTH helper with caller-supplied, procedure-derived keying
+material. The product layer owns exchange correlation and authorization policy.
 
 See [CONFORMANCE.md](CONFORMANCE.md) for the exact evidence boundary and
 explicit non-goals.

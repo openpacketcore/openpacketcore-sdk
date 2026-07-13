@@ -2852,9 +2852,14 @@ name = "opc-proto-diameter"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "hmac 0.12.1",
  "opc-protocol",
  "opc-testbed",
+ "opc-types",
  "quickcheck",
+ "sha2 0.10.9",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2885,6 +2890,7 @@ dependencies = [
  "hmac 0.12.1",
  "opc-proto-ikev2",
  "opc-protocol",
+ "opc-types",
  "p256",
  "p384",
  "p521",

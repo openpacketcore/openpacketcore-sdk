@@ -30,6 +30,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `material_controller()`, `publish_active_key()`, and `material_epoch()`.
   `MemoryRemoteSealProvider::key_id()` is replaced by async
   `active_key_id()`, with `rotate_key()` available for fixtures.
+- **BREAKING — `opc-proto-diameter`:** the SWm request model adds DER-only
+  `emergency_services` and `terminal_information` fields, while the answer
+  model replaces `result_code` with the mutually exclusive typed `result` and
+  adds `mobile_node_identifier`. `SwmDiameterResult` preserves whether the wire
+  carried a base `Result-Code` or grouped `Experimental-Result`; normal answers
+  use `SwmDiameterResult::Base(previous_result_code)`. With both new request
+  fields `None`, ordinary DER bytes remain unchanged.
+- `opc-proto-diameter`: standards-correct TS 33.402 unauthenticated-emergency
+  evidence. Emergency-Services is accepted only on DER; vendor 10415/code 5001
+  triggers correlated DEVICE_IDENTITY recovery; the first DER must carry an
+  exact IMSI-based emergency NAI in a matching EAP-Response/Identity; the retry
+  must add the exact recovered Terminal-Information IMEI without changing the
+  first request; and the final exact-success DEA must match both Diameter
+  transaction IDs and the EAP identifier while carrying the matching
+  IMEI-derived MSK and Mobile-Node-Identifier. Standalone answers and
+  no-MSK/NULL-auth shortcuts cannot authorize the flow. Live transports must
+  consume the corresponding pending request before constructing evidence.
+- `opc-proto-ikev2` and `opc-types`: redaction-safe validated IMEI/IMEISV types
+  and strict TS 24.302 DEVICE_IDENTITY Notify 41101 request/response codecs.
+  `Imei` preserves 14/15-digit Terminal-Information wire values; `Imei15`
+  preserves every DEVICE_IDENTITY/KDF digit without applying Luhn as a wire
+  rule. Existing IKE_AUTH methods and bytes are unchanged; emergency completion
+  uses the existing ordinary method-2 shared-key AUTH helper with the verified
+  MSK.
 - `opc-tls`: a shared `TlsMaterialController` and immutable per-handshake
   client/server snapshots. Accepted same-identity rotations and rollbacks
   advance an opaque epoch; invalid, oversized, expired, wrong-key/chain/trust,

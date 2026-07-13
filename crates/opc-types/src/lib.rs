@@ -15,7 +15,9 @@ mod validation;
 mod versioning;
 
 pub use crate::error::ParseError;
-pub use crate::identity::{InstanceId, PlmnId, RegionId, Snssai, SpiffeId, TenantId};
+pub use crate::identity::{
+    Imei, Imei15, Imeisv, ImeisvParts, InstanceId, PlmnId, RegionId, Snssai, SpiffeId, TenantId,
+};
 pub use crate::nf::{NetworkFunctionKind, NfInstanceId, NfKind, NfType};
 pub use crate::redaction::{redact, IntoRedacted, Redacted, RedactedDebug};
 pub use crate::versioning::{ConfigVersion, SchemaDigest, Timestamp, TxId};

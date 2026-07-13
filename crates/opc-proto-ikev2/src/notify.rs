@@ -165,6 +165,12 @@ pub const IKEV2_NOTIFY_COOKIE2: u16 = 16_401;
 /// @conformance boundary-only
 pub const IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION: u16 = 16_417;
 
+/// IKEv2 Notify Message Type for 3GPP DEVICE_IDENTITY.
+///
+/// @spec 3GPP TS24.302 8.2.9.2
+/// @conformance boundary-only
+pub const IKEV2_NOTIFY_DEVICE_IDENTITY: u16 = 41_101;
+
 /// Protocol ID used by IKE-level notifications with no protocol-specific SPI.
 pub const IKEV2_NOTIFY_PROTOCOL_ID_NONE: u8 = 0;
 
@@ -263,6 +269,11 @@ impl<'a> Ikev2NotifyPayload<'a> {
     /// Return true when this is an EAP_ONLY_AUTHENTICATION Notify payload.
     pub const fn is_eap_only_authentication(self) -> bool {
         self.notify_message_type == IKEV2_NOTIFY_EAP_ONLY_AUTHENTICATION
+    }
+
+    /// Return true when this is a 3GPP DEVICE_IDENTITY Notify payload.
+    pub const fn is_device_identity(self) -> bool {
+        self.notify_message_type == IKEV2_NOTIFY_DEVICE_IDENTITY
     }
 
     /// Return true when Protocol ID and SPI Size have the cookie-compatible shape.

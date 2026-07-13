@@ -7,16 +7,21 @@ use opc_proto_diameter::apps::rf::{
 };
 use opc_proto_diameter::apps::swm::{
     AllocationRetentionPriority, Ambr, ApnConfiguration, AuthRequestType, EpsSubscribedQosProfile,
-    PdnType, SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmResultCategory,
+    PdnType, SwmAuthorizationOutcome, SwmCorrelatedDiameterEapExchange, SwmDiameterEapAnswer,
+    SwmDiameterEapAnswerEnvelope, SwmDiameterEapRequest, SwmDiameterEapRequestEnvelope,
+    SwmDiameterResult, SwmDiameterTransaction, SwmEmergencyAuthorizationError,
+    SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath, SwmEmergencyServices,
+    SwmResultCategory, SwmTerminalInformation,
 };
 use opc_proto_diameter::{
-    apps, base, ApplicationId, AvpCode, AvpDataType, AvpHeader, AvpKey, CommandCode, CommandFlags,
-    CommandKind, DictionarySet, Header, Message, OwnedMessage, RawAvp, VendorId,
-    DIAMETER_HEADER_LEN,
+    apps, base, ApplicationId, AvpCode, AvpDataType, AvpFlags, AvpHeader, AvpKey, CommandCode,
+    CommandFlags, CommandKind, DictionarySet, FlagRequirement, Header, Message, OwnedMessage,
+    RawAvp, VendorId, DIAMETER_HEADER_LEN,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DuplicateIePolicy, Encode, EncodeContext, UnknownIePolicy,
 };
+use opc_types::{Imei, Imei15};
 
 #[cfg(feature = "app-swm")]
 static SWM_BASELINE_DICTIONARIES: DictionarySet<'static> =
@@ -45,6 +50,65 @@ fn decode_message(encoded: &[u8]) -> Message<'_> {
         Message::decode(encoded, DecodeContext::default()).expect("message decode must succeed");
     assert!(tail.is_empty());
     message
+}
+
+#[cfg(feature = "app-swm")]
+fn request_envelope(
+    request: &SwmDiameterEapRequest,
+    hop_by_hop_identifier: u32,
+    end_to_end_identifier: u32,
+) -> SwmDiameterEapRequestEnvelope {
+    SwmDiameterEapRequestEnvelope::for_outbound(
+        request.clone(),
+        SwmDiameterTransaction::new(hop_by_hop_identifier, end_to_end_identifier),
+    )
+}
+
+#[cfg(feature = "app-swm")]
+fn answer_envelope(
+    answer: &SwmDiameterEapAnswer,
+    hop_by_hop_identifier: u32,
+    end_to_end_identifier: u32,
+) -> SwmDiameterEapAnswerEnvelope {
+    SwmDiameterEapAnswerEnvelope::for_outbound(
+        answer.clone(),
+        SwmDiameterTransaction::new(hop_by_hop_identifier, end_to_end_identifier),
+    )
+}
+
+#[cfg(feature = "app-swm")]
+fn correlate_exchange(
+    request: &SwmDiameterEapRequest,
+    answer: &SwmDiameterEapAnswer,
+    hop_by_hop_identifier: u32,
+    end_to_end_identifier: u32,
+) -> Result<SwmCorrelatedDiameterEapExchange, SwmEmergencyAuthorizationError> {
+    request_envelope(request, hop_by_hop_identifier, end_to_end_identifier).correlate_answer(
+        answer_envelope(answer, hop_by_hop_identifier, end_to_end_identifier),
+    )
+}
+
+#[cfg(feature = "app-swm")]
+fn emergency_imsi_nai() -> &'static str {
+    "0234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org"
+}
+
+#[cfg(feature = "app-swm")]
+fn eap_response_identity(identifier: u8, identity: &str) -> Vec<u8> {
+    let length = u16::try_from(5 + identity.len()).expect("bounded test EAP identity");
+    let mut payload = Vec::with_capacity(usize::from(length));
+    payload.extend_from_slice(&[2, identifier]);
+    payload.extend_from_slice(&length.to_be_bytes());
+    payload.push(1);
+    payload.extend_from_slice(identity.as_bytes());
+    payload
+}
+
+#[cfg(feature = "app-swm")]
+fn prepare_recovery_request(request: &mut SwmDiameterEapRequest) {
+    request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+    request.user_name = Some(emergency_imsi_nai().into());
+    request.eap_payload = eap_response_identity(0x17, emergency_imsi_nai()).into();
 }
 
 #[test]
@@ -105,6 +169,53 @@ fn swm_dictionary_contains_application_command_and_avps() {
         .find_avp(AvpKey::ietf(apps::swm::AVP_EAP_PAYLOAD))
         .expect("EAP-Payload must be present");
     assert_eq!(eap_payload.data_type(), AvpDataType::OctetString);
+
+    let emergency_key = AvpKey::vendor(apps::swm::AVP_EMERGENCY_SERVICES, apps::VENDOR_ID_3GPP);
+    let emergency = dictionary
+        .find_avp(emergency_key)
+        .expect("Emergency-Services must be present");
+    assert_eq!(emergency.data_type(), AvpDataType::Unsigned32);
+    assert_eq!(emergency.flags().vendor(), FlagRequirement::MustBeSet);
+    assert_eq!(emergency.flags().mandatory(), FlagRequirement::MustBeUnset);
+    assert_eq!(emergency.flags().protected(), FlagRequirement::MustBeUnset);
+    assert!(der.find_avp_rule(emergency_key).is_some());
+    assert!(!der.allows_multiple(emergency_key));
+
+    let terminal_key = AvpKey::vendor(apps::swm::AVP_TERMINAL_INFORMATION, apps::VENDOR_ID_3GPP);
+    let terminal = dictionary
+        .find_avp(terminal_key)
+        .expect("Terminal-Information must be present");
+    assert_eq!(terminal.data_type(), AvpDataType::Grouped);
+    assert!(der.find_avp_rule(terminal_key).is_some());
+    assert!(!der.allows_multiple(terminal_key));
+
+    let dea = dictionary
+        .find_command(
+            apps::swm::APPLICATION_ID,
+            apps::swm::COMMAND_DIAMETER_EAP,
+            CommandKind::Answer,
+        )
+        .expect("DEA command must be present");
+    assert!(dea.find_avp_rule(emergency_key).is_none());
+    assert!(dea
+        .find_avp_rule(AvpKey::ietf(base::AVP_RESULT_CODE))
+        .is_some());
+    assert!(dea
+        .find_avp_rule(AvpKey::ietf(base::AVP_EXPERIMENTAL_RESULT))
+        .is_some());
+    assert!(dea
+        .find_avp_rule(AvpKey::vendor(
+            apps::swm::AVP_MOBILE_NODE_IDENTIFIER,
+            apps::VENDOR_ID_3GPP,
+        ))
+        .is_none());
+    let mobile_node_identifier = dictionary
+        .find_avp(AvpKey::ietf(apps::swm::AVP_MOBILE_NODE_IDENTIFIER))
+        .expect("Mobile-Node-Identifier must be present");
+    assert_eq!(mobile_node_identifier.data_type(), AvpDataType::Utf8String);
+    assert!(dea
+        .find_avp_rule(AvpKey::ietf(apps::swm::AVP_MOBILE_NODE_IDENTIFIER))
+        .is_some());
 }
 
 #[test]
@@ -218,6 +329,10 @@ fn swm_der_dea_round_trip() {
     .expect("SWm DER build must succeed");
     let encoded = encode_message(&built_request);
     let message = decode_message(&encoded);
+    assert!(message
+        .avps(DecodeContext::default())
+        .map(|avp| avp.expect("normal DER AVP"))
+        .all(|avp| avp.header.code != apps::swm::AVP_EMERGENCY_SERVICES));
     let parsed_request =
         apps::swm::parse_swm_diameter_eap_request(&message, DecodeContext::default())
             .expect("SWm DER parse must succeed");
@@ -232,10 +347,944 @@ fn swm_der_dea_round_trip() {
     .expect("SWm DEA build must succeed");
     let encoded = encode_message(&built_answer);
     let message = decode_message(&encoded);
+    assert!(message
+        .avps(DecodeContext::default())
+        .map(|avp| avp.expect("normal DEA AVP"))
+        .all(|avp| avp.header.code != apps::swm::AVP_EMERGENCY_SERVICES));
     let parsed_answer =
         apps::swm::parse_swm_diameter_eap_answer(&message, DecodeContext::default())
             .expect("SWm DEA parse must succeed");
     assert_eq!(parsed_answer, answer);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_emergency_indication_round_trips_on_der_and_emits_exact_flags() {
+    let mut request = sample_swm_request();
+    request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+    let built = apps::swm::build_swm_diameter_eap_request(
+        &request,
+        0x1111_2222,
+        0x3333_4444,
+        EncodeContext::default(),
+    )
+    .expect("emergency DER build");
+    let encoded = encode_message(&built);
+
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("emergency DER dictionary decode");
+    assert!(tail.is_empty());
+    let emergency_avp = decoded
+        .avps(DecodeContext::conservative())
+        .map(|avp| avp.expect("valid AVP"))
+        .find(|avp| {
+            avp.header.code == apps::swm::AVP_EMERGENCY_SERVICES
+                && avp.header.vendor_id == Some(apps::VENDOR_ID_3GPP)
+        })
+        .expect("Emergency-Services AVP");
+    assert!(emergency_avp.header.flags.is_vendor_specific());
+    assert!(!emergency_avp.header.flags.is_mandatory());
+    assert!(!emergency_avp.header.flags.is_protected());
+    assert_eq!(emergency_avp.value, 1u32.to_be_bytes());
+
+    let parsed = apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative())
+        .expect("emergency DER parse");
+    assert_eq!(parsed, request);
+    assert!(parsed.requests_emergency_services());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_experimental_identity_recovery_round_trips_without_base_result() {
+    let mut answer = sample_swm_answer();
+    answer.result = SwmDiameterResult::Experimental {
+        vendor_id: apps::VENDOR_ID_3GPP,
+        code: apps::swm::DIAMETER_ERROR_USER_UNKNOWN,
+    };
+    answer.eap_payload = None;
+    answer.eap_reissued_payload = None;
+    answer.eap_master_session_key = None;
+
+    let built = apps::swm::build_swm_diameter_eap_answer(
+        &answer,
+        0x5555_6666,
+        0x7777_8888,
+        EncodeContext::default(),
+    )
+    .expect("identity-recovery DEA build");
+    assert!(!built.header.flags.is_error());
+    let encoded = encode_message(&built);
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("identity-recovery DEA dictionary decode");
+    assert!(tail.is_empty());
+    let avps = decoded
+        .avps(DecodeContext::conservative())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("valid DEA AVPs");
+    assert_eq!(
+        avps.iter()
+            .filter(|avp| avp.header.code == base::AVP_EXPERIMENTAL_RESULT)
+            .count(),
+        1
+    );
+    assert!(avps
+        .iter()
+        .all(|avp| avp.header.code != base::AVP_RESULT_CODE));
+    let parsed = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative())
+        .expect("identity-recovery DEA parse");
+
+    assert_eq!(parsed, answer);
+    assert!(parsed.result.requests_emergency_identity_recovery());
+    assert_eq!(
+        parsed.authorization_outcome(),
+        SwmAuthorizationOutcome::NotAuthorized
+    );
+
+    let mut wrong_error_bit = built;
+    wrong_error_bit.header.flags = CommandFlags::answer(true, true);
+    let encoded = encode_message(&wrong_error_bit);
+    let decoded = decode_message(&encoded);
+    assert!(
+        apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative(),).is_err()
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_emergency_der_discards_undefined_bits_and_reencodes_canonically() {
+    let emergency = encode_raw_vendor_avp(
+        apps::swm::AVP_EMERGENCY_SERVICES,
+        apps::VENDOR_ID_3GPP,
+        false,
+        &0xffff_ffffu32.to_be_bytes(),
+    );
+    let message = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03],
+        &[emergency],
+    );
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    let parsed = apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative())
+        .expect("undefined bits are discarded");
+    assert_eq!(
+        parsed.emergency_services,
+        Some(SwmEmergencyServices::emergency_indication())
+    );
+
+    let rebuilt =
+        apps::swm::build_swm_diameter_eap_request(&parsed, 1, 2, EncodeContext::default())
+            .expect("canonical emergency DER rebuild");
+    let encoded = encode_message(&rebuilt);
+    let decoded = decode_message(&encoded);
+    let value = decoded
+        .avps(DecodeContext::conservative())
+        .map(|avp| avp.expect("valid AVP"))
+        .find(|avp| avp.header.code == apps::swm::AVP_EMERGENCY_SERVICES)
+        .expect("rebuilt Emergency-Services")
+        .value;
+    assert_eq!(value, 1u32.to_be_bytes());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_emergency_indication_is_singleton_under_both_decode_layers() {
+    let emergency = encode_raw_vendor_avp(
+        apps::swm::AVP_EMERGENCY_SERVICES,
+        apps::VENDOR_ID_3GPP,
+        false,
+        &1u32.to_be_bytes(),
+    );
+    let message = build_raw_swm_der_with_extras(
+        Some(apps::swm::APPLICATION_ID.get()),
+        3,
+        &[0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03],
+        &[emergency.clone(), emergency],
+    );
+    let encoded = encode_message(&message);
+
+    assert!(Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .is_err());
+
+    let decoded = decode_message(&encoded);
+    assert!(
+        apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::default(),).is_err()
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_emergency_indication_rejects_forbidden_m_and_p_flags() {
+    for flags in [
+        AvpFlags::new(true, true, false),
+        AvpFlags::new(true, false, true),
+    ] {
+        let value = 1u32.to_be_bytes();
+        let avp = RawAvp {
+            header: AvpHeader::vendor(
+                apps::swm::AVP_EMERGENCY_SERVICES,
+                apps::VENDOR_ID_3GPP,
+                false,
+            )
+            .with_flags(flags),
+            value: &value,
+            padding: &[],
+        };
+        let mut emergency = BytesMut::new();
+        avp.encode(&mut emergency, EncodeContext::default())
+            .expect("raw flag-violation fixture");
+        let message = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03],
+            &[emergency],
+        );
+        let encoded = encode_message(&message);
+        let decoded = decode_message(&encoded);
+        assert!(
+            apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative(),)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_unauthenticated_emergency_msk_matches_annex_a4_vector() {
+    let imei = emergency_imei();
+    let msk = apps::swm::derive_unauthenticated_emergency_msk(&imei);
+    assert_eq!(
+        msk.as_bytes(),
+        &[
+            0xe0, 0x33, 0x1e, 0x12, 0x1c, 0xc1, 0xb8, 0xf4, 0x68, 0xf0, 0x8e, 0x24, 0xf4, 0xe7,
+            0xb8, 0xda, 0xe3, 0xc8, 0xf7, 0xa8, 0xb5, 0xe7, 0x14, 0x76, 0x13, 0xae, 0xdf, 0xce,
+            0x21, 0xd9, 0xd6, 0xac,
+        ]
+    );
+    let debug = format!("{msk:?}");
+    assert!(!debug.contains("e0331e"));
+    assert!(debug.contains("redacted"));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_direct_emergency_evidence_requires_correlated_exact_success() {
+    let imei = emergency_imei();
+    let mut request = sample_swm_request();
+    request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+    let direct_identity = format!("imei{}@sos.invalid", imei.as_str());
+    request.user_name = Some(direct_identity.clone().into());
+    request.eap_payload = eap_response_identity(0x17, &direct_identity).into();
+    let answer = sample_final_emergency_answer(&imei);
+
+    let request_message = apps::swm::build_swm_diameter_eap_request(
+        &request,
+        0x1111_2222,
+        0x3333_4444,
+        EncodeContext::default(),
+    )
+    .expect("direct emergency DER build");
+    let request_wire = encode_message(&request_message);
+    let request_decoded = decode_message(&request_wire);
+    let parsed_request = apps::swm::parse_swm_diameter_eap_request_envelope(
+        &request_decoded,
+        DecodeContext::conservative(),
+    )
+    .expect("direct emergency DER parse");
+    let answer_message = apps::swm::build_swm_diameter_eap_answer(
+        &answer,
+        0x1111_2222,
+        0x3333_4444,
+        EncodeContext::default(),
+    )
+    .expect("final emergency DEA build");
+    let answer_wire = encode_message(&answer_message);
+    let answer_decoded = decode_message(&answer_wire);
+    let parsed_answer = apps::swm::parse_swm_diameter_eap_answer_envelope(
+        &answer_decoded,
+        DecodeContext::conservative(),
+    )
+    .expect("final emergency DEA parse");
+
+    let exchange = parsed_request
+        .correlate_answer(parsed_answer)
+        .expect("Diameter transaction correlation");
+    let evidence = SwmEmergencyAuthorizationEvidence::verify_direct(exchange, &imei)
+        .expect("exact direct emergency exchange");
+    assert_eq!(
+        evidence.path(),
+        SwmEmergencyAuthorizationPath::DirectEmergencyIdentity
+    );
+    assert_eq!(evidence.as_str(), "emergency_imei_msk_authorized");
+    assert_eq!(
+        evidence.msk().as_bytes(),
+        apps::swm::derive_unauthenticated_emergency_msk(&imei).as_bytes()
+    );
+
+    let mut wrong_request = request.clone();
+    wrong_request.user_name = Some("anonymous@sos.invalid".into());
+    let exchange = correlate_exchange(&wrong_request, &answer, 1, 2)
+        .expect("unrelated identity does not break Diameter correlation");
+    assert_eq!(
+        SwmEmergencyAuthorizationEvidence::verify_direct(exchange, &imei)
+            .expect_err("answer-local material must not authorize an unrelated request"),
+        SwmEmergencyAuthorizationError::InitialIdentityMismatch
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_identity_recovery_evidence_accepts_only_the_complete_correlated_sequence() {
+    let imei = emergency_imei();
+    let mut initial = sample_swm_request();
+    prepare_recovery_request(&mut initial);
+
+    let identity_response = sample_identity_recovery_answer();
+    let mut retry = initial.clone();
+    retry.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: Some("01".to_string().into()),
+    });
+    let final_answer = sample_final_emergency_answer(&imei);
+    let initial = request_envelope(&initial, 1, 2);
+    let identity_response = answer_envelope(&identity_response, 1, 2);
+    let retry = request_envelope(&retry, 3, 4);
+    let final_answer = answer_envelope(&final_answer, 3, 4);
+    let initial_exchange = initial
+        .correlate_answer(identity_response)
+        .expect("initial Diameter correlation");
+    let retry_exchange = retry
+        .correlate_answer(final_answer)
+        .expect("retry Diameter correlation");
+
+    let evidence = SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+        initial_exchange,
+        retry_exchange,
+        &imei,
+    )
+    .expect("complete identity-recovery sequence");
+    assert_eq!(
+        evidence.path(),
+        SwmEmergencyAuthorizationPath::RecoveredDeviceIdentity
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_identity_recovery_evidence_fails_closed_at_every_boundary() {
+    let imei = emergency_imei();
+    let other_imei = Imei::new("356938035643709").expect("valid alternate IMEI");
+    let mut initial = sample_swm_request();
+    prepare_recovery_request(&mut initial);
+    let identity_response = sample_identity_recovery_answer();
+    let mut retry = initial.clone();
+    retry.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: None,
+    });
+    let final_answer = sample_final_emergency_answer(&imei);
+
+    let verify = |identity_response: &SwmDiameterEapAnswer,
+                  retry: &SwmDiameterEapRequest,
+                  final_answer: &SwmDiameterEapAnswer| {
+        let initial = request_envelope(&initial, 1, 2);
+        let identity_response = answer_envelope(identity_response, 1, 2);
+        let retry = request_envelope(retry, 3, 4);
+        let final_answer = answer_envelope(final_answer, 3, 4);
+        let initial_exchange = initial.correlate_answer(identity_response)?;
+        let retry_exchange = retry.correlate_answer(final_answer)?;
+        SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+    };
+
+    let mut changed = identity_response.clone();
+    changed.result = SwmDiameterResult::Experimental {
+        vendor_id: VendorId::new(0),
+        code: apps::swm::DIAMETER_ERROR_USER_UNKNOWN,
+    };
+    assert_eq!(
+        verify(&changed, &retry, &final_answer).expect_err("wrong vendor"),
+        SwmEmergencyAuthorizationError::IdentityRecoveryNotRequested
+    );
+    changed.result = SwmDiameterResult::Experimental {
+        vendor_id: apps::VENDOR_ID_3GPP,
+        code: 5002,
+    };
+    assert_eq!(
+        verify(&changed, &retry, &final_answer).expect_err("wrong code"),
+        SwmEmergencyAuthorizationError::IdentityRecoveryNotRequested
+    );
+    changed = identity_response.clone();
+    changed.session_id = "other-session".into();
+    assert_eq!(
+        verify(&changed, &retry, &final_answer).expect_err("identity response session mismatch"),
+        SwmEmergencyAuthorizationError::SessionMismatch
+    );
+    changed = identity_response.clone();
+    changed.auth_application_id = 0;
+    assert_eq!(
+        verify(&changed, &retry, &final_answer).expect_err("answer application mismatch"),
+        SwmEmergencyAuthorizationError::AnswerRequestMismatch
+    );
+    changed = identity_response.clone();
+    changed.eap_payload = Some(vec![0x01].into());
+    assert_eq!(
+        verify(&changed, &retry, &final_answer)
+            .expect_err("recovery response authorization material"),
+        SwmEmergencyAuthorizationError::IdentityRecoveryResponseHasAuthorizationMaterial
+    );
+
+    let mut changed_retry = retry.clone();
+    changed_retry.session_id = "other-session".into();
+    assert_eq!(
+        verify(&identity_response, &changed_retry, &final_answer)
+            .expect_err("retry session mismatch"),
+        SwmEmergencyAuthorizationError::SessionMismatch
+    );
+    changed_retry = retry.clone();
+    changed_retry.user_name = Some("different@example.invalid".into());
+    assert_eq!(
+        verify(&identity_response, &changed_retry, &final_answer)
+            .expect_err("retry identity mismatch"),
+        SwmEmergencyAuthorizationError::RetryUserIdentityMismatch
+    );
+    changed_retry = retry.clone();
+    changed_retry.destination_realm = "other.example".into();
+    assert_eq!(
+        verify(&identity_response, &changed_retry, &final_answer)
+            .expect_err("retry changed an original parameter"),
+        SwmEmergencyAuthorizationError::RetryRequestMismatch
+    );
+    changed_retry = retry.clone();
+    changed_retry.terminal_information = None;
+    assert_eq!(
+        verify(&identity_response, &changed_retry, &final_answer)
+            .expect_err("missing Terminal-Information"),
+        SwmEmergencyAuthorizationError::RetryTerminalInformationMissing
+    );
+    changed_retry = retry.clone();
+    changed_retry.terminal_information = Some(SwmTerminalInformation {
+        imei: other_imei,
+        software_version: None,
+    });
+    assert_eq!(
+        verify(&identity_response, &changed_retry, &final_answer).expect_err("wrong IMEI"),
+        SwmEmergencyAuthorizationError::RetryDeviceIdentityMismatch
+    );
+
+    let mut changed_final = final_answer.clone();
+    changed_final.result = SwmDiameterResult::Base(2002);
+    assert_eq!(
+        verify(&identity_response, &retry, &changed_final).expect_err("non-success result"),
+        SwmEmergencyAuthorizationError::FinalResultNotSuccess
+    );
+    changed_final = final_answer.clone();
+    changed_final.eap_payload = Some(vec![0x03, 0x18, 0x00, 0x05].into());
+    assert_eq!(
+        verify(&identity_response, &retry, &changed_final).expect_err("malformed EAP-Success"),
+        SwmEmergencyAuthorizationError::FinalEapSuccessMissing
+    );
+    changed_final = final_answer.clone();
+    changed_final.eap_master_session_key = None;
+    assert_eq!(
+        verify(&identity_response, &retry, &changed_final).expect_err("missing MSK"),
+        SwmEmergencyAuthorizationError::FinalMskMissing
+    );
+    changed_final = final_answer.clone();
+    changed_final.eap_reissued_payload = Some(vec![0x01].into());
+    assert_eq!(
+        verify(&identity_response, &retry, &changed_final)
+            .expect_err("ambiguous final EAP material"),
+        SwmEmergencyAuthorizationError::FinalEapMaterialAmbiguous
+    );
+    changed_final = final_answer.clone();
+    changed_final.eap_master_session_key = Some(vec![0x55; 32].into());
+    assert_eq!(
+        verify(&identity_response, &retry, &changed_final).expect_err("wrong MSK"),
+        SwmEmergencyAuthorizationError::FinalMskMismatch
+    );
+    changed_final = final_answer.clone();
+    changed_final.mobile_node_identifier = None;
+    assert_eq!(
+        verify(&identity_response, &retry, &changed_final).expect_err("missing permanent identity"),
+        SwmEmergencyAuthorizationError::FinalPermanentIdentityMissing
+    );
+    changed_final = final_answer;
+    changed_final.mobile_node_identifier = Some("imei000000000000000@sos.invalid".into());
+    assert_eq!(
+        verify(&identity_response, &retry, &changed_final).expect_err("wrong permanent identity"),
+        SwmEmergencyAuthorizationError::FinalPermanentIdentityMismatch
+    );
+
+    let mut changed_initial = initial.clone();
+    changed_initial.user_name = None;
+    let changed_initial = request_envelope(&changed_initial, 1, 2);
+    let initial_exchange = changed_initial
+        .correlate_answer(answer_envelope(&identity_response, 1, 2))
+        .expect("Diameter correlation");
+    let retry_exchange = request_envelope(&retry, 3, 4)
+        .correlate_answer(answer_envelope(&changed_final, 3, 4))
+        .expect("Diameter correlation");
+    assert_eq!(
+        SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+        .expect_err("identity recovery requires an initial subscriber identity"),
+        SwmEmergencyAuthorizationError::IdentityRecoveryInitialIdentityInvalid
+    );
+    let mut changed_initial = initial.clone();
+    let direct_identity = format!("imei{}@sos.invalid", imei.as_str());
+    changed_initial.user_name = Some(direct_identity.clone().into());
+    changed_initial.eap_payload = eap_response_identity(0x17, &direct_identity).into();
+    let changed_initial = request_envelope(&changed_initial, 1, 2);
+    let initial_exchange = changed_initial
+        .correlate_answer(answer_envelope(&identity_response, 1, 2))
+        .expect("Diameter correlation");
+    let retry_exchange = request_envelope(&retry, 3, 4)
+        .correlate_answer(answer_envelope(&changed_final, 3, 4))
+        .expect("Diameter correlation");
+    assert_eq!(
+        SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+        .expect_err("an IMEI-based initial identity uses the direct path"),
+        SwmEmergencyAuthorizationError::IdentityRecoveryInitialIdentityInvalid
+    );
+
+    let mut changed_initial = initial.clone();
+    changed_initial.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: None,
+    });
+    let changed_initial = request_envelope(&changed_initial, 1, 2);
+    let initial_exchange = changed_initial
+        .correlate_answer(answer_envelope(&identity_response, 1, 2))
+        .expect("Diameter correlation");
+    let retry_exchange = request_envelope(&retry, 3, 4)
+        .correlate_answer(answer_envelope(&changed_final, 3, 4))
+        .expect("Diameter correlation");
+    assert_eq!(
+        SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+        .expect_err("initial request must not already contain Terminal-Information"),
+        SwmEmergencyAuthorizationError::InitialTerminalInformationUnexpected
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_emergency_evidence_binds_diameter_eap_and_imsi_emergency_nai() {
+    let imei = emergency_imei();
+    let mut initial = sample_swm_request();
+    prepare_recovery_request(&mut initial);
+    let identity_answer = sample_identity_recovery_answer();
+    let mut retry = initial.clone();
+    retry.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: None,
+    });
+    let final_answer = sample_final_emergency_answer(&imei);
+
+    let initial_envelope = request_envelope(&initial, 1, 2);
+    let correlated_answer = apps::swm::build_swm_diameter_eap_answer_for(
+        &initial_envelope,
+        &identity_answer,
+        EncodeContext::default(),
+    )
+    .expect("answer-for helper must copy request identifiers");
+    assert_eq!(correlated_answer.header.hop_by_hop_identifier, 1);
+    assert_eq!(correlated_answer.header.end_to_end_identifier, 2);
+    let mut unrelated_answer = identity_answer.clone();
+    unrelated_answer.session_id = "unrelated-session".into();
+    assert!(apps::swm::build_swm_diameter_eap_answer_for(
+        &initial_envelope,
+        &unrelated_answer,
+        EncodeContext::default(),
+    )
+    .is_err());
+
+    let verify = |initial: &SwmDiameterEapRequest,
+                  identity: &SwmDiameterEapAnswer,
+                  initial_transaction: (u32, u32),
+                  retry: &SwmDiameterEapRequest,
+                  final_answer: &SwmDiameterEapAnswer,
+                  retry_transaction: (u32, u32)| {
+        let initial_exchange = correlate_exchange(
+            initial,
+            identity,
+            initial_transaction.0,
+            initial_transaction.1,
+        )?;
+        let retry_exchange = correlate_exchange(
+            retry,
+            final_answer,
+            retry_transaction.0,
+            retry_transaction.1,
+        )?;
+        SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+    };
+
+    assert_eq!(
+        request_envelope(&initial, 1, 2)
+            .correlate_answer(answer_envelope(&identity_answer, 9, 2))
+            .expect_err("5001 answer must match the initial Diameter transaction"),
+        SwmEmergencyAuthorizationError::DiameterTransactionMismatch
+    );
+
+    assert_eq!(
+        request_envelope(&retry, 3, 4)
+            .correlate_answer(answer_envelope(&final_answer, 3, 9))
+            .expect_err("final answer must match the retry Diameter transaction"),
+        SwmEmergencyAuthorizationError::DiameterTransactionMismatch
+    );
+
+    assert_eq!(
+        verify(
+            &initial,
+            &identity_answer,
+            (1, 2),
+            &retry,
+            &final_answer,
+            (1, 2),
+        )
+        .expect_err("the retry is a new Diameter request"),
+        SwmEmergencyAuthorizationError::RetryRequestMismatch
+    );
+
+    let mut mismatched_success = final_answer.clone();
+    mismatched_success.eap_payload = Some(vec![3, 0x18, 0, 4].into());
+    assert_eq!(
+        verify(
+            &initial,
+            &identity_answer,
+            (1, 2),
+            &retry,
+            &mismatched_success,
+            (3, 4),
+        )
+        .expect_err("EAP Success must answer the EAP Response identifier"),
+        SwmEmergencyAuthorizationError::FinalEapIdentifierMismatch
+    );
+
+    for invalid_nai in [
+        "0234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "1234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "0234150999999999@sos.nai.epc.mnc016.mcc234.3gppnetwork.org",
+        "0234150999999999@sos.nai.epc.mnc015.mcc235.3gppnetwork.org",
+        "0234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org.extra",
+    ] {
+        let mut changed = initial.clone();
+        changed.user_name = Some(invalid_nai.into());
+        changed.eap_payload = eap_response_identity(0x17, invalid_nai).into();
+        assert_eq!(
+            verify(
+                &changed,
+                &identity_answer,
+                (1, 2),
+                &retry,
+                &final_answer,
+                (3, 4),
+            )
+            .expect_err("noncanonical IMSI emergency NAI must fail"),
+            SwmEmergencyAuthorizationError::IdentityRecoveryInitialIdentityInvalid
+        );
+    }
+
+    let mut wrong_eap_type = initial.clone();
+    let mut payload = eap_response_identity(0x17, emergency_imsi_nai());
+    payload[4] = 0x32;
+    wrong_eap_type.eap_payload = payload.into();
+    assert_eq!(
+        verify(
+            &wrong_eap_type,
+            &identity_answer,
+            (1, 2),
+            &retry,
+            &final_answer,
+            (3, 4),
+        )
+        .expect_err("initial payload must be EAP-Response/Identity"),
+        SwmEmergencyAuthorizationError::InitialEapIdentityInvalid
+    );
+
+    let mut wrong_eap_length = initial.clone();
+    let mut payload = eap_response_identity(0x17, emergency_imsi_nai());
+    payload[3] = payload[3].saturating_sub(1);
+    wrong_eap_length.eap_payload = payload.into();
+    assert_eq!(
+        verify(
+            &wrong_eap_length,
+            &identity_answer,
+            (1, 2),
+            &retry,
+            &final_answer,
+            (3, 4),
+        )
+        .expect_err("EAP length must cover the exact payload"),
+        SwmEmergencyAuthorizationError::InitialEapIdentityInvalid
+    );
+
+    let mut mismatched_eap_identity = initial.clone();
+    mismatched_eap_identity.eap_payload = eap_response_identity(
+        0x17,
+        "6234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org",
+    )
+    .into();
+    assert_eq!(
+        verify(
+            &mismatched_eap_identity,
+            &identity_answer,
+            (1, 2),
+            &retry,
+            &final_answer,
+            (3, 4),
+        )
+        .expect_err("EAP Identity must equal Diameter User-Name"),
+        SwmEmergencyAuthorizationError::InitialEapIdentityMismatch
+    );
+
+    let aka_prime_nai = "6310260123456789@sos.nai.epc.mnc260.mcc310.3gppnetwork.org";
+    let mut aka_prime_initial = initial.clone();
+    aka_prime_initial.user_name = Some(aka_prime_nai.into());
+    aka_prime_initial.eap_payload = eap_response_identity(0x17, aka_prime_nai).into();
+    let mut aka_prime_retry = aka_prime_initial.clone();
+    aka_prime_retry.terminal_information = retry.terminal_information.clone();
+    verify(
+        &aka_prime_initial,
+        &identity_answer,
+        (10, 11),
+        &aka_prime_retry,
+        &final_answer,
+        (12, 13),
+    )
+    .expect("AKA-prime three-digit-MNC emergency NAI must be accepted");
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_terminal_information_round_trips_with_exact_3gpp_flags() {
+    let mut request = sample_swm_request();
+    request.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(emergency_imei()),
+        software_version: Some("01".to_string().into()),
+    });
+    let built = apps::swm::build_swm_diameter_eap_request(
+        &request,
+        0x1111_2222,
+        0x3333_4444,
+        EncodeContext::default(),
+    )
+    .expect("Terminal-Information DER build");
+    let encoded = encode_message(&built);
+    let decoded = decode_message(&encoded);
+    let terminal = decoded
+        .avps(DecodeContext::conservative())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("valid DER AVPs")
+        .into_iter()
+        .find(|avp| {
+            avp.header.code == apps::swm::AVP_TERMINAL_INFORMATION
+                && avp.header.vendor_id == Some(apps::VENDOR_ID_3GPP)
+        })
+        .expect("Terminal-Information AVP");
+    assert!(terminal.header.flags.is_vendor_specific());
+    assert!(terminal.header.flags.is_mandatory());
+    assert!(!terminal.header.flags.is_protected());
+    let children = terminal
+        .grouped_avps(DecodeContext::conservative())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("valid Terminal-Information children");
+    assert_eq!(children.len(), 2);
+    assert!(children.iter().all(|child| {
+        child.header.vendor_id == Some(apps::VENDOR_ID_3GPP)
+            && child.header.flags.is_vendor_specific()
+            && child.header.flags.is_mandatory()
+            && !child.header.flags.is_protected()
+    }));
+
+    let parsed = apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative())
+        .expect("Terminal-Information DER parse");
+    assert_eq!(parsed, request);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_terminal_information_preserves_fourteen_and_fifteen_digit_imei() {
+    for digits in ["49015420323751", "490154203237510", "490154203237519"] {
+        let mut request = sample_swm_request();
+        request.terminal_information = Some(SwmTerminalInformation {
+            imei: Imei::new(digits).expect("standards-valid Terminal-Information IMEI"),
+            software_version: None,
+        });
+        let built = apps::swm::build_swm_diameter_eap_request(
+            &request,
+            0x1111_2222,
+            0x3333_4444,
+            EncodeContext::default(),
+        )
+        .expect("Terminal-Information build");
+        let wire = encode_message(&built);
+        let decoded = decode_message(&wire);
+        let parsed =
+            apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative())
+                .expect("Terminal-Information parse");
+        assert_eq!(
+            parsed
+                .terminal_information
+                .as_ref()
+                .map(|terminal| terminal.imei.as_str()),
+            Some(digits)
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_terminal_information_rejects_missing_duplicate_or_malformed_children() {
+    let imei = encode_raw_vendor_avp(
+        apps::swm::AVP_IMEI,
+        apps::VENDOR_ID_3GPP,
+        true,
+        b"490154203237518",
+    );
+    let software = encode_raw_vendor_avp(
+        apps::swm::AVP_SOFTWARE_VERSION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        b"01",
+    );
+    let malformed_imei = encode_raw_vendor_avp(
+        apps::swm::AVP_IMEI,
+        apps::VENDOR_ID_3GPP,
+        true,
+        b"49015420323751x",
+    );
+    let malformed_software = encode_raw_vendor_avp(
+        apps::swm::AVP_SOFTWARE_VERSION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        b"1",
+    );
+    let mut duplicate_imei = BytesMut::new();
+    duplicate_imei.extend_from_slice(&imei);
+    duplicate_imei.extend_from_slice(&imei);
+    let mut malformed_software_children = BytesMut::new();
+    malformed_software_children.extend_from_slice(&imei);
+    malformed_software_children.extend_from_slice(&malformed_software);
+
+    for children in [
+        software,
+        malformed_imei,
+        malformed_software_children,
+        duplicate_imei,
+    ] {
+        let terminal = encode_raw_vendor_avp(
+            apps::swm::AVP_TERMINAL_INFORMATION,
+            apps::VENDOR_ID_3GPP,
+            true,
+            &children,
+        );
+        let message = build_raw_swm_der_with_extras(
+            Some(apps::swm::APPLICATION_ID.get()),
+            3,
+            &[0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03],
+            &[terminal],
+        );
+        let encoded = encode_message(&message);
+        let decoded = decode_message(&encoded);
+        assert!(
+            apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative(),)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_result_rejects_base_and_experimental_result_together() {
+    let mut grouped = BytesMut::new();
+    grouped.extend_from_slice(&encode_raw_avp(
+        base::AVP_VENDOR_ID,
+        true,
+        &apps::VENDOR_ID_3GPP.get().to_be_bytes(),
+    ));
+    grouped.extend_from_slice(&encode_raw_avp(
+        base::AVP_EXPERIMENTAL_RESULT_CODE,
+        true,
+        &apps::swm::DIAMETER_ERROR_USER_UNKNOWN.to_be_bytes(),
+    ));
+    let experimental = encode_raw_avp(base::AVP_EXPERIMENTAL_RESULT, true, &grouped);
+    let message = build_raw_swm_dea_with_extras(&[experimental]);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(
+        apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative(),).is_err()
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_experimental_result_rejects_missing_duplicate_and_bad_flag_children() {
+    let vendor = encode_raw_avp(
+        base::AVP_VENDOR_ID,
+        true,
+        &apps::VENDOR_ID_3GPP.get().to_be_bytes(),
+    );
+    let code = encode_raw_avp(
+        base::AVP_EXPERIMENTAL_RESULT_CODE,
+        true,
+        &apps::swm::DIAMETER_ERROR_USER_UNKNOWN.to_be_bytes(),
+    );
+    let mut duplicate_vendor = BytesMut::new();
+    duplicate_vendor.extend_from_slice(&vendor);
+    duplicate_vendor.extend_from_slice(&vendor);
+    duplicate_vendor.extend_from_slice(&code);
+    let code_without_m = encode_raw_avp(
+        base::AVP_EXPERIMENTAL_RESULT_CODE,
+        false,
+        &apps::swm::DIAMETER_ERROR_USER_UNKNOWN.to_be_bytes(),
+    );
+    let mut bad_flags = BytesMut::new();
+    bad_flags.extend_from_slice(&vendor);
+    bad_flags.extend_from_slice(&code_without_m);
+
+    for children in [vendor, code, duplicate_vendor, bad_flags] {
+        let experimental = encode_raw_avp(base::AVP_EXPERIMENTAL_RESULT, true, &children);
+        let message = build_raw_swm_dea_with_result_avp_and_extras(&experimental, &[]);
+        let encoded = encode_message(&message);
+        let decoded = decode_message(&encoded);
+        assert!(
+            apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative(),)
+                .is_err()
+        );
+    }
 }
 
 #[test]
@@ -256,13 +1305,14 @@ fn swm_answer_result_category_is_classified() {
         session_id: "sess;swm;001".into(),
         auth_application_id: apps::swm::APPLICATION_ID.get(),
         auth_request_type: AuthRequestType::AuthorizeAuthenticate,
-        result_code: 2001,
+        result: SwmDiameterResult::Base(2001),
         origin_host: "aaa.home.example".into(),
         origin_realm: "home.example".into(),
         user_name: None,
         service_selection: None,
         default_context_identifier: None,
         apn_configurations: vec![],
+        mobile_node_identifier: None,
         eap_payload: None,
         eap_reissued_payload: None,
         error_message: None,
@@ -310,6 +1360,29 @@ fn swm_der_rejects_invalid_eap_request_semantics_in_builder() {
         apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
             .is_err()
     );
+
+    request = sample_swm_request();
+    request.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(emergency_imei()),
+        software_version: Some("1".to_string().into()),
+    });
+    assert!(
+        apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+            .is_err()
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_mobile_node_identifier_rejects_non_utf8_wire_value() {
+    let mobile_node_identifier =
+        encode_raw_avp(apps::swm::AVP_MOBILE_NODE_IDENTIFIER, true, &[0xff, 0xfe]);
+    let message = build_raw_swm_dea_with_extras(&[mobile_node_identifier]);
+    let encoded = encode_message(&message);
+    let decoded = decode_message(&encoded);
+    assert!(
+        apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative(),).is_err()
+    );
 }
 
 #[test]
@@ -351,7 +1424,10 @@ fn swm_dea_rejects_success_without_eap_material() {
 #[cfg(feature = "app-swm")]
 fn swm_dea_allows_failure_without_eap_material() {
     let mut answer = sample_swm_answer();
-    answer.result_code = 5001;
+    answer.result = SwmDiameterResult::Experimental {
+        vendor_id: apps::VENDOR_ID_3GPP,
+        code: apps::swm::DIAMETER_ERROR_USER_UNKNOWN,
+    };
     answer.eap_payload = None;
     answer.eap_reissued_payload = None;
     answer.eap_master_session_key = None;
@@ -447,6 +1523,8 @@ fn sample_swm_request() -> SwmDiameterEapRequest {
         user_name: Some("601010123456789@nai.epc.mnc001.mcc001.3gppnetwork.org".into()),
         auth_request_type: AuthRequestType::AuthorizeAuthenticate,
         eap_payload: vec![0x02, 0x17, 0x00, 0x08, 0x32, 0x01, 0x02, 0x03].into(),
+        emergency_services: None,
+        terminal_information: None,
         state_avps: vec![b"opaque-state".to_vec()],
     }
 }
@@ -457,19 +1535,52 @@ fn sample_swm_answer() -> SwmDiameterEapAnswer {
         session_id: "sess;swm;001".into(),
         auth_application_id: apps::swm::APPLICATION_ID.get(),
         auth_request_type: AuthRequestType::AuthorizeAuthenticate,
-        result_code: 2001,
+        result: SwmDiameterResult::Base(2001),
         origin_host: "aaa.home.example".into(),
         origin_realm: "home.example".into(),
         user_name: None,
         service_selection: None,
         default_context_identifier: None,
         apn_configurations: vec![],
+        mobile_node_identifier: None,
         eap_payload: Some(vec![0x03, 0x18, 0x00, 0x04].into()),
         eap_reissued_payload: None,
         error_message: None,
         state_avps: vec![],
         eap_master_session_key: Some(vec![0xAA; 32].into()),
     }
+}
+
+#[cfg(feature = "app-swm")]
+fn emergency_imei() -> Imei15 {
+    Imei15::new("490154203237518").expect("3GPP example IMEI")
+}
+
+#[cfg(feature = "app-swm")]
+fn sample_identity_recovery_answer() -> SwmDiameterEapAnswer {
+    let mut answer = sample_swm_answer();
+    answer.result = SwmDiameterResult::Experimental {
+        vendor_id: apps::VENDOR_ID_3GPP,
+        code: apps::swm::DIAMETER_ERROR_USER_UNKNOWN,
+    };
+    answer.eap_payload = None;
+    answer.eap_reissued_payload = None;
+    answer.eap_master_session_key = None;
+    answer
+}
+
+#[cfg(feature = "app-swm")]
+fn sample_final_emergency_answer(imei: &Imei15) -> SwmDiameterEapAnswer {
+    let mut answer = sample_swm_answer();
+    answer.eap_payload = Some(vec![0x03, 0x17, 0x00, 0x04].into());
+    answer.eap_master_session_key = Some(
+        apps::swm::derive_unauthenticated_emergency_msk(imei)
+            .as_bytes()
+            .to_vec()
+            .into(),
+    );
+    answer.mobile_node_identifier = Some(format!("imei{}@sos.invalid", imei.as_str()).into());
+    answer
 }
 
 #[cfg(feature = "app-swm")]
@@ -702,6 +1813,16 @@ fn build_raw_swm_der_with(
     auth_request_type: u32,
     eap_payload: &[u8],
 ) -> OwnedMessage {
+    build_raw_swm_der_with_extras(auth_application_id, auth_request_type, eap_payload, &[])
+}
+
+#[cfg(feature = "app-swm")]
+fn build_raw_swm_der_with_extras(
+    auth_application_id: Option<u32>,
+    auth_request_type: u32,
+    eap_payload: &[u8],
+    extras: &[BytesMut],
+) -> OwnedMessage {
     let mut raw_avps = BytesMut::new();
     raw_avps.extend_from_slice(&encode_raw_avp(base::AVP_SESSION_ID, true, b"sess;swm;001"));
     if let Some(id) = auth_application_id {
@@ -736,6 +1857,9 @@ fn build_raw_swm_der_with(
         true,
         eap_payload,
     ));
+    for extra in extras {
+        raw_avps.extend_from_slice(extra);
+    }
     OwnedMessage {
         header: Header::new(
             CommandFlags::request(true),
@@ -757,6 +1881,16 @@ fn build_raw_swm_dea_with_extras(extras: &[BytesMut]) -> OwnedMessage {
 /// Raw DEA carrying EAP material, an explicit result code, and extra AVPs.
 #[cfg(feature = "app-swm")]
 fn build_raw_swm_dea_with_result_and_extras(result_code: u32, extras: &[BytesMut]) -> OwnedMessage {
+    let result = encode_raw_avp(base::AVP_RESULT_CODE, true, &result_code.to_be_bytes());
+    build_raw_swm_dea_with_result_avp_and_extras(&result, extras)
+}
+
+/// Raw DEA carrying EAP material, a caller-provided result AVP, and extras.
+#[cfg(feature = "app-swm")]
+fn build_raw_swm_dea_with_result_avp_and_extras(
+    result_avp: &[u8],
+    extras: &[BytesMut],
+) -> OwnedMessage {
     let mut raw_avps = BytesMut::new();
     raw_avps.extend_from_slice(&encode_raw_avp(base::AVP_SESSION_ID, true, b"sess;swm;001"));
     raw_avps.extend_from_slice(&encode_raw_avp(
@@ -769,11 +1903,7 @@ fn build_raw_swm_dea_with_result_and_extras(result_code: u32, extras: &[BytesMut
         true,
         &3u32.to_be_bytes(),
     ));
-    raw_avps.extend_from_slice(&encode_raw_avp(
-        base::AVP_RESULT_CODE,
-        true,
-        &result_code.to_be_bytes(),
-    ));
+    raw_avps.extend_from_slice(result_avp);
     raw_avps.extend_from_slice(&encode_raw_avp(
         base::AVP_ORIGIN_HOST,
         true,
@@ -1872,7 +3002,7 @@ fn swm_dea_rejects_default_context_identifier_without_configurations() {
 fn swm_dea_rejects_apn_profile_material_without_diameter_success() {
     for result_code in [2002, 5005] {
         let mut answer = sample_swm_answer();
-        answer.result_code = result_code;
+        answer.result = SwmDiameterResult::Base(result_code);
         answer.default_context_identifier = Some(7);
         answer.apn_configurations = vec![sample_apn_configuration()];
         let err = apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default())

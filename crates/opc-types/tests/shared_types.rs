@@ -1,6 +1,6 @@
 use opc_types::{
-    redact, ConfigVersion, InstanceId, IntoRedacted, NfKind, PlmnId, Redacted, RegionId,
-    SchemaDigest, Snssai, SpiffeId, TenantId, Timestamp, TxId,
+    redact, ConfigVersion, Imei, Imei15, Imeisv, InstanceId, IntoRedacted, NfKind, PlmnId,
+    Redacted, RegionId, SchemaDigest, Snssai, SpiffeId, TenantId, Timestamp, TxId,
 };
 use std::str::FromStr;
 
@@ -67,6 +67,90 @@ fn plmn_and_snssai_support_canonical_parsing() {
 
     let compact_slice = Snssai::from_str("2-010203").expect("compact snssai");
     assert_eq!(compact_slice.to_string(), "sst=2,sd=010203");
+}
+
+#[test]
+fn imei_preserves_fourteen_check_digit_and_spare_zero_forms() {
+    let from_body = Imei::new("49015420323751").expect("valid IMEI body");
+    let checked = Imei::new("490154203237518").expect("valid checked IMEI");
+    let spare_zero = Imei::new("490154203237510").expect("valid spare-zero IMEI");
+    let opaque_fifteenth = Imei::new("490154203237519").expect("wire digit is preserved");
+
+    assert_ne!(from_body, checked);
+    assert_ne!(checked, spare_zero);
+    assert_eq!(from_body.expose(), "49015420323751");
+    assert_eq!(checked.expose(), "490154203237518");
+    assert_eq!(spare_zero.expose(), "490154203237510");
+    assert_eq!(checked.equipment_body(), "49015420323751");
+    assert_eq!(checked.transmitted_digit(), Some(8));
+    assert_eq!(spare_zero.transmitted_digit(), Some(0));
+    assert_eq!(from_body.transmitted_digit(), None);
+    assert_eq!(checked.luhn_check_digit(), 8);
+    assert!(checked.has_transmitted_digit());
+    assert!(!from_body.has_transmitted_digit());
+    assert!(from_body.identifies_same_equipment(&checked));
+    assert!(spare_zero.identifies_same_equipment(&checked));
+    assert_eq!(opaque_fifteenth.expose(), "490154203237519");
+
+    assert!(Imei::new("4901542032375").is_err());
+    assert!(Imei::new("4901542032375x").is_err());
+}
+
+#[test]
+fn imei15_requires_complete_input_and_preserves_every_digit() {
+    let complete = Imei15::new("490154203237519").expect("arbitrary transmitted digit");
+    assert_eq!(complete.expose(), "490154203237519");
+    assert_eq!(complete.equipment_body(), "49015420323751");
+    assert_eq!(complete.transmitted_digit(), 9);
+    assert_eq!(complete.luhn_check_digit(), 8);
+
+    let general: Imei = complete.clone().into();
+    assert_eq!(general.expose(), complete.expose());
+    assert_eq!(
+        Imei15::try_from(general).expect("complete conversion"),
+        complete
+    );
+    assert!(Imei15::try_from(Imei::new("49015420323751").expect("body")).is_err());
+    assert!(Imei15::new("49015420323751").is_err());
+}
+
+#[test]
+fn device_identity_formatting_and_errors_never_expose_raw_digits() {
+    const RAW_IMEI: &str = "490154203237518";
+    const RAW_IMEISV: &str = "4901542032375116";
+    let imei = Imei::new(RAW_IMEI).expect("valid IMEI");
+    let imeisv = Imeisv::new(RAW_IMEISV).expect("valid IMEISV");
+
+    for formatted in [
+        format!("{imei:?}"),
+        imei.to_string(),
+        format!("{imeisv:?}"),
+        imeisv.to_string(),
+        format!("{:?}", imeisv.split()),
+    ] {
+        assert!(!formatted.contains(RAW_IMEI));
+        assert!(!formatted.contains(RAW_IMEISV));
+        assert!(formatted.contains("redacted"));
+    }
+
+    let error = Imei::new("49015420323751x").expect_err("non-decimal IMEI");
+    assert!(!format!("{error:?}").contains("49015420323751x"));
+    assert!(!error.to_string().contains("49015420323751x"));
+}
+
+#[test]
+fn imeisv_splits_and_converts_to_checked_imei() {
+    let imeisv = Imeisv::new("4901542032375116").expect("valid IMEISV");
+    let parts = imeisv.split();
+
+    assert_eq!(parts.type_allocation_code(), "49015420");
+    assert_eq!(parts.serial_number(), "323751");
+    assert_eq!(parts.software_version(), "16");
+    assert_eq!(imeisv.equipment_identity().expose(), "49015420323751");
+    assert_eq!(imeisv.to_luhn_imei().expose(), "490154203237518");
+
+    assert!(Imeisv::new("490154203237511").is_err());
+    assert!(Imeisv::new("490154203237511x").is_err());
 }
 
 #[test]
