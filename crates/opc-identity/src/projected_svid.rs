@@ -12,12 +12,14 @@ use crate::{
     IdentityReloadError, IdentityReloadEvent, IdentityState, TrustBundle, TrustBundleSet,
     TrustDomain,
 };
+use rustls_pki_types::CertificateDer;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, watch, Mutex};
 use zeroize::Zeroizing;
 
 /// Maximum size of the PEM file containing the leaf and intermediate chain.
@@ -105,6 +107,8 @@ pub enum ProjectedSvidReloadReason {
     GenerationChanged,
     /// Every bounded retry observed a different generation.
     GenerationRetryLimit,
+    /// One generation-read attempt exhausted its fixed work deadline.
+    ReadAttemptTimeout,
     /// A configured material file could not be read.
     MaterialUnavailable,
     /// A configured material path did not resolve to a regular file.
@@ -148,6 +152,7 @@ impl ProjectedSvidReloadReason {
             Self::InvalidGenerationLink => "invalid_generation_link",
             Self::GenerationChanged => "generation_changed",
             Self::GenerationRetryLimit => "generation_retry_limit",
+            Self::ReadAttemptTimeout => "read_attempt_timeout",
             Self::MaterialUnavailable => "material_unavailable",
             Self::MaterialNotRegular => "material_not_regular",
             Self::MaterialFileTooLarge => "material_file_too_large",
@@ -272,15 +277,21 @@ impl ProjectedSvidSource {
         let (state_tx, state_rx) = watch::channel(None);
         let (status_tx, status_rx) = watch::channel(ProjectedSvidReloadStatus::initial());
         let (event_tx, _) = broadcast::channel(32);
+        let publication_guard = Arc::new(Mutex::new(()));
 
         let task_handle = tokio::spawn(run_source(
             config,
             state_tx.clone(),
             status_tx.clone(),
             event_tx.clone(),
+            publication_guard.clone(),
         ));
-        let expiry_task_handle =
-            spawn_projected_expiry_monitor(state_tx, status_tx, event_tx.clone());
+        let expiry_task_handle = spawn_projected_expiry_monitor(
+            state_tx,
+            status_tx,
+            event_tx.clone(),
+            publication_guard,
+        );
 
         Ok(Self {
             state_rx,
@@ -385,25 +396,41 @@ async fn run_source(
     state_tx: watch::Sender<Option<IdentityState>>,
     status_tx: watch::Sender<ProjectedSvidReloadStatus>,
     event_tx: broadcast::Sender<IdentityReloadEvent>,
+    publication_guard: Arc<Mutex<()>>,
 ) {
     let mut last_published_target: Option<PathBuf> = None;
+    let mut last_observed_target: Option<PathBuf> = None;
     loop {
-        let target_is_current = match resolve_generation_target(&config.root).await {
-            Ok(target) => last_published_target.as_ref() == Some(&target),
-            Err(_) => false,
+        let should_load = match resolve_generation_target(&config.root).await {
+            Ok(target) => {
+                let target_is_published = last_published_target.as_ref() == Some(&target);
+                let target_changed = last_observed_target.as_ref() != Some(&target);
+                last_observed_target = Some(target);
+                !target_is_published
+                    || target_changed
+                    || status_tx.borrow().availability != ProjectedSvidAvailability::Ready
+            }
+            Err(_) => {
+                last_observed_target = None;
+                true
+            }
         };
 
-        if !target_is_current {
+        if should_load {
             match load_projected_generation(&config, &NoopReadObserver).await {
                 Ok(loaded) => {
+                    let publication = publication_guard.lock().await;
                     let current_generation = status_tx.borrow().generation;
                     let Some(next_generation) = current_generation.checked_add(1) else {
+                        drop(publication);
                         publish_failure(
                             ProjectedSvidReloadReason::GenerationExhausted,
                             &state_tx,
                             &status_tx,
                             &event_tx,
-                        );
+                            &publication_guard,
+                        )
+                        .await;
                         tokio::time::sleep(config.poll_interval).await;
                         continue;
                     };
@@ -419,12 +446,16 @@ async fn run_source(
                         availability: ProjectedSvidAvailability::Ready,
                         reason: None,
                     });
+                    last_observed_target = Some(loaded.target.clone());
                     last_published_target = Some(loaded.target);
                     let _ = event_tx.send(IdentityReloadEvent::Success {
                         expires_at: u64::try_from(expires_at).unwrap_or_default(),
                     });
                 }
-                Err(reason) => publish_failure(reason, &state_tx, &status_tx, &event_tx),
+                Err(reason) => {
+                    publish_failure(reason, &state_tx, &status_tx, &event_tx, &publication_guard)
+                        .await;
+                }
             }
         }
 
@@ -432,26 +463,37 @@ async fn run_source(
     }
 }
 
-fn publish_failure(
+async fn publish_failure(
     reason: ProjectedSvidReloadReason,
     state_tx: &watch::Sender<Option<IdentityState>>,
     status_tx: &watch::Sender<ProjectedSvidReloadStatus>,
     event_tx: &broadcast::Sender<IdentityReloadEvent>,
+    publication_guard: &Mutex<()>,
 ) {
-    let has_last_good = state_tx
-        .borrow()
-        .as_ref()
-        .is_some_and(|state| !state.is_expired());
-    let has_any_state = state_tx.borrow().is_some();
-    if !has_last_good && has_any_state {
+    let _publication = publication_guard.lock().await;
+    let (has_last_good, expired_last_good) = match state_tx.borrow().as_ref() {
+        Some(current) if current.is_expired() => (false, true),
+        Some(_) => (true, false),
+        None => (false, false),
+    };
+    if expired_last_good {
         state_tx.send_replace(None);
     }
+    let current_status = *status_tx.borrow();
+    let reason = if expired_last_good
+        || (!has_last_good
+            && current_status.reason == Some(ProjectedSvidReloadReason::LastGoodExpired))
+    {
+        ProjectedSvidReloadReason::LastGoodExpired
+    } else {
+        reason
+    };
     let availability = if has_last_good {
         ProjectedSvidAvailability::RetainingLastGood
     } else {
         ProjectedSvidAvailability::Unavailable
     };
-    let generation = status_tx.borrow().generation;
+    let generation = current_status.generation;
     status_tx.send_replace(ProjectedSvidReloadStatus {
         generation,
         availability,
@@ -466,6 +508,7 @@ fn spawn_projected_expiry_monitor(
     state_tx: watch::Sender<Option<IdentityState>>,
     status_tx: watch::Sender<ProjectedSvidReloadStatus>,
     event_tx: broadcast::Sender<IdentityReloadEvent>,
+    publication_guard: Arc<Mutex<()>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut state_rx = state_tx.subscribe();
@@ -478,6 +521,7 @@ fn spawn_projected_expiry_monitor(
                     }
                 }
                 () = tokio::time::sleep(sleep_for) => {
+                    let _publication = publication_guard.lock().await;
                     let observed_generation = status_tx.borrow().generation;
                     let expired = state_tx
                         .borrow()
@@ -553,7 +597,7 @@ async fn load_projected_generation<O: ReadPhaseObserver>(
             load_projected_generation_once(config, observer),
         )
         .await
-        .map_err(|_| ProjectedSvidReloadReason::MaterialUnavailable)?;
+        .map_err(|_| ProjectedSvidReloadReason::ReadAttemptTimeout)?;
         match attempt {
             Err(ProjectedSvidReloadReason::GenerationChanged)
                 if retry < MAX_PROJECTED_SVID_GENERATION_RETRIES =>
@@ -575,17 +619,24 @@ async fn load_projected_generation_once<O: ReadPhaseObserver>(
 ) -> Result<LoadedGeneration, ProjectedSvidReloadReason> {
     let target = resolve_generation_target(&config.root).await?;
     let generation_dir = config.root.join(&target);
-    let metadata = tokio::fs::symlink_metadata(&generation_dir)
-        .await
-        .map_err(|_| ProjectedSvidReloadReason::GenerationUnavailable)?;
+    let metadata = match tokio::fs::symlink_metadata(&generation_dir).await {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            ensure_generation_current(&config.root, &target).await?;
+            return Err(ProjectedSvidReloadReason::GenerationUnavailable);
+        }
+    };
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        ensure_generation_current(&config.root, &target).await?;
         return Err(ProjectedSvidReloadReason::InvalidGenerationLink);
     }
     observer.after_phase(ProjectedReadPhase::GenerationResolved);
     ensure_generation_current(&config.root, &target).await?;
 
     let mut budget = MaterialBudget::default();
-    let cert_bytes = read_bounded_file(
+    let cert_bytes = read_generation_file(
+        &config.root,
+        &target,
         &generation_dir.join(&config.cert_file),
         MAX_PROJECTED_SVID_CERT_FILE_BYTES,
     )
@@ -595,7 +646,9 @@ async fn load_projected_generation_once<O: ReadPhaseObserver>(
     ensure_generation_current(&config.root, &target).await?;
 
     let key_bytes = Zeroizing::new(
-        read_bounded_file(
+        read_generation_file(
+            &config.root,
+            &target,
             &generation_dir.join(&config.key_file),
             MAX_PROJECTED_SVID_KEY_FILE_BYTES,
         )
@@ -607,7 +660,9 @@ async fn load_projected_generation_once<O: ReadPhaseObserver>(
 
     let mut bundle_bytes = Vec::with_capacity(config.bundle_files.len());
     for (index, bundle_file) in config.bundle_files.iter().enumerate() {
-        let bytes = read_bounded_file(
+        let bytes = read_generation_file(
+            &config.root,
+            &target,
             &generation_dir.join(bundle_file),
             MAX_PROJECTED_SVID_BUNDLE_FILE_BYTES,
         )
@@ -620,18 +675,7 @@ async fn load_projected_generation_once<O: ReadPhaseObserver>(
     observer.after_phase(ProjectedReadPhase::BeforeFinalCheck);
     ensure_generation_current(&config.root, &target).await?;
 
-    let cert_pem = std::str::from_utf8(&cert_bytes)
-        .map_err(|_| ProjectedSvidReloadReason::MalformedCertificate)?;
-    let cert_chain =
-        parse_certs_pem(cert_pem).map_err(|_| ProjectedSvidReloadReason::MalformedCertificate)?;
-    if cert_chain.is_empty() {
-        return Err(ProjectedSvidReloadReason::MalformedCertificate);
-    }
-    ensure_count(
-        cert_chain.len(),
-        MAX_PROJECTED_SVID_CERTIFICATES,
-        ProjectedSvidReloadReason::CertificateCountExceeded,
-    )?;
+    let cert_chain = parse_bounded_certificate_chain(&cert_bytes)?;
 
     let key_pem = std::str::from_utf8(&key_bytes)
         .map_err(|_| ProjectedSvidReloadReason::MalformedPrivateKey)?;
@@ -644,13 +688,7 @@ async fn load_projected_generation_once<O: ReadPhaseObserver>(
     let trust_domain = extract_leaf_trust_domain(leaf.as_ref())?;
     let mut anchors = Vec::new();
     for bytes in bundle_bytes {
-        let bundle_pem = std::str::from_utf8(&bytes)
-            .map_err(|_| ProjectedSvidReloadReason::MalformedTrustBundle)?;
-        let certs = parse_certs_pem(bundle_pem)
-            .map_err(|_| ProjectedSvidReloadReason::MalformedTrustBundle)?;
-        if certs.is_empty() {
-            return Err(ProjectedSvidReloadReason::MalformedTrustBundle);
-        }
+        let certs = parse_bounded_trust_bundle(&bytes)?;
         let next_count = anchors
             .len()
             .checked_add(certs.len())
@@ -737,6 +775,57 @@ async fn read_bounded_file(
     Ok(bytes)
 }
 
+async fn read_generation_file(
+    root: &Path,
+    generation: &Path,
+    path: &Path,
+    maximum: usize,
+) -> Result<Vec<u8>, ProjectedSvidReloadReason> {
+    match read_bounded_file(path, maximum).await {
+        Ok(bytes) => Ok(bytes),
+        Err(reason) => {
+            ensure_generation_current(root, generation).await?;
+            Err(reason)
+        }
+    }
+}
+
+fn parse_bounded_certificate_chain(
+    bytes: &[u8],
+) -> Result<Vec<CertificateDer<'static>>, ProjectedSvidReloadReason> {
+    let pem =
+        std::str::from_utf8(bytes).map_err(|_| ProjectedSvidReloadReason::MalformedCertificate)?;
+    let certificates =
+        parse_certs_pem(pem).map_err(|_| ProjectedSvidReloadReason::MalformedCertificate)?;
+    if certificates.is_empty() {
+        return Err(ProjectedSvidReloadReason::MalformedCertificate);
+    }
+    ensure_count(
+        certificates.len(),
+        MAX_PROJECTED_SVID_CERTIFICATES,
+        ProjectedSvidReloadReason::CertificateCountExceeded,
+    )?;
+    Ok(certificates)
+}
+
+fn parse_bounded_trust_bundle(
+    bytes: &[u8],
+) -> Result<Vec<CertificateDer<'static>>, ProjectedSvidReloadReason> {
+    let pem =
+        std::str::from_utf8(bytes).map_err(|_| ProjectedSvidReloadReason::MalformedTrustBundle)?;
+    let certificates =
+        parse_certs_pem(pem).map_err(|_| ProjectedSvidReloadReason::MalformedTrustBundle)?;
+    if certificates.is_empty() {
+        return Err(ProjectedSvidReloadReason::MalformedTrustBundle);
+    }
+    ensure_count(
+        certificates.len(),
+        MAX_PROJECTED_SVID_TRUST_ANCHORS,
+        ProjectedSvidReloadReason::TrustAnchorCountExceeded,
+    )?;
+    Ok(certificates)
+}
+
 #[derive(Default)]
 struct MaterialBudget {
     bytes: usize,
@@ -801,12 +890,12 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
     use tokio::time::timeout;
 
     const CERT_FILE: &str = "tls.crt";
     const KEY_FILE: &str = "tls.key";
     const BUNDLE_FILE: &str = "ca.crt";
+    const SECOND_BUNDLE_FILE: &str = "ca-2.crt";
     const SPIFFE_A: &str =
         "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/smf-0";
     const SPIFFE_B: &str =
@@ -1153,34 +1242,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn certificate_and_anchor_count_limits_accept_exact_and_reject_one_over() {
-        assert!(ensure_count(
-            MAX_PROJECTED_SVID_CERTIFICATES,
-            MAX_PROJECTED_SVID_CERTIFICATES,
-            ProjectedSvidReloadReason::CertificateCountExceeded,
+    #[tokio::test]
+    async fn aggregate_material_limit_applies_before_candidate_parsing() {
+        let directory = TestDirectory::new("aggregate-bound");
+        let generation = directory.path().join("..gen-a");
+        fs::create_dir_all(&generation).expect("create aggregate generation");
+        fs::write(
+            generation.join(CERT_FILE),
+            vec![b'x'; MAX_PROJECTED_SVID_CERT_FILE_BYTES],
         )
-        .is_ok());
+        .expect("write exact-size certificate file");
+        fs::write(
+            generation.join(KEY_FILE),
+            vec![b'x'; MAX_PROJECTED_SVID_KEY_FILE_BYTES],
+        )
+        .expect("write exact-size private-key file");
+        let bundle_files = (0..3)
+            .map(|index| PathBuf::from(format!("bundle-{index}.pem")))
+            .collect::<Vec<_>>();
+        for bundle_file in &bundle_files {
+            fs::write(
+                generation.join(bundle_file),
+                vec![b'x'; MAX_PROJECTED_SVID_BUNDLE_FILE_BYTES],
+            )
+            .expect("write exact-size bundle file");
+        }
+        switch_generation(directory.path(), "..gen-a");
+        let aggregate_config = ProjectedSvidConfig {
+            root: directory.path().to_path_buf(),
+            cert_file: PathBuf::from(CERT_FILE),
+            key_file: PathBuf::from(KEY_FILE),
+            bundle_files,
+            poll_interval: MIN_PROJECTED_SVID_POLL_INTERVAL,
+        };
+
+        assert!(matches!(
+            load_projected_generation(&aggregate_config, &NoopReadObserver).await,
+            Err(ProjectedSvidReloadReason::TotalMaterialTooLarge)
+        ));
+    }
+
+    #[test]
+    fn parsed_certificate_and_anchor_counts_accept_exact_and_reject_one_over() {
+        let material = valid_material(SPIFFE_A);
+        let mut exact_chain = material.cert_chain_pem.clone();
+        exact_chain.push_str(
+            &material
+                .bundle_pem
+                .repeat(MAX_PROJECTED_SVID_CERTIFICATES - 2),
+        );
         assert_eq!(
-            ensure_count(
-                MAX_PROJECTED_SVID_CERTIFICATES + 1,
-                MAX_PROJECTED_SVID_CERTIFICATES,
-                ProjectedSvidReloadReason::CertificateCountExceeded,
-            ),
+            parse_bounded_certificate_chain(exact_chain.as_bytes())
+                .expect("exact certificate count")
+                .len(),
+            MAX_PROJECTED_SVID_CERTIFICATES
+        );
+        exact_chain.push_str(&material.bundle_pem);
+        assert_eq!(
+            parse_bounded_certificate_chain(exact_chain.as_bytes()),
             Err(ProjectedSvidReloadReason::CertificateCountExceeded)
         );
-        assert!(ensure_count(
-            MAX_PROJECTED_SVID_TRUST_ANCHORS,
-            MAX_PROJECTED_SVID_TRUST_ANCHORS,
-            ProjectedSvidReloadReason::TrustAnchorCountExceeded,
-        )
-        .is_ok());
+
+        let mut exact_anchors = material.bundle_pem.repeat(MAX_PROJECTED_SVID_TRUST_ANCHORS);
         assert_eq!(
-            ensure_count(
-                MAX_PROJECTED_SVID_TRUST_ANCHORS + 1,
-                MAX_PROJECTED_SVID_TRUST_ANCHORS,
-                ProjectedSvidReloadReason::TrustAnchorCountExceeded,
-            ),
+            parse_bounded_trust_bundle(exact_anchors.as_bytes())
+                .expect("exact trust-anchor count")
+                .len(),
+            MAX_PROJECTED_SVID_TRUST_ANCHORS
+        );
+        exact_anchors.push_str(&material.bundle_pem);
+        assert_eq!(
+            parse_bounded_trust_bundle(exact_anchors.as_bytes()),
             Err(ProjectedSvidReloadReason::TrustAnchorCountExceeded)
         );
     }
@@ -1192,12 +1324,25 @@ mod tests {
             ProjectedReadPhase::CertificateRead,
             ProjectedReadPhase::PrivateKeyRead,
             ProjectedReadPhase::TrustBundleRead(0),
+            ProjectedReadPhase::TrustBundleRead(1),
             ProjectedReadPhase::BeforeFinalCheck,
         ];
         for (index, phase) in phases.into_iter().enumerate() {
             let directory = TestDirectory::new(&format!("phase-{index}"));
-            write_generation(directory.path(), "..gen-a", &valid_material(SPIFFE_A));
-            write_generation(directory.path(), "..gen-b", &valid_material(SPIFFE_B));
+            let material_a = valid_material(SPIFFE_A);
+            let material_b = valid_material(SPIFFE_B);
+            let generation_a = write_generation(directory.path(), "..gen-a", &material_a);
+            let generation_b = write_generation(directory.path(), "..gen-b", &material_b);
+            fs::write(
+                generation_a.join(SECOND_BUNDLE_FILE),
+                &material_a.bundle_pem,
+            )
+            .expect("write second generation-A bundle");
+            fs::write(
+                generation_b.join(SECOND_BUNDLE_FILE),
+                &material_b.bundle_pem,
+            )
+            .expect("write second generation-B bundle");
             switch_generation(directory.path(), "..gen-a");
             let observer = SwapOnceObserver {
                 root: directory.path().to_path_buf(),
@@ -1205,8 +1350,12 @@ mod tests {
                 phase,
                 swapped: AtomicBool::new(false),
             };
+            let mut phase_config = config(directory.path());
+            phase_config
+                .bundle_files
+                .push(PathBuf::from(SECOND_BUNDLE_FILE));
 
-            let loaded = load_projected_generation(&config(directory.path()), &observer)
+            let loaded = load_projected_generation(&phase_config, &observer)
                 .await
                 .expect("retry coherent generation");
             assert!(observer.swapped.load(Ordering::SeqCst));
@@ -1279,6 +1428,8 @@ mod tests {
             .wait_for_initial_identity(Duration::from_secs(5))
             .await
             .expect("initial projected identity");
+        let mut retained_state_rx = source.subscribe();
+        drop(retained_state_rx.borrow_and_update());
         let mut event_rx = source.subscribe_events();
         assert_eq!(source.status().generation(), 1);
 
@@ -1297,6 +1448,52 @@ mod tests {
             &mut event_rx,
             ProjectedSvidReloadReason::MalformedCertificate,
         )
+        .await;
+        assert!(
+            timeout(Duration::from_millis(25), retained_state_rx.changed())
+                .await
+                .is_err(),
+            "a rejected candidate must not republish the retained state"
+        );
+        assert_identity_bytes_equal(
+            &initial,
+            &source
+                .subscribe()
+                .borrow()
+                .clone()
+                .expect("retained identity"),
+        );
+
+        let malformed_key = TestMaterial {
+            cert_chain_pem: initial_material.cert_chain_pem.clone(),
+            private_key_pem: "not a private key".to_string(),
+            bundle_pem: initial_material.bundle_pem.clone(),
+        };
+        write_generation(directory.path(), "..malformed-key", &malformed_key);
+        switch_generation(directory.path(), "..malformed-key");
+        wait_for_status(&source, |status| {
+            status.reason() == Some(ProjectedSvidReloadReason::MalformedPrivateKey)
+        })
+        .await;
+        assert_identity_bytes_equal(
+            &initial,
+            &source
+                .subscribe()
+                .borrow()
+                .clone()
+                .expect("retained identity"),
+        );
+
+        let malformed_bundle = TestMaterial {
+            cert_chain_pem: initial_material.cert_chain_pem.clone(),
+            private_key_pem: initial_material.private_key_pem.clone(),
+            bundle_pem: "not a trust bundle".to_string(),
+        };
+        write_generation(directory.path(), "..malformed-bundle", &malformed_bundle);
+        switch_generation(directory.path(), "..malformed-bundle");
+        wait_for_status(&source, |status| {
+            status.reason() == Some(ProjectedSvidReloadReason::MalformedTrustBundle)
+        })
         .await;
         assert_identity_bytes_equal(
             &initial,
@@ -1468,6 +1665,21 @@ mod tests {
             source.status().availability(),
             ProjectedSvidAvailability::RetainingLastGood
         );
+
+        switch_generation(directory.path(), "..good");
+        let rollback_status = wait_for_status(&source, |status| {
+            status.generation() == 2 && status.availability() == ProjectedSvidAvailability::Ready
+        })
+        .await;
+        assert_eq!(rollback_status.reason(), None);
+        assert_identity_bytes_equal(
+            &initial,
+            &source
+                .subscribe()
+                .borrow()
+                .clone()
+                .expect("republished rollback identity"),
+        );
     }
 
     #[tokio::test]
@@ -1537,7 +1749,8 @@ mod tests {
             reason: Some(ProjectedSvidReloadReason::MalformedCertificate),
         });
         let (event_tx, _) = broadcast::channel(4);
-        let handle = spawn_projected_expiry_monitor(state_tx, status_tx, event_tx);
+        let handle =
+            spawn_projected_expiry_monitor(state_tx, status_tx, event_tx, Arc::new(Mutex::new(())));
         timeout(Duration::from_secs(1), async {
             loop {
                 if state_rx.borrow().is_none() {
@@ -1557,6 +1770,65 @@ mod tests {
             }
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn candidate_failures_cannot_replace_an_expired_last_good_reason() {
+        let directory = TestDirectory::new("expiry-failure-race");
+        write_generation(directory.path(), "..gen-a", &valid_material(SPIFFE_A));
+        switch_generation(directory.path(), "..gen-a");
+        let mut loaded = load_projected_generation(&config(directory.path()), &NoopReadObserver)
+            .await
+            .expect("valid identity")
+            .state;
+        let expired = Timestamp::now_utc();
+        loaded.identity.expires_at = expired;
+        loaded.svid.expires_at = expired;
+
+        let (state_tx, state_rx) = watch::channel(Some(loaded));
+        let (status_tx, status_rx) = watch::channel(ProjectedSvidReloadStatus {
+            generation: 11,
+            availability: ProjectedSvidAvailability::Ready,
+            reason: None,
+        });
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let publication_guard = Mutex::new(());
+
+        publish_failure(
+            ProjectedSvidReloadReason::MalformedCertificate,
+            &state_tx,
+            &status_tx,
+            &event_tx,
+            &publication_guard,
+        )
+        .await;
+        assert!(state_rx.borrow().is_none());
+        assert_eq!(
+            *status_rx.borrow(),
+            ProjectedSvidReloadStatus {
+                generation: 11,
+                availability: ProjectedSvidAvailability::Unavailable,
+                reason: Some(ProjectedSvidReloadReason::LastGoodExpired),
+            }
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(IdentityReloadEvent::Failure { error })
+                if error == ProjectedSvidReloadReason::LastGoodExpired.as_str()
+        ));
+
+        publish_failure(
+            ProjectedSvidReloadReason::MaterialUnavailable,
+            &state_tx,
+            &status_tx,
+            &event_tx,
+            &publication_guard,
+        )
+        .await;
+        assert_eq!(
+            status_rx.borrow().reason(),
+            Some(ProjectedSvidReloadReason::LastGoodExpired)
+        );
     }
 
     #[tokio::test]
@@ -1616,6 +1888,10 @@ mod tests {
         assert_eq!(
             ProjectedSvidReloadReason::PrivateKeyMismatch.to_string(),
             "private_key_mismatch"
+        );
+        assert_eq!(
+            ProjectedSvidReloadReason::ReadAttemptTimeout.as_str(),
+            "read_attempt_timeout"
         );
         let status = ProjectedSvidReloadStatus::initial();
         assert_eq!(status.generation(), 0);

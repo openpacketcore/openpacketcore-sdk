@@ -82,7 +82,8 @@ fn projected_source() -> ProjectedSvidSource {
   accepts at most 16 bundle files, 16 SVID-chain certificates, and 128 trust
   anchors. A `..data` change is retried three times after the initial attempt;
   each attempt has a five-second deadline, and polling cannot be configured
-  below 100 milliseconds.
+  below 100 milliseconds. Deadline exhaustion reports `read_attempt_timeout`;
+  exhausting generation-change retries reports `generation_retry_limit`.
 - Projected-source status contains only a process-local publication generation,
   closed availability/reason enums, and no path, PEM, SPIFFE ID, key, or parser
   text. A failed candidate retains the exact previous state only until its leaf

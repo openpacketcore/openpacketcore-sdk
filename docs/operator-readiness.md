@@ -601,7 +601,9 @@ retain last-good material past its leaf expiry.
 Alert on the fixed projected reload reason codes, not the legacy free-form
 event field. Generation numbers are process-local evidence: rollback advances
 the number, and process restart resets it. Do not use them as a persisted
-cluster epoch or membership identity.
+cluster epoch or membership identity. Page on `generation_retry_limit`,
+`read_attempt_timeout`, and `last_good_expired`; the last reason stays active
+until a validated replacement is published.
 
 ### Legacy direct-backend session-net v4 rollout boundary
 
