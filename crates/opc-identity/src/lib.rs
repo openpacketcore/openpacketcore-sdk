@@ -24,7 +24,12 @@ use zeroize::{Zeroize, Zeroizing};
 pub const MAX_SPIFFE_ID_URI_LEN: usize = 2_048;
 
 pub mod file_svid;
+pub mod projected_svid;
 pub use file_svid::FileSvidSource;
+pub use projected_svid::{
+    ProjectedSvidAvailability, ProjectedSvidConfigError, ProjectedSvidReloadReason,
+    ProjectedSvidReloadStatus, ProjectedSvidSource,
+};
 
 #[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum IdentityReloadError {

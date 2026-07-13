@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-identity`: a production `ProjectedSvidSource` for Kubernetes projected
+  Secrets. It resolves one immutable `..data` target, detects and boundedly
+  retries every mid-read generation switch, enforces exact file/total/
+  certificate/trust/retry limits, retains only unexpired last-known-good
+  material, and publishes an opaque monotonic generation with typed,
+  redaction-safe availability/reason status. Existing file/socket source APIs
+  and reload events remain source compatible.
 - **BREAKING — `opc-session-net`/`opc-session-store`:** direct CAS
   idempotency in the quarantined protocol-v4 compatibility path is now scoped
   by the authenticated logical replica, canonical request UUID, complete
@@ -24,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cas_idempotency_epoch`, direct CAS carries `idempotency_epoch`, and
   exhaustive public frame construction/matching must
   be updated in one coordinated stop/upgrade/start.
+- `opc-sctp`: `DiameterSctpAssociation::connect_with_config` now opens the
+  existing Diameter-framed send/receive surface over an explicit
+  `SctpConnectConfig`, including bounded static local and remote multihoming.
+  Unsupported kernel or namespace multihoming remains a typed capability
+  failure and never degrades to one address silently.
 - **BREAKING — `opc-session-store`:** bounded authoritative restore scans now read only the
   local Openraft-applied state after a linearizable barrier, seek the existing
   SQLite composite primary key, cap pages at 4,096 examined live candidates,

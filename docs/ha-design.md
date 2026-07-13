@@ -122,8 +122,8 @@ operator-selected checkpoint without becoming a second runtime authority; see
 the [recovery runbook](session-store-legacy-recovery.md). #133 provides bounded
 applied-state restore with snapshot-bound cursors. Watch and expiry hardening
 remain #145/#148, and network/resource/rotation qualification remains #143 and
-the #162 -> #161 -> #163 -> #158 -> #164 credential chain. Stable IDs,
-durable transaction IDs, and log-range cursors remain #167/#168/#171.
+the #161 -> #162 -> #163 -> #164 credential chain under umbrella #158. Stable
+IDs, durable transaction IDs, and log-range cursors remain #167/#168/#171.
 
 ### Configured topology admission
 
@@ -495,7 +495,14 @@ a subsequent new call/full handshake and wrong-scope rejection. They do not
 exercise a retained old connection. Fleet trust overlap, revocation,
 long-lived-connection retirement, reconnect storms, a documented maximum
 authentication age, multi-process rotation, seamless continuity, and soak
-remain open production work under the existing lifecycle/#143 gates. Session
+remain open production work under the existing lifecycle/#143 gates.
+
+For Kubernetes mounts, `ProjectedSvidSource` now publishes only a bounded,
+validated candidate read from one immutable `..data` target and retains a
+failed candidate's predecessor only until expiry. That closes source-level
+atomicity, not connection continuity: #162 still owns coherent handshake
+epochs, #163 owns retirement/reauthentication, #164 owns fleet evidence, and
+#158 remains their umbrella. Distributed qualification remains #143. Session
 TTL is application-state lifetime; the 365-day bound is not a
 certificate-expiry, trust-validity, or authentication-age policy.
 
