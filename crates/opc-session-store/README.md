@@ -61,6 +61,11 @@ evidence.
   `QuorumSessionStore` is a compatibility type alias to that same Openraft
   implementation, not a second quorum algorithm. Callers install its
   consensus RPC handler, then call `initialize_cluster` for pristine storage.
+  Every member may make that call concurrently. On clean first formation only
+  the canonical lowest node initializes Openraft; the other pristine members
+  wait for replicated membership. A member reopening durable Openraft state
+  skips bootstrap and re-admits normally. Clean first formation fails closed
+  when the canonical node is absent.
 - `ConsensusSessionStore::probe_durable_readiness` uses the same bounded
   Openraft linearizable-read barrier as real authoritative operations. It does
   not treat a bound listener or cached capabilities as quorum evidence.
@@ -336,9 +341,15 @@ the resulting `ConsensusIdentity` to `QuorumTopologyConfig::new_consensus`.
 Open each node with its own file-backed `SqliteSessionBackend`, snapshot
 directory, and an exact map of every other stable node ID to a
 `SessionConsensusPeer`. Install `rpc_handler()` on the dedicated authenticated
-consensus listener before concurrently calling `initialize_cluster()` on a
-pristine fleet. Do not form membership from DNS order or start a local writer
-while peers are still unidentified.
+consensus listener before concurrently calling `initialize_cluster()` on the
+fleet. During clean first formation the method admits only the canonical
+lowest stable node ID as the Openraft initializer; other pristine members wait
+for its exact membership to replicate. Persistent members skip initialization
+on restart, so a noncanonical durable majority restarts normally. Do not form
+membership from DNS order or start a local writer while peers are still
+unidentified. Clean first formation requires the canonical node and fails
+closed if it is absent; this restriction does not apply to a fleet reopening
+persisted Openraft membership.
 
 The topology member vector contains only `QuorumReplicaDescriptor` values.
 The node's one local SQLite backend is supplied separately to

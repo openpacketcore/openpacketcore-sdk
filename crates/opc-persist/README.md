@@ -31,7 +31,12 @@ accepted single-replica profile.
   set is immutable within one topology epoch. Construction requires an exact
   `ConfigConsensusTopology` and one
   shared `opc_consensus::ConsensusPeer` route for every configured remote
-  voter.
+  voter. Every node may call `initialize_cluster` concurrently; on clean first
+  formation only the canonical lowest node initializes Openraft and the other
+  pristine nodes wait for replicated membership. Nodes reopening durable
+  Openraft state skip bootstrap and re-admit normally. Clean first formation
+  fails closed when the canonical node is absent; it never lets another
+  pristine node mint competing initial authority.
 - `ConsensusConfigStore::rpc_handler` exposes the shared bounded inbound
   consensus port. `opc-persist` does not contain a second TCP or TLS transport.
 - `ApprovedLegacyConfigRecovery` is the explicit offline admission object for

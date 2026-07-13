@@ -149,6 +149,32 @@ pub(crate) struct SqliteWorkCancellation {
     deadline: Option<std::time::Instant>,
 }
 
+struct SqliteWorkCancelOnDrop {
+    cancellation: Arc<SqliteWorkCancellation>,
+    armed: bool,
+}
+
+impl SqliteWorkCancelOnDrop {
+    fn new(cancellation: Arc<SqliteWorkCancellation>) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SqliteWorkCancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.cancellation.cancel_before_commit();
+        }
+    }
+}
+
 impl SqliteWorkCancellation {
     fn new() -> Self {
         Self {
@@ -346,6 +372,7 @@ impl ConfigConsensusCore {
         let worker_members = expected_members.clone();
         let worker_audit_key = backend.audit_key().clone();
         let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
+        let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
         let worker_cancellation = cancellation.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -379,6 +406,7 @@ impl ConfigConsensusCore {
                     .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
             }
         };
+        cancel_on_drop.disarm();
         initialization?;
         let super::storage::AdmittedSnapshotDirectory {
             path: snapshot_dir,
@@ -521,6 +549,7 @@ where
         .await
         .map_err(|_| timed_out("config consensus SQLite connection timed out"))?;
     let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
+    let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
     let worker_cancellation = cancellation.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -540,7 +569,7 @@ where
         conn.progress_handler(0, None::<fn() -> bool>);
         result
     });
-    match tokio::time::timeout_at(deadline, &mut worker).await {
+    let result = match tokio::time::timeout_at(deadline, &mut worker).await {
         Ok(Ok(result)) => {
             if cancellation.is_cancelled() && cancellation.cancel_before_commit() {
                 Err(timed_out("config consensus SQLite operation timed out"))
@@ -566,7 +595,9 @@ where
                 .await
                 .map_err(|_| invalid_data("config consensus SQLite worker failed"))?
         }
-    }
+    };
+    cancel_on_drop.disarm();
+    result
 }
 
 fn initialize_schema(

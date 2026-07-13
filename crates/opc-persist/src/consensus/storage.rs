@@ -1695,6 +1695,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_sqlite_future_cancels_worker_and_reuses_connection() {
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        let (log, _, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("storage");
+        log.core
+            .run_sqlite(|conn| {
+                conn.execute("CREATE TABLE drop_probe (value INTEGER NOT NULL)", [])
+                    .map(|_| ())
+                    .map_err(|_| sqlite::invalid_data("create drop probe failed"))
+            })
+            .await
+            .expect("drop probe table");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+        let core = log.core.clone();
+        let caller = tokio::spawn(async move {
+            core.run_sqlite_with_test_timeout_controlled(
+                Duration::from_secs(10),
+                move |conn, cancellation| {
+                    let tx = conn
+                        .unchecked_transaction()
+                        .map_err(|_| sqlite::invalid_data("drop probe transaction failed"))?;
+                    tx.execute("INSERT INTO drop_probe (value) VALUES (1)", [])
+                        .map_err(|_| sqlite::invalid_data("drop probe insert failed"))?;
+                    let _ = started_tx.send(());
+                    while !cancellation.is_cancelled() {
+                        std::thread::yield_now();
+                    }
+                    let commit_rejected = tx.commit().is_err();
+                    let _ = exited_tx.send(commit_rejected);
+                    cancellation.check_io()
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("controlled worker starts")
+            .expect("controlled worker start signal");
+        caller.abort();
+        assert!(caller
+            .await
+            .expect_err("caller must be canceled")
+            .is_cancelled());
+        let commit_rejected = tokio::time::timeout(Duration::from_secs(2), exited_rx)
+            .await
+            .expect("dropped caller cancels controlled worker")
+            .expect("controlled worker exit signal");
+        assert!(commit_rejected, "dropped work must not commit");
+
+        let committed = tokio::time::timeout(
+            Duration::from_secs(2),
+            log.core.run_sqlite(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM drop_probe", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|_| sqlite::invalid_data("drop probe count failed"))
+            }),
+        )
+        .await
+        .expect("dropped worker releases admission and connection")
+        .expect("drop probe count");
+        assert_eq!(0, committed, "dropped work must be rolled back");
+    }
+
+    #[tokio::test]
     async fn pre_core_probe_timeout_never_queues_late_work_and_reuses_backend() {
         let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
             .await
@@ -1801,6 +1877,77 @@ mod tests {
         open(&backend, &snapshot_path, identity(), members())
             .await
             .expect("clean retry after canceled initialization");
+    }
+
+    #[tokio::test]
+    async fn dropped_initialization_cancels_before_authority_and_allows_retry() {
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let backend = Arc::new(
+            SqliteBackend::open_with_audit_key(
+                temp.path().join("config.sqlite"),
+                true,
+                0,
+                shared_audit_key(),
+            )
+            .await
+            .expect("backend"),
+        );
+        let snapshot_path = temp.path().join("snapshots");
+        let admitted = admit_snapshot_directory(&backend, snapshot_path.clone())
+            .expect("admitted snapshot directory");
+        let progress = Arc::new(ConfigDurableProgress::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+        let worker_backend = backend.clone();
+        let caller = tokio::spawn(async move {
+            sqlite::ConfigConsensusCore::initialize_with_test_timeout(
+                &worker_backend,
+                admitted,
+                identity(),
+                members(),
+                progress,
+                None,
+                Duration::from_secs(10),
+                move |cancellation| {
+                    let _ = started_tx.send(());
+                    while !cancellation.is_cancelled() {
+                        std::thread::yield_now();
+                    }
+                    let _ = exited_tx.send(());
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("controlled initialization starts")
+            .expect("controlled initialization start signal");
+        caller.abort();
+        match caller.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("initialization caller must be canceled"),
+        }
+        tokio::time::timeout(Duration::from_secs(2), exited_rx)
+            .await
+            .expect("dropped initialization cancels worker")
+            .expect("controlled initialization exit signal");
+
+        let identity_tables = {
+            let conn = backend.conn();
+            let conn = tokio::time::timeout(Duration::from_secs(2), conn.lock())
+                .await
+                .expect("dropped initialization releases connection");
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'config_raft_identity'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("identity table count")
+        };
+        assert_eq!(0, identity_tables, "dropped initialization must roll back");
+        open(&backend, snapshot_path, identity(), members())
+            .await
+            .expect("clean retry after dropped initialization");
     }
 
     #[tokio::test]
