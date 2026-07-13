@@ -117,7 +117,7 @@ pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractPr
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
 
-const WIRE_SCHEMA_REVISION: u16 = 5;
+const WIRE_SCHEMA_REVISION: u16 = 6;
 const ERROR_SET_REVISION: u16 = 8;
 
 /// Exact semantic and resource-bound contract required by protocol v5.
@@ -613,6 +613,12 @@ pub enum Response {
     AcquireLease(Result<LeaseGuard, opc_session_store::error::LeaseError>),
     RenewLease(Result<LeaseGuard, opc_session_store::error::LeaseError>),
     ReleaseLease(Result<(), opc_session_store::error::LeaseError>),
+    /// Authenticated proof that the server retired this connection before
+    /// dispatching the one outstanding request.
+    ///
+    /// A client may retry only after decoding this complete frame. EOF,
+    /// partial frames, and generic errors remain ambiguous for mutations.
+    ConnectionRetiring,
     Error {
         message: String,
     },
@@ -1092,6 +1098,7 @@ fn validate_response_profile(response: &Response) -> Result<(), WireConversionEr
         | Response::AcquireLease(Err(_))
         | Response::RenewLease(Err(_))
         | Response::ReleaseLease(_)
+        | Response::ConnectionRetiring
         | Response::Error { .. } => Ok(()),
     }
 }
@@ -2778,6 +2785,7 @@ enum WireResponseRef<'a> {
     AcquireLease(Result<&'a LeaseGuard, WireLeaseErrorRef<'a>>),
     RenewLease(Result<&'a LeaseGuard, WireLeaseErrorRef<'a>>),
     ReleaseLease(Result<&'a (), WireLeaseErrorRef<'a>>),
+    ConnectionRetiring,
     Error { message: &'a str },
 }
 
@@ -2813,6 +2821,7 @@ enum WireResponse {
     AcquireLease(Result<LeaseGuard, WireLeaseError>),
     RenewLease(Result<LeaseGuard, WireLeaseError>),
     ReleaseLease(Result<(), WireLeaseError>),
+    ConnectionRetiring,
     Error {
         message: String,
     },
@@ -2923,6 +2932,7 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
                 Self::RenewLease(wire_lease_result_ref(result))
             }
             Response::ReleaseLease(result) => Self::ReleaseLease(wire_lease_result_ref(result)),
+            Response::ConnectionRetiring => Self::ConnectionRetiring,
             Response::Error { .. } => Self::Error {
                 message: "remote protocol error",
             },
@@ -3001,6 +3011,7 @@ impl TryFrom<WireResponse> for Response {
             WireResponse::AcquireLease(result) => Self::AcquireLease(domain_lease_result(result)),
             WireResponse::RenewLease(result) => Self::RenewLease(domain_lease_result(result)),
             WireResponse::ReleaseLease(result) => Self::ReleaseLease(domain_lease_result(result)),
+            WireResponse::ConnectionRetiring => Self::ConnectionRetiring,
             WireResponse::Error { message } => {
                 drop(message);
                 Self::Error {
@@ -3994,7 +4005,7 @@ mod tests {
     fn contract_profile_and_bootstrap_frames_are_exact_and_version_tolerant() {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/5");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
-        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 5);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 6);
         assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 8);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
@@ -4003,7 +4014,7 @@ mod tests {
         assert_eq!(
             profile,
             serde_json::json!({
-                "wire_schema_revision": 5,
+                "wire_schema_revision": 6,
                 "error_set_revision": 8,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 4194304,
@@ -4026,6 +4037,14 @@ mod tests {
                 "cas_request_id_bytes": 36
             })
         );
+
+        let retiring = serde_json::to_value(Response::ConnectionRetiring)
+            .expect("connection-retiring response");
+        assert_eq!(retiring, serde_json::json!("ConnectionRetiring"));
+        assert!(matches!(
+            serde_json::from_value::<Response>(retiring),
+            Ok(Response::ConnectionRetiring)
+        ));
 
         let legacy = serde_json::json!({
             "Hello": {

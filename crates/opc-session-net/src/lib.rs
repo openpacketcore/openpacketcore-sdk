@@ -12,6 +12,21 @@
 //! replica IDs and manifest scope to the canonical SPIFFE identities extracted
 //! from the live mutual-TLS connection, and prove the exact same
 //! [`SessionConsensusContractProfile`] before an operation is dispatched.
+//!
+//! Every authenticated direct and consensus connection also has one finite
+//! [`ConnectionLifecyclePolicy`]. The transport records the completed
+//! handshake's material epoch and local/peer leaf-expiry evidence, stops
+//! admitting new work at the earliest retirement boundary, and bounds the
+//! transport wait plus connection-slot lifetime by the hard deadline. A
+//! supervised backend mutation may still finish after its caller future is
+//! dropped, so transport retirement reports typed ambiguity and never proves
+//! rollback or permits an automatic replay. Material publication or an explicit
+//! [`SessionReauthenticationControl`] request drains existing connections;
+//! replacements always repeat the complete mutual-TLS and application-profile
+//! handshake. Direct watch streams reconnect from the exact next
+//! caller-visible sequence. Protocol-profile upgrades remain coordinated
+//! stop/upgrade/start operations; this lifecycle provides seamless credential
+//! rotation only after every participant already runs the same profile.
 
 #![forbid(unsafe_code)]
 
@@ -20,6 +35,7 @@ pub mod client;
 pub mod consensus;
 pub mod error;
 pub mod identity;
+mod lifecycle;
 #[cfg(not(feature = "legacy-session-net-compat"))]
 mod protocol;
 #[cfg(feature = "legacy-session-net-compat")]
@@ -38,6 +54,11 @@ pub use identity::{
     LocalReplicaBinding, RemoteReplicaBinding, SessionClusterId, SessionConfigurationEpoch,
     SessionConfigurationGeneration, SessionConfigurationId, SessionManifestError,
     SessionReplicationManifest,
+};
+pub use lifecycle::{
+    ConnectionLifecycleError, ConnectionLifecyclePolicy, SessionReauthenticationControl,
+    DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
+    DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
 };
 pub use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId, ConsensusIdentity,

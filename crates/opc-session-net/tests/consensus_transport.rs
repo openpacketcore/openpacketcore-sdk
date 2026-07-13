@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,9 @@ use opc_persist::{
 #[cfg(feature = "legacy-session-net-compat")]
 use opc_session_net::RemoteSessionBackend;
 use opc_session_net::{
-    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationEpoch,
-    SessionConfigurationGeneration, SessionConsensusServer, SessionReplicationManifest,
+    ConnectionLifecyclePolicy, RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId,
+    SessionConfigurationEpoch, SessionConfigurationGeneration, SessionConsensusServer,
+    SessionReauthenticationControl, SessionReplicationManifest,
 };
 #[cfg(feature = "legacy-session-net-compat")]
 use opc_session_store::ReplicaReadinessFailure;
@@ -30,7 +31,10 @@ use opc_session_store::{
     SqliteSessionBackend, StateClass, StateType, StoredSessionRecord, SystemClock,
     ValidatedQuorumTopology, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
-use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
+use opc_tls::{
+    AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder,
+    TlsMaterialAvailability, TlsMaterialEpoch,
+};
 use opc_types::{NetworkFunctionKind, TenantId};
 
 const SERVER_REPLICA: u16 = 2;
@@ -95,6 +99,25 @@ impl TestPki {
         });
         build_identity_state(certs, private_key, trust_bundles).expect("identity state")
     }
+}
+
+async fn wait_for_material_epoch_change(
+    status: impl Fn() -> opc_tls::TlsMaterialStatus,
+    previous: TlsMaterialEpoch,
+) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let current = status();
+            if current.epoch() != previous
+                && current.availability() == TlsMaterialAvailability::Ready
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("consensus material epoch update");
 }
 
 fn replica_id(replica: u16) -> ReplicaId {
@@ -360,6 +383,36 @@ impl SessionConsensusRpcHandler for EchoHandler {
     }
 }
 
+#[derive(Debug, Default)]
+struct LifecycleEchoHandler {
+    calls: AtomicUsize,
+    first_started: tokio::sync::Notify,
+    first_release: tokio::sync::Notify,
+    authenticated_senders: StdMutex<Vec<opc_session_store::SessionConsensusNodeId>>,
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for LifecycleEchoHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: opc_session_store::SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        self.authenticated_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(authenticated_sender);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.first_started.notify_one();
+            self.first_release.notified().await;
+        }
+        SessionConsensusWireResponse {
+            result: Ok(request.payload),
+        }
+    }
+}
+
 async fn start_server(
     pki: &TestPki,
     manifest: &Arc<SessionReplicationManifest>,
@@ -441,6 +494,120 @@ async fn authenticated_consensus_call_uses_stable_manifest_node_ids() {
     );
 
     handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn consensus_inflight_rpc_drains_and_reauthenticates_on_renewed_material() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-lifecycle", 11, 1);
+    let (client_tx, client_rx) = tokio::sync::watch::channel(Some(pki.identity_state(1)));
+    let (server_tx, server_rx) =
+        tokio::sync::watch::channel(Some(pki.identity_state(SERVER_REPLICA)));
+    let client_config = TlsConfigBuilder::new(client_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("rotating consensus client config");
+    let server_config = TlsConfigBuilder::new(server_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_server_config()
+        .expect("rotating consensus server config");
+    let lifecycle = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+        Duration::ZERO,
+    )
+    .expect("consensus lifecycle policy");
+    let reauthentication = SessionReauthenticationControl::new();
+    let handler = Arc::new(LifecycleEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), server_config.clone(), binding)
+            .with_max_connections(1)
+            .with_connection_lifecycle(lifecycle)
+            .with_reauthentication_control(reauthentication.clone())
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("consensus lifecycle listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let lifecycle_resolver: RemoteAddrResolver = {
+        let resolutions = resolutions.clone();
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        lifecycle_resolver,
+        client_config.clone(),
+        Some(Duration::from_secs(3)),
+    )
+    .with_connection_lifecycle(lifecycle)
+    .with_reauthentication_control(reauthentication.clone());
+
+    let first = tokio::spawn({
+        let peer = peer.clone();
+        let request = request(&manifest, 1, b"inflight-before-rotation".to_vec());
+        async move { peer.call(request).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), handler.first_started.notified())
+        .await
+        .expect("first consensus RPC must enter the handler");
+
+    let client_epoch = client_config.material_status().epoch();
+    let server_epoch = server_config.material_status().epoch();
+    client_tx.send_replace(Some(pki.identity_state(1)));
+    server_tx.send_replace(Some(pki.identity_state(SERVER_REPLICA)));
+    wait_for_material_epoch_change(|| client_config.material_status(), client_epoch).await;
+    wait_for_material_epoch_change(|| server_config.material_status(), server_epoch).await;
+    reauthentication
+        .request_reauthentication()
+        .expect("retire the admitted consensus connection");
+    handler.first_release.notify_one();
+
+    assert_eq!(
+        first.await.expect("first consensus call join"),
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"inflight-before-rotation".to_vec()),
+        }),
+        "an RPC admitted before soft retirement must complete once inside the drain"
+    );
+    assert_eq!(
+        peer.call(request(
+            &manifest,
+            1,
+            b"replacement-after-rotation".to_vec(),
+        ))
+        .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"replacement-after-rotation".to_vec()),
+        }),
+        "the sole server slot must be released and the replacement must repeat mTLS and exact bootstrap admission"
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+    let expected_sender = manifest
+        .bind_local(replica_id(1))
+        .expect("sender binding")
+        .local_consensus_node_id();
+    assert_eq!(
+        *handler
+            .authenticated_senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![expected_sender, expected_sender],
+        "both Vote RPCs must reach Openraft only after exact authenticated sender admission"
+    );
+
+    server.abort_and_wait().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2,7 +2,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -35,6 +35,10 @@ use tokio::sync::Mutex;
 pub use crate::consensus::RemoteAddrResolver;
 use crate::error::ProtocolError;
 use crate::identity::RemoteReplicaBinding;
+use crate::lifecycle::{
+    directed_connection_key, ConnectionLifecycle, ConnectionLifecyclePolicy, LeafExpiryEvidence,
+    SessionReauthenticationControl,
+};
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
     compare_and_set_result_matches_key, conservative_payload_budget, get_result_matches_key,
@@ -57,6 +61,145 @@ struct Connection {
     contract_profile: ContractProfile,
     frame_limits: NegotiatedFrameLimits,
     cas_idempotency_epoch: uuid::Uuid,
+    lifecycle: ConnectionLifecycle,
+}
+
+#[derive(Clone, Copy)]
+struct ObservedGenerationChange {
+    value: u64,
+    observed_at: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy)]
+struct ObservedMaterialChange {
+    value: Option<opc_tls::TlsMaterialEpoch>,
+    observed_at: tokio::time::Instant,
+}
+
+#[derive(Default)]
+struct PoolLifecycleEvents {
+    generation: Option<ObservedGenerationChange>,
+    material: Option<ObservedMaterialChange>,
+}
+
+#[derive(Default)]
+struct PoolLifecycleMonitor {
+    task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    events: StdMutex<PoolLifecycleEvents>,
+}
+
+impl PoolLifecycleMonitor {
+    fn publish_generation(&self, value: u64, observed_at: tokio::time::Instant) {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match events.generation.as_mut() {
+            Some(event) => event.value = value,
+            None => {
+                events.generation = Some(ObservedGenerationChange { value, observed_at });
+            }
+        }
+    }
+
+    fn publish_material(
+        &self,
+        value: Option<opc_tls::TlsMaterialEpoch>,
+        observed_at: tokio::time::Instant,
+    ) {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match events.material.as_mut() {
+            Some(event) => event.value = value,
+            None => {
+                events.material = Some(ObservedMaterialChange { value, observed_at });
+            }
+        }
+    }
+
+    fn apply_to(
+        &self,
+        lifecycle: &mut ConnectionLifecycle,
+        current_generation: u64,
+        current_material_epoch: Option<opc_tls::TlsMaterialEpoch>,
+        observed_now: tokio::time::Instant,
+        edge_key: &[u8],
+    ) {
+        let (generation, material) = {
+            let events = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (events.generation, events.material)
+        };
+        if current_generation != lifecycle.admitted_generation() {
+            let observed_at = generation
+                .filter(|event| event.value == current_generation)
+                .map_or(observed_now, |event| event.observed_at);
+            lifecycle.observe_rotation(
+                observed_at,
+                current_generation,
+                lifecycle.admitted_material_epoch(),
+                edge_key,
+            );
+        }
+        if current_material_epoch != lifecycle.admitted_material_epoch() {
+            let observed_at = material
+                .filter(|event| event.value == current_material_epoch)
+                .map_or(observed_now, |event| event.observed_at);
+            lifecycle.observe_rotation(
+                observed_at,
+                lifecycle.admitted_generation(),
+                current_material_epoch,
+                edge_key,
+            );
+        }
+        // Catch a publication observed directly at checkout before the
+        // monitor task has processed its subscribed event.
+        lifecycle.observe_rotation(
+            observed_now,
+            current_generation,
+            current_material_epoch,
+            edge_key,
+        );
+    }
+
+    fn acknowledge_admission(
+        &self,
+        generation: u64,
+        material_epoch: Option<opc_tls::TlsMaterialEpoch>,
+    ) {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if events
+            .generation
+            .is_some_and(|event| event.value == generation)
+        {
+            events.generation = None;
+        }
+        if events
+            .material
+            .is_some_and(|event| event.value == material_epoch)
+        {
+            events.material = None;
+        }
+    }
+}
+
+impl Drop for PoolLifecycleMonitor {
+    fn drop(&mut self) {
+        let task = self
+            .task
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(task) = task.take() {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +220,7 @@ enum RemoteRequestFailure {
     Transport,
     Authentication,
     Timeout,
+    ConnectionRetiring,
     Protocol,
     ResponseContract,
     ReplicationLogResponseContract,
@@ -126,6 +270,16 @@ impl RemoteRequestAttemptFailure {
             invalidates_contract: true,
         }
     }
+
+    fn connection_retiring() -> Self {
+        Self {
+            failure: RemoteRequestFailure::ConnectionRetiring,
+            // A complete authenticated control frame is proof that the
+            // server correlated this request but did not dispatch it.
+            request_may_have_reached_server: false,
+            invalidates_contract: false,
+        }
+    }
 }
 
 impl RemoteRequestFailure {
@@ -145,7 +299,10 @@ impl RemoteRequestFailure {
     }
 
     const fn is_retryable(self) -> bool {
-        matches!(self, Self::Transport | Self::Timeout | Self::Backend)
+        matches!(
+            self,
+            Self::Transport | Self::Timeout | Self::ConnectionRetiring | Self::Backend
+        )
     }
 
     const fn reason_code(self) -> &'static str {
@@ -153,6 +310,7 @@ impl RemoteRequestFailure {
             Self::Transport => "transport",
             Self::Authentication => "authentication",
             Self::Timeout => "timeout",
+            Self::ConnectionRetiring => "connection_retiring",
             Self::Protocol => "protocol",
             Self::ResponseContract | Self::ReplicationLogResponseContract => "protocol",
             Self::Backend => "backend",
@@ -220,6 +378,7 @@ impl From<RemoteRequestFailure> for ReplicaReadinessFailure {
             RemoteRequestFailure::Transport => Self::Transport,
             RemoteRequestFailure::Authentication => Self::Authentication,
             RemoteRequestFailure::Timeout => Self::Timeout,
+            RemoteRequestFailure::ConnectionRetiring => Self::Backend,
             RemoteRequestFailure::Protocol => Self::Protocol,
             RemoteRequestFailure::ResponseContract
             | RemoteRequestFailure::ReplicationLogResponseContract => Self::Protocol,
@@ -312,10 +471,8 @@ impl std::fmt::Display for RemoteTarget {
     }
 }
 
-fn session_client_tls_config(
-    config: &opc_tls::AuthenticatedClientConfig,
-) -> Arc<opc_tls::ClientConfig> {
-    let mut config = config.rustls_config().as_ref().clone();
+fn session_client_tls_config(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls::ClientConfig> {
+    let mut config = config.as_ref().clone();
     config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
     // Session identity is defined by the certificate presented on this exact
     // connection. A resumed TLS session can carry cached peer certificates and
@@ -328,43 +485,138 @@ fn session_client_tls_config(
 
 async fn open_connection(
     target: RemoteTarget,
-    tls_config: Option<Arc<opc_tls::ClientConfig>>,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     binding: RemoteReplicaBinding,
     requested_response_frame_size: usize,
     operation_deadline: tokio::time::Instant,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
+) -> Result<Connection, ProtocolError> {
+    // Local configuration rejection is not a connection attempt.
+    checked_wire_frame_size(requested_response_frame_size)?;
+    METRICS
+        .session_net_connection_attempts
+        .fetch_add(1, Ordering::Relaxed);
+    let result = open_connection_attempt(
+        target,
+        tls_config,
+        binding,
+        requested_response_frame_size,
+        operation_deadline,
+        lifecycle_policy,
+        reauthentication,
+    )
+    .await;
+    match &result {
+        Ok(_) => &METRICS.session_net_connection_successes,
+        Err(ProtocolError::Io(error)) if error.kind() == io::ErrorKind::TimedOut => {
+            &METRICS.session_net_connection_failure_timeout
+        }
+        Err(ProtocolError::Io(_)) => &METRICS.session_net_connection_failure_transport,
+        Err(ProtocolError::Authentication) => {
+            &METRICS.session_net_connection_failure_authentication
+        }
+        Err(ProtocolError::BackendUnavailable(_)) => {
+            &METRICS.session_net_connection_failure_backend
+        }
+        Err(_) => &METRICS.session_net_connection_failure_protocol,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+    result
+}
+
+async fn open_connection_attempt(
+    target: RemoteTarget,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
+    binding: RemoteReplicaBinding,
+    requested_response_frame_size: usize,
+    operation_deadline: tokio::time::Instant,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
 ) -> Result<Connection, ProtocolError> {
     // Reject unrepresentable or unusably small local budgets before DNS or a
     // socket allocation. The handshake repeats this conversion when building
     // the fixed-width field, keeping direct callers fail closed as well.
-    checked_wire_frame_size(requested_response_frame_size)?;
-    let addr = target.resolve().await.map_err(ProtocolError::Io)?;
-    let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
-
+    let admitted_generation = reauthentication.generation();
     if let Some(tls_config) = tls_config {
-        let connector = tokio_rustls::TlsConnector::from(tls_config);
-        let server_name = target.tls_server_name(addr)?;
-        let tls_stream = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(classify_tls_connect_error)?;
-        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
-            return Err(ProtocolError::UnexpectedResponse);
-        }
-        let peer_spiffe = opc_tls::peer_spiffe_id_from_client_connection(tls_stream.get_ref().1)
-            .map_err(|_| ProtocolError::Authentication)?;
-        if peer_spiffe.as_str() != binding.remote_spiffe_id().as_str() {
-            return Err(ProtocolError::Authentication);
-        }
+        let outcome = tls_config
+            .run_handshake(|attempt| {
+                let target = target.clone();
+                let binding = binding.clone();
+                async move {
+                    let addr = target.resolve().await.map_err(ProtocolError::Io)?;
+                    let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
+                    let connector = tokio_rustls::TlsConnector::from(session_client_tls_config(
+                        attempt.rustls_config(),
+                    ));
+                    let server_name = target.tls_server_name(addr)?;
+                    let tls_stream = connector
+                        .connect(server_name, tcp)
+                        .await
+                        .map_err(classify_tls_connect_error)?;
+                    if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
+                        return Err(ProtocolError::UnexpectedResponse);
+                    }
+                    let peer =
+                        opc_tls::peer_tls_identity_from_client_connection(tls_stream.get_ref().1)
+                            .map_err(|_| ProtocolError::Authentication)?;
+                    if peer.spiffe_id().as_str() != binding.remote_spiffe_id().as_str() {
+                        return Err(ProtocolError::Authentication);
+                    }
+                    let tls_completed_at = tokio::time::Instant::now();
+                    let local_expiry =
+                        LeafExpiryEvidence::capture(attempt.leaf_expires_at(), tls_completed_at);
+                    let peer_expiry =
+                        LeafExpiryEvidence::capture(peer.leaf_expires_at(), tls_completed_at);
 
-        let (mut reader, mut writer) = tokio::io::split(tls_stream);
-        let (contract_profile, frame_limits, cas_idempotency_epoch) = perform_client_handshake(
-            &mut reader,
-            &mut writer,
-            &binding,
-            requested_response_frame_size,
-            operation_deadline,
+                    let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                    let (contract_profile, frame_limits, cas_idempotency_epoch) =
+                        perform_client_handshake(
+                            &mut reader,
+                            &mut writer,
+                            &binding,
+                            requested_response_frame_size,
+                            operation_deadline,
+                        )
+                        .await?;
+                    Ok::<_, ProtocolError>((
+                        reader,
+                        writer,
+                        tls_completed_at,
+                        local_expiry,
+                        peer_expiry,
+                        contract_profile,
+                        frame_limits,
+                        cas_idempotency_epoch,
+                    ))
+                }
+            })
+            .await
+            .map_err(|error| match error {
+                opc_tls::TlsHandshakeRunError::Material(_) => ProtocolError::Authentication,
+                opc_tls::TlsHandshakeRunError::Operation(error) => error,
+            })?;
+        let admission = outcome.admission();
+        let (parts, _) = outcome.into_parts();
+        let (
+            reader,
+            writer,
+            established_at,
+            local_expiry,
+            peer_expiry,
+            contract_profile,
+            frame_limits,
+            cas_idempotency_epoch,
+        ) = parts;
+        let lifecycle = ConnectionLifecycle::new(
+            lifecycle_policy,
+            established_at,
+            Some(local_expiry),
+            Some(peer_expiry),
+            admitted_generation,
+            Some(admission.epoch()),
         )
-        .await?;
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
         Ok(Connection {
             reader: Box::new(reader),
             writer: Box::new(writer),
@@ -372,8 +624,11 @@ async fn open_connection(
             contract_profile,
             frame_limits,
             cas_idempotency_epoch,
+            lifecycle,
         })
     } else {
+        let addr = target.resolve().await.map_err(ProtocolError::Io)?;
+        let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
         let (mut reader, mut writer) = tokio::io::split(tcp);
         let (contract_profile, frame_limits, cas_idempotency_epoch) = perform_client_handshake(
             &mut reader,
@@ -383,6 +638,16 @@ async fn open_connection(
             operation_deadline,
         )
         .await?;
+        let established_at = tokio::time::Instant::now();
+        let lifecycle = ConnectionLifecycle::new(
+            lifecycle_policy,
+            established_at,
+            None,
+            None,
+            admitted_generation,
+            None,
+        )
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
         Ok(Connection {
             reader: Box::new(reader),
             writer: Box::new(writer),
@@ -390,6 +655,7 @@ async fn open_connection(
             contract_profile,
             frame_limits,
             cas_idempotency_epoch,
+            lifecycle,
         })
     }
 }
@@ -673,11 +939,14 @@ fn discard_replication_entry_iteratively(entry: ReplicationEntry) {
 #[derive(Clone)]
 pub struct RemoteSessionBackend {
     target: RemoteTarget,
-    tls_config: Option<Arc<opc_tls::ClientConfig>>,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     binding: RemoteReplicaBinding,
     deadline: Duration,
     max_frame_size: usize,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
     conn: Arc<Mutex<Option<Connection>>>,
+    pool_lifecycle_monitor: Arc<PoolLifecycleMonitor>,
     negotiated_frame_limits: Arc<RwLock<Option<NegotiatedFrameLimits>>>,
     cached_capabilities:
         Arc<RwLock<Option<(ContractProfile, NegotiatedFrameLimits, BackendCapabilities)>>>,
@@ -716,12 +985,7 @@ impl RemoteSessionBackend {
         deadline: Option<Duration>,
     ) -> Self {
         let target = RemoteTarget::configured(&binding);
-        Self::from_transport(
-            target,
-            Some(session_client_tls_config(&tls_config)),
-            binding,
-            deadline,
-        )
+        Self::from_transport(target, Some(tls_config), binding, deadline)
     }
 
     /// Create a new mTLS remote backend client that re-resolves before each
@@ -741,7 +1005,7 @@ impl RemoteSessionBackend {
         let server_name = binding.remote_endpoint().host().to_string();
         Self::from_transport(
             RemoteTarget::resolved(Some(server_name), resolve),
-            Some(session_client_tls_config(&tls_config)),
+            Some(tls_config),
             binding,
             deadline,
         )
@@ -776,7 +1040,7 @@ impl RemoteSessionBackend {
 
     fn from_transport(
         target: RemoteTarget,
-        tls_config: Option<Arc<opc_tls::ClientConfig>>,
+        tls_config: Option<opc_tls::AuthenticatedClientConfig>,
         binding: RemoteReplicaBinding,
         deadline: Option<Duration>,
     ) -> Self {
@@ -786,7 +1050,10 @@ impl RemoteSessionBackend {
             binding,
             deadline: deadline.unwrap_or(Duration::from_secs(2)),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            lifecycle_policy: ConnectionLifecyclePolicy::default(),
+            reauthentication: SessionReauthenticationControl::new(),
             conn: Arc::new(Mutex::new(None)),
+            pool_lifecycle_monitor: Arc::new(PoolLifecycleMonitor::default()),
             negotiated_frame_limits: Arc::new(RwLock::new(None)),
             cached_capabilities: Arc::new(RwLock::new(None)),
         }
@@ -804,9 +1071,37 @@ impl RemoteSessionBackend {
         // `max_frame_size` is clone-local, so this configured value must not
         // reuse connection or negotiation state created by another clone.
         self.conn = Arc::new(Mutex::new(None));
+        self.pool_lifecycle_monitor = Arc::new(PoolLifecycleMonitor::default());
         self.negotiated_frame_limits = Arc::new(RwLock::new(None));
         self.cached_capabilities = Arc::new(RwLock::new(None));
         self
+    }
+
+    /// Set the finite authentication, drain, and reconnect policy.
+    #[must_use]
+    pub fn with_connection_lifecycle(mut self, policy: ConnectionLifecyclePolicy) -> Self {
+        self.lifecycle_policy = policy;
+        self.conn = Arc::new(Mutex::new(None));
+        self.pool_lifecycle_monitor = Arc::new(PoolLifecycleMonitor::default());
+        self
+    }
+
+    /// Share an orchestration control that gracefully retires live requests
+    /// and reconnects watches without enabling plaintext or aborting tasks.
+    #[must_use]
+    pub fn with_reauthentication_control(
+        mut self,
+        control: SessionReauthenticationControl,
+    ) -> Self {
+        self.reauthentication = control;
+        self.conn = Arc::new(Mutex::new(None));
+        self.pool_lifecycle_monitor = Arc::new(PoolLifecycleMonitor::default());
+        self
+    }
+
+    /// Control used by this client for explicit graceful reauthentication.
+    pub fn reauthentication_control(&self) -> SessionReauthenticationControl {
+        self.reauthentication.clone()
     }
 
     async fn send_request_classified(
@@ -820,30 +1115,55 @@ impl RemoteSessionBackend {
             .checked_add(self.deadline)
             .ok_or(RemoteRequestFailure::Protocol)?;
         let mut last_failure = None;
-        let mut request_in_flight = true;
+        let transmission_started = AtomicBool::new(false);
+        let pretransmission_failure = StdMutex::new(None);
         let attempts = async {
-            let mut backoff_ms = 100u64;
+            let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
             loop {
-                request_in_flight = true;
-                match self.do_request(&req, operation_deadline, None).await {
+                transmission_started.store(false, Ordering::Release);
+                match self
+                    .do_request(
+                        &req,
+                        operation_deadline,
+                        Some(&transmission_started),
+                        &pretransmission_failure,
+                    )
+                    .await
+                {
                     Ok(resp) => return Ok(resp),
                     Err(attempt) => {
                         let failure = attempt.failure;
                         if !failure.is_retryable() {
                             return Err(failure);
                         }
+                        METRICS
+                            .session_net_reconnect_attempts
+                            .fetch_add(1, Ordering::Relaxed);
+                        if failure != RemoteRequestFailure::ConnectionRetiring {
+                            METRICS
+                                .session_net_reconnect_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         last_failure = Some(failure);
-                        request_in_flight = false;
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(1000);
+                        if !attempt.request_may_have_reached_server {
+                            transmission_started.store(false, Ordering::Release);
+                        }
+                        tokio::time::sleep(backoff).await;
+                        backoff = self.lifecycle_policy.next_backoff(backoff);
                     }
                 }
             }
         };
         match tokio::time::timeout_at(operation_deadline, attempts).await {
             Ok(res) => res,
-            Err(_) if request_in_flight => Err(RemoteRequestFailure::Timeout),
-            Err(_) => Err(last_failure.unwrap_or(RemoteRequestFailure::Timeout)),
+            Err(_) if transmission_started.load(Ordering::Acquire) => {
+                Err(RemoteRequestFailure::Timeout)
+            }
+            Err(_) => Err(pretransmission_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .or(last_failure)
+                .unwrap_or(RemoteRequestFailure::Timeout)),
         }
     }
 
@@ -967,15 +1287,47 @@ impl RemoteSessionBackend {
         deadline: tokio::time::Instant,
     ) -> Result<NegotiatedResponse, RemoteRequestAttemptFailure> {
         let transmission_started = AtomicBool::new(false);
-        match tokio::time::timeout_at(
-            deadline,
-            self.do_request(req, deadline, Some(&transmission_started)),
-        )
-        .await
-        {
+        let pretransmission_failure = StdMutex::new(None);
+        let attempts = async {
+            let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
+            loop {
+                transmission_started.store(false, Ordering::Release);
+                match self
+                    .do_request(
+                        req,
+                        deadline,
+                        Some(&transmission_started),
+                        &pretransmission_failure,
+                    )
+                    .await
+                {
+                    Err(attempt) if attempt.failure == RemoteRequestFailure::ConnectionRetiring => {
+                        // Only this complete authenticated frame proves that
+                        // repeating a mutation cannot duplicate an effect.
+                        transmission_started.store(false, Ordering::Release);
+                        METRICS
+                            .session_net_reconnect_attempts
+                            .fetch_add(1, Ordering::Relaxed);
+                        let now = tokio::time::Instant::now();
+                        let retry_at = now.checked_add(backoff).unwrap_or(deadline).min(deadline);
+                        tokio::time::sleep_until(retry_at).await;
+                        backoff = self.lifecycle_policy.next_backoff(backoff);
+                    }
+                    result => return result,
+                }
+            }
+        };
+        match tokio::time::timeout_at(deadline, attempts).await {
             Ok(result) => result,
             Err(_) => Err(RemoteRequestAttemptFailure {
-                failure: RemoteRequestFailure::Timeout,
+                failure: if transmission_started.load(Ordering::Acquire) {
+                    RemoteRequestFailure::Timeout
+                } else {
+                    pretransmission_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .unwrap_or(RemoteRequestFailure::Timeout)
+                },
                 request_may_have_reached_server: transmission_started.load(Ordering::Acquire),
                 invalidates_contract: false,
             }),
@@ -1010,7 +1362,9 @@ impl RemoteSessionBackend {
         req: &Request,
         operation_deadline: tokio::time::Instant,
         transmission_started: Option<&AtomicBool>,
+        pretransmission_failure: &StdMutex<Option<RemoteRequestFailure>>,
     ) -> Result<NegotiatedResponse, RemoteRequestAttemptFailure> {
+        self.ensure_pool_lifecycle_monitor();
         let mut guard = self.conn.lock().await;
 
         // Take the connection out of the slot for the duration of the
@@ -1020,14 +1374,111 @@ impl RemoteSessionBackend {
         // response of the cancelled request to the next caller; taking it
         // means cancellation drops the connection and the next request
         // reconnects cleanly. Errors drop it for the same reason.
-        let mut conn = match guard.take() {
-            Some(conn) => conn,
-            None => self
-                .connect(operation_deadline)
-                .await
-                .map_err(|error| RemoteRequestAttemptFailure::before_transmission(&error))?,
+        let mut candidate = guard.take();
+        let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
+        let mut conn = loop {
+            if tokio::time::Instant::now() >= operation_deadline {
+                return Err(RemoteRequestAttemptFailure {
+                    failure: pretransmission_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .unwrap_or(RemoteRequestFailure::Timeout),
+                    request_may_have_reached_server: false,
+                    invalidates_contract: false,
+                });
+            }
+            let from_pool = candidate.is_some();
+            let mut candidate_connection = match candidate.take() {
+                Some(connection) => connection,
+                None => match self.connect(operation_deadline).await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        let attempt = RemoteRequestAttemptFailure::before_transmission(&error);
+                        *pretransmission_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(attempt.failure);
+                        if !attempt.failure.is_retryable() {
+                            return Err(attempt);
+                        }
+                        METRICS
+                            .session_net_reconnect_attempts
+                            .fetch_add(1, Ordering::Relaxed);
+                        METRICS
+                            .session_net_reconnect_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        let now = tokio::time::Instant::now();
+                        let retry_at = now
+                            .checked_add(backoff)
+                            .unwrap_or(operation_deadline)
+                            .min(operation_deadline);
+                        tokio::time::sleep_until(retry_at).await;
+                        backoff = self.lifecycle_policy.next_backoff(backoff);
+                        continue;
+                    }
+                },
+            };
+            // Capture time only after connection and application bootstrap
+            // complete. A slow bootstrap must not admit work using an Instant
+            // from before this connection existed.
+            let now = tokio::time::Instant::now();
+            let current_generation = self.reauthentication.generation();
+            let current_material_epoch = self
+                .tls_config
+                .as_ref()
+                .map(|config| config.material_status().epoch());
+            self.pool_lifecycle_monitor.apply_to(
+                &mut candidate_connection.lifecycle,
+                current_generation,
+                current_material_epoch,
+                now,
+                &directed_connection_key(
+                    b"direct",
+                    self.binding.local_replica_id().as_str(),
+                    self.binding.remote_replica_id().as_str(),
+                ),
+            );
+            let mismatch = candidate_connection
+                .lifecycle
+                .evidence_mismatch_reason(current_generation, current_material_epoch);
+            let scheduled_pool_rotation = from_pool
+                && candidate_connection.lifecycle.rotation_was_observed()
+                && mismatch.is_some();
+            if (mismatch.is_none() || scheduled_pool_rotation)
+                && candidate_connection.lifecycle.retirement(now).is_none()
+            {
+                *pretransmission_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                self.pool_lifecycle_monitor.acknowledge_admission(
+                    candidate_connection.lifecycle.admitted_generation(),
+                    candidate_connection.lifecycle.admitted_material_epoch(),
+                );
+                break candidate_connection;
+            }
+            if let Some(reason) = mismatch.filter(|_| !scheduled_pool_rotation) {
+                candidate_connection
+                    .lifecycle
+                    .record_forced_retirement(reason);
+            }
+            tracing::debug!(
+                reason = "retired",
+                "session connection retired before dispatch"
+            );
+            METRICS
+                .session_net_reconnect_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            *pretransmission_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(RemoteRequestFailure::Timeout);
+            let retry_at = now
+                .checked_add(backoff)
+                .unwrap_or(operation_deadline)
+                .min(operation_deadline);
+            tokio::time::sleep_until(retry_at).await;
+            backoff = self.lifecycle_policy.next_backoff(backoff);
         };
-
         let request = match req {
             Request::CompareAndSet { op, request_id, .. } => Request::CompareAndSet {
                 op: op.clone(),
@@ -1041,20 +1492,75 @@ impl RemoteSessionBackend {
                 conn.frame_limits.response_frame_size,
             ));
         if let Err(error) = validate_request_payload_limit(&request, transport_limit) {
+            // No bytes were emitted, so the authenticated connection remains
+            // clean and can safely serve a later bounded request.
             *guard = Some(conn);
             return Err(RemoteRequestAttemptFailure::from_store_preflight(error));
         }
 
-        match self
-            .exchange(
+        let mut lifecycle = conn.lifecycle.clone();
+        let mut reauthentication_rx = self.reauthentication.subscribe();
+        let mut material_rx = self
+            .tls_config
+            .as_ref()
+            .map(opc_tls::AuthenticatedClientConfig::subscribe_material_changes);
+        let exchange_result = {
+            let exchange = self.exchange(
                 &request,
                 &mut conn,
                 operation_deadline,
                 transmission_started,
-            )
-            .await
-        {
+            );
+            tokio::pin!(exchange);
+            loop {
+                let now = tokio::time::Instant::now();
+                self.pool_lifecycle_monitor.apply_to(
+                    &mut lifecycle,
+                    self.reauthentication.generation(),
+                    self.tls_config
+                        .as_ref()
+                        .map(|config| config.material_status().epoch()),
+                    now,
+                    &directed_connection_key(
+                        b"direct",
+                        self.binding.local_replica_id().as_str(),
+                        self.binding.remote_replica_id().as_str(),
+                    ),
+                );
+                let lifecycle_hard_deadline = lifecycle.hard_deadline().map_err(|_| {
+                    RemoteRequestAttemptFailure::before_transmission(
+                        &ProtocolError::InvalidWireValue,
+                    )
+                })?;
+                let hard_deadline = lifecycle_hard_deadline.min(operation_deadline);
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(hard_deadline) => {
+                        let now = tokio::time::Instant::now();
+                        if now >= lifecycle_hard_deadline {
+                            let _ = lifecycle.retirement(now);
+                            lifecycle.record_hard_overrun();
+                        }
+                        break Err(RemoteRequestAttemptFailure {
+                            failure: RemoteRequestFailure::Timeout,
+                            request_may_have_reached_server: transmission_started
+                                .is_none_or(|started| started.load(Ordering::Acquire)),
+                            invalidates_contract: false,
+                        });
+                    }
+                    result = &mut exchange => break result,
+                    _ = reauthentication_rx.changed() => {}
+                    _ = wait_for_material_change(&mut material_rx) => {}
+                }
+            }
+        };
+        conn.lifecycle = lifecycle;
+
+        match exchange_result {
             Ok(resp) => {
+                if matches!(resp, Response::ConnectionRetiring) {
+                    return Err(RemoteRequestAttemptFailure::connection_retiring());
+                }
                 if let Some(failure) = response_contract_failure(&request, &resp) {
                     discard_replication_payloads_from_response(resp);
                     self.clear_cached_capabilities();
@@ -1068,7 +1574,21 @@ impl RemoteSessionBackend {
                     contract_profile: conn.contract_profile,
                     frame_limits: conn.frame_limits,
                 };
-                if !requires_fresh_connection {
+                let now = tokio::time::Instant::now();
+                self.pool_lifecycle_monitor.apply_to(
+                    &mut conn.lifecycle,
+                    self.reauthentication.generation(),
+                    self.tls_config
+                        .as_ref()
+                        .map(|config| config.material_status().epoch()),
+                    now,
+                    &directed_connection_key(
+                        b"direct",
+                        self.binding.local_replica_id().as_str(),
+                        self.binding.remote_replica_id().as_str(),
+                    ),
+                );
+                if !requires_fresh_connection && conn.lifecycle.retirement(now).is_none() {
                     *guard = Some(conn);
                 }
                 Ok(response)
@@ -1082,6 +1602,82 @@ impl RemoteSessionBackend {
         }
     }
 
+    fn ensure_pool_lifecycle_monitor(&self) {
+        let mut task = self
+            .pool_lifecycle_monitor
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let weak_connection = Arc::downgrade(&self.conn);
+        let tls_config = self.tls_config.clone();
+        let reauthentication = self.reauthentication.clone();
+        // Subscribe before spawning so a publication between this function
+        // returning and the task's first poll is still observed.
+        let mut reauthentication_rx = reauthentication.subscribe();
+        let mut material_rx = tls_config
+            .as_ref()
+            .map(opc_tls::AuthenticatedClientConfig::subscribe_material_changes);
+        let weak_monitor = Arc::downgrade(&self.pool_lifecycle_monitor);
+        let edge_key = directed_connection_key(
+            b"direct",
+            self.binding.local_replica_id().as_str(),
+            self.binding.remote_replica_id().as_str(),
+        );
+        *task = Some(tokio::spawn(async move {
+            loop {
+                enum Change {
+                    Generation,
+                    Material,
+                }
+                let change = tokio::select! {
+                    biased;
+                    changed = reauthentication_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        Change::Generation
+                    }
+                    _ = wait_for_material_change(&mut material_rx) => Change::Material,
+                };
+                // Preserve publication time across a busy connection: the
+                // monitor may wait for the one-in-flight mutex, but the stable
+                // jitter remains anchored to this event rather than checkout.
+                let observed_at = tokio::time::Instant::now();
+                let generation = reauthentication.generation();
+                let material_epoch = tls_config
+                    .as_ref()
+                    .map(|config| config.material_status().epoch());
+                let Some(monitor) = weak_monitor.upgrade() else {
+                    return;
+                };
+                match change {
+                    Change::Generation => monitor.publish_generation(generation, observed_at),
+                    Change::Material => monitor.publish_material(material_epoch, observed_at),
+                }
+                drop(monitor);
+                let Some(connection) = weak_connection.upgrade() else {
+                    return;
+                };
+                let mut connection = connection.lock().await;
+                if let Some(connection) = connection.as_mut() {
+                    let Some(monitor) = weak_monitor.upgrade() else {
+                        return;
+                    };
+                    monitor.apply_to(
+                        &mut connection.lifecycle,
+                        generation,
+                        material_epoch,
+                        observed_at,
+                        &edge_key,
+                    );
+                }
+            }
+        }));
+    }
+
     async fn connect(
         &self,
         operation_deadline: tokio::time::Instant,
@@ -1092,6 +1688,8 @@ impl RemoteSessionBackend {
             self.binding.clone(),
             self.max_frame_size,
             operation_deadline,
+            self.lifecycle_policy,
+            self.reauthentication.clone(),
         )
         .await;
         if let Ok(connection) = &result {
@@ -1133,14 +1731,39 @@ impl RemoteSessionBackend {
         if let Some(transmission_started) = transmission_started {
             transmission_started.store(true, Ordering::Release);
         }
-        write_frame_bounded_until(
+        let write_result = write_frame_bounded_until(
             &mut conn.writer,
             req,
             conn.frame_limits.request_frame_size,
             operation_deadline,
         )
-        .await
-        .map_err(|error| RemoteRequestAttemptFailure::after_transmission_started(&error))?;
+        .await;
+        if let Err(write_error) = write_result {
+            // A server can win the retirement/request race and return the
+            // authenticated no-dispatch proof while this half observes a
+            // write failure. Only a fully decoded fixed control changes the
+            // conservative ambiguous classification; partial frames, EOF,
+            // and every other response retain the original write failure.
+            return match read_response_frame(
+                &mut conn.reader,
+                conn.frame_limits.response_frame_size,
+            )
+            .await
+            {
+                Ok(Response::ConnectionRetiring) => {
+                    Err(RemoteRequestAttemptFailure::connection_retiring())
+                }
+                Ok(other) => {
+                    discard_replication_payloads_from_response(other);
+                    Err(RemoteRequestAttemptFailure::after_transmission_started(
+                        &write_error,
+                    ))
+                }
+                Err(_) => Err(RemoteRequestAttemptFailure::after_transmission_started(
+                    &write_error,
+                )),
+            };
+        }
         read_response_frame(&mut conn.reader, conn.frame_limits.response_frame_size)
             .await
             .map_err(|error| RemoteRequestAttemptFailure::after_transmission_started(&error))
@@ -1641,19 +2264,65 @@ impl SessionBackend for RemoteSessionBackend {
                 )
             })?;
         let cursor = ReplicationWatchCursor::new(start_sequence);
-        let connection = open_watch_connection(
-            self.target.clone(),
-            self.tls_config.clone(),
-            self.max_frame_size,
-            self.binding.clone(),
-            cursor,
-            operation_deadline,
-        )
-        .await?;
+        let config = WatchConnectionConfig {
+            target: self.target.clone(),
+            tls_config: self.tls_config.clone(),
+            binding: self.binding.clone(),
+            max_frame_size: self.max_frame_size,
+            lifecycle_policy: self.lifecycle_policy,
+            reauthentication: self.reauthentication.clone(),
+        };
+        let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
+        let connection = loop {
+            match open_watch_connection(&config, cursor, operation_deadline).await {
+                Ok(connection) => break connection,
+                Err(WatchOpenFailure::Remote(failure)) if failure.is_retryable() => {
+                    METRICS
+                        .session_net_reconnect_attempts
+                        .fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .session_net_reconnect_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    let now = tokio::time::Instant::now();
+                    if now >= operation_deadline {
+                        return Err(watch_open_store_error(WatchOpenFailure::Remote(failure)));
+                    }
+                    let retry_at = now
+                        .checked_add(backoff)
+                        .unwrap_or(operation_deadline)
+                        .min(operation_deadline);
+                    tokio::time::sleep_until(retry_at).await;
+                    backoff = self.lifecycle_policy.next_backoff(backoff);
+                }
+                Err(failure) => return Err(watch_open_store_error(failure)),
+            }
+        };
 
         let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
+        let terminal = Arc::new(std::sync::Mutex::new(None));
+        let task_terminal = terminal.clone();
+        let deadline = self.deadline;
+        // Subscribe before spawning so a rotation publication cannot land in
+        // the gap between returning the caller-visible stream and first poll.
+        let reauthentication_rx = config.reauthentication.subscribe();
+        let material_rx = config
+            .tls_config
+            .as_ref()
+            .map(opc_tls::AuthenticatedClientConfig::subscribe_material_changes);
         tokio::spawn(async move {
-            let result = read_watch_stream(connection, cursor, tx).await;
+            let result = read_watch_stream(
+                connection,
+                cursor,
+                tx,
+                WatchStreamContext {
+                    config,
+                    deadline,
+                    terminal_error: task_terminal,
+                    reauthentication_rx,
+                    material_rx,
+                },
+            )
+            .await;
             if let Err(e) = result {
                 tracing::debug!(
                     failure = RemoteRequestFailure::from_protocol_error(&e).reason_code(),
@@ -1662,7 +2331,11 @@ impl SessionBackend for RemoteSessionBackend {
             }
         });
 
-        Ok(Box::pin(WatchStream { rx }))
+        Ok(Box::pin(WatchStream {
+            rx,
+            terminal,
+            terminal_delivered: false,
+        }))
     }
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
@@ -1740,42 +2413,166 @@ impl SessionLeaseManager for RemoteSessionBackend {
     }
 }
 
-async fn open_watch_connection(
+#[derive(Clone)]
+struct WatchConnectionConfig {
     target: RemoteTarget,
-    tls_config: Option<Arc<opc_tls::ClientConfig>>,
-    max_frame_size: usize,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     binding: RemoteReplicaBinding,
+    max_frame_size: usize,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
+}
+
+async fn open_watch_connection(
+    config: &WatchConnectionConfig,
     cursor: ReplicationWatchCursor,
     operation_deadline: tokio::time::Instant,
-) -> Result<Connection, StoreError> {
+) -> Result<Connection, WatchOpenFailure> {
     // Complete the dedicated watch handshake before returning a stream so a
     // typed backend rejection cannot be confused with a later disconnect.
     let open = async {
-        let mut connection = open_connection(
-            target,
-            tls_config,
-            binding,
-            max_frame_size,
-            operation_deadline,
-        )
-        .await?;
+        let mut backoff = config.lifecycle_policy.reconnect_backoff_min();
+        let mut connection = loop {
+            let mut connection = open_connection(
+                config.target.clone(),
+                config.tls_config.clone(),
+                config.binding.clone(),
+                config.max_frame_size,
+                operation_deadline,
+                config.lifecycle_policy,
+                config.reauthentication.clone(),
+            )
+            .await?;
+            let now = tokio::time::Instant::now();
+            let current_generation = config.reauthentication.generation();
+            let current_material_epoch = config
+                .tls_config
+                .as_ref()
+                .map(|tls| tls.material_status().epoch());
+            connection.lifecycle.observe_rotation(
+                now,
+                current_generation,
+                current_material_epoch,
+                &directed_connection_key(
+                    b"direct",
+                    config.binding.local_replica_id().as_str(),
+                    config.binding.remote_replica_id().as_str(),
+                ),
+            );
+            let mismatch = connection
+                .lifecycle
+                .evidence_mismatch_reason(current_generation, current_material_epoch);
+            if mismatch.is_none() && connection.lifecycle.retirement(now).is_none() {
+                break connection;
+            }
+            if let Some(reason) = mismatch {
+                connection.lifecycle.record_forced_retirement(reason);
+            }
+            let retry_at = now
+                .checked_add(backoff)
+                .unwrap_or(operation_deadline)
+                .min(operation_deadline);
+            tokio::time::sleep_until(retry_at).await;
+            backoff = config.lifecycle_policy.next_backoff(backoff);
+            if tokio::time::Instant::now() >= operation_deadline {
+                return Err(ProtocolError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "watch connection admission deadline expired",
+                )));
+            }
+        };
         let watch = Request::Watch {
             start_sequence: cursor.first_sequence(),
         };
-        write_frame_bounded_until(
-            &mut connection.writer,
-            &watch,
-            connection.frame_limits.request_frame_size,
-            operation_deadline,
-        )
-        .await?;
-        let response = read_response_frame(
-            &mut connection.reader,
-            connection.frame_limits.response_frame_size,
-        )
-        .await?;
+        let mut lifecycle = connection.lifecycle.clone();
+        let mut reauthentication_rx = config.reauthentication.subscribe();
+        let mut material_rx = config
+            .tls_config
+            .as_ref()
+            .map(opc_tls::AuthenticatedClientConfig::subscribe_material_changes);
+        let response = {
+            let transmission_started = AtomicBool::new(false);
+            let setup = async {
+                transmission_started.store(true, Ordering::Release);
+                write_frame_bounded_until(
+                    &mut connection.writer,
+                    &watch,
+                    connection.frame_limits.request_frame_size,
+                    operation_deadline,
+                )
+                .await?;
+                read_response_frame(
+                    &mut connection.reader,
+                    connection.frame_limits.response_frame_size,
+                )
+                .await
+            };
+            tokio::pin!(setup);
+            loop {
+                let now = tokio::time::Instant::now();
+                let current_generation = config.reauthentication.generation();
+                let current_material_epoch = config
+                    .tls_config
+                    .as_ref()
+                    .map(|tls| tls.material_status().epoch());
+                lifecycle.observe_rotation(
+                    now,
+                    current_generation,
+                    current_material_epoch,
+                    &directed_connection_key(
+                        b"direct",
+                        config.binding.local_replica_id().as_str(),
+                        config.binding.remote_replica_id().as_str(),
+                    ),
+                );
+                let mismatch =
+                    lifecycle.evidence_mismatch_reason(current_generation, current_material_epoch);
+                let retired = lifecycle.retirement(now);
+                if !transmission_started.load(Ordering::Acquire)
+                    && (mismatch.is_some() || retired.is_some())
+                {
+                    if let Some(reason) = mismatch {
+                        lifecycle.record_forced_retirement(reason);
+                    }
+                    return Err(ProtocolError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "watch connection retired before setup",
+                    )));
+                }
+                let lifecycle_hard_deadline = lifecycle
+                    .hard_deadline()
+                    .map_err(|_| ProtocolError::InvalidWireValue)?;
+                let hard_deadline = lifecycle_hard_deadline.min(operation_deadline);
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(hard_deadline) => {
+                        let now = tokio::time::Instant::now();
+                        if now >= lifecycle_hard_deadline {
+                            let _ = lifecycle.retirement(now);
+                            lifecycle.record_hard_overrun();
+                        }
+                        return Err(ProtocolError::Io(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "watch setup exceeded the authentication hard deadline",
+                        )));
+                    }
+                    changed = reauthentication_rx.changed() => {
+                        if changed.is_err() {
+                            return Err(ProtocolError::Authentication);
+                        }
+                    }
+                    _ = wait_for_material_change(&mut material_rx) => {}
+                    result = &mut setup => break result?,
+                }
+            }
+        };
+        connection.lifecycle = lifecycle;
         match response {
             Response::WatchStream => Ok::<_, ProtocolError>(Ok(connection)),
+            Response::ConnectionRetiring => Err(ProtocolError::Io(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "watch request was not dispatched before connection retirement",
+            ))),
             Response::WatchEntry(Err(error))
                 if store_error_matches_class(&error, StoreResponseClass::Read) =>
             {
@@ -1792,58 +2589,212 @@ async fn open_watch_connection(
     };
     match tokio::time::timeout_at(operation_deadline, open).await {
         Ok(Ok(Ok(connection))) => Ok(connection),
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(error)) => {
-            let reason = RemoteRequestFailure::from_protocol_error(&error).reason_code();
-            Err(StoreError::BackendUnavailable(format!(
-                "remote session watch handshake failed: {reason}"
-            )))
-        }
-        Err(_) => Err(StoreError::BackendUnavailable(
-            "remote session watch handshake timed out".to_string(),
+        Ok(Ok(Err(error))) => Err(WatchOpenFailure::Backend(error)),
+        Ok(Err(error)) => Err(WatchOpenFailure::Remote(
+            RemoteRequestFailure::from_protocol_error(&error),
+        )),
+        Err(_) => Err(WatchOpenFailure::Remote(RemoteRequestFailure::Timeout)),
+    }
+}
+
+#[derive(Debug)]
+enum WatchOpenFailure {
+    Backend(StoreError),
+    Remote(RemoteRequestFailure),
+}
+
+fn watch_open_store_error(failure: WatchOpenFailure) -> StoreError {
+    match failure {
+        WatchOpenFailure::Backend(error) => error,
+        WatchOpenFailure::Remote(failure) => StoreError::BackendUnavailable(format!(
+            "remote session watch handshake failed: {}",
+            failure.reason_code()
         )),
     }
 }
 
+async fn wait_for_material_change(receiver: &mut Option<opc_tls::TlsMaterialStatusReceiver>) {
+    let closed = match receiver.as_mut() {
+        Some(receiver) => receiver.changed().await.is_err(),
+        None => {
+            std::future::pending::<()>().await;
+            false
+        }
+    };
+    if closed {
+        *receiver = None;
+    }
+}
+
+async fn reconnect_watch(
+    config: &WatchConnectionConfig,
+    deadline: Duration,
+    cursor: ReplicationWatchCursor,
+    tx: &tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
+) -> Result<Option<Connection>, StoreError> {
+    let mut backoff = config.lifecycle_policy.reconnect_backoff_min();
+    loop {
+        let Some(operation_deadline) = tokio::time::Instant::now().checked_add(deadline) else {
+            return Err(StoreError::BackendUnavailable(
+                "remote session watch deadline is not representable".to_string(),
+            ));
+        };
+        METRICS
+            .session_net_reconnect_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let open = open_watch_connection(config, cursor, operation_deadline);
+        tokio::pin!(open);
+        let result = tokio::select! {
+            biased;
+            _ = tx.closed() => return Ok(None),
+            result = &mut open => result,
+        };
+        match result {
+            Ok(connection) => return Ok(Some(connection)),
+            Err(WatchOpenFailure::Remote(failure)) if failure.is_retryable() => {
+                METRICS
+                    .session_net_reconnect_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    _ = tx.closed() => return Ok(None),
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = config.lifecycle_policy.next_backoff(backoff);
+            }
+            Err(WatchOpenFailure::Remote(failure)) => {
+                return Err(watch_open_store_error(WatchOpenFailure::Remote(failure)));
+            }
+            Err(WatchOpenFailure::Backend(error)) => return Err(error),
+        }
+    }
+}
+
+struct WatchStreamContext {
+    config: WatchConnectionConfig,
+    deadline: Duration,
+    terminal_error: Arc<std::sync::Mutex<Option<StoreError>>>,
+    reauthentication_rx: tokio::sync::watch::Receiver<u64>,
+    material_rx: Option<opc_tls::TlsMaterialStatusReceiver>,
+}
+
 async fn read_watch_stream(
-    mut connection: Connection,
+    connection: Connection,
     cursor: ReplicationWatchCursor,
     tx: tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
+    context: WatchStreamContext,
 ) -> Result<(), ProtocolError> {
+    let WatchStreamContext {
+        config,
+        deadline,
+        terminal_error,
+        mut reauthentication_rx,
+        mut material_rx,
+    } = context;
+    let mut connection = Some(connection);
     let mut expected_sequence = cursor.first_sequence();
 
     loop {
-        match read_response_frame(
-            &mut connection.reader,
-            connection.frame_limits.response_frame_size,
-        )
-        .await
-        {
+        // Lifecycle publications must never cancel and recreate a partially
+        // consumed frame read on the same socket. Preserve the exact future
+        // until a full frame arrives or soft retirement drops the connection.
+        let frame = {
+            let connection = connection
+                .as_mut()
+                .expect("watch connection is present while reading");
+            let frame_read = read_response_frame(
+                &mut connection.reader,
+                connection.frame_limits.response_frame_size,
+            );
+            tokio::pin!(frame_read);
+            loop {
+                let now = tokio::time::Instant::now();
+                connection.lifecycle.observe_rotation(
+                    now,
+                    config.reauthentication.generation(),
+                    config
+                        .tls_config
+                        .as_ref()
+                        .map(|config| config.material_status().epoch()),
+                    &directed_connection_key(
+                        b"direct",
+                        config.binding.local_replica_id().as_str(),
+                        config.binding.remote_replica_id().as_str(),
+                    ),
+                );
+                if connection.lifecycle.retirement(now).is_some() {
+                    break Err(ProtocolError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "watch connection retired",
+                    )));
+                }
+                let retire_at = connection.lifecycle.retire_at();
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => return Ok(()),
+                    _ = reauthentication_rx.changed() => {}
+                    _ = wait_for_material_change(&mut material_rx) => {}
+                    _ = tokio::time::sleep_until(retire_at) => {}
+                    frame = &mut frame_read => break frame,
+                }
+            }
+        };
+        match frame {
             Ok(Response::WatchEntry(Ok(entry))) => {
                 let entry = match entry.into_validated() {
                     Ok(entry) if entry.sequence == expected_sequence => entry,
                     Ok(entry) => {
                         discard_replication_payloads_from_response(Response::WatchEntry(Ok(entry)));
-                        let _ = tx.try_send(Err(StoreError::BackendUnavailable(
-                            "remote session watch failed: protocol".to_string(),
-                        )));
+                        set_watch_terminal(
+                            &terminal_error,
+                            StoreError::BackendUnavailable(
+                                "remote session watch failed: protocol".to_string(),
+                            ),
+                        );
                         break;
                     }
                     Err(_) => {
-                        let _ = tx.try_send(Err(StoreError::BackendUnavailable(
-                            "remote session watch failed: protocol".to_string(),
-                        )));
+                        set_watch_terminal(
+                            &terminal_error,
+                            StoreError::BackendUnavailable(
+                                "remote session watch failed: protocol".to_string(),
+                            ),
+                        );
                         break;
                     }
                 };
-                let terminal = expected_sequence == u64::MAX;
-                if !terminal {
-                    expected_sequence = next_replication_sequence(expected_sequence)
-                        .map_err(|_| ProtocolError::InvalidWireValue)?;
+                let terminal_sequence = expected_sequence == u64::MAX;
+                match tx.try_send(Ok(entry)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(item)) => {
+                        if let Ok(entry) = item {
+                            discard_replication_entry_iteratively(entry);
+                        }
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+                        if let Ok(entry) = item {
+                            discard_replication_entry_iteratively(entry);
+                        }
+                        METRICS
+                            .session_net_watch_slow_consumers
+                            .fetch_add(1, Ordering::Relaxed);
+                        set_watch_terminal(
+                            &terminal_error,
+                            StoreError::BackendUnavailable(
+                                "remote session watch consumer is too slow".to_string(),
+                            ),
+                        );
+                        break;
+                    }
                 }
-                if tx.try_send(Ok(entry)).is_err() || terminal {
+                if terminal_sequence {
                     break;
                 }
+                // Resume only after the item crossed the caller-visible
+                // delivery boundary. A disconnect before this point replays
+                // the item; one after it resumes at the checked successor.
+                expected_sequence = next_replication_sequence(expected_sequence)
+                    .map_err(|_| ProtocolError::InvalidWireValue)?;
             }
             Ok(Response::WatchEntry(Err(error))) => {
                 let error = if store_error_matches_class(&error, StoreResponseClass::Read) {
@@ -1853,24 +2804,48 @@ async fn read_watch_stream(
                         "remote session watch failed: protocol".to_string(),
                     )
                 };
-                let _ = tx.try_send(Err(error));
+                set_watch_terminal(&terminal_error, error);
                 break;
             }
             Ok(response) => {
                 discard_replication_payloads_from_response(response);
-                let _ = tx.try_send(Err(StoreError::BackendUnavailable(
-                    "unexpected watch frame".into(),
-                )));
+                set_watch_terminal(
+                    &terminal_error,
+                    StoreError::BackendUnavailable("unexpected watch frame".into()),
+                );
                 break;
             }
-            Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break;
+            Err(ProtocolError::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                // Close the retired/broken socket before dialing. Keeping it
+                // alive until the replacement handshake completes can
+                // deadlock a one-connection peer waiting for this EOF.
+                drop(connection.take());
+                let cursor = ReplicationWatchCursor::new(expected_sequence);
+                match reconnect_watch(&config, deadline, cursor, &tx).await {
+                    Ok(Some(reconnected)) => connection = Some(reconnected),
+                    Ok(None) => break,
+                    Err(error) => {
+                        set_watch_terminal(&terminal_error, error);
+                        break;
+                    }
+                }
             }
             Err(e) => {
                 let reason = RemoteRequestFailure::from_protocol_error(&e).reason_code();
-                let _ = tx.try_send(Err(StoreError::BackendUnavailable(format!(
-                    "remote session watch failed: {reason}"
-                ))));
+                set_watch_terminal(
+                    &terminal_error,
+                    StoreError::BackendUnavailable(format!(
+                        "remote session watch failed: {reason}"
+                    )),
+                );
                 break;
             }
         }
@@ -1915,13 +2890,35 @@ fn store_error_kind(err: &StoreError) -> &'static str {
 
 struct WatchStream {
     rx: tokio::sync::mpsc::Receiver<Result<ReplicationEntry, StoreError>>,
+    terminal: Arc<std::sync::Mutex<Option<StoreError>>>,
+    terminal_delivered: bool,
 }
 
 impl Stream for WatchStream {
     type Item = Result<ReplicationEntry, StoreError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(None) if !self.terminal_delivered => {
+                let terminal = self
+                    .terminal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                self.terminal_delivered = terminal.is_some();
+                terminal.map_or(Poll::Ready(None), |error| Poll::Ready(Some(Err(error))))
+            }
+            result => result,
+        }
+    }
+}
+
+fn set_watch_terminal(terminal: &Arc<std::sync::Mutex<Option<StoreError>>>, error: StoreError) {
+    let mut slot = terminal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_none() {
+        *slot = Some(error);
     }
 }
 
@@ -1936,7 +2933,7 @@ mod tests {
         MAX_REPLICATION_OPERATION_DEPTH,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn successful_hello_ack(hello: &Request) -> Response {
@@ -2164,6 +3161,952 @@ mod tests {
         (addr, handle)
     }
 
+    async fn retirement_then_response_server(
+        response: Response,
+    ) -> (SocketAddr, tokio::task::JoinHandle<Vec<serde_json::Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind retirement test listener");
+        let addr = listener.local_addr().expect("retirement test address");
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(2);
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept mutation client");
+                let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("read retirement hello");
+                write_frame(&mut stream, &successful_hello_ack(&hello))
+                    .await
+                    .expect("write retirement hello ack");
+                let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("read retirement mutation");
+                requests.push(serde_json::to_value(request).expect("mutation wire value"));
+                if attempt == 0 {
+                    write_frame(&mut stream, &Response::ConnectionRetiring)
+                        .await
+                        .expect("write authenticated no-dispatch proof");
+                } else {
+                    write_frame(&mut stream, &response)
+                        .await
+                        .expect("write replacement response");
+                }
+            }
+            requests
+        });
+        (addr, handle)
+    }
+
+    async fn partial_retirement_server() -> (SocketAddr, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind partial-retirement listener");
+        let addr = listener.local_addr().expect("partial-retirement address");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept mutation client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read partial-retirement hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write partial-retirement hello ack");
+            let _request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read partial-retirement mutation");
+            let encoded =
+                serde_json::to_vec(&Response::ConnectionRetiring).expect("encode retirement proof");
+            stream
+                .write_all(
+                    &u32::try_from(encoded.len())
+                        .expect("bounded test frame")
+                        .to_be_bytes(),
+                )
+                .await
+                .expect("write retirement prefix");
+            stream
+                .write_all(&encoded[..encoded.len() / 2])
+                .await
+                .expect("write partial retirement proof");
+            drop(stream);
+            match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+                Ok(Ok((_retry, _))) => 2,
+                _ => 1,
+            }
+        });
+        (addr, handle)
+    }
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected write failure",
+            )))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingBackend {
+        compare_and_set_calls: AtomicUsize,
+        compare_and_set_completed: AtomicUsize,
+        batch_calls: AtomicUsize,
+        lease_calls: AtomicUsize,
+        block_compare_and_set: AtomicBool,
+        compare_and_set_started: tokio::sync::Notify,
+        compare_and_set_release: tokio::sync::Notify,
+    }
+
+    #[derive(Default)]
+    struct SupervisedLateMutationBackend {
+        compare_and_set_calls: AtomicUsize,
+        compare_and_set_completed: Arc<AtomicUsize>,
+        compare_and_set_started: tokio::sync::Notify,
+        compare_and_set_release: Arc<tokio::sync::Notify>,
+        committed_record: Arc<StdMutex<Option<StoredSessionRecord>>>,
+    }
+
+    #[async_trait]
+    impl SessionBackend for CountingBackend {
+        async fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::all_enabled()
+        }
+
+        async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn compare_and_set(
+            &self,
+            _operation: CompareAndSet,
+        ) -> Result<CompareAndSetResult, StoreError> {
+            self.compare_and_set_calls.fetch_add(1, Ordering::SeqCst);
+            if self.block_compare_and_set.load(Ordering::Acquire) {
+                self.compare_and_set_started.notify_one();
+                self.compare_and_set_release.notified().await;
+            }
+            self.compare_and_set_completed
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(CompareAndSetResult::Success)
+        }
+
+        async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn batch(
+            &self,
+            operations: Vec<SessionOp>,
+        ) -> Result<Vec<SessionOpResult>, StoreError> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(operations
+                .into_iter()
+                .map(|operation| match operation {
+                    SessionOp::Get { .. } => SessionOpResult::Get(Ok(None)),
+                    SessionOp::CompareAndSet(_) => {
+                        SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success))
+                    }
+                    SessionOp::DeleteFenced { .. } => SessionOpResult::DeleteFenced(Ok(())),
+                    SessionOp::RefreshTtl { .. } => SessionOpResult::RefreshTtl(Ok(())),
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl SessionLeaseManager for CountingBackend {
+        async fn acquire(
+            &self,
+            _key: &SessionKey,
+            _owner: OwnerId,
+            _ttl: Duration,
+        ) -> Result<LeaseGuard, LeaseError> {
+            self.lease_calls.fetch_add(1, Ordering::SeqCst);
+            Err(LeaseError::Backend("counted acquire".to_string()))
+        }
+
+        async fn renew(
+            &self,
+            _lease: &LeaseGuard,
+            _ttl: Duration,
+        ) -> Result<LeaseGuard, LeaseError> {
+            self.lease_calls.fetch_add(1, Ordering::SeqCst);
+            Err(LeaseError::Backend("counted renew".to_string()))
+        }
+
+        async fn release(&self, _lease: LeaseGuard) -> Result<(), LeaseError> {
+            self.lease_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionBackend for SupervisedLateMutationBackend {
+        async fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::all_enabled()
+        }
+
+        async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+            Ok(self
+                .committed_record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .filter(|record| &record.key == key)
+                .cloned())
+        }
+
+        async fn compare_and_set(
+            &self,
+            operation: CompareAndSet,
+        ) -> Result<CompareAndSetResult, StoreError> {
+            self.compare_and_set_calls.fetch_add(1, Ordering::SeqCst);
+            self.compare_and_set_started.notify_one();
+            let release = self.compare_and_set_release.clone();
+            let completed = self.compare_and_set_completed.clone();
+            let committed_record = self.committed_record.clone();
+            // Model a bounded backend supervisor: dropping this public future
+            // detaches only the already-admitted, still-supervised task. The
+            // task may finish later, which is permitted by SessionBackend.
+            tokio::spawn(async move {
+                release.notified().await;
+                *committed_record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(operation.new_record);
+                completed.fetch_add(1, Ordering::SeqCst);
+                CompareAndSetResult::Success
+            })
+            .await
+            .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)
+        }
+
+        async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn batch(
+            &self,
+            operations: Vec<SessionOp>,
+        ) -> Result<Vec<SessionOpResult>, StoreError> {
+            Ok(operations
+                .into_iter()
+                .map(|operation| match operation {
+                    SessionOp::Get { .. } => SessionOpResult::Get(Ok(None)),
+                    SessionOp::CompareAndSet(_) => {
+                        SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success))
+                    }
+                    SessionOp::DeleteFenced { .. } => SessionOpResult::DeleteFenced(Ok(())),
+                    SessionOp::RefreshTtl { .. } => SessionOpResult::RefreshTtl(Ok(())),
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl SessionLeaseManager for SupervisedLateMutationBackend {
+        async fn acquire(
+            &self,
+            _key: &SessionKey,
+            _owner: OwnerId,
+            _ttl: Duration,
+        ) -> Result<LeaseGuard, LeaseError> {
+            Err(LeaseError::Backend("unused supervised acquire".to_string()))
+        }
+
+        async fn renew(
+            &self,
+            _lease: &LeaseGuard,
+            _ttl: Duration,
+        ) -> Result<LeaseGuard, LeaseError> {
+            Err(LeaseError::Backend("unused supervised renew".to_string()))
+        }
+
+        async fn release(&self, _lease: LeaseGuard) -> Result<(), LeaseError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_retirement_proof_retries_every_mutation_family_exactly_once() {
+        #[derive(Clone, Copy)]
+        enum MutationClass {
+            Cas,
+            Backend,
+            Lease,
+        }
+
+        let operation = valid_compare_and_set(0).await;
+        let lease = operation.lease.clone();
+        let key = operation.key.clone();
+        let owner = lease.owner().clone();
+        let entry = valid_deadline_entry();
+        let cases = vec![
+            (
+                MutationClass::Cas,
+                Request::CompareAndSet {
+                    op: operation,
+                    request_id: Some(uuid::Uuid::nil().hyphenated().to_string()),
+                    idempotency_epoch: None,
+                },
+                Response::CompareAndSet(Ok(CompareAndSetResult::Success)),
+            ),
+            (
+                MutationClass::Backend,
+                Request::DeleteFenced {
+                    lease: lease.clone(),
+                },
+                Response::DeleteFenced(Ok(())),
+            ),
+            (
+                MutationClass::Backend,
+                Request::RefreshTtl {
+                    lease: lease.clone(),
+                    ttl: Duration::from_secs(60),
+                },
+                Response::RefreshTtl(Ok(())),
+            ),
+            (
+                MutationClass::Backend,
+                Request::Batch {
+                    ops: vec![SessionOp::DeleteFenced {
+                        lease: lease.clone(),
+                    }],
+                },
+                Response::Batch(Ok(vec![SessionOpResult::DeleteFenced(Ok(()))])),
+            ),
+            (
+                MutationClass::Backend,
+                Request::ReplicateEntry {
+                    entry: entry.clone(),
+                },
+                Response::ReplicateEntry(Ok(())),
+            ),
+            (
+                MutationClass::Backend,
+                Request::RebuildReplicationState {
+                    entries: vec![entry],
+                },
+                Response::RebuildReplicationState(Ok(())),
+            ),
+            (
+                MutationClass::Lease,
+                Request::AcquireLease {
+                    key,
+                    owner,
+                    ttl: Duration::from_secs(60),
+                },
+                Response::AcquireLease(Err(LeaseError::Backend("replacement reached".to_string()))),
+            ),
+            (
+                MutationClass::Lease,
+                Request::RenewLease {
+                    lease: lease.clone(),
+                    ttl: Duration::from_secs(60),
+                },
+                Response::RenewLease(Err(LeaseError::Backend("replacement reached".to_string()))),
+            ),
+            (
+                MutationClass::Lease,
+                Request::ReleaseLease { lease },
+                Response::ReleaseLease(Ok(())),
+            ),
+        ];
+
+        for (class, request, response) in cases {
+            let expected_response = serde_json::to_value(&response).expect("response wire value");
+            let (addr, server) = retirement_then_response_server(response).await;
+            let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(2)));
+            let actual = match class {
+                MutationClass::Cas => backend
+                    .send_mutation_once(request)
+                    .await
+                    .map_err(|error| error.to_string()),
+                MutationClass::Backend => backend
+                    .send_backend_mutation_once(request)
+                    .await
+                    .map_err(|error| error.to_string()),
+                MutationClass::Lease => backend
+                    .send_lease_mutation_once(request)
+                    .await
+                    .map_err(|error| error.to_string()),
+            }
+            .expect("complete retirement proof must permit one safe retry");
+            assert_eq!(
+                serde_json::to_value(actual).expect("actual response wire value"),
+                expected_response
+            );
+            let requests = server.await.expect("retirement server");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0], requests[1],
+                "the replacement must receive the exact same logical request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_retirement_proof_never_retries_mutations() {
+        let operation = valid_compare_and_set(0).await;
+        let lease = operation.lease.clone();
+
+        let (addr, server) = partial_retirement_server().await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(matches!(
+            backend
+                .send_mutation_once(Request::CompareAndSet {
+                    op: operation,
+                    request_id: Some(uuid::Uuid::nil().hyphenated().to_string()),
+                    idempotency_epoch: None,
+                })
+                .await,
+            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+        assert_eq!(server.await.expect("partial CAS server"), 1);
+
+        let (addr, server) = partial_retirement_server().await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(matches!(
+            backend
+                .send_backend_mutation_once(Request::DeleteFenced {
+                    lease: lease.clone(),
+                })
+                .await,
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        ));
+        assert_eq!(server.await.expect("partial backend server"), 1);
+
+        let (addr, server) = partial_retirement_server().await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(matches!(
+            backend
+                .send_lease_mutation_once(Request::ReleaseLease { lease })
+                .await,
+            Err(LeaseError::OperationOutcomeUnavailable)
+        ));
+        assert_eq!(server.await.expect("partial lease server"), 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_complete_retirement_proof_overrides_a_local_write_failure() {
+        let payload =
+            serde_json::to_vec(&Response::ConnectionRetiring).expect("encode retirement proof");
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("bounded test frame")
+                .to_be_bytes(),
+        );
+        framed.extend_from_slice(&payload);
+        let backend = RemoteSessionBackend::new_insecure(
+            "127.0.0.1:1".parse().expect("unused address"),
+            Some(Duration::from_secs(1)),
+        );
+        let lifecycle = ConnectionLifecycle::new(
+            ConnectionLifecyclePolicy::default(),
+            tokio::time::Instant::now(),
+            None,
+            None,
+            0,
+            None,
+        )
+        .expect("test lifecycle");
+        let mut connection = Connection {
+            reader: Box::new(std::io::Cursor::new(framed)),
+            writer: Box::new(FailingWriter),
+            authenticated_peer: None,
+            contract_profile: CURRENT_CONTRACT_PROFILE,
+            frame_limits: NegotiatedFrameLimits {
+                response_frame_size: DEFAULT_MAX_FRAME_SIZE,
+                request_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            },
+            cas_idempotency_epoch: uuid::Uuid::nil(),
+            lifecycle,
+        };
+        let started = AtomicBool::new(false);
+        let failure = backend
+            .exchange(
+                &Request::MaxReplicationSequence,
+                &mut connection,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Some(&started),
+            )
+            .await
+            .expect_err("buffered retirement proof is a retry classification");
+        assert_eq!(failure.failure, RemoteRequestFailure::ConnectionRetiring);
+        assert!(!failure.request_may_have_reached_server);
+        assert!(started.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn server_only_retirement_reconnects_and_dispatches_each_mutation_once() {
+        let counting = Arc::new(CountingBackend::default());
+        let server_control = SessionReauthenticationControl::new();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("test lifecycle policy");
+        let (server, addr) =
+            crate::server::SessionReplicationServer::new_insecure(counting.clone())
+                .with_connection_lifecycle(policy)
+                .with_reauthentication_control(server_control.clone())
+                .listen("127.0.0.1:0".parse().expect("listen address"))
+                .await
+                .expect("start test server");
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = resolve_calls.clone();
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(addr) }.boxed()
+        });
+        let client = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(2)),
+        )
+        .with_connection_lifecycle(policy);
+        assert!(client.capabilities().await.atomic_compare_and_set);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
+
+        let operation = valid_compare_and_set(0).await;
+        let lease = operation.lease.clone();
+        server_control
+            .request_reauthentication()
+            .expect("retire before CAS");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            client
+                .send_mutation_once(Request::CompareAndSet {
+                    op: operation,
+                    request_id: Some(uuid::Uuid::nil().hyphenated().to_string()),
+                    idempotency_epoch: None,
+                })
+                .await,
+            Ok(Response::CompareAndSet(Ok(CompareAndSetResult::Success)))
+        ));
+        assert_eq!(counting.compare_and_set_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 2);
+
+        server_control
+            .request_reauthentication()
+            .expect("retire before batch");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            client
+                .send_backend_mutation_once(Request::Batch {
+                    ops: vec![SessionOp::DeleteFenced {
+                        lease: lease.clone(),
+                    }],
+                })
+                .await,
+            Ok(Response::Batch(Ok(_)))
+        ));
+        assert_eq!(counting.batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 3);
+
+        server_control
+            .request_reauthentication()
+            .expect("retire before lease release");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            client
+                .send_lease_mutation_once(Request::ReleaseLease { lease })
+                .await,
+            Ok(Response::ReleaseLease(Ok(())))
+        ));
+        assert_eq!(counting.lease_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 4);
+
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn request_admitted_before_soft_retirement_drains_once_then_socket_retires() {
+        let counting = Arc::new(CountingBackend::default());
+        counting
+            .block_compare_and_set
+            .store(true, Ordering::Release);
+        let server_control = SessionReauthenticationControl::new();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .expect("test lifecycle policy");
+        let (server, addr) =
+            crate::server::SessionReplicationServer::new_insecure(counting.clone())
+                .with_connection_lifecycle(policy)
+                .with_reauthentication_control(server_control.clone())
+                .listen("127.0.0.1:0".parse().expect("listen address"))
+                .await
+                .expect("start test server");
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = resolve_calls.clone();
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(addr) }.boxed()
+        });
+        let client = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(2)),
+        )
+        .with_connection_lifecycle(policy);
+        assert!(client.capabilities().await.atomic_compare_and_set);
+
+        let operation = valid_compare_and_set(0).await;
+        let lease = operation.lease.clone();
+        let mutation_client = client.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_client
+                .send_mutation_once(Request::CompareAndSet {
+                    op: operation,
+                    request_id: Some(uuid::Uuid::nil().hyphenated().to_string()),
+                    idempotency_epoch: None,
+                })
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            counting.compare_and_set_started.notified(),
+        )
+        .await
+        .expect("backend mutation must start before retirement");
+        server_control
+            .request_reauthentication()
+            .expect("retire in-flight connection");
+        // The directed jitter is bounded by 20 ms. Keep the admitted request
+        // alive beyond soft retirement but release it well before hard drain.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        counting.compare_and_set_release.notify_one();
+        assert!(matches!(
+            mutation.await.expect("mutation task"),
+            Ok(Response::CompareAndSet(Ok(CompareAndSetResult::Success)))
+        ));
+        assert_eq!(counting.compare_and_set_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(counting.compare_and_set_completed.load(Ordering::SeqCst), 1);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
+
+        assert!(matches!(
+            client
+                .send_backend_mutation_once(Request::Batch {
+                    ops: vec![SessionOp::DeleteFenced { lease }],
+                })
+                .await,
+            Ok(Response::Batch(Ok(_)))
+        ));
+        assert_eq!(counting.batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            2,
+            "the post-soft request must receive no-dispatch proof and reconnect"
+        );
+
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn authentication_hard_deadline_cancels_a_cancellation_sensitive_backend_and_releases_connection_slot(
+    ) {
+        let counting = Arc::new(CountingBackend::default());
+        counting
+            .block_compare_and_set
+            .store(true, Ordering::Release);
+        let server_control = SessionReauthenticationControl::new();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("test lifecycle policy");
+        let (server, addr) =
+            crate::server::SessionReplicationServer::new_insecure(counting.clone())
+                .with_max_connections(1)
+                .with_connection_lifecycle(policy)
+                .with_reauthentication_control(server_control.clone())
+                .listen("127.0.0.1:0".parse().expect("listen address"))
+                .await
+                .expect("start test server");
+        let client = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)))
+            .with_connection_lifecycle(policy);
+        assert!(client.capabilities().await.atomic_compare_and_set);
+
+        let operation = valid_compare_and_set(0).await;
+        let mutation_client = client.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_client
+                .send_mutation_once(Request::CompareAndSet {
+                    op: operation,
+                    request_id: Some(uuid::Uuid::nil().hyphenated().to_string()),
+                    idempotency_epoch: None,
+                })
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            counting.compare_and_set_started.notified(),
+        )
+        .await
+        .expect("slow backend mutation must start");
+        server_control
+            .request_reauthentication()
+            .expect("retire slow connection");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), mutation)
+                .await
+                .expect("hard deadline must end mutation task")
+                .expect("mutation join"),
+            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+        assert_eq!(counting.compare_and_set_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counting.compare_and_set_completed.load(Ordering::SeqCst),
+            0,
+            "this cancellation-sensitive backend must stop when its future is dropped"
+        );
+
+        counting
+            .block_compare_and_set
+            .store(false, Ordering::Release);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), client.capabilities())
+                .await
+                .expect("retired handler must release the sole connection slot")
+                .atomic_compare_and_set
+        );
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn authentication_hard_deadline_reports_ambiguity_without_retrying_a_late_supervised_mutation(
+    ) {
+        let supervised = Arc::new(SupervisedLateMutationBackend::default());
+        let server_control = SessionReauthenticationControl::new();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("test lifecycle policy");
+        let (server, addr) =
+            crate::server::SessionReplicationServer::new_insecure(supervised.clone())
+                .with_max_connections(1)
+                .with_connection_lifecycle(policy)
+                .with_reauthentication_control(server_control.clone())
+                .listen("127.0.0.1:0".parse().expect("listen address"))
+                .await
+                .expect("start test server");
+        let client = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)))
+            .with_connection_lifecycle(policy);
+        assert!(client.capabilities().await.atomic_compare_and_set);
+
+        let operation = valid_compare_and_set(0).await;
+        let operation_for_replay = operation.clone();
+        let committed_key = operation.key.clone();
+        let mutation_client = client.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_client
+                .send_mutation_once(Request::CompareAndSet {
+                    op: operation,
+                    request_id: Some(uuid::Uuid::nil().hyphenated().to_string()),
+                    idempotency_epoch: None,
+                })
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            supervised.compare_and_set_started.notified(),
+        )
+        .await
+        .expect("supervised backend mutation must start");
+        server_control
+            .request_reauthentication()
+            .expect("retire supervised mutation connection");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), mutation)
+                .await
+                .expect("hard deadline must close the transport wait")
+                .expect("mutation join"),
+            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+        assert_eq!(supervised.compare_and_set_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            supervised.compare_and_set_completed.load(Ordering::SeqCst),
+            0,
+            "transport completion must not pretend the supervised mutation rolled back"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), client.capabilities())
+                .await
+                .expect("retired handler must release the sole connection slot")
+                .atomic_compare_and_set
+        );
+        assert_eq!(
+            supervised.compare_and_set_calls.load(Ordering::SeqCst),
+            1,
+            "the ambiguous mutation must never be automatically retried"
+        );
+
+        supervised.compare_and_set_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while supervised.compare_and_set_completed.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded supervised mutation may finish after transport retirement");
+        assert_eq!(
+            supervised.compare_and_set_completed.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(supervised.compare_and_set_calls.load(Ordering::SeqCst), 1);
+        assert!(client
+            .get(&committed_key)
+            .await
+            .expect("authoritative reread after ambiguous completion")
+            .is_some());
+        let replay = client
+            .send_mutation_once(Request::CompareAndSet {
+                op: operation_for_replay,
+                request_id: Some(uuid::Uuid::nil().hyphenated().to_string()),
+                idempotency_epoch: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                replay,
+                Ok(Response::CompareAndSet(Err(
+                    StoreError::CasIdempotencyOutcomeUnavailable
+                )))
+            ),
+            "unexpected exact ambiguity replay result: {replay:?}"
+        );
+        assert_eq!(
+            supervised.compare_and_set_calls.load(Ordering::SeqCst),
+            1,
+            "the exact replay must resolve from the ambiguity tombstone without redispatch"
+        );
+
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_client_aborts_the_pool_lifecycle_monitor() {
+        let backend = RemoteSessionBackend::new_insecure(
+            "127.0.0.1:1".parse().expect("unused address"),
+            Some(Duration::from_secs(1)),
+        );
+        backend.ensure_pool_lifecycle_monitor();
+        let weak_monitor = Arc::downgrade(&backend.pool_lifecycle_monitor);
+        assert!(weak_monitor.upgrade().is_some());
+        drop(backend);
+        tokio::task::yield_now().await;
+        assert!(
+            weak_monitor.upgrade().is_none(),
+            "the monitor task must not retain its own owner or TLS/control sources"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_pool_checkout_uses_the_published_event_time_without_collapsing_jitter() {
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+        )
+        .expect("test lifecycle policy");
+        let mut directed = Vec::new();
+        for suffix in 0_u16..=u16::MAX {
+            let key = suffix.to_be_bytes();
+            let jitter = policy.deterministic_jitter(&key);
+            if jitter > Duration::from_millis(100)
+                && directed
+                    .first()
+                    .is_none_or(|(_, first_jitter)| *first_jitter != jitter)
+            {
+                directed.push((key, jitter));
+                if directed.len() == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(directed.len(), 2, "test requires two distinct edge jitters");
+
+        let monitor = PoolLifecycleMonitor::default();
+        let observed_at = tokio::time::Instant::now();
+        monitor.publish_generation(1, observed_at);
+        // Model the task blocked behind the one-in-flight mutex while queued
+        // checkouts observe the new generation first.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let checkout_at = tokio::time::Instant::now();
+        let mut first = ConnectionLifecycle::new(policy, observed_at, None, None, 0, None)
+            .expect("first lifecycle");
+        let mut second = ConnectionLifecycle::new(policy, observed_at, None, None, 0, None)
+            .expect("second lifecycle");
+        monitor.apply_to(&mut first, 1, None, checkout_at, &directed[0].0);
+        monitor.apply_to(&mut second, 1, None, checkout_at, &directed[1].0);
+        assert_eq!(first.retire_at(), observed_at + directed[0].1);
+        assert_eq!(second.retire_at(), observed_at + directed[1].1);
+        assert_ne!(first.retire_at(), second.retire_at());
+        assert!(first.retirement(checkout_at).is_none());
+        assert!(second.retirement(checkout_at).is_none());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        monitor.publish_generation(2, tokio::time::Instant::now());
+        let mut coalesced = ConnectionLifecycle::new(policy, observed_at, None, None, 0, None)
+            .expect("coalesced lifecycle");
+        monitor.apply_to(
+            &mut coalesced,
+            2,
+            None,
+            tokio::time::Instant::now(),
+            &directed[0].0,
+        );
+        assert_eq!(
+            coalesced.retire_at(),
+            observed_at + directed[0].1,
+            "a later generation publication must not postpone an existing stale connection"
+        );
+    }
+
     #[tokio::test]
     async fn mutations_are_not_retried_after_response_loss_and_preconnect_failure_is_known_safe() {
         let fixture = FakeSessionBackend::new();
@@ -2211,6 +4154,78 @@ mod tests {
             .await
             .expect_err("connect failure is known not applied");
         assert!(matches!(error, StoreError::BackendUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn bounded_pretransmission_retry_preserves_the_last_transport_classification() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unreachable address");
+        let unreachable = listener.local_addr().expect("unreachable address");
+        drop(listener);
+        let resolver: RemoteAddrResolver = Arc::new(move || async move { Ok(unreachable) }.boxed());
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_millis(150)),
+        );
+
+        assert!(matches!(
+            backend
+                .send_request_classified(Request::MaxReplicationSequence)
+                .await,
+            Err(RemoteRequestFailure::Transport)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_prior_pretransmission_transport_does_not_mask_post_write_mutation_ambiguity() {
+        let fixture = FakeSessionBackend::new();
+        let key = match valid_deadline_entry().op {
+            ReplicationOp::RefreshTtl { key, .. } => key,
+            _ => unreachable!("fixture operation is fixed"),
+        };
+        let lease = fixture
+            .acquire(
+                &key,
+                OwnerId::new("mixed-failure-owner").expect("owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("fixture lease");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unreachable address");
+        let unreachable = listener.local_addr().expect("unreachable address");
+        drop(listener);
+        let (server_addr, server) = response_loss_server().await;
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = {
+            let resolutions = resolutions.clone();
+            Arc::new(move || {
+                let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Ok(unreachable)
+                    } else {
+                        Ok(server_addr)
+                    }
+                }
+                .boxed()
+            })
+        };
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(1)),
+        );
+
+        assert!(matches!(
+            backend
+                .send_backend_mutation_once(Request::DeleteFenced { lease })
+                .await,
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        ));
+        assert!(resolutions.load(Ordering::SeqCst) >= 2);
+        assert_eq!(server.await.expect("response-loss server"), 1);
     }
 
     async fn warmed_malicious_response_server(
@@ -2437,6 +4452,8 @@ mod tests {
                 crate::identity::insecure_test_client_binding(),
                 configured_frame_size,
                 deadline,
+                ConnectionLifecyclePolicy::default(),
+                SessionReauthenticationControl::new(),
             )
             .await
             {
@@ -2745,11 +4762,11 @@ mod tests {
             .await
             .expect("write constrained acknowledgement");
             let mut byte = [0u8; 1];
-            let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
-                .await
-                .expect("client must close after local preflight")
-                .expect("read connection close");
-            assert_eq!(read, 0, "no operation prefix may be emitted");
+            match tokio::time::timeout(Duration::from_millis(250), stream.read(&mut byte)).await {
+                Err(_) | Ok(Ok(0)) => {}
+                Ok(Ok(read)) => panic!("local preflight emitted {read} operation-prefix bytes"),
+                Ok(Err(error)) => panic!("preflight connection read failed: {error}"),
+            }
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
         let mut key = match valid_deadline_entry().op {
@@ -4027,6 +6044,456 @@ mod tests {
             StoreError::BackendUnavailable("remote session watch failed: protocol".to_string())
         );
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn watch_reauthentication_reconnects_from_the_exact_delivered_successor() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind watch-rotation listener");
+        let addr = listener.local_addr().expect("watch-rotation address");
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("accept first watch client");
+            let hello: Request = read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read first watch hello");
+            write_frame(&mut first, &successful_hello_ack(&hello))
+                .await
+                .expect("write first watch hello ack");
+            let request: Request = read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read first watch request");
+            assert!(matches!(request, Request::Watch { start_sequence: 1 }));
+            write_frame(&mut first, &Response::WatchStream)
+                .await
+                .expect("write first watch ack");
+            write_frame(
+                &mut first,
+                &Response::WatchEntry(Ok(valid_deadline_entry())),
+            )
+            .await
+            .expect("write first watch entry");
+            let mut eof = [0_u8; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), first.read(&mut eof))
+                    .await
+                    .expect("rotated watch must close promptly")
+                    .expect("read rotated watch EOF"),
+                0
+            );
+
+            let (mut second, _) = listener.accept().await.expect("accept replacement watch");
+            let hello: Request = read_frame(&mut second, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read replacement watch hello");
+            write_frame(&mut second, &successful_hello_ack(&hello))
+                .await
+                .expect("write replacement watch hello ack");
+            let request: Request = read_frame(&mut second, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read replacement watch request");
+            assert!(matches!(request, Request::Watch { start_sequence: 2 }));
+            write_frame(&mut second, &Response::WatchStream)
+                .await
+                .expect("write replacement watch ack");
+            let mut second_entry = valid_deadline_entry();
+            second_entry.sequence = 2;
+            second_entry.tx_id = "watch-rotation-2".try_into().expect("valid transaction ID");
+            write_frame(&mut second, &Response::WatchEntry(Ok(second_entry)))
+                .await
+                .expect("write replacement watch entry");
+        });
+        let control = SessionReauthenticationControl::new();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("watch lifecycle policy");
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)))
+            .with_connection_lifecycle(policy)
+            .with_reauthentication_control(control.clone());
+        let mut watch = backend.watch(1).await.expect("open first watch");
+        assert_eq!(
+            watch
+                .next()
+                .await
+                .expect("first watch item")
+                .expect("first watch success")
+                .sequence,
+            1
+        );
+        control
+            .request_reauthentication()
+            .expect("request watch reauthentication");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next())
+                .await
+                .expect("replacement watch deadline")
+                .expect("replacement watch item")
+                .expect("replacement watch success")
+                .sequence,
+            2
+        );
+        drop(watch);
+        server.await.expect("watch-rotation server");
+    }
+
+    #[tokio::test]
+    async fn watch_setup_retries_only_after_complete_no_dispatch_proof() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind watch-setup-retirement listener");
+        let addr = listener
+            .local_addr()
+            .expect("watch-setup-retirement address");
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept watch client");
+                let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("read watch setup hello");
+                write_frame(&mut stream, &successful_hello_ack(&hello))
+                    .await
+                    .expect("write watch setup hello ack");
+                let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("read watch setup request");
+                assert!(matches!(request, Request::Watch { start_sequence: 7 }));
+                if attempt == 0 {
+                    write_frame(&mut stream, &Response::ConnectionRetiring)
+                        .await
+                        .expect("write watch no-dispatch proof");
+                } else {
+                    write_frame(&mut stream, &Response::WatchStream)
+                        .await
+                        .expect("write replacement watch ack");
+                    let mut entry = valid_deadline_entry();
+                    entry.sequence = 7;
+                    entry.tx_id = "watch-setup-replacement"
+                        .try_into()
+                        .expect("valid transaction ID");
+                    write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
+                        .await
+                        .expect("write replacement watch item");
+                }
+            }
+        });
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("watch setup lifecycle policy");
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)))
+            .with_connection_lifecycle(policy);
+        let mut watch = backend.watch(7).await.expect("retry watch setup");
+        assert_eq!(
+            watch
+                .next()
+                .await
+                .expect("replacement watch item")
+                .expect("replacement watch success")
+                .sequence,
+            7
+        );
+        drop(watch);
+        server.await.expect("watch-setup-retirement server");
+    }
+
+    #[tokio::test]
+    async fn watch_rotation_never_restarts_a_partially_consumed_frame_on_the_same_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind partial-watch listener");
+        let addr = listener.local_addr().expect("partial-watch address");
+        let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept watch client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read partial-watch hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write partial-watch hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read partial-watch request");
+            assert!(matches!(request, Request::Watch { start_sequence: 1 }));
+            write_frame(&mut stream, &Response::WatchStream)
+                .await
+                .expect("write partial-watch ack");
+            let encoded = serde_json::to_vec(&Response::WatchEntry(Ok(valid_deadline_entry())))
+                .expect("encode watch entry");
+            stream
+                .write_all(
+                    &u32::try_from(encoded.len())
+                        .expect("bounded watch frame")
+                        .to_be_bytes(),
+                )
+                .await
+                .expect("write watch prefix");
+            let midpoint = encoded.len() / 2;
+            stream
+                .write_all(&encoded[..midpoint])
+                .await
+                .expect("write first watch fragment");
+            partial_tx.send(()).expect("publish partial frame");
+            continue_rx.await.expect("continue partial frame");
+            stream
+                .write_all(&encoded[midpoint..])
+                .await
+                .expect("write final watch fragment");
+        });
+        let control = SessionReauthenticationControl::new();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::from_secs(30),
+        )
+        .expect("partial-watch lifecycle policy");
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)))
+            .with_connection_lifecycle(policy)
+            .with_reauthentication_control(control.clone());
+        let edge = directed_connection_key(
+            b"direct",
+            backend.binding.local_replica_id().as_str(),
+            backend.binding.remote_replica_id().as_str(),
+        );
+        let jitter = policy.deterministic_jitter(&edge);
+        assert!(
+            jitter > Duration::from_millis(50),
+            "fixed insecure-test edge must leave a partial-frame observation window"
+        );
+        let mut watch = backend.watch(1).await.expect("open partial watch");
+        partial_rx.await.expect("observe partial watch frame");
+        control
+            .request_reauthentication()
+            .expect("request partial-watch reauthentication");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        continue_tx.send(()).expect("finish partial watch frame");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), watch.next())
+                .await
+                .expect("partial watch delivery deadline")
+                .expect("partial watch item")
+                .expect("partial watch success")
+                .sequence,
+            1
+        );
+        drop(watch);
+        server.await.expect("partial-watch server");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stalled_watch_closes_the_transport_task_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cancelled-watch listener");
+        let addr = listener.local_addr().expect("cancelled-watch address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept watch client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read cancelled-watch hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write cancelled-watch hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read cancelled-watch request");
+            assert!(matches!(request, Request::Watch { .. }));
+            write_frame(&mut stream, &Response::WatchStream)
+                .await
+                .expect("write cancelled-watch ack");
+            let mut eof = [0_u8; 1];
+            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut eof))
+                .await
+                .expect("caller cancellation must close stalled watch")
+                .expect("read cancelled-watch EOF")
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        let watch = backend.watch(1).await.expect("open cancelled watch");
+        drop(watch);
+        assert_eq!(server.await.expect("cancelled-watch server"), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_watch_sequence_is_delivered_once_without_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind terminal-watch listener");
+        let addr = listener.local_addr().expect("terminal-watch address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept watch client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read terminal-watch hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write terminal-watch hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read terminal-watch request");
+            assert!(matches!(
+                request,
+                Request::Watch {
+                    start_sequence: u64::MAX
+                }
+            ));
+            write_frame(&mut stream, &Response::WatchStream)
+                .await
+                .expect("write terminal-watch ack");
+            let mut entry = valid_deadline_entry();
+            entry.sequence = u64::MAX;
+            entry.tx_id = "terminal-watch".try_into().expect("valid transaction ID");
+            write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
+                .await
+                .expect("write terminal-watch entry");
+            match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+                Ok(Ok((_retry, _))) => 2,
+                _ => 1,
+            }
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        let mut watch = backend.watch(u64::MAX).await.expect("open terminal watch");
+        assert_eq!(
+            watch
+                .next()
+                .await
+                .expect("terminal watch item")
+                .expect("terminal watch success")
+                .sequence,
+            u64::MAX
+        );
+        assert!(watch.next().await.is_none());
+        assert_eq!(server.await.expect("terminal-watch server"), 1);
+    }
+
+    #[tokio::test]
+    async fn permanent_watch_error_is_delivered_once_without_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind permanent-watch listener");
+        let addr = listener.local_addr().expect("permanent-watch address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept watch client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read permanent-watch hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write permanent-watch hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read permanent-watch request");
+            assert!(matches!(request, Request::Watch { .. }));
+            write_frame(&mut stream, &Response::WatchStream)
+                .await
+                .expect("write permanent-watch ack");
+            write_frame(
+                &mut stream,
+                &Response::WatchEntry(Err(StoreError::ReplicationWatchCatchUpRequired)),
+            )
+            .await
+            .expect("write permanent watch error");
+            match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+                Ok(Ok((_retry, _))) => 2,
+                _ => 1,
+            }
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        let mut watch = backend.watch(1).await.expect("open permanent watch");
+        assert_eq!(
+            watch.next().await.expect("permanent watch item"),
+            Err(StoreError::ReplicationWatchCatchUpRequired)
+        );
+        assert!(watch.next().await.is_none());
+        assert_eq!(server.await.expect("permanent-watch server"), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_watch_consumer_gets_one_explicit_terminal_error_without_unbounded_retention() {
+        let before = METRICS
+            .session_net_watch_slow_consumers
+            .load(Ordering::Relaxed);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow-watch listener");
+        let addr = listener.local_addr().expect("slow-watch address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept watch client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read slow-watch hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write slow-watch hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read slow-watch request");
+            assert!(matches!(request, Request::Watch { start_sequence: 1 }));
+            write_frame(&mut stream, &Response::WatchStream)
+                .await
+                .expect("write slow-watch ack");
+            for sequence in
+                1..=u64::try_from(WATCH_CHANNEL_CAPACITY + 2).expect("bounded watch test width")
+            {
+                let mut entry = valid_deadline_entry();
+                entry.sequence = sequence;
+                entry.tx_id = format!("slow-watch-{sequence}")
+                    .try_into()
+                    .expect("valid transaction ID");
+                if write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        let mut watch = backend.watch(1).await.expect("open slow watch");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut successes = 0_usize;
+        let mut terminal = None;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("slow-watch terminal deadline")
+        {
+            match item {
+                Ok(entry) => {
+                    successes += 1;
+                    drop(entry.into_validated());
+                }
+                Err(error) => {
+                    terminal = Some(error);
+                    break;
+                }
+            }
+        }
+        assert!(successes <= WATCH_CHANNEL_CAPACITY);
+        assert_eq!(
+            terminal,
+            Some(StoreError::BackendUnavailable(
+                "remote session watch consumer is too slow".to_string()
+            ))
+        );
+        assert!(watch.next().await.is_none());
+        assert!(
+            METRICS
+                .session_net_watch_slow_consumers
+                .load(Ordering::Relaxed)
+                > before
+        );
+        server.await.expect("slow-watch server");
     }
 
     #[tokio::test]

@@ -121,9 +121,10 @@ campaign that quarantines every selected PVC and resumes from one immutable
 operator-selected checkpoint without becoming a second runtime authority; see
 the [recovery runbook](session-store-legacy-recovery.md). #133 provides bounded
 applied-state restore with snapshot-bound cursors. Absolute record-expiry
-hardening is implemented under #148; watch handoff is implemented, and
-network/resource/rotation qualification remains #143. #161 and #162 are
-implemented; #163 -> #164 remain under umbrella #158. Stable
+hardening is implemented under #148; watch handoff and finite connection
+reauthentication are implemented under #145/#163. Network/resource
+qualification remains #143. #161 and #162 are implemented; #164 fleet rotation
+evidence remains under umbrella #158. Stable
 ID bounds are implemented under #167. #168 adds the bounded durable
 transaction-ID type, canonical coordinator mint, exact legacy preservation,
 SQLite/snapshot/recovery validation, and version-3 migration audit. #171
@@ -430,7 +431,7 @@ response budget, a confidential authenticated strictly bounded restore cursor, a
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 5, error-set revision 8, a 4 MiB restore
+profile pins wire-schema revision 6, error-set revision 8, a 4 MiB restore
 payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, the
 31,536,000-second TTL maximum, and
@@ -524,21 +525,22 @@ moves to one exact profile together. Rollback across `OPCH`/#135 retains its
 independent coherent-checkpoint or reverse-migration requirement.
 
 Session caches, tickets, resumption, early data, and 0-RTT are disabled, so a
-reconnect performs a full mutual-TLS certificate exchange. Production still
-requires complete certificate and trust-bundle rotation without interrupting
-session service. Real-mTLS tests now qualify a correctly scoped renewed SVID on
-a subsequent new call/full handshake and wrong-scope rejection. They do not
-exercise a retained old connection. Fleet trust overlap, revocation,
-long-lived-connection retirement, reconnect storms, a documented maximum
-authentication age, multi-process rotation, seamless continuity, and soak
-remain open production work under the existing lifecycle/#143 gates.
+reconnect performs a full mutual-TLS certificate exchange. #163 gives every
+connection a finite maximum authentication age and exact local/peer leaf-expiry
+bound, retires retained connections on coherent material-epoch or explicit
+reauthentication changes, ends transport waits and releases connection slots by
+the hard deadline, and reconnects watches from the exact delivered cursor. A
+bounded supervised mutation may still finish later; its outcome remains typed
+ambiguous and must not be automatically retried. Fleet trust overlap/removal,
+revocation, reconnect-storm, multi-process rotation, seamless continuity, and
+soak remain production evidence under #164/#143.
 
 For Kubernetes mounts, `ProjectedSvidSource` now publishes only a bounded,
 validated candidate read from one immutable `..data` target and retains a
-failed candidate's predecessor only until expiry. That closes source-level
-atomicity, not connection continuity: #162 implements coherent handshake
-epochs; #163 retirement/reauthentication and #164 fleet evidence remain under
-umbrella #158. Distributed qualification remains #143. Session
+failed candidate's predecessor only until expiry. #162 implements coherent
+handshake epochs and #163 consumes those epochs for connection continuity;
+#164 fleet evidence remains under umbrella #158. Distributed qualification
+remains #143. Session
 TTL is application-state lifetime; the 365-day bound is not a
 certificate-expiry, trust-validity, or authentication-age policy.
 
@@ -631,10 +633,9 @@ second consensus algorithm.
   config keys, reads from followers, snapshots and restarts the fleet, and
   scans durable artifacts for plaintext, raw-key, and provider-endpoint
   canaries. Followers, apply, snapshots, and recovery make no provider calls.
-- **Shared mTLS lifecycle**: `opc-session-net` transport tests observe a
-  renewed SVID on a subsequent new call/full handshake and reject a rotated
-  client or server identity outside the bound peer scope. They do not exercise
-  retained-connection retirement or seamless continuity. The suite also forms
+- **Shared mTLS lifecycle**: `opc-session-net` transport tests cover local and
+  peer leaf-expiry retirement, overlapping trust, full replacement admission,
+  and removed/wrong-scope identity rejection. The suite also forms
   a real three-node config Openraft cluster and commits/linearizably reads
   through the existing mTLS peer/server types.
 
@@ -685,8 +686,9 @@ implement a second quorum algorithm.
   fixed redaction-safe fallbacks, authenticated slow-reader reaping, connection
   slot recovery, ambiguous mutation outcomes, and deterministic shutdown.
   Passing those tests demonstrates the #159 transport boundary only; #171
-  supplies bounded log-range cursor semantics. The complete seamless credential
-  lifecycle and #143 production qualification remain open. #167/#168 separately supply
+  supplies bounded log-range cursor semantics and #163 supplies the finite
+  credential lifecycle. #164/#143 fleet and production qualification remains
+  open. #167/#168 separately supply
   the structural retained-identity and migration contracts. #177 reuses this shared
   transport boundary for config consensus instead of maintaining a separate
   config TCP deadline or credential path.

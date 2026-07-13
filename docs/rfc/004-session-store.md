@@ -26,9 +26,10 @@ linearizable-read authority. `ConsensusSessionStore` is the operational store;
 This RFC does not claim production qualification: #128 supplies
 current-format recovery and #129 supplies the audited offline legacy-fork
 campaign, while #133 supplies bounded restore from the Openraft-applied state
-without becoming readiness evidence by itself. Distributed qualification
-(#143) and seamless credential rotation beyond the qualified
-subsequent-new-call/full-handshake SVID scope remain gates.
+without becoming readiness evidence by itself. Connection reauthentication and
+retained-connection continuity are implemented under #163. Distributed fleet
+qualification of trust overlap/removal, revocation, reconnect storms,
+resources, and soak (#164/#143) remains a gate.
 
 ## 2. Scope
 
@@ -265,9 +266,9 @@ boundary. Protocol-v4 fixed-width wire admission is implemented under #134,
 and #127 now supplies Openraft durable commit authority. #128 supplies
 current-format divergence recovery and #129 supplies explicit offline
 legacy-fork recovery. #133 supplies bounded snapshot-bound applied-state
-restore; production qualification (#143) remains open. #161 atomic reload and
-#162 coherent material epochs are implemented; #163 connection
-reauthentication and #164 fleet qualification remain under umbrella #158;
+restore; production qualification (#143) remains open. #161 atomic reload,
+#162 coherent material epochs, and #163 connection reauthentication are
+implemented; #164 fleet qualification remains under umbrella #158;
 payload-protection-key rotation and distributed production evidence remain
 #143.
 
@@ -934,7 +935,7 @@ Serde boundary MUST delegate to private fixed-width v5 DTOs. `Hello` and
 `HelloAck` add an optional `contract_profile`; `HelloAck` also carries the
 server's optional `cas_idempotency_epoch`, and direct CAS carries an optional
 `idempotency_epoch`. Exhaustive Rust construction and matching MUST account for
-the new fields. The profile pins wire-schema revision 5 and error-set revision
+the new fields. The profile pins wire-schema revision 6 and error-set revision
 8; owner, custom-key, and state-type
 bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `max_frame_size = 16777216`;
@@ -1169,7 +1170,7 @@ or traffic admission. A cache MUST be keyed by the exact profile and negotiated
 directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
-The transition to v5 wire-schema revision 5 and error-set revision 8 is a
+The transition to v5 wire-schema revision 6 and error-set revision 8 is a
 coordinated stop/upgrade/start boundary, not a rolling deployment. Operators
 MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore
@@ -1206,6 +1207,13 @@ migration. Mixed revision-3 and older participants fail closed. Rollback
 across the independent `OPCH`/#135 boundary retains its checkpoint/reverse-
 migration requirement.
 
+That compatibility cutover is distinct from credential rotation. Only after
+every participant is admitted on the same revision-6 profile MAY operators use
+material-epoch or explicit reauthentication to recycle connections without
+draining application traffic. The lifecycle MUST NOT be used to mix protocol
+profiles, negotiate a downgrade, or turn a binary rollback into a rolling
+operation.
+
 The cursor encoding is variable-length but strictly bounded by the consensus
 RPC/key ceiling. HMAC-derived AEAD and synthetic-nonce keys are separated;
 identical semantic positions encode identically. The seek key and snapshot
@@ -1221,20 +1229,21 @@ caller MUST discard partial pagination and restart at the first page.
 
 #159 establishes only session-net response/write and wire-containment bounds.
 It does not close #167 or #168 and does not provide #143's
-payload-key/distributed production qualification. Real-mTLS transport tests now
-qualify a renewed SVID on a subsequent new call/full handshake and rejection
-of rotated client/server identities outside the bound peer scope. That scoped
-evidence is not seamless rotation, old-connection retirement, multi-process
-rotation/soak, or the complete trust-bundle, revocation, and
-authentication-age lifecycle. #177 removes `opc-persist`'s separate config TCP
+payload-key/distributed production qualification. #163 real-mTLS transport
+tests cover local/peer leaf-expiry retirement, overlapping trust, complete
+replacement negotiation, old-trust rejection, and request/watch continuity.
+That scoped evidence is not #164/#143's multi-process rotation/soak,
+reconnect-storm, revocation, or fleet trust-removal qualification. #177 removes
+`opc-persist`'s separate config TCP
 path and reuses the shared consensus peer/handler boundary instead of defining
 another timeout or credential lifecycle. An in-process real-mTLS integration
 forms a three-node config Openraft cluster and commits/linearizably reads
 through the existing peer/server types. Any compatibility transport work
 must preserve the single Openraft authority rather than reopen direct mutation
 as a quorum path.
-#161 atomic reload and #162 coherent material epochs are implemented. Seamless
-SVID/trust-bundle rotation remains #163 -> #164 under umbrella #158.
+#161 atomic reload, #162 coherent material epochs, and #163 finite connection
+reauthentication are implemented. Fleet SVID/trust-bundle qualification remains
+#164 under umbrella #158.
 
 ### 12.4 Consensus-Only Session Transport
 
@@ -1279,23 +1288,51 @@ NOT interpret commands or decide leadership, voting, log matching, commit, or
 repair. An identity, authentication, schema, payload-bound, or sender mismatch
 MUST fail before Openraft dispatch with redaction-safe diagnostics.
 
+Every authenticated client, peer, and listener MUST apply one finite
+`ConnectionLifecyclePolicy`. Its hard deadline MUST be the earliest of the
+configured maximum authentication age, authenticated local leaf expiry, and
+authenticated peer leaf expiry. Soft retirement MUST begin early enough to
+leave at most one configured drain window before that hard deadline. A coherent
+TLS material-epoch change or an explicit process-local reauthentication
+generation MUST also schedule retirement, using deterministic directed-peer
+jitter no greater than the configured bound.
+
+After soft retirement the client MUST NOT assign a new operation to the
+connection and the server MUST NOT read or dispatch another request. An
+operation admitted before retirement MAY return once within its existing
+operation deadline, but transport ownership MUST stop waiting by the lifecycle
+hard deadline and MUST release every connection/task slot. Dropping the backend
+future requests cancellation but MUST NOT be interpreted as rollback: bounded
+supervised mutation work MAY finish later. Such an outcome MUST remain typed
+ambiguous, MUST NOT be automatically replayed, and requires authoritative
+readback or the operation's existing idempotency/fencing contract. A replacement
+MUST repeat DNS/route resolution, mutual TLS, live certificate identity,
+nonce/challenge, ALPN, version, and exact contract-profile checks. TLS
+resumption, cached peer authority, plaintext fallback, and task-abort
+reauthentication MUST NOT replace that handshake.
+
+The legacy direct profile MAY automatically retry a mutation after retirement
+only when it has decoded the complete fixed `ConnectionRetiring` response,
+which proves server dispatch did not occur. EOF, a partial retirement frame,
+write failure without a complete buffered proof, or a generic transport error
+MUST remain an ambiguous mutation outcome. A legacy watch MUST keep the caller
+stream alive across planned retirement, pin any partially read item to its old
+connection, advance the resume cursor only after caller delivery, and resume
+from checked `last_delivered_sequence + 1`. Cursor overflow, compaction or
+another permanent backend error, cancellation, and bounded slow-consumer
+failure MUST terminate explicitly rather than reconnect forever.
+
 This authenticated transport plus #127 commit authority is still not a
 production qualification. #128 supplies current-format divergence recovery,
 #129 supplies the audited offline legacy-fork campaign without reopening a
 runtime consensus path, and #133 provides bounded applied-state restore without
 reopening a direct backend/rebuild port. #143 remains the distributed
-partition/restart/resource/soak and payload-key gate. Real-mTLS
-transport tests now qualify live client/server SVID reload observed by a fresh
-full handshake on a subsequent new call, success for a correctly scoped
-renewed identity, and rejection of an incorrectly scoped rotated identity.
-They do not exercise an in-flight or retained old connection. Full seamless
-production rotation MUST additionally overlap old/new trust, retire old
-connections, enforce revocation and a documented maximum authentication age,
-bound reconnect storms, and supply multi-process/soak evidence. The scoped
-in-process new-call result does not close those fleet lifecycle requirements.
-#161 atomic reload and #162 material epochs are implemented. #163
-reauthentication across an epoch and #164 qualification remain, with #158 open
-as the umbrella until that evidence passes.
+partition/restart/resource/soak and payload-key gate. #161 atomic reload, #162
+material epochs, and #163 bounded reauthentication are implemented, including
+scoped retained-connection, request, and watch continuity evidence. Production
+rotation MUST additionally qualify old/new trust overlap and removal,
+revocation, reconnect-storm bounds, and multi-process/soak behavior under
+#164/#143. #158 remains the umbrella until that fleet evidence passes.
 
 ## 13. Local Cache
 
@@ -1415,10 +1452,24 @@ lifetime, trust-bundle lifetime, or maximum-authentication-age policy. A
 production networked session-store profile MUST rotate workload certificates
 and trust bundles without interrupting service, while still enforcing
 revocation and a documented maximum authentication age on long-lived
-connections. Consensus reconnects perform a full mutual-TLS handshake, but
-#161 atomic reload and #162 material epochs are implemented. Seamless
-certificate/trust rotation remains #163 -> #164 under umbrella #158;
-reconnect-storm and wider distributed production evidence remain #143.
+connections. #161 atomic reload, #162 coherent material epochs, and #163 finite
+connection retirement/reauthentication are implemented. On epoch change or an
+explicit orchestration request, both sides MUST stop new admission, end the
+transport wait and release connection slots within the finite hard deadline,
+and repeat the full mutual-TLS and application handshake on replacements.
+Already-admitted supervised mutations retain the ambiguity/readback contract
+above if their bounded backend work finishes later.
+
+An operator MUST publish overlapping old/new trust before new leaves, preserve
+the exact stable SPIFFE and consensus scope, trigger reauthentication, and
+verify that every directed peer path has authenticated on current material
+before removing old trust. Rollback before old-trust removal restores the prior
+leaf/material publication and triggers another monotonic reauthentication
+generation; rollback after removal MUST first restore overlapping trust and
+prove it Ready, then restore the old leaf and trigger reauthentication. A
+rollback MUST NOT reuse an old authenticated connection as evidence.
+Reconnect-storm, revocation, multi-process trust-removal, soak, and wider
+distributed production evidence remain #164/#143 under umbrella #158.
 
 ## 15. Observability
 
@@ -1438,6 +1489,17 @@ Required metrics:
 - `opc_session_restore_page_records{cursor_profile}`
 - `opc_session_restore_page_examined{cursor_profile}`
 - `opc_session_restore_page_payload_bytes{cursor_profile}`
+- `opc_session_net_connection_retirements_total{reason}`
+- `opc_session_net_connection_lifecycle{state}`
+- `opc_session_net_connection_drain_events_total{event}`
+- `opc_session_net_connection_attempts_total{outcome}`
+- `opc_session_net_reconnect_events_total{outcome}`
+- `opc_session_net_watch_slow_consumers_total`
+
+The lifecycle metric labels MUST come only from their closed SDK-owned reason,
+state, event, and outcome enums. They MUST NOT contain endpoints, DNS names,
+SPIFFE IDs, certificates, key material, transaction IDs, record keys, or
+payload/backend text.
 - `opc_session_restore_page_latency_seconds{cursor_profile}`
 - `opc_session_restore_restarts_total{reason}` where `reason` is one of
   `stale_cursor`, `work_budget`, `response_too_large`, or `cancelled`
@@ -1621,7 +1683,8 @@ This RFC is implemented when:
     provider/key handles never enter Raft apply/log/snapshot transport, and the
     documented payload-envelope versus full-database boundary is qualified.
 15. Divergence recovery (#128), operator-safe legacy-fork recovery (#129),
-    bounded applied-state restore (#133), distributed production qualification
-    (#143), and the remaining #163 -> #164 credential-rotation gates under
-    umbrella #158 have passed their own acceptance gates (#161/#162 are
-    implemented prerequisites).
+    bounded applied-state restore (#133), and finite connection
+    reauthentication (#163) are implemented; distributed production
+    qualification (#143) and fleet credential-rotation evidence (#164) under
+    umbrella #158 have passed their own acceptance gates before a production
+    claim (#161/#162 are implemented prerequisites).

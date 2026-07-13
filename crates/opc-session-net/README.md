@@ -198,19 +198,21 @@ build.
 
 ### Outbound response contract
 
-Protocol v5 contract-profile wire-schema revision 5 retains revision 4's
+Protocol v5 contract-profile wire-schema revision 6 retains revision 5's
 confidential authenticated snapshot-bound
 restore cursor, explicit durable-page profile, fixed 4 MiB restore payload and
 8 MiB retained-page, 8 MiB examined-metadata, and 4,096 examined-candidate
 budgets and exact configuration/process epoch binding for direct CAS. Revision
 5 adds the bounded, payload-free `RecordExpiryPreflight` authority exchange.
+Revision 6 adds the fixed `ConnectionRetiring` no-dispatch proof used for safe
+reconnection during authentication-material rotation.
 The error-set revision is 8. Directional budgets are part of the exact
 handshake. `requested_response_frame_size`,
 `accepted_response_frame_size`, and `server_request_frame_size` are public
 `Option<u32>` bootstrap fields so an older decoder can classify an otherwise
 decodable legacy minimal bootstrap. This is not bidirectional mismatch
 negotiation: an older decoder may reject unknown fields by simply closing.
-Exact revision-5 v5 admission requires each to be `Some`, at least
+Exact revision-6 v5 admission requires each to be `Some`, at least
 `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes), and at most
 `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes). The profile pins
 both as `min_frame_size = 8192` and `max_frame_size = 16777216`.
@@ -435,6 +437,66 @@ campaigns.
   Logical replica ID, dial endpoint, expected TLS identity, failure domain,
   backing identity, and exact local self remain independent descriptor fields.
 
+## Authentication lifetime and seamless credential rotation
+
+Authenticated direct and consensus transports use one validated
+`ConnectionLifecyclePolicy` on clients and servers. The defaults are a 15-minute
+maximum authentication age, a 30-second drain window, 50 ms through 1 second
+bounded reconnect backoff, and up to 30 seconds of stable directed-peer
+rotation jitter. A connection's hard deadline is the earliest of its maximum
+age, local leaf expiry, and peer leaf expiry. Retirement begins one drain window
+before that hard deadline, or immediately when less than one drain window
+remains.
+
+At TLS completion the transport retains exact monotonic deadline evidence for
+both leaves and the coherent `TlsMaterialEpoch` admitted by `opc-tls`. A later
+material epoch, or `SessionReauthenticationControl::request_reauthentication`,
+starts cooperative retirement after the configured stable jitter. Configure a
+shared control with `with_reauthentication_control`, and configure non-default
+finite bounds with `with_connection_lifecycle`, on every client/peer and
+listener that must rotate together.
+
+Retirement has these invariants:
+
+- no request is assigned or dispatched after its connection's soft retirement
+  boundary;
+- work already admitted may return once before the hard deadline; at that
+  deadline the transport stops waiting, closes the connection, releases its
+  slot, and reports a typed ambiguous mutation outcome where an effect may
+  already have crossed the backend boundary;
+- dropping the backend future requests cancellation but does not prove
+  rollback: a bounded supervised mutation may finish after transport closure,
+  so callers never automatically replay it and must authoritatively re-read or
+  use its operation-bound idempotency/fencing contract;
+- a replacement repeats TCP resolution, mutual TLS, canonical SPIFFE identity,
+  nonce/challenge, ALPN, version, and exact contract-profile checks;
+- the fixed, fully decoded `ConnectionRetiring` response proves that a legacy
+  direct mutation was not dispatched and is therefore the only retirement
+  signal that permits an automatic mutation retry; EOF, a partial frame, or a
+  generic error remains an ambiguous mutation outcome;
+- a caller-visible legacy watch survives planned retirement and resumes from
+  checked `last_delivered_sequence + 1`; a partially read item stays on the old
+  connection, the cursor advances only after caller delivery, and overflow,
+  compaction/permanent errors, cancellation, and slow consumers terminate
+  explicitly.
+
+This is credential continuity, not protocol negotiation. The move to direct
+wire-schema revision 6 is still a coordinated drained stop/upgrade/start of
+every participant. After the fleet is uniformly on revision 6, leaf and trust
+rotation uses the lifecycle above without a protocol downgrade or plaintext
+fallback. Session payload protection and HKMS placement are unchanged:
+encryption remains above consensus and the network lifecycle never receives
+plaintext, provider handles, or raw key material.
+
+The exporter provides only closed, low-cardinality lifecycle dimensions:
+`opc_session_net_connection_retirements_total{reason}`, current
+`opc_session_net_connection_lifecycle{state}`,
+`opc_session_net_connection_drain_events_total{event}`,
+`opc_session_net_connection_attempts_total{outcome}`,
+`opc_session_net_reconnect_events_total{outcome}`, and
+`opc_session_net_watch_slow_consumers_total`. Their fixed labels contain no
+endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
+
 ## Status Notes
 
 - `publish = false`.
@@ -464,16 +526,18 @@ campaigns.
 - Session-net disables TLS session caches, tickets, resumption, early data, and
   0-RTT. Every reconnect pays for a full mutual-TLS handshake so SVID rotation
   cannot reuse a cached peer certificate or authority decision.
-- Real-mTLS consensus tests now qualify a renewed client/server SVID on a
-  subsequent new call/full handshake and rejection when either rotated
-  identity no longer matches the bound peer. They do not exercise an in-flight
-  or retained old connection and therefore do not qualify seamless continuity
-  or connection retirement.
-  A production CNF still owns trust-bundle overlap, long-lived-connection
-  retirement, revocation, reconnect storms, and a documented maximum
-  authentication age. Multi-process rotation/soak and distributed
-  qualification remain open. The 365-day session TTL bound is unrelated to
-  certificate lifetime, trust-bundle lifetime, or authentication age.
+- Authenticated connections now retire at a finite age, exact local/peer leaf
+  expiry, material-epoch change, or explicit reauthentication request. Both
+  sides stop new admission at the soft boundary, bound the transport wait and
+  connection-slot lifetime by the hard deadline, and reconnect through a
+  complete mutual-TLS/application handshake. An already-admitted supervised
+  backend mutation may still finish later and therefore remains typed
+  ambiguous and non-retryable. Legacy watches resume from the exact delivered
+  cursor. Scoped real-mTLS tests cover retained connections and continuous
+  request/watch recycling. #164 and #143 still own multi-process fleet
+  trust-overlap, revocation, reconnect-storm, resource, soak, and release
+  evidence. The 365-day session TTL remains unrelated to certificate lifetime,
+  trust-bundle lifetime, or authentication age.
 - The configuration ID is a SHA-256 digest of the cluster ID, explicit
   generation, and the full sorted descriptor set. Changing a member ID,
   endpoint, TLS identity, failure domain, backing identity, cluster, or
@@ -490,7 +554,7 @@ campaigns.
   adds public `ContractProfile::max_frame_size`, so external profile struct
   literals and exhaustive destructuring must be updated in the same
   coordinated change.
-- The v5 profile pins wire-schema revision 5 and error-set revision 8;
+- The v5 profile pins wire-schema revision 6 and error-set revision 8;
   `max_restore_scan_page_payload_bytes = 4194304`;
   `max_restore_scan_examined_rows = 4096`;
   `min_frame_size = 8192`; `max_frame_size = 16777216`; the 128-byte
@@ -513,7 +577,7 @@ campaigns.
   pre-v4 peer built before #135 can still send an empty or oversized value
   that a new peer rejects before dispatch, so unchanged valid JSON shape is not
   a rolling-compatibility claim.
-- Treat every v5 exact-profile migration through wire-schema revision 5 and
+- Treat every v5 exact-profile migration through wire-schema revision 6 and
   error-set revision 8 as a
   coordinated stop/upgrade/start boundary. Drain
   traffic and writers, audit every persisted SQLite replica with the count-only
@@ -647,12 +711,12 @@ campaigns.
 ## Roadmap
 
 - Retain #171's bounded cursor contract and add distributed
-  failure and soak evidence. A renewed SVID on a subsequent new call/full
-  handshake and wrong-scope rejection now have scoped real-mTLS qualification;
-  seamless continuity/connection retirement, complete trust-bundle,
-  revocation, authentication-age, multi-process rotation,
-  payload-protection-key, and production qualification work remains. Close
-  those before treating this as production transport.
+  failure and soak evidence. Connection continuity, bounded authentication age,
+  and full-handshake reauthentication are implemented; complete fleet
+  trust-bundle overlap/removal, revocation, reconnect-storm,
+  multi-process/deployed-network, payload-protection-key, and production
+  qualification evidence remains under #164/#143. Close those evidence gates
+  before treating this as production transport.
 - Keep plaintext transport limited to tests.
 - Keep the compatibility server wrapping `SessionStoreBackend` rather than
   owning storage; production authority uses only `SessionConsensusServer`.
@@ -661,16 +725,18 @@ campaigns.
 
 - Source checked: `Cargo.toml`, `src/lib.rs`, client, server, protocol, and
   tests.
-- `tests/authenticated_replica_identity.rs` covers exact v5 profile/identity, routing
-  aliases, certificate/claim/scope mismatches, downgrade and malformed Hello,
-  reconnect/rotation, relabeling, and replayed challenge responses over mTLS.
+- `tests/authenticated_replica_identity.rs` covers exact v5 profile/identity,
+  routing aliases, certificate/claim/scope mismatches, downgrade and malformed
+  Hello, local and peer leaf-expiry retirement, overlapping trust rotation,
+  old-trust rejection, fresh nonce/profile/ALPN checks on replacements,
+  relabeling, and replayed challenge responses over mTLS.
 - `tests/consensus_transport.rs` covers the shared consensus-only ALPN,
   complete call deadlines, scope binding, a renewed SVID observed on a
   subsequent new call/full handshake, wrong rotated identities, and rejection
   of legacy backend authority. It also forms a real three-node
   `ConsensusConfigStore` over the existing mTLS peer/server and commits plus
-  linearizably reads through that shared adapter. It does not exercise
-  retained-connection retirement or out-of-process deployment.
+  linearizably reads through that shared adapter. Out-of-process deployment
+  remains #164/#143 qualification.
 - `tests/three_node_quorum.rs` covers typed TTL and replication-tree-limit
   rejection before resolution and authenticated server dispatch, plus
   connection reuse after rejection, deterministic listener/handler teardown,

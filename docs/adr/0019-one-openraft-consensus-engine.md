@@ -104,10 +104,10 @@ The #177 migration deliberately deletes the private `opc-persist` TCP/mTLS
 stack. It does not create another endpoint or another credential-rotation API.
 Certificate and trust-bundle rotation remains the shared transport's existing
 responsibility, including trust overlap, fresh authentication, connection
-drain, readiness gating, and old-trust retirement. Real-mTLS tests qualify a
-renewed SVID on a subsequent new call/full handshake and wrong-scope rejection;
-retained-connection retirement, seamless continuity, and broader production
-qualification gates remain unchanged.
+drain, readiness gating, and old-trust retirement. #163 real-mTLS tests cover
+finite retained-connection retirement, overlapping trust, complete replacement
+handshakes, and old/wrong-scope trust rejection. #164/#143 retain the broader
+fleet production qualification gates.
 
 ## Migration rule
 

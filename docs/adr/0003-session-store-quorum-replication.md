@@ -102,13 +102,16 @@ TLS session caches, tickets, resumption, early data, and 0-RTT are disabled;
 every reconnect performs a full mutual-TLS certificate exchange so rotated
 SVIDs cannot inherit cached replica authority.
 
-That reconnect rule is necessary but not sufficient for production rotation.
-The qualified CNF/operator profile must rotate workload certificates and trust
-bundles seamlessly, without interrupting session service, while proving trust
-overlap, revocation, retirement of long-lived connections, reconnect-storm
-behavior, and a documented maximum authentication age. This evidence remains
-open in #143. Session/lease TTL is an application-state lifetime and does not
-set certificate expiry, trust-bundle validity, or authentication age.
+#163 now applies a finite maximum authentication age and exact local/peer leaf
+expiry to every connection, retires retained connections on coherent material
+epoch or explicit reauthentication changes, ends transport waits and releases
+connection slots by the hard deadline, and repeats the full handshake.
+Already-admitted supervised mutations may finish later; they remain typed
+ambiguous and are never automatically replayed. The qualified CNF/operator
+profile must still prove fleet trust overlap/removal, revocation,
+reconnect-storm behavior, and multi-process continuity under #164/#143.
+Session/lease TTL is an application-state lifetime and does not set certificate
+expiry, trust-bundle validity, or authentication age.
 
 Transport authentication does not replace topology admission or prove physical
 store provenance. The operator must still map each logical member to exactly
@@ -164,15 +167,17 @@ admission, and typed-invalid handover rejection are
 implemented under #135; checked TTL rejection is implemented under #137, and
 malformed sequence zero, checked increment, rebuild-prefix, SQLite
 signed-boundary, cache, and authenticated wire rejection are implemented under
-#138. Seamless session-net credential/trust lifecycle remains #158, and its
-distributed production qualification remains #143.
+#138. Finite session-net connection reauthentication is implemented under #163;
+fleet credential qualification remains #164/#158 and distributed production
+qualification remains #143.
 Watch handoff correctness is implemented. Absolute-record-expiry admission
 is implemented under #148. Bounded nested-CAS protection is implemented under #147;
 outbound response allocation/frame bounds and slow-reader deadlines are
 implemented under #159. Distributed failure/resource qualification remains
-#143. #161 atomic reload and #162 coherent material epochs are implemented;
-#163 connection reauthentication and #164 fleet qualification remain under
-umbrella #158. These remaining gates keep the networked profile experimental.
+#143. #161 atomic reload, #162 coherent material epochs, and #163 connection
+reauthentication are implemented; #164 fleet qualification remains under
+umbrella #158. These remaining evidence gates keep the networked profile
+experimental.
 
 The v5 wire uses `u32` for restore/log request limits and the client restore
 response budget; a confidential authenticated strictly bounded restore cursor;
@@ -182,7 +187,7 @@ backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile pins wire-schema revision 5, error-set revision 8, a 4 MiB restore
+profile pins wire-schema revision 6, error-set revision 8, a 4 MiB restore
 payload bound, 8 MiB retained-page and examined key/filter-metadata bounds,
 `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
@@ -224,7 +229,7 @@ independent request-frame size. Each is a checked `u32` between
 `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that same minimum.
 This makes unequal client/server limits explicit. The directional fields were
 introduced by wire-schema revision 2 and are retained by the current
-wire-schema revision 5/error-set revision 8 profile. Older exact profiles,
+wire-schema revision 6/error-set revision 8 profile. Older exact profiles,
 including wire revision 4/error revision 7 or older, are incompatible; the
 current ALPN is `opc-session-net/5`.
 
@@ -422,12 +427,11 @@ Session-net's bounded call remains the shared production transport contract.
 consensus through the same transport-neutral peer/handler ports instead of a
 second timeout or credential lifecycle. A real-mTLS integration forms a
 three-node config Openraft cluster and commits/linearizably reads through those
-existing peer/server types. Separate real-mTLS tests qualify a renewed SVID on
-a subsequent new call/full handshake and wrong-scope rejection on this shared
-transport. They do not prove seamless rotation or old-connection retirement.
-Multi-process rotation/soak and the complete trust-bundle,
-revocation, authentication-age, and seamless-continuity lifecycle retain their
-production gates. Remote-seal historical selection now uses the exact validated
+existing peer/server types. #163 tests qualify bounded retained-connection
+retirement, full reauthentication, and request/watch continuity on this shared
+transport. Multi-process rotation/soak and complete trust-bundle removal,
+revocation, reconnect-storm, and seamless-continuity evidence retain their
+#164/#143 production gates. Remote-seal historical selection now uses the exact validated
 envelope key ID with KMS/HKMS-owned retention. The SDK has no local historical
 cache, retirement API, or enforcement gate. Distributed payload-protection and
 failure/soak/resource qualification remains #143.

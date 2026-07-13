@@ -516,6 +516,26 @@ pub struct SdkMetrics {
     pub session_net_backend_cancellations: AtomicU64,
     pub session_net_backend_peer_disconnects: AtomicU64,
     pub session_net_backend_ambiguous_outcomes: AtomicU64,
+    pub session_net_lifecycle_retirement_maximum_age: AtomicU64,
+    pub session_net_lifecycle_retirement_local_leaf_expiry: AtomicU64,
+    pub session_net_lifecycle_retirement_peer_leaf_expiry: AtomicU64,
+    pub session_net_lifecycle_retirement_material_epoch: AtomicU64,
+    pub session_net_lifecycle_retirement_explicit: AtomicU64,
+    pub session_net_lifecycle_active_connections: AtomicI64,
+    pub session_net_lifecycle_draining_connections: AtomicI64,
+    pub session_net_lifecycle_drain_started: AtomicU64,
+    pub session_net_lifecycle_drain_completed: AtomicU64,
+    pub session_net_lifecycle_drain_overruns: AtomicU64,
+    pub session_net_connection_attempts: AtomicU64,
+    pub session_net_connection_successes: AtomicU64,
+    pub session_net_connection_failure_transport: AtomicU64,
+    pub session_net_connection_failure_authentication: AtomicU64,
+    pub session_net_connection_failure_timeout: AtomicU64,
+    pub session_net_connection_failure_protocol: AtomicU64,
+    pub session_net_connection_failure_backend: AtomicU64,
+    pub session_net_reconnect_attempts: AtomicU64,
+    pub session_net_reconnect_failures: AtomicU64,
+    pub session_net_watch_slow_consumers: AtomicU64,
 
     // === NACM / Authz ===
     pub nacm_eval_allow: AtomicU64,
@@ -662,6 +682,26 @@ impl SdkMetrics {
             session_net_backend_cancellations: AtomicU64::new(0),
             session_net_backend_peer_disconnects: AtomicU64::new(0),
             session_net_backend_ambiguous_outcomes: AtomicU64::new(0),
+            session_net_lifecycle_retirement_maximum_age: AtomicU64::new(0),
+            session_net_lifecycle_retirement_local_leaf_expiry: AtomicU64::new(0),
+            session_net_lifecycle_retirement_peer_leaf_expiry: AtomicU64::new(0),
+            session_net_lifecycle_retirement_material_epoch: AtomicU64::new(0),
+            session_net_lifecycle_retirement_explicit: AtomicU64::new(0),
+            session_net_lifecycle_active_connections: AtomicI64::new(0),
+            session_net_lifecycle_draining_connections: AtomicI64::new(0),
+            session_net_lifecycle_drain_started: AtomicU64::new(0),
+            session_net_lifecycle_drain_completed: AtomicU64::new(0),
+            session_net_lifecycle_drain_overruns: AtomicU64::new(0),
+            session_net_connection_attempts: AtomicU64::new(0),
+            session_net_connection_successes: AtomicU64::new(0),
+            session_net_connection_failure_transport: AtomicU64::new(0),
+            session_net_connection_failure_authentication: AtomicU64::new(0),
+            session_net_connection_failure_timeout: AtomicU64::new(0),
+            session_net_connection_failure_protocol: AtomicU64::new(0),
+            session_net_connection_failure_backend: AtomicU64::new(0),
+            session_net_reconnect_attempts: AtomicU64::new(0),
+            session_net_reconnect_failures: AtomicU64::new(0),
+            session_net_watch_slow_consumers: AtomicU64::new(0),
 
             nacm_eval_allow: AtomicU64::new(0),
             nacm_eval_deny: AtomicU64::new(0),
@@ -840,6 +880,46 @@ impl SdkMetrics {
         self.session_net_backend_peer_disconnects
             .store(0, Ordering::Relaxed);
         self.session_net_backend_ambiguous_outcomes
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_retirement_maximum_age
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_retirement_local_leaf_expiry
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_retirement_peer_leaf_expiry
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_retirement_material_epoch
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_retirement_explicit
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_active_connections
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_draining_connections
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_drain_started
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_drain_completed
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_drain_overruns
+            .store(0, Ordering::Relaxed);
+        self.session_net_connection_attempts
+            .store(0, Ordering::Relaxed);
+        self.session_net_connection_successes
+            .store(0, Ordering::Relaxed);
+        self.session_net_connection_failure_transport
+            .store(0, Ordering::Relaxed);
+        self.session_net_connection_failure_authentication
+            .store(0, Ordering::Relaxed);
+        self.session_net_connection_failure_timeout
+            .store(0, Ordering::Relaxed);
+        self.session_net_connection_failure_protocol
+            .store(0, Ordering::Relaxed);
+        self.session_net_connection_failure_backend
+            .store(0, Ordering::Relaxed);
+        self.session_net_reconnect_attempts
+            .store(0, Ordering::Relaxed);
+        self.session_net_reconnect_failures
+            .store(0, Ordering::Relaxed);
+        self.session_net_watch_slow_consumers
             .store(0, Ordering::Relaxed);
 
         self.nacm_eval_allow.store(0, Ordering::Relaxed);
@@ -1709,6 +1789,174 @@ pub fn export_prometheus_text() -> String {
         "opc_session_net_backend_lifetime_events_total{{event=\"ambiguous_outcome\"}} {backend_ambiguous_outcomes}\n"
     ));
 
+    out.push_str(
+        "# HELP opc_session_net_connection_retirements_total Session connection retirements by fixed reason\n",
+    );
+    out.push_str("# TYPE opc_session_net_connection_retirements_total counter\n");
+    for (reason, value) in [
+        (
+            "maximum_age",
+            METRICS
+                .session_net_lifecycle_retirement_maximum_age
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "local_leaf_expiry",
+            METRICS
+                .session_net_lifecycle_retirement_local_leaf_expiry
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "peer_leaf_expiry",
+            METRICS
+                .session_net_lifecycle_retirement_peer_leaf_expiry
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "material_epoch",
+            METRICS
+                .session_net_lifecycle_retirement_material_epoch
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "explicit",
+            METRICS
+                .session_net_lifecycle_retirement_explicit
+                .load(Ordering::Relaxed),
+        ),
+    ] {
+        out.push_str(&format!(
+            "opc_session_net_connection_retirements_total{{reason=\"{reason}\"}} {value}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP opc_session_net_connection_lifecycle Current authenticated session connections by fixed lifecycle state\n",
+    );
+    out.push_str("# TYPE opc_session_net_connection_lifecycle gauge\n");
+    for (state, value) in [
+        (
+            "active",
+            METRICS
+                .session_net_lifecycle_active_connections
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "draining",
+            METRICS
+                .session_net_lifecycle_draining_connections
+                .load(Ordering::Relaxed),
+        ),
+    ] {
+        out.push_str(&format!(
+            "opc_session_net_connection_lifecycle{{state=\"{state}\"}} {value}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP opc_session_net_connection_drain_events_total Authentication drain transitions by fixed outcome\n",
+    );
+    out.push_str("# TYPE opc_session_net_connection_drain_events_total counter\n");
+    for (event, value) in [
+        (
+            "started",
+            METRICS
+                .session_net_lifecycle_drain_started
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "completed",
+            METRICS
+                .session_net_lifecycle_drain_completed
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "overrun",
+            METRICS
+                .session_net_lifecycle_drain_overruns
+                .load(Ordering::Relaxed),
+        ),
+    ] {
+        out.push_str(&format!(
+            "opc_session_net_connection_drain_events_total{{event=\"{event}\"}} {value}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP opc_session_net_connection_attempts_total Session connection attempts by fixed outcome\n",
+    );
+    out.push_str("# TYPE opc_session_net_connection_attempts_total counter\n");
+    for (outcome, value) in [
+        (
+            "started",
+            METRICS
+                .session_net_connection_attempts
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "success",
+            METRICS
+                .session_net_connection_successes
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "transport_failure",
+            METRICS
+                .session_net_connection_failure_transport
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "authentication_or_trust_failure",
+            METRICS
+                .session_net_connection_failure_authentication
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "timeout",
+            METRICS
+                .session_net_connection_failure_timeout
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "protocol_failure",
+            METRICS
+                .session_net_connection_failure_protocol
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "backend_failure",
+            METRICS
+                .session_net_connection_failure_backend
+                .load(Ordering::Relaxed),
+        ),
+    ] {
+        out.push_str(&format!(
+            "opc_session_net_connection_attempts_total{{outcome=\"{outcome}\"}} {value}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP opc_session_net_reconnect_events_total Session replacement connection activity by fixed outcome\n",
+    );
+    out.push_str("# TYPE opc_session_net_reconnect_events_total counter\n");
+    out.push_str(&format!(
+        "opc_session_net_reconnect_events_total{{outcome=\"attempt\"}} {}\n",
+        METRICS
+            .session_net_reconnect_attempts
+            .load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "opc_session_net_reconnect_events_total{{outcome=\"failure\"}} {}\n",
+        METRICS
+            .session_net_reconnect_failures
+            .load(Ordering::Relaxed)
+    ));
+    write_metric(
+        &mut out,
+        "opc_session_net_watch_slow_consumers_total",
+        "counter",
+        "Watch streams closed because the bounded caller queue was full",
+        METRICS
+            .session_net_watch_slow_consumers
+            .load(Ordering::Relaxed) as f64,
+    );
+
     // --- NACM / Authz ---
     let nacm_allow = METRICS.nacm_eval_allow.load(Ordering::Relaxed);
     out.push_str("# HELP opc_nacm_eval_total Total count of NACM policy evaluations\n");
@@ -2375,6 +2623,66 @@ mod tests {
         METRICS
             .session_net_backend_ambiguous_outcomes
             .store(22, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_retirement_maximum_age
+            .store(23, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_retirement_local_leaf_expiry
+            .store(24, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_retirement_peer_leaf_expiry
+            .store(25, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_retirement_material_epoch
+            .store(26, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_retirement_explicit
+            .store(27, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_active_connections
+            .store(28, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_draining_connections
+            .store(29, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_drain_started
+            .store(30, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_drain_completed
+            .store(31, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_drain_overruns
+            .store(32, Ordering::Relaxed);
+        METRICS
+            .session_net_connection_attempts
+            .store(33, Ordering::Relaxed);
+        METRICS
+            .session_net_connection_successes
+            .store(34, Ordering::Relaxed);
+        METRICS
+            .session_net_connection_failure_transport
+            .store(35, Ordering::Relaxed);
+        METRICS
+            .session_net_connection_failure_authentication
+            .store(36, Ordering::Relaxed);
+        METRICS
+            .session_net_connection_failure_timeout
+            .store(37, Ordering::Relaxed);
+        METRICS
+            .session_net_connection_failure_protocol
+            .store(38, Ordering::Relaxed);
+        METRICS
+            .session_net_connection_failure_backend
+            .store(39, Ordering::Relaxed);
+        METRICS
+            .session_net_reconnect_attempts
+            .store(40, Ordering::Relaxed);
+        METRICS
+            .session_net_reconnect_failures
+            .store(41, Ordering::Relaxed);
+        METRICS
+            .session_net_watch_slow_consumers
+            .store(42, Ordering::Relaxed);
 
         if let Ok(mut lag) = METRICS.persist_peer_replication_lag.lock() {
             lag.insert(1, 42);
@@ -2473,6 +2781,52 @@ mod tests {
         assert!(exported.contains(
             "opc_session_net_backend_lifetime_events_total{event=\"ambiguous_outcome\"} 22\n"
         ));
+        assert!(exported
+            .contains("opc_session_net_connection_retirements_total{reason=\"maximum_age\"} 23\n"));
+        assert!(exported.contains(
+            "opc_session_net_connection_retirements_total{reason=\"local_leaf_expiry\"} 24\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_net_connection_retirements_total{reason=\"peer_leaf_expiry\"} 25\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_net_connection_retirements_total{reason=\"material_epoch\"} 26\n"
+        ));
+        assert!(exported
+            .contains("opc_session_net_connection_retirements_total{reason=\"explicit\"} 27\n"));
+        assert!(exported.contains("opc_session_net_connection_lifecycle{state=\"active\"} 28\n"));
+        assert!(exported.contains("opc_session_net_connection_lifecycle{state=\"draining\"} 29\n"));
+        assert!(exported
+            .contains("opc_session_net_connection_drain_events_total{event=\"started\"} 30\n"));
+        assert!(exported
+            .contains("opc_session_net_connection_drain_events_total{event=\"completed\"} 31\n"));
+        assert!(exported
+            .contains("opc_session_net_connection_drain_events_total{event=\"overrun\"} 32\n"));
+        assert!(exported
+            .contains("opc_session_net_connection_attempts_total{outcome=\"started\"} 33\n"));
+        assert!(exported
+            .contains("opc_session_net_connection_attempts_total{outcome=\"success\"} 34\n"));
+        assert!(exported.contains(
+            "opc_session_net_connection_attempts_total{outcome=\"transport_failure\"} 35\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_net_connection_attempts_total{outcome=\"authentication_or_trust_failure\"} 36\n"
+        ));
+        assert!(exported
+            .contains("opc_session_net_connection_attempts_total{outcome=\"timeout\"} 37\n"));
+        assert!(exported.contains(
+            "opc_session_net_connection_attempts_total{outcome=\"protocol_failure\"} 38\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_net_connection_attempts_total{outcome=\"backend_failure\"} 39\n"
+        ));
+        assert!(
+            exported.contains("opc_session_net_reconnect_events_total{outcome=\"attempt\"} 40\n")
+        );
+        assert!(
+            exported.contains("opc_session_net_reconnect_events_total{outcome=\"failure\"} 41\n")
+        );
+        assert!(exported.contains("opc_session_net_watch_slow_consumers_total 42\n"));
         assert!(exported.contains("opc_admin_requests_total{route=\"readyz\",status=\"200\"} 1\n"));
         assert!(exported
             .contains("opc_admin_requests_total{route=\"redacted\",status=\"invalid\"} 1\n"));
@@ -2539,6 +2893,93 @@ mod tests {
         assert!(after.contains(
             "opc_session_net_backend_lifetime_events_total{event=\"ambiguous_outcome\"} 0\n"
         ));
+        assert!(after.contains(
+            "opc_session_net_connection_retirements_total{reason=\"material_epoch\"} 0\n"
+        ));
+        assert!(after.contains("opc_session_net_connection_lifecycle{state=\"active\"} 0\n"));
+        assert!(
+            after.contains("opc_session_net_connection_drain_events_total{event=\"overrun\"} 0\n")
+        );
+        assert!(after.contains(
+            "opc_session_net_connection_attempts_total{outcome=\"authentication_or_trust_failure\"} 0\n"
+        ));
+        assert!(after.contains("opc_session_net_reconnect_events_total{outcome=\"failure\"} 0\n"));
+        assert!(after.contains("opc_session_net_watch_slow_consumers_total 0\n"));
+    }
+
+    #[test]
+    fn session_net_lifecycle_metrics_initialize_and_reset() {
+        let metrics = SdkMetrics::new();
+        let counters = [
+            &metrics.session_net_lifecycle_retirement_maximum_age,
+            &metrics.session_net_lifecycle_retirement_local_leaf_expiry,
+            &metrics.session_net_lifecycle_retirement_peer_leaf_expiry,
+            &metrics.session_net_lifecycle_retirement_material_epoch,
+            &metrics.session_net_lifecycle_retirement_explicit,
+            &metrics.session_net_lifecycle_drain_started,
+            &metrics.session_net_lifecycle_drain_completed,
+            &metrics.session_net_lifecycle_drain_overruns,
+            &metrics.session_net_connection_attempts,
+            &metrics.session_net_connection_successes,
+            &metrics.session_net_connection_failure_transport,
+            &metrics.session_net_connection_failure_authentication,
+            &metrics.session_net_connection_failure_timeout,
+            &metrics.session_net_connection_failure_protocol,
+            &metrics.session_net_connection_failure_backend,
+            &metrics.session_net_reconnect_attempts,
+            &metrics.session_net_reconnect_failures,
+            &metrics.session_net_watch_slow_consumers,
+        ];
+        let gauges = [
+            &metrics.session_net_lifecycle_active_connections,
+            &metrics.session_net_lifecycle_draining_connections,
+        ];
+
+        assert!(counters
+            .iter()
+            .all(|metric| metric.load(Ordering::Relaxed) == 0));
+        assert!(gauges
+            .iter()
+            .all(|metric| metric.load(Ordering::Relaxed) == 0));
+
+        for metric in counters {
+            metric.store(1, Ordering::Relaxed);
+        }
+        for metric in gauges {
+            metric.store(1, Ordering::Relaxed);
+        }
+        metrics.reset_all();
+
+        let reset_counters = [
+            &metrics.session_net_lifecycle_retirement_maximum_age,
+            &metrics.session_net_lifecycle_retirement_local_leaf_expiry,
+            &metrics.session_net_lifecycle_retirement_peer_leaf_expiry,
+            &metrics.session_net_lifecycle_retirement_material_epoch,
+            &metrics.session_net_lifecycle_retirement_explicit,
+            &metrics.session_net_lifecycle_drain_started,
+            &metrics.session_net_lifecycle_drain_completed,
+            &metrics.session_net_lifecycle_drain_overruns,
+            &metrics.session_net_connection_attempts,
+            &metrics.session_net_connection_successes,
+            &metrics.session_net_connection_failure_transport,
+            &metrics.session_net_connection_failure_authentication,
+            &metrics.session_net_connection_failure_timeout,
+            &metrics.session_net_connection_failure_protocol,
+            &metrics.session_net_connection_failure_backend,
+            &metrics.session_net_reconnect_attempts,
+            &metrics.session_net_reconnect_failures,
+            &metrics.session_net_watch_slow_consumers,
+        ];
+        let reset_gauges = [
+            &metrics.session_net_lifecycle_active_connections,
+            &metrics.session_net_lifecycle_draining_connections,
+        ];
+        assert!(reset_counters
+            .iter()
+            .all(|metric| metric.load(Ordering::Relaxed) == 0));
+        assert!(reset_gauges
+            .iter()
+            .all(|metric| metric.load(Ordering::Relaxed) == 0));
     }
 
     #[test]
