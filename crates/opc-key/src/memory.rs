@@ -100,6 +100,17 @@ impl MemoryKeyProvider {
         Self::default()
     }
 
+    pub(crate) fn from_active_handle(handle: KeyHandle) -> Self {
+        let mut state = MemoryProviderState::default();
+        state.by_id.insert(handle.key_id().clone(), handle.clone());
+        state
+            .active
+            .insert((handle.purpose(), handle.tenant().clone()), handle);
+        Self {
+            inner: Mutex::new(state),
+        }
+    }
+
     /// Inserts an active key using zeroizing secret material.
     pub fn insert_active_key(
         &self,

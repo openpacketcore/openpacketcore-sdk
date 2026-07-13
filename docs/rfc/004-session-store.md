@@ -1132,6 +1132,26 @@ unavailability MAY block new protection or plaintext reads, but MUST NOT cause
 provider I/O during deterministic apply or make already sealed Raft replay and
 quorum formation depend on provider availability.
 
+Remote unseal MUST pass the canonical envelope key ID through the provider
+boundary after validating envelope shape and record AAD. The active remote key
+is an atomic process-local material epoch used only by future seals; a seal
+already in flight keeps its selected key ID, but may still fail because of
+timeout, provider outage, or revocation. Mixed-epoch fleet writes remain
+readable while KMS retains each envelope's exact key. Missing, revoked,
+malformed, cross-tenant, and wrong-AAD inputs fail with coarse, redacted crypto
+errors. Provider, endpoint, tenant, key ID, and payload text MUST NOT be
+included in those errors.
+
+KMS/HKMS owns remote historical-key retention and retirement. The SDK keeps no
+local historical material or authorization cache and exposes no retirement API
+or enforcement gate. It supplies exact key selection and bounded live-state
+scan inputs, not a rewrap campaign or complete dependency proof. Operators MUST
+combine a snapshot-bound, write-fenced live-state scan after rewrap with
+separate compaction, expiry, or inspection of logs and snapshots, plus
+inspection and rewrap/deletion/retention decisions for backups, restore sources,
+and rollback checkpoints. A restore scan alone does not prove those retained
+artifacts. Incomplete/stale evidence or an unbounded record blocks retirement.
+
 `EnvelopeV1` MUST be validated rather than trusted as a marker. Construction,
 wire decode, durable-row decode, log append, replay, and snapshot validation
 MUST reject a malformed or non-canonical RFC 003 envelope, mismatched embedded
@@ -1158,10 +1178,14 @@ SQLite metadata—including membership, terms/indexes, tenant and key routing,
 owners, generations, fences, timestamps, request identities, and envelope key
 IDs—remains visible to the host storage boundary. A deployment requiring
 metadata or full-file encryption MUST add and qualify an approved database or
-volume layer without moving provider access below the wrapper. Closing the
-payload boundary does not qualify seamless remote-seal historical-key rotation
-(#179) or distributed protection evidence (#143); both remain mandatory for
-their respective production profiles.
+volume layer without moving provider access below the wrapper. Scoped
+three-node in-process Openraft evidence uses actual file-backed nodes and
+controllable RPC, explicitly forces snapshot installation, shuts down/restarts,
+and restores both key epochs while counters prove replication, replay, quorum
+formation, and snapshots perform no provider calls. Production KMS framing is
+tested separately. This does not qualify multi-process or deployed-network
+behavior; distributed protection/failure/soak evidence (#143) remains a
+separate production-profile gate.
 
 ### 14.2 Integrity
 

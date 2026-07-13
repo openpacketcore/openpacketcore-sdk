@@ -314,10 +314,11 @@ replacement before the new SDK starts; it must not be clamped or split ad hoc.
 Raw inner-backend rebuild does not add protection.
 
 #147 closes only this bounded nested-payload path. The session profile remains
-experimental until the remaining non-consensus gates pass. Seamless SVID/trust-bundle lifecycle remains #158;
-remote-seal historical-key rotation remains #179, while distributed
-payload-protection and production qualification remain #143. These are
-separate mandatory gates.
+experimental until the remaining non-consensus gates pass. Seamless
+SVID/trust-bundle lifecycle remains #158. Remote-seal historical selection is
+implemented with KMS/HKMS-owned retention; the SDK has no local historical
+cache, retirement API, or enforcement gate. Distributed payload-protection and
+production qualification remain #143. These are separate mandatory gates.
 
 ### Consensus transport and encryption boundary
 

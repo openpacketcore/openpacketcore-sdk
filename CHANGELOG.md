@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **BREAKING — `opc-key` remote-seal implementors:**
+  `RemoteSealProvider::unseal` now receives the canonical envelope `KeyId`, so
+  remote reads select the exact historical key instead of silently using the
+  provider's current active key. `KmsRemoteSealProvider` adds a constant-space,
+  process-local `RemoteSealMaterialController`; its clones share publication
+  only inside that process. Publication atomically changes future seals while
+  an in-flight seal retains its captured key ID. Historical retention and
+  revocation stay KMS/HKMS-owned; the SDK has neither a local historical cache
+  nor a retirement API or enforcement gate. Redacted production KMS framing
+  tests cover exact-ID requests, missing history, and in-flight publication.
+  Session tests cover old/new reads, cross-tenant/AAD rejection before provider
+  I/O, and a scoped three-node in-process Openraft snapshot-install,
+  shutdown/restart restore with zero provider calls below the outer sealing
+  boundary. Custom trait implementations and callers must upgrade together
+  before any new active ID is published. Durable envelopes, Openraft/session
+  wire formats, and KMS framing/schema do not change; decrypt request contents
+  now use the historical envelope ID.
+- **BREAKING — `opc-key` remote-seal accessors:**
+  `KmsRemoteSealProvider::key_id()` is replaced by
+  `material_controller()`, `publish_active_key()`, and `material_epoch()`.
+  `MemoryRemoteSealProvider::key_id()` is replaced by async
+  `active_key_id()`, with `rotate_key()` available for fixtures.
 - `opc-tls`: a shared `TlsMaterialController` and immutable per-handshake
   client/server snapshots. Accepted same-identity rotations and rollbacks
   advance an opaque epoch; invalid, oversized, expired, wrong-key/chain/trust,
@@ -449,9 +471,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport. #177 removes `opc-persist`'s private TCP peer/server and uses the
   same transport-neutral consensus ports instead of defining another deadline,
   retry, or certificate lifecycle. Seamless
-  credential/trust rotation remains #158, remote-seal historical-key rotation
-  remains #179, and distributed resource/failover/soak plus payload-protection
-  qualification remains #143.
+  credential/trust rotation remains #158, while distributed
+  resource/failover/soak plus payload-protection qualification remains #143.
 - **BREAKING — `opc-session-store`:** the old backend-bearing quorum member and
   raw-vector coordinator surfaces are removed. Migrate HA callers through a
   descriptor-only `QuorumTopologyConfig`/`ValidatedQuorumTopology`; migrate

@@ -392,9 +392,9 @@ a subsequent new call/full handshake and wrong-scope rejection on this shared
 transport. They do not prove seamless rotation or old-connection retirement.
 Multi-process rotation/soak and the complete trust-bundle,
 revocation, authentication-age, and seamless-continuity lifecycle retain their
-production gates;
-remote-seal
-historical-key rotation remains #179; distributed payload-protection and
+production gates. Remote-seal historical selection now uses the exact validated
+envelope key ID with KMS/HKMS-owned retention. The SDK has no local historical
+cache, retirement API, or enforcement gate. Distributed payload-protection and
 failure/soak/resource qualification remains #143.
 
 A product composes one descriptor per physical vote. For example, logical self
