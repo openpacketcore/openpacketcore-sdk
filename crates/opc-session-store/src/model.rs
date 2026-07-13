@@ -614,7 +614,9 @@ impl<'de> Deserialize<'de> for SessionKeyType {
 ///
 /// Raw subscriber identifiers MUST NOT be used directly as `stable_id` in
 /// production; derive tenant-scoped keyed digests with
-/// [`SessionKey::digest_with_key`] for backend keys and correlation IDs.
+/// [`StableId::derive_hmac_sha256`]. [`SessionKey::digest_with_key`] is only a
+/// separate digest of an already-built composite key for correlation and does
+/// not construct `stable_id`.
 /// [`SessionKey::digest`] is provided only for non-privacy-sensitive,
 /// deterministic hashing.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -630,9 +632,11 @@ pub struct SessionKey {
     /// records of different shapes that share the same `stable_id`.
     pub key_type: SessionKeyType,
     /// Stable identifying bytes within the tenant/NF/type scope. MUST NOT be
-    /// a raw SUPI/GPSI in production; use a derived identifier and rely on
-    /// `SessionKey::digest_with_key` for backend keys. The `Debug` impl
-    /// redacts these bytes to keep subscriber identifiers out of logs.
+    /// a raw SUPI/GPSI in production; use [`StableId::derive_hmac_sha256`].
+    /// [`SessionKey::digest_with_key`] is only the separate digest of the
+    /// already-built composite key for correlation and does not construct this
+    /// field. The `Debug` impl redacts these bytes to keep subscriber
+    /// identifiers out of logs.
     pub stable_id: StableId,
 }
 
