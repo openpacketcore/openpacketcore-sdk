@@ -19,6 +19,8 @@ opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-mgmt-audit = { path = "../opc-mgmt-audit", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -30,6 +32,9 @@ time = { workspace = true, features = ["serde"] }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+zeroize = { workspace = true }
+libc = "0.2"
+nix = { workspace = true, features = ["fs"] }
 aes-gcm-siv = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"

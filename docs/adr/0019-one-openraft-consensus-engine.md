@@ -92,7 +92,11 @@ identify a coherent applied snapshot from authoritative evidence. Unknown or
 minority tails are discarded only through that explicit recovery procedure,
 never by startup heuristics. A pristine deployment may initialize directly;
 an existing fleet requires versioned schema admission, backup/rollback
-evidence, and a coordinated rollout.
+evidence, and a coordinated rollout. The session-store procedure is the
+offline, full-fleet campaign in the
+[legacy recovery runbook](../session-store-legacy-recovery.md): it can copy an
+operator-selected checkpoint, but Openraft alone commits the recovery epoch and
+returns the fleet to service.
 
 ## Consequences
 
