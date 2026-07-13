@@ -57,11 +57,26 @@ pub const GTPU_MAX_EXT_HEADERS: usize = 4;
 pub const UPLINK_FAR_VALUE_LEN: usize = 12;
 /// Byte length of a downlink PDR map value.
 pub const DOWNLINK_PDR_VALUE_LEN: usize = 4;
+/// Byte length of an optional uplink DSCP map value.
+pub const UPLINK_DSCP_VALUE_LEN: usize = 1;
+
+/// Reserved impossible UE-PAA key carrying durable DSCP-schema evidence in
+/// the existing uplink FAR map.
+///
+/// Userspace rejects `0.0.0.0` as a PDP address, and the eBPF uplink program
+/// explicitly bypasses this key before lookup. This keeps the FAR key/value
+/// ABI unchanged while distinguishing a one-time pre-DSCP migration from loss
+/// of the additive DSCP map after that migration completed.
+pub const UPLINK_DSCP_SCHEMA_MARKER_KEY: [u8; 4] = [0; 4];
+/// Magic FAR value stored at [`UPLINK_DSCP_SCHEMA_MARKER_KEY`].
+pub const UPLINK_DSCP_SCHEMA_MARKER_VALUE: [u8; UPLINK_FAR_VALUE_LEN] = *b"OPC-DSCP-v1\0";
 
 /// BPF map name: uplink FAR, keyed by UE PAA (IPv4, network order).
 pub const MAP_UPLINK_FAR: &str = "GTPU_UPLINK_FAR";
 /// BPF map name: downlink PDR, keyed by local S2b-U TEID (network order).
 pub const MAP_DOWNLINK_PDR: &str = "GTPU_DOWNLINK_PDR";
+/// BPF map name: optional uplink DSCP, keyed by UE PAA.
+pub const MAP_UPLINK_DSCP: &str = "GTPU_UPLINK_DSCP";
 /// BPF map name: per-CPU datapath counters.
 pub const MAP_COUNTERS: &str = "GTPU_COUNTERS";
 /// BPF map name: single-slot device configuration (local S2b-U IPv4).
@@ -202,7 +217,25 @@ pub fn ipv4_header_checksum(header: &[u8; IPV4_MIN_HDR_LEN]) -> u16 {
 ///   header), TEID from the FAR.
 #[must_use]
 pub fn build_uplink_encap(far: &UplinkFar, inner_len: u16) -> Option<[u8; GTPU_ENCAP_LEN]> {
+    build_uplink_encap_with_dscp(far, inner_len, None)
+}
+
+/// Build uplink encapsulation with an optional fixed outer DSCP codepoint.
+///
+/// A present codepoint must be in `0..=63`. The DSCP occupies the high six
+/// bits of the IPv4 ToS octet and the ECN bits remain zero for this newly
+/// generated outer header. Invalid codepoints fail closed with `None`.
+/// Passing `None` is byte-for-byte equivalent to [`build_uplink_encap`].
+#[must_use]
+pub fn build_uplink_encap_with_dscp(
+    far: &UplinkFar,
+    inner_len: u16,
+    dscp: Option<u8>,
+) -> Option<[u8; GTPU_ENCAP_LEN]> {
     const ENCAP: u16 = GTPU_ENCAP_LEN as u16;
+    if dscp.is_some_and(|value| value > 63) {
+        return None;
+    }
     if inner_len > u16::MAX - ENCAP {
         return None;
     }
@@ -212,6 +245,7 @@ pub fn build_uplink_encap(far: &UplinkFar, inner_len: u16) -> Option<[u8; GTPU_E
     let mut out = [0_u8; GTPU_ENCAP_LEN];
     // Outer IPv4 header.
     out[0] = 0x45; // version 4, IHL 5
+    out[1] = dscp.unwrap_or(0) << 2;
     out[2..4].copy_from_slice(&outer_total.to_be_bytes());
     out[8] = 64; // TTL
     out[9] = 17; // UDP
@@ -365,6 +399,41 @@ mod tests {
     fn uplink_encap_rejects_oversized_inner() {
         assert!(build_uplink_encap(&far(), u16::MAX - 35).is_none());
         assert!(build_uplink_encap(&far(), u16::MAX - 36).is_some());
+    }
+
+    #[test]
+    fn absent_dscp_preserves_exact_legacy_encapsulation() {
+        assert_eq!(
+            build_uplink_encap(&far(), 60),
+            build_uplink_encap_with_dscp(&far(), 60, None)
+        );
+        assert_eq!(build_uplink_encap(&far(), 60).unwrap()[1], 0);
+    }
+
+    #[test]
+    fn fixed_dscp_is_stamped_and_ipv4_checksum_is_updated() {
+        let encap = build_uplink_encap_with_dscp(&far(), 60, Some(46)).unwrap();
+        assert_eq!(encap[1], 46 << 2);
+        let mut header = [0_u8; IPV4_MIN_HDR_LEN];
+        header.copy_from_slice(&encap[..IPV4_MIN_HDR_LEN]);
+        assert_eq!(
+            u16::from_be_bytes([encap[10], encap[11]]),
+            ipv4_header_checksum(&header)
+        );
+    }
+
+    #[test]
+    fn fixed_dscp_accepts_boundaries_and_rejects_out_of_range() {
+        assert_eq!(
+            build_uplink_encap_with_dscp(&far(), 60, Some(0)).unwrap()[1],
+            0
+        );
+        assert_eq!(
+            build_uplink_encap_with_dscp(&far(), 60, Some(63)).unwrap()[1],
+            0xfc
+        );
+        assert!(build_uplink_encap_with_dscp(&far(), 60, Some(64)).is_none());
+        assert!(build_uplink_encap_with_dscp(&far(), 60, Some(u8::MAX)).is_none());
     }
 
     #[test]

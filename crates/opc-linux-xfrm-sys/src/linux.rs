@@ -1,12 +1,133 @@
+use std::ffi::{CStr, CString};
 use std::io;
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
 use crate::NETLINK_XFRM;
+
+const BPF_FS_MAGIC: libc::c_long = 0xcafe_4a11;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
 
 #[derive(Debug)]
 pub struct NetlinkSocket {
     fd: OwnedFd,
+}
+
+#[derive(Debug)]
+pub struct BpffsDirectory {
+    fd: OwnedFd,
+}
+
+impl BpffsDirectory {
+    pub fn proc_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+    }
+}
+
+pub fn open_or_create_bpffs_directory(relative: &Path) -> io::Result<BpffsDirectory> {
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bpffs path must contain only relative normal components",
+        ));
+    }
+
+    let base = open_absolute_directory(c"/sys/fs/bpf")?;
+    verify_bpffs(&base)?;
+    let mut current = base;
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("validated above")
+        };
+        let component = CString::new(component.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bpffs path contains NUL"))?;
+        // SAFETY: `current` is a live directory descriptor and `component` is
+        // a NUL-terminated single path component. The mode is used only when
+        // creation succeeds.
+        let result = unsafe { libc::mkdirat(current.as_raw_fd(), component.as_ptr(), 0o750) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error);
+            }
+        }
+        current = open_child_directory(&current, &component)?;
+    }
+    verify_bpffs(&current)?;
+    Ok(BpffsDirectory { fd: current })
+}
+
+fn open_absolute_directory(path: &CStr) -> io::Result<OwnedFd> {
+    // SAFETY: `path` is a valid NUL-terminated path. A successful fresh
+    // descriptor is transferred immediately into `OwnedFd`.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    owned_fd(fd)
+}
+
+fn open_child_directory(parent: &OwnedFd, component: &CStr) -> io::Result<OwnedFd> {
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+    };
+    // SAFETY: `parent` is live, `component` is NUL terminated, and `how`
+    // points to a fully initialized `open_how`-compatible value for its size.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            parent.as_raw_fd(),
+            component.as_ptr(),
+            &how as *const OpenHow,
+            mem::size_of::<OpenHow>(),
+        ) as libc::c_int
+    };
+    owned_fd(fd)
+}
+
+fn owned_fd(fd: libc::c_int) -> io::Result<OwnedFd> {
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: `fd` is a fresh descriptor returned by a successful open.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+fn verify_bpffs(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: zero is a valid initial representation for `statfs`; the kernel
+    // initializes it completely on success below.
+    let mut status: libc::statfs = unsafe { mem::zeroed() };
+    // SAFETY: `fd` is live and `status` is valid writable storage.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut status) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if status.f_type != BPF_FS_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pin directory is not on bpffs",
+        ));
+    }
+    Ok(())
 }
 
 impl NetlinkSocket {
@@ -130,6 +251,28 @@ fn kernel_netlink_addr(groups: u32) -> libc::sockaddr_nl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bpffs_directory_rejects_non_normal_relative_paths() {
+        for path in ["", "/absolute", "../escape", "nested/../escape"] {
+            assert_eq!(
+                open_or_create_bpffs_directory(Path::new(path))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+                "path={path}"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_verification_rejects_a_real_non_bpffs_mount() {
+        let root = open_absolute_directory(c"/").expect("open root filesystem");
+        assert_eq!(
+            verify_bpffs(&root).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn kernel_addr_is_xfrm_netlink_family() {

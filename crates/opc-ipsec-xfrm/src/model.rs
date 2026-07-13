@@ -7,6 +7,7 @@
 
 use std::{fmt, num::NonZeroU32};
 
+use opc_types::DscpCodepoint;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -132,7 +133,7 @@ impl UdpEncap {
 }
 
 /// Optional Linux XFRM packet mark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct XfrmMark {
     /// Mark value.
     pub value: u32,
@@ -483,6 +484,14 @@ pub struct SaParameters {
     pub mark: Option<XfrmMark>,
     /// Optional XFRM interface identifier.
     pub if_id: Option<u32>,
+    /// Optional fixed DSCP for the outer tunnel header.
+    ///
+    /// Linux has no fixed-DSCP XFRM SA attribute. The production backend
+    /// implements this through its explicitly configured post-transform tc
+    /// eBPF companion and rejects `Some` when that capability is unavailable.
+    /// `None` emits exactly the pre-DSCP XFRM netlink bytes and does not
+    /// require the companion.
+    pub egress_dscp: Option<DscpCodepoint>,
 }
 
 /// Parameters needed to install or update a Security Policy.
@@ -554,6 +563,7 @@ impl SpiAllocation {
             destination: self.destination,
             protocol: self.protocol,
             spi: self.spi,
+            mark: None,
         }
     }
 }
@@ -574,6 +584,28 @@ pub struct QuerySaRequest {
     pub protocol: u8,
     /// SPI in host byte order.
     pub spi: u32,
+    /// Optional packet mark selecting a marked SA with this identity.
+    pub mark: Option<XfrmMark>,
+}
+
+impl QuerySaRequest {
+    /// Build an SA query for an unmarked SA.
+    #[must_use]
+    pub const fn new(destination: IpAddress, protocol: u8, spi: u32) -> Self {
+        Self {
+            destination,
+            protocol,
+            spi,
+            mark: None,
+        }
+    }
+
+    /// Select an SA carrying the supplied Linux XFRM lookup mark.
+    #[must_use]
+    pub const fn with_mark(mut self, mark: XfrmMark) -> Self {
+        self.mark = Some(mark);
+        self
+    }
 }
 
 /// Redaction-safe kernel state for a queried SA.
@@ -599,6 +631,8 @@ pub struct SaState {
     pub lifetime_current: LifetimeCurrent,
     /// Current kernel failure counters.
     pub statistics: SaStatistics,
+    /// Fixed outer DSCP decoded from this backend's post-transform mark token.
+    pub egress_dscp: Option<DscpCodepoint>,
 }
 
 /// Request to rekey (update) an existing Security Association.
@@ -617,6 +651,28 @@ pub struct RemoveSaRequest {
     pub protocol: u8,
     /// SPI in host byte order.
     pub spi: u32,
+    /// Optional packet mark selecting a marked SA with this identity.
+    pub mark: Option<XfrmMark>,
+}
+
+impl RemoveSaRequest {
+    /// Build an SA removal request for an unmarked SA.
+    #[must_use]
+    pub const fn new(destination: IpAddress, protocol: u8, spi: u32) -> Self {
+        Self {
+            destination,
+            protocol,
+            spi,
+            mark: None,
+        }
+    }
+
+    /// Select an SA carrying the supplied Linux XFRM lookup mark.
+    #[must_use]
+    pub const fn with_mark(mut self, mark: XfrmMark) -> Self {
+        self.mark = Some(mark);
+        self
+    }
 }
 
 /// Request to install a new Security Policy.
@@ -640,6 +696,27 @@ pub struct RemovePolicyRequest {
     pub selector: XfrmSelector,
     /// Policy direction.
     pub direction: XfrmDirection,
+    /// Optional packet mark selecting a marked policy with this identity.
+    pub mark: Option<XfrmMark>,
+}
+
+impl RemovePolicyRequest {
+    /// Build a removal request for an unmarked policy.
+    #[must_use]
+    pub const fn new(selector: XfrmSelector, direction: XfrmDirection) -> Self {
+        Self {
+            selector,
+            direction,
+            mark: None,
+        }
+    }
+
+    /// Select a policy carrying the supplied Linux XFRM lookup mark.
+    #[must_use]
+    pub const fn with_mark(mut self, mark: XfrmMark) -> Self {
+        self.mark = Some(mark);
+        self
+    }
 }
 
 /// Kind of XFRM backend implementation.
@@ -683,6 +760,8 @@ pub struct XfrmProbe {
     pub net_admin_capable: bool,
     /// Availability of required XFRM algorithms.
     pub algorithms: XfrmCapability,
+    /// Availability of fixed outer-DSCP stamping for tunnel-mode SAs.
+    pub egress_dscp_marking: XfrmCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,
 }
@@ -696,6 +775,7 @@ impl XfrmProbe {
             kernel_reachable: false,
             net_admin_capable: false,
             algorithms: XfrmCapability::Available,
+            egress_dscp_marking: XfrmCapability::Missing,
             details: Some("dry-run/mock backend"),
         }
     }
@@ -708,6 +788,7 @@ impl XfrmProbe {
             kernel_reachable: false,
             net_admin_capable: false,
             algorithms: XfrmCapability::Unknown,
+            egress_dscp_marking: XfrmCapability::Missing,
             details: Some("XFRM operations are not supported on this platform"),
         }
     }
@@ -837,6 +918,7 @@ mod tests {
                 destination: IpAddress::Ipv4([192, 0, 2, 10]),
                 protocol: 50,
                 spi: 0x1000_0001,
+                mark: None,
             }
         );
     }

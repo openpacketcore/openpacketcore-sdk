@@ -50,9 +50,9 @@ pub enum XfrmError {
         /// key material.
         raw_os_error: Option<i32>,
     },
-    /// A request was sent, but the ACK was not observed, so kernel state may
-    /// already have changed.
-    #[error("XFRM {operation} outcome is indeterminate")]
+    /// A mutation may have been accepted, but its final kernel state could
+    /// not be proven or safely reconciled.
+    #[error("XFRM {operation} final state is indeterminate")]
     StateIndeterminate {
         /// Stable operation label.
         operation: &'static str,
@@ -170,7 +170,10 @@ mod tests {
             operation: "install_sa",
         };
 
-        assert_eq!(err.to_string(), "XFRM install_sa outcome is indeterminate");
+        assert_eq!(
+            err.to_string(),
+            "XFRM install_sa final state is indeterminate"
+        );
     }
 
     #[test]

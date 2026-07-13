@@ -1,8 +1,20 @@
 use std::io;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct NetlinkSocket {
     _private: (),
+}
+
+#[derive(Debug)]
+pub struct BpffsDirectory {
+    _private: (),
+}
+
+impl BpffsDirectory {
+    pub fn proc_path(&self) -> PathBuf {
+        PathBuf::new()
+    }
 }
 
 fn unsupported() -> io::Error {
@@ -21,6 +33,10 @@ pub fn send_message(_socket: &NetlinkSocket, _payload: &[u8]) -> io::Result<usiz
 }
 
 pub fn receive_message(_socket: &NetlinkSocket, _buffer: &mut [u8]) -> io::Result<usize> {
+    Err(unsupported())
+}
+
+pub fn open_or_create_bpffs_directory(_relative: &Path) -> io::Result<BpffsDirectory> {
     Err(unsupported())
 }
 

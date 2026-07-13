@@ -10,6 +10,7 @@
 #![deny(missing_docs)]
 
 use std::io;
+use std::path::{Path, PathBuf};
 
 #[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
 mod linux;
@@ -31,6 +32,24 @@ pub const NETLINK_XFRM: i32 = 6;
 #[derive(Debug)]
 pub struct NetlinkSocket {
     inner: platform::NetlinkSocket,
+}
+
+/// An open directory anchored inside the verified Linux BPF filesystem.
+///
+/// The descriptor remains open for the lifetime of this value. [`Self::proc_path`]
+/// may therefore be used to give path-only BPF APIs a race-free reference to
+/// the exact directory that was opened and verified.
+#[derive(Debug)]
+pub struct BpffsDirectory {
+    inner: platform::BpffsDirectory,
+}
+
+impl BpffsDirectory {
+    /// Return a `/proc/self/fd` path for the held directory descriptor.
+    #[must_use]
+    pub fn proc_path(&self) -> PathBuf {
+        self.inner.proc_path()
+    }
 }
 
 impl NetlinkSocket {
@@ -67,6 +86,16 @@ pub fn send_message(socket: &NetlinkSocket, payload: &[u8]) -> io::Result<usize>
 /// response and treat truncation as an indeterminate operation result.
 pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<usize> {
     platform::receive_message(&socket.inner, buffer)
+}
+
+/// Open or create a directory strictly beneath `/sys/fs/bpf`.
+///
+/// Every component is resolved relative to an already-open directory with
+/// Linux `openat2(2)` using `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+/// `RESOLVE_NO_MAGICLINKS`. The final descriptor is accepted only when
+/// `fstatfs(2)` reports `BPF_FS_MAGIC`.
+pub fn open_or_create_bpffs_directory(relative: &Path) -> io::Result<BpffsDirectory> {
+    platform::open_or_create_bpffs_directory(relative).map(|inner| BpffsDirectory { inner })
 }
 
 /// Netlink request flag.
@@ -164,6 +193,10 @@ pub const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 pub const XFRMA_MARK: u16 = 21;
 /// XFRM ESN replay sequence/bitmap attribute.
 pub const XFRMA_REPLAY_ESN_VAL: u16 = 23;
+/// XFRM post-transform output skb-mark value attribute.
+pub const XFRMA_SET_MARK: u16 = 29;
+/// XFRM post-transform output skb-mark mask attribute.
+pub const XFRMA_SET_MARK_MASK: u16 = 30;
 /// XFRM optional interface identifier attribute.
 pub const XFRMA_IF_ID: u16 = 31;
 
@@ -579,6 +612,8 @@ mod tests {
         assert_eq!(XFRMA_MARK, 21);
         assert_eq!(XFRMA_REPLAY_ESN_VAL, 23);
         assert_eq!(XFRMA_IF_ID, 31);
+        assert_eq!(XFRMA_SET_MARK, 29);
+        assert_eq!(XFRMA_SET_MARK_MASK, 30);
         assert_eq!(XFRM_STATE_ESN, 0x80);
     }
 

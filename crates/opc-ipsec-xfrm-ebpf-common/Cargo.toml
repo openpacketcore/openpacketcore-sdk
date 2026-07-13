@@ -1,0 +1,13 @@
+[package]
+name = "opc-ipsec-xfrm-ebpf-common"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared mark-token and packet-header layouts for opc-ipsec-xfrm tc eBPF DSCP stamping"
+publish = false
+
+[lints]
+workspace = true

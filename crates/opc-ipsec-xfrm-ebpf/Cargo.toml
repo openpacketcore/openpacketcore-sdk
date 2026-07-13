@@ -1,0 +1,31 @@
+[package]
+name = "opc-ipsec-xfrm-ebpf"
+version = "0.2.0"
+authors = ["OpenPacketCore Contributors"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/openpacketcore/openpacketcore-sdk"
+description = "tc eBPF post-transform outer-DSCP companion for opc-ipsec-xfrm"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.2.1"
+opc-ipsec-xfrm-ebpf-common = { path = "../opc-ipsec-xfrm-ebpf-common" }
+
+[[bin]]
+name = "opc-ipsec-xfrm-dscp"
+path = "src/main.rs"
+
+[workspace]
+
+[profile.release]
+debug = 2
+codegen-units = 1
+lto = true
+panic = "abort"
+opt-level = 3
+
+[profile.dev]
+panic = "abort"
+opt-level = 3
+debug = 2

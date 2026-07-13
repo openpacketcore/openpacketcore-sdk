@@ -168,6 +168,8 @@ pub const TCA_KIND: u16 = 1;
 pub const TCA_OPTIONS: u16 = 2;
 /// cls_bpf attribute: attached BPF program name.
 pub const TCA_BPF_NAME: u16 = 7;
+/// cls_bpf attribute: attached BPF program identifier.
+pub const TCA_BPF_ID: u16 = 11;
 
 /// tc parent handle for the clsact ingress hook.
 pub const TC_H_CLSACT_INGRESS: u32 = 0xFFFF_FFF2;
@@ -370,6 +372,7 @@ mod tests {
         assert_eq!(TCA_KIND, 1);
         assert_eq!(TCA_OPTIONS, 2);
         assert_eq!(TCA_BPF_NAME, 7);
+        assert_eq!(TCA_BPF_ID, 11);
         assert_eq!(TC_H_CLSACT_INGRESS, 0xFFFF_FFF2);
         assert_eq!(TC_H_CLSACT_EGRESS, 0xFFFF_FFF3);
         assert_eq!(AF_UNSPEC, 0);

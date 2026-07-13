@@ -24,8 +24,8 @@ use opc_linux_gtpu_sys::{
 
 use crate::{
     CreateGtpDeviceRequest, GtpAddressFamily, GtpDevice, GtpPdpContext, GtpRole, GtpVersion,
-    GtpuBackendKind, GtpuDataplaneBackend, GtpuError, GtpuProbe, RemovePdpContextRequest,
-    GTPU_PORT,
+    GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuProbe,
+    RemovePdpContextRequest, GTPU_PORT,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -553,6 +553,7 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             bpf_capable: false,
             btf_present: false,
             mutation_ready,
+            egress_dscp_marking: GtpuCapability::Missing,
             details,
         }
     }
@@ -621,6 +622,11 @@ fn validate_device(device: &GtpDevice) -> Result<(), GtpuError> {
 }
 
 fn validate_pdp_context(context: &GtpPdpContext) -> Result<(), GtpuError> {
+    if context.egress_dscp.is_some() {
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "fixed_outer_dscp",
+        });
+    }
     validate_ifindex(context.link_ifindex, "pdp.link_ifindex")?;
     validate_gtp_version(context.gtp_version)?;
     if is_unspecified(context.ms_address) {
@@ -1165,6 +1171,7 @@ mod tests {
                     bpf_capable: false,
                     btf_present: false,
                     mutation_ready: true,
+                    egress_dscp_marking: GtpuCapability::Missing,
                     details: Some("test transport"),
                 },
                 socket_fd: 9,
@@ -1248,6 +1255,7 @@ mod tests {
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 42,
             gtp_version: GtpVersion::V1,
+            egress_dscp: None,
         }
     }
 
@@ -1390,6 +1398,28 @@ mod tests {
         assert_eq!(
             attr_u32(&body[GENERIC_NETLINK_HEADER_LEN..], GTPA_O_TEI),
             0x5566_7788
+        );
+    }
+
+    #[test]
+    fn kernel_backend_rejects_fixed_outer_dscp_without_sending_it() {
+        let baseline = pdp_context();
+        let baseline_bytes = encode_install_pdp_context(&baseline).unwrap();
+        assert!(validate_pdp_context(&baseline).is_ok());
+
+        let mut marked = baseline.clone();
+        marked.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+        assert!(matches!(
+            validate_pdp_context(&marked).unwrap_err(),
+            GtpuError::UnsupportedFeature {
+                feature: "fixed_outer_dscp"
+            }
+        ));
+        // The encoder has no hidden DSCP attribute: the supported None path
+        // remains exactly the established netlink payload.
+        assert_eq!(
+            encode_install_pdp_context(&baseline).unwrap(),
+            baseline_bytes
         );
     }
 

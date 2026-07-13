@@ -28,6 +28,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from 5 to 6, so every compatibility peer must be drained and upgraded
   together. Openraft consensus transport/schema, persisted SQLite rows,
   snapshots, payload envelopes, AAD, and HKMS placement are unchanged.
+- **BREAKING — `opc-ipsec-xfrm`, `opc-gtpu-dataplane`, and `opc-types`:**
+  one shared validated `DscpCodepoint` (0 through 63) now reaches both user-plane
+  install surfaces. `SaParameters`/`SaState` and `GtpPdpContext` add
+  `egress_dscp`; XFRM and GTP-U probes add truthful marking capability fields.
+  The Linux XFRM backend uses masked output-mark tokens plus an explicitly
+  configured, pinned tc egress companion to stamp tunnel-mode ESP/ESP-in-UDP
+  outer IPv4/IPv6 headers while preserving ECN, IPv4 checksum correctness, and
+  unrelated mark bits. It validates mark collisions and every live attachment
+  before marked mutations, adopts its exact tc slot without a detach gap, and
+  binds adoption to the embedded classifier's kernel tag/type/name. Stale-code
+  upgrades fail closed and use a documented drain-and-replace procedure. It
+  does not claim availability until exact kernel GETSA readback exists. Marked
+  SA query/remove and marked policy removal now carry the lookup mark as part
+  of the kernel identity. Post-ACK readback compares every stable redaction-safe
+  SA field, but cannot prove key ownership; failure is explicitly indeterminate
+  and never triggers a potentially destructive same-identity DELSA. Sensitive
+  inbound netlink response buffers zeroize on drop. The
+  GTP-U eBPF backend adds an independent per-UE DSCP map without changing FAR,
+  PDR, counter, or absent-path wire layouts; ordered publication, rollback,
+  DSCP-only crash-orphan recovery, additive legacy-pin adoption, and runtime
+  map-loss handling fail closed. Both tc links are kernel-owned, preventing old
+  loader drop from detaching a static same-slot replacement. Cleanup rechecks
+  both program IDs and every named map-pin ID; partial/uncertain cleanup is
+  typed indeterminate. Classic tc and bpffs pathname cleanup require the
+  documented exclusive-writer boundary and do not claim atomic safety against
+  uncoordinated concurrent external mutation. Provisioning reconciles lost tc
+  attach ACKs by exact live program ID, propagates every rollback failure, and
+  unlinks fresh pins only after exact named-map reproof plus a proven
+  no-desired-hook state. A capable pre-attach probe reports `Unknown`.
+  Mainline Linux GTP, mock, unsupported, and unconfigured XFRM paths reject a
+  requested mark instead of silently dropping it. `None` preserves exact legacy
+  netlink/packet bytes. Kernel-independent boundary tests, committed-object
+  rebuild gates, and privileged real XFRM/tc and GTP-U wire captures cover both
+  set and absent paths.
 - **BREAKING — `opc-key` remote-seal implementors:**
   `RemoteSealProvider::unseal` now receives the canonical envelope `KeyId`, so
   remote reads select the exact historical key instead of silently using the
