@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
-use opc_consensus::engine::{Config, EmptyNode, LogId, SnapshotPolicy, StoredMembership};
+use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
-    encode_bounded, ConsensusNodeId, ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily,
-    ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
+    durable_openraft_config, encode_bounded, ConsensusNodeId, ConsensusPeer, ConsensusPeerError,
+    ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
+    DurableOpenraftDomain,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,13 +37,7 @@ use crate::types::{
 /// Complete client-operation deadline including routing, quorum, commit, and apply.
 pub const DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-const HEARTBEAT_MILLIS: u64 = 250;
-const ELECTION_MIN_MILLIS: u64 = 1_000;
-const ELECTION_MAX_MILLIS: u64 = 2_000;
 const ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const SNAPSHOT_CHUNK_BYTES: u64 = 1024 * 1024;
-const LOGS_PER_SNAPSHOT: u64 = 4_096;
-const RETAINED_LOGS: u64 = 1_024;
 const MAX_FORWARDED_BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_ID_DOMAIN: &[u8] = b"openpacketcore/config-consensus/request-id/v1\0";
 
@@ -1030,22 +1025,9 @@ impl ConsensusConfigStore {
     }
 }
 
-fn config_raft_config() -> Result<Config, ConfigConsensusOpenError> {
-    Config {
-        cluster_name: "opc-config-store".into(),
-        heartbeat_interval: HEARTBEAT_MILLIS,
-        election_timeout_min: ELECTION_MIN_MILLIS,
-        election_timeout_max: ELECTION_MAX_MILLIS,
-        install_snapshot_timeout: 10_000,
-        max_payload_entries: 1,
-        replication_lag_threshold: LOGS_PER_SNAPSHOT,
-        snapshot_policy: SnapshotPolicy::LogsSinceLast(LOGS_PER_SNAPSHOT),
-        snapshot_max_chunk_size: SNAPSHOT_CHUNK_BYTES,
-        max_in_snapshot_log_to_keep: RETAINED_LOGS,
-        ..Config::default()
-    }
-    .validate()
-    .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)
+fn config_raft_config() -> Result<opc_consensus::engine::Config, ConfigConsensusOpenError> {
+    durable_openraft_config(DurableOpenraftDomain::ConfigurationState)
+        .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)
 }
 
 fn client_write_leader(
