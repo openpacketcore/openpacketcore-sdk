@@ -50,6 +50,47 @@ async fn partition_and_recover() {
   or a second consensus implementation.
 - Used by AMF-lite, IPsec ownership, cache, and session-store tests.
 
+## Production-mTLS Candidate Harness
+
+The private `opc-session-quorum-node` binary now has a default production-mTLS
+path for qualification work. It loads one coherent Kubernetes-style projected
+SVID generation through `ProjectedSvidSource`, pins the configured local SPIFFE
+ID in one shared `TlsMaterialController`, and gives the resulting authenticated
+client/server configs to
+`RemoteSessionConsensusPeer::new_profiled_with_resolver` and
+`SessionConsensusServer::new`. The manifest still performs the exact peer
+SPIFFE-ID check after certificate-chain authentication.
+
+The candidate build has no default features:
+
+```console
+cargo build -p opc-session-testkit --bin opc-session-quorum-node --no-default-features
+cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features
+```
+
+Its strict node config accepts `projected_mtls` with an absolute projected
+volume root inside the node workspace, normalized relative certificate/key/
+bundle names, a bounded polling interval, and a finite validated connection
+lifecycle policy. The control protocol exposes only redaction-safe evidence:
+authoritative TLS material status and expiries, an explicit reauthentication
+generation, a directed fresh authenticated-TLS plus exact manifest-bound
+consensus-bootstrap proof, durable readiness, and fixed-cardinality lifecycle
+counters. A directed proof succeeds only after that path's resolver count has
+advanced at the requested reauthentication generation, independently of the
+generation echoed in the control reply. It may end in the exact authenticated
+`Protocol` application result and therefore does not claim valid private
+ReadBarrier handler execution. The protocol never returns material, SPIFFE IDs,
+routes, or filesystem paths.
+
+`qualification/v1/session-mtls-candidate-evidence.schema.json` deliberately
+requires `experimental = true`, `qualification_complete = false`,
+`insecure_test_enabled = false`, and
+`counts_for_seamless_tls_rotation = false`. This v1 schema accepts exactly the
+current three-process test and its six directed paths, and requires all seven
+coarse candidate gaps encoded by this checkpoint. Those seven gaps are not an
+exhaustive #164 acceptance inventory. The checkpoint proves initial
+projected-SVID mTLS fleet formation; it is not seamless-rotation qualification.
+
 ## Status Notes
 
 - `publish = false`; this crate is test-only.
@@ -63,6 +104,13 @@ async fn partition_and_recover() {
   These loopback plaintext tests do not by themselves qualify cold-start races,
   deployed-network/mTLS behavior, complete crash matrices, multi-node
   restart/rejoin, legacy-fork repair, or carrier failover.
+- The production-mTLS candidate does not yet cover five-member
+  multiprocess/deployed evidence, old/new trust overlap, projected material
+  replacement under continuous durable traffic, rejection after overlap
+  removal, certificate-expiry retirement, bounded drain/reconnect evidence, or
+  the platform/soak matrix. The three- and five-voter in-process mechanics are
+  covered separately in `opc-session-net`; these remaining cases are still
+  required before #164/#158 can be closed.
 - Long-running network, resource, and soak qualification remains #143. Watch
   handoff and bounded replication-log cursor/retention semantics are
   implemented under #145/#171.
@@ -83,7 +131,10 @@ async fn partition_and_recover() {
 ## Verification
 
 - Source checked: `Cargo.toml`, `src/lib.rs`, and dependent session tests.
-- Run with: `cargo test -p opc-session-testkit`.
+- Run production-mTLS qualification with:
+  `cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features`.
+- Run the historical plaintext foundation explicitly with:
+  `cargo test -p opc-session-testkit --features foundation-insecure --test qualification_multiprocess`.
 
 ## License
 

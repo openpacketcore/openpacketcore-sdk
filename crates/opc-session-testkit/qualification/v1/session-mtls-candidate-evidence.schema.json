@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-mtls-candidate-evidence/v1",
+  "title": "Experimental session production-mTLS harness checkpoint",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "experimental",
+    "qualification_complete",
+    "artifact",
+    "topology",
+    "observations",
+    "remaining_acceptance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "opc-session-mtls-candidate-evidence/v1"
+    },
+    "experimental": {
+      "const": true
+    },
+    "qualification_complete": {
+      "const": false
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "crate_name",
+        "default_features_only",
+        "insecure_test_enabled"
+      ],
+      "properties": {
+        "crate_name": {
+          "const": "opc-session-testkit"
+        },
+        "default_features_only": {
+          "const": true
+        },
+        "insecure_test_enabled": {
+          "const": false
+        }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "members",
+        "distinct_processes",
+        "distinct_sqlite_databases",
+        "transport_mode",
+        "counts_for_seamless_tls_rotation"
+      ],
+      "properties": {
+        "members": {
+          "const": 3
+        },
+        "distinct_processes": {
+          "const": true
+        },
+        "distinct_sqlite_databases": {
+          "const": true
+        },
+        "transport_mode": {
+          "const": "projected_svid_mtls"
+        },
+        "counts_for_seamless_tls_rotation": {
+          "const": false
+        }
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "material_status_collected",
+        "durable_readiness_reached",
+        "directed_fresh_handshakes_succeeded",
+        "directed_handshake_count",
+        "lifecycle_metrics_collected"
+      ],
+      "properties": {
+        "material_status_collected": {
+          "const": true
+        },
+        "durable_readiness_reached": {
+          "const": true
+        },
+        "directed_fresh_handshakes_succeeded": {
+          "const": true,
+          "description": "After an explicit reauthentication request, every directed path advanced its resolver at that generation and completed authenticated TLS plus the exact manifest-bound consensus bootstrap. This does not claim a valid private ReadBarrier handler result."
+        },
+        "directed_handshake_count": {
+          "const": 6,
+          "description": "Exactly six directed TLS plus manifest-bootstrap paths in this three-member v1 checkpoint."
+        },
+        "lifecycle_metrics_collected": {
+          "const": true
+        }
+      }
+    },
+    "remaining_acceptance": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "five_member_mtls_matrix",
+          "projected_material_rotation_under_continuous_traffic",
+          "old_and_new_trust_overlap",
+          "post_overlap_old_trust_rejection",
+          "certificate_expiry_retirement",
+          "bounded_drain_and_reconnect_evidence",
+          "platform_and_soak_matrix"
+        ]
+      }
+    }
+  }
+}
