@@ -214,13 +214,10 @@ is deterministic for an identical semantic position, so a response retry
 reuses the same token. The cursor is backend-incarnation/node-bound: same-PVC
 restart can resume it, but another node or an installed snapshot returns typed
 `RestoreScanCursorStale`; restart at the first page instead of merging pages.
-The maximum local consensus-key cursor serializes to roughly 4 MiB of hex and
-therefore exceeds the 1 MiB default legacy session-net frame while remaining
-below the 16 MiB negotiated ceiling. Response sizing is exact and bounded: an
-insufficient negotiated frame returns typed `RestoreScanResponseTooLarge`
-without a prefix or partial cursor. Configure a larger frame only when an
-approved compatibility deployment actually needs it; session-net records
-remain independently limited to 64-byte stable IDs.
+The model-wide 64-byte stable-ID bound keeps the complete confidential cursor
+below 2 KiB after hex encoding, so it fits the minimum legacy session-net
+frame. Response sizing remains exact and bounded: an otherwise oversized page
+returns typed `RestoreScanResponseTooLarge` without a prefix or partial cursor.
 
 The existing restore request's `max_response_frame_size` remains an additional
 per-call cap; it may reduce, never enlarge, that connection's accepted response
@@ -402,8 +399,9 @@ campaigns.
   page and rejection of a modified cursor; and only then restore traffic. The
   fixed-width DTO and handshake now state the #135 admission contract
   explicitly, and revision 2 adds the exact directional response/request
-  budgets and wire-only stable-ID, replication-transaction-ID, and CAS-request-ID
-  containment. The audit and runtime never
+  budgets and replication-transaction-ID/CAS-request-ID wire containment.
+  #167 promotes stable-ID admission to the shared model/store contract. The
+  audit and runtime never
   truncate, rename, or rewrite rejected identities or log entries, and their
   errors do not expose the rejected raw value.
 - Before enabling revision 2, inventory every retained record, replication log,

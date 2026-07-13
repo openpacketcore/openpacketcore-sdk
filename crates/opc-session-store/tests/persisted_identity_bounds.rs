@@ -90,7 +90,9 @@ fn key(key_type: SessionKeyType, stable_id: &'static [u8]) -> SessionKey {
         tenant: TenantId::new(TENANT).expect("valid tenant"),
         nf_kind: NetworkFunctionKind::from_static(NF_KIND),
         key_type,
-        stable_id: Bytes::from_static(stable_id),
+        stable_id: Bytes::from_static(stable_id)
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 
@@ -239,6 +241,28 @@ fn replace_json_string(value: &mut JsonValue, needle: &str, replacement: &str) -
         JsonValue::Object(values) => values
             .values_mut()
             .map(|value| replace_json_string(value, needle, replacement))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn replace_json_field(value: &mut JsonValue, field: &str, replacement: &JsonValue) -> usize {
+    match value {
+        JsonValue::Object(values) => {
+            let mut replaced = 0;
+            if let Some(value) = values.get_mut(field) {
+                *value = replacement.clone();
+                replaced += 1;
+            }
+            replaced
+                + values
+                    .values_mut()
+                    .map(|value| replace_json_field(value, field, replacement))
+                    .sum::<usize>()
+        }
+        JsonValue::Array(values) => values
+            .iter_mut()
+            .map(|value| replace_json_field(value, field, replacement))
             .sum(),
         _ => 0,
     }
@@ -655,6 +679,48 @@ async fn invalid_nested_replication_log_key_type_is_redacted_and_read_only() {
         error,
         "custom session key type must be at most 128 bytes",
         &hostile_key_type,
+    );
+    assert_eq!(snapshot(file.path()), before);
+}
+
+#[tokio::test]
+async fn invalid_nested_replication_log_stable_id_is_redacted_and_read_only() {
+    let file = initialized_database();
+    let entry = nested_delete_entry(
+        1,
+        legacy_key(b"nested-invalid-stable-id"),
+        OwnerId::new("nested-stable-id-owner").expect("valid owner"),
+    );
+    let mut json = serde_json::to_value(&entry).expect("serialize replication entry");
+    assert!(
+        replace_json_field(
+            &mut json,
+            "stable_id",
+            &serde_json::json!(vec![0x5a_u8; opc_session_store::STABLE_ID_MAX_BYTES + 1]),
+        ) > 0
+    );
+    {
+        let connection = Connection::open(file.path()).expect("open raw SQLite connection");
+        insert_raw_replication_json(
+            &connection,
+            entry.sequence,
+            &entry.tx_id,
+            &serde_json::to_string(&json).expect("serialize hostile entry"),
+        );
+    }
+    let before = snapshot(file.path());
+
+    let backend = SqliteSessionBackend::open(file.path()).expect("open SQLite backend");
+    let error = backend
+        .get_replication_log(1, 10)
+        .await
+        .expect_err("reject invalid nested stable ID");
+    drop(backend);
+
+    assert_redacted_serialization_error(
+        error,
+        "stable session identifier must contain 1 to 64 bytes",
+        "[90,90,90",
     );
     assert_eq!(snapshot(file.path()), before);
 }

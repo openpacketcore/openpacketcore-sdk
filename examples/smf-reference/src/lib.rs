@@ -286,7 +286,7 @@ impl Smf {
     /// marker.
     pub async fn create_session(&self) -> Result<u64, SmfError> {
         let seid = self.allocate_seid().await;
-        let key = session_key(&self.owner, seid);
+        let key = session_key(&self.owner, seid)?;
         let lease = self
             .store
             .acquire(&key, self.owner.clone(), Duration::from_secs(60))
@@ -329,7 +329,7 @@ impl Smf {
 
     /// Read a PDU session record from the session store.
     pub async fn get_session(&self, seid: u64) -> Result<Option<PduSessionRecord>, SmfError> {
-        let key = session_key(&self.owner, seid);
+        let key = session_key(&self.owner, seid)?;
         let maybe_record = self.store.get(&key).await?;
         match maybe_record {
             Some(record) => {
@@ -359,19 +359,23 @@ fn ownership_key(owner: &OwnerId) -> Result<SessionKey, SmfError> {
         tenant: TenantId::from_static("ref-smf"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::other("smf-ownership").map_err(SmfError::SessionStore)?,
-        stable_id: Bytes::copy_from_slice(owner.as_str().as_bytes()),
+        stable_id: opc_session_store::StableId::new(Bytes::copy_from_slice(
+            owner.as_str().as_bytes(),
+        ))
+        .map_err(|error| SmfError::SessionStore(error.to_string()))?,
     })
 }
 
-fn session_key(owner: &OwnerId, seid: u64) -> SessionKey {
+fn session_key(owner: &OwnerId, seid: u64) -> Result<SessionKey, SmfError> {
     let mut stable_id = owner.as_str().as_bytes().to_vec();
     stable_id.extend_from_slice(&seid.to_be_bytes());
-    SessionKey {
+    Ok(SessionKey {
         tenant: TenantId::from_static("ref-smf"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from(stable_id),
-    }
+        stable_id: opc_session_store::StableId::new(Bytes::from(stable_id))
+            .map_err(|error| SmfError::SessionStore(error.to_string()))?,
+    })
 }
 
 fn build_smf_profile(config: &SmfConfig) -> NfProfile {

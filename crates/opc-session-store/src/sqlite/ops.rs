@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use opc_key::Zeroizing;
 use opc_types::Timestamp;
 use rand::{rngs::SysRng, TryRng};
@@ -590,7 +589,11 @@ impl RestoreScanCandidate {
                     StoreError::Serialization("persisted session key is invalid".into())
                 })?,
                 key_type: SessionKeyType::from_str(key_type).map_err(StoreError::Serialization)?,
-                stable_id: Bytes::copy_from_slice(stable_id),
+                stable_id: crate::StableId::try_from(stable_id).map_err(|_| {
+                    StoreError::Serialization(
+                        "persisted stable session identifier is invalid".into(),
+                    )
+                })?,
             },
             generation: Generation::new(persisted_u64(restore_scan_integer(row, 4)?)?),
             owner: persisted_owner_id(owner.to_owned())?,
@@ -717,9 +720,13 @@ fn restore_scan_row_budget(row: &Row<'_>) -> Result<RestoreScanRowBudget, StoreE
             "custom session key type must be at most 128 bytes".into(),
         ));
     }
+    if !(crate::STABLE_ID_MIN_BYTES..=crate::STABLE_ID_MAX_BYTES).contains(&stable_id.len()) {
+        return Err(StoreError::Serialization(
+            "persisted stable session identifier is invalid".into(),
+        ));
+    }
     if tenant.len() > RESTORE_SCAN_TENANT_MAX_BYTES
         || nf_kind.len() > RESTORE_SCAN_NF_KIND_MAX_BYTES
-        || stable_id.len() > crate::SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES
         || owner.len() > OWNER_ID_MAX_BYTES
         || state_type.len() > STATE_TYPE_MAX_BYTES
     {
@@ -1007,7 +1014,9 @@ pub(crate) fn stored_record_from_row(
             tenant,
             nf_kind,
             key_type,
-            stable_id: Bytes::from(stable_id),
+            stable_id: crate::StableId::try_from(stable_id).map_err(|_| {
+                StoreError::Serialization("persisted stable session identifier is invalid".into())
+            })?,
         },
         generation: Generation::new(persisted_u64(generation)?),
         owner,

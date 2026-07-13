@@ -260,9 +260,10 @@ async fn test_amf_lite_e2e_happy_path() {
     );
     let ctx: opc_amf_lite::UeSessionContext = serde_json::from_slice(plaintext_payload).unwrap();
     assert_eq!(
-        ctx.subscriber_pseudonym,
-        std::str::from_utf8(&key.stable_id).unwrap()
+        key.stable_id.len(),
+        opc_session_store::STABLE_ID_HMAC_SHA256_BYTES
     );
+    assert_ne!(ctx.subscriber_pseudonym.as_bytes(), key.stable_id.as_ref());
     assert!(!ctx.subscriber_pseudonym.contains(imsi));
     assert_eq!(ctx.subscriber_identity, "<subscriber-id>");
     assert_eq!(ctx.state, "REGISTERED");

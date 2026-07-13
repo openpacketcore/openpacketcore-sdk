@@ -1486,7 +1486,9 @@ mod tests {
                     tenant: opc_types::TenantId::new("tenant-a").expect("test tenant"),
                     nf_kind: opc_types::NetworkFunctionKind::from_static("smf"),
                     key_type: opc_session_store::SessionKeyType::PduSession,
-                    stable_id: bytes::Bytes::from_static(b"forged-response"),
+                    stable_id: bytes::Bytes::from_static(b"forged-response")
+                        .try_into()
+                        .expect("valid stable ID"),
                 },
                 owner: OwnerId::new("forged-response-owner").expect("test owner"),
                 fence: opc_session_store::FenceToken::new(1),
@@ -2064,18 +2066,12 @@ mod tests {
             Some(Duration::from_secs(1)),
         );
 
-        let mut invalid_key = match valid_deadline_entry().op {
-            ReplicationOp::RefreshTtl { key, .. } => key,
-            _ => unreachable!("fixture operation is fixed"),
-        };
-        invalid_key.stable_id =
-            bytes::Bytes::from(vec![7; crate::MAX_SESSION_NET_STABLE_ID_BYTES + 1]);
-        assert!(matches!(
-            backend
-                .send_request_classified(Request::Get { key: invalid_key })
-                .await,
-            Err(RemoteRequestFailure::Protocol)
-        ));
+        assert!(opc_session_store::StableId::new(bytes::Bytes::from(vec![
+            7;
+            crate::MAX_SESSION_NET_STABLE_ID_BYTES
+                + 1
+        ]))
+        .is_err());
 
         let mut invalid_tx = valid_deadline_entry();
         invalid_tx.tx_id = "x".repeat(crate::MAX_SESSION_NET_REPLICATION_TX_ID_BYTES + 1);
@@ -2168,7 +2164,9 @@ mod tests {
             opc_session_store::ReplicationOp::RefreshTtl { key, .. } => key,
             _ => unreachable!("fixture operation is fixed"),
         };
-        key.stable_id = bytes::Bytes::from(vec![u8::MAX; crate::MAX_SESSION_NET_STABLE_ID_BYTES]);
+        key.stable_id = bytes::Bytes::from(vec![u8::MAX; crate::MAX_SESSION_NET_STABLE_ID_BYTES])
+            .try_into()
+            .expect("maximum stable ID");
         let error = backend
             .batch(vec![SessionOp::Get { key }; 128])
             .await
@@ -2572,7 +2570,9 @@ mod tests {
     async fn peer_record_for_a_different_key_is_a_protocol_violation() {
         let mut operation = valid_compare_and_set(0).await;
         let wrong_record = operation.new_record.clone();
-        operation.key.stable_id = bytes::Bytes::from_static(b"requested-peer-key");
+        operation.key.stable_id = bytes::Bytes::from_static(b"requested-peer-key")
+            .try_into()
+            .expect("valid stable ID");
         let requested_key = operation.key;
         assert_ne!(wrong_record.key, requested_key);
         let (addr, server) =
@@ -2606,7 +2606,9 @@ mod tests {
     async fn peer_cas_conflict_for_a_different_key_is_a_protocol_violation() {
         let operation = valid_compare_and_set(0).await;
         let mut wrong_record = operation.new_record.clone();
-        wrong_record.key.stable_id = bytes::Bytes::from_static(b"wrong-cas-conflict-key");
+        wrong_record.key.stable_id = bytes::Bytes::from_static(b"wrong-cas-conflict-key")
+            .try_into()
+            .expect("valid stable ID");
         let response = Response::CompareAndSet(Ok(CompareAndSetResult::Conflict {
             current: Some(wrong_record),
         }));
@@ -2675,7 +2677,9 @@ mod tests {
         let operation = valid_compare_and_set(0).await;
         let requested_key = operation.key.clone();
         let mut wrong_record = operation.new_record.clone();
-        wrong_record.key.stable_id = bytes::Bytes::from_static(b"wrong-batch-get-key");
+        wrong_record.key.stable_id = bytes::Bytes::from_static(b"wrong-batch-get-key")
+            .try_into()
+            .expect("valid stable ID");
         assert_malicious_batch_response_is_rejected(
             vec![SessionOp::Get { key: requested_key }],
             vec![SessionOpResult::Get(Ok(Some(wrong_record)))],
@@ -2684,7 +2688,9 @@ mod tests {
 
         let operation = valid_compare_and_set(0).await;
         let mut wrong_record = operation.new_record.clone();
-        wrong_record.key.stable_id = bytes::Bytes::from_static(b"wrong-batch-cas-key");
+        wrong_record.key.stable_id = bytes::Bytes::from_static(b"wrong-batch-cas-key")
+            .try_into()
+            .expect("valid stable ID");
         assert_malicious_batch_response_is_rejected(
             vec![SessionOp::CompareAndSet(operation)],
             vec![SessionOpResult::CompareAndSet(Ok(
@@ -2704,7 +2710,9 @@ mod tests {
         };
         let requested_owner = OwnerId::new("requested-owner").expect("test owner");
         let mut wrong_key = requested_key.clone();
-        wrong_key.stable_id = bytes::Bytes::from_static(b"wrong-acquire-key");
+        wrong_key.stable_id = bytes::Bytes::from_static(b"wrong-acquire-key")
+            .try_into()
+            .expect("valid stable ID");
         let wrong_lease = FakeSessionBackend::new()
             .acquire(
                 &wrong_key,
@@ -2740,7 +2748,9 @@ mod tests {
         let lease = valid_compare_and_set(0).await.lease;
         let mut forged_wire = serde_json::to_value(&lease).expect("serialize lease");
         let mut wrong_key = lease.key().clone();
-        wrong_key.stable_id = bytes::Bytes::from_static(b"wrong-renew-key");
+        wrong_key.stable_id = bytes::Bytes::from_static(b"wrong-renew-key")
+            .try_into()
+            .expect("valid stable ID");
         forged_wire["key"] = serde_json::to_value(wrong_key).expect("serialize wrong key");
         forged_wire["owner"] = serde_json::json!("wrong-renew-owner");
         forged_wire["fence"] = serde_json::json!(lease.fence().get() + 1);

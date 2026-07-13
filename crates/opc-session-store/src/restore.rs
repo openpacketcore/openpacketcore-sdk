@@ -74,7 +74,7 @@ const RESTORE_SCAN_CURSOR_NONCE_BYTES: usize = 12;
 const RESTORE_SCAN_CURSOR_TENANT_BYTES: usize = 128;
 const RESTORE_SCAN_CURSOR_NF_KIND_BYTES: usize = 64;
 const RESTORE_SCAN_CURSOR_KEY_TYPE_BYTES: usize = 128;
-const RESTORE_SCAN_CURSOR_STABLE_ID_BYTES: usize = crate::SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES;
+const RESTORE_SCAN_CURSOR_STABLE_ID_BYTES: usize = crate::STABLE_ID_MAX_BYTES;
 const RESTORE_SCAN_CURSOR_FIELD_LENGTH_BYTES: usize = 4;
 const RESTORE_SCAN_CURSOR_EXAMINED_BYTES: usize = 8;
 const RESTORE_SCAN_CURSOR_TAG_BYTES: usize = 16;
@@ -356,7 +356,8 @@ impl RestoreScanCursor {
                 .map_err(|_| StoreError::RestoreScanCursorStale)?,
             key_type: SessionKeyType::from_str(key_type)
                 .map_err(|_| StoreError::RestoreScanCursorStale)?,
-            stable_id: bytes::Bytes::from(stable_id),
+            stable_id: crate::StableId::try_from(stable_id)
+                .map_err(|_| StoreError::RestoreScanCursorStale)?,
         };
         Ok((
             backend_epoch,
@@ -1389,7 +1390,9 @@ mod cursor_tests {
             tenant: TenantId::from_static("tenant-secret"),
             nf_kind: NetworkFunctionKind::upf(),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"subscriber-derived-secret"),
+            stable_id: Bytes::from_static(b"subscriber-derived-secret")
+                .try_into()
+                .expect("valid stable ID"),
         };
         let snapshot_time = Timestamp::from_offset_datetime(
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(987_654),
@@ -1446,7 +1449,9 @@ mod cursor_tests {
             tenant: TenantId::from_static("tenant-secret"),
             nf_kind: NetworkFunctionKind::upf(),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"subscriber-derived-secret"),
+            stable_id: Bytes::from_static(b"subscriber-derived-secret")
+                .try_into()
+                .expect("valid stable ID"),
         };
         let snapshot_time = Timestamp::from_offset_datetime(
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(987_654),
@@ -1487,11 +1492,13 @@ mod cursor_tests {
     fn cursor_represents_consensus_bounded_stable_ids() {
         let authentication_key = [0x5a; 32];
         let scope = RestoreScanScope::all();
-        let mut seek_key = SessionKey {
+        let seek_key = SessionKey {
             tenant: TenantId::from_static("tenant-a"),
             nf_kind: NetworkFunctionKind::upf(),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from(vec![0x6a; RESTORE_SCAN_CURSOR_STABLE_ID_BYTES]),
+            stable_id: Bytes::from(vec![0x6a; RESTORE_SCAN_CURSOR_STABLE_ID_BYTES])
+                .try_into()
+                .expect("maximum stable ID"),
         };
         let snapshot_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
         let cursor = RestoreScanCursor::durable(
@@ -1509,18 +1516,12 @@ mod cursor_tests {
             .authenticated_parts(&scope, &authentication_key)
             .expect("maximum cursor authenticates");
 
-        seek_key.stable_id = Bytes::from(vec![0x6a; RESTORE_SCAN_CURSOR_STABLE_ID_BYTES + 1]);
         assert_eq!(
-            RestoreScanCursor::durable(
-                &authentication_key,
-                [0x33; 16],
-                42,
-                snapshot_time,
-                &scope,
-                &seek_key,
-                1,
-            ),
-            Err(StoreError::RestoreScanWorkBudgetExceeded)
+            crate::StableId::new(Bytes::from(vec![
+                0x6a;
+                RESTORE_SCAN_CURSOR_STABLE_ID_BYTES + 1
+            ])),
+            Err(crate::StableIdError::InvalidWidth)
         );
     }
 

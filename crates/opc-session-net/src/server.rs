@@ -2009,7 +2009,9 @@ mod tests {
                 tenant: TenantId::from_static("tenant-a"),
                 nf_kind: NetworkFunctionKind::from_static("smf"),
                 key_type: SessionKeyType::PduSession,
-                stable_id: Bytes::from_static(stable_id),
+                stable_id: Bytes::from_static(stable_id)
+                    .try_into()
+                    .expect("valid stable ID"),
             },
             generation: Generation::new(1),
             owner: OwnerId::new("owner-a").expect("owner"),
@@ -2021,8 +2023,11 @@ mod tests {
         }
     }
 
-    fn durable_cursor_larger_than_the_default_frame() -> RestoreScanCursor {
-        let mut token = vec![0_u8; (crate::protocol::DEFAULT_MAX_FRAME_SIZE / 2) + 4_096];
+    fn large_bounded_durable_cursor() -> RestoreScanCursor {
+        // The model-wide 64-byte stable-ID bound makes 517 bytes the maximum
+        // durable token. A 512-byte syntactic token exercises the high end
+        // without duplicating the store's private encoding constants.
+        let mut token = vec![0_u8; 512];
         token[0] = 1;
         // Clear cumulative examined-row position, big endian.
         token[8] = 1;
@@ -2172,36 +2177,27 @@ mod tests {
     }
 
     #[test]
-    fn oversized_opaque_cursor_is_a_typed_negotiated_fit_failure() {
+    fn bounded_opaque_cursor_fits_the_minimum_negotiated_frame() {
         let request = RestoreScanRequest::all(1);
-        let mut page = RestoreScanPage::new(
-            Vec::new(),
-            1,
-            Some(durable_cursor_larger_than_the_default_frame()),
-        );
+        let mut page = RestoreScanPage::new(Vec::new(), 1, Some(large_bounded_durable_cursor()));
         page.cursor_profile = RestoreScanCursorProfile::DurableOpaqueV1;
         page.validate_for_request(&request)
             .expect("syntactic test cursor proves exact page progress");
         assert!(ensure_restore_scan_success_frame_fits(
             &page,
-            crate::protocol::MAX_NEGOTIATED_FRAME_SIZE,
+            crate::protocol::MIN_NEGOTIATED_FRAME_SIZE,
         )
         .is_ok());
 
         let response = bounded_restore_scan_response(
             Ok(page),
             &request,
-            crate::protocol::DEFAULT_MAX_FRAME_SIZE,
+            crate::protocol::MIN_NEGOTIATED_FRAME_SIZE,
             response_write_deadline(std::time::Duration::from_secs(1)).expect("deadline"),
             &TEST_NOT_CANCELLED,
         )
         .expect("bounded negotiated-fit response");
-        assert!(matches!(
-            response,
-            Response::ScanRestoreRecords(Err(StoreError::RestoreScanResponseTooLarge {
-                max_bytes: crate::protocol::DEFAULT_MAX_FRAME_SIZE
-            }))
-        ));
+        assert!(matches!(response, Response::ScanRestoreRecords(Ok(_))));
     }
 
     #[test]

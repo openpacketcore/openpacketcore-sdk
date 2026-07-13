@@ -182,7 +182,7 @@ pub mod prelude {
 
     #[cfg(feature = "session")]
     pub use opc_session_store::{
-        model::{CustomSessionKeyType, SessionKey, SessionKeyType},
+        model::{CustomSessionKeyType, SessionKey, SessionKeyType, StableId, StableIdError},
         BackendPeerBinding, BackendPeerScopeIdentity, DurableReadinessReport,
         DurableReadinessState, QuorumReplicaDescriptor, QuorumSessionStore, QuorumTopologyConfig,
         QuorumTopologyError, QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity,
@@ -190,6 +190,8 @@ pub mod prelude {
         ReplicaReadinessObservation, ReplicaReadinessOutcome, ReplicaTlsIdentity,
         ReplicaTopologyField, ReplicaTopologyFieldError, SessionStoreBackend,
         ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS, REPLICA_IDENTITY_MAX_BYTES,
-        REPLICA_ID_MAX_BYTES,
+        REPLICA_ID_MAX_BYTES, STABLE_ID_CANONICAL_SUBJECT_MAX_BYTES, STABLE_ID_HMAC_SHA256_BYTES,
+        STABLE_ID_MAX_BYTES, STABLE_ID_MIN_BYTES, STABLE_ID_PRIVACY_KEY_MAX_BYTES,
+        STABLE_ID_PRIVACY_KEY_MIN_BYTES,
     };
 }
