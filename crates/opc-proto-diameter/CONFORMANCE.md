@@ -6,7 +6,8 @@ This document defines the conformance status of the `opc-proto-diameter` crate.
 
 - **Document**: IETF RFC 6733 — *Diameter Base Protocol*
 - **3GPP references**: 3GPP TS 32.299 (Rf offline charging), 3GPP TS 29.273
-  (SWm Diameter-EAP), 3GPP TS 29.212 (Gx), 3GPP TS 29.272 (S6a/S6d),
+  (SWm Diameter-EAP), 3GPP TS 33.402 (non-3GPP access security and emergency
+  attach), 3GPP TS 29.272 (Terminal-Information), 3GPP TS 29.212 (Gx), and
   3GPP TS 29.273 (S6b/SWx).
 - **Status**: experimental scaffold with ADR 0015 evidence in progress
 
@@ -94,16 +95,53 @@ The SWm typed helpers validate the ePDG-required Diameter-EAP subset at both
 encode and parse boundaries: `Auth-Request-Type` must be
 `AUTHORIZE_AUTHENTICATE`, DER `EAP-Payload` must be present and nonempty,
 optional EAP/State material must not be empty when present, and a success DEA
-must carry EAP challenge/reissued payload or MSK material. These checks are
-mechanical message-shape validation only; AAA challenge selection, subscriber
-authorization, realm routing, transport state, and EAP-AKA policy remain
-downstream product work.
+must carry EAP challenge/reissued payload or MSK material. Emergency
+authorization additionally requires the correlated evidence described below.
+These checks are mechanical message-shape validation only; AAA challenge
+selection, subscriber authorization, local emergency policy, realm routing,
+transport state, and EAP-AKA policy remain downstream product work.
+
+The typed DER surface models TS 29.273 `Emergency-Services` as its actual 3GPP
+vendor-specific `Unsigned32` AVP (code 1538), with the V bit set and M/P bits
+clear. It is not grouped. Bit zero is `Emergency-Indication`; undefined
+received bits are discarded and never re-emitted. The field is a singleton at
+both command-dictionary and typed-parser boundaries. TS 29.273 enumerates the
+AVP on the DER only. It is not modeled as a DEA field and can never become an
+authorization signal; conservative decoding rejects it as an unknown DEA AVP.
+
+The DEA result is a typed, mutually exclusive base `Result-Code` or grouped
+`Experimental-Result`. In the TS 33.402 §13.3 recovery path, 3GPP vendor
+10415 / experimental code 5001 requests the UE's device identity. It is a
+continuation signal, not an authorization result. After the UE returns a TS
+24.302 `DEVICE_IDENTITY`, the ePDG sends a correlated retry DER containing the
+same emergency indication and the recovered IMEI in the TS 29.272
+`Terminal-Information` grouped AVP (code 1401). The IMEI child (code 1402)
+preserves exact 14- or 15-digit wire values. DEVICE_IDENTITY and the KDF use a
+separate exact-15-digit type, so the received spare/check digit is neither
+normalized nor silently replaced.
+
+A terminal emergency-success observation is issued only after correlating the
+exchange and checking all of the following: the initial payload is an exact
+EAP-Response/Identity bound byte-for-byte to a TS 23.003 IMSI emergency NAI;
+each DEA preserves its DER's Hop-by-Hop and End-to-End identifiers; the final
+DEA has exact base `DIAMETER_SUCCESS` (2001); its EAP payload is exactly an EAP
+Success with the correlated Response identifier; its EAP-Master-Session-Key is
+nonempty and equals the TS 33.402 Annex A.4 HMAC-SHA-256 result keyed by the
+exact 15 received IMEI digits; and `Mobile-Node-Identifier` contains that same
+IMEI Emergency NAI. A live Diameter transport must consume the matching
+pending request before invoking the codec evidence API. The verified MSK is
+then used for ordinary IKEv2 method-2 AUTH. Evidence accepts only the opaque
+exchange produced by consuming and correlating the two transaction envelopes.
+A standalone answer, stale or
+out-of-order transaction, experimental result, absent MSK, mismatched identity,
+or IKEv2 NULL-auth path cannot produce this evidence.
 
 The SWm DEA parse matches vendor-specific AVPs by (vendor-id, code); only
 genuinely unknown AVPs fall through to the unknown-AVP policy (mandatory
 unknown AVPs remain fail-closed). The typed DEA surface decodes and encodes
 `APN-Configuration` (TS 29.272 §7.3.35), top-level `Service-Selection` (RFC
-5778), and an optional top-level `Context-Identifier`.
+5778), an optional top-level `Context-Identifier`, and
+`Mobile-Node-Identifier` (RFC 5779).
 
 The top-level default pointer is an explicit interoperability extension, not a
 baseline SWm conformance claim. TS 29.273's SWm DEA command ABNF enumerates one
@@ -149,9 +187,9 @@ handled by the unknown-AVP policy.
 
 ### 6. Redaction
 
-Sensitive typed fields are wrapped in `Redacted<T>`. `Debug` and `Display`
-output the literal `REDACTED`; equality, cloning, and hashing delegate to the
-inner value so business logic can still operate on the real data.
+Sensitive typed fields are wrapped in `Redacted<T>` or redaction-safe identity
+newtypes. Their `Debug` and `Display` output never exposes the underlying
+value; equality, cloning, and hashing still support business logic.
 
 Covered redacted fields:
 - `RfAccountingRequest` / `RfAccountingAnswer`: `Session-Id`, `Origin-Host`,
@@ -160,6 +198,7 @@ Covered redacted fields:
 - `SwmDiameterEapRequest` / `SwmDiameterEapAnswer`: `Session-Id`, `Origin-Host`,
   `Origin-Realm`, `Destination-Realm`, `Destination-Host`, `User-Name`,
   `EAP-Payload`, `EAP-Reissued-Payload`, `EAP-Master-Session-Key`,
+  Terminal-Information IMEI and Software-Version, `Mobile-Node-Identifier`,
   `Service-Selection` (top level and inside
   `ApnConfiguration::service_selection`). `SwmDiameterEapAnswer` debug output
   shows only the count of `apn_configurations`, never their contents. Context
@@ -177,12 +216,15 @@ preallocate from a wire-declared length. Three layers guard them:
   fuzz corpus entry, byte-truncations of each entry, and hostile constant
   inputs through raw, owned, dictionary-command, and AVP decode entry points
   under `catch_unwind`. Seeds include repeated SWm State and the explicit
-  projected two-APN profile.
+  projected two-APN profile. The SWm set also covers the DER-only emergency
+  indication, 3GPP experimental result 5001, the Terminal-Information retry,
+  and final EAP-Success/MSK/Mobile-Node-Identifier material.
   Runs in ordinary `cargo test`; no nightly toolchain or libFuzzer required.
-- **Corpus generator flag-validation guard** — `fuzz/generate_corpus.py
-  self-test` exercises the `avp()` helper's acceptance of valid flags and
-  rejection of reserved AVP flag bits. The per-PR `.github/workflows/ci.yml`
-  gate runs this self-test without regenerating the committed corpus.
+- **Corpus generator helper guard** — `fuzz/generate_corpus.py self-test`
+  exercises the `avp()` helper's acceptance of valid flags and rejection of
+  reserved AVP flag bits, and pins the emergency KDF fixture to a fixed
+  independently checked vector. The per-PR `.github/workflows/ci.yml` gate
+  runs this self-test without regenerating the committed corpus.
 - **Fuzz target registration and scheduled coverage** — `fuzz/Cargo.toml`
   registers `fuzz/fuzz_targets/decode_message.rs` and
   `fuzz/fuzz_targets/decode_avp.rs`. The repository-level
@@ -210,7 +252,7 @@ fuzz/corpus/
 │   ├── dwr_request-*
 │   ├── dpr_request-*
 │   ├── rf_acr_start-*
-│   ├── swm_der-*
+│   ├── swm_der-* / swm_dea-*       # normal and emergency recovery stages
 │   └── malformed_*-*         # hostile seeds: truncation, duplicate, depth, flags
 └── decode_avp/               # seeds for the decode_avp fuzz target
     ├── ietf_origin_host-*
@@ -238,9 +280,10 @@ evidence only.
    ADR 0015 conformance evidence for the base header and AVP layer.
 2. **3GPP-authored fixtures** (`tests/fixture_provenance.rs` and the spec-valid
    seeds in `fuzz/corpus/*/`) — hand-built from RFC 6733 wire framing plus
-   3GPP TS 32.299 §5.1/§7.1 (Rf) and 3GPP TS 29.273 §7.2 (SWm) command/AVP
-   codes. They are application-dictionary evidence, not full
-   application-conformance evidence.
+   3GPP TS 32.299 §5.1/§7.1 (Rf), TS 29.273 §7.2 (SWm command and
+   AVP codes), TS 29.272 §7.3 (Terminal-Information), and TS 33.402 Annex
+   A.4 (IMEI-derived emergency MSK). They are application-dictionary evidence,
+   not full application-conformance evidence.
 3. **ePDG parity bytes** — *not imported*. The source plan references ePDG
    local-builder cases; those remain external **parity-only** seeds until a
    later fixture-intake task records provenance, license, and capture metadata.

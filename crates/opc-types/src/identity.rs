@@ -121,6 +121,341 @@ string_identifier!(
     128
 );
 
+/// Validated International Mobile Equipment Identity.
+///
+/// The exact transmitted representation is preserved. Fourteen digits carry
+/// TAC and SNR only. A fifteenth digit may be either the Luhn check digit used
+/// for presentation or the zero spare digit used on 3GPP protocol surfaces.
+/// Wire parsing does not infer which meaning applies and never synthesizes or
+/// rejects the fifteenth digit using Luhn. Formatting is always redacted;
+/// callers must deliberately use [`Imei::expose`] or [`Imei::as_str`] to
+/// access the original validated digits.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Imei(String);
+
+impl Imei {
+    /// Parse and validate a 14- or 15-digit IMEI without changing its digits.
+    pub fn new(value: impl Into<String>) -> Result<Self, ParseError> {
+        Ok(Self(validate_digits("imei", &value.into(), &[14, 15])?))
+    }
+
+    /// Deliberately expose the exact validated 14- or 15-digit IMEI.
+    ///
+    /// The returned value is personally identifying data and must not be
+    /// written to logs, traces, panic messages, or ordinary serialized output.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Deliberately expose the exact validated IMEI as a string slice.
+    ///
+    /// This is an alias for [`Imei::expose`].
+    pub fn as_str(&self) -> &str {
+        self.expose()
+    }
+
+    /// Return the fourteen-digit TAC and SNR equipment identity.
+    pub fn equipment_body(&self) -> &str {
+        &self.0[..14]
+    }
+
+    /// Return the transmitted fifteenth digit, if one was present.
+    ///
+    /// A zero value can be either the protocol spare digit or a valid Luhn
+    /// check digit. The wire representation does not distinguish those cases.
+    pub fn transmitted_digit(&self) -> Option<u8> {
+        self.0.as_bytes().get(14).map(|digit| *digit - b'0')
+    }
+
+    /// Return the Luhn check digit calculated from TAC and SNR.
+    pub fn luhn_check_digit(&self) -> u8 {
+        imei_check_digit(self.equipment_body().as_bytes())
+    }
+
+    /// Return whether this value contains all fifteen transmitted digits.
+    pub fn has_transmitted_digit(&self) -> bool {
+        self.0.len() == 15
+    }
+
+    /// Return whether two representations identify the same TAC and SNR.
+    pub fn identifies_same_equipment(&self, other: &Self) -> bool {
+        self.equipment_body() == other.equipment_body()
+    }
+}
+
+impl fmt::Debug for Imei {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Imei(<redacted>)")
+    }
+}
+
+impl fmt::Display for Imei {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted-imei>")
+    }
+}
+
+impl FromStr for Imei {
+    type Err = ParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for Imei {
+    type Error = ParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for Imei {
+    type Error = ParseError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// Exact 15-digit IMEI received from a UE protocol identity surface.
+///
+/// The fifteenth digit is preserved without guessing whether it is a Luhn
+/// check digit or the 3GPP spare digit. This complete form is required by
+/// DEVICE_IDENTITY and the TS 33.402 Annex A.4 emergency KDF. Formatting is
+/// always redacted and this type intentionally has no serde implementation.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Imei15(String);
+
+impl Imei15 {
+    /// Parse and preserve exactly 15 decimal IMEI digits.
+    pub fn new(value: impl Into<String>) -> Result<Self, ParseError> {
+        Ok(Self(validate_digits("imei15", &value.into(), &[15])?))
+    }
+
+    /// Deliberately expose the exact 15 transmitted digits.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Deliberately expose the exact 15 transmitted digits as a string slice.
+    pub fn as_str(&self) -> &str {
+        self.expose()
+    }
+
+    /// Return the fourteen-digit TAC and SNR equipment identity.
+    pub fn equipment_body(&self) -> &str {
+        &self.0[..14]
+    }
+
+    /// Return the received fifteenth digit without assigning it a meaning.
+    pub fn transmitted_digit(&self) -> u8 {
+        self.0.as_bytes()[14] - b'0'
+    }
+
+    /// Return the Luhn check digit calculated from TAC and SNR.
+    pub fn luhn_check_digit(&self) -> u8 {
+        imei_check_digit(self.equipment_body().as_bytes())
+    }
+}
+
+impl fmt::Debug for Imei15 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Imei15(<redacted>)")
+    }
+}
+
+impl fmt::Display for Imei15 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted-imei15>")
+    }
+}
+
+impl FromStr for Imei15 {
+    type Err = ParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for Imei15 {
+    type Error = ParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for Imei15 {
+    type Error = ParseError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<Imei> for Imei15 {
+    type Error = ParseError;
+
+    fn try_from(value: Imei) -> Result<Self, Self::Error> {
+        Self::new(value.0)
+    }
+}
+
+impl TryFrom<&Imei> for Imei15 {
+    type Error = ParseError;
+
+    fn try_from(value: &Imei) -> Result<Self, Self::Error> {
+        Self::new(value.as_str())
+    }
+}
+
+impl From<Imei15> for Imei {
+    fn from(value: Imei15) -> Self {
+        Self(value.0)
+    }
+}
+
+impl From<&Imei15> for Imei {
+    fn from(value: &Imei15) -> Self {
+        Self(value.0.clone())
+    }
+}
+
+/// Validated International Mobile Equipment Identity and Software Version.
+///
+/// An IMEISV is exactly 16 decimal digits: an eight-digit Type Allocation Code,
+/// a six-digit serial number, and a two-digit software-version number.
+/// Formatting is always redacted and this type intentionally has no serde
+/// implementation.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Imeisv(String);
+
+impl Imeisv {
+    /// Parse and validate a 16-digit IMEISV.
+    pub fn new(value: impl Into<String>) -> Result<Self, ParseError> {
+        Ok(Self(validate_digits("imeisv", &value.into(), &[16])?))
+    }
+
+    /// Deliberately expose the 16-digit IMEISV.
+    ///
+    /// The returned value is personally identifying data and must not be
+    /// written to logs, traces, panic messages, or ordinary serialized output.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Deliberately expose the 16-digit IMEISV as a string slice.
+    ///
+    /// This is an alias for [`Imeisv::expose`].
+    pub fn as_str(&self) -> &str {
+        self.expose()
+    }
+
+    /// Split the IMEISV into redaction-safe typed component views.
+    pub fn split(&self) -> ImeisvParts<'_> {
+        ImeisvParts {
+            type_allocation_code: &self.0[..8],
+            serial_number: &self.0[8..14],
+            software_version: &self.0[14..],
+        }
+    }
+
+    /// Return the exact fourteen-digit TAC and SNR equipment identity.
+    pub fn equipment_identity(&self) -> Imei {
+        Imei(self.0[..14].to_owned())
+    }
+
+    /// Deliberately synthesize a 15-digit presentation IMEI with Luhn digit.
+    pub fn to_luhn_imei(&self) -> Imei15 {
+        let mut value = self.0[..14].to_owned();
+        value.push(char::from(b'0' + imei_check_digit(value.as_bytes())));
+        Imei15(value)
+    }
+}
+
+impl fmt::Debug for Imeisv {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Imeisv(<redacted>)")
+    }
+}
+
+impl fmt::Display for Imeisv {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted-imeisv>")
+    }
+}
+
+impl FromStr for Imeisv {
+    type Err = ParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for Imeisv {
+    type Error = ParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for Imeisv {
+    type Error = ParseError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// Borrowed component views of an [`Imeisv`].
+///
+/// Debug formatting is redacted. Each accessor deliberately exposes one part
+/// of the device identity and is subject to the same handling requirements as
+/// [`Imeisv::expose`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ImeisvParts<'a> {
+    type_allocation_code: &'a str,
+    serial_number: &'a str,
+    software_version: &'a str,
+}
+
+impl<'a> ImeisvParts<'a> {
+    /// Deliberately expose the eight-digit Type Allocation Code.
+    pub const fn type_allocation_code(self) -> &'a str {
+        self.type_allocation_code
+    }
+
+    /// Deliberately expose the six-digit serial number.
+    pub const fn serial_number(self) -> &'a str {
+        self.serial_number
+    }
+
+    /// Deliberately expose the two-digit software-version number.
+    pub const fn software_version(self) -> &'a str {
+        self.software_version
+    }
+}
+
+impl fmt::Debug for ImeisvParts<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ImeisvParts(<redacted>)")
+    }
+}
+
+fn imei_check_digit(body: &[u8]) -> u8 {
+    let sum = body.iter().enumerate().fold(0_u16, |sum, (index, digit)| {
+        let digit = u16::from(*digit - b'0');
+        let weighted = if index % 2 == 1 { digit * 2 } else { digit };
+        sum + weighted / 10 + weighted % 10
+    });
+    ((10 - (sum % 10)) % 10) as u8
+}
+
 /// Canonical workload identity URI validated against SPIFFE-style constraints.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpiffeId(String);

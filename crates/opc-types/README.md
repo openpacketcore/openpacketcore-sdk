@@ -11,7 +11,7 @@ pass raw strings at trust boundaries.
 ## API Shape
 
 - Identifier types: `TenantId`, `InstanceId`, `RegionId`, `SpiffeId`, `PlmnId`,
-  and `Snssai`.
+  `Snssai`, and redaction-safe `Imei`/`Imei15`/`Imeisv` device identities.
 - Network-function types: `NfKind`, plus compatibility aliases
   `NetworkFunctionKind`, `NfType`, and `NfInstanceId`.
 - Versioning/time types: `ConfigVersion`, `SchemaDigest`, `Timestamp`, and
@@ -54,6 +54,13 @@ assert_eq!(format!("{secret:?}"), "<redacted>");
   strings can still be constructed with `NfKind::new`.
 - `Redacted<T>` hides values in `Debug` and `Display` but still allows explicit
   access with `expose` or `into_inner`.
+- `Imei` preserves an exact 14- or 15-digit protocol value; it never adds or
+  rejects the fifteenth digit using Luhn. `Imei15` requires all 15 transmitted
+  digits for DEVICE_IDENTITY and KDF inputs. `Imeisv` accepts exactly 16 digits,
+  exposes a typed split, returns its exact 14-digit equipment identity, and has
+  a separately named presentation-only Luhn conversion. These types do not
+  implement serde and redact `Debug`/`Display`; raw digits require explicit
+  exposure methods.
 
 ## Roadmap
 

@@ -27,7 +27,12 @@ all-apps = ["app-gx", "app-rf", "app-s6a", "app-s6b", "app-swm", "app-swx"]
 
 [dependencies]
 bytes = { workspace = true }
+hmac = { workspace = true }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 opc-testbed = { path = "../opc-testbed", version = "0.2.0" }
