@@ -623,7 +623,6 @@ impl TlsClientHandshake {
     }
 
     /// Material epoch fixed before this handshake began.
-    /// Material epoch fixed before this handshake began.
     pub fn epoch(&self) -> TlsMaterialEpoch {
         self.snapshot.epoch()
     }
@@ -675,7 +674,6 @@ impl TlsServerHandshake {
         Arc::clone(&self.config)
     }
 
-    /// Material epoch fixed before this handshake began.
     /// Material epoch fixed before this handshake began.
     pub fn epoch(&self) -> TlsMaterialEpoch {
         self.snapshot.epoch()

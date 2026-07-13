@@ -123,7 +123,10 @@ async fn coherent_handshake(
 helpers, and identity-source events remain source compatible. The legacy
 `rustls_config()` view remains reloadable for existing consumers; it does not
 provide the new post-application epoch-current admission proof. New production
-transport integrations should use `begin_handshake()` or `run_handshake()`.
+transport integrations should use `run_handshake()` by default. Direct
+`begin_handshake()` is a low-level adapter primitive: an adapter using it must
+independently enforce equivalent concurrency, deadline, epoch-retry, and
+post-application `admit()` bounds.
 
 This contract makes each new handshake coherent and records its exact material
 epoch. It does not drain already authenticated connections or enforce maximum

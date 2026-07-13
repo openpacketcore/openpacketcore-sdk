@@ -4,7 +4,9 @@ use opc_identity::{
 use opc_tls::{
     TlsConfigBuilder, TlsHandshakeRunError, TlsMaterialAvailability, TlsMaterialController,
     TlsMaterialError, TlsMaterialReloadReason, MAX_TLS_CONCURRENT_HANDSHAKES,
-    MAX_TLS_HANDSHAKE_EPOCH_RETRIES,
+    MAX_TLS_HANDSHAKE_EPOCH_RETRIES, MAX_TLS_MATERIAL_CHAIN_CERTIFICATES,
+    MAX_TLS_MATERIAL_PRIVATE_KEY_BYTES, MAX_TLS_MATERIAL_TOTAL_BYTES,
+    MAX_TLS_MATERIAL_TRUST_ANCHORS, MAX_TLS_MATERIAL_TRUST_BUNDLES,
 };
 use opc_types::{SpiffeId, Timestamp};
 use rcgen::{CertificateParams, DnType, KeyPair, SanType};
@@ -165,6 +167,22 @@ fn complete_handshake_with_phase(
     panic!("TLS handshake exceeded the bounded exchange");
 }
 
+fn assert_limit_rejection_retains_epoch(controller: &TlsMaterialController, epoch: u64) {
+    let status = controller.status();
+    assert_eq!(status.epoch().get(), epoch);
+    assert_eq!(
+        status.availability(),
+        TlsMaterialAvailability::RetainingLastGood
+    );
+    assert_eq!(
+        status.reason(),
+        Some(TlsMaterialReloadReason::MaterialLimitExceeded)
+    );
+    let debug = format!("{status:?}");
+    assert!(!debug.contains("spiffe://"));
+    assert!(!debug.contains("BEGIN"));
+}
+
 #[tokio::test]
 async fn controller_pins_identity_retains_invalid_candidates_and_versions_rollbacks() {
     let (ca, ca_key) = test_ca("stable CA");
@@ -298,6 +316,80 @@ async fn controller_pins_identity_retains_invalid_candidates_and_versions_rollba
         explicit.status().availability(),
         TlsMaterialAvailability::Unavailable
     );
+}
+
+#[test]
+fn controller_rejects_oversized_candidates_and_retains_last_good() {
+    let (ca, ca_key) = test_ca("bounded CA");
+    let baseline = material(CLIENT_ID, &ca, &ca_key, None).state;
+    let (source_tx, source_rx) = watch::channel(Some(baseline.clone()));
+    let controller = TlsMaterialController::new(source_rx);
+    assert_eq!(controller.status().epoch().get(), 1);
+
+    let mut oversized_chain = baseline.clone();
+    while oversized_chain.svid.cert_chain.len() <= MAX_TLS_MATERIAL_CHAIN_CERTIFICATES {
+        oversized_chain.svid.cert_chain.push(ca.der().clone());
+    }
+    source_tx
+        .send(Some(oversized_chain))
+        .expect("publish oversized chain");
+    assert_limit_rejection_retains_epoch(&controller, 1);
+
+    let mut oversized_key = baseline.clone();
+    oversized_key.svid.private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(vec![
+        0x5a;
+        MAX_TLS_MATERIAL_PRIVATE_KEY_BYTES
+            + 1
+    ]));
+    source_tx
+        .send(Some(oversized_key))
+        .expect("publish oversized key");
+    assert_limit_rejection_retains_epoch(&controller, 1);
+
+    let mut oversized_bundles = baseline.clone();
+    for index in 0..MAX_TLS_MATERIAL_TRUST_BUNDLES {
+        let trust_domain = opc_identity::TrustDomain::new(format!("limit-{index}.example.test"))
+            .expect("bounded trust domain");
+        oversized_bundles.trust_bundles.insert(TrustBundle {
+            trust_domain,
+            certificates: vec![ca.der().clone()],
+        });
+    }
+    source_tx
+        .send(Some(oversized_bundles))
+        .expect("publish oversized bundle count");
+    assert_limit_rejection_retains_epoch(&controller, 1);
+
+    let mut oversized_anchors = baseline.clone();
+    oversized_anchors
+        .trust_bundles
+        .bundles
+        .values_mut()
+        .next()
+        .expect("baseline trust bundle")
+        .certificates = vec![ca.der().clone(); MAX_TLS_MATERIAL_TRUST_ANCHORS + 1];
+    source_tx
+        .send(Some(oversized_anchors))
+        .expect("publish oversized anchor count");
+    assert_limit_rejection_retains_epoch(&controller, 1);
+
+    let mut oversized_total = baseline;
+    oversized_total
+        .trust_bundles
+        .bundles
+        .values_mut()
+        .next()
+        .expect("baseline trust bundle")
+        .certificates
+        .push(rustls_pki_types::CertificateDer::from(vec![
+            0xa5;
+            MAX_TLS_MATERIAL_TOTAL_BYTES
+                + 1
+        ]));
+    source_tx
+        .send(Some(oversized_total))
+        .expect("publish oversized aggregate material");
+    assert_limit_rejection_retains_epoch(&controller, 1);
 }
 
 #[tokio::test]

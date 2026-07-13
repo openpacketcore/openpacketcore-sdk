@@ -29,6 +29,8 @@ pub use material::{
 const TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
 const TLS13_WITH_TLS12_COMPAT: [&rustls::SupportedProtocolVersion; 2] =
     [&rustls::version::TLS13, &rustls::version::TLS12];
+const RAW_CONFIG_MATERIAL_SETTINGS_ERROR: &str =
+    "TLS material pinning requires an authenticated TLS config builder";
 
 fn protocol_versions(compat_mode: bool) -> &'static [&'static rustls::SupportedProtocolVersion] {
     if compat_mode {
@@ -718,6 +720,11 @@ impl TlsConfigBuilder {
     }
 
     pub fn build_client_config(self) -> Result<rustls::ClientConfig, rustls::Error> {
+        self.validate_raw_config_material_settings()?;
+        self.build_reloadable_client_config()
+    }
+
+    fn build_reloadable_client_config(self) -> Result<rustls::ClientConfig, rustls::Error> {
         self.validate_peer_policy()?;
 
         static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
@@ -767,7 +774,7 @@ impl TlsConfigBuilder {
         let policy = self.policy.clone();
         let compat_mode = self.compat_mode;
         let allow_unconstrained_peer_policy = self.allow_unconstrained_peer_policy;
-        let config = self.build_client_config()?;
+        let config = self.build_reloadable_client_config()?;
         Ok(AuthenticatedClientConfig {
             config: Arc::new(config),
             controller,
@@ -778,6 +785,11 @@ impl TlsConfigBuilder {
     }
 
     pub fn build_server_config(self) -> Result<rustls::ServerConfig, rustls::Error> {
+        self.validate_raw_config_material_settings()?;
+        self.build_reloadable_server_config()
+    }
+
+    fn build_reloadable_server_config(self) -> Result<rustls::ServerConfig, rustls::Error> {
         self.validate_peer_policy()?;
 
         static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
@@ -824,7 +836,7 @@ impl TlsConfigBuilder {
         let policy = self.policy.clone();
         let compat_mode = self.compat_mode;
         let allow_unconstrained_peer_policy = self.allow_unconstrained_peer_policy;
-        let config = self.build_server_config()?;
+        let config = self.build_reloadable_server_config()?;
         Ok(AuthenticatedServerConfig {
             config: Arc::new(config),
             controller,
@@ -849,6 +861,15 @@ impl TlsConfigBuilder {
         if self.material_controller.is_some() && self.local_spiffe_id.is_some() {
             return Err(rustls::Error::General(
                 "a shared TLS material controller already owns local identity pinning".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_raw_config_material_settings(&self) -> Result<(), rustls::Error> {
+        if self.material_controller.is_some() || self.local_spiffe_id.is_some() {
+            return Err(rustls::Error::General(
+                RAW_CONFIG_MATERIAL_SETTINGS_ERROR.to_string(),
             ));
         }
         Ok(())
@@ -1011,6 +1032,22 @@ mod policy_tests {
         panic!("TLS handshake did not complete within the bounded exchange");
     }
 
+    fn assert_raw_material_setting_rejected<T>(result: Result<T, rustls::Error>) {
+        let error = match result {
+            Ok(_) => panic!("raw config builder accepted a material-controller setting"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            rustls::Error::General(message) if message == RAW_CONFIG_MATERIAL_SETTINGS_ERROR
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!("unexpected error: {RAW_CONFIG_MATERIAL_SETTINGS_ERROR}")
+        );
+        assert!(!format!("{error:?}").contains("spiffe://"));
+    }
+
     #[test]
     fn unconstrained_policy_authorizes_any_peer() {
         // Pins (and documents) the allow-all behavior of an unconfigured policy.
@@ -1083,6 +1120,45 @@ mod policy_tests {
             .build_server_config();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn raw_builders_reject_explicit_local_identity_pinning() {
+        let (_tx, rx) = watch::channel(None);
+        let local_spiffe_id = SpiffeId::new(
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/default/nf/smf/instance/local-0",
+        )
+        .unwrap();
+
+        assert_raw_material_setting_rejected(
+            TlsConfigBuilder::new(rx.clone())
+                .with_local_spiffe_id(local_spiffe_id.clone())
+                .allow_any_trusted_peer()
+                .build_client_config(),
+        );
+        assert_raw_material_setting_rejected(
+            TlsConfigBuilder::new(rx)
+                .with_local_spiffe_id(local_spiffe_id)
+                .allow_any_trusted_peer()
+                .build_server_config(),
+        );
+    }
+
+    #[test]
+    fn raw_builders_reject_shared_material_controller() {
+        let (_tx, rx) = watch::channel(None);
+        let controller = TlsMaterialController::new(rx);
+
+        assert_raw_material_setting_rejected(
+            TlsConfigBuilder::from_material_controller(controller.clone())
+                .allow_any_trusted_peer()
+                .build_client_config(),
+        );
+        assert_raw_material_setting_rejected(
+            TlsConfigBuilder::from_material_controller(controller)
+                .allow_any_trusted_peer()
+                .build_server_config(),
+        );
     }
 
     #[test]
