@@ -127,6 +127,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state under one watch guard, then updates admission after releasing it, so a
   queued metrics publisher cannot deadlock a nested status read during leader
   failover.
+- **BREAKING — `opc-session-store`/`opc-session-net`/`opc-session-cache`:**
+  caller-authored `StoredSessionRecord::expires_at` is now bounded to the same
+  365-day horizon as duration TTLs at the mutation coordinator's reference
+  time. Past, immediate, and exact-maximum deadlines remain valid; one
+  nanosecond more and immortal `EphemeralProcedure` records return fieldless
+  `StoreError::InvalidRecordExpiry`. Intentional `None` remains valid for the
+  other state profiles. Direct Fake/SQLite batches capture one injected-clock
+  reference before mutation, legacy entries bind nested CAS to their immutable
+  timestamp, and OpenRaft binds proposal/apply/replay to leader-authored command
+  time rather than follower clocks. A bounded, payload-free preflight carries
+  at most 256 expiry/state-class descriptors to that authority. Forwarding
+  wrappers and the authenticated CAS/batch dispatcher await its verdict before
+  idempotency admission, cache invalidation, provider/HKMS work, sealing, or
+  backend dispatch. Invalid input performs no provider call or requested
+  mutation; timeout/unavailability is retry-safe because only a consensus
+  logical-time floor may have committed. `RecordExpiryPreflightLimitExceeded`
+  is fieldless and redaction-safe. The legacy exact transport becomes
+  `opc-session-net/5`, wire-schema revision 5, error-set revision 8; the
+  consensus exact transport becomes `opc-session-consensus/2`, transport/wire
+  revision 2, error-set revision 4. Both require a coordinated drained
+  full-profile upgrade. The count-only SQLite audit advances to report version 4,
+  accepts a reproducible `--expiry-reference`, and counts relational expiry
+  violations while strict entry validation covers nested CAS. Violations
+  require the documented backup, product-aware re-authoring, OpenRaft recovery,
+  re-audit, and rollback procedure. Persisted record/log/snapshot
+  representations, payload envelopes, AAD, key lookup, HKMS/KMS placement, and
+  encryption-at-rest boundaries do not change; the wire profile intentionally
+  does.
 - **BREAKING — `opc-session-store` and consumers:** `SessionKey::stable_id` is
   now the validated `StableId` newtype instead of arbitrary `Bytes`. The
   production invariant is exactly 1 through 64 bytes across construction,
@@ -801,8 +829,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replication validation admits at most one microsecond of positive deadline
   drift solely for legacy `seconds_f64` rounding; new deadlines remain exact,
   the TTL maximum is unchanged, and larger mismatches fail closed.
-  Caller-authored absolute record expiry remains #148; iterative protection of
-  CAS payloads below multiple replicated-batch levels is closed in the security
+  Caller-authored absolute record expiry is now separately bounded under #148
+  as described in the breaking entry above; iterative protection of CAS
+  payloads below multiple replicated-batch levels is closed in the security
   entry above under #147.
 - `opc-session-store`/`opc-session-net`/`opc-session-cache`: replication-log
   entries now reject sequence zero with the typed, redaction-safe

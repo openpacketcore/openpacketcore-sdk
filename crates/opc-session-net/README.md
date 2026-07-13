@@ -15,12 +15,12 @@ immutable replication manifest.
 
 Issue #127 introduces a separate least-authority transport for the shared
 Openraft engine. `SessionConsensusServer` advertises only
-`opc-session-consensus/1` and owns only an
+`opc-session-consensus/2` and owns only an
 `Arc<dyn SessionConsensusRpcHandler>`; it cannot dispatch `SessionBackend`,
 lease, raw replication-log append, or rebuild operations.
 `RemoteSessionConsensusPeer` implements only `SessionConsensusPeer`.
 
-The legacy `RemoteSessionBackend`, `SessionReplicationServer`, and protocol-v4
+The legacy `RemoteSessionBackend`, `SessionReplicationServer`, and protocol-v5
 `Request`/`Response` surface compile only with the non-default
 `legacy-session-net-compat` feature. That feature grants direct mutation and raw
 replication/rebuild authority. It is for controlled migration and compatibility
@@ -35,7 +35,7 @@ fingerprints. Stable non-zero Openraft node IDs are domain-separated hashes of
 the cluster identity and immutable logical `ReplicaId`; they survive member
 reordering, addition, removal, and epoch changes. Derived collisions are
 rejected during admission. The legacy `try_new` constructor is deprecated and
-fixes the epoch to 1 only for source compatibility with protocol-v4 callers.
+fixes the epoch to 1 only for source compatibility with protocol-v5 callers.
 
 Every consensus connection performs a fresh mutual-TLS handshake and binds the
 certificate SPIFFE identity, logical replica ID, stable node ID, expected
@@ -44,9 +44,11 @@ handshake nonce before decoding one operation. Each call also carries a fresh
 correlation ID. The client applies one absolute logical deadline to gate
 acquisition, DNS, TCP, TLS, bootstrap, bounded encoding, write, and response
 read; cancellation drops the connection, so a late response cannot be reused.
-The exact consensus contract remains at wire-schema revision 1 and advances to
-error-set revision 2 because forwarded applied responses can now carry the
-non-CAS ambiguity outcome. Error-set revision 1 peers fail before dispatch;
+The exact consensus contract is transport/wire-schema revision 2 and error-set
+revision 4. Revision 2 carries the payload-free bounded expiry-authority
+preflight used before wrapper/provider work; error revision 4 adds the typed
+`RecordExpiryPreflightLimitExceeded` bound. Revision 1/error revision 3 or
+older peers fail before dispatch;
 upgrade every consensus member together while traffic and writers are drained.
 This is not a rolling mixed-profile transition.
 
@@ -62,7 +64,7 @@ mutation or rebuild authority beside Openraft.
 ## API Shape
 
 - `SessionReplicationManifest::try_new_with_epoch` validates one cluster ID,
-  positive consensus configuration epoch, one legacy protocol-v4
+  positive consensus configuration epoch, one legacy protocol-v5
   operator-controlled configuration generation, and the complete replica
   descriptor set. The deprecated `try_new` compatibility constructor uses
   epoch 1.
@@ -151,6 +153,10 @@ mutation or rebuild authority beside Openraft.
 - Acquire, renew, TTL refresh, batch, and nested replication requests enforce
   `opc_session_store::MAX_SESSION_TTL` (365 days) before resolution or backend
   dispatch. Zero remains valid and means immediate expiry.
+- CAS records enforce the time-independent `None`/state-class expiry profile
+  before dialing or dispatch. A direct backend with explicit clock authority
+  also enforces the finite 365-day horizon; production OpenRaft binds it to the
+  leader-authored command time, never the client's or follower's wall clock.
 - If one record cannot fit, the call returns
   `StoreError::RestoreScanResponseTooLarge` instead of retrying indefinitely.
 - `listen(bind_addr).await` starts the listener and returns a server handle and
@@ -162,7 +168,7 @@ mutation or rebuild authority beside Openraft.
   `shutdown()` remains a graceful request, not a completion barrier.
 - `Request`, `Response`, `HelloRejectReason`, `ProtocolError`, and protocol
   constants remain in the public protocol layer. Public semantic frames use
-  custom Serde implementations backed by private v4 fixed-width DTOs rather
+  custom Serde implementations backed by private v5 fixed-width DTOs rather
   than serializing target-width domain integers directly.
 
 ```rust,ignore
@@ -184,7 +190,7 @@ let remote = RemoteSessionBackend::new(
 let _remote = remote.with_max_frame_size(1024 * 1024);
 ```
 
-## Legacy protocol-v4 details (`legacy-session-net-compat` only)
+## Legacy protocol-v5 details (`legacy-session-net-compat` only)
 
 Everything below this heading documents the quarantined compatibility
 protocol. None of these APIs or public DTOs are present in a default production
@@ -192,18 +198,19 @@ build.
 
 ### Outbound response contract
 
-Protocol v4 contract-profile wire-schema revision 4 retains revision 3's
+Protocol v5 contract-profile wire-schema revision 5 retains revision 4's
 confidential authenticated snapshot-bound
 restore cursor, explicit durable-page profile, fixed 4 MiB restore payload and
 8 MiB retained-page, 8 MiB examined-metadata, and 4,096 examined-candidate
-budgets, and adds exact configuration/process epoch binding for direct CAS.
-The error-set revision is 6. Directional budgets are part of the exact
+budgets and exact configuration/process epoch binding for direct CAS. Revision
+5 adds the bounded, payload-free `RecordExpiryPreflight` authority exchange.
+The error-set revision is 8. Directional budgets are part of the exact
 handshake. `requested_response_frame_size`,
 `accepted_response_frame_size`, and `server_request_frame_size` are public
 `Option<u32>` bootstrap fields so an older decoder can classify an otherwise
 decodable legacy minimal bootstrap. This is not bidirectional mismatch
 negotiation: an older decoder may reject unknown fields by simply closing.
-Exact revision-4 v4 admission requires each to be `Some`, at least
+Exact revision-5 v5 admission requires each to be `Some`, at least
 `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes), and at most
 `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes). The profile pins
 both as `min_frame_size = 8192` and `max_frame_size = 16777216`.
@@ -212,8 +219,8 @@ second independently configurable limit. The accepted response size is the
 smaller of the client's receive limit and the server's configured frame limit;
 the server request size independently bounds frames sent by that client. This
 supports unequal client/server settings without assuming either configured
-limit applies in both directions. A revision-5 or older v4 peer is incompatible
-even though the ALPN remains `opc-session-net/4`.
+limit applies in both directions. A revision-4/error-revision-7 or older peer
+is incompatible; the ALPN is `opc-session-net/5`.
 
 Error-set revision 4 adds typed replication-log range overflow, page-limit,
 and compacted-cursor outcomes. A log request normalizes `start = 0` to one;
@@ -245,6 +252,19 @@ encryption provider. Backlog overflow is non-retryable until the caller has
 invalidated dependent state and completed a coherent catch-up; it never
 supplies a cursor that could skip history. This changes only the exact legacy
 error set and requires a coordinated compatibility-fleet upgrade.
+
+Error-set revision 7 introduced the fieldless `InvalidRecordExpiry` outcome.
+Wire revision 5 adds a bounded, payload-free authority
+preflight of at most 256 expiry/state-class descriptors. Every authenticated
+CAS and complete batch awaits that verdict before CAS-idempotency admission,
+cache invalidation, key-provider/HKMS work, sealing, or backend dispatch.
+Remote/consensus clients never substitute their wall clock for coordinator
+time. Invalid input produces no provider call or log/state mutation; a queue,
+transport, or authority timeout returns retry-safe `BackendUnavailable`
+because only the logical-time floor may have committed and the requested
+mutation did not start.
+Error revision 8 adds the fieldless
+`RecordExpiryPreflightLimitExceeded` outcome for that bound.
 
 Direct CAS uses a canonical request UUID plus the server's
 `cas_idempotency_epoch` from the authenticated `HelloAck`. The server binds
@@ -424,9 +444,9 @@ campaigns.
   `opc-tls`; raw Rustls configs cannot enter these constructors.
 - Plaintext client/server support is test-only and gated behind
   `insecure-test`.
-- The wire contract version is `4`; the default max frame size is 1 MiB and the
+- The wire contract version is `5`; the default max frame size is 1 MiB and the
   exact negotiated ceiling is 16 MiB.
-- Protocol v4 uses `u32` for restore/log request limits and the client restore
+- Protocol v5 uses `u32` for restore/log request limits and the client restore
   response budget; a confidential authenticated strictly bounded restore cursor;
   `u64` excluded counts,
   `max_value_bytes`, and size-bearing `StoreError` fields; and checked
@@ -434,7 +454,7 @@ campaigns.
   backend dispatch or caller exposure. The negotiated frame-size limit remains
   a separate encoded-byte bound and now covers every ordinary response/watch
   item under one absolute write deadline.
-- The v4 handshake extracts the canonical SPIFFE URI from the live peer
+- The v5 handshake extracts the canonical SPIFFE URI from the live peer
   certificate and requires it to match the claimed stable `ReplicaId` in the
   manifest. Client and server also verify the expected opposite replica,
   cluster ID, and configuration ID; the client verifies its fresh challenge is
@@ -458,9 +478,9 @@ campaigns.
   generation, and the full sorted descriptor set. Changing a member ID,
   endpoint, TLS identity, failure domain, backing identity, cluster, or
   generation changes the authenticated scope.
-- Protocol v4 has no production fallback to v3. The exact
-  `opc-session-net/4` ALPN, version, and contract profile require a coordinated
-  stop/upgrade/start of every session-net participant; mixed v3/v4 fleets are
+- Protocol v5 has no production fallback. The exact
+  `opc-session-net/5` ALPN, version, and contract profile require a coordinated
+  stop/upgrade/start of every session-net participant; mixed-profile fleets are
   unsupported and there is no highest-common-version downgrade negotiation.
   `Hello` and `HelloAck` gain optional `contract_profile`, exact
   `configuration_epoch`, and directional-frame fields; `HelloAck` also gains
@@ -470,7 +490,7 @@ campaigns.
   adds public `ContractProfile::max_frame_size`, so external profile struct
   literals and exhaustive destructuring must be updated in the same
   coordinated change.
-- The v4 profile pins wire-schema revision 4 and error-set revision 6;
+- The v5 profile pins wire-schema revision 5 and error-set revision 8;
   `max_restore_scan_page_payload_bytes = 4194304`;
   `max_restore_scan_examined_rows = 4096`;
   `min_frame_size = 8192`; `max_frame_size = 16777216`; the 128-byte
@@ -493,15 +513,15 @@ campaigns.
   pre-v4 peer built before #135 can still send an empty or oversized value
   that a new peer rejects before dispatch, so unchanged valid JSON shape is not
   a rolling-compatibility claim.
-- Treat every v4 exact-profile migration through wire-schema revision 4 and
-  error-set revision 6 as a
+- Treat every v5 exact-profile migration through wire-schema revision 5 and
+  error-set revision 8 as a
   coordinated stop/upgrade/start boundary. Drain
   traffic and writers, audit every persisted SQLite replica with the count-only
   `opc-session-store-audit identity-invariants` command, and separately
   preflight every live/replayable handover payload and nested payload-protection
   boundary. Upgrade all clients, servers, protection wrappers, and product
   handover readers/writers together; verify authenticated handshakes and
-  representative v4 restore/log reads, including an empty advancing sparse
+  representative v5 restore/log reads, including an empty advancing sparse
   page and rejection of a modified cursor; and only then restore traffic. The
   fixed-width DTO and handshake now state the #135 admission contract
   explicitly, and revision 2 adds the exact directional response/request
@@ -538,7 +558,7 @@ campaigns.
   IP, and alias changes do not alter the expected `ReplicaId`, certificate
   SPIFFE identity, or manifest scope.
 - `capabilities()` is descriptive admission evidence. Clean transport loss or
-  timeout may fall back to a previously successful exact-v4 negotiation while
+  timeout may fall back to a previously successful exact-v5 negotiation while
   masking operations such as restore scan that require a fresh handshake. A
   cache entry is keyed by the exact profile plus negotiated request/response
   limits; a successful reconnect with different limits clears it before a new
@@ -557,11 +577,12 @@ campaigns.
   Capability declarations and a successful handshake do not replace
   `ConsensusSessionStore::probe_durable_readiness` or continuous traffic
   gating. Long-running network/resource qualification remains #143; watch
-  handoff remains #145, and bounded journal cursors/retention remain #171.
+  handoff and bounded journal cursor/retention semantics are implemented under
+  #145/#171.
 - Replication entry sequence zero and malformed rebuild prefixes are rejected
   before dialing on the client and before backend dispatch on the server. The
   unit `InvalidReplicationSequence` error contains no peer-controlled data;
-  an authenticated server returns it as a typed v4 response and keeps the
+  an authenticated server returns it as a typed v5 response and keeps the
   connection usable. This is input-boundary safety, not sequence authority.
 - TTL-bearing requests above 365 days are rejected with
   `StoreError::InvalidSessionTtl` or `LeaseError::InvalidSessionTtl` before
@@ -570,7 +591,7 @@ campaigns.
   unchanged for entries within the operation-tree contract. The new serialized
   error variants require external exhaustive matches. Their wire representation
   was introduced by v4 error revision 1 and is retained by current error
-  revision 6; an error-revision-5 or older v4 peer fails exact negotiation.
+  revision 8; an error-revision-7 or older peer fails exact negotiation.
   Legacy persisted replication logs must be
   audited before upgrade because an entry carrying a larger TTL now fails
   closed during replay or rebuild rather than being clamped. Cross-field
@@ -605,11 +626,12 @@ campaigns.
   replace the store before starting the new SDK. Never clamp or split the entry
   ad hoc; a raw inner-backend rebuild preserves the protection gap.
 - Remote scan and fresh-probe transport parity do not by themselves qualify
-  networked session HA for production. Protocol v4 authenticates membership;
+  networked session HA for production. Protocol v5 authenticates membership;
   it does not establish consensus, fork reconciliation, or
   majority-authoritative restore. The separate consensus ALPN supplies durable
   sequence/commit authority under #127 and bounded applied-state restore under
-  #133; recovery remains #128/#129. #134's fixed-width v4 boundary and #135's
+  #133; #128 current-format reconciliation and #129 bounded legacy recovery
+  are implemented. #134's fixed-width boundary and #135's
   model-level decode boundary are implemented but do not provide any of those
   distributed properties.
 - #159 contains stable IDs and replication transaction IDs at the wire
@@ -624,7 +646,7 @@ campaigns.
 
 ## Roadmap
 
-- Close #145, #148, and #171; and add distributed
+- Retain #171's bounded cursor contract and add distributed
   failure and soak evidence. A renewed SVID on a subsequent new call/full
   handshake and wrong-scope rejection now have scoped real-mTLS qualification;
   seamless continuity/connection retirement, complete trust-bundle,
@@ -639,7 +661,7 @@ campaigns.
 
 - Source checked: `Cargo.toml`, `src/lib.rs`, client, server, protocol, and
   tests.
-- `tests/authenticated_replica_identity.rs` covers exact v4 profile/identity, routing
+- `tests/authenticated_replica_identity.rs` covers exact v5 profile/identity, routing
   aliases, certificate/claim/scope mismatches, downgrade and malformed Hello,
   reconnect/rotation, relabeling, and replayed challenge responses over mTLS.
 - `tests/consensus_transport.rs` covers the shared consensus-only ALPN,

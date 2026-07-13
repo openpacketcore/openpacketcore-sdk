@@ -8,18 +8,19 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
+use opc_types::Timestamp;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    OwnerId, ReplicationEntry, ReplicationTxId, SessionKeyType, OWNER_ID_MAX_BYTES,
-    REPLICATION_TX_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_MAX_BYTES,
-    STABLE_ID_MIN_BYTES,
+    validate_record_expiry_at, OwnerId, ReplicationEntry, ReplicationTxId, SessionKeyType,
+    StateClass, OWNER_ID_MAX_BYTES, REPLICATION_TX_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES,
+    STABLE_ID_MAX_BYTES, STABLE_ID_MIN_BYTES,
 };
 
 /// Version of the count-only SQLite identity-audit report.
-pub const SQLITE_IDENTITY_AUDIT_REPORT_VERSION: u32 = 3;
+pub const SQLITE_IDENTITY_AUDIT_REPORT_VERSION: u32 = 4;
 
 /// Fixed number of SQLite rows requested by each bounded audit page.
 pub const SQLITE_IDENTITY_AUDIT_PAGE_ROWS: u32 = 256;
@@ -161,6 +162,7 @@ pub struct SqliteIdentityAuditViolationCounts {
     invalid_stable_id_fields: u64,
     invalid_replication_tx_id_fields: u64,
     invalid_replication_entries: u64,
+    invalid_record_expiry_fields: u64,
 }
 
 impl SqliteIdentityAuditViolationCounts {
@@ -190,12 +192,19 @@ impl SqliteIdentityAuditViolationCounts {
         self.invalid_replication_entries
     }
 
+    /// Relational record rows whose absolute expiry violates the bounded
+    /// profile at the audit reference time.
+    pub const fn invalid_record_expiry_fields(self) -> u64 {
+        self.invalid_record_expiry_fields
+    }
+
     const fn any(self) -> bool {
         self.invalid_owner_fields != 0
             || self.invalid_session_key_type_fields != 0
             || self.invalid_stable_id_fields != 0
             || self.invalid_replication_tx_id_fields != 0
             || self.invalid_replication_entries != 0
+            || self.invalid_record_expiry_fields != 0
     }
 }
 
@@ -205,6 +214,7 @@ pub struct SqliteIdentityAuditReport {
     report_version: u32,
     status: SqliteIdentityAuditStatus,
     limits: SqliteIdentityAuditLimits,
+    expiry_reference: Timestamp,
     scanned: SqliteIdentityAuditScannedCounts,
     violations: SqliteIdentityAuditViolationCounts,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -212,11 +222,12 @@ pub struct SqliteIdentityAuditReport {
 }
 
 impl SqliteIdentityAuditReport {
-    fn new(limits: SqliteIdentityAuditLimits) -> Self {
+    fn new(limits: SqliteIdentityAuditLimits, expiry_reference: Timestamp) -> Self {
         Self {
             report_version: SQLITE_IDENTITY_AUDIT_REPORT_VERSION,
             status: SqliteIdentityAuditStatus::Compliant,
             limits,
+            expiry_reference,
             scanned: SqliteIdentityAuditScannedCounts::default(),
             violations: SqliteIdentityAuditViolationCounts::default(),
             incomplete_reason: None,
@@ -251,6 +262,11 @@ impl SqliteIdentityAuditReport {
     /// Caller-approved work limits used for this audit.
     pub const fn limits(&self) -> SqliteIdentityAuditLimits {
         self.limits
+    }
+
+    /// Authority timestamp used to classify relational absolute deadlines.
+    pub const fn expiry_reference(&self) -> Timestamp {
+        self.expiry_reference
     }
 
     /// Counts of rows fully inspected before the result was produced.
@@ -310,9 +326,9 @@ struct AuditState {
 }
 
 impl AuditState {
-    fn new(limits: SqliteIdentityAuditLimits) -> Self {
+    fn new(limits: SqliteIdentityAuditLimits, expiry_reference: Timestamp) -> Self {
         Self {
-            report: SqliteIdentityAuditReport::new(limits),
+            report: SqliteIdentityAuditReport::new(limits, expiry_reference),
             rows_seen: 0,
             json_bytes_seen: 0,
         }
@@ -421,6 +437,21 @@ impl AuditState {
         self.report.violations.invalid_replication_tx_id_fields = next;
         true
     }
+
+    fn increment_invalid_record_expiry(&mut self) -> bool {
+        let Some(next) = self
+            .report
+            .violations
+            .invalid_record_expiry_fields
+            .checked_add(1)
+        else {
+            self.report
+                .mark_incomplete(SqliteIdentityAuditIncompleteReason::CounterOverflow);
+            return false;
+        };
+        self.report.violations.invalid_record_expiry_fields = next;
+        true
+    }
 }
 
 enum ScanControl {
@@ -438,6 +469,18 @@ pub fn audit_sqlite_identity_invariants(
     path: impl AsRef<Path>,
     limits: SqliteIdentityAuditLimits,
 ) -> Result<SqliteIdentityAuditReport, SqliteIdentityAuditError> {
+    audit_sqlite_identity_invariants_at(path, limits, Timestamp::now_utc())
+}
+
+/// Audit an existing SQLite database at an explicit expiry reference time.
+///
+/// Pinning this value makes a drained pre-upgrade audit reproducible. It is
+/// report metadata and never changes the read-only snapshot.
+pub fn audit_sqlite_identity_invariants_at(
+    path: impl AsRef<Path>,
+    limits: SqliteIdentityAuditLimits,
+    expiry_reference: Timestamp,
+) -> Result<SqliteIdentityAuditReport, SqliteIdentityAuditError> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
         .map_err(|_| SqliteIdentityAuditError::DatabaseOpenFailed)?;
@@ -452,7 +495,7 @@ pub fn audit_sqlite_identity_invariants(
         .unchecked_transaction()
         .map_err(|_| SqliteIdentityAuditError::DatabaseSetupFailed)?;
 
-    let mut state = AuditState::new(limits);
+    let mut state = AuditState::new(limits, expiry_reference);
     match schema_is_supported(&snapshot) {
         Ok(true) => {}
         Ok(false) => {
@@ -494,7 +537,16 @@ pub fn audit_sqlite_identity_invariants(
 
 fn schema_is_supported(conn: &Connection) -> Result<bool, ()> {
     for (table, columns) in [
-        ("session_records", &["owner", "key_type", "stable_id"][..]),
+        (
+            "session_records",
+            &[
+                "owner",
+                "key_type",
+                "stable_id",
+                "state_class",
+                "expires_at",
+            ][..],
+        ),
         ("leases", &["owner", "key_type", "stable_id"][..]),
         ("key_fences", &["key_type", "stable_id"][..]),
         (
@@ -563,7 +615,13 @@ const SESSION_RECORDS_FIRST_PAGE: &str = r#"
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
                   AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
-           typeof(stable_id), length(stable_id)
+           typeof(stable_id), length(stable_id),
+           typeof(state_class),
+           CASE WHEN typeof(state_class) = 'text'
+                  AND length(CAST(state_class AS BLOB)) <= 64 THEN state_class END,
+           typeof(expires_at),
+           CASE WHEN typeof(expires_at) = 'text'
+                  AND length(CAST(expires_at AS BLOB)) <= 64 THEN expires_at END
     FROM session_records
     ORDER BY rowid
     LIMIT ?3
@@ -577,7 +635,13 @@ const SESSION_RECORDS_NEXT_PAGE: &str = r#"
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
                   AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
-           typeof(stable_id), length(stable_id)
+           typeof(stable_id), length(stable_id),
+           typeof(state_class),
+           CASE WHEN typeof(state_class) = 'text'
+                  AND length(CAST(state_class AS BLOB)) <= 64 THEN state_class END,
+           typeof(expires_at),
+           CASE WHEN typeof(expires_at) = 'text'
+                  AND length(CAST(expires_at AS BLOB)) <= 64 THEN expires_at END
     FROM session_records
     WHERE rowid > ?3
     ORDER BY rowid
@@ -592,7 +656,8 @@ const LEASES_FIRST_PAGE: &str = r#"
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
                   AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
-           typeof(stable_id), length(stable_id)
+           typeof(stable_id), length(stable_id),
+           NULL, NULL, NULL, NULL
     FROM leases
     ORDER BY rowid
     LIMIT ?3
@@ -606,7 +671,8 @@ const LEASES_NEXT_PAGE: &str = r#"
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
                   AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
-           typeof(stable_id), length(stable_id)
+           typeof(stable_id), length(stable_id),
+           NULL, NULL, NULL, NULL
     FROM leases
     WHERE rowid > ?3
     ORDER BY rowid
@@ -621,6 +687,7 @@ fn scan_session_records(conn: &Connection, state: &mut AuditState) -> Result<Sca
         "SELECT 1 FROM session_records LIMIT 1",
         "SELECT 1 FROM session_records WHERE rowid > ?1 LIMIT 1",
         ScannedTable::SessionRecords,
+        true,
         state,
     )
 }
@@ -633,6 +700,7 @@ fn scan_leases(conn: &Connection, state: &mut AuditState) -> Result<ScanControl,
         "SELECT 1 FROM leases LIMIT 1",
         "SELECT 1 FROM leases WHERE rowid > ?1 LIMIT 1",
         ScannedTable::Leases,
+        false,
         state,
     )
 }
@@ -645,6 +713,7 @@ fn scan_owner_and_key_type_table(
     first_exists_sql: &str,
     next_exists_sql: &str,
     table: ScannedTable,
+    validate_expiry: bool,
     state: &mut AuditState,
 ) -> Result<ScanControl, ()> {
     let mut cursor = None;
@@ -698,6 +767,19 @@ fn scan_owner_and_key_type_table(
             if !stable_id_field_is_valid(row, 7, 8)? && !state.increment_invalid_stable_id() {
                 return Ok(ScanControl::Stop);
             }
+            if validate_expiry
+                && !record_expiry_fields_are_valid(
+                    row,
+                    9,
+                    10,
+                    11,
+                    12,
+                    state.report.expiry_reference,
+                )?
+                && !state.increment_invalid_record_expiry()
+            {
+                return Ok(ScanControl::Stop);
+            }
             cursor = Some(rowid);
             rows_in_page = rows_in_page.checked_add(1).ok_or(())?;
         }
@@ -705,6 +787,42 @@ fn scan_owner_and_key_type_table(
             return Ok(ScanControl::Continue);
         }
     }
+}
+
+fn record_expiry_fields_are_valid(
+    row: &Row<'_>,
+    state_class_type_index: usize,
+    state_class_value_index: usize,
+    expiry_type_index: usize,
+    expiry_value_index: usize,
+    reference: Timestamp,
+) -> Result<bool, ()> {
+    let state_class_type: String = row.get(state_class_type_index).map_err(|_| ())?;
+    let state_class_value: Option<String> = row.get(state_class_value_index).map_err(|_| ())?;
+    let state_class = match (state_class_type.as_str(), state_class_value.as_deref()) {
+        ("text", Some("authoritative-session")) => StateClass::AuthoritativeSession,
+        ("text", Some("dataplane-lookup")) => StateClass::DataplaneLookup,
+        ("text", Some("replicated-dr")) => StateClass::ReplicatedDr,
+        ("text", Some("telemetry-derived")) => StateClass::TelemetryDerived,
+        ("text", Some("ephemeral-procedure")) => StateClass::EphemeralProcedure,
+        _ => return Ok(false),
+    };
+    let expiry_type: String = row.get(expiry_type_index).map_err(|_| ())?;
+    let expires_at = match expiry_type.as_str() {
+        "null" => None,
+        "text" => {
+            let value: Option<String> = row.get(expiry_value_index).map_err(|_| ())?;
+            let Some(value) = value else {
+                return Ok(false);
+            };
+            Some(match Timestamp::from_str(&value) {
+                Ok(value) => value,
+                Err(_) => return Ok(false),
+            })
+        }
+        _ => return Ok(false),
+    };
+    Ok(validate_record_expiry_at(expires_at, state_class, reference).is_ok())
 }
 
 fn owner_field_is_valid(

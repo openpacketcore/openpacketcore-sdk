@@ -201,7 +201,8 @@ opc-session-store-audit identity-invariants \
   --database PATH \
   --max-rows N \
   --max-entry-json-bytes N \
-  --max-total-json-bytes N
+  --max-total-json-bytes N \
+  --expiry-reference 2026-07-13T18:00:00Z
 ```
 
 All limits MUST be explicit and non-zero, and the per-entry JSON-byte limit
@@ -212,13 +213,19 @@ pages, applies the row budget across `session_records`, `leases`,
 `key_fences`, and `session_replication_log`, and bounds individual and
 cumulative replication JSON before strict typed decode and domain validation.
 
-Report schema version 2 is count-only. It contains the supplied limits,
-per-table scanned counts, counts for invalid owner fields, invalid session-key
-type fields, invalid stable-ID fields, and invalid replication entries, and at
-most one bounded incomplete reason. Relational stable-ID checks read only
-SQLite type and length. It MUST NOT contain the database path, row identity,
-tenant, owner, key type, stable ID, payload, transaction, or raw JSON. The
-stable command outcomes are:
+Report schema version 4 is count-only. It contains the supplied limits, the
+expiry reference, per-table scanned counts, counts for invalid owner fields,
+invalid session-key type fields, invalid stable-ID fields, invalid replication
+transaction-ID fields, invalid replication entries, and invalid relational
+record-expiry fields, and at most one bounded incomplete reason. Relational
+expiry MUST be classified against the reported reference; each nested legacy
+CAS expiry MUST be classified against its immutable replication-entry
+timestamp. Relational stable-ID checks read only SQLite type and length. It
+MUST NOT contain the database path, row identity, tenant, owner, key type,
+stable ID, payload, transaction, rejected row timestamp, or raw JSON. Omitting
+`--expiry-reference` selects current UTC, but a migration campaign MUST record
+and pass one explicit RFC 3339 reference so repeated audits are reproducible.
+The stable command outcomes are:
 
 - `compliant` on stdout with exit 0;
 - `violations_found` on stdout with exit 1;
@@ -236,8 +243,10 @@ invalid identity or replication state automatically. A violation requires a
 separately reviewed product migration that preserves authoritative identity and
 history, or audited store replacement, followed by another complete audit.
 Every retained SQLite snapshot or restore/rebuild image that can become
-authoritative MUST pass the same audit. The normative operator procedure is
-`docs/session-store-stable-id-migration.md`.
+authoritative MUST pass the same audit. The identity procedure is
+`docs/session-store-stable-id-migration.md`; absolute-expiry re-authoring,
+OpenRaft recovery, and rollback are defined by
+`docs/session-store-record-expiry-migration.md`.
 
 The identity audit MUST NOT be treated as a handover-payload preflight. It does
 not classify live payloads or payload bytes inside nested CAS log operations,
@@ -256,9 +265,9 @@ boundary. Protocol-v4 fixed-width wire admission is implemented under #134,
 and #127 now supplies Openraft durable commit authority. #128 supplies
 current-format divergence recovery and #129 supplies explicit offline
 legacy-fork recovery. #133 supplies bounded snapshot-bound applied-state
-restore; production qualification (#143) remains open. Seamless certificate
-and trust-bundle lifecycle remains the #161 -> #162 -> #163 -> #164 chain
-under umbrella #158;
+restore; production qualification (#143) remains open. #161 atomic reload and
+#162 coherent material epochs are implemented; #163 connection
+reauthentication and #164 fleet qualification remain under umbrella #158;
 payload-protection-key rotation and distributed production evidence remain
 #143.
 
@@ -328,9 +337,8 @@ maintenance or disaster-recovery windows while preventing a malformed value
 from creating an effectively permanent lease. A product profile MAY enforce a
 smaller operational limit.
 
-This section bounds `Duration` inputs. It does not yet define admission for a
-caller-authored absolute `StoredSessionRecord::expires_at`; that separate
-state-profile and migration contract is tracked by #148.
+This section bounds `Duration` inputs. Caller-authored absolute record expiry
+has the related but distinct authority contract in §7.2.
 
 `validate_session_ttl` defines the duration check and
 `checked_session_deadline` defines conversion and deadline calculation.
@@ -351,9 +359,63 @@ fail closed even if an outer layer omitted validation.
 
 The new errors are public enum variants, so external exhaustive matches MUST be
 updated. Protocol v4 introduced their private fixed-width DTOs in error
-revision 1; current error revision 6 retains those encodings. An
-error-revision-5 or older v4 decoder is rejected during the exact handshake;
-deployments MUST use the coordinated v4 rollout in §12.3.
+revision 1; current v5 error revision 8 retains those encodings and adds the
+bounded expiry-preflight outcome. An error-revision-7 or older decoder is rejected
+during the exact handshake;
+deployments MUST use the coordinated v5 rollout in §12.3.
+
+### 7.2 Absolute Record Expiry Authority
+
+For a mutation with authority reference `T`, a finite
+`StoredSessionRecord::expires_at` MUST be accepted when it is in the past,
+equal to `T`, or no later than `T + MAX_SESSION_TTL`. The exact upper bound
+MUST be accepted and one nanosecond later MUST be rejected. Addition near the
+timestamp range maximum MUST saturate for comparison and MUST NOT unwind.
+`MAX_RECORD_EXPIRY_CLOCK_SKEW` is zero; an implementation MUST NOT silently
+extend retention to accommodate caller/coordinator clock skew. Deployments MUST
+synchronize coordinator clocks and a product MAY impose a smaller horizon.
+
+`expires_at = None` is intentional non-expiring state. It MUST be accepted for
+`AuthoritativeSession`, `DataplaneLookup`, `ReplicatedDr`, and
+`TelemetryDerived`. It MUST be rejected for `EphemeralProcedure`, because that
+profile requires per-key expiry to collect abandoned procedure state. A
+violation MUST return the fieldless `StoreError::InvalidRecordExpiry` without
+the record, timestamp, key, or peer-controlled detail.
+
+A direct Fake or SQLite backend MUST capture its injected clock once before a
+CAS or whole-batch preflight. All CAS slots MUST be checked before any slot can
+mutate. A forwarding, cache, or crypto wrapper MAY delegate an inner backend's
+explicit reference; it MUST NOT invent one from its own process clock. A remote
+or consensus client without coordinator authority MUST perform the
+time-independent `None`/state-profile check and leave the finite verdict to the
+authenticated mutation coordinator.
+
+A legacy `ReplicationEntry` MUST validate every nested CAS against the entry's
+immutable `timestamp`, including replay and rebuild before mutation. This is a
+reproducible compatibility reference, not production consensus authority. The
+production OpenRaft leader MUST capture the command logical time, validate the
+CAS before proposal, and commit that same time with the command. Admission,
+state-machine apply, replay, follower apply, and journal publication MUST repeat
+the deterministic check against committed command metadata. A follower's wall
+clock MUST NOT alter the verdict. Authenticated cluster/configuration identity,
+leader term/membership, commitment, and applied index supply the coordinator
+authority described in §12.4.
+
+Profile rejection MUST precede cache invalidation, provider work, or backend
+dispatch. A wrapper above remote/consensus authority MUST obtain a bounded,
+payload-free authenticated authority preflight before cache invalidation,
+provider/HKMS work, sealing, or backend dispatch. The authenticated CAS/batch
+dispatcher MUST repeat the preflight before idempotency admission. Invalid
+input and preflight timeout/unavailability perform no provider work or
+requested mutation; retry is safe because only a consensus logical-time floor
+may have committed. This rule does not change payload encoding, AAD, key
+selection, HKMS/KMS placement, or encryption at rest.
+
+Existing valid row and JSON representations are unchanged. Legacy admission,
+product-aware re-authoring, OpenRaft recovery, and rollback MUST follow
+`docs/session-store-record-expiry-migration.md`. The audit MUST be run over a
+drained snapshot with one recorded `--expiry-reference`; runtime and audit MUST
+NOT guess intent, clamp a far-future value, or edit OpenRaft history in place.
 
 ## 8. Record Format
 
@@ -856,24 +918,24 @@ Decoders MUST:
 - Avoid panics on corrupt data.
 - Support partial decode for lookup keys where useful.
 
-### 12.3 Legacy Direct-Backend Session-Net Protocol v4
+### 12.3 Legacy Direct-Backend Session-Net Protocol v5
 
 The direct `SessionBackend` protocol is retained only behind the non-default
 `legacy-session-net-compat` feature for controlled migration and compatibility
 testing. It MUST NOT be enabled on a production consensus node or served on the
 consensus endpoint. When used for migration, it MUST use the exact
-`opc-session-net/4` ALPN, contract version, and contract profile. It MUST NOT
-negotiate down to v3 or select a highest-common version. A mismatch MUST fail
+`opc-session-net/5` ALPN, contract version, and contract profile. It MUST NOT
+negotiate down or select a highest-common version. A mismatch MUST fail
 before backend dispatch, close the connection, and be non-retryable for that
 request.
 
 The public semantic `Request` and `Response` types remain available, but their
-Serde boundary MUST delegate to private fixed-width v4 DTOs. `Hello` and
+Serde boundary MUST delegate to private fixed-width v5 DTOs. `Hello` and
 `HelloAck` add an optional `contract_profile`; `HelloAck` also carries the
 server's optional `cas_idempotency_epoch`, and direct CAS carries an optional
 `idempotency_epoch`. Exhaustive Rust construction and matching MUST account for
-the new fields. The profile pins wire-schema revision 4 and error-set revision
-6; owner, custom-key, and state-type
+the new fields. The profile pins wire-schema revision 5 and error-set revision
+8; owner, custom-key, and state-type
 bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `max_frame_size = 16777216`;
 `stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
@@ -1107,10 +1169,9 @@ or traffic admission. A cache MUST be keyed by the exact profile and negotiated
 directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
-The v3-to-v4 transition, and same-v4 exact-profile transitions through
-wire-schema revision 4 and error-set revision 6, are coordinated
-stop/upgrade/start boundaries, not rolling
-deployments. Operators MUST drain traffic and writers; run the #135 identity
+The transition to v5 wire-schema revision 5 and error-set revision 8 is a
+coordinated stop/upgrade/start boundary, not a rolling deployment. Operators
+MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore
 source, and replay source for the stable-ID and transaction-ID bounds; and
 complete product-aware handover/nested-payload preflights. A retained-value
@@ -1120,12 +1181,12 @@ replacement occurs. Stable IDs MUST follow the product-aware #167
 model/persistence/privacy/audit policy. Durable transaction IDs MUST follow
 the #168 bounded-type and
 [`migration policy`](../session-store-replication-tx-id-migration.md), including
-report version 3 and coordinated cutover with #127/#128/#143. The
+current report version 4 and coordinated cutover with #127/#128/#143. The
 migration MUST NOT silently truncate, hash, or rename a key or idempotency
 identity. Operators MUST verify that the strict revision-3 decoder accepts the
 result; then they MUST stop every session-net client, server, and protection
 wrapper plus every handover reader/writer; upgrade them together; verify
-exact-v4 authenticated restore/log traffic, rejection of modified/legacy
+exact-v5 authenticated restore/log traffic, rejection of modified/legacy
 restore cursors, sparse empty-page progress, and fresh quorum evidence; and only
 then restore traffic. Once an
 `OPCH` value has been written, v3 rollback additionally requires a coherent
@@ -1172,22 +1233,23 @@ forms a three-node config Openraft cluster and commits/linearizably reads
 through the existing peer/server types. Any compatibility transport work
 must preserve the single Openraft authority rather than reopen direct mutation
 as a quorum path.
-Seamless SVID/trust-bundle rotation remains #161 -> #162 -> #163 -> #164 under
-umbrella #158.
+#161 atomic reload and #162 coherent material epochs are implemented. Seamless
+SVID/trust-bundle rotation remains #163 -> #164 under umbrella #158.
 
 ### 12.4 Consensus-Only Session Transport
 
 The production session HA transport MUST use `SessionConsensusServer` and
-`RemoteSessionConsensusPeer` on the exact `opc-session-consensus/1` ALPN. The
+`RemoteSessionConsensusPeer` on the exact `opc-session-consensus/2` ALPN. The
 server MUST own only a `SessionConsensusRpcHandler`; it MUST NOT accept a
 `SessionBackend`, lease manager, direct mutation request, caller-authored
 replication append, or rebuild request. The consensus ALPN and legacy
-`opc-session-net/4` ALPN MUST NOT be multiplexed as equivalent authority on one
+`opc-session-net/5` ALPN MUST NOT be multiplexed as equivalent authority on one
 production listener.
 
-The exact consensus contract profile MUST use wire-schema revision 1 and
-error-set revision 2. Error-set revision 1 MUST fail before engine dispatch
-because a forwarded applied response can carry the non-CAS ambiguity outcome.
+The exact consensus contract profile MUST use transport/wire-schema revision 2
+and error-set revision 4. The wire adds the bounded payload-free authority
+preflight; the error set adds `RecordExpiryPreflightLimitExceeded`. Revision
+1/error revision 3 or older MUST fail before engine dispatch.
 Operators MUST drain traffic and writers, stop every consensus member, upgrade
 the full membership together, verify exact-profile handshakes, and only then
 restore traffic. Mixed-profile rolling operation is unsupported.
@@ -1231,9 +1293,9 @@ production rotation MUST additionally overlap old/new trust, retire old
 connections, enforce revocation and a documented maximum authentication age,
 bound reconnect storms, and supply multi-process/soak evidence. The scoped
 in-process new-call result does not close those fleet lifecycle requirements.
-The required dependency order remains #161 (atomic reload), #162 (material
-epochs), #163 (reauthentication across an epoch), and #164 (qualification),
-with #158 remaining open as the umbrella until that evidence passes.
+#161 atomic reload and #162 material epochs are implemented. #163
+reauthentication across an epoch and #164 qualification remain, with #158 open
+as the umbrella until that evidence passes.
 
 ## 13. Local Cache
 
@@ -1354,9 +1416,9 @@ production networked session-store profile MUST rotate workload certificates
 and trust bundles without interrupting service, while still enforcing
 revocation and a documented maximum authentication age on long-lived
 connections. Consensus reconnects perform a full mutual-TLS handshake, but
-seamless certificate/trust rotation remains the
-#161 -> #162 -> #163 -> #164 dependency chain under umbrella #158; reconnect-storm and
-wider distributed production evidence remain #143.
+#161 atomic reload and #162 material epochs are implemented. Seamless
+certificate/trust rotation remains #163 -> #164 under umbrella #158;
+reconnect-storm and wider distributed production evidence remain #143.
 
 ## 15. Observability
 
@@ -1432,7 +1494,7 @@ fencing.
   across direct, batch, replicated, persisted, and authenticated-wire paths;
   rejected values must have no partial effect.
 - Serialization corrupt input rejection.
-- Protocol-v4 golden frames with no target-width integer fields; checked
+- Protocol-v5 golden frames with no target-width integer fields; checked
   fixed-width maximum/overflow conversion; exact collection limits; omitted
   restore fields recomputed; and size errors nested in batch results.
 - Revision-2 negotiation with equal and unequal client/server limits, rejection
@@ -1447,7 +1509,7 @@ fencing.
   reaping; handler/connection-slot return to baseline; repeated reconnect bounds
   on memory/tasks/file descriptors/CPU; and deterministic shutdown/abort while
   response serialization or socket writes are blocked.
-- Exact-v4 handshake success plus v3 ALPN/version, profile, authentication,
+- Exact-v5 handshake success plus older ALPN/version, profile, authentication,
   malformed acknowledgement, and replay rejection before backend dispatch;
   incompatible peers clear cached capabilities to all false/zero.
 - Exact 1-byte and 128-byte owner/custom-key acceptance, empty and 129-byte
@@ -1480,8 +1542,8 @@ fencing.
 - Backend restart with leases recovered or invalidated according to profile.
 - Geo-replication applies newer generation and rejects older generation.
 - Cache invalidation after remote update.
-- Coordinated v4 multi-replica admission and fresh-readiness behavior, including
-  fail-closed mixed-v3/v4 peers and non-authoritative cached capabilities.
+- Coordinated v5 multi-replica admission and fresh-readiness behavior, including
+  fail-closed mixed-profile peers and non-authoritative cached capabilities.
 - Ambiguous mutation outcomes under response rejection/write timeout, proving
   callers recover through idempotency, fencing, and authoritative re-read rather
   than assuming rollback or blindly replaying the operation.
@@ -1560,5 +1622,6 @@ This RFC is implemented when:
     documented payload-envelope versus full-database boundary is qualified.
 15. Divergence recovery (#128), operator-safe legacy-fork recovery (#129),
     bounded applied-state restore (#133), distributed production qualification
-    (#143), and the #161 -> #162 -> #163 -> #164 credential-rotation chain
-    under umbrella #158 have passed their own acceptance gates.
+    (#143), and the remaining #163 -> #164 credential-rotation gates under
+    umbrella #158 have passed their own acceptance gates (#161/#162 are
+    implemented prerequisites).

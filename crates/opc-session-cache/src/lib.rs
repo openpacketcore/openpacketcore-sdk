@@ -11,11 +11,11 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use opc_session_store::{
-    next_replication_sequence, validate_replication_log_page_owned,
+    next_replication_sequence, record_expiry_preflights, validate_replication_log_page_owned,
     validate_replication_prefix_owned, validate_session_ttl, BackendCapabilities,
     BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
-    ReplicationEntry, ReplicationLogRange, ReplicationOp, SessionBackend, SessionKey, SessionOp,
-    SessionOpResult, StoreError, StoredSessionRecord,
+    RecordExpiryPreflight, ReplicationEntry, ReplicationLogRange, ReplicationOp, SessionBackend,
+    SessionKey, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
 };
 
 /// A local, in-memory read-through session cache that stays coherent with the
@@ -520,11 +520,26 @@ impl SessionBackend for SessionCache {
         self.backend.capabilities().await
     }
 
+    fn record_expiry_reference(&self) -> Option<opc_session_store::Timestamp> {
+        self.backend.record_expiry_reference()
+    }
+
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        self.backend.preflight_record_expiry(preflights).await
+    }
+
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         SessionCache::get(self, key).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        let preflight = RecordExpiryPreflight::from_record(&op.new_record);
+        self.backend
+            .preflight_record_expiry(std::slice::from_ref(&preflight))
+            .await?;
         let key = op.key.clone();
         self.invalidate(&key).await;
         let result = self.backend.compare_and_set(op).await;
@@ -560,7 +575,8 @@ impl SessionBackend for SessionCache {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
-        ops.iter().try_for_each(SessionOp::validate_ttls)?;
+        let preflights = record_expiry_preflights(&ops)?;
+        self.backend.preflight_record_expiry(&preflights).await?;
         let results = self.backend.batch(ops.clone()).await?;
         for (op, result) in ops.iter().zip(results.iter()) {
             self.invalidate_successful_session_op(op, result).await;
@@ -692,6 +708,8 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::ReplicationWatchCatchUpRequired => "replication_watch_catch_up_required",
         StoreError::ReplicationOperationLimitExceeded => "replication_operation_limit_exceeded",
         StoreError::InvalidSessionTtl => "invalid_session_ttl",
+        StoreError::InvalidRecordExpiry => "invalid_record_expiry",
+        StoreError::RecordExpiryPreflightLimitExceeded => "record_expiry_preflight_limit_exceeded",
         StoreError::LeaseHeld => "lease_held",
         StoreError::LeaseExpired => "lease_expired",
         StoreError::Crypto(_) => "crypto",
@@ -713,13 +731,23 @@ mod tests {
     use bytes::Bytes;
     use futures_util::{stream, StreamExt};
     use opc_session_store::{
-        validate_replication_page_owned, EncryptedSessionPayload, FakeSessionBackend, FenceToken,
-        Generation, OwnerId, SessionKeyType, SessionLeaseManager, StateClass, StateType,
-        MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH, MAX_SESSION_TTL,
+        validate_replication_page_owned, Clock, EncryptedSessionPayload, FakeSessionBackend,
+        FenceToken, Generation, OwnerId, SessionKeyType, SessionLeaseManager, StateClass,
+        StateType, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
+
+    #[derive(Debug)]
+    struct FixedClock(Timestamp);
+
+    impl Clock for FixedClock {
+        fn now_utc(&self) -> Timestamp {
+            self.0
+        }
+    }
 
     struct ScriptedWatchBackend {
         max_sequence: AtomicU64,
@@ -1102,6 +1130,44 @@ mod tests {
         assert_eq!(error, StoreError::InvalidSessionTtl);
         assert_eq!(backend.refresh_calls.load(Ordering::Relaxed), 0);
         assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+    }
+
+    #[tokio::test]
+    async fn invalid_absolute_expiry_is_rejected_before_cache_invalidation() {
+        let authority_time = "2030-01-01T00:00:00Z"
+            .parse::<Timestamp>()
+            .expect("authority timestamp");
+        let backend =
+            Arc::new(FakeSessionBackend::new().with_clock(Arc::new(FixedClock(authority_time))));
+        let cache = cache_without_watch(backend.clone());
+        let key = test_key();
+        let record = test_record(key.clone(), 1);
+        let lease = test_lease(&key).await;
+        cache
+            .cache
+            .write()
+            .await
+            .insert(key.clone(), record.clone());
+
+        let mut replacement = test_record(key.clone(), 2);
+        replacement.expires_at = Some(
+            "9999-12-31T23:59:59.999999999Z"
+                .parse()
+                .expect("far-future timestamp"),
+        );
+        let error = cache
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: Some(Generation::new(1)),
+                new_record: replacement,
+            })
+            .await
+            .expect_err("far-future expiry must fail before invalidation");
+
+        assert_eq!(error, StoreError::InvalidRecordExpiry);
+        assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+        assert_eq!(backend.get(&key).await.expect("backend read"), None);
     }
 
     #[tokio::test]

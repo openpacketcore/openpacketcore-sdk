@@ -12,10 +12,10 @@ use futures_util::Stream;
 use opc_redaction::metrics::METRICS;
 use opc_session_store::backend::{
     next_replication_sequence, validate_replication_log_page, validate_replication_log_page_owned,
-    validate_replication_page_owned, validate_replication_prefix_owned, BackendInstanceIdentity,
-    BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange,
-    ReplicationOp, ReplicationWatchCursor, SessionBackend, SessionOp, SessionOpResult,
-    WATCH_CHANNEL_CAPACITY,
+    validate_replication_page_owned, validate_replication_prefix_owned,
+    validate_session_ops_profile, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
+    CompareAndSetResult, ReplicationEntry, ReplicationLogRange, ReplicationOp,
+    ReplicationWatchCursor, SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -24,8 +24,9 @@ use opc_session_store::model::{OwnerId, SessionKey};
 
 use opc_session_store::record::StoredSessionRecord;
 use opc_session_store::{
-    validate_session_ttl, ReplicaId, ReplicaReadinessFailure, RestoreScanCursorProfile,
-    RestoreScanPage, RestoreScanRequest,
+    validate_record_expiry_preflights_profile, validate_session_ttl,
+    validate_stored_record_expiry_profile, RecordExpiryPreflight, ReplicaId,
+    ReplicaReadinessFailure, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -497,6 +498,7 @@ enum StoreResponseClass {
     Read,
     CompareAndSet,
     Mutation,
+    RecordExpiryPreflight,
 }
 
 fn store_error_matches_class(error: &StoreError, class: StoreResponseClass) -> bool {
@@ -559,6 +561,9 @@ fn response_matches_request(request: &Request, response: &Response) -> bool {
         (Request::DeleteFenced { .. }, Response::DeleteFenced(result))
         | (Request::RefreshTtl { .. }, Response::RefreshTtl(result)) => {
             store_result_matches_class(result, StoreResponseClass::Mutation)
+        }
+        (Request::RecordExpiryPreflight { .. }, Response::RecordExpiryPreflight(result)) => {
+            store_result_matches_class(result, StoreResponseClass::RecordExpiryPreflight)
         }
         (Request::Batch { ops }, Response::Batch(Ok(results))) => {
             batch_response_matches_request(ops, results)
@@ -1180,7 +1185,7 @@ impl RemoteSessionBackend {
 
     fn capabilities_for_transport(
         mut caps: BackendCapabilities,
-        fresh_v4_negotiation: bool,
+        fresh_v5_negotiation: bool,
         contract_profile: ContractProfile,
         frame_limits: NegotiatedFrameLimits,
     ) -> BackendCapabilities {
@@ -1195,7 +1200,7 @@ impl RemoteSessionBackend {
         caps.max_value_bytes = caps
             .max_value_bytes
             .min(conservative_payload_budget(request_frame_size));
-        if !fresh_v4_negotiation || response_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
+        if !fresh_v5_negotiation || response_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
             caps.restore_scan = false;
         }
         caps
@@ -1317,6 +1322,29 @@ impl SessionBackend for RemoteSessionBackend {
         }
     }
 
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        validate_record_expiry_preflights_profile(preflights)?;
+        if !preflights
+            .iter()
+            .copied()
+            .any(RecordExpiryPreflight::is_finite)
+        {
+            return Ok(());
+        }
+        match self
+            .send_request_with_retry(Request::RecordExpiryPreflight {
+                preflights: preflights.to_vec(),
+            })
+            .await?
+        {
+            Response::RecordExpiryPreflight(result) => result,
+            response => Err(self.backend_mutation_protocol_violation(response).await),
+        }
+    }
+
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         match self
             .send_request_with_retry(Request::Get { key: key.clone() })
@@ -1329,6 +1357,7 @@ impl SessionBackend for RemoteSessionBackend {
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        validate_stored_record_expiry_profile(&op.new_record)?;
         let expected_key = op.key.clone();
         let response = self
             .send_mutation_once(Request::CompareAndSet {
@@ -1389,9 +1418,7 @@ impl SessionBackend for RemoteSessionBackend {
         if ops.len() > MAX_SESSION_NET_BATCH_OPERATIONS {
             return Err(StoreError::ReplicationOperationLimitExceeded);
         }
-        for op in &ops {
-            op.validate_ttls()?;
-        }
+        validate_session_ops_profile(&ops)?;
         let expected = bounded_session_op_expectations(&ops)?;
         let contains_mutation = ops.iter().any(|op| !matches!(op, SessionOp::Get { .. }));
         let response = if contains_mutation {
@@ -1870,6 +1897,8 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::ReplicationWatchCatchUpRequired => "replication_watch_catch_up_required",
         StoreError::ReplicationOperationLimitExceeded => "replication_operation_limit_exceeded",
         StoreError::InvalidSessionTtl => "invalid_session_ttl",
+        StoreError::InvalidRecordExpiry => "invalid_record_expiry",
+        StoreError::RecordExpiryPreflightLimitExceeded => "record_expiry_preflight_limit_exceeded",
         StoreError::LeaseHeld => "lease_held",
         StoreError::LeaseExpired => "lease_expired",
         StoreError::Crypto(_) => "crypto",
@@ -2950,7 +2979,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_or_wrong_v4_contract_profile_clears_all_cached_capabilities() {
+    async fn missing_or_wrong_v5_contract_profile_clears_all_cached_capabilities() {
         let mut wrong_profile = CURRENT_CONTRACT_PROFILE;
         wrong_profile.error_set_revision = wrong_profile.error_set_revision.saturating_add(1);
 

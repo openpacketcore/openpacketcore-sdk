@@ -1125,6 +1125,8 @@ pub(crate) fn validate_command_for_log(
         }
     }
     if let SessionMutationIntent::CompareAndSet(op) = &command.intent {
+        crate::ttl::validate_stored_record_expiry_at(&op.new_record, command.logical_time)
+            .map_err(|_| invalid_data("session consensus record expiry is invalid"))?;
         if op.new_record.payload.encoding() != SessionPayloadEncoding::EnvelopeV1 {
             return Err(invalid_data(
                 "session consensus requires a sealed record payload",
@@ -1632,6 +1634,7 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::CasConflict
         | StoreError::InvalidKey(_)
         | StoreError::InvalidSessionTtl
+        | StoreError::InvalidRecordExpiry
         | StoreError::LeaseHeld
         | StoreError::LeaseExpired
         | StoreError::PayloadTooLarge { .. } => true,
@@ -1646,6 +1649,7 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::ReplicationLogCursorCompacted { .. }
         | StoreError::ReplicationWatchCatchUpRequired
         | StoreError::ReplicationOperationLimitExceeded
+        | StoreError::RecordExpiryPreflightLimitExceeded
         | StoreError::Crypto(_)
         | StoreError::Serialization(_)
         | StoreError::InvalidRestoreScanRequest(_)
@@ -1709,6 +1713,13 @@ pub(crate) fn proposal_state_sync(
 ) -> io::Result<(u64, SessionConsensusEntryDigest, Option<Timestamp>)> {
     let (sequence, digest, logical_time, _) = read_machine_sync(conn, identity)?;
     Ok((sequence, digest, logical_time))
+}
+
+pub(crate) fn logical_time_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<Option<Timestamp>> {
+    read_machine_sync(conn, identity).map(|(_, _, logical_time, _)| logical_time)
 }
 
 fn read_outcome_sync(
@@ -2787,6 +2798,7 @@ mod tests {
             StoreError::CasConflict,
             StoreError::InvalidKey("SDK-owned validation reason".into()),
             StoreError::InvalidSessionTtl,
+            StoreError::InvalidRecordExpiry,
             StoreError::LeaseHeld,
             StoreError::LeaseExpired,
             StoreError::PayloadTooLarge { actual: 2, max: 1 },
@@ -2802,6 +2814,54 @@ mod tests {
         ] {
             assert!(!is_deterministic_intent_rejection(&error));
         }
+    }
+
+    #[test]
+    fn follower_log_admission_uses_command_time_for_record_expiry() {
+        let logical_time = timestamp(1);
+        let key = key();
+        let owner = OwnerId::new("owner-a").expect("owner");
+        let fence = crate::FenceToken::new(1);
+        let lease = crate::LeaseGuard::new(
+            key.clone(),
+            owner.clone(),
+            fence,
+            logical_time,
+            logical_time,
+            1,
+        );
+        let command = SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: identity(),
+            request_id: SessionConsensusRequestId::from_bytes([0x44; 16]),
+            logical_time,
+            intent: SessionMutationIntent::CompareAndSet(Box::new(crate::CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: crate::StoredSessionRecord {
+                    key,
+                    generation: crate::Generation::new(1),
+                    owner,
+                    fence,
+                    state_class: crate::StateClass::AuthoritativeSession,
+                    state_type: crate::StateType::from_static("state-machine-fault"),
+                    expires_at: Some(
+                        Timestamp::from_str("9999-12-31T23:59:59.999999999Z")
+                            .expect("far-future timestamp"),
+                    ),
+                    payload: crate::EncryptedSessionPayload::new(b"payload"),
+                },
+            })),
+        };
+
+        let error = validate_command_for_log(&command, identity())
+            .expect_err("follower log admission must reject the leader command");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session consensus record expiry is invalid"
+        );
     }
 
     #[test]

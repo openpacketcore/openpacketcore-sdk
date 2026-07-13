@@ -24,7 +24,7 @@ use crate::{
         RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES, RESTORE_SCAN_MAX_SQLITE_VM_STEPS,
         RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
     },
-    ttl::checked_session_deadline,
+    ttl::{checked_session_deadline, validate_stored_record_expiry_at},
 };
 
 const RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL: i32 = 1_000;
@@ -1147,6 +1147,7 @@ pub(crate) fn compare_and_set_sync(
     caps: &BackendCapabilities,
     now: Timestamp,
 ) -> Result<CompareAndSetResult, StoreError> {
+    validate_stored_record_expiry_at(&op.new_record, now)?;
     prune_sync(conn, now)?;
 
     if !caps.atomic_compare_and_set {

@@ -7,10 +7,11 @@ use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use opc_session_store::{
     checked_session_deadline, Clock, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
-    FakeSessionBackend, FenceToken, Generation, LeaseError, LeaseGuard, OwnerId, ReplicationEntry,
-    ReplicationOp, SessionKey, SessionKeyType, SessionOp, SessionStoreBackend,
-    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
-    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_SESSION_TTL,
+    FakeSessionBackend, FenceToken, Generation, LeaseError, LeaseGuard, OwnerId,
+    RecordExpiryPreflight, ReplicationEntry, ReplicationOp, SessionKey, SessionKeyType, SessionOp,
+    SessionStoreBackend, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord, MAX_RECORD_EXPIRY_PREFLIGHTS, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_SESSION_TTL,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -165,6 +166,12 @@ fn assert_store_ttl_error(error: StoreError) {
     assert_eq!(error, StoreError::InvalidSessionTtl);
     assert_eq!(error.to_string(), "invalid session TTL");
     assert_eq!(format!("{error:?}"), "InvalidSessionTtl");
+}
+
+fn assert_store_expiry_error(error: StoreError) {
+    assert_eq!(error, StoreError::InvalidRecordExpiry);
+    assert_eq!(error.to_string(), "invalid session record expiry");
+    assert_eq!(format!("{error:?}"), "InvalidRecordExpiry");
 }
 
 fn valid_ttls() -> [Duration; 3] {
@@ -747,6 +754,188 @@ async fn assert_invalid_rebuild_preserves_state(kind: BackendKind) {
     );
 }
 
+async fn assert_absolute_record_expiry_boundaries(kind: BackendKind) {
+    let now = base_timestamp();
+    let maximum = checked_session_deadline(now, MAX_SESSION_TTL).expect("maximum expiry");
+    let maximum_plus_one = shift(maximum, time::Duration::nanoseconds(1));
+    let past = shift(now, time::Duration::nanoseconds(-1));
+
+    for (index, expires_at) in [past, now, maximum].into_iter().enumerate() {
+        let clock = Arc::new(FixedClock::new(now));
+        let backend = backend(kind, clock);
+        let key = test_key(format!("absolute-valid-{index}").as_bytes());
+        let lease = backend
+            .acquire(&key, owner("owner-a"), Duration::from_secs(60))
+            .await
+            .expect("lease");
+        let mut new_record = record(key.clone(), 1, &lease);
+        new_record.expires_at = Some(expires_at);
+        assert_eq!(
+            backend
+                .compare_and_set(CompareAndSet {
+                    key,
+                    lease,
+                    expected_generation: None,
+                    new_record,
+                })
+                .await
+                .expect("bounded absolute expiry"),
+            CompareAndSetResult::Success,
+            "{kind:?} expiry boundary {index}"
+        );
+    }
+
+    let clock = Arc::new(FixedClock::new(now));
+    let backend = backend(kind, clock);
+    let key = test_key(b"absolute-invalid");
+    let lease = backend
+        .acquire(&key, owner("owner-a"), Duration::from_secs(60))
+        .await
+        .expect("lease");
+    let before_head = backend.max_replication_sequence().await.expect("head");
+    let before_log = replication_log(backend.as_ref()).await;
+    let mut watch = backend
+        .watch(before_head.checked_add(1).expect("watch cursor"))
+        .await
+        .expect("watch");
+
+    let mut far_future = record(key.clone(), 1, &lease);
+    far_future.expires_at = Some(maximum_plus_one);
+    assert_store_expiry_error(
+        backend
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: far_future,
+            })
+            .await
+            .expect_err("maximum plus one must fail"),
+    );
+
+    let mut immortal_ephemeral = record(key.clone(), 1, &lease);
+    immortal_ephemeral.state_class = StateClass::EphemeralProcedure;
+    assert_store_expiry_error(
+        backend
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: immortal_ephemeral,
+            })
+            .await
+            .expect_err("ephemeral state must carry finite expiry"),
+    );
+    assert_eq!(backend.get(&key).await.expect("record"), None);
+    assert_eq!(
+        backend.max_replication_sequence().await.expect("head"),
+        before_head
+    );
+    assert_eq!(replication_log(backend.as_ref()).await, before_log);
+    assert!(watch.next().now_or_never().is_none());
+}
+
+async fn assert_absolute_expiry_batch_rebuild_and_replication_are_atomic(kind: BackendKind) {
+    let now = base_timestamp();
+    let maximum = checked_session_deadline(now, MAX_SESSION_TTL).expect("maximum expiry");
+    let invalid = shift(maximum, time::Duration::nanoseconds(1));
+    let clock = Arc::new(FixedClock::new(now));
+    let backend = backend(kind, clock);
+    let preserved_key = test_key(b"absolute-preserved");
+    let (preserved_lease, preserved_record) = seed_record(backend.as_ref(), &preserved_key).await;
+    let invalid_key = test_key(b"absolute-batch-invalid");
+    let invalid_lease = backend
+        .acquire(&invalid_key, owner("owner-a"), Duration::from_secs(60))
+        .await
+        .expect("invalid-slot lease");
+    let mut invalid_record = record(invalid_key.clone(), 1, &invalid_lease);
+    invalid_record.expires_at = Some(invalid);
+    let before_head = backend.max_replication_sequence().await.expect("head");
+    let before_log = replication_log(backend.as_ref()).await;
+
+    assert_store_expiry_error(
+        backend
+            .batch(vec![
+                SessionOp::DeleteFenced {
+                    lease: preserved_lease,
+                },
+                SessionOp::CompareAndSet(CompareAndSet {
+                    key: invalid_key.clone(),
+                    lease: invalid_lease,
+                    expected_generation: None,
+                    new_record: invalid_record,
+                }),
+            ])
+            .await
+            .expect_err("whole batch must reject before its first mutation"),
+    );
+    assert_eq!(
+        backend.get(&preserved_key).await.expect("preserved record"),
+        Some(preserved_record.clone())
+    );
+    assert_eq!(
+        backend.max_replication_sequence().await.expect("head"),
+        before_head
+    );
+    assert_eq!(replication_log(backend.as_ref()).await, before_log);
+
+    let replacement_key = test_key(b"absolute-rebuild-invalid");
+    let lease_expiry =
+        checked_session_deadline(now, Duration::from_secs(60)).expect("lease expiry");
+    let mut replicated = replicated_record(
+        replacement_key.clone(),
+        1,
+        owner("owner-a"),
+        FenceToken::new(1),
+    );
+    replicated.expires_at = Some(invalid);
+    let invalid_cas = ReplicationOp::CompareAndSet {
+        key: replacement_key.clone(),
+        expected_generation: None,
+        credential_id: 1,
+        guard_expires_at: lease_expiry,
+        new_record: replicated,
+    };
+    let entry = replication_entry(1, "absolute-wire-invalid", now, invalid_cas.clone());
+    assert_store_expiry_error(entry.validate().expect_err("entry timestamp is authority"));
+    assert_store_expiry_error(
+        backend
+            .replicate_entry(entry)
+            .await
+            .expect_err("invalid replication CAS must fail before mutation"),
+    );
+
+    let rebuild = vec![
+        replication_entry(
+            1,
+            "absolute-rebuild-lease",
+            now,
+            ttl_op(
+                ReplicatedTtlKind::Acquire,
+                replacement_key,
+                Duration::from_secs(60),
+                lease_expiry,
+            ),
+        ),
+        replication_entry(2, "absolute-rebuild-cas", now, invalid_cas),
+    ];
+    assert_store_expiry_error(
+        backend
+            .rebuild_replication_state(rebuild)
+            .await
+            .expect_err("invalid rebuild must preserve prior state"),
+    );
+    assert_eq!(
+        backend.get(&preserved_key).await.expect("preserved record"),
+        Some(preserved_record)
+    );
+    assert_eq!(
+        backend.max_replication_sequence().await.expect("head"),
+        before_head
+    );
+    assert_eq!(replication_log(backend.as_ref()).await, before_log);
+}
+
 async fn assert_backend_contract(kind: BackendKind) {
     assert_acquire_boundaries(kind).await;
     assert_renew_boundaries(kind).await;
@@ -754,6 +943,8 @@ async fn assert_backend_contract(kind: BackendKind) {
     assert_batch_preflight_is_atomic(kind).await;
     assert_replicated_ttl_rejection_is_atomic(kind).await;
     assert_invalid_rebuild_preserves_state(kind).await;
+    assert_absolute_record_expiry_boundaries(kind).await;
+    assert_absolute_expiry_batch_rebuild_and_replication_are_atomic(kind).await;
 }
 
 #[tokio::test]
@@ -764,4 +955,42 @@ async fn fake_ttl_boundaries_are_exact_typed_and_atomic() {
 #[tokio::test]
 async fn sqlite_ttl_boundaries_are_exact_typed_and_atomic() {
     assert_backend_contract(BackendKind::Sqlite).await;
+}
+
+#[test]
+fn expiry_preflight_descriptor_limit_is_typed_and_redaction_safe() {
+    let now = base_timestamp();
+    let key = test_key(b"expiry-preflight-limit");
+    let descriptor = RecordExpiryPreflight::from_record(&StoredSessionRecord {
+        key,
+        generation: Generation::new(1),
+        owner: owner("expiry-preflight-owner"),
+        fence: FenceToken::new(1),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("expiry-preflight-limit"),
+        expires_at: Some(now),
+        payload: EncryptedSessionPayload::new(b"expiry-preflight-limit-payload"),
+    });
+    assert!(
+        opc_session_store::validate_record_expiry_preflights_profile(&vec![
+        descriptor;
+        MAX_RECORD_EXPIRY_PREFLIGHTS
+    ])
+        .is_ok()
+    );
+    let error = opc_session_store::validate_record_expiry_preflights_profile(&vec![
+        descriptor;
+        MAX_RECORD_EXPIRY_PREFLIGHTS
+            + 1
+    ])
+    .expect_err("one-over descriptor set");
+    assert_eq!(error, StoreError::RecordExpiryPreflightLimitExceeded);
+    assert_eq!(
+        error.to_string(),
+        "session record-expiry preflight limit exceeded"
+    );
+    let rendered = format!("{error:?} {descriptor:?}");
+    for forbidden in ["expiry-preflight-limit", "expiry-preflight-owner"] {
+        assert!(!rendered.contains(forbidden));
+    }
 }

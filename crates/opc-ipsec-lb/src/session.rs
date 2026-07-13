@@ -707,6 +707,14 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             "session_store.ttl",
             "session-store TTL is outside the supported range",
         ),
+        StoreError::InvalidRecordExpiry => IpsecLbError::invalid_config(
+            "session_store.expiry",
+            "session-store record expiry is outside the supported policy",
+        ),
+        StoreError::RecordExpiryPreflightLimitExceeded => IpsecLbError::invalid_config(
+            "session_store.expiry",
+            "session-store record expiry preflight limit exceeded",
+        ),
         StoreError::CapabilityNotSupported(_) => IpsecLbError::Unsupported,
         StoreError::ReplicationWatchCatchUpRequired | StoreError::BackendUnavailable(_) => {
             IpsecLbError::io(

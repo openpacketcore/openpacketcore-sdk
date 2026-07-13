@@ -23,6 +23,8 @@
 
 #![forbid(unsafe_code)]
 
+pub use opc_types::Timestamp;
+
 pub mod backend;
 pub mod capability;
 pub mod clock;
@@ -47,13 +49,16 @@ pub mod topology;
 pub mod ttl;
 
 pub use backend::{
-    next_replication_sequence, validate_replication_log_page, validate_replication_log_page_owned,
-    validate_replication_page, validate_replication_page_owned, validate_replication_prefix,
-    validate_replication_prefix_owned, validate_session_ops_ttls, BackendInstanceIdentity,
-    BackendPeerBinding, BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult,
-    EncryptingSessionBackend, RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange,
+    next_replication_sequence, record_expiry_preflights, validate_record_expiry_preflights_at,
+    validate_record_expiry_preflights_profile, validate_replication_log_page,
+    validate_replication_log_page_owned, validate_replication_page,
+    validate_replication_page_owned, validate_replication_prefix,
+    validate_replication_prefix_owned, validate_session_ops_at, validate_session_ops_profile,
+    validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding,
+    BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
+    RecordExpiryPreflight, RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange,
     ReplicationOp, ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor, SessionBackend,
-    SessionOp, SessionOpResult, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS, MAX_REPLICATION_LOG_PAGE_ENTRIES,
     MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
     MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, REPLICATION_TX_ID_CANONICAL_BYTES,
     REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
@@ -129,4 +134,8 @@ pub use topology::{
     ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS, REPLICA_IDENTITY_MAX_BYTES,
     REPLICA_ID_MAX_BYTES,
 };
-pub use ttl::{checked_session_deadline, validate_session_ttl, MAX_SESSION_TTL};
+pub use ttl::{
+    checked_session_deadline, validate_record_expiry_at, validate_record_expiry_profile,
+    validate_session_ttl, validate_stored_record_expiry_at, validate_stored_record_expiry_profile,
+    MAX_RECORD_EXPIRY_CLOCK_SKEW, MAX_SESSION_TTL,
+};

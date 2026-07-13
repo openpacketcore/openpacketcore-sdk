@@ -30,6 +30,25 @@ fn run(path: &std::path::Path, max_rows: &str) -> Output {
         .expect("run audit CLI")
 }
 
+fn run_at(path: &std::path::Path, expiry_reference: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_opc-session-store-audit"))
+        .args([
+            "identity-invariants",
+            "--database",
+            path.to_str().expect("UTF-8 test path"),
+            "--max-rows",
+            "10",
+            "--max-entry-json-bytes",
+            "4096",
+            "--max-total-json-bytes",
+            "4096",
+            "--expiry-reference",
+            expiry_reference,
+        ])
+        .output()
+        .expect("run audit CLI with expiry reference")
+}
+
 #[test]
 fn cli_returns_versioned_count_only_json_and_stable_exit_codes() {
     let (_dir, path) = database();
@@ -38,7 +57,7 @@ fn cli_returns_versioned_count_only_json_and_stable_exit_codes() {
     assert_eq!(compliant.status.code(), Some(0));
     let compliant_json: serde_json::Value =
         serde_json::from_slice(&compliant.stdout).expect("compliant JSON");
-    assert_eq!(compliant_json["report_version"], 3);
+    assert_eq!(compliant_json["report_version"], 4);
     assert_eq!(compliant_json["status"], "compliant");
     assert!(compliant.stderr.is_empty());
 
@@ -97,6 +116,28 @@ fn cli_returns_versioned_count_only_json_and_stable_exit_codes() {
     assert!(!rendered.contains("sensitive-database-name"));
     assert!(!rendered.contains("raw-custom-key-must-not-leak"));
     assert!(!rendered.contains("tenant-a"));
+}
+
+#[test]
+fn cli_persists_an_explicit_expiry_reference_and_rejects_invalid_input() {
+    let (_dir, path) = database();
+    let reference = "2035-04-05T06:07:08.000000009Z";
+
+    let output = run_at(&path, reference);
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("explicit-reference report");
+    assert_eq!(report["report_version"], 4);
+    assert_eq!(report["expiry_reference"], reference);
+
+    let invalid = run_at(&path, "not-a-timestamp");
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    let error: serde_json::Value =
+        serde_json::from_slice(&invalid.stderr).expect("invalid-reference error");
+    assert_eq!(error["status"], "error");
+    assert_eq!(error["reason"], "invalid_arguments");
+    assert!(!String::from_utf8_lossy(&invalid.stderr).contains("not-a-timestamp"));
 }
 
 #[test]

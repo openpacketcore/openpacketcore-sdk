@@ -22,7 +22,10 @@ use crate::{
     record::{EncryptedSessionPayload, StoredSessionRecord},
     restore::{RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest},
     topology::{ReplicaId, ReplicaTlsIdentity},
-    ttl::{checked_session_deadline, validate_session_ttl},
+    ttl::{
+        checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at,
+        validate_stored_record_expiry_profile,
+    },
 };
 
 /// Per-watcher buffer size for replication watch streams.
@@ -49,7 +52,7 @@ pub const MAX_REPLICATION_WATCH_BACKLOG_ENTRIES: usize = WATCH_CHANNEL_CAPACITY;
 /// cryptographic-provider work, and the built-in replay adapters bounded. It
 /// is deliberately not configurable per replica because different limits
 /// could make replicas disagree about the same ordered log entry. Versioned
-/// `opc-session-net` protocol v4 pins and enforces this limit during
+/// `opc-session-net` protocol v5 pins and enforces this limit during
 /// pre-allocation wire decoding.
 pub const MAX_REPLICATION_OPERATION_DEPTH: usize = 16;
 
@@ -293,6 +296,109 @@ pub enum SessionOp {
     },
 }
 
+/// Payload-free metadata used to preflight caller-authored record expiry.
+///
+/// The descriptor deliberately excludes the session key, owner, generation,
+/// fence, state type, and payload. It can therefore cross an authenticated
+/// coordinator boundary without widening the plaintext or redaction surface.
+/// At most [`MAX_RECORD_EXPIRY_PREFLIGHTS`] descriptors may be submitted in
+/// one call.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordExpiryPreflight {
+    expires_at: Option<Timestamp>,
+    state_class: crate::model::StateClass,
+}
+
+impl RecordExpiryPreflight {
+    /// Build the payload-free expiry descriptor for one record.
+    pub const fn from_record(record: &StoredSessionRecord) -> Self {
+        Self {
+            expires_at: record.expires_at,
+            state_class: record.state_class,
+        }
+    }
+
+    /// Whether this descriptor carries a finite absolute deadline.
+    pub const fn is_finite(self) -> bool {
+        self.expires_at.is_some()
+    }
+
+    /// Validate profile-only rules without claiming clock authority.
+    pub fn validate_profile(self) -> Result<(), StoreError> {
+        crate::ttl::validate_record_expiry_profile(self.expires_at, self.state_class)
+    }
+
+    /// Validate this descriptor at one coordinator authority timestamp.
+    pub fn validate_at(self, reference_timestamp: Timestamp) -> Result<(), StoreError> {
+        crate::ttl::validate_record_expiry_at(
+            self.expires_at,
+            self.state_class,
+            reference_timestamp,
+        )
+    }
+}
+
+impl std::fmt::Debug for RecordExpiryPreflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordExpiryPreflight")
+            .field("expires_at", &self.expires_at.map(|_| "<redacted>"))
+            .field("state_class", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Maximum payload-free record-expiry descriptors in one authority preflight.
+pub const MAX_RECORD_EXPIRY_PREFLIGHTS: usize = 256;
+
+/// Derive bounded, payload-free expiry descriptors for every CAS in a batch.
+pub fn record_expiry_preflights(
+    ops: &[SessionOp],
+) -> Result<Vec<RecordExpiryPreflight>, StoreError> {
+    validate_session_ops_profile(ops)?;
+    let count = ops
+        .iter()
+        .filter(|op| matches!(op, SessionOp::CompareAndSet(_)))
+        .count();
+    if count > MAX_RECORD_EXPIRY_PREFLIGHTS {
+        return Err(StoreError::RecordExpiryPreflightLimitExceeded);
+    }
+    Ok(ops
+        .iter()
+        .filter_map(|op| match op {
+            SessionOp::CompareAndSet(op) => {
+                Some(RecordExpiryPreflight::from_record(&op.new_record))
+            }
+            SessionOp::Get { .. }
+            | SessionOp::DeleteFenced { .. }
+            | SessionOp::RefreshTtl { .. } => None,
+        })
+        .collect())
+}
+
+/// Validate a bounded descriptor set without claiming clock authority.
+pub fn validate_record_expiry_preflights_profile(
+    preflights: &[RecordExpiryPreflight],
+) -> Result<(), StoreError> {
+    if preflights.len() > MAX_RECORD_EXPIRY_PREFLIGHTS {
+        return Err(StoreError::RecordExpiryPreflightLimitExceeded);
+    }
+    preflights
+        .iter()
+        .try_for_each(|preflight| preflight.validate_profile())
+}
+
+/// Validate a bounded descriptor set at one coordinator authority timestamp.
+pub fn validate_record_expiry_preflights_at(
+    preflights: &[RecordExpiryPreflight],
+    reference_timestamp: Timestamp,
+) -> Result<(), StoreError> {
+    validate_record_expiry_preflights_profile(preflights)?;
+    preflights
+        .iter()
+        .try_for_each(|preflight| preflight.validate_at(reference_timestamp))
+}
+
 impl SessionOp {
     /// Validate every caller-supplied TTL carried by this operation.
     ///
@@ -304,11 +410,56 @@ impl SessionOp {
             Self::Get { .. } | Self::CompareAndSet(_) | Self::DeleteFenced { .. } => Ok(()),
         }
     }
+
+    /// Validate every caller-authored deadline against one operation authority
+    /// timestamp.
+    pub fn validate_record_expiry_at(
+        &self,
+        reference_timestamp: Timestamp,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::CompareAndSet(op) => {
+                validate_stored_record_expiry_at(&op.new_record, reference_timestamp)
+            }
+            Self::Get { .. } | Self::DeleteFenced { .. } | Self::RefreshTtl { .. } => Ok(()),
+        }
+    }
+
+    /// Validate time-independent record-expiry profile rules.
+    pub fn validate_record_expiry_profile(&self) -> Result<(), StoreError> {
+        match self {
+            Self::CompareAndSet(op) => validate_stored_record_expiry_profile(&op.new_record),
+            Self::Get { .. } | Self::DeleteFenced { .. } | Self::RefreshTtl { .. } => Ok(()),
+        }
+    }
 }
 
 /// Validate all TTL-bearing operations in a batch before executing any slot.
 pub fn validate_session_ops_ttls(ops: &[SessionOp]) -> Result<(), StoreError> {
     ops.iter().try_for_each(SessionOp::validate_ttls)
+}
+
+/// Preflight all TTL and absolute-record-expiry inputs in a batch.
+///
+/// Callers capture `reference_timestamp` once and invoke this before any slot,
+/// lock, transaction, provider, watcher, or log mutation.
+pub fn validate_session_ops_at(
+    ops: &[SessionOp],
+    reference_timestamp: Timestamp,
+) -> Result<(), StoreError> {
+    validate_session_ops_ttls(ops)?;
+    ops.iter()
+        .try_for_each(|op| op.validate_record_expiry_at(reference_timestamp))
+}
+
+/// Validate batch TTLs and time-independent record-expiry profile rules.
+///
+/// This is safe at non-authoritative wrappers and clients. The mutation
+/// coordinator must still call [`validate_session_ops_at`] with its own clock.
+pub fn validate_session_ops_profile(ops: &[SessionOp]) -> Result<(), StoreError> {
+    validate_session_ops_ttls(ops)?;
+    ops.iter()
+        .try_for_each(SessionOp::validate_record_expiry_profile)
 }
 
 /// Result of a single batched operation.
@@ -901,10 +1052,11 @@ impl ReplicationOp {
                         return Err(StoreError::InvalidSessionTtl);
                     }
                 }
+                Self::CompareAndSet { new_record, .. } => {
+                    validate_stored_record_expiry_at(new_record, reference_timestamp)?;
+                }
                 Self::Batch { ops } => pending.extend(ops),
-                Self::CompareAndSet { .. }
-                | Self::DeleteFenced { .. }
-                | Self::ReleaseLease { .. } => {}
+                Self::DeleteFenced { .. } | Self::ReleaseLease { .. } => {}
             }
         }
         Ok(())
@@ -1072,6 +1224,44 @@ pub trait SessionBackend: Send + Sync {
 
     /// Return the capability declaration for this backend.
     async fn capabilities(&self) -> BackendCapabilities;
+
+    /// Current absolute-expiry authority time for direct local mutation.
+    ///
+    /// Standalone adapters with an injected clock return `Some`. Forwarding
+    /// wrappers delegate it. Consensus and remote clients return `None`
+    /// because their local wall clock is not the mutation coordinator; the
+    /// leader or remote backend performs the finite verdict instead.
+    fn record_expiry_reference(&self) -> Option<Timestamp> {
+        None
+    }
+
+    /// Preflight caller-authored absolute deadlines before wrapper side effects.
+    ///
+    /// Standalone implementations validate against one captured injected-clock
+    /// reference. Remote and consensus coordinators override this method to
+    /// obtain an authenticated authority verdict. The input contains no key or
+    /// payload and is bounded before any transport or provider work.
+    /// Forwarding wrappers MUST delegate this method before performing cache,
+    /// key-provider, sealing, or other externally visible work.
+    ///
+    /// The default accepts profile-only descriptors without a finite deadline.
+    /// It fails closed for any finite deadline when
+    /// [`Self::record_expiry_reference`] is absent; a backend that validates at
+    /// a remote or consensus authority MUST override this method.
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        validate_record_expiry_preflights_profile(preflights)?;
+        if let Some(reference) = self.record_expiry_reference() {
+            validate_record_expiry_preflights_at(preflights, reference)?;
+        } else if preflights.iter().any(|preflight| preflight.is_finite()) {
+            return Err(StoreError::CapabilityNotSupported(
+                "record_expiry_preflight".into(),
+            ));
+        }
+        Ok(())
+    }
 
     /// Retrieve a record by key.
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError>;
@@ -1544,12 +1734,27 @@ where
         self.inner.capabilities().await
     }
 
+    fn record_expiry_reference(&self) -> Option<Timestamp> {
+        self.inner.record_expiry_reference()
+    }
+
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        self.inner.preflight_record_expiry(preflights).await
+    }
+
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         let record = self.inner.get(key).await?;
         self.decrypt_optional_record(record).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        let preflight = RecordExpiryPreflight::from_record(&op.new_record);
+        self.inner
+            .preflight_record_expiry(std::slice::from_ref(&preflight))
+            .await?;
         let encrypted_record = self.encrypt_record(op.new_record).await?;
         let result = self
             .inner
@@ -1573,7 +1778,8 @@ where
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
-        validate_session_ops_ttls(&ops)?;
+        let preflights = record_expiry_preflights(&ops)?;
+        self.inner.preflight_record_expiry(&preflights).await?;
         if !self.inner.capabilities().await.batch_write {
             return Err(StoreError::CapabilityNotSupported("batch_write".into()));
         }
@@ -1962,12 +2168,27 @@ where
         self.inner.capabilities().await
     }
 
+    fn record_expiry_reference(&self) -> Option<Timestamp> {
+        self.inner.record_expiry_reference()
+    }
+
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        self.inner.preflight_record_expiry(preflights).await
+    }
+
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         let record = self.inner.get(key).await?;
         self.unseal_optional_record(record).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        let preflight = RecordExpiryPreflight::from_record(&op.new_record);
+        self.inner
+            .preflight_record_expiry(std::slice::from_ref(&preflight))
+            .await?;
         let sealed_record = self.seal_record(op.new_record).await?;
         let result = self
             .inner
@@ -1991,7 +2212,8 @@ where
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
-        validate_session_ops_ttls(&ops)?;
+        let preflights = record_expiry_preflights(&ops)?;
+        self.inner.preflight_record_expiry(&preflights).await?;
         if !self.inner.capabilities().await.batch_write {
             return Err(StoreError::CapabilityNotSupported("batch_write".into()));
         }
@@ -2219,5 +2441,66 @@ where
 
     async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
         self.inner.release(lease).await
+    }
+}
+
+#[cfg(test)]
+mod record_expiry_preflight_default_tests {
+    use super::*;
+
+    struct NonAuthoritativeBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for NonAuthoritativeBackend {
+        async fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::minimal()
+        }
+
+        async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn compare_and_set(
+            &self,
+            _op: CompareAndSet,
+        ) -> Result<CompareAndSetResult, StoreError> {
+            Err(StoreError::CasConflict)
+        }
+
+        async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn finite_preflight_fails_closed_without_an_authority_reference() {
+        let backend = NonAuthoritativeBackend;
+        let finite = RecordExpiryPreflight {
+            expires_at: Some(Timestamp::from_offset_datetime(
+                time::OffsetDateTime::UNIX_EPOCH,
+            )),
+            state_class: crate::model::StateClass::AuthoritativeSession,
+        };
+
+        assert_eq!(
+            backend.preflight_record_expiry(&[finite]).await,
+            Err(StoreError::CapabilityNotSupported(
+                "record_expiry_preflight".into()
+            ))
+        );
+
+        let nonfinite = RecordExpiryPreflight {
+            expires_at: None,
+            state_class: crate::model::StateClass::AuthoritativeSession,
+        };
+        assert_eq!(backend.preflight_record_expiry(&[nonfinite]).await, Ok(()));
     }
 }

@@ -120,13 +120,14 @@ hardened under #128. #129 supplies an offline, audited whole-fleet legacy-fork
 campaign that quarantines every selected PVC and resumes from one immutable
 operator-selected checkpoint without becoming a second runtime authority; see
 the [recovery runbook](session-store-legacy-recovery.md). #133 provides bounded
-applied-state restore with snapshot-bound cursors. Watch and expiry hardening
-remain #145/#148, and network/resource/rotation qualification remains #143 and
-the #161 -> #162 -> #163 -> #164 credential chain under umbrella #158. Stable
+applied-state restore with snapshot-bound cursors. Absolute record-expiry
+hardening is implemented under #148; watch handoff is implemented, and
+network/resource/rotation qualification remains #143. #161 and #162 are
+implemented; #163 -> #164 remain under umbrella #158. Stable
 ID bounds are implemented under #167. #168 adds the bounded durable
 transaction-ID type, canonical coordinator mint, exact legacy preservation,
-SQLite/snapshot/recovery validation, and version-3 migration audit. Log-range
-cursors remain #171.
+SQLite/snapshot/recovery validation, and version-3 migration audit. #171
+implements bounded log-range cursor semantics.
 
 ### Configured topology admission
 
@@ -147,12 +148,18 @@ are independent. A bare local ID can belong to a member with an FQDN endpoint;
 no hostname shortening or endpoint-as-identity inference occurs. The explicit
 consensus lab singleton uses the same engine but reports `single-replica`.
 
-Production peers use the dedicated `opc-session-consensus/1` ALPN. Every RPC
+Production peers use the dedicated `opc-session-consensus/2` ALPN. Every RPC
 binds the live SPIFFE identity, configured local and remote logical IDs, stable
 node IDs, cluster/configuration/epoch, sender field, expected server profile,
 and a fresh challenge before Openraft dispatch. This is authentication and
 composition evidence, not physical-store provenance. A CNF must still map each
 logical voter to exactly one durable backing volume.
+
+The exact consensus contract is transport/wire-schema revision 2 and error-set
+revision 4. It carries only the bounded payload-free expiry-authority
+preflight plus the existing Openraft RPC families; error revision 4 adds
+`RecordExpiryPreflightLimitExceeded`. Older exact profiles fail before engine
+dispatch and require a drained full-membership upgrade.
 
 ### Structural identity and legacy persistence admission
 
@@ -193,13 +200,15 @@ opc-session-store-audit identity-invariants \
   --database PATH \
   --max-rows N \
   --max-entry-json-bytes N \
-  --max-total-json-bytes N
+  --max-total-json-bytes N \
+  --expiry-reference 2026-07-13T18:00:00Z
 ```
 
 All budgets are required and non-zero, with the per-entry JSON limit no larger
 than the total or SQLite's signed `i64` length range. The audit opens one drained SQLite snapshot read-only and
 query-only, scans the four identity-bearing tables in fixed 256-row pages, and
-emits version-1 count-only JSON. `compliant`/0 is the sole pass;
+emits version-4 count-only JSON including the recorded expiry reference and
+expiry-violation count. `compliant`/0 is the sole pass;
 `violations_found`/1, `incomplete`/2, and redacted command/setup `error`/2 all
 block upgrade. Reports contain version/status, limits, bounded scanned and
 violation counts, and an optional bounded `incomplete_reason` only—never a
@@ -264,8 +273,9 @@ application/backend mutation or provider work: clients reject before
 resolution/dialing, while servers reject after request receipt but before
 backend dispatch and may return the typed response. The new public error
 variants require external exhaustive matches. Protocol v4 introduced their
-private fixed-width DTOs in error revision 1; current error revision 6 retains
-those encodings and rejects error-revision-5 or older v4 peers during the exact
+private fixed-width DTOs in error revision 1; current v5 error revision 8
+retains those encodings and adds the bounded expiry-preflight outcome. It
+rejects error-revision-7 or older peers during the exact
 handshake. Operators must audit legacy
 persisted logs before upgrade because a TTL-bearing entry
 above the bound now fails closed during replay/rebuild rather than being
@@ -276,7 +286,8 @@ larger mismatches fail closed.
 
 This closes only the duration-input/process-availability gap in #137. Openraft
 commit authority is independent; repair, restore, and qualification work remain
-open. Caller-authored absolute record expiry remains #148.
+open. Caller-authored absolute record expiry is separately bounded under #148
+using the coordinator-authority contract below.
 
 ### Bounded protected replication trees
 
@@ -324,7 +335,7 @@ production qualification remain #143. These are separate mandatory gates.
 ### Consensus transport and encryption boundary
 
 The production authority path uses `SessionConsensusServer` and
-`RemoteSessionConsensusPeer` over the exact `opc-session-consensus/1` ALPN.
+`RemoteSessionConsensusPeer` over the exact `opc-session-consensus/2` ALPN.
 Consensus DTOs carry only bounded Openraft RPC families and application
 forward/read-barrier requests. Sender identity is checked against both the
 authenticated peer and the inner Openraft vote/log sender before dispatch.
@@ -350,9 +361,9 @@ This is payload-envelope encryption, not full-database encryption. Membership,
 indexes, routing fields, owners, fences, timestamps, and envelope key IDs remain
 visible unless a separate approved storage layer protects them.
 
-### Legacy backend and restore transport (protocol v4)
+### Legacy backend and restore transport (protocol v5)
 
-The opt-in `opc-session-net` protocol v4 carries validated restore-scan
+The opt-in `opc-session-net` protocol v5 carries validated restore-scan
 requests and pages to individual remote replicas. It admits only the
 `DurableOpaqueV1` page profile; offset cursors from the local fake are rejected
 and can never become remote restore evidence. Backend pages are capped at
@@ -370,15 +381,15 @@ Every production participant is created with an opaque authenticated TLS
 config and a binding derived from one immutable `SessionReplicationManifest`.
 The manifest's configuration ID is an order-independent SHA-256 digest of the
 cluster ID, operator-controlled generation, and every field of every replica
-descriptor. During the v4 handshake, each side extracts the canonical SPIFFE
+descriptor. During the v5 handshake, each side extracts the canonical SPIFFE
 URI from the live certificate and requires it to match the claimed stable
 `ReplicaId`, expected opposite member, cluster, and configuration ID before
 dispatch. The client verifies its fresh challenge is echoed by the server.
 DNS/FQDN/IP aliases and resolver overrides affect
 routing only; they never redefine replica identity.
 
-The exact `opc-session-net/4` ALPN, version, and contract profile have no
-production fallback to v3. A v3-to-v4 change is a coordinated
+The exact `opc-session-net/5` ALPN, version, and contract profile have no
+production fallback. The v5 change is a coordinated
 stop/upgrade/start of all clients and servers, not a mixed-version rolling
 deployment or highest-common-version negotiation. Public `Request`/`Response`
 remain available, but `Hello`/`HelloAck` gain an optional `contract_profile`, so
@@ -397,8 +408,10 @@ confidential cursor and explicit durable-page profile and pins the payload and
 examined-candidate budgets; error-set revision 3 carries stale-cursor,
 direct-CAS idempotency, and work-budget failures. Error-set revision 4 adds
 checked replication-log range outcomes; revision 5 adds non-CAS backend and
-lease ambiguity outcomes; revision 6 adds bounded-watch catch-up. Different exact v4
-profiles do not interoperate even though their ALPN text is the same.
+lease ambiguity outcomes; revision 6 adds bounded-watch catch-up; and revision
+7 adds absolute-record-expiry rejection. Those historical exact v4 profiles
+do not interoperate with one another despite sharing their old ALPN; current v5
+uses a distinct ALPN and rejects them before bootstrap.
 
 Cursor ciphertext is variable-length up to the consensus RPC/key ceiling and
 uses separated HMAC-derived AES-256-GCM-SIV and synthetic-nonce keys. Identical
@@ -410,14 +423,14 @@ and snapshot fields remain confidential. Cursors survive a same-PVC
 restart but are node/incarnation-bound. Another node or an installed snapshot
 returns typed stale-cursor state and the caller restarts at page one.
 
-The private v4 DTOs use `u32` for restore/log request limits and the restore
+The private v5 DTOs use `u32` for restore/log request limits and the restore
 response budget, a confidential authenticated strictly bounded restore cursor, and
 `u64` excluded counts,
 `max_value_bytes`, and size-bearing store errors. Restore `loaded_count` and
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 4, error-set revision 6, a 4 MiB restore
+profile pins wire-schema revision 5, error-set revision 8, a 4 MiB restore
 payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, the
 31,536,000-second TTL maximum, and
@@ -430,8 +443,19 @@ through 128 UTF-8 bytes, and CAS request IDs, when present, use the canonical
 lowercase hyphenated 36-byte UUID encoding.
 Error-set revision 4 adds checked replication-log range overflow, page-limit,
 and compacted-cursor outcomes; revision 5 adds non-CAS backend and lease
-ambiguity outcomes; revision 6 adds bounded-watch catch-up. A revision-5 or
-older peer is therefore incompatible.
+ambiguity outcomes; revision 6 adds bounded-watch catch-up; revision 7 adds
+absolute-record-expiry rejection; and revision 8 adds the bounded
+expiry-preflight limit outcome. A revision-4/error-revision-7 or older peer is
+therefore
+incompatible.
+
+Every forwarding wrapper and authenticated CAS/batch dispatcher obtains the
+payload-free expiry-authority verdict before idempotency admission, cache
+invalidation, provider/HKMS work, sealing, or backend dispatch. Invalid input
+and preflight timeout/unavailability perform no provider call or requested
+mutation. Caller retry is safe because only a consensus logical-time floor may
+have committed; payload envelopes, AAD, key selection, and HKMS placement are
+unchanged.
 
 Every server response and watch item is fully bounded-encoded before a length
 prefix is emitted. Common non-pageable and complete-page successes use one
@@ -473,12 +497,12 @@ Capabilities retained after transient transport loss remain descriptive only;
 they never authorize a store operation or readiness. Use fresh bounded quorum
 evidence and continuous traffic gating.
 
-Before the v4 rollout, drain traffic and writers, run the #135 count-only
+Before the v5 rollout, drain traffic and writers, run the count-only
 identity audit, and preflight every live/replayable handover and nested-payload
 copy. Stop and upgrade every client, server, protection wrapper, and product
-handover reader/writer together; verify exact-v4 authenticated restore/log
+handover reader/writer together; verify exact-v5 authenticated restore/log
 traffic and fresh quorum evidence before reopening traffic. Once `OPCH` has
-been written, rollback to a v3 binary additionally requires a coherent drained
+been written, rollback to an older binary additionally requires a coherent drained
 checkpoint restore or reviewed reverse migration of every live and replayable
 record, log, snapshot, and restore source.
 
@@ -512,9 +536,9 @@ remain open production work under the existing lifecycle/#143 gates.
 For Kubernetes mounts, `ProjectedSvidSource` now publishes only a bounded,
 validated candidate read from one immutable `..data` target and retains a
 failed candidate's predecessor only until expiry. That closes source-level
-atomicity, not connection continuity: #162 still owns coherent handshake
-epochs, #163 owns retirement/reauthentication, #164 owns fleet evidence, and
-#158 remains their umbrella. Distributed qualification remains #143. Session
+atomicity, not connection continuity: #162 implements coherent handshake
+epochs; #163 retirement/reauthentication and #164 fleet evidence remain under
+umbrella #158. Distributed qualification remains #143. Session
 TTL is application-state lifetime; the 365-day bound is not a
 certificate-expiry, trust-validity, or authentication-age policy.
 
@@ -527,7 +551,7 @@ uses bounded operation-family/reason categories for oversize/fallback/timeout
 without logging keys, payloads, owners, transaction IDs, peer identities, or
 backend/peer-controlled error text.
 
-Protocol v4 remains a compatibility transport and does not establish
+Protocol v5 remains a compatibility transport and does not establish
 authority. #127 uses the separate Openraft transport; #133 scans only the
 barrier-confirmed local applied state with bounded work, while #129 legacy-fork
 recovery remains an offline, operator-authorized campaign.
@@ -660,9 +684,9 @@ implement a second quorum algorithm.
   round trips, cursor/sequence-preserving prefixes, non-truncated batches,
   fixed redaction-safe fallbacks, authenticated slow-reader reaping, connection
   slot recovery, ambiguous mutation outcomes, and deterministic shutdown.
-  Passing those tests demonstrates the #159 transport boundary only; it does
-  not close #171 log-range cursor work, the complete seamless credential
-  lifecycle, or #143 production qualification. #167/#168 separately supply
+  Passing those tests demonstrates the #159 transport boundary only; #171
+  supplies bounded log-range cursor semantics. The complete seamless credential
+  lifecycle and #143 production qualification remain open. #167/#168 separately supply
   the structural retained-identity and migration contracts. #177 reuses this shared
   transport boundary for config consensus instead of maintaining a separate
   config TCP deadline or credential path.

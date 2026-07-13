@@ -1,11 +1,13 @@
 use bytes::Bytes;
 use opc_session_store::sqlite::audit::{
-    audit_sqlite_identity_invariants, SqliteIdentityAuditIncompleteReason,
-    SqliteIdentityAuditLimits, SqliteIdentityAuditStatus, SQLITE_IDENTITY_AUDIT_REPORT_VERSION,
+    audit_sqlite_identity_invariants, audit_sqlite_identity_invariants_at,
+    SqliteIdentityAuditIncompleteReason, SqliteIdentityAuditLimits, SqliteIdentityAuditStatus,
+    SQLITE_IDENTITY_AUDIT_REPORT_VERSION,
 };
 use opc_session_store::{
-    FenceToken, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend, SessionKey,
-    SessionKeyType, SqliteSessionBackend, OWNER_ID_MAX_BYTES, REPLICATION_TX_ID_MAX_BYTES,
+    checked_session_deadline, FenceToken, Generation, OwnerId, ReplicationEntry, ReplicationOp,
+    SessionBackend, SessionKey, SessionKeyType, SqliteSessionBackend, StateClass, StateType,
+    StoredSessionRecord, MAX_SESSION_TTL, OWNER_ID_MAX_BYTES, REPLICATION_TX_ID_MAX_BYTES,
     SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_MAX_BYTES,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -332,11 +334,121 @@ fn replication_transaction_id_audit_is_exact_bounded_and_cross_checks_json() {
         report.report_version(),
         SQLITE_IDENTITY_AUDIT_REPORT_VERSION
     );
-    assert_eq!(SQLITE_IDENTITY_AUDIT_REPORT_VERSION, 3);
+    assert_eq!(SQLITE_IDENTITY_AUDIT_REPORT_VERSION, 4);
     assert_eq!(report.status(), SqliteIdentityAuditStatus::ViolationsFound);
     assert_eq!(report.scanned().replication_entries(), 8);
     assert_eq!(report.violations().invalid_replication_tx_id_fields(), 6);
     assert_eq!(report.violations().invalid_replication_entries(), 2);
+}
+
+#[test]
+fn absolute_expiry_audit_uses_explicit_reference_and_reports_counts_only() {
+    let (_dir, path) = database();
+    let reference = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("reference"),
+    );
+    let exact = checked_session_deadline(reference, MAX_SESSION_TTL).expect("exact maximum");
+    let plus_one = Timestamp::from_offset_datetime(
+        exact
+            .as_offset_datetime()
+            .checked_add(time::Duration::nanoseconds(1))
+            .expect("plus one"),
+    );
+    let conn = Connection::open(&path).expect("open fixture");
+    for (rowid, class, expires_at) in [
+        (1_i64, "authoritative-session", None),
+        (2_i64, "ephemeral-procedure", None),
+        (3_i64, "authoritative-session", Some(exact)),
+        (4_i64, "authoritative-session", Some(plus_one)),
+        (5_i64, "ephemeral-procedure", Some(reference)),
+    ] {
+        conn.execute(
+            r#"
+            INSERT INTO session_records (
+                rowid, tenant, nf_kind, key_type, stable_id, generation, owner,
+                fence, state_class, state_type, expires_at, payload, encoding
+            ) VALUES (?1, 'sensitive-tenant', 'smf', 'pdu-session', ?2, 1,
+                      'sensitive-owner', 1, ?3, 'sensitive-state', ?4, X'', 0)
+            "#,
+            params![
+                rowid,
+                format!("sensitive-stable-{rowid}").into_bytes(),
+                class,
+                expires_at.map(|value| value.to_string()),
+            ],
+        )
+        .expect("insert expiry fixture");
+    }
+    drop(conn);
+
+    let report = audit_sqlite_identity_invariants_at(&path, limits(10, 1024, 1024), reference)
+        .expect("audit succeeds");
+    assert_eq!(report.expiry_reference(), reference);
+    assert_eq!(report.scanned().session_records(), 5);
+    assert_eq!(report.violations().invalid_record_expiry_fields(), 2);
+    assert_eq!(report.status(), SqliteIdentityAuditStatus::ViolationsFound);
+    let encoded = serde_json::to_string(&report).expect("report JSON");
+    for sensitive in [
+        "sensitive-tenant",
+        "sensitive-owner",
+        "sensitive-state",
+        "sensitive-stable",
+    ] {
+        assert!(!encoded.contains(sensitive));
+    }
+}
+
+#[test]
+fn replication_cas_expiry_audit_is_bound_to_entry_timestamp() {
+    let (_dir, path) = database();
+    let timestamp = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("reference"),
+    );
+    let key = SessionKey {
+        tenant: TenantId::from_static("tenant-a"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(b"expiry-audit")
+            .try_into()
+            .expect("stable ID"),
+    };
+    let far_future = Timestamp::from_offset_datetime(
+        checked_session_deadline(timestamp, MAX_SESSION_TTL)
+            .expect("maximum")
+            .as_offset_datetime()
+            .checked_add(time::Duration::nanoseconds(1))
+            .expect("plus one"),
+    );
+    let entry = ReplicationEntry {
+        sequence: 1,
+        tx_id: "expiry-audit-tx".try_into().expect("transaction ID"),
+        timestamp,
+        op: ReplicationOp::CompareAndSet {
+            key: key.clone(),
+            expected_generation: None,
+            credential_id: 1,
+            guard_expires_at: timestamp,
+            new_record: StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner: OwnerId::new("owner-a").expect("owner"),
+                fence: FenceToken::new(1),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("audit"),
+                expires_at: Some(far_future),
+                payload: opc_session_store::EncryptedSessionPayload::new([]),
+            },
+        },
+    };
+    let encoded = serde_json::to_string(&entry).expect("entry JSON");
+    let conn = Connection::open(&path).expect("open fixture");
+    insert_replication_json(&conn, 1, &encoded);
+    drop(conn);
+
+    let width = u64::try_from(encoded.len()).expect("encoded width");
+    let report = audit_sqlite_identity_invariants_at(&path, limits(2, width, width), timestamp)
+        .expect("audit succeeds");
+    assert_eq!(report.violations().invalid_replication_entries(), 1);
 }
 
 #[tokio::test]

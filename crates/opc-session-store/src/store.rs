@@ -11,10 +11,11 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 
 use crate::backend::{
-    enforce_replication_watch_cursor, validate_replication_log_page_owned,
-    validate_replication_prefix_owned, validate_session_ops_ttls, BackendInstanceIdentity,
-    BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange,
-    SessionBackend, SessionOp, SessionOpResult,
+    enforce_replication_watch_cursor, record_expiry_preflights,
+    validate_replication_log_page_owned, validate_replication_prefix_owned,
+    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
+    RecordExpiryPreflight, ReplicationEntry, ReplicationLogRange, SessionBackend, SessionOp,
+    SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
 use crate::error::{LeaseError, StoreError};
@@ -109,11 +110,26 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         self.backend.capabilities().await
     }
 
+    fn record_expiry_reference(&self) -> Option<opc_types::Timestamp> {
+        self.backend.record_expiry_reference()
+    }
+
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        self.backend.preflight_record_expiry(preflights).await
+    }
+
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         self.backend.get(key).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        let preflight = RecordExpiryPreflight::from_record(&op.new_record);
+        self.backend
+            .preflight_record_expiry(std::slice::from_ref(&preflight))
+            .await?;
         self.backend.compare_and_set(op).await
     }
 
@@ -127,7 +143,8 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
-        validate_session_ops_ttls(&ops)?;
+        let preflights = record_expiry_preflights(&ops)?;
+        self.backend.preflight_record_expiry(&preflights).await?;
         self.backend.batch(ops).await
     }
 
