@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redact operation errors, cap concurrent attempts, and keep tickets,
   resumption, early data, and 0-RTT disabled. Existing `rustls_config()` and
   identity-source event APIs remain source compatible.
+- **BREAKING — `opc-proto-diameter`:** trusted dictionary decode now resolves
+  exactly one command by application id, command code, and request/answer role
+  before applying vendor-aware per-command AVP cardinality. Conservative SWm
+  decode accepts repeatable State and, only through the explicit projected APN
+  profile, repeated APN-Configuration; singleton, grouped-child, and unknown
+  duplicates still fail at the second AVP offset, while raw decode keeps its
+  blanket rejection. `Dictionary[Set]::find_command` now takes application id;
+  overlapping/missing command profiles fail closed. Typed singleton guards,
+  baseline wire encoding, and unknown-mandatory rejection remain unchanged.
 - `opc-ipsec-lb`: additive `SteeringBackendKind::VipDelivered` and
   `SteeringProbe::vip_delivered()` distinguish production converged shared-L2
   floating-VIP delivery from testkit mocks. The ready mutation contract is an

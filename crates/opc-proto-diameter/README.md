@@ -20,9 +20,14 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
 - `validate_avp_region` and `validate_avp_region_with_dictionary` enforce
   length, padding, count, duplicate-key, and dictionary-marked grouped-AVP
   recursion rules.
+- `Message::decode_with_dictionary` and
+  `OwnedMessage::decode_owned_with_dictionary` resolve exactly one command by
+  application id, command code, and request/answer role before applying its
+  top-level AVP cardinality. Missing or overlapping command profiles fail
+  closed; raw `Message::decode` retains reject-all duplicate behavior.
 - `dictionary` exposes `Dictionary`, `DictionarySet`, `ApplicationDefinition`,
-  `CommandDefinition`, `AvpDefinition`, `AvpDataType`, `AvpFlagRules`, and
-  related metadata types.
+  `CommandDefinition`, `CommandAvpRule`, `AvpCardinality`, `AvpDefinition`,
+  `AvpDataType`, `AvpFlagRules`, and related metadata types.
 - The `peer` feature adds transport-neutral CER/CEA, DWR/DWA, DPR/DPA
   builders/parsers, capability negotiation helpers, result-code helpers, and
   `PeerSession` projection state.
@@ -86,10 +91,19 @@ APN-Configuration-Profile default pointer into the SWm DEA extension surface.
 The baseline SWm DEA command ABNF does not enumerate that top-level AVP. SDK
 receivers predating this field reject the extension emitted with its required
 M-bit as unknown, so upgrade decoders before enabling its emission from
-encoders. Repeated projected APN configurations currently require
-`DuplicateIePolicy::Last`; the conservative blanket duplicate pre-scan cannot
-distinguish repeatable profile AVPs until #131 is resolved, while typed
-singleton fields remain protected by their own duplicate checks.
+encoders. Peers using the projected APN profile should decode with
+`Message::decode_with_dictionary(..., DecodeContext::conservative(),
+apps::SWM_PROJECTED_PROFILE_DICTIONARIES)`. That explicit profile permits
+repeated `APN-Configuration` and `State` while retaining `DuplicateIe` for
+every singleton and duplicate unknown key. Baseline callers use
+`apps::APP_DICTIONARIES`, where APN-Configuration remains singleton. Never
+combine the baseline and projected SWm dictionaries: overlapping command
+grammars are rejected as ambiguous. Typed `set_once` checks remain defense in
+depth.
+
+`Dictionary::find_command` and `DictionarySet::find_command` now require an
+`ApplicationId` before command code and role. Update callers that previously
+looked up commands by code and role alone; wire encodings are unchanged.
 
 ## Roadmap
 
