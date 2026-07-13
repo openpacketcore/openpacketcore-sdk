@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,23 +11,32 @@ use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
 };
 use opc_key::{
-    KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing,
+    EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose,
+    MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider, Zeroizing,
     AES_256_GCM_SIV_KEY_LEN,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 
 use super::ConsensusSessionStore;
 use crate::backend::{
-    CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, SessionBackend,
+    CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend,
+    SessionBackend,
+};
+use crate::consensus::{
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
 };
 use crate::lease::SessionLeaseManager;
 use crate::model::{Generation, OwnerId, SessionKey, SessionKeyType, StateClass, StateType};
 use crate::record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
+use crate::restore::RestoreScanRequest;
 use crate::sqlite::SqliteSessionBackend;
 use crate::topology::{
-    QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, ValidatedQuorumTopology,
+    QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ValidatedQuorumTopology,
 };
+use opc_crypto::CryptoEnvelopeV1;
+use tempfile::TempDir;
 
 const ENCRYPTION_NAMESPACE: &str = "consensus-snapshot-boundary-qualification";
 const PLAINTEXT_BEFORE_ROTATION: &[u8] = b"snapshot-restart-plaintext-canary-before-key-rotation";
@@ -487,4 +497,531 @@ async fn actual_encryption_wrapper_survives_snapshot_restart_and_key_rotation() 
         .shutdown()
         .await
         .expect("shutdown restarted consensus node");
+}
+
+const REMOTE_ROTATION_MEMBER_COUNT: usize = 3;
+const REMOTE_ROTATION_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const REMOTE_ROTATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct RemoteRotationPeer {
+    target: SessionConsensusNodeId,
+    handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl RemoteRotationPeer {
+    fn new(target: SessionConsensusNodeId) -> Self {
+        Self {
+            target,
+            handler: Arc::new(tokio::sync::RwLock::new(None)),
+            enabled: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    async fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
+        *self.handler.write().await = Some(handler);
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+    }
+}
+
+impl fmt::Debug for RemoteRotationPeer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteRotationPeer")
+            .field("target", &self.target)
+            .field("enabled", &self.enabled.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl SessionConsensusPeer for RemoteRotationPeer {
+    fn node_id(&self) -> SessionConsensusNodeId {
+        self.target
+    }
+
+    async fn call(
+        &self,
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        let handler = self
+            .handler
+            .read()
+            .await
+            .clone()
+            .ok_or(SessionConsensusPeerError::Unavailable)?;
+        Ok(handler.handle(request.sender, request).await)
+    }
+}
+
+fn remote_rotation_replica_id(index: usize) -> ReplicaId {
+    ReplicaId::new(format!("remote-rotation-{index}")).expect("replica ID")
+}
+
+fn remote_rotation_member(index: usize) -> QuorumReplicaDescriptor {
+    QuorumReplicaDescriptor::new(
+        remote_rotation_replica_id(index),
+        ReplicaEndpoint::new(format!("remote-rotation-{index}.invalid"), 7443).expect("endpoint"),
+        ReplicaTlsIdentity::new(format!("spiffe://test/session/remote-rotation/{index}"))
+            .expect("TLS identity"),
+        ReplicaFailureDomain::new(format!("remote-rotation-zone-{index}")).expect("failure domain"),
+        ReplicaBackingIdentity::new(format!("remote-rotation-disk-{index}"))
+            .expect("backing identity"),
+    )
+}
+
+fn remote_rotation_identity(members: &[QuorumReplicaDescriptor]) -> ConsensusIdentity {
+    let cluster_id = ConsensusClusterId::new("session-remote-rotation-tests").expect("cluster ID");
+    let epoch = ConsensusConfigurationEpoch::new(1).expect("configuration epoch");
+    let fingerprints = members
+        .iter()
+        .map(QuorumReplicaDescriptor::configuration_fingerprint)
+        .collect::<Vec<_>>();
+    let configuration_id = derive_configuration_id(cluster_id, epoch, &fingerprints);
+    ConsensusIdentity::new(cluster_id, configuration_id, epoch)
+}
+
+struct RemoteRotationCluster {
+    directory: TempDir,
+    backends: Vec<SqliteSessionBackend>,
+    stores: Vec<ConsensusSessionStore>,
+    paths: BTreeMap<(usize, usize), Arc<RemoteRotationPeer>>,
+}
+
+impl RemoteRotationCluster {
+    async fn start() -> Self {
+        Self::open(tempfile::tempdir().expect("create remote rotation directory")).await
+    }
+
+    async fn open(directory: TempDir) -> Self {
+        let backends = (0..REMOTE_ROTATION_MEMBER_COUNT)
+            .map(|index| {
+                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
+                    .expect("open remote rotation SQLite node")
+            })
+            .collect::<Vec<_>>();
+        let members = (0..REMOTE_ROTATION_MEMBER_COUNT)
+            .map(remote_rotation_member)
+            .collect::<Vec<_>>();
+        let identity = remote_rotation_identity(&members);
+        let topologies = (0..REMOTE_ROTATION_MEMBER_COUNT)
+            .map(|index| {
+                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                    remote_rotation_replica_id(index),
+                    members.clone(),
+                    identity,
+                ))
+                .expect("validate remote rotation topology")
+            })
+            .collect::<Vec<_>>();
+        let node_ids = topologies
+            .iter()
+            .map(|topology| {
+                topology
+                    .local_consensus_node_id()
+                    .expect("consensus node ID")
+            })
+            .collect::<Vec<_>>();
+
+        let mut paths = BTreeMap::new();
+        for source in 0..REMOTE_ROTATION_MEMBER_COUNT {
+            for (target, node_id) in node_ids.iter().copied().enumerate() {
+                if source != target {
+                    paths.insert((source, target), Arc::new(RemoteRotationPeer::new(node_id)));
+                }
+            }
+        }
+
+        let mut stores = Vec::with_capacity(REMOTE_ROTATION_MEMBER_COUNT);
+        for index in 0..REMOTE_ROTATION_MEMBER_COUNT {
+            let peers = (0..REMOTE_ROTATION_MEMBER_COUNT)
+                .filter(|target| *target != index)
+                .map(|target| {
+                    let peer: Arc<dyn SessionConsensusPeer> =
+                        paths.get(&(index, target)).expect("loopback path").clone();
+                    (node_ids[target], peer)
+                })
+                .collect::<BTreeMap<_, _>>();
+            let store = ConsensusSessionStore::open(
+                topologies[index].clone(),
+                backends[index].clone(),
+                directory.path().join(format!("snapshots-{index}")),
+                peers,
+            )
+            .await
+            .expect("open remote rotation consensus node");
+            stores.push(store);
+        }
+
+        for ((_, target), path) in &paths {
+            path.install(stores[*target].rpc_handler()).await;
+        }
+        let results = futures_util::future::join_all(
+            stores.iter().map(ConsensusSessionStore::initialize_cluster),
+        )
+        .await;
+        for result in results {
+            result.expect("initialize remote rotation membership");
+        }
+
+        let cluster = Self {
+            directory,
+            backends,
+            stores,
+            paths,
+        };
+        cluster.wait_all_ready().await;
+        cluster
+    }
+
+    async fn wait_all_ready(&self) {
+        tokio::time::timeout(REMOTE_ROTATION_TIMEOUT, async {
+            loop {
+                let reports = futures_util::future::join_all(
+                    self.stores
+                        .iter()
+                        .map(ConsensusSessionStore::probe_durable_readiness),
+                )
+                .await;
+                if reports.iter().all(|report| report.is_ready()) {
+                    return;
+                }
+                tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("remote rotation cluster reaches readiness");
+    }
+
+    async fn wait_surviving_majority_ready(&self) {
+        tokio::time::timeout(REMOTE_ROTATION_TIMEOUT, async {
+            loop {
+                let reports = futures_util::future::join_all(
+                    self.stores[1..]
+                        .iter()
+                        .map(ConsensusSessionStore::probe_durable_readiness),
+                )
+                .await;
+                if reports.iter().all(|report| report.is_ready()) {
+                    return;
+                }
+                tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("surviving remote rotation majority reaches readiness");
+    }
+
+    fn isolate(&self, node: usize) {
+        for peer in 0..REMOTE_ROTATION_MEMBER_COUNT {
+            if peer != node {
+                self.paths
+                    .get(&(node, peer))
+                    .expect("outbound path")
+                    .set_enabled(false);
+                self.paths
+                    .get(&(peer, node))
+                    .expect("inbound path")
+                    .set_enabled(false);
+            }
+        }
+    }
+
+    fn heal(&self, node: usize) {
+        for peer in 0..REMOTE_ROTATION_MEMBER_COUNT {
+            if peer != node {
+                self.paths
+                    .get(&(node, peer))
+                    .expect("outbound path")
+                    .set_enabled(true);
+                self.paths
+                    .get(&(peer, node))
+                    .expect("inbound path")
+                    .set_enabled(true);
+            }
+        }
+    }
+
+    async fn snapshot_surviving_majority(&self, lagging_applied: u64) {
+        for store in &self.stores[1..] {
+            let applied = store
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_applied
+                .expect("applied log before snapshot");
+            store
+                .inner
+                .raft
+                .trigger()
+                .snapshot()
+                .await
+                .expect("trigger remote rotation snapshot");
+            store
+                .inner
+                .raft
+                .wait(Some(Duration::from_secs(10)))
+                .snapshot(applied, "remote rotation snapshot")
+                .await
+                .expect("remote rotation snapshot completes");
+            store
+                .inner
+                .raft
+                .trigger()
+                .purge_log(applied.index)
+                .await
+                .expect("purge logs covered by remote rotation snapshot");
+        }
+
+        tokio::time::timeout(REMOTE_ROTATION_TIMEOUT, async {
+            loop {
+                let compacted = self.stores[1..].iter().all(|store| {
+                    let metrics = store.inner.raft.metrics();
+                    let metrics = metrics.borrow();
+                    metrics
+                        .purged
+                        .is_some_and(|log_id| log_id.index > lagging_applied)
+                        && metrics.snapshot.is_some()
+                });
+                if compacted {
+                    return;
+                }
+                tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("surviving majority compacts beyond isolated follower");
+    }
+
+    async fn shutdown_and_restart(self) -> Self {
+        let results = futures_util::future::join_all(
+            self.stores.iter().map(|store| store.inner.raft.shutdown()),
+        )
+        .await;
+        for result in results {
+            result.expect("shut down remote rotation member");
+        }
+        let Self {
+            directory,
+            backends,
+            stores,
+            paths,
+        } = self;
+        drop(paths);
+        drop(stores);
+        drop(backends);
+        Self::open(directory).await
+    }
+
+    async fn shutdown(&self) {
+        let results = futures_util::future::join_all(
+            self.stores.iter().map(|store| store.inner.raft.shutdown()),
+        )
+        .await;
+        assert!(results.into_iter().all(|result| result.is_ok()));
+    }
+}
+
+struct CountingRemoteSealProvider {
+    inner: Arc<MemoryRemoteSealProvider>,
+    seal_calls: AtomicUsize,
+    unseal_calls: AtomicUsize,
+}
+
+impl CountingRemoteSealProvider {
+    fn new(inner: Arc<MemoryRemoteSealProvider>) -> Self {
+        Self {
+            inner,
+            seal_calls: AtomicUsize::new(0),
+            unseal_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_counts(&self) -> (usize, usize) {
+        (
+            self.seal_calls.load(Ordering::SeqCst),
+            self.unseal_calls.load(Ordering::SeqCst),
+        )
+    }
+}
+
+#[async_trait]
+impl RemoteSealProvider for CountingRemoteSealProvider {
+    async fn seal(
+        &self,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        self.seal_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.seal(aad, plaintext).await
+    }
+
+    async fn unseal(
+        &self,
+        key_id: &KeyId,
+        aad: &EnvelopeAad,
+        ciphertext_and_tag: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        self.unseal_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.unseal(key_id, aad, ciphertext_and_tag).await
+    }
+}
+
+#[tokio::test]
+async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart() {
+    let cluster = RemoteRotationCluster::start().await;
+    let lagging_applied = cluster.stores[0]
+        .inner
+        .raft
+        .metrics()
+        .borrow()
+        .last_applied
+        .expect("initial follower applied log")
+        .index;
+    cluster.isolate(0);
+    cluster.wait_surviving_majority_ready().await;
+
+    let material = Arc::new(MemoryRemoteSealProvider::new(
+        KeyId::new("consensus-remote-key-2026-01").expect("key ID"),
+        KeyPurpose::Session,
+        tenant(),
+        Zeroizing::new(*RAW_KEY_MATERIAL),
+    ));
+    let provider = Arc::new(CountingRemoteSealProvider::new(Arc::clone(&material)));
+    let writer = RemoteSealingSessionBackend::new(
+        Arc::new(cluster.stores[1].clone()),
+        Arc::clone(&provider),
+        ENCRYPTION_NAMESPACE,
+    );
+
+    let before_key = key(b"remote-before-rotation");
+    let before_lease = writer
+        .acquire(
+            &before_key,
+            OwnerId::new("remote-owner-before").expect("owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("pre-rotation lease");
+    assert_eq!(
+        writer
+            .compare_and_set(CompareAndSet {
+                key: before_key.clone(),
+                lease: before_lease.clone(),
+                expected_generation: None,
+                new_record: record(before_key.clone(), &before_lease, PLAINTEXT_BEFORE_ROTATION,),
+            })
+            .await
+            .expect("pre-rotation remote seal"),
+        CompareAndSetResult::Success
+    );
+    let old_key_id = material.active_key_id().await.expect("old key ID");
+
+    let new_key_id = material.rotate_key().await.expect("rotate remote seal key");
+    let after_key = key(b"remote-after-rotation");
+    let after_lease = writer
+        .acquire(
+            &after_key,
+            OwnerId::new("remote-owner-after").expect("owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("post-rotation lease");
+    assert_eq!(
+        writer
+            .compare_and_set(CompareAndSet {
+                key: after_key.clone(),
+                lease: after_lease.clone(),
+                expected_generation: None,
+                new_record: record(after_key.clone(), &after_lease, PLAINTEXT_AFTER_ROTATION,),
+            })
+            .await
+            .expect("post-rotation remote seal"),
+        CompareAndSetResult::Success
+    );
+    assert_ne!(old_key_id, new_key_id);
+    assert_eq!(provider.call_counts(), (2, 0));
+
+    cluster.snapshot_surviving_majority(lagging_applied).await;
+    assert_eq!(
+        provider.call_counts(),
+        (2, 0),
+        "replication or snapshot construction called remote provider"
+    );
+
+    cluster.heal(0);
+    cluster.wait_all_ready().await;
+    let recovered_metrics = cluster.stores[0].inner.raft.metrics();
+    let recovered_metrics = recovered_metrics.borrow();
+    assert!(recovered_metrics
+        .snapshot
+        .is_some_and(|log_id| log_id.index > lagging_applied));
+    assert!(recovered_metrics
+        .last_applied
+        .is_some_and(|log_id| log_id.index > lagging_applied));
+    drop(recovered_metrics);
+    for (session_key, expected_key_id, plaintext) in [
+        (&before_key, &old_key_id, PLAINTEXT_BEFORE_ROTATION),
+        (&after_key, &new_key_id, PLAINTEXT_AFTER_ROTATION),
+    ] {
+        let raw = cluster.stores[0]
+            .get(session_key)
+            .await
+            .expect("raw read after snapshot install")
+            .expect("snapshot-installed record");
+        let envelope = CryptoEnvelopeV1::decode(raw.payload.as_bytes()).expect("envelope");
+        assert_eq!(&envelope.key_id, expected_key_id);
+        assert!(!contains_bytes(raw.payload.as_bytes(), plaintext));
+    }
+    assert_eq!(
+        provider.call_counts(),
+        (2, 0),
+        "snapshot install or raw consensus read called remote provider"
+    );
+    assert_file_tree_is_sealed(cluster.directory.path());
+
+    drop(writer);
+    let cluster = cluster.shutdown_and_restart().await;
+    assert_eq!(
+        provider.call_counts(),
+        (2, 0),
+        "shutdown, replay, quorum formation, or recovery called remote provider"
+    );
+    let reader = RemoteSealingSessionBackend::new(
+        Arc::new(cluster.stores[1].clone()),
+        Arc::clone(&provider),
+        ENCRYPTION_NAMESPACE,
+    );
+    let restored = reader
+        .scan_restore_records(RestoreScanRequest::all(16))
+        .await
+        .expect("restore both remote key epochs");
+    assert_eq!(restored.loaded_count, 2);
+    for (session_key, expected) in [
+        (&before_key, PLAINTEXT_BEFORE_ROTATION),
+        (&after_key, PLAINTEXT_AFTER_ROTATION),
+    ] {
+        let restored_record = restored
+            .records
+            .iter()
+            .find(|record| &record.key == session_key)
+            .expect("restored material epoch");
+        assert_eq!(restored_record.payload.as_bytes(), expected);
+    }
+    assert_eq!(
+        provider.call_counts(),
+        (2, 2),
+        "only outer restore unseal may call remote provider"
+    );
+
+    drop(reader);
+    cluster.shutdown().await;
 }

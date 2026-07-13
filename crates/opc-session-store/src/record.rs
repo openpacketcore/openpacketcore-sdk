@@ -438,7 +438,7 @@ impl EncryptedSessionPayload {
         }
 
         provider
-            .unseal(&aad, &envelope.ciphertext_and_tag)
+            .unseal(&envelope.key_id, &aad, &envelope.ciphertext_and_tag)
             .await
             .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into()))
     }

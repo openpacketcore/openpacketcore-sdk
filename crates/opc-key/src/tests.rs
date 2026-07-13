@@ -191,13 +191,14 @@ async fn memory_remote_seal_provider_round_trips_and_binds_aad() {
 
     let sealed = provider.seal(&aad, plaintext).await.expect("seal");
     assert_ne!(sealed.ciphertext_and_tag, plaintext);
+    let sealed_key_id = key_id_from_bound_aad(&sealed.aad).expect("key id");
     assert_eq!(
-        key_id_from_bound_aad(&sealed.aad).expect("key id"),
-        provider.key_id().clone()
+        sealed_key_id,
+        provider.active_key_id().await.expect("active key ID")
     );
 
     let opened = provider
-        .unseal(&aad, &sealed.ciphertext_and_tag)
+        .unseal(&sealed_key_id, &aad, &sealed.ciphertext_and_tag)
         .await
         .expect("unseal");
     assert_eq!(opened.as_slice(), plaintext);
@@ -217,10 +218,57 @@ async fn memory_remote_seal_provider_round_trips_and_binds_aad() {
     );
     assert_eq!(
         provider
-            .unseal(&wrong_aad, &sealed.ciphertext_and_tag)
+            .unseal(&sealed_key_id, &wrong_aad, &sealed.ciphertext_and_tag)
             .await
             .expect_err("wrong aad must fail"),
         KeyError::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn memory_remote_seal_rotation_reads_both_material_epochs() {
+    let provider = MemoryRemoteSealProvider::new(
+        KeyId::new("session-remote-2026-01").expect("key id"),
+        KeyPurpose::Session,
+        tenant(),
+        Zeroizing::new([0x52; AES_256_GCM_SIV_KEY_LEN]),
+    );
+    let aad = session_aad();
+
+    let before = provider.seal(&aad, b"before rotation").await.expect("seal");
+    let before_key = key_id_from_bound_aad(&before.aad).expect("historical key ID");
+    let after_key = provider.rotate_key().await.expect("rotate remote test key");
+    let after = provider.seal(&aad, b"after rotation").await.expect("seal");
+    assert_eq!(
+        key_id_from_bound_aad(&after.aad).expect("active key ID"),
+        after_key
+    );
+    assert_ne!(before_key, after_key);
+
+    assert_eq!(
+        provider
+            .unseal(&before_key, &aad, &before.ciphertext_and_tag)
+            .await
+            .expect("historical unseal")
+            .as_slice(),
+        b"before rotation"
+    );
+    assert_eq!(
+        provider
+            .unseal(&after_key, &aad, &after.ciphertext_and_tag)
+            .await
+            .expect("active unseal")
+            .as_slice(),
+        b"after rotation"
+    );
+
+    let unknown = KeyId::new("session-remote-unknown").expect("key ID");
+    assert_eq!(
+        provider
+            .unseal(&unknown, &aad, &before.ciphertext_and_tag)
+            .await
+            .expect_err("unknown historical key must fail closed"),
+        KeyError::NotFound
     );
 }
 

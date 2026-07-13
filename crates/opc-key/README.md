@@ -18,11 +18,20 @@ providers.
 - `MemoryKeyProvider` is the in-process provider for tests and local fixtures.
 - `KmsKeyProvider` talks to a Unix-socket or TLS/TCP JSON KMS endpoint using
   length-prefixed requests.
+- `RemoteSealProvider` delegates encryption to KMS/HKMS and receives the
+  validated envelope key ID on unseal so historical reads never substitute the
+  current active key.
+- `RemoteSealMaterialController` atomically publishes an active remote key and
+  an opaque, constant-space process-local epoch. An in-flight seal keeps the
+  snapshot it began with. Cloned controllers share state only within one
+  process; the controller is not a cross-pod coordinator, watcher, or durable
+  epoch source.
 - `KeyPurpose` separates lanes such as `Config`, `Session`,
   `ShadowSecurity`, `IpsecSa`, `Audit`, and `Backup`.
 - `EnvelopeAad`, `ConfigAad`, `SessionAad`, and `ShadowSecurityAad` build
   structured authenticated data.
-- `AeadAlgorithm` currently exposes `Aes256GcmSiv`.
+- `AeadAlgorithm` exposes local `Aes256GcmSiv` and server-side `RemoteSeal`
+  envelope modes.
 
 ```rust,no_run
 use opc_key::{EnvelopeAad, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, SessionAad, Zeroizing};
@@ -72,6 +81,17 @@ async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 - `KmsKeyProvider` redacts errors and requires TLS for TCP endpoints. Unix
   sockets are accepted for local KMS deployments.
 - Rotation keeps historical keys addressable by key ID.
+- `KmsRemoteSealProvider` keeps no local historical-key or authorization cache.
+  Every unseal calls KMS/HKMS with the exact validated envelope key ID. KMS/HKMS
+  owns retention and revocation; the SDK provides no retirement API or
+  enforcement gate and cannot prevent an external retirement.
+- `RemoteSealProvider::unseal` now takes `&KeyId`. Custom provider
+  implementations and callers must upgrade together before publishing a new
+  active ID. `KmsRemoteSealProvider::key_id()` is replaced by
+  `material_controller()`, `publish_active_key()`, and `material_epoch()`;
+  `MemoryRemoteSealProvider::key_id()` is replaced by async
+  `active_key_id()`. Durable envelopes and KMS framing/schema are unchanged;
+  decrypt request contents now select the historical envelope ID.
 - `SessionAad` rejects NUL-containing fields; config AAD rejects blank principal
   and store kind values.
 

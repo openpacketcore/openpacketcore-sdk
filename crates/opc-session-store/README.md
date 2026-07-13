@@ -525,10 +525,12 @@ visible to the host storage boundary. Products requiring metadata or full-file
 encryption must add an approved volume/database layer without moving HKMS into
 the deterministic state machine. Qualification tests assert plaintext canaries
 are absent from Raft logs, state/outcome tables, WAL/SHM files, captured
-consensus frames, and snapshots, and that restart plus active-key rotation
-with retained historical local keys preserves decryptability. Seamless
-remote-seal historical-key selection is tracked by #179 and remains required
-before remote-seal rotation can be claimed.
+consensus frames, and snapshots. Local and remote-seal qualification covers
+restart plus active-key rotation with historical decryptability. Remote unseal
+receives the exact validated envelope key ID, while one current provider
+configuration atomically selects the active key only for future seals. The
+KMS/HKMS remains authoritative for historical retention/revocation; the SDK has
+no local history cache, retirement API, or enforcement gate.
 
 ### TTL input contract
 
@@ -649,10 +651,10 @@ rebuild does not add protection.
 
 This closes #147's nested-wrapper traversal gap only. Durable sequencing now
 uses Openraft under #127, but the networked profile remains experimental until
-the remaining qualification gates pass. Seamless SVID/trust-bundle lifecycle remains #158;
-remote-seal historical-key rotation remains #179, while distributed
-payload-protection qualification remains #143. These are separate mandatory
-gates, and the operation-tree limits do not provide rotation evidence.
+the remaining qualification gates pass. Seamless SVID/trust-bundle lifecycle
+remains #158, while distributed payload-protection qualification remains #143.
+These are separate mandatory gates, and the operation-tree limits do not
+provide rotation evidence.
 
 The outbound bound does not make backend effects transactional with response
 delivery. A compare-and-set, batch slot, lease operation, replicated append, or
@@ -775,8 +777,11 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   and wrong-scope rejection have scoped real-mTLS coverage; seamless connection
   retirement and the broader certificate/trust, revocation,
   authentication-age, multi-process, and soak work remains open under #158;
-  remote-seal historical-key rotation is #179, and distributed
-  payload-protection evidence remains #143.
+  distributed payload-protection evidence remains #143. Remote-seal historical
+  selection is implemented; old-key retirement remains KMS/operator-owned and
+  requires external proof across live state and every retained artifact. The
+  SDK supplies exact key selection and bounded live-state scans, but no rewrap
+  campaign or retirement gate.
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,
   fence, and session-key digest.
 
@@ -804,7 +809,12 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 - Encryption and remote-sealing suites cover deep nested-CAS replicate,
   rebuild, log, and watch round trips; depth/count boundaries; no plaintext or
   protected-byte exposure; and late-provider failure without backend
-  delegation or partial entry/page exposure.
+  delegation or partial entry/page exposure. They also cover one-provider
+  old/new remote-key reads, in-flight active publication, cross-tenant/AAD
+  rejection before provider I/O, redacted KMS failure, and a scoped three-node
+  in-process Openraft snapshot-install/shutdown/restart restore with actual
+  file-backed nodes, controllable RPC, and explicit provider-call counts. This
+  is not multi-process or deployed-network qualification.
 - `tests/persisted_identity_bounds.rs`, `tests/sqlite_identity_audit.rs`, and
   `tests/sqlite_identity_audit_cli.rs` cover valid legacy hydration, hostile
   owner/key identities across SQLite and nested logs, no-effect rejection,

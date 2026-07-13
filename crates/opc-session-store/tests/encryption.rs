@@ -434,13 +434,14 @@ impl RemoteSealProvider for FailOnCallRemoteSealProvider {
 
     async fn unseal(
         &self,
+        key_id: &KeyId,
         aad: &EnvelopeAad,
         ciphertext_and_tag: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
         if self.fail_this_call() {
             return Err(KeyError::Unavailable);
         }
-        self.inner.unseal(aad, ciphertext_and_tag).await
+        self.inner.unseal(key_id, aad, ciphertext_and_tag).await
     }
 }
 
@@ -1046,11 +1047,12 @@ impl RemoteSealProvider for CountingRemoteSealProvider {
 
     async fn unseal(
         &self,
+        key_id: &KeyId,
         aad: &EnvelopeAad,
         ciphertext_and_tag: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.unseal(aad, ciphertext_and_tag).await
+        self.inner.unseal(key_id, aad, ciphertext_and_tag).await
     }
 }
 
@@ -1376,6 +1378,211 @@ async fn remote_sealing_session_backend_round_trips_compare_and_set_get_and_batc
         .expect("restore scan");
     assert_eq!(scan_page.loaded_count, 1);
     assert_eq!(scan_page.records[0].payload.as_bytes(), &batch_payload);
+}
+
+#[tokio::test]
+async fn remote_sealing_session_backend_reads_before_and_after_rotation() {
+    let inner = Arc::new(FakeSessionBackend::new());
+    let provider = test_remote_seal_provider();
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "regional-cache-a",
+    );
+    let before_key = test_key();
+    let after_key = SessionKey {
+        stable_id: Bytes::from_static(b"after-rotation")
+            .try_into()
+            .expect("valid stable ID"),
+        ..before_key.clone()
+    };
+
+    let before_lease = backend
+        .acquire(
+            &before_key,
+            OwnerId::new("owner-before").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("pre-rotation lease");
+    backend
+        .compare_and_set(CompareAndSet {
+            key: before_key.clone(),
+            lease: before_lease.clone(),
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                payload: EncryptedSessionPayload::new(b"before rotation"),
+                ..test_record(before_key.clone(), 1, &before_lease)
+            },
+        })
+        .await
+        .expect("pre-rotation write");
+
+    let old_key_id = provider.active_key_id().await.expect("old key ID");
+    let new_key_id = provider.rotate_key().await.expect("rotate remote key");
+    assert_ne!(old_key_id, new_key_id);
+
+    let after_lease = backend
+        .acquire(
+            &after_key,
+            OwnerId::new("owner-after").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("post-rotation lease");
+    backend
+        .compare_and_set(CompareAndSet {
+            key: after_key.clone(),
+            lease: after_lease.clone(),
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                payload: EncryptedSessionPayload::new(b"after rotation"),
+                ..test_record(after_key.clone(), 1, &after_lease)
+            },
+        })
+        .await
+        .expect("post-rotation write");
+
+    for (key, expected) in [
+        (&before_key, b"before rotation".as_slice()),
+        (&after_key, b"after rotation".as_slice()),
+    ] {
+        let restored = backend
+            .get(key)
+            .await
+            .expect("current provider read")
+            .expect("stored record");
+        assert_eq!(restored.payload.as_bytes(), expected);
+    }
+
+    let before_envelope = CryptoEnvelopeV1::decode(
+        inner
+            .get(&before_key)
+            .await
+            .expect("raw read")
+            .expect("raw before record")
+            .payload
+            .as_bytes(),
+    )
+    .expect("before envelope");
+    let after_envelope = CryptoEnvelopeV1::decode(
+        inner
+            .get(&after_key)
+            .await
+            .expect("raw read")
+            .expect("raw after record")
+            .payload
+            .as_bytes(),
+    )
+    .expect("after envelope");
+    assert_eq!(before_envelope.key_id, old_key_id);
+    assert_eq!(after_envelope.key_id, new_key_id);
+}
+
+#[tokio::test]
+async fn remote_historical_lookup_validates_scope_before_provider_and_redacts_failure() {
+    let inner = Arc::new(FakeSessionBackend::new());
+    let provider = test_remote_seal_provider();
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "regional-cache-a",
+    );
+    let key = test_key();
+    let lease = backend
+        .acquire(
+            &key,
+            OwnerId::new("historical-owner").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+    backend
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: test_record(key.clone(), 1, &lease),
+        })
+        .await
+        .expect("seed remote envelope");
+    let raw = inner.get(&key).await.expect("raw read").expect("record");
+
+    let counting = CountingRemoteSealProvider::new(Arc::clone(&provider));
+    let mut oversized_key_envelope = raw.payload.as_bytes().to_vec();
+    let original_key_len = usize::from(u16::from_be_bytes([
+        oversized_key_envelope[8],
+        oversized_key_envelope[9],
+    ]));
+    let oversized_key_id = vec![b'k'; 513];
+    oversized_key_envelope[8..10].copy_from_slice(&513_u16.to_be_bytes());
+    oversized_key_envelope.splice(16..16 + original_key_len, oversized_key_id);
+    let malformed = EncryptedSessionPayload::try_envelope(oversized_key_envelope)
+        .expect_err("oversized historical key ID must fail canonical decode");
+    assert!(matches!(malformed, StoreError::Crypto(_)));
+    assert_eq!(counting.calls(), 0, "malformed key ID reached provider");
+
+    let wrong_tenant_key = SessionKey {
+        tenant: TenantId::new("tenant-b-sensitive").expect("tenant"),
+        ..key.clone()
+    };
+    let wrong_tenant = raw
+        .payload
+        .remote_unseal(
+            &counting,
+            &wrong_tenant_key,
+            &raw.state_type,
+            raw.generation,
+            raw.fence,
+            "regional-cache-a",
+        )
+        .await
+        .expect_err("cross-tenant envelope use must fail");
+    assert_eq!(counting.calls(), 0, "wrong tenant reached provider");
+
+    let wrong_aad = raw
+        .payload
+        .remote_unseal(
+            &counting,
+            &key,
+            &raw.state_type,
+            raw.generation,
+            raw.fence,
+            "wrong-sensitive-namespace",
+        )
+        .await
+        .expect_err("wrong AAD must fail");
+    assert_eq!(counting.calls(), 0, "wrong AAD reached provider");
+
+    let missing_provider = Arc::new(MemoryRemoteSealProvider::new(
+        KeyId::new("unknown-historical-sensitive-id").expect("key ID"),
+        KeyPurpose::Session,
+        tenant(),
+        Zeroizing::new([0x91; AES_256_GCM_SIV_KEY_LEN]),
+    ));
+    let missing_reader =
+        RemoteSealingSessionBackend::new(Arc::clone(&inner), missing_provider, "regional-cache-a");
+    let unknown = missing_reader
+        .get(&key)
+        .await
+        .expect_err("unknown historical key must fail closed");
+
+    for error in [wrong_tenant, wrong_aad, unknown] {
+        assert_eq!(
+            error,
+            StoreError::Crypto("session envelope decryption failed".into())
+        );
+        let rendered = format!("{error} {error:?}");
+        for secret in [
+            "session-remote-2026-01",
+            "tenant-b-sensitive",
+            "wrong-sensitive-namespace",
+            "unknown-historical-sensitive-id",
+            "plain-session",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
 }
 
 #[tokio::test]

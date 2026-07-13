@@ -6,7 +6,7 @@ use zeroize::Zeroizing;
 use crate::{
     errors::KeyError,
     provider::{EncryptedPayload, KeyHandle, KeyProvider},
-    remote::RemoteSealProvider,
+    remote::{RemoteSealMaterialController, RemoteSealMaterialEpoch, RemoteSealProvider},
     scope::{serialize_bound_aad, EnvelopeAad, KeyId, KeyPurpose},
 };
 
@@ -124,7 +124,16 @@ pub struct KmsRemoteSealProvider {
     connector: Option<tokio_rustls::TlsConnector>,
     server_name: String,
     timeout: std::time::Duration,
-    key_id: KeyId,
+    material: RemoteSealMaterialController,
+}
+
+impl std::fmt::Debug for KmsRemoteSealProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KmsRemoteSealProvider")
+            .field("material_epoch", &self.material.epoch().ok())
+            .finish_non_exhaustive()
+    }
 }
 
 impl KmsKeyProvider {
@@ -307,7 +316,7 @@ impl KmsRemoteSealProvider {
     /// Default TLS server name used when `endpoint` is a TCP address.
     pub const DEFAULT_SERVER_NAME: &'static str = KmsKeyProvider::DEFAULT_SERVER_NAME;
 
-    /// Create a remote-seal KMS client for one remote key id.
+    /// Create a remote-seal KMS client with an initial active remote key ID.
     ///
     /// The external service is expected to perform AEAD/KMS Encrypt and
     /// Decrypt server-side. The SDK sends the same serialized bound AAD bytes
@@ -324,7 +333,7 @@ impl KmsRemoteSealProvider {
             connector,
             server_name: Self::DEFAULT_SERVER_NAME.to_string(),
             timeout,
-            key_id,
+            material: RemoteSealMaterialController::new(key_id),
         }
     }
 
@@ -333,8 +342,23 @@ impl KmsRemoteSealProvider {
         self
     }
 
-    pub fn key_id(&self) -> &KeyId {
-        &self.key_id
+    /// Shared coherent material controller used by this provider.
+    ///
+    /// Clones of the returned controller publish into this provider's same
+    /// process-local state. Publishing affects future seal requests only;
+    /// unseal always selects the envelope key ID.
+    pub fn material_controller(&self) -> RemoteSealMaterialController {
+        self.material.clone()
+    }
+
+    /// Atomically select a new key for future seal operations.
+    pub fn publish_active_key(&self, key_id: KeyId) -> Result<RemoteSealMaterialEpoch, KeyError> {
+        self.material.publish_active_key(key_id)
+    }
+
+    /// Current redaction-safe process-local material epoch.
+    pub fn material_epoch(&self) -> Result<RemoteSealMaterialEpoch, KeyError> {
+        self.material.epoch()
     }
 
     async fn call_kms(&self, req: KmsRequest) -> Result<KmsResponse, KeyError> {
@@ -423,12 +447,13 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
         aad: &EnvelopeAad,
         plaintext: &[u8],
     ) -> Result<EncryptedPayload, KeyError> {
-        let bound_aad = serialize_bound_aad(aad, &self.key_id)?;
+        let (_epoch, key_id) = self.material.active_selection()?;
+        let bound_aad = serialize_bound_aad(aad, &key_id)?;
         let req = KmsRequest {
             request_type: "encrypt".to_string(),
             purpose: Some(aad.purpose().as_str().to_string()),
             tenant: Some(aad.tenant().as_str().to_string()),
-            key_id: Some(self.key_id.as_str().to_string()),
+            key_id: Some(key_id.as_str().to_string()),
             aad_hex: Some(encode_hex(&bound_aad)),
             plaintext_hex: Some(encode_hex(plaintext)),
             ciphertext_and_tag_hex: None,
@@ -445,15 +470,16 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
 
     async fn unseal(
         &self,
+        key_id: &KeyId,
         aad: &EnvelopeAad,
         ciphertext_and_tag: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
-        let bound_aad = serialize_bound_aad(aad, &self.key_id)?;
+        let bound_aad = serialize_bound_aad(aad, key_id)?;
         let req = KmsRequest {
             request_type: "decrypt".to_string(),
             purpose: Some(aad.purpose().as_str().to_string()),
             tenant: Some(aad.tenant().as_str().to_string()),
-            key_id: Some(self.key_id.as_str().to_string()),
+            key_id: Some(key_id.as_str().to_string()),
             aad_hex: Some(encode_hex(&bound_aad)),
             plaintext_hex: None,
             ciphertext_and_tag_hex: Some(encode_hex(ciphertext_and_tag)),
@@ -470,10 +496,18 @@ mod tests {
     use crate::provider::AES_256_GCM_SIV_KEY_LEN;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn next_mock_socket_path() -> PathBuf {
+        let unique = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        // `sockaddr_un::sun_path` is short on supported Unix targets. A
+        // fixed-width PID/counter basename stays unique within the test
+        // process without consuming the budget with timestamps or labels.
+        std::env::temp_dir().join(format!("ok-{:08x}-{unique:016x}.s", std::process::id()))
+    }
 
     enum MockResponse {
         Bytes(Vec<u8>),
@@ -501,15 +535,7 @@ mod tests {
     async fn mock_kms_recording(
         response: MockResponse,
     ) -> (MockKms, tokio::sync::oneshot::Receiver<KmsRequest>) {
-        let unique = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let path = std::env::temp_dir().join(format!(
-            "opc-key-kms-{}-{nanos}-{unique}.sock",
-            std::process::id()
-        ));
+        let path = next_mock_socket_path();
         let _ = std::fs::remove_file(&path);
         let listener = tokio::net::UnixListener::bind(&path).expect("bind mock KMS socket");
         let task_path = path.clone();
@@ -561,6 +587,69 @@ mod tests {
             handle,
         };
         (mock, request_rx)
+    }
+
+    async fn two_request_gated_kms(
+        response_body: Vec<u8>,
+    ) -> (
+        MockKms,
+        tokio::sync::mpsc::Receiver<KmsRequest>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let path = next_mock_socket_path();
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind gated KMS socket");
+        let task_path = path.clone();
+        let (request_tx, request_rx) = tokio::sync::mpsc::channel(2);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let mut release_rx = Some(release_rx);
+            for request_index in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept KMS client");
+                let mut len_buf = [0u8; 4];
+                stream
+                    .read_exact(&mut len_buf)
+                    .await
+                    .expect("read request length");
+                let request_len = u32::from_be_bytes(len_buf) as usize;
+                let mut request = vec![0u8; request_len];
+                stream
+                    .read_exact(&mut request)
+                    .await
+                    .expect("read request body");
+                let request: KmsRequest =
+                    serde_json::from_slice(&request).expect("decode KMS request");
+                request_tx.send(request).await.expect("capture KMS request");
+
+                if request_index == 0 {
+                    release_rx
+                        .take()
+                        .expect("first request release")
+                        .await
+                        .expect("release first KMS response");
+                }
+                let len = u32::try_from(response_body.len()).expect("response length");
+                stream
+                    .write_all(&len.to_be_bytes())
+                    .await
+                    .expect("write response length");
+                stream
+                    .write_all(&response_body)
+                    .await
+                    .expect("write response body");
+            }
+            let _ = std::fs::remove_file(task_path);
+        });
+
+        (
+            MockKms {
+                endpoint: path.to_string_lossy().into_owned(),
+                path,
+                handle,
+            },
+            request_rx,
+            release_tx,
+        )
     }
 
     fn tenant() -> TenantId {
@@ -797,17 +886,151 @@ mod tests {
             key_id.clone(),
         );
         let aad = session_aad();
+        let historical_bound_aad =
+            serialize_bound_aad(&aad, &key_id).expect("historical bound AAD");
+        let next_key_id = KeyId::new("session-remote-2026-02").expect("next key id");
+        assert_eq!(
+            provider
+                .publish_active_key(next_key_id)
+                .expect("publish active key")
+                .get(),
+            2
+        );
 
-        let plaintext = provider.unseal(&aad, ciphertext).await.expect("kms unseal");
+        let plaintext = provider
+            .unseal(&key_id, &aad, ciphertext)
+            .await
+            .expect("kms unseal");
 
         assert_eq!(plaintext.as_slice(), b"plain-session");
         let request = request_rx.await.expect("request captured");
         assert_eq!(request.request_type, "decrypt");
         assert_eq!(request.key_id.as_deref(), Some(key_id.as_str()));
         assert_eq!(
+            request.aad_hex.as_deref(),
+            Some(encode_hex(&historical_bound_aad).as_str())
+        );
+        assert_eq!(
             request.ciphertext_and_tag_hex.as_deref(),
             Some(encode_hex(ciphertext).as_str())
         );
         assert!(request.plaintext_hex.is_none());
+    }
+
+    #[tokio::test]
+    async fn kms_remote_seal_failure_redacts_remote_context() {
+        let key_id = KeyId::new("session-remote-sensitive-key").expect("key id");
+        let payload_canary = "subscriber-payload-canary";
+        let response = serde_json::json!({
+            "status": "error",
+            "error_message": format!(
+                "not found: key={} tenant=tenant-a endpoint=provider.internal payload={payload_canary}",
+                key_id.as_str()
+            ),
+        })
+        .to_string()
+        .into_bytes();
+        let mock = mock_kms(MockResponse::Bytes(response)).await;
+        let provider = KmsRemoteSealProvider::new(
+            mock.endpoint.clone(),
+            None,
+            Duration::from_secs(1),
+            key_id.clone(),
+        );
+
+        let error = provider
+            .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+            .await
+            .expect_err("remote failure must fail closed");
+        assert_eq!(error, KeyError::NotFound);
+        let rendered = format!("{error} {error:?} {provider:?}");
+        for secret in [
+            key_id.as_str(),
+            "tenant-a",
+            "provider.internal",
+            payload_canary,
+            mock.endpoint.as_str(),
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_remote_seal_revoked_history_fails_closed() {
+        let key_id = KeyId::new("session-remote-revoked-sensitive").expect("key id");
+        let response = serde_json::json!({
+            "status": "error",
+            "error_message": format!("revoked key {} for tenant-a", key_id.as_str()),
+        })
+        .to_string()
+        .into_bytes();
+        let mock = mock_kms(MockResponse::Bytes(response)).await;
+        let provider = KmsRemoteSealProvider::new(
+            mock.endpoint.clone(),
+            None,
+            Duration::from_secs(1),
+            key_id.clone(),
+        );
+
+        let error = provider
+            .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+            .await
+            .expect_err("revoked historical key must fail closed");
+        assert_eq!(error, KeyError::Unavailable);
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains(key_id.as_str()));
+        assert!(!rendered.contains("tenant-a"));
+        assert!(!rendered.contains(&mock.endpoint));
+    }
+
+    #[tokio::test]
+    async fn kms_remote_seal_in_flight_request_keeps_its_material_epoch() {
+        let old_key_id = KeyId::new("session-remote-2026-01").expect("old key id");
+        let new_key_id = KeyId::new("session-remote-2026-02").expect("new key id");
+        let response = serde_json::json!({
+            "status": "success",
+            "ciphertext_and_tag_hex": encode_hex(&[0xA5; 32]),
+        })
+        .to_string()
+        .into_bytes();
+        let (mock, mut requests, release_first) = two_request_gated_kms(response).await;
+        let provider = std::sync::Arc::new(KmsRemoteSealProvider::new(
+            mock.endpoint.clone(),
+            None,
+            Duration::from_secs(2),
+            old_key_id.clone(),
+        ));
+        let aad = session_aad();
+
+        let first = tokio::spawn({
+            let provider = std::sync::Arc::clone(&provider);
+            let aad = aad.clone();
+            async move { provider.seal(&aad, b"in flight").await }
+        });
+        let first_request = requests.recv().await.expect("first KMS request");
+        assert_eq!(first_request.key_id.as_deref(), Some(old_key_id.as_str()));
+
+        assert_eq!(
+            provider
+                .publish_active_key(new_key_id.clone())
+                .expect("publish next active key")
+                .get(),
+            2
+        );
+        release_first.send(()).expect("release first response");
+        first
+            .await
+            .expect("join first seal")
+            .expect("complete first seal");
+
+        provider.seal(&aad, b"after publish").await.expect("seal");
+        let second_request = requests.recv().await.expect("second KMS request");
+        assert_eq!(second_request.key_id.as_deref(), Some(new_key_id.as_str()));
+        assert_eq!(provider.material_epoch().expect("material epoch").get(), 2);
+
+        let rendered = format!("{provider:?}");
+        assert!(!rendered.contains(old_key_id.as_str()));
+        assert!(!rendered.contains(new_key_id.as_str()));
+        assert!(!rendered.contains(&mock.endpoint));
     }
 }

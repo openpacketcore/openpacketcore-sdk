@@ -424,11 +424,29 @@ pub trait KeyProvider: Send + Sync {
     async fn rotate_key(&self, purpose: KeyPurpose, tenant: &TenantId)
         -> Result<KeyId, KeyError>;
 }
+
+#[async_trait::async_trait]
+pub trait RemoteSealProvider: Send + Sync {
+    async fn seal(&self, aad: &EnvelopeAad, plaintext: &[u8])
+        -> Result<EncryptedPayload, KeyError>;
+    async fn unseal(&self, key_id: &KeyId, aad: &EnvelopeAad,
+        ciphertext_and_tag: &[u8]) -> Result<Zeroizing<Vec<u8>>, KeyError>;
+}
 ```
 
 `KeyHandle` MUST avoid exposing raw bytes unless required by the crypto module.
 If raw bytes are materialized, they MUST be zeroized after use where the crypto
 backend permits.
+
+For remote sealing, `key_id` MUST come from a canonical, validated envelope.
+It selects the exact historical remote key and MUST NOT be replaced by the
+provider's current active key. `KmsRemoteSealProvider` snapshots one coherent
+`RemoteSealMaterialController` epoch before each encrypt request. Active-key
+publication affects only future seals; in-flight requests keep their snapshot.
+The controller retains only the current ID and opaque process-local epoch. It
+does not cache historical key material or authorization decisions, persist its
+epoch, watch a source, coordinate pods, or produce a fleet-comparable epoch.
+Each unseal calls the remote provider for the exact envelope key ID.
 
 ### 9.4 Rotation
 
@@ -442,6 +460,47 @@ Key rotation MUST support:
 
 If a key is unavailable, the SDK MUST fail closed for writes and for reads that
 require the missing key.
+
+For remote-seal rotation, KMS/HKMS is the authority for historical retention,
+revocation, and physical retirement. The SDK supplies exact historical-key
+selection and bounded live-state scan inputs, but it has no rewrap campaign,
+dependency-proof object, retirement API, or enforcement gate and cannot block
+an external KMS retirement. Operators MUST provision the new key before
+publishing it active, retain every old key while any artifact can reference it,
+and enforce retirement externally only after a composite proof:
+
+- a separately implemented rewrap has completed and a bounded,
+  snapshot-bound, write-fenced scan verifies the resulting live state;
+- retained Raft logs and snapshots have been compacted, expired, or inspected
+  and verified independently; and
+- backups, restore inputs, rollback checkpoints, and other offline sources have
+  been inspected and then rewrapped, deleted, or retained with the old key.
+
+A deployment-specific finite retention/TTL proof MAY replace rewrap only when
+it covers every live and replayable source and no record is unbounded. A restore
+scan alone does not prove logs, snapshots, backups, restore sources, or rollback
+artifacts. A partial or stale scan, concurrent writes, an unavailable source,
+or an ambiguous result blocks the operator's retirement decision. Emergency
+KMS revocation remains fail closed and may intentionally make dependent records
+unreadable.
+
+`RemoteSealProvider::unseal`'s historical `KeyId` argument is a breaking source
+API change. Provider implementations and callers MUST be upgraded together.
+It does not change the durable envelope or consensus/session wire format; the
+KMS request framing/schema is unchanged, but decrypt request contents now use
+the historical envelope ID. A code rollout MUST keep the old ID active until
+every reader, writer, and custom provider has stopped or upgraded, passed
+readiness, and can unseal by exact ID. Only then may the fleet publish a new
+active ID; upgraded pods may temporarily seal under different IDs because all
+upgraded reads select the envelope key.
+
+Material rollback MUST first verify that KMS can encrypt/decrypt with the old ID
+and decrypt with the new ID, then republish the old ID on every upgraded process
+and verify new writes use it while both epochs remain readable. The new ID MUST
+remain retained while any artifact depends on it. Rolling back to a pre-change
+binary is safe only before a new ID is published, or after a complete
+rewrap/artifact proof has returned all dependencies to one key; otherwise use a
+coherent pre-publication checkpoint restore.
 
 ## 10. AEAD Envelope Encryption
 

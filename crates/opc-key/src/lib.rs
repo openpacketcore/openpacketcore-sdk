@@ -25,7 +25,10 @@ pub use provider::{
     EncryptedPayload, KeyHandle, KeyProvider, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
 };
-pub use remote::{MemoryRemoteSealProvider, RemoteSealProvider};
+pub use remote::{
+    MemoryRemoteSealProvider, RemoteSealMaterialController, RemoteSealMaterialEpoch,
+    RemoteSealProvider,
+};
 pub use scope::{
     decode_bound_aad, key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, ConfigAad,
     EnvelopeAad, EnvelopeMetadata, KeyId, KeyPurpose, SessionAad, ShadowSecurityAad,

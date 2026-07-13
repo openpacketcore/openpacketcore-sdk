@@ -560,9 +560,61 @@ payload bytes are sealed, while host-visible SQLite/Openraft metadata includes
 membership, terms and indexes, request and key routing fields, tenant/owner,
 generation/fence, timestamps, and envelope key IDs. A product requiring
 metadata or full-file encryption must add an approved database/volume layer and
-qualify it without bypassing the wrapper. #179 owns seamless remote-seal
-historical-key selection; #143 owns distributed payload-protection evidence;
-the transport certificate rotation chain is separate.
+qualify it without bypassing the wrapper. Exact remote-seal historical-key
+selection is implemented; #143 owns distributed payload-protection evidence,
+and the transport certificate rotation chain is separate.
+
+### Remote-seal key rotation runbook
+
+1. Inventory every live store, Raft log/snapshot, backup, restore source, and
+   rollback checkpoint that may contain the old envelope key ID. An unbounded
+   record or unknown source makes the retirement proof incomplete.
+2. Upgrade every reader, writer, and custom remote provider while the old key
+   remains active. Stop or drain old binaries, wait for upgraded readiness, and
+   prove every active process can unseal by the exact envelope key ID. Do not
+   publish a new active ID before this fleet gate completes.
+3. Provision the new remote key in KMS/HKMS and prove exact-ID encrypt/decrypt
+   for the expected purpose and tenant before publishing it to any CNF. Keep
+   the old key enabled for decrypt.
+4. Publish the new key through the `RemoteSealMaterialController` in each
+   process. Cloned controllers share publication only inside that process; the
+   controller is not a cross-pod watcher or durable coordinator, and its opaque
+   epoch cannot be compared across processes. Publication affects only future
+   seals. A request already in flight continues using its captured old ID but
+   can still timeout, encounter revocation, or fail. Mixed old/new fleet writes
+   remain readable while KMS retains both envelope IDs.
+5. Verify new writes use the new envelope ID and both old/new records restore
+   through the current provider configuration. Missing/revoked keys, provider
+   outage, wrong tenant/AAD, or malformed history must return only coarse,
+   redacted crypto errors. Do not log provider responses, endpoints, tenants,
+   key IDs, or payloads.
+6. Run a separately implemented bounded, restartable rewrap campaign if the
+   deployment requires early retirement. After the final write fence, use a
+   bounded snapshot-bound live-state scan to verify the resulting live state.
+   Independently compact, expire, or inspect retained logs and snapshots, and
+   inspect then rewrap, delete, or retain backups, restore inputs, and rollback
+   artifacts. The SDK does not supply the rewrap campaign or a composite
+   dependency-proof object; a restore scan alone does not prove retained
+   artifacts. A partial page, stale cursor, concurrent write, unavailable
+   source, or remaining dependency blocks retirement. A finite TTL/retention
+   proof is acceptable only when it covers every source and no record is
+   unbounded.
+7. Retire or revoke the old key at KMS/HKMS only after the operator-controlled
+   proof and gate succeed. The SDK has no retirement API or enforcement gate
+   and cannot prevent external KMS retirement. Emergency revocation is fail
+   closed and can intentionally make dependent records unreadable.
+
+For material rollback, first verify that KMS can encrypt/decrypt with the old
+ID and decrypt with the new ID. Republish the old ID on every upgraded process,
+verify new writes use it and both key epochs remain readable, and retain the new
+ID while any artifact depends on it. A pre-change binary cannot safely read
+mixed-key state: binary rollback is safe only before publishing the new ID, or
+after a complete rewrap/artifact proof returns all dependencies to one key.
+Otherwise restore a coherent pre-publication checkpoint. The
+`RemoteSealProvider::unseal(&KeyId, ...)` source-API change requires custom
+providers and callers to upgrade together. Envelope, session-net, Openraft, and
+KMS framing/schema are unchanged; decrypt request contents now select the
+historical envelope ID.
 
 ### Session consensus transport and identity
 
@@ -899,7 +951,7 @@ migration requirement.
 | Config authorization & apply example | `opc-config-bus` implements `ConfigAuthorizer` checking at the admission boundary, and the toy config integration registers a custom `NacmAuthorizer` hook to enforce NACM policy before validation, persistence, or subscriber notification. | `crates/opc-config-bus/src/lib.rs`, `crates/opc-config-fixture/tests/config_fixture_commit.rs` |
 | Config persistence encryption and audit integrity | `EncryptingManagedDatastore` seals persisted config records with shared envelope helpers and AAD-bound tenant/schema/version metadata. Durable `SqliteBackend` opens require an explicit non-zero `AuditKey`, and stored audit chains are verified on load after sensitive audit values are redacted before storage. | `crates/opc-config-bus/src/lib.rs`, `crates/opc-config-bus/tests/encryption.rs`, `crates/opc-persist/src/backend/mod.rs`, `crates/opc-persist/tests/persist_sqlite.rs`, `crates/opc-persist/tests/persist_ops.rs`, `crates/opc-persist/tests/persist_audit.rs` |
 | Alarm admin authorization & auditing | `opc-alarm` provides `NacmAlarmAuthorizer` and `PersistAlarmAuditSink` adapters to authorize alarm ack/suppress actions against NACM policy and an explicit operator-principal allowlist, then log audit events durably to the persistence SQLite database with automatic sensitive data redaction. | `crates/opc-alarm/src/nacm_adapter.rs`, `crates/opc-alarm/src/persist_adapter.rs`, `crates/opc-alarm/tests/adapters.rs` |
-| Session persistence encryption | `EncryptingSessionBackend` or `RemoteSealingSessionBackend` must wrap `ConsensusSessionStore`, so payloads are sealed before Openraft submission and decrypted only above consensus. Raft logs, state, outcomes, peer frames, and snapshots carry opaque envelopes; HKMS/KMS provider calls and key handles stay outside deterministic apply. This is payload-envelope protection, not full SQLite metadata/file encryption. | `crates/opc-session-store/src/backend.rs`, `crates/opc-session-store/src/consensus/store.rs`, `crates/opc-session-store/src/sqlite/consensus.rs`, `crates/opc-session-store/tests/consensus_openraft.rs`, `crates/opc-session-store/src/consensus/store/encryption_tests.rs` |
+| Session persistence encryption | `EncryptingSessionBackend` or `RemoteSealingSessionBackend` must wrap `ConsensusSessionStore`, so payloads are sealed before Openraft submission and decrypted only above consensus. Remote unseal selects the exact validated envelope key ID; process-local active publication changes only future seals, while KMS/HKMS owns historical retention/revocation. The SDK has no retirement API or enforcement gate. Raft logs, state, outcomes, peer frames, and snapshots carry opaque envelopes; HKMS/KMS provider calls and key handles stay outside deterministic apply. This is payload-envelope protection, not full SQLite metadata/file encryption. | `crates/opc-key/src/remote.rs`, `crates/opc-key/src/kms.rs`, `crates/opc-session-store/src/backend.rs`, `crates/opc-session-store/src/consensus/store.rs`, `crates/opc-session-store/src/sqlite/consensus.rs`, `crates/opc-session-store/tests/encryption.rs`, `crates/opc-session-store/tests/consensus_openraft.rs`, `crates/opc-session-store/src/consensus/store/encryption_tests.rs` |
 | Runtime alarms | `SharedAlarmManager` is used by runtime supervision and config-bus failure paths; toy NF integration uses the runtime-owned manager rather than separate toy glue. | `crates/opc-runtime/src/supervisor/mod.rs`, `crates/opc-config-bus/src/lib.rs`, `crates/opc-sdk-integration/tests/toy_runtime.rs` |
 | Graceful drain | `DrainHook` and `NrfDrainHook` provide the shared SIGTERM/NRF drain integration point. Hook timeouts and hook errors raise drain-incomplete alarms, and `NrfRuntimeBuilderExt` gives first NF adopters a one-call registration path. | `crates/opc-runtime/src/shutdown.rs`, `crates/opc-sbi/src/nrf/mod.rs`, `crates/opc-runtime/tests/graceful_shutdown.rs` |
 | Evidence format | `opc-evidence` provides tested RFC 006 record, manifest, gap, SBOM/VEX, provenance, performance, bundle, and policy-evaluation library primitives. Embedded bundle blobs are signature-covered, but separately supplied `GateEvaluator` artifact arguments are not cross-checked against that verified bundle. Repository workflows do not yet invoke the evaluator or wire a production signer/verifier and complete artifact set. | `crates/opc-evidence/src/extract.rs`, `crates/opc-evidence/src/sbom.rs`, `crates/opc-evidence/src/vex.rs`, `crates/opc-evidence/src/provenance.rs`, `crates/opc-evidence/src/bundle.rs`, `crates/opc-evidence/src/performance.rs`, `crates/opc-evidence/src/policy.rs`, `crates/opc-evidence/tests/evidence_bundle.rs`, `crates/opc-evidence/tests/evidence_policy.rs`, `docs/implementation-status.md#known-gaps` (`GAP-006-*`) |
