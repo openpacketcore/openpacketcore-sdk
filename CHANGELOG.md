@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-ipsec-lb`: additive `SteeringBackendKind::VipDelivered` and
+  `SteeringProbe::vip_delivered()` distinguish production converged shared-L2
+  floating-VIP delivery from testkit mocks. The ready mutation contract is an
+  intentional no-op and claims no XDP, NIC offload, key custody, or datapath
+  programming; defaults remain fail-closed as `Unsupported`.
 - **BREAKING — `opc-session-store` and consumers:** `SessionKey::stable_id` is
   now the validated `StableId` newtype instead of arbitrary `Bytes`. The
   production invariant is exactly 1 through 64 bytes across construction,
