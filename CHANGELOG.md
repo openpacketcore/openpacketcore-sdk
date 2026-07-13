@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-ipsec-lb`: additive `SteeringBackendKind::VipDelivered` and
+  `SteeringProbe::vip_delivered()` distinguish production converged shared-L2
+  floating-VIP delivery from testkit mocks. The ready mutation contract is an
+  intentional no-op and claims no XDP, NIC offload, key custody, or datapath
+  programming; defaults remain fail-closed as `Unsupported`.
 - `opc-identity`: a production `ProjectedSvidSource` for Kubernetes projected
   Secrets. It resolves one immutable `..data` target, detects and boundedly
   retries every mid-read generation switch, enforces exact file/total/

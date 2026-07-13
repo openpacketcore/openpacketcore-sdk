@@ -466,6 +466,15 @@ stop new ownership publication and traffic advertisement immediately and enter
 the product's fenced relinquish/handoff workflow; a prior readiness report is
 not an ownership lease.
 
+For a converged shared-L2 product where that floating VIP itself delivers
+packets, report `SteeringProbe::vip_delivered()` rather than a testkit mock.
+Its `mutation_ready` state means the product adapter intentionally accepts
+steering mutations as no-ops because VIP delivery already satisfies the
+contract. It does not evidence Host-XDP, VF-XDP, NIC offload, datapath rule
+programming, key custody, VIP ownership, or packet-flow correctness; those
+claims still require their own current product evidence. Default and unknown
+steering selection remains fail-closed as `Unsupported`.
+
 ### Tested session Openraft features
 
 1. **One Consensus Authority**: `ConsensusSessionStore` delegates election,
