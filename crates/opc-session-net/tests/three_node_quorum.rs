@@ -29,8 +29,8 @@ use opc_session_store::quorum::SessionStoreBackend;
 use opc_session_store::record::{EncryptedSessionPayload, StoredSessionRecord};
 use opc_session_store::{
     QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity, RestoreScanCursor, RestoreScanRequest,
-    RestoreScanScope, StoreError, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity, RestoreScanRequest, RestoreScanScope,
+    SqliteSessionBackend, StoreError, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
     MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
@@ -1767,7 +1767,8 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
 #[tokio::test]
 async fn remote_restore_scan_round_trips_scope_and_pagination_over_mtls() {
     let mtls = mtls_configs();
-    let (addr, backend, handle) = start_server(&mtls, 2).await;
+    let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
     let remote = remote_backend(&mtls, 1, 2, addr, None);
 
     assert!(remote.capabilities().await.restore_scan);
@@ -1798,7 +1799,7 @@ async fn remote_restore_scan_round_trips_scope_and_pagination_over_mtls() {
         .expect("first remote restore page");
     assert_eq!(first.records.len(), 1);
     assert_eq!(first.records[0].key.stable_id.as_ref(), b"a");
-    assert_eq!(first.excluded_count, 1);
+    assert_eq!(first.excluded_count, 0);
     assert!(!first.complete);
     assert!(first.next_cursor.is_some());
 
@@ -1841,12 +1842,21 @@ async fn remote_restore_scan_round_trips_scope_and_pagination_over_mtls() {
         CompareAndSetResult::Success
     );
 
+    let prefix = remote
+        .scan_restore_records(RestoreScanRequest::all(3))
+        .await
+        .expect("obtain durable cursor before the large record");
+    assert_eq!(prefix.records.len(), 3);
+    let large_record_cursor = prefix
+        .next_cursor
+        .expect("large record follows the bounded prefix");
+
     let small_frame_remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(1)))
         .with_max_frame_size(minimum_frame_size);
     let oversized = small_frame_remote
         .scan_restore_records(RestoreScanRequest {
             scope: RestoreScanScope::all(),
-            cursor: Some(RestoreScanCursor::from_offset(3)),
+            cursor: Some(large_record_cursor),
             limit: 1,
         })
         .await
@@ -2130,12 +2140,21 @@ async fn replication_log_returns_the_largest_contiguous_prefix_for_the_peer_budg
         payload_replication_entry(2, 4096),
         payload_replication_entry(3, 4096),
     ];
-    let one_entry_budget =
-        serde_json::to_vec(&opc_session_net::Response::GetReplicationLog(Ok(vec![
-            entries[0].clone(),
-        ])))
-        .expect("size one valid replication entry")
-        .len();
+    // RFC 3339 fractional seconds are canonically trimmed, so otherwise
+    // equivalent entries created at different instants can differ by a few
+    // encoded bytes. Every page continuation must fit the chosen one-entry
+    // budget; sizing only the first entry makes this test nondeterministic.
+    let one_entry_budget = entries
+        .iter()
+        .map(|entry| {
+            serde_json::to_vec(&opc_session_net::Response::GetReplicationLog(Ok(vec![
+                entry.clone(),
+            ])))
+            .expect("size one valid replication entry")
+            .len()
+        })
+        .max()
+        .expect("non-empty replication fixture");
     assert!(one_entry_budget >= opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE);
     assert!(
         serde_json::to_vec(&opc_session_net::Response::GetReplicationLog(Ok(entries

@@ -36,12 +36,10 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-security-testkit = { path = "../opc-security-testkit", version = "0.2.0" }
 opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0" }
 tempfile = "3"
-rcgen = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [lints]

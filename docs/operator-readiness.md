@@ -111,63 +111,73 @@ tests, and release evidence in the downstream CNF operator repository.
 
 ## HA hardening scope
 
-The June 8 review closed the listed algorithmic and test-harness tasks, not
-carrier HA qualification. `ConsensusConfigStore` remains a separate durable
-config-consensus prototype. For session state, #127 replaces the former custom
-majority-visible-log coordinator with `ConsensusSessionStore`, backed by the
-workspace's shared Openraft engine; `QuorumSessionStore` is a compatibility
-type alias for that implementation, not a second authority path. This closes
-the durable sequencing/commit-authority implementation gap, but it is not a
-production-profile claim until the recovery, restore, lifecycle, and
-distributed qualification gates listed below pass.
+The June 8 review closed scoped algorithms and test harnesses, not carrier HA
+qualification. #127 and #177 now place session and config distributed
+persistence behind the workspace's single exact-pinned Openraft engine.
+`QuorumSessionStore` remains only a compatibility alias to
+`ConsensusSessionStore`; the custom config Raft and majority config wrapper are
+removed. Each domain retains its own state machine and production evidence
+gates.
 
-### Config consensus RPC and identity-lifecycle contract
+### Config Openraft, migration, and shared transport contract
 
-For `opc-persist` config consensus, configure every `TcpPeer` timeout (or the
-test-node `--rpc-timeout` value) as one end-to-end logical RPC deadline. The
-same absolute budget covers local authentication/TLS setup locks, bounded
-cooperative serialization, TCP connect, mTLS, request write, response
-length/body reads and decode, all attempts, and 50/100 ms retry backoff. Zero
-expires before I/O; an unrepresentable monotonic-clock duration fails closed.
-Do not multiply this value by transport stages or retries when sizing an
-election: voting-peer requests fan out concurrently. Do budget as much as
-`128 * rpc-timeout`, plus local database/scheduling overhead, for one lagging
-peer's bounded catch-up pass: there are 64 rounds and a rejected snapshot can
-fall through to one append in the same round. A later trigger resumes from
-`next_index` after the 64-round ceiling.
+For `opc-persist`, the authority path is:
 
-Treat this as a coordinated upgrade setting. Earlier SDKs reset the configured
-timeout for each I/O stage; the same numeric value can therefore produce a much
-shorter failure window after this change. Retune it as an end-to-end budget,
-update election/failover/drain thresholds, and roll out the selected value
-coherently across cluster members. Rust integrations that exhaustively match
-the public `PersistErrorKind` must add `ConsensusRpcTimeout`.
+```text
+application -> HKMS-backed encryption -> ConsensusConfigStore
+            -> Openraft -> SQLite and Openraft snapshots
+```
 
-Retries preserve the request's safety semantics. RequestVote, AppendEntries,
-InstallSnapshot, LoadLatest, and LoadRollback may replay after ambiguous
-delivery. TimeoutNow may already have launched a campaign, so it is not replayed
-after any bytes may have reached the peer. Invalid local identity/TLS setup and
-certificate-verification failures are permanent for the call and must not be
-reported as logical timeouts.
+Only a config envelope carrying one-shot evidence from the real encryption
+adapter may cross into Openraft; the evidence is consumed before serialization.
+Sealed ciphertext, deterministic metadata, and redacted finalized audit records
+are replicated. Plaintext, providers, key handles, and raw key material stay
+above the consensus boundary. Creating the Openraft
+authority marker and checking or importing legacy state is one immediate
+per-database SQLite transaction; direct standalone mutations then fail closed.
 
-Operators should alert from `rpc_timeouts` and its fixed
-`rpc_timeouts_by_family`/`rpc_timeouts_by_stage` dimensions. Those maps use
-bounded request-family and stage keys; do not add replica IDs, endpoints,
-SPIFFE identities, tenants, or request fields as labels. A timeout on the
-client closes that attempt, but it does not create a server-wide post-handshake
-I/O deadline. `TcpRpcServer` currently applies five seconds only to TLS
-acceptance; request reads and response writes are frame-bounded and need a
-separate server-side slow-client bound before that property can be claimed.
+The config voter set is exact and immutable within one topology epoch. A
+subset/superset is never an admissible degraded mode; a reviewed topology
+change uses a coordinated new epoch.
 
-A production CNF must also own seamless identity rotation. Watch the live SVID
-and trust bundle and call `set_identity`; the `opc-consensus-node` test binary
-loads PEM files only at startup. Roll out old/new trust overlap first, then
-rotate leaves while preserving the exact SPIFFE workload profile and node
-instance, drain old connections, verify fresh handshakes across the quorum, and
-remove old trust only after the maximum authentication age. Gate traffic and
-readiness through the transition and bound reconnect storms. Replacing leaf and
-trust material simultaneously without overlap is not a supported seamless
-rotation procedure.
+Configure one complete config operation timeout greater than zero and no more
+than 60 seconds. It bounds leader routing, the linearizable barrier, quorum
+commit, and local apply. Network call deadlines, retries, framing, mTLS, and
+authentication belong to the shared `opc-consensus`/`opc-session-net`
+transport contract; do not translate removed config TCP timeout or metric
+settings into the Openraft adapter.
+
+Install `ConsensusConfigStore::rpc_handler()` on the authenticated shared
+listener before cluster initialization, and require
+`probe_durable_readiness()` before traffic. Listener bind, TLS setup, cached
+capabilities, status observation, or a local SQLite read is not durable
+readiness. Retain each mutation's request ID across response loss so a retry
+within the newest 4,096 outcomes recovers the original durable result rather
+than creating a second write. After that finite horizon, use a fresh
+authoritative read.
+
+Nonempty legacy authority must be migrated offline. Preserve untouched
+pre-migration backups, select one externally proven applied SQLite snapshot,
+checkpoint it, and bind its exact SHA-256, latest transaction ID/version, and
+the explicit `DiscardUnknownAppendedSuffix` decision. Unknown target suffixes
+are discarded; they are never inferred committed. Recovery opens the source
+without following symlinks and binds verification/consumption to the same file
+descriptor while rechecking the path identity and offline WAL state. Atomicity
+is per database,
+so the fleet must be drained and coordinated. Rollback is only a full restore
+from the preserved pre-migration backups; deleting `config_raft_*` state or
+reconstructing the removed engine is prohibited.
+
+`opc-persist` contains no replacement TCP listener, certificate parser, or
+rotation API. Production mTLS and certificate/trust-bundle rotation remain the
+existing `opc-session-net`/CNF responsibility. Preserve trust overlap, force
+fresh authentication, drain old connections, and gate on fresh readiness.
+Shared real-mTLS tests qualify a renewed SVID on a subsequent new call/full
+handshake and wrong-scope rejection. They do not prove seamless old-connection
+retirement. The suite also forms a real three-node `ConsensusConfigStore` and
+commits/linearizably reads through the existing mTLS adapter. This migration
+does not by itself supply out-of-process/deployed-network, multi-process/soak,
+or the complete fleet trust lifecycle.
 
 ### Session topology admission
 
@@ -404,8 +414,11 @@ clamp/split entries ad hoc or use the raw inner backend as protection.
 
 This closes the #147 traversal/confidentiality gap only. It does not qualify
 networked session HA. #143 and the remaining dependencies still block the
-experimental profile. Seamless SVID rotation, payload-protection key rotation,
-and trust-bundle rotation remain separate mandatory production gates.
+experimental profile. A renewed SVID on a subsequent new call/full handshake
+and wrong-scope rejection have scoped real-mTLS qualification; seamless
+connection retirement, payload-protection key rotation, and the complete
+trust-bundle, revocation, authentication-age, multi-process, and soak lifecycle
+remain separate mandatory production gates.
 
 ### Session durable readiness
 
@@ -428,6 +441,12 @@ is Openraft barrier/committed-apply evidence, not a custom majority-log-prefix
 calculation. Do not reconstruct authority from the individual report counters
 or observations.
 
+The same report exposes `recovery_progress()` with a closed state set:
+`synchronized`, `catching_up`, `awaiting_quorum`, or `recovery_required`, and
+optional local log/applied/snapshot/purged indexes. These are redaction-safe
+progress counters, not branch-selection evidence and not authorization to
+truncate, rebuild, or serve traffic.
+
 The store's one bounded operation deadline applies to the complete leader,
 network, barrier, and local-apply path. Do not log raw peer errors or turn
 replica IDs, endpoints, DNS names, or SPIFFE identities into metric labels.
@@ -447,7 +466,7 @@ stop new ownership publication and traffic advertisement immediately and enter
 the product's fenced relinquish/handoff workflow; a prior readiness report is
 not an ownership lease.
 
-### Tested HA algorithm and prototype features
+### Tested session Openraft features
 
 1. **One Consensus Authority**: `ConsensusSessionStore` delegates election,
    voting, log matching, commitment, membership, snapshot coordination, and
@@ -468,12 +487,43 @@ not an ownership lease.
    log, committed/applied/purged positions, membership, request outcomes, and
    the application chain; bounded checksummed snapshots carry only one coherent
    sealed state-machine image.
-6. **Remaining Qualification**: #128 must reconcile a diverged replica from
-   committed authority; #129 must provide operator-safe legacy-fork recovery;
-   #133 must make restore scans bounded and majority-authoritative; and #143
-   must supply distributed partition/restart/resource/soak and payload-key
-   qualification. Until those land, this is implemented commit authority, not
+6. **Remaining Qualification**: #128 makes current-format repair exclusively
+   Openraft-owned, rejects committed/applied truncation and stale snapshots,
+   validates restart artifacts, and qualifies divergent-tail/snapshot recovery.
+   #129 provides the default-deny offline whole-fleet procedure documented in
+   the [legacy recovery runbook](session-store-legacy-recovery.md). #133 bounds
+   restore scans over the barrier-confirmed local applied state; method
+   availability still is not readiness evidence. #143 must supply distributed
+   partition/restart/resource/soak and payload-key qualification. Until that
+   lands, this is implemented commit and recovery authority, not
    production HA qualification.
+
+### Current-format follower recovery runbook
+
+1. Close traffic, ownership publication, VIP advertisement, and new lease
+   acquisition unless the fresh report is `Ready`.
+2. For `catching_up` or `awaiting_quorum`, verify the exact admitted peer set,
+   bidirectional authenticated consensus reachability, and durable volume
+   availability. Restore connectivity and allow Openraft to reconcile. Do not
+   copy rows, call raw rebuild APIs, or delete a PVC.
+3. Confirm progress through the bounded local indexes only. Recovery is
+   complete only when a fresh barrier reports `Ready` and `synchronized`.
+4. On `recovery_required`, preserve the SQLite database, WAL/SHM if present,
+   snapshot directory, deployment identity/configuration/epoch, and the
+   redacted readiness report. Do not edit or retry around a corrupt referenced
+   snapshot; replace/recover the member only from an approved committed source.
+5. If storage predates Openraft or startup reports legacy recovery required,
+   stop. Use the [audited #129 workflow](session-store-legacy-recovery.md);
+   current-format automatic recovery cannot infer a committed branch from
+   legacy rows.
+
+The adapter removes bounded SDK-named interrupted staging files on restart but
+does not delete unknown operator files. A missing/corrupt referenced snapshot,
+directory above 8,192 entries, cross-identity image, or snapshot behind the
+committed/applied floor fails closed before service admission. Covered-log
+purge waits at most ten seconds for asynchronous snapshot apply to advance the
+durable floor; timeout stops the Openraft node rather than deleting unapplied
+history.
 
 ### Session payload protection boundary
 
@@ -527,14 +577,17 @@ identity mismatch fails before engine dispatch. The outer consensus frame is
 bounded for the shared compact Openraft payload; transport code does not decode
 commands or make consensus decisions.
 
-Fresh handshakes make renewed credentials observable, but seamless operation
-during rotation is not yet qualified. The implementation order is #161
-(atomic identity/trust reload), #162 (bounded material epochs), and #163 (peer
-reauthentication across an epoch), followed by #164 rotation qualification.
-#158 remains the umbrella until that evidence passes. A production CNF must
-keep old/new trust overlapped, retire old connections, enforce revocation and
-maximum authentication age, and bound reconnect storms; #143 still owns the
-wider distributed qualification.
+Real-mTLS tests now qualify a correctly scoped renewed client/server SVID on a
+subsequent new call/full handshake and rejection when either rotated identity
+falls outside the bound peer scope. They do not exercise an in-flight or
+retained old connection. Seamless operation during rotation is not yet
+qualified. The implementation order is #161 (atomic identity/trust reload),
+#162 (bounded material epochs), and #163 (peer reauthentication across an
+epoch), followed by #164 rotation qualification. #158 remains the umbrella
+until that evidence passes. A production CNF must keep old/new trust overlapped,
+retire old connections, enforce revocation and maximum authentication age,
+bound reconnect storms, and supply multi-process/soak and seamless-continuity
+evidence; #143 still owns the wider distributed qualification.
 
 When TLS material is mounted as a Kubernetes projected Secret, construct
 `ProjectedSvidSource` with the mount root and relative Secret-key paths. Do not
@@ -572,11 +625,22 @@ migration. `MAX_SESSION_TTL` controls
 session/lease state only; it does not define
 certificate expiry, trust-bundle validity, or authentication age.
 
-A successful restore page may be shorter than requested to fit the effective
-client/server frame limit; follow `next_cursor` until `complete`. A single
-record that cannot fit returns `RestoreScanResponseTooLarge`.
+A successful restore page may be shorter than requested to respect the backend
+4 MiB payload, 8 MiB retained-page, 8 MiB examined key/filter metadata, or
+4,096 examined-candidate budget; a narrow scope may yield an empty page with
+an advancing cursor. Follow the confidential authenticated `next_cursor` until
+the issuer reports `complete`. Compatibility peer validation checks bounds,
+order, scope, cursor shape, and claimed progress; it cannot prove that an
+authenticated server did not omit a record or falsely report completion.
+Production completeness comes only from scanning the barrier-confirmed local
+Openraft-applied state. A page that
+cannot fit the effective wire frame returns `RestoreScanResponseTooLarge` and
+is retried from the same cursor with a smaller record limit.
 
-Wire-schema revision 2 negotiates the response budget explicitly. The client
+Wire-schema revision 3 retains revision 2's negotiated response budget and
+adds the AES-256-GCM-SIV snapshot-bound cursor, explicit durable-page profile,
+and typed stale/work-budget outcomes. Offset cursors from the local fake are
+rejected on this remote surface. The client
 Hello requests its response-frame limit; HelloAck returns the accepted
 client/server minimum and the server's separate request-frame limit. All three
 values are checked `u32` values of at least
@@ -634,6 +698,8 @@ outage: drain session traffic and writers; run the identity audit and complete
 handover/nested-payload preflights; stop every session-net client, server, and
 protection wrapper plus every product handover reader/writer; upgrade them
 together; verify v4 authenticated handshakes, empty/multi-page restore scans,
+an empty advancing page across more than 4,096 excluded candidates, modified-
+cursor rejection, cursor restart after mutation, resume after process restart,
 bounded maximum-payload get/CAS/batch/log/restore/watch traffic, slow-reader slot
 recovery, and fresh quorum evidence on each replica; then
 restore traffic. Do not perform a mixed-version rolling upgrade.
@@ -641,14 +707,18 @@ restore traffic. Do not perform a mixed-version rolling upgrade.
 Public `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
 `contract_profile`, so exhaustive construction and matching must account for
 the field. Private v4 DTOs use `u32` for restore/log request limits and the
-client restore response budget; `u64` for restore cursors/excluded counts,
-`max_value_bytes`, and size-bearing store errors; and checked conversion before
-dispatch/exposure. Restore `loaded_count` and `complete` are recomputed rather
-than trusted from the peer. Independent limits are 256 batch operations, 1,024
-restore records, 65,536 log entries, and 65,536 rebuild entries; the configured
-frame bound remains separate. #159 now enforces that negotiated bound and one
+client restore response budget; a confidential authenticated restore cursor;
+`u64` for
+excluded counts, `max_value_bytes`, and size-bearing store errors; and checked
+conversion before dispatch/exposure. Restore `loaded_count` and `complete` are
+recomputed rather than trusted from the peer. Independent limits are 256 batch
+operations, 1,024 restore records, 4 MiB of restore payload and 4,096 examined
+live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
+configured frame bound remains
+separate. #159 now enforces that negotiated bound and one
 absolute write deadline across every ordinary response/watch item. The profile
-pins wire-schema revision 2, error-set revision 1,
+pins wire-schema revision 3, error-set revision 2,
+`max_restore_scan_examined_rows = 4096`,
 `min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
 owner/custom-key/state-type bounds,
 `stable_id_max_bytes = 64`, `replication_tx_id_max_bytes = 128`,
@@ -656,11 +726,31 @@ owner/custom-key/state-type bounds,
 depth-16/256-node trees. Stable IDs contain 1 through 64 bytes, replication
 transaction IDs contain 1 through 128 UTF-8 bytes, and CAS request IDs, when
 present, are canonical lowercase hyphenated UUIDs with the exact 36-byte encoding. A
-revision-1 v4 participant is incompatible despite
+revision-2 or older v4 participant is incompatible despite
 sharing the same ALPN, so that profile transition also requires the coordinated
 stop/upgrade/start above. `ContractProfile::max_frame_size` is a public Rust
 source break for external struct literals/destructuring and must be updated in
 that same transition.
+
+Opening an existing SQLite store adds only the 32-byte
+`restore_scan_state.cursor_key` metadata field and does not backfill session
+records. Verify that O(1) migration on every replica before traffic admission.
+A consensus snapshot created before revision 3 lacks the cursor key and is not
+an installable revision-3 repair source; after the coordinated upgrade, take
+and validate a fresh coherent snapshot before declaring rollback/recovery
+coverage.
+
+Restore cursors are backend-incarnation/node-bound. A same-PVC process restart
+retains the cursor key and epoch and can resume a page. Another node or an
+installed snapshot has a different cursor incarnation and returns typed
+`RestoreScanCursorStale`; the operator/CNF must discard partial pagination and
+restart from the first page. Do not merge pages across nodes or snapshots.
+The maximum local consensus-key cursor is roughly 4 MiB after hex encoding, so
+it does not fit session-net's 1 MiB default frame. The compatibility server
+returns typed `RestoreScanResponseTooLarge` without writing a partial frame;
+only a sufficiently large negotiated frame (bounded at 16 MiB) can carry it.
+The session-net record profile remains independently limited to 64-byte stable
+IDs.
 
 A mutation may commit before response encoding or delivery fails. A disconnect,
 oversize fallback, or write timeout is an ambiguous result, not rollback proof.
@@ -677,6 +767,22 @@ oversize and authenticated slow-reader campaigns keep memory, tasks, file
 descriptors, CPU, and connection slots bounded and that shutdown barriers still
 complete.
 
+Restore runbook evidence must record low-cardinality counters/histograms for
+page outcome, `cursor_profile`, `complete`, loaded records, excluded/examined
+candidates, payload bytes, elapsed time, and typed restart reason
+(`stale_cursor`, `work_budget`, `response_too_large`, `cancelled`). Alert when
+stale/work-budget restarts repeat, a scan makes no cursor progress, or restore
+latency consumes the CNF RTO. An empty page is healthy only when it carries a
+different durable cursor and the examined count is nonzero. On a stale cursor,
+discard all partial restore results and restart at page one after fresh
+Openraft readiness; never splice snapshots. On cancellation or deadline, wait
+for the SDK call to finish releasing its SQLite worker before retrying. SQLite
+admits one clone-shared blocking restore worker per backend before
+`spawn_blocking`; a timed-out waiter spawns no worker, while the admitted worker
+retains its permit until its cancellation callback exits. These
+labels must never contain cursor bytes, tenant/NF/key fields, owner, payload,
+database path, peer text, or certificate identity.
+
 A fresh version/profile/authentication or malformed-handshake failure clears
 the capability cache and reports every boolean false with
 `max_value_bytes = 0`. A cache retained after transient transport loss is
@@ -691,9 +797,11 @@ Either scope change requires another coordinated rollout.
 
 This is not production HA qualification. Do not infer readiness from bind
 success, static profiles, or cached capabilities; use the fresh bounded probe
-and continuous gate. #127 now provides Openraft commit authority, but do not use
-restore results as majority authority before #133, treat divergence repair as
-implemented before #128, or auto-resolve a legacy fork before #129. Protocol
+and continuous gate. #127 now provides Openraft commit authority and #133
+provides bounded snapshot-bound applied-state restore. Do not treat divergence
+repair outside #128's current-format rules or apply those rules to a legacy
+fork. Use only #129's
+[explicit offline procedure](session-store-legacy-recovery.md). Protocol
 identity/fixed-width binding is not fork recovery. #135's invariant-safe model decoding
 and bounded offline identity audit and #134's fixed-width v4 DTOs are implemented.
 Checked TTL and sequence boundaries now fail closed under #137/#138, and
@@ -703,13 +811,15 @@ handoff and absolute-record-expiry admission remain
 under #159, but its stable-ID and transaction-ID limits are wire containment
 only. The production stable-ID model/persistence/privacy/audit/migration remains
 #167; the canonical durable `ReplicationEntry` transaction-ID type and migration
-remain #168 and must be coordinated with #127/#128/#143. Session-net's response
-deadline is independent of `opc-persist`'s already-implemented #169
-`TcpPeer::timeout` contract: one atomic end-to-end logical-RPC deadline covers
-its attempts and backoff, with safe retry and bounded metrics. Seamless
-SVID/trust-bundle lifecycle remains #161 -> #162 -> #163 -> #164 under umbrella
-#158, while the remaining distributed/payload-key production evidence stays
-open in #143.
+remain #168 and must be coordinated with #127/#128/#143. The shared
+session-net call deadline and `ConsensusConfigStore`'s complete
+routing/quorum/commit/apply operation deadline remain separate bounded layers;
+the removed private config TCP timeout is not a production setting. A renewed
+SVID on a subsequent new call/full handshake and wrong-scope rejection have
+scoped real-mTLS qualification; seamless connection retirement, complete
+trust-bundle/revocation/authentication-age fleet lifecycle remains
+#161 -> #162 -> #163 -> #164 under umbrella #158. The remaining distributed/payload-key
+production evidence stays open in #143.
 
 #159 does not rewrite persisted session-store bytes. In-profile stores need no
 format conversion, but a retained empty/over-64-byte stable ID or
@@ -785,36 +895,35 @@ operator glue:
 
 ## HA Persistence & Replication Adapters
 
-The SDK includes a config-store consensus hardening prototype
-(`ConsensusConfigStore` in crate `opc-persist`) and an Openraft-backed session
-authority (`ConsensusSessionStore` in crate `opc-session-store`;
-`QuorumSessionStore` is its compatibility alias). These are currently distinct
-authority implementations; migrating config HA to the shared `opc-consensus`
-engine is tracked separately and must be completed before claiming a
-workspace-wide one-engine production profile.
+The SDK includes Openraft-backed config and session adapters:
+`ConsensusConfigStore` in `opc-persist` and `ConsensusSessionStore` in
+`opc-session-store` (`QuorumSessionStore` is its compatibility alias). They
+have distinct deterministic state machines but one consensus authority through
+`opc-consensus`; neither domain retains a custom quorum engine.
 
 The standard SQLite-backed config and session store profiles (`SqliteBackend` and `SqliteSessionBackend`) are single-node only. They are acceptable only for development, conformance, lab, or explicitly accepted edge/single-replica deployments, and must not be used to claim carrier HA without a production consensus/replication layer.
 
-- **Config Store Consensus Hardening**: `ConsensusConfigStore` provides durable
-  membership, TCP RPC framing over real mTLS transport with SPIFFE identity
-  verification bound to the configured workload profile and active membership,
-  one absolute client logical-RPC deadline, request-aware retry ambiguity
-  handling, concurrent peer fan-out, bounded/resumable 64-round per-peer
-  catch-up (at most two RPCs per round), no-op commit safety, snapshot HMAC
-  verification, a server lifecycle with 100-handler concurrency and a
-  five-second TLS-accept timeout, membership-change guardrails, and
-  fixed-family/stage timeout metrics. Post-handshake server reads/writes remain
-  frame-bounded without an independent server I/O deadline, and production
-  CNFs must supply live identity watching plus trust-overlap rotation. Checked
-  via out-of-process campaigns, failovers, network partitioning, pending
-  commits surviving restarts, deterministic transport stalls/cancellation, and
-  catch-up resume tests.
+- **Config Store Commit Authority**: `ConsensusConfigStore` uses Openraft for
+  election, term/vote persistence, log matching, quorum commit, membership,
+  linearizable reads, and snapshots. Its SQLite adapter admits only sealed
+  config envelopes and redacted finalized audit, fences every standalone write
+  after an atomic authority claim, persists idempotent outcomes, and supports
+  exact offline legacy recovery by checksum, applied head, and explicit
+  unknown-suffix discard. In-process tests cover formation, partition/heal,
+  failover, response loss, snapshots, and migration; an AMF-lite integration
+  adds provider-backed outer encryption, key rotation, follower/snapshot/restart
+  isolation, and durable plaintext/raw-key/provider canary scans.
+  This qualifies the three-node HKMS boundary. `GAP-001-006` remains open for
+  remote-HKMS, out-of-process/deployed-network compatibility, multi-process
+  restart/rejoin, resource, soak, seamless fleet trust-lifecycle, and release
+  evidence. In-process three-node real-mTLS config formation, commit, and
+  linearizable-read integration is present through the shared transport.
 - **Session Store Commit Authority**: `ConsensusSessionStore` uses the shared
   Openraft engine for elections, voting, log matching, committed membership,
   snapshot coordination, and linearizable reads. Its SQLite state machine owns
   deterministic session semantics and exposes journal/watch changes only after
-  apply. #127 is implemented; #128/#129/#133/#143 remain qualification and
-  recovery gates.
+  apply. #127, #128, #129, and #133 are implemented; #143 remains the
+  distributed-qualification gate.
 - **Session Topology, Identity, and Readiness**: HA construction requires one
   immutable descriptor set, explicit logical self, configuration digest, and
   positive epoch. Stable node IDs derive from cluster plus logical
@@ -825,9 +934,13 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   capability evidence.
 - **Fault Coverage**: Tests cover concurrent pristine formation, cross-node
   lease/CAS visibility, follower linearizable reads, partition-bounded failure
-  and rejoin, restart, and delivered-but-lost response idempotency. These are
-  implementation tests, not #143 distributed production qualification, and
-  they do not implement #128 divergence repair or #129 legacy-fork recovery.
+  and rejoin, restart, delivered-but-lost response idempotency, replacement of
+  repeated uncommitted tails above an immutable committed prefix, stale and
+  cross-identity snapshot rejection, corrupt-snapshot restart, and interrupted
+  staging cleanup. File-backed recovery tests additionally cover #129's
+  two-branch/three-branch legacy campaigns, full-fleet backup-before-mutation,
+  failpoint resume, pending-epoch fencing, and legacy cursor invalidation.
+  These are not #143 distributed production qualification.
 - **SQLite Writer Envelope**: Each node persists Openraft vote/log/membership,
   committed/applied positions, deterministic state, outcomes, and bounded
   snapshots in its own SQLite-backed store. Standalone `SqliteSessionBackend`
@@ -1022,7 +1135,8 @@ The following items are updated in `docs/implementation-status.md`:
   - `GAP-012-002` (First reusable per-NF testkit crate `opc-amf-lite-testkit` and documented testkit adoption pattern).
   - `GAP-012-003` (Local in-process runner, Kubernetes `kind` dry-run manifest runner, and `hardware-lab` dry-run preflight validation runner).
 - **Narrowed / Partial**:
-  - RFC 001 config consensus has extensive prototype evidence, but carrier HA
+  - RFC 001 config consensus has one Openraft authority, atomic local migration,
+    encryption-boundary, and in-process failure evidence, but carrier HA
     qualification remains open.
   - RFC 004 ordered-quorum semantics are tested in process, but networked
     session HA is not graduated.

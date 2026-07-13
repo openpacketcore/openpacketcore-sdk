@@ -24,6 +24,13 @@ use unsupported as platform;
 /// Linux SCTP association identifier.
 pub type AssocId = i32;
 
+/// Maximum number of socket addresses accepted by the bounded SCTP helpers.
+///
+/// Linux represents bindx/connectx address sets as one packed option buffer.
+/// Keeping a fixed public ceiling prevents an untrusted configuration from
+/// causing an unbounded allocation at the socket boundary.
+pub const MAX_SCTP_ADDRESSES: usize = 64;
+
 /// IP address family used when opening an SCTP socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
@@ -179,6 +186,14 @@ pub fn bind(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<()> {
     platform::bind(fd, addr)
 }
 
+/// Atomically bind an SCTP socket to a bounded set of local addresses.
+///
+/// All addresses must use one family and port. Callers that have exactly one
+/// address should use [`bind`] to preserve the ordinary socket path.
+pub fn bind_addresses(fd: BorrowedFd<'_>, addrs: &[SocketAddr]) -> io::Result<()> {
+    platform::bind_addresses(fd, addrs)
+}
+
 /// Start listening on an SCTP socket that accepts inbound associations.
 pub fn listen(fd: BorrowedFd<'_>, backlog: i32) -> io::Result<()> {
     platform::listen(fd, backlog)
@@ -192,6 +207,31 @@ pub fn accept(fd: BorrowedFd<'_>) -> io::Result<(OwnedFd, SocketAddr)> {
 /// Start a nonblocking connect to one peer address.
 pub fn connect(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<ConnectStatus> {
     platform::connect(fd, addr)
+}
+
+/// Start a nonblocking SCTP connect using a bounded peer address set.
+///
+/// All addresses must use one family and port. Callers that have exactly one
+/// address should use [`connect`] to preserve the ordinary socket path.
+pub fn connect_addresses(fd: BorrowedFd<'_>, addrs: &[SocketAddr]) -> io::Result<ConnectStatus> {
+    platform::connect_addresses(fd, addrs)
+}
+
+/// Return the local SCTP addresses for an endpoint or association.
+pub fn local_addresses(fd: BorrowedFd<'_>, assoc_id: AssocId) -> io::Result<Vec<SocketAddr>> {
+    platform::local_addresses(fd, assoc_id)
+}
+
+/// Return the peer SCTP addresses for an association.
+pub fn peer_addresses(fd: BorrowedFd<'_>, assoc_id: AssocId) -> io::Result<Vec<SocketAddr>> {
+    platform::peer_addresses(fd, assoc_id)
+}
+
+/// Return whether an I/O error means the kernel cannot provide static
+/// multihoming for this socket.
+#[must_use]
+pub fn is_multihoming_unavailable(error: &io::Error) -> bool {
+    platform::is_multihoming_unavailable(error)
 }
 
 /// Return the pending socket error after a nonblocking connect completes.

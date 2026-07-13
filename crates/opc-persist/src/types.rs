@@ -118,6 +118,52 @@ pub struct StoredConfig {
     pub audit: Vec<AuditRecord>,
 }
 
+/// A config commit bound to one successful outer-adapter AEAD encryption.
+///
+/// The one-shot encryption claim is consumed by [`Self::try_new`] and is not
+/// retained or serialized. Consensus therefore receives only ciphertext and
+/// deterministic metadata, while unauthenticated raw bytes cannot enter its
+/// proposal API.
+pub struct AttestedConfigCommit {
+    record: CommitRecord,
+    audit: Vec<AuditRecord>,
+}
+
+impl AttestedConfigCommit {
+    pub fn try_new(
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        claim: opc_crypto::AuthenticatedEnvelopeClaim,
+    ) -> Result<Self, PersistError> {
+        if !claim.matches(&record.encrypted_blob)
+            || !claim.matches_plaintext_digest(&record.plaintext_digest)
+        {
+            return Err(PersistError::corrupt_blob());
+        }
+        Ok(Self { record, audit })
+    }
+
+    pub(crate) fn into_parts(self) -> (CommitRecord, Vec<AuditRecord>) {
+        (self.record, self.audit)
+    }
+
+    pub fn record(&self) -> &CommitRecord {
+        &self.record
+    }
+}
+
+impl fmt::Debug for AttestedConfigCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttestedConfigCommit")
+            .field("tx_id", &self.record.tx_id)
+            .field("version", &self.record.version)
+            .field("encrypted_blob", &"<redacted>")
+            .field("audit_records", &self.audit.len())
+            .finish()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ConfigStore trait
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +194,17 @@ pub trait ConfigStore: Send + Sync {
         record: CommitRecord,
         audit: Vec<AuditRecord>,
     ) -> Result<(), PersistError>;
+
+    /// Append a commit carrying one-shot evidence from the real encryption
+    /// adapter. Ordinary SQLite/mock stores delegate to their existing typed
+    /// append; consensus stores override this and reject the raw method.
+    async fn append_attested_commit(
+        &self,
+        commit: AttestedConfigCommit,
+    ) -> Result<(), PersistError> {
+        let (record, audit) = commit.into_parts();
+        self.append_commit(record, audit).await
+    }
 
     /// Mark a commit-confirmed transaction as confirmed before its deadline.
     async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), PersistError>;
@@ -189,27 +246,74 @@ pub use crate::error::PersistError;
 ///
 /// The key is deliberately opaque and refuses all-zero material so production
 /// callers cannot accidentally get forgeable audit chains.
+///
+/// ```compile_fail
+/// use opc_persist::AuditKey;
+/// let key = AuditKey::new([7; 32]).expect("audit key");
+/// let _raw_material = key.as_bytes();
+/// ```
 #[derive(Clone)]
-pub struct AuditKey(Zeroizing<[u8; 32]>);
+pub struct AuditKey {
+    epoch: u64,
+    material: Zeroizing<[u8; 32]>,
+}
+
+const AUDIT_KEY_FINGERPRINT_DOMAIN: &[u8] = b"openpacketcore/config-audit-key/fingerprint/v1\0";
 
 impl AuditKey {
     pub fn new(bytes: [u8; 32]) -> Result<Self, PersistError> {
+        Self::new_with_epoch(bytes, 1)
+    }
+
+    /// Construct deployment-owned audit material at an explicit rotation
+    /// epoch. The epoch is non-secret and participates in config-consensus
+    /// durable identity and peer admission.
+    pub fn new_with_epoch(bytes: [u8; 32], epoch: u64) -> Result<Self, PersistError> {
         if bytes.iter().all(|byte| *byte == 0) {
             return Err(PersistError::preflight_failed(
                 "audit HMAC key must not be all zero",
             ));
         }
-        Ok(Self(Zeroizing::new(bytes)))
+        if epoch == 0 || epoch > i64::MAX as u64 {
+            return Err(PersistError::preflight_failed(
+                "audit HMAC key epoch is outside the durable range",
+            ));
+        }
+        Ok(Self {
+            epoch,
+            material: Zeroizing::new(bytes),
+        })
     }
 
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.material
+    }
+
+    /// Non-secret deployment rotation epoch used by durable/peer admission.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Purpose-separated, non-secret fingerprint for fleet compatibility
+    /// checks. This is an HMAC output and does not reveal the key material.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(self.as_bytes())
+            .expect("HMAC-SHA-256 accepts a 32-byte key");
+        mac.update(AUDIT_KEY_FINGERPRINT_DOMAIN);
+        mac.update(&self.epoch.to_be_bytes());
+        mac.finalize().into_bytes().into()
     }
 }
 
 impl fmt::Debug for AuditKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuditKey")
+            .field("epoch", &self.epoch)
+            .field(
+                "fingerprint",
+                &"<non-secret-available-via-consensus-status>",
+            )
             .field("material", &"<redacted>")
             .finish()
     }

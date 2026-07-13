@@ -13,11 +13,85 @@ use opc_key::{
     AES_256_GCM_SIV_NONCE_LEN,
 };
 use rand::{rngs::SysRng, TryRng};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
 const ENVELOPE_MAGIC: [u8; 4] = *b"OPCE";
 const ENVELOPE_VERSION: u16 = 1;
 const HEADER_LEN: usize = 4 + 2 + 2 + 2 + 2 + 4;
+
+/// One-shot evidence that an envelope was returned by a successful encryption
+/// operation. The evidence is consumed at the persistence adapter boundary and
+/// is never serialized into a consensus command, log, RPC, or snapshot.
+#[derive(Clone)]
+pub struct AuthenticatedEnvelope {
+    encoded: Arc<[u8]>,
+    plaintext_digest: [u8; 32],
+    unclaimed: Arc<AtomicBool>,
+}
+
+impl AuthenticatedEnvelope {
+    fn new(encoded: Vec<u8>, plaintext: &[u8]) -> Self {
+        Self {
+            encoded: Arc::from(encoded),
+            plaintext_digest: Sha256::digest(plaintext).into(),
+            unclaimed: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Encoded AEAD envelope bytes to place in the sealed record.
+    pub fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    /// Consume the fresh-encryption capability exactly once.
+    pub fn claim(&self) -> Result<AuthenticatedEnvelopeClaim, CryptoError> {
+        self.unclaimed
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CryptoError::EncryptionFailed)?;
+        Ok(AuthenticatedEnvelopeClaim {
+            encoded: self.encoded.clone(),
+            plaintext_digest: self.plaintext_digest,
+        })
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedEnvelope")
+            .field("encoded", &"<redacted>")
+            .field("unclaimed", &self.unclaimed.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+/// Non-cloneable one-shot claim consumed by an authenticated persistence
+/// proposal constructor.
+pub struct AuthenticatedEnvelopeClaim {
+    encoded: Arc<[u8]>,
+    plaintext_digest: [u8; 32],
+}
+
+impl AuthenticatedEnvelopeClaim {
+    /// Verify that record bytes are exactly the successfully encrypted bytes.
+    pub fn matches(&self, encoded: &[u8]) -> bool {
+        self.encoded.as_ref() == encoded
+    }
+
+    /// Verify the digest of the plaintext input that was encrypted.
+    pub fn matches_plaintext_digest(&self, digest: &[u8]) -> bool {
+        self.plaintext_digest.as_slice() == digest
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedEnvelopeClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthenticatedEnvelopeClaim(<redacted>)")
+    }
+}
 
 /// Decoded RFC 001 envelope structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +208,17 @@ pub async fn encrypt_envelope<P: KeyProvider + ?Sized>(
     encrypt_envelope_with_nonce(provider, aad, plaintext, nonce).await
 }
 
+/// Encrypt and return a one-shot persistence-boundary attestation.
+pub async fn encrypt_attested_envelope<P: KeyProvider + ?Sized>(
+    provider: &P,
+    aad: &EnvelopeAad,
+    plaintext: &[u8],
+) -> Result<AuthenticatedEnvelope, CryptoError> {
+    encrypt_envelope(provider, aad, plaintext)
+        .await
+        .map(|encoded| AuthenticatedEnvelope::new(encoded, plaintext))
+}
+
 /// Deterministic encryption for test vectors.
 ///
 /// Callers MUST NOT reuse a nonce with the same key. Prefer [`encrypt_envelope`]
@@ -185,6 +270,18 @@ pub fn encrypt_envelope_with_handle_and_nonce(
         ciphertext_and_tag: payload.ciphertext_and_tag,
     }
     .encode()
+}
+
+/// Deterministic test/vector variant that also returns one-shot evidence.
+/// Callers MUST NOT reuse a nonce with the same key.
+pub fn encrypt_attested_envelope_with_handle_and_nonce(
+    handle: &KeyHandle,
+    aad: &EnvelopeAad,
+    plaintext: &[u8],
+    nonce: [u8; AES_256_GCM_SIV_NONCE_LEN],
+) -> Result<AuthenticatedEnvelope, CryptoError> {
+    encrypt_envelope_with_handle_and_nonce(handle, aad, plaintext, nonce)
+        .map(|encoded| AuthenticatedEnvelope::new(encoded, plaintext))
 }
 
 pub fn decrypt_envelope_with_handle(
@@ -379,6 +476,28 @@ mod tests {
 
         assert_eq!(round_trip.as_slice(), plaintext);
         assert_eq!(envelope.nonce.len(), AES_256_GCM_SIV_NONCE_LEN);
+    }
+
+    #[tokio::test]
+    async fn authenticated_envelope_claim_is_exact_and_one_shot_across_clones() {
+        let provider = provider_with_active_key(KeyPurpose::Config, "config-key-2026-01", 0x41);
+        let plaintext = br#"{"hostname":"amf-01"}"#;
+        let aad = config_aad();
+        let envelope = encrypt_attested_envelope(&provider, &aad, plaintext)
+            .await
+            .expect("attested encryption");
+        let clone = envelope.clone();
+        let encoded = envelope.encoded().to_vec();
+        let claim = clone.claim().expect("first claim");
+
+        assert!(claim.matches(&encoded));
+        assert!(!claim.matches(b"different envelope"));
+        assert!(claim.matches_plaintext_digest(&Sha256::digest(plaintext)));
+        assert!(!claim.matches_plaintext_digest(&[0; 32]));
+        assert_eq!(
+            CryptoError::EncryptionFailed,
+            envelope.claim().expect_err("second claim must fail")
+        );
     }
 
     #[tokio::test]

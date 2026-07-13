@@ -149,7 +149,7 @@ async fn test_tenant_separation_empirical() {
 #[tokio::test]
 async fn test_key_lane_separation_empirical() {
     let _guard = EMPIRICAL_TEST_MUTEX.lock().await;
-    let (service, backend, key_provider, _temp_dir) =
+    let (service, _backend, key_provider, temp_dir) =
         setup_stress_service(&["tenant-a", "tenant-b"]).await;
 
     let admin_a = get_tenant_principal("tenant-a", "security-admin");
@@ -163,8 +163,7 @@ async fn test_key_lane_separation_empirical() {
     service.apply_policy("tenant-a", &admin_a).await.unwrap();
 
     // Fetch the encrypted blob from the database for Tenant A
-    let conn_mutex = backend.conn();
-    let conn = conn_mutex.lock().await;
+    let conn = rusqlite::Connection::open(temp_dir.path().join("stress_security.db")).unwrap();
     let (version, encrypted_blob): (u64, Vec<u8>) = conn
         .query_row(
             "SELECT version, encrypted_blob FROM security_policy_active WHERE tenant = ?1",

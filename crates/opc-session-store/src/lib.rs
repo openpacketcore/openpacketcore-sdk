@@ -17,6 +17,7 @@
 //! | [`record`] | Stored record format and encrypted payloads |
 //! | [`topology`] | Validated quorum membership and replica identity |
 //! | [`readiness`] | Fresh, bounded durable-quorum readiness evidence |
+//! | [`recovery`] | Authorized offline legacy-fork inspection and recovery |
 //! | [`fake`] | In-memory backend and lease manager for tests |
 //! | [`error`] | `StoreError` and `LeaseError` |
 
@@ -37,6 +38,7 @@ pub mod payload_codec;
 pub mod quorum;
 pub mod readiness;
 pub mod record;
+pub mod recovery;
 pub mod restore;
 pub mod sqlite;
 pub mod store;
@@ -91,15 +93,25 @@ pub use payload_codec::{
 };
 pub use quorum::{QuorumSessionStore, SessionStoreBackend};
 pub use readiness::{
-    DurableReadinessReport, DurableReadinessState, ReplicaReadinessFailure,
-    ReplicaReadinessObservation, ReplicaReadinessOutcome,
+    DurableReadinessReport, DurableReadinessState, DurableRecoveryProgress, DurableRecoveryState,
+    ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
+pub use recovery::{
+    LegacyForkRecovery, RecoveryAction, RecoveryAlarm, RecoveryAuthorizationDenied,
+    RecoveryAuthorizationScope, RecoveryAuthorizer, RecoveryConfirmation, RecoveryContext,
+    RecoveryDecisionBasis, RecoveryDigest, RecoveryError, RecoveryExecutionReport,
+    RecoveryExecutionState, RecoveryIntegrityKey, RecoveryLimits, RecoveryObserver, RecoveryPlan,
+    RecoveryReplica, RecoveryReplicaEvidence, RecoveryReplicaFormat, RecoverySignal,
+};
 pub use restore::{
     summarize_restore_records, OwnerFenceMetadata, RestoreBlockReason, RestoreBlockReasonCode,
-    RestoreRecordSummary, RestoreScanCursor, RestoreScanPage, RestoreScanRequest, RestoreScanScope,
-    RestoreStage, StoredRecordHeaderSummary, RESTORE_SCAN_DEFAULT_PAGE_SIZE,
-    RESTORE_SCAN_MAX_PAGE_SIZE,
+    RestoreRecordSummary, RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage,
+    RestoreScanRequest, RestoreScanScope, RestoreStage, StoredRecordHeaderSummary,
+    RESTORE_SCAN_DEFAULT_PAGE_SIZE, RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES,
+    RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
+    RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES, RESTORE_SCAN_MAX_PAGE_SIZE,
+    RESTORE_SCAN_MAX_SQLITE_VM_STEPS, RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
 };
 pub use sqlite::SqliteSessionBackend;
 pub use store::SessionStore;

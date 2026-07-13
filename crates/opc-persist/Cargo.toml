@@ -17,7 +17,7 @@ categories = ["network-programming", "data-structures"]
 thiserror = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "rt"] }
+tokio = { workspace = true, features = ["sync", "time", "io-util", "fs", "rt"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
@@ -25,26 +25,22 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
-x509-parser = { workspace = true }
 
 # SQLite with bundled static library (no system SQLite needed)
 # rusqlite 0.40 pulls libsqlite3-sys 0.38, whose build script needs cfg_select!
 # (Rust 1.91); held at 0.32 while the workspace MSRV is 1.88.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks"] }
 rand = { workspace = true }
+libc = "0.2"
 
 # Shared types across the SDK
 opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
-opc-identity = { path = "../opc-identity", version = "0.2.0" }
-opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
+opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 
 [features]
 default = []
@@ -56,5 +52,4 @@ workspace = true
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
-rcgen = { workspace = true }
 opc-alarm = { path = "../opc-alarm", version = "0.2.0" }

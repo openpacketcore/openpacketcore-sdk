@@ -110,5 +110,9 @@ an SCTP-terminating CNF is in scope:
   enforced" lesson of ADR 0014.
 - `opc-sctp` uses the non-inheritance mechanism and `AsyncFd` model described
   by this ADR. Its README and tests record the current capability profile.
+- Static multihoming stays inside the same boundary: the sys crate owns the
+  packed Linux bindx/connectx and bounded address-list UAPI, while the safe
+  crate validates complete address sets, preserves the single-address syscall
+  path, and exposes typed capability and kernel-active-address evidence.
 - NGAP-over-SCTP wiring (PPID 60) is separate integration work and is not
   authorized to use FFI for the NGAP codec itself.

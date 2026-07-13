@@ -473,8 +473,7 @@ async fn test_break_glass_audit_corruption_fails_closed() {
         .unwrap();
 
     {
-        let conn = backend.conn();
-        let db = conn.lock().await;
+        let db = rusqlite::Connection::open(&db_path).unwrap();
         db.execute(
             "UPDATE break_glass_audit SET entry_hmac = ?1 WHERE tenant = ?2",
             rusqlite::params![vec![0x01_u8, 0x02, 0x03], tenant],

@@ -23,10 +23,12 @@ The #127 implementation uses one shared Openraft engine for intra-cluster
 election, voting, log matching, commitment, membership, snapshots, and
 linearizable-read authority. `ConsensusSessionStore` is the operational store;
 `QuorumSessionStore` is a compatibility alias, not a second quorum algorithm.
-This RFC does not claim production qualification: divergence recovery (#128),
-operator-safe legacy-fork recovery (#129), majority-authoritative bounded
-restore (#133), distributed qualification (#143), and seamless credential
-rotation remain gates.
+This RFC does not claim production qualification: #128 supplies
+current-format recovery and #129 supplies the audited offline legacy-fork
+campaign, while #133 supplies bounded restore from the Openraft-applied state
+without becoming readiness evidence by itself. Distributed qualification
+(#143) and seamless credential rotation beyond the qualified
+subsequent-new-call/full-handshake SVID scope remain gates.
 
 ## 2. Scope
 
@@ -232,11 +234,12 @@ or store replacement before startup; automatic guessing/truncation is forbidden.
 
 This bounded identity admission closes #135's scoped model/persistence
 boundary. Protocol-v4 fixed-width wire admission is implemented under #134,
-and #127 now supplies Openraft durable commit authority. Those changes do not
-provide divergence or legacy-fork recovery (#128/#129), majority-authoritative
-restore (#133), or production qualification (#143). Seamless certificate and
-trust-bundle lifecycle remains the #161 -> #162 -> #163 -> #164 chain under
-umbrella #158;
+and #127 now supplies Openraft durable commit authority. #128 supplies
+current-format divergence recovery and #129 supplies explicit offline
+legacy-fork recovery. #133 supplies bounded snapshot-bound applied-state
+restore; production qualification (#143) remains open. Seamless certificate
+and trust-bundle lifecycle remains the #161 -> #162 -> #163 -> #164 chain
+under umbrella #158;
 payload-protection-key rotation and distributed production evidence remain
 #143.
 
@@ -328,8 +331,9 @@ public or trust boundary is intentional: direct callers and older peers must
 fail closed even if an outer layer omitted validation.
 
 The new errors are public enum variants, so external exhaustive matches MUST be
-updated. Protocol v4 encodes them through private fixed-width DTOs under pinned
-error revision 1. An older v3 decoder is rejected during the exact handshake;
+updated. Protocol v4 introduced their private fixed-width DTOs in error
+revision 1; current error revision 2 retains those encodings. An older v3
+decoder is rejected during the exact handshake;
 deployments MUST use the coordinated v4 rollout in §12.3.
 
 ## 8. Record Format
@@ -562,8 +566,9 @@ successful appends remain observable normally. These are
 backend-local atomicity requirements. In the production HA profile, a caller
 MUST NOT invoke rebuild or append as an alternative authority path; only an
 Openraft-committed command or snapshot installation may replace authoritative
-state. #127 supplies that commit gate, while #128/#129 own reconciliation and
-operator-directed legacy recovery.
+state. #127 supplies that commit gate, #128 owns current-format reconciliation,
+and #129 provides the offline operator-directed legacy campaign documented in
+the [recovery runbook](../session-store-legacy-recovery.md).
 
 An operator upgrading persisted state from an older SDK MUST audit every
 TTL-bearing replication entry before rollout. A legacy entry above 365 days
@@ -667,8 +672,9 @@ and lease sequencing MUST be rejected by this production adapter.
 Snapshots MUST be bounded, checksummed, tied to the exact consensus identity,
 and installed atomically as one coherent state-machine image. They MUST contain
 only payloads already admitted by the protection wrapper described in §14.1.
-Automatic reconciliation of a divergent replica remains #128, and an
-operator-safe path for pre-#127 persisted forks remains #129.
+Automatic current-format reconciliation is supplied by #128. Pre-#127
+persisted forks use #129's full-fleet, backup-before-mutation procedure and
+remain readiness-fenced until Openraft commits the recovery epoch.
 
 `probe_durable_readiness` MUST use the same bounded authority path as an
 authoritative read: discover or follow the current leader, execute Openraft's
@@ -678,8 +684,24 @@ bound listener, completed TLS handshake, cached capability set, local SQLite
 availability, or successful single-node restore scan MUST NOT produce `Ready`.
 The readiness result is point-in-time evidence, never an ownership lease.
 Products MUST continuously gate ownership publication, VIP/service
-advertisement, and traffic on fresh readiness. #133 must additionally make
-restore scans bounded and majority-authoritative; restore method availability
+advertisement, and traffic on fresh readiness. Restore scans MUST execute only
+after the Openraft barrier and local apply. One absolute deadline MUST begin at
+the public restore entry and cover the barrier/apply path, blocking-worker and
+asynchronous connection admission, SQLite progress, and blocking-task join.
+Each page MUST examine no more than 4,096 live candidates plus one non-decoded
+lookahead, return no more than 1,024 records, 4 MiB of payload, or 8 MiB of
+retained record/key/metadata/payload/cursor bytes, examine no more than 8 MiB
+of key/filter metadata, and obey the SQLite VM-step, wall-time, and cancellation
+budgets. Candidate/lookahead SQL MUST NOT select payload blobs; admitted
+records are fetched by exact primary key inside the same transaction. Scope
+filtering occurs inside the backend over that
+bounded candidate window, so an empty page is valid only with a different
+durable cursor and nonzero excluded/examined count. Pagination MUST seek the
+existing composite primary key; it MUST NOT use `OFFSET` or add a digest-order
+authority. The cursor MUST confidentially and authentically bind that seek key,
+backend epoch, record revision, logical-time snapshot, scope, and examined
+progress. Any edit or mismatch MUST return `RestoreScanCursorStale` before the
+record query rather than skip, merge, or guess. Restore method availability
 alone is not readiness evidence.
 
 Replicas MUST apply events only if `generation` and `fence` are newer according
@@ -901,8 +923,8 @@ or traffic admission. A cache MUST be keyed by the exact profile and negotiated
 directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
-The v3-to-v4 transition, and the same-v4 wire-schema revision-1 to revision-2
-transition, are coordinated stop/upgrade/start boundaries, not rolling
+The v3-to-v4 transition, and same-v4 wire-schema transitions through revision 3,
+are coordinated stop/upgrade/start boundaries, not rolling
 deployments. Operators MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore
 source, and replay source for the stable-ID and transaction-ID bounds; and
@@ -913,33 +935,58 @@ replacement occurs. Stable IDs MUST follow the product-aware #167
 model/persistence/privacy/audit policy, and durable transaction IDs MUST follow
 the canonical-type/migration policy in #168 coordinated with #127/#128/#143. The
 migration MUST NOT silently truncate, hash, or rename a key or idempotency
-identity. Operators MUST verify that the strict revision-2 decoder accepts the
+identity. Operators MUST verify that the strict revision-3 decoder accepts the
 result; then they MUST stop every session-net client, server, and protection
 wrapper plus every handover reader/writer; upgrade them together; verify
-exact-v4 authenticated restore/log traffic and fresh quorum evidence; and only
+exact-v4 authenticated restore/log traffic, rejection of modified/legacy
+restore cursors, sparse empty-page progress, and fresh quorum evidence; and only
 then restore traffic. Once an
 `OPCH` value has been written, v3 rollback additionally requires a coherent
 drained checkpoint restore or reviewed reverse migration of every live and
 replayable record, log, snapshot, and restore source.
-Revision 2 does not itself rewrite persisted session-store bytes. In-profile
+Revision 3 adds only an O(1) per-store cursor key to local restore metadata; it
+does not rewrite session records or create another authority. A pre-revision-3
+consensus snapshot lacks that metadata and MUST NOT be installed after upgrade;
+operators MUST take and validate a coherent post-upgrade snapshot before
+claiming repair or rollback coverage. In-profile
 data needs no format conversion, but out-of-profile retained values MUST be
 migrated or replaced before strict transport starts. Binary rollback MUST
 restore one exact drained fleet profile and install a rollback-side decoder that
 can read the retained target representation before old writers restart;
 otherwise it MUST restore a coherent checkpoint or run a reviewed reverse
-migration. Mixed revision-1 and revision-2 participants fail closed. Rollback
+migration. Mixed revision-3 and older participants fail closed. Rollback
 across the independent `OPCH`/#135 boundary retains its checkpoint/reverse-
 migration requirement.
 
+The cursor encoding is variable-length but strictly bounded by the consensus
+RPC/key ceiling. HMAC-derived AEAD and synthetic-nonce keys are separated;
+identical semantic positions encode identically. The seek key and snapshot
+metadata remain confidential, while a clear cumulative examined-row position
+is bound into cursor authentication. A receiver can reject a structurally
+inconsistent claimed step and the issuer authenticates the position when the
+cursor returns, but neither fact proves peer-page completeness or server
+honesty. Production completeness comes from the local Openraft-applied state
+after its linearizable barrier.
+Cursors are backend-incarnation/node-bound: same-PVC restart can resume, but
+another node or installed snapshot MUST return typed stale-cursor state and the
+caller MUST discard partial pagination and restart at the first page.
+
 #159 establishes only session-net response/write and wire-containment bounds.
-It does not close #167 or #168, does not implement seamless SVID/trust-bundle
-rotation (#161 -> #162 -> #163 -> #164 under umbrella #158), and does not provide #143's
-payload-key/distributed production qualification. It also does not change
-`opc-persist`'s already-implemented #169 `TcpPeer::timeout` contract, whose one
-atomic end-to-end logical-RPC deadline covers attempts and backoff with safe
-retry policy and bounded metrics. Any compatibility transport work must
-preserve #127's Openraft authority rather than reopen direct mutation as a
-quorum path.
+It does not close #167 or #168 and does not provide #143's
+payload-key/distributed production qualification. Real-mTLS transport tests now
+qualify a renewed SVID on a subsequent new call/full handshake and rejection
+of rotated client/server identities outside the bound peer scope. That scoped
+evidence is not seamless rotation, old-connection retirement, multi-process
+rotation/soak, or the complete trust-bundle, revocation, and
+authentication-age lifecycle. #177 removes `opc-persist`'s separate config TCP
+path and reuses the shared consensus peer/handler boundary instead of defining
+another timeout or credential lifecycle. An in-process real-mTLS integration
+forms a three-node config Openraft cluster and commits/linearizably reads
+through the existing peer/server types. Any compatibility transport work
+must preserve the single Openraft authority rather than reopen direct mutation
+as a quorum path.
+Seamless SVID/trust-bundle rotation remains #161 -> #162 -> #163 -> #164 under
+umbrella #158.
 
 ### 12.4 Consensus-Only Session Transport
 
@@ -977,17 +1024,22 @@ repair. An identity, authentication, schema, payload-bound, or sender mismatch
 MUST fail before Openraft dispatch with redaction-safe diagnostics.
 
 This authenticated transport plus #127 commit authority is still not a
-production qualification. #133 MUST provide bounded majority-authoritative
-restore behavior without reopening a direct backend/rebuild port. #128 and
-#129 remain the divergence and legacy-fork recovery gates, and #143 remains the
-distributed partition/restart/resource/soak and payload-key gate. Seamless
-transport credential rotation MUST complete, in dependency order, #161
-(atomic reload), #162 (material epochs), #163 (reauthentication across an
-epoch), and #164 (qualification), with #158 remaining open as the umbrella
-until that evidence passes. Implementations
-MUST overlap old/new trust, retire old connections, enforce revocation and a
-documented maximum authentication age, and bound reconnect storms; a fresh
-handshake by itself is not seamless-rotation evidence.
+production qualification. #128 supplies current-format divergence recovery,
+#129 supplies the audited offline legacy-fork campaign without reopening a
+runtime consensus path, and #133 provides bounded applied-state restore without
+reopening a direct backend/rebuild port. #143 remains the distributed
+partition/restart/resource/soak and payload-key gate. Real-mTLS
+transport tests now qualify live client/server SVID reload observed by a fresh
+full handshake on a subsequent new call, success for a correctly scoped
+renewed identity, and rejection of an incorrectly scoped rotated identity.
+They do not exercise an in-flight or retained old connection. Full seamless
+production rotation MUST additionally overlap old/new trust, retire old
+connections, enforce revocation and a documented maximum authentication age,
+bound reconnect storms, and supply multi-process/soak evidence. The scoped
+in-process new-call result does not close those fleet lifecycle requirements.
+The required dependency order remains #161 (atomic reload), #162 (material
+epochs), #163 (reauthentication across an epoch), and #164 (qualification),
+with #158 remaining open as the umbrella until that evidence passes.
 
 ## 13. Local Cache
 
@@ -1102,6 +1154,18 @@ Required metrics:
 - `opc_session_replication_lag_seconds{region}`
 - `opc_session_cache_hit_ratio{state_class}`
 - `opc_session_record_bytes{state_type}`
+- `opc_session_restore_pages_total{outcome,cursor_profile,complete}`
+- `opc_session_restore_page_records{cursor_profile}`
+- `opc_session_restore_page_examined{cursor_profile}`
+- `opc_session_restore_page_payload_bytes{cursor_profile}`
+- `opc_session_restore_page_latency_seconds{cursor_profile}`
+- `opc_session_restore_restarts_total{reason}` where `reason` is one of
+  `stale_cursor`, `work_budget`, `response_too_large`, or `cancelled`
+
+Restore metric labels MUST NOT include cursor bytes, key fields, tenant, owner,
+payload, peer-controlled text, paths, or certificate identity. A product MAY
+expose these metrics through its existing metrics facade; #133 does not add a
+second registry or metrics authority.
 
 Required logs for state transitions:
 
@@ -1271,7 +1335,6 @@ This RFC is implemented when:
     provider/key handles never enter Raft apply/log/snapshot transport, and the
     documented payload-envelope versus full-database boundary is qualified.
 15. Divergence recovery (#128), operator-safe legacy-fork recovery (#129),
-    bounded majority-authoritative restore (#133), distributed production
-    qualification (#143), and the #161 -> #162 -> #163 -> #164
-    credential-rotation chain under umbrella #158 have passed their own
-    acceptance gates.
+    bounded applied-state restore (#133), distributed production qualification
+    (#143), and the #161 -> #162 -> #163 -> #164 credential-rotation chain
+    under umbrella #158 have passed their own acceptance gates.

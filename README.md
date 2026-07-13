@@ -4,7 +4,8 @@
 
 A polyglot software development kit of reusable foundations for cloud-native 5G
 packet core network functions (CNFs). It includes runtime-chassis APIs,
-Openraft-backed session consensus, encrypted config-persistence primitives,
+one shared Openraft engine for config and session consensus, encrypted
+config-persistence primitives,
 northbound gNMI/NETCONF foundations, data-governance/redaction mechanisms, and
 release-assurance schemas and policy APIs. Each surface has its own documented
 maturity and deployment boundary; this repository does not currently claim a
@@ -82,7 +83,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | :--- | :--- | :--- |
 | [`opc-config-bus`](crates/opc-config-bus/) | Transactional config bus supporting schema validation, tenant segregation, AAD-bound envelope encryption, and admission control. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-config-model`](crates/opc-config-model/) | Shared config-model request, result, identity, and error types. | [RFC 001](docs/rfc/001-management-substrate.md) |
-| [`opc-persist`](crates/opc-persist/) | Tamper-evident SQLite datastores and config persistence. Its custom consensus prototype is transition-only pending the required shared-Openraft migration in #177. | [RFC 001](docs/rfc/001-management-substrate.md), [ADR 0019](docs/adr/0019-one-openraft-consensus-engine.md) |
+| [`opc-persist`](crates/opc-persist/) | Tamper-evident SQLite datastores and a `ConsensusConfigStore` on the shared Openraft engine, with atomic authority fencing, sealed/redacted commands, and exact offline legacy recovery. Production HA qualification remains conditional. | [RFC 001](docs/rfc/001-management-substrate.md), [ADR 0002](docs/adr/0002-config-store-consensus-ha.md), [ADR 0019](docs/adr/0019-one-openraft-consensus-engine.md) |
 | [`opc-nacm`](crates/opc-nacm/) | Normalized YANG path parsing and NACM authorization evaluation. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-nacm-config`](crates/opc-nacm-config/) | Typed `/nacm` datastore model with RFC 8341 group/rule-list validation, SPIFFE group selectors, signed-grant resolution, and policy compilation. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-yanggen`](crates/opc-yanggen/) | YANG-to-Rust type projection, RFC 7951 JSON serde, schema registry generation, NETCONF XML/gNMI JSON projections, and patch applicators. | [RFC 002](docs/rfc/002-yang-projection.md) |
@@ -114,7 +115,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
 | [`opc-consensus`](crates/opc-consensus/) | Exact-pinned shared Openraft boundary with bounded codecs, stable cluster/configuration/node identity, and transport contracts; domain crates do not implement competing consensus authority. | [ADR 0019](docs/adr/0019-one-openraft-consensus-engine.md) |
-| [`opc-session-store`](crates/opc-session-store/) | Openraft-backed session authority with lease/fenced-CAS semantics, deterministic SQLite state-machine storage, committed journal/watch output, linearizable readiness, bounded snapshots, and envelope encryption above consensus. Networked production qualification remains conditional. | [RFC 004](docs/rfc/004-session-store.md), [ADR 0003](docs/adr/0003-session-store-quorum-replication.md) |
+| [`opc-session-store`](crates/opc-session-store/) | Openraft-backed session authority with lease/fenced-CAS semantics, deterministic SQLite state-machine storage, committed journal/watch output, linearizable readiness, bounded snapshots, envelope encryption above consensus, and an audited offline legacy-fork recovery campaign. Networked production qualification remains conditional. | [RFC 004](docs/rfc/004-session-store.md), [ADR 0003](docs/adr/0003-session-store-quorum-replication.md), [Recovery runbook](docs/session-store-legacy-recovery.md) |
 | [`opc-session-cache`](crates/opc-session-cache/) | Coherence-aware read-through session cache with key-scoped invalidation, sequence tracking, and resume recovery. It is not a durability layer and does not elevate the selected backend/profile's maturity. | [RFC 004](docs/rfc/004-session-store.md) |
 | [`opc-session-net`](crates/opc-session-net/) | Dedicated mTLS `opc-session-consensus/1` Openraft transport plus a feature-gated legacy backend/restore compatibility protocol. Logical member identity is independent of DNS/FQDN routing. | [RFC 004](docs/rfc/004-session-store.md) |
 

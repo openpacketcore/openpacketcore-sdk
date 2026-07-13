@@ -11,8 +11,10 @@ use opc_session_store::backend::{
 };
 use opc_session_store::error::{LeaseError, StoreError};
 use opc_session_store::quorum::SessionStoreBackend;
+#[cfg(test)]
+use opc_session_store::RestoreScanCursor;
 use opc_session_store::{
-    validate_session_ttl, ReplicaId, RestoreScanCursor, RestoreScanPage, RestoreScanRequest,
+    validate_session_ttl, ReplicaId, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
 };
 use opc_types::SpiffeId;
 use tokio::net::{TcpListener, TcpStream};
@@ -189,6 +191,16 @@ fn capabilities_for_transport(
         .min(conservative_payload_budget(request_frame_size))
         .min(conservative_payload_budget(response_frame_size));
     if response_frame_size < MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE {
+        capabilities.restore_scan = false;
+    }
+    capabilities
+}
+
+fn capabilities_for_restore_profile(
+    mut capabilities: opc_session_store::BackendCapabilities,
+    profile: Option<RestoreScanCursorProfile>,
+) -> opc_session_store::BackendCapabilities {
+    if profile != Some(RestoreScanCursorProfile::DurableOpaqueV1) {
         capabilities.restore_scan = false;
     }
     capabilities
@@ -524,7 +536,7 @@ fn bounded_restore_scan_response(
     deadline: tokio::time::Instant,
     cancellation: &AtomicBool,
 ) -> Result<Response, ProtocolError> {
-    let mut page = match result {
+    let page = match result {
         Ok(page) => page,
         Err(error) => {
             return bounded_restore_scan_error_response(
@@ -548,40 +560,35 @@ fn bounded_restore_scan_response(
         );
     }
 
-    loop {
-        match ensure_restore_scan_success_frame_fits_until(
-            &page,
+    match ensure_restore_scan_success_frame_fits_until(
+        &page,
+        max_response_frame_size,
+        deadline,
+        cancellation,
+    ) {
+        Ok(()) => Ok(Response::ScanRestoreRecords(Ok(page))),
+        Err(ProtocolError::FrameTooLarge(_)) => bounded_restore_scan_error_response(
+            StoreError::RestoreScanResponseTooLarge {
+                max_bytes: max_response_frame_size,
+            },
             max_response_frame_size,
             deadline,
             cancellation,
-        ) {
-            Ok(()) => return Ok(Response::ScanRestoreRecords(Ok(page))),
-            Err(ProtocolError::FrameTooLarge(_)) if page.records.len() > 1 => {
-                let retained = (page.records.len() / 2).max(1);
-                page.records.truncate(retained);
-                page.loaded_count = page.records.len();
-                let start = request.cursor.map(RestoreScanCursor::offset).unwrap_or(0);
-                let next = start.checked_add(page.records.len()).ok_or_else(|| {
-                    ProtocolError::BackendUnavailable(
-                        "restore scan cursor overflowed while fitting response".to_string(),
-                    )
-                })?;
-                page.next_cursor = Some(RestoreScanCursor::from_offset(next));
-                page.complete = false;
-            }
-            Err(ProtocolError::FrameTooLarge(_)) => {
-                return bounded_restore_scan_error_response(
-                    StoreError::RestoreScanResponseTooLarge {
-                        max_bytes: max_response_frame_size,
-                    },
-                    max_response_frame_size,
-                    deadline,
-                    cancellation,
-                );
-            }
-            Err(other) => return Err(other),
-        }
+        ),
+        Err(other) => Err(other),
     }
+}
+
+fn validate_dispatched_restore_page(
+    page: &RestoreScanPage,
+    dispatched_request: &RestoreScanRequest,
+) -> Result<(), StoreError> {
+    if page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1 {
+        return Err(StoreError::CapabilityNotSupported(
+            "legacy_remote_restore_scan".to_string(),
+        ));
+    }
+    page.validate_for_request(dispatched_request)
 }
 
 fn bounded_restore_scan_error_response(
@@ -1298,8 +1305,12 @@ where
 
         match req {
             Request::Capabilities => {
-                let caps = capabilities_for_transport(
+                let backend_capabilities = capabilities_for_restore_profile(
                     backend.capabilities().await,
+                    backend.restore_scan_cursor_profile(),
+                );
+                let caps = capabilities_for_transport(
+                    backend_capabilities,
                     max_frame_size,
                     effective_response_frame_size,
                 );
@@ -1537,7 +1548,7 @@ where
                 backend_request.limit = backend_request.limit.min(frame_limited_records);
                 let result = match tokio::time::timeout(
                     restore_scan_timeout,
-                    backend.scan_restore_records(backend_request),
+                    backend.scan_restore_records(backend_request.clone()),
                 )
                 .await
                 {
@@ -1550,7 +1561,7 @@ where
                 let response = match result {
                     Ok(page) => {
                         check_response_write_control(deadline, &cancellation)?;
-                        let validation = page.validate_for_request(&request);
+                        let validation = validate_dispatched_restore_page(&page, &backend_request);
                         check_response_write_control(deadline, &cancellation)?;
                         if let Err(error) = validation {
                             bounded_restore_scan_error_response(
@@ -1577,7 +1588,7 @@ where
                                 Err(ProtocolError::FrameTooLarge(_)) => {
                                     tracing::warn!(
                                         response_family = ResponseFamily::RestoreScan.code(),
-                                        reason = "page_shortening",
+                                        reason = "frame_too_large",
                                         "restore-scan response exceeded the negotiated frame limit"
                                     );
                                     let Response::ScanRestoreRecords(Ok(page)) = response else {
@@ -1585,7 +1596,7 @@ where
                                     };
                                     bounded_restore_scan_response(
                                         Ok(page),
-                                        &request,
+                                        &backend_request,
                                         effective_max,
                                         deadline,
                                         &cancellation,
@@ -1917,7 +1928,7 @@ where
     let deadline = response_write_deadline(timeout)?;
     write_frame_bounded_until_cancellable(
         writer,
-        &BootstrapResponse::HelloAck(BootstrapHelloAck {
+        &BootstrapResponse::HelloAck(Box::new(BootstrapHelloAck {
             contract_version: CONTRACT_VERSION,
             server_replica_id,
             accepted_client_replica_id,
@@ -1927,7 +1938,7 @@ where
             contract_profile: Some(CURRENT_CONTRACT_PROFILE),
             accepted_response_frame_size,
             server_request_frame_size,
-        }),
+        })),
         MAX_HANDSHAKE_FRAME_SIZE,
         deadline,
         cancellation,
@@ -1959,7 +1970,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ensure_frame_fits;
+    use crate::protocol::{ensure_frame_fits, ensure_restore_scan_success_frame_fits};
     use bytes::Bytes;
     use opc_session_store::{
         EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionKey, SessionKeyType,
@@ -2008,6 +2019,22 @@ mod tests {
             expires_at: None,
             payload: EncryptedSessionPayload::new(vec![7; payload_len]),
         }
+    }
+
+    fn durable_cursor_larger_than_the_default_frame() -> RestoreScanCursor {
+        let mut token = vec![0_u8; (crate::protocol::DEFAULT_MAX_FRAME_SIZE / 2) + 4_096];
+        token[0] = 1;
+        // Clear cumulative examined-row position, big endian.
+        token[8] = 1;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = Vec::with_capacity(token.len() * 2);
+        for byte in token {
+            encoded.push(HEX[usize::from(byte >> 4)]);
+            encoded.push(HEX[usize::from(byte & 0x0f)]);
+        }
+        let encoded = String::from_utf8(encoded).expect("lowercase cursor hex");
+        serde_json::from_value(serde_json::Value::String(encoded))
+            .expect("strictly bounded durable cursor shape")
     }
 
     fn replication_log_entry(sequence: u64, payload_len: usize) -> ReplicationEntry {
@@ -2114,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_restore_scan_response_truncates_and_advances_cursor() {
+    fn bounded_restore_scan_response_rejects_a_page_that_does_not_fit() {
         let request = RestoreScanRequest {
             scope: Default::default(),
             cursor: Some(RestoreScanCursor::from_offset(7)),
@@ -2123,17 +2150,10 @@ mod tests {
         let first = restore_record(b"a", 64);
         let second = restore_record(b"b", 64);
         let full_page = RestoreScanPage::new(vec![first.clone(), second], 0, None);
-        let expected_prefix =
-            RestoreScanPage::new(vec![first], 0, Some(RestoreScanCursor::from_offset(8)));
-        let budget = serde_json::to_vec(&Response::ScanRestoreRecords(Ok(expected_prefix.clone())))
-            .expect("encode prefix")
+        let full_size = serde_json::to_vec(&Response::ScanRestoreRecords(Ok(full_page.clone())))
+            .expect("encode full page")
             .len();
-        assert!(
-            serde_json::to_vec(&Response::ScanRestoreRecords(Ok(full_page.clone())))
-                .expect("encode full page")
-                .len()
-                > budget
-        );
+        let budget = full_size.checked_sub(1).expect("response is non-empty");
 
         let response = bounded_restore_scan_response(
             Ok(full_page),
@@ -2145,8 +2165,66 @@ mod tests {
         .expect("bounded response");
         assert!(matches!(
             response,
-            Response::ScanRestoreRecords(Ok(page)) if page == expected_prefix
+            Response::ScanRestoreRecords(Err(StoreError::RestoreScanResponseTooLarge {
+                max_bytes
+            })) if max_bytes == budget
         ));
+    }
+
+    #[test]
+    fn oversized_opaque_cursor_is_a_typed_negotiated_fit_failure() {
+        let request = RestoreScanRequest::all(1);
+        let mut page = RestoreScanPage::new(
+            Vec::new(),
+            1,
+            Some(durable_cursor_larger_than_the_default_frame()),
+        );
+        page.cursor_profile = RestoreScanCursorProfile::DurableOpaqueV1;
+        page.validate_for_request(&request)
+            .expect("syntactic test cursor proves exact page progress");
+        assert!(ensure_restore_scan_success_frame_fits(
+            &page,
+            crate::protocol::MAX_NEGOTIATED_FRAME_SIZE,
+        )
+        .is_ok());
+
+        let response = bounded_restore_scan_response(
+            Ok(page),
+            &request,
+            crate::protocol::DEFAULT_MAX_FRAME_SIZE,
+            response_write_deadline(std::time::Duration::from_secs(1)).expect("deadline"),
+            &TEST_NOT_CANCELLED,
+        )
+        .expect("bounded negotiated-fit response");
+        assert!(matches!(
+            response,
+            Response::ScanRestoreRecords(Err(StoreError::RestoreScanResponseTooLarge {
+                max_bytes: crate::protocol::DEFAULT_MAX_FRAME_SIZE
+            }))
+        ));
+    }
+
+    #[test]
+    fn restore_backend_page_is_checked_against_the_narrowed_dispatch_contract() {
+        let mut oversized = RestoreScanPage::new(
+            vec![restore_record(b"a", 16), restore_record(b"b", 16)],
+            0,
+            None,
+        );
+        oversized.cursor_profile = RestoreScanCursorProfile::DurableOpaqueV1;
+        let narrowed = RestoreScanRequest::all(1);
+        assert!(matches!(
+            validate_dispatched_restore_page(&oversized, &narrowed),
+            Err(StoreError::InvalidRestoreScanResponse(_))
+        ));
+
+        let legacy = RestoreScanPage::new(vec![restore_record(b"a", 16)], 0, None);
+        assert_eq!(
+            validate_dispatched_restore_page(&legacy, &narrowed),
+            Err(StoreError::CapabilityNotSupported(
+                "legacy_remote_restore_scan".to_string()
+            ))
+        );
     }
 
     #[test]
@@ -2299,6 +2377,26 @@ mod tests {
         assert_eq!(
             capabilities.max_value_bytes,
             conservative_payload_budget(response_frame_size)
+        );
+    }
+
+    #[test]
+    fn capabilities_mask_legacy_or_unspecified_restore_profiles() {
+        let capabilities = opc_session_store::BackendCapabilities::all_enabled();
+        assert!(
+            !capabilities_for_restore_profile(
+                capabilities,
+                Some(RestoreScanCursorProfile::LegacyCompatibility)
+            )
+            .restore_scan
+        );
+        assert!(!capabilities_for_restore_profile(capabilities, None).restore_scan);
+        assert!(
+            capabilities_for_restore_profile(
+                capabilities,
+                Some(RestoreScanCursorProfile::DurableOpaqueV1)
+            )
+            .restore_scan
         );
     }
 

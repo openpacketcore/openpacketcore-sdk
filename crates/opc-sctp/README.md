@@ -14,7 +14,8 @@ errors.
   `DIAMETER_SCTP_PPID`, `DIAMETER_DTLS_SCTP_PPID`, and
   `DIAMETER_DEFAULT_STREAM_ID`.
 - Config: `SctpEndpointConfig`, `SctpConnectConfig`, `SctpMode`, `InitConfig`,
-  `RtoConfig`, `HeartbeatConfig`, and `DeliveryOrder`.
+  `RtoConfig`, `HeartbeatConfig`, `DeliveryOrder`, `SctpCapabilities`, and
+  `MAX_STATIC_MULTIHOMING_ADDRESSES`.
 - Messaging: `OutboundMessage`, `InboundMessage`, `SctpEvent`, `SctpEndpoint`,
   and `SctpAssociation`.
 - Observability: `SctpHealth`, `SctpMetrics`, and `SctpMetricsSnapshot`.
@@ -53,15 +54,23 @@ async fn send_ngap(remote: std::net::SocketAddr, payload: Bytes) -> Result<(), S
 - Linux SCTP sockets are supported; non-Linux hosts fail closed with
   unsupported-platform errors.
 - One-to-one and one-to-many modes are represented.
-- Multi-address bind/connect currently fails closed.
+- Static multihoming binds every configured local address and connects with the
+  complete remote address set on Linux. Address sets are bounded and must use
+  one family and port; exactly one address preserves the original syscall path.
+- `capabilities()` advertises build support, kernel policy failures are a typed
+  `CapabilityUnavailable` error, and `local_addresses()`/`peer_addresses()`
+  expose the kernel-active set. Consumers may therefore choose an explicit
+  single-address fallback without silently ignoring configured addresses.
 - Custom RTO and heartbeat configs are modeled, but non-default values fail
   closed until the corresponding Linux option layouts are safely bound.
 - Live loopback tests require kernel SCTP support and are ignored where the host
-  cannot provide it.
+  cannot provide it. The path-failover qualification additionally uses
+  passwordless `sudo` to install port-scoped SCTP firewall rules and always
+  removes them through a drop guard.
 
 ## Roadmap
 
-- Bind multihoming and additional SCTP options only with validated UAPI support.
+- Add further SCTP options only with validated UAPI support.
 - Keep protocol-specific validation in protocol crates or thin helper layers,
   not in the generic SCTP transport.
 - Expand live integration coverage where CI hosts provide SCTP kernel support.
@@ -70,4 +79,6 @@ async fn send_ngap(remote: std::net::SocketAddr, payload: Bytes) -> Result<(), S
 
 ```sh
 cargo test -p opc-sctp
+cargo test -p opc-sctp tests::loopback_static_multihoming_binds_and_connects_full_sets -- --ignored --exact
+cargo test -p opc-sctp tests::static_multihoming_survives_primary_path_drop -- --ignored --exact
 ```

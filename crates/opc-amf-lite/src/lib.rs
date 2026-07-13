@@ -29,7 +29,9 @@ use opc_config_model::{
 use opc_data_governance::IdentifierType;
 use opc_key::{KeyProvider, KeyPurpose, KmsKeyProvider};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmEvaluator, NacmPolicy};
-use opc_persist::{AuditRecord, CommitRecord, CommitSource, ConfigStore, RollbackTarget};
+use opc_persist::{
+    AttestedConfigCommit, AuditRecord, CommitRecord, CommitSource, ConfigStore, RollbackTarget,
+};
 use opc_redaction::{DigestKey, RedactionLevel, TelcoIdentifier};
 use opc_runtime::{
     health::HealthResponse, known_gates, Builder, Criticality, GateImpact, GateStatus, HealthGate,
@@ -421,8 +423,11 @@ where
             entry_hmac: [0u8; 32],
         }];
 
+        let claim = commit.config.claim_fresh_envelope()?;
+        let commit = AttestedConfigCommit::try_new(record, audit, claim)
+            .map_err(|error| StoreError::internal(error.to_string()))?;
         self.inner
-            .append_commit(record, audit)
+            .append_attested_commit(commit)
             .await
             .map_err(|e| StoreError::internal(e.to_string()))
     }

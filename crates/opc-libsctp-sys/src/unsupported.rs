@@ -26,6 +26,10 @@ pub fn bind(_fd: BorrowedFd<'_>, _addr: &SocketAddr) -> io::Result<()> {
     Err(unsupported())
 }
 
+pub fn bind_addresses(_fd: BorrowedFd<'_>, _addrs: &[SocketAddr]) -> io::Result<()> {
+    Err(unsupported())
+}
+
 pub fn listen(_fd: BorrowedFd<'_>, _backlog: i32) -> io::Result<()> {
     Err(unsupported())
 }
@@ -36,6 +40,22 @@ pub fn accept(_fd: BorrowedFd<'_>) -> io::Result<(OwnedFd, SocketAddr)> {
 
 pub fn connect(_fd: BorrowedFd<'_>, _addr: &SocketAddr) -> io::Result<ConnectStatus> {
     Err(unsupported())
+}
+
+pub fn connect_addresses(_fd: BorrowedFd<'_>, _addrs: &[SocketAddr]) -> io::Result<ConnectStatus> {
+    Err(unsupported())
+}
+
+pub fn local_addresses(_fd: BorrowedFd<'_>, _assoc_id: i32) -> io::Result<Vec<SocketAddr>> {
+    Err(unsupported())
+}
+
+pub fn peer_addresses(_fd: BorrowedFd<'_>, _assoc_id: i32) -> io::Result<Vec<SocketAddr>> {
+    Err(unsupported())
+}
+
+pub fn is_multihoming_unavailable(_error: &io::Error) -> bool {
+    true
 }
 
 pub fn socket_error(_fd: BorrowedFd<'_>) -> io::Result<Option<io::Error>> {

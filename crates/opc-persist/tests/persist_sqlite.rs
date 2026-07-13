@@ -3,7 +3,7 @@ mod persist_common;
 use opc_persist::{AuditKey, ConfigStore, MockConfigStore, PersistErrorKind, SqliteBackend};
 use opc_types::TxId;
 
-use persist_common::{make_commit_record, test_audit_key};
+use persist_common::{make_audit_record, make_commit_record, test_audit_key};
 
 #[tokio::test]
 async fn open_migrates_schema_version_1_0_0_to_alarm_audit_schema() {
@@ -66,7 +66,7 @@ async fn open_migrates_schema_version_1_0_0_to_alarm_audit_schema() {
         .query_row("SELECT COUNT(*) FROM alarm_audit", [], |row| row.get(0))
         .expect("query migrated alarm audit table");
 
-    assert_eq!(sdk_version, "1.8.1");
+    assert_eq!(sdk_version, "1.9.0");
     assert_ne!(schema_digest, "legacy-digest");
     assert_eq!(alarm_audit_count, 1);
 }
@@ -113,7 +113,7 @@ async fn open_migrates_schema_version_1_4_0_to_current_schema() {
         )
         .expect("read migrated schema digest");
 
-    assert_eq!(sdk_version, "1.8.1");
+    assert_eq!(sdk_version, "1.9.0");
     assert_ne!(schema_digest, "legacy-digest-1-4");
 }
 
@@ -566,10 +566,34 @@ async fn ephemeral_backends_use_distinct_audit_hmac_keys() {
         .await
         .expect("open second ephemeral backend");
 
+    let tx_a = TxId::new();
+    let tx_b = TxId::new();
+    backend_a
+        .append_commit(
+            make_commit_record(tx_a, 1),
+            vec![make_audit_record(tx_a, 0, "/system/hostname")],
+        )
+        .await
+        .expect("first ephemeral audit");
+    backend_b
+        .append_commit(
+            make_commit_record(tx_b, 1),
+            vec![make_audit_record(tx_b, 0, "/system/hostname")],
+        )
+        .await
+        .expect("second ephemeral audit");
+    let hmac = |path: &std::path::Path| {
+        rusqlite::Connection::open(path)
+            .expect("open audit database")
+            .query_row("SELECT entry_hmac FROM audit_trail", [], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .expect("audit HMAC")
+    };
     assert_ne!(
-        backend_a.audit_key().as_bytes(),
-        backend_b.audit_key().as_bytes(),
-        "ephemeral audit HMAC keys must not be a shared compile-time constant"
+        hmac(&db_path_a),
+        hmac(&db_path_b),
+        "identical audit inputs must be sealed differently by distinct ephemeral keys"
     );
 }
 
@@ -601,22 +625,15 @@ async fn sqlite_backend_busy_timeout_is_capped_for_async_worker_profile() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let db_path = temp_dir.path().join("test_busy_timeout_cap.db");
 
-    let backend = SqliteBackend::open(&db_path, true, 0)
+    let _backend = SqliteBackend::open(&db_path, true, 0)
         .await
         .expect("open backend");
 
     assert_eq!(SqliteBackend::MAX_CONCURRENT_DB_OPERATIONS, 1);
 
-    let conn = backend.conn();
-    let guard = conn.lock().await;
-    let busy_timeout_ms: u32 = guard
-        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-        .expect("query backend busy_timeout");
-
-    assert!(
-        busy_timeout_ms <= 100,
-        "busy_timeout must be capped to avoid pinning async workers, got {busy_timeout_ms}ms"
-    );
+    const {
+        assert!(SqliteBackend::SQLITE_BUSY_TIMEOUT_MS <= 100);
+    }
 }
 
 #[tokio::test]

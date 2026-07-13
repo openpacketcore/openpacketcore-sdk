@@ -42,8 +42,8 @@ use crate::error::{LeaseError, StoreError};
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
 use crate::readiness::{
-    DurableReadinessReport, DurableReadinessState, ReplicaReadinessObservation,
-    ReplicaReadinessOutcome,
+    DurableReadinessReport, DurableReadinessState, DurableRecoveryProgress, DurableRecoveryState,
+    ReplicaReadinessObservation, ReplicaReadinessOutcome,
 };
 use crate::record::SessionPayloadEncoding;
 use crate::record::StoredSessionRecord;
@@ -74,8 +74,9 @@ pub enum ConsensusSessionStoreOpenError {
     /// The exact remote consensus peer set did not match admitted membership.
     #[error("session consensus peer set does not match topology")]
     PeerSetMismatch,
-    /// A nonempty legacy authority requires the explicit recovery workflow.
-    #[error("session consensus legacy recovery is required")]
+    /// Legacy or corrupt durable authority requires an explicit recovery
+    /// workflow before this member may join.
+    #[error("session consensus durable recovery is required")]
     RecoveryRequired,
     /// Persisted identity/schema does not match this deployment.
     #[error("session consensus durable identity does not match configuration")]
@@ -94,13 +95,20 @@ pub enum ConsensusSessionStoreOpenError {
     ClusterFormationRejected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperatorRecoveryCommitError {
+    NotLocalLeader,
+    Rejected,
+    Unavailable,
+}
+
 impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
-            SessionConsensusStorageError::RecoveryRequired => Self::RecoveryRequired,
+            SessionConsensusStorageError::RecoveryRequired
+            | SessionConsensusStorageError::CorruptState => Self::RecoveryRequired,
             SessionConsensusStorageError::IdentityMismatch
             | SessionConsensusStorageError::SchemaVersionMismatch
-            | SessionConsensusStorageError::CorruptState
             | SessionConsensusStorageError::InvalidIdentity => Self::DurableIdentityMismatch,
             SessionConsensusStorageError::BackendUnavailable => Self::StorageUnavailable,
         }
@@ -158,10 +166,10 @@ struct ConsensusSessionStoreInner {
 /// SQLite session state coordinated by the SDK's single Openraft engine.
 ///
 /// Call [`Self::open`] first, start the consensus-only network listener using
-/// [`Self::rpc_handler`], then call [`Self::initialize_cluster`]. Calling
-/// initialization concurrently on every pristine member with the same
-/// admitted membership is safe; restart of an initialized member is also
-/// idempotent.
+/// [`Self::rpc_handler`], then call [`Self::initialize_cluster`] on every
+/// member. On clean first formation the method lets only the canonical lowest
+/// node initialize Openraft while the other pristine nodes wait for replicated
+/// membership. Restarted members with durable Openraft state skip bootstrap.
 #[derive(Clone)]
 pub struct ConsensusSessionStore {
     inner: Arc<ConsensusSessionStoreInner>,
@@ -309,24 +317,36 @@ impl ConsensusSessionStore {
     }
 
     /// Initialize pristine members with the exact admitted voting set.
+    ///
+    /// Concurrent calls are expected, but only the canonical lowest pristine
+    /// member invokes Openraft initialization. Other pristine members wait for
+    /// replicated membership, avoiding fixed-timeout split-vote lockstep.
+    /// Clean first formation fails closed if the canonical member is absent.
     pub async fn initialize_cluster(&self) -> Result<(), ConsensusSessionStoreOpenError> {
         self.inner.admitted.store(false, Ordering::Release);
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or(ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
-        let initialize = tokio::time::timeout_at(
-            deadline,
-            self.inner.raft.initialize(self.inner.members.clone()),
-        )
-        .await
-        .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
-        match initialize {
-            Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
-            Err(RaftError::APIError(InitializeError::NotInMembers(_))) => {
-                return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
-            }
-            Err(RaftError::Fatal(_)) => {
-                return Err(ConsensusSessionStoreOpenError::EngineUnavailable);
+        let initialized = tokio::time::timeout_at(deadline, self.inner.raft.is_initialized())
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?
+            .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+        let canonical_bootstrap = self.inner.members.first().copied();
+        if !initialized && canonical_bootstrap == Some(self.inner.local_node_id) {
+            let initialize = tokio::time::timeout_at(
+                deadline,
+                self.inner.raft.initialize(self.inner.members.clone()),
+            )
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
+            match initialize {
+                Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
+                Err(RaftError::APIError(InitializeError::NotInMembers(_))) => {
+                    return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
+                }
+                Err(RaftError::Fatal(_)) => {
+                    return Err(ConsensusSessionStoreOpenError::EngineUnavailable);
+                }
             }
         }
         self.wait_for_exact_membership(deadline).await?;
@@ -340,6 +360,14 @@ impl ConsensusSessionStore {
     /// Redaction-safe immutable topology shape.
     pub fn topology(&self) -> &QuorumTopologySummary {
         &self.inner.topology
+    }
+
+    pub(crate) fn recovery_identity(&self) -> SessionConsensusIdentity {
+        self.inner.identity
+    }
+
+    pub(crate) fn recovery_members(&self) -> &BTreeSet<SessionConsensusNodeId> {
+        &self.inner.members
     }
 
     /// This adapter is the only store allowed to claim the quorum profile.
@@ -412,22 +440,71 @@ impl ConsensusSessionStore {
     pub async fn probe_durable_readiness(&self) -> DurableReadinessReport {
         let configured = self.inner.members.len();
         let quorum = (configured / 2) + 1;
-        let no_quorum = || {
-            DurableReadinessReport::new(
-                DurableReadinessState::NoQuorum,
-                configured,
-                0,
-                0,
-                quorum,
-                None,
-                Vec::new(),
+        let report_without_barrier = |state, recovery_progress| {
+            DurableReadinessReport::new(state, configured, 0, 0, quorum, None, Vec::new())
+                .with_recovery_progress(recovery_progress)
+        };
+        let progress = || {
+            let metrics = self.inner.raft.metrics();
+            let metrics = metrics.borrow();
+            let state = if metrics.running_state.is_err() {
+                DurableRecoveryState::RecoveryRequired
+            } else if metrics.last_log_index
+                > metrics.last_applied.as_ref().map(|log_id| log_id.index)
+            {
+                DurableRecoveryState::CatchingUp
+            } else {
+                DurableRecoveryState::AwaitingQuorum
+            };
+            DurableRecoveryProgress::new(
+                state,
+                metrics.last_log_index,
+                metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                metrics.snapshot.as_ref().map(|log_id| log_id.index),
+                metrics.purged.as_ref().map(|log_id| log_id.index),
             )
         };
+        if self
+            .inner
+            .backend
+            .consensus_operator_recovery_pending(self.inner.identity)
+            .await
+            .unwrap_or(true)
+        {
+            let metrics = self.inner.raft.metrics();
+            let metrics = metrics.borrow();
+            let recovery_progress = DurableRecoveryProgress::new(
+                DurableRecoveryState::RecoveryRequired,
+                metrics.last_log_index,
+                metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                metrics.snapshot.as_ref().map(|log_id| log_id.index),
+                metrics.purged.as_ref().map(|log_id| log_id.index),
+            );
+            return report_without_barrier(
+                DurableReadinessState::RecoveryRequired,
+                recovery_progress,
+            );
+        }
         if !self.exact_membership_is_admitted() {
-            return no_quorum();
+            let progress = progress();
+            let state = if progress.state() == DurableRecoveryState::RecoveryRequired {
+                DurableReadinessState::RecoveryRequired
+            } else {
+                DurableReadinessState::NoQuorum
+            };
+            return report_without_barrier(state, progress);
         }
         match self.linearizable_barrier().await {
             Ok(log_id) => {
+                let metrics = self.inner.raft.metrics();
+                let metrics = metrics.borrow();
+                let recovery_progress = DurableRecoveryProgress::new(
+                    DurableRecoveryState::Synchronized,
+                    metrics.last_log_index,
+                    metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                    metrics.snapshot.as_ref().map(|log_id| log_id.index),
+                    metrics.purged.as_ref().map(|log_id| log_id.index),
+                );
                 let observations = self
                     .inner
                     .topology
@@ -451,8 +528,17 @@ impl ConsensusSessionStore {
                     log_id.map(|log_id| log_id.index),
                     observations,
                 )
+                .with_recovery_progress(recovery_progress)
             }
-            Err(_) => no_quorum(),
+            Err(_) => {
+                let progress = progress();
+                let state = if progress.state() == DurableRecoveryState::RecoveryRequired {
+                    DurableReadinessState::RecoveryRequired
+                } else {
+                    DurableReadinessState::NoQuorum
+                };
+                report_without_barrier(state, progress)
+            }
         }
     }
 
@@ -469,11 +555,34 @@ impl ConsensusSessionStore {
         request_id: SessionConsensusRequestId,
         intent: SessionMutationIntent,
     ) -> Result<SessionConsensusResponse, StoreError> {
-        self.require_exact_membership_admission()?;
-        validate_consensus_intent(&intent)?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
+        self.submit_request_before(request_id, intent, deadline)
+            .await
+    }
+
+    async fn submit_request_before(
+        &self,
+        request_id: SessionConsensusRequestId,
+        intent: SessionMutationIntent,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsensusResponse, StoreError> {
+        self.require_exact_membership_admission()?;
+        let recovery_pending = tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .backend
+                .consensus_operator_recovery_pending(self.inner.identity),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(true);
+        if recovery_pending {
+            return Err(consensus_unavailable());
+        }
+        validate_consensus_intent(&intent)?;
         let request = ForwardMutationRequest { request_id, intent };
         let mut preferred = None;
 
@@ -528,10 +637,32 @@ impl ConsensusSessionStore {
         request: ForwardMutationRequest,
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
+        self.apply_on_local_leader_inner(request, deadline, false)
+            .await
+    }
+
+    async fn apply_on_local_leader_inner(
+        &self,
+        request: ForwardMutationRequest,
+        deadline: tokio::time::Instant,
+        allow_operator_recovery: bool,
+    ) -> ForwardMutationReply {
         if self.require_exact_membership_admission().is_err() {
             return ForwardMutationReply::Unavailable;
         }
-        if let Err(error) = validate_consensus_intent(&request.intent) {
+        if !allow_operator_recovery
+            && self
+                .inner
+                .backend
+                .consensus_operator_recovery_pending(self.inner.identity)
+                .await
+                .unwrap_or(true)
+        {
+            return ForwardMutationReply::Unavailable;
+        }
+        if let Err(error) =
+            validate_consensus_intent_with_recovery(&request.intent, allow_operator_recovery)
+        {
             return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
                 error,
             )));
@@ -592,6 +723,89 @@ impl ConsensusSessionStore {
                 leader: client_write_leader(&error),
             },
         }
+    }
+
+    pub(crate) async fn commit_operator_recovery(
+        &self,
+        request_id: SessionConsensusRequestId,
+        recovery_epoch: u64,
+        plan_digest: [u8; 32],
+        fence_high_water: u64,
+        credential_high_water: u64,
+    ) -> Result<(), OperatorRecoveryCommitError> {
+        self.require_exact_membership_admission()
+            .map_err(|_| OperatorRecoveryCommitError::Unavailable)?;
+        if recovery_epoch == 0 {
+            return Err(OperatorRecoveryCommitError::Rejected);
+        }
+        let metrics = self.inner.raft.metrics();
+        if metrics.borrow().current_leader != Some(self.inner.local_node_id) {
+            return Err(OperatorRecoveryCommitError::NotLocalLeader);
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or(OperatorRecoveryCommitError::Unavailable)?;
+        let reply = self
+            .apply_on_local_leader_inner(
+                ForwardMutationRequest {
+                    request_id,
+                    intent: SessionMutationIntent::FinalizeOperatorRecovery {
+                        recovery_epoch,
+                        plan_digest,
+                        fence_high_water,
+                        credential_high_water,
+                    },
+                },
+                deadline,
+                true,
+            )
+            .await;
+        match reply {
+            ForwardMutationReply::Applied(response) => match response.result {
+                Ok(SessionMutationOutcome::Unit) => Ok(()),
+                Err(StoreError::InvalidKey(reason))
+                    if reason == "operator_recovery_epoch_rejected" =>
+                {
+                    Err(OperatorRecoveryCommitError::Rejected)
+                }
+                _ => Err(OperatorRecoveryCommitError::Unavailable),
+            },
+            ForwardMutationReply::NotLeader { .. } => {
+                Err(OperatorRecoveryCommitError::NotLocalLeader)
+            }
+            ForwardMutationReply::Unavailable => Err(OperatorRecoveryCommitError::Unavailable),
+        }
+    }
+
+    pub(crate) async fn probe_operator_recovery_rejoin(
+        &self,
+        recovery_epoch: u64,
+        plan_digest: [u8; 32],
+    ) -> bool {
+        if self.require_exact_membership_admission().is_err() {
+            return false;
+        }
+        let deadline = match tokio::time::Instant::now().checked_add(self.inner.operation_timeout) {
+            Some(deadline) => deadline,
+            None => return false,
+        };
+        if !matches!(
+            tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await,
+            Ok(Ok(_))
+        ) {
+            return false;
+        }
+        self.exact_membership_is_admitted()
+            && self
+                .inner
+                .backend
+                .consensus_operator_recovery_committed(
+                    self.inner.identity,
+                    recovery_epoch,
+                    plan_digest,
+                )
+                .await
+                .unwrap_or(false)
     }
 
     async fn wait_for_known_leader(
@@ -672,6 +886,15 @@ impl ConsensusSessionStore {
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
         if self.require_exact_membership_admission().is_err() {
+            return ReadBarrierReply::Unavailable;
+        }
+        if self
+            .inner
+            .backend
+            .consensus_operator_recovery_pending(self.inner.identity)
+            .await
+            .unwrap_or(true)
+        {
             return ReadBarrierReply::Unavailable;
         }
         match tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await {
@@ -767,20 +990,31 @@ impl ConsensusSessionStore {
         }
     }
 
-    async fn logical_read_time(&self) -> Result<Timestamp, StoreError> {
+    async fn logical_read_time_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Timestamp, StoreError> {
         let response = self
-            .submit_intent(SessionMutationIntent::AdvanceLogicalTime)
+            .submit_request_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::AdvanceLogicalTime,
+                deadline,
+            )
             .await?;
         response.result?;
         if response.raft_log_index == 0 {
             return Err(consensus_unavailable());
         }
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .ok_or_else(consensus_unavailable)?;
         self.wait_for_local_apply(response.raft_log_index, deadline)
             .await?;
         response.logical_time.ok_or_else(consensus_unavailable)
+    }
+
+    async fn logical_read_time(&self) -> Result<Timestamp, StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.logical_read_time_before(deadline).await
     }
 }
 
@@ -832,6 +1066,22 @@ fn exact_uniform_voter_membership(
 }
 
 fn validate_consensus_intent(intent: &SessionMutationIntent) -> Result<(), StoreError> {
+    validate_consensus_intent_with_recovery(intent, false)
+}
+
+fn validate_consensus_intent_with_recovery(
+    intent: &SessionMutationIntent,
+    allow_operator_recovery: bool,
+) -> Result<(), StoreError> {
+    if matches!(
+        intent,
+        SessionMutationIntent::FinalizeOperatorRecovery { .. }
+    ) && !allow_operator_recovery
+    {
+        return Err(StoreError::CapabilityNotSupported(
+            "operator_recovery_requires_local_admin_authority".into(),
+        ));
+    }
     if let SessionMutationIntent::CompareAndSet(op) = intent {
         validate_sealed_payload(op)?;
     }
@@ -938,6 +1188,10 @@ fn protocol_rejection() -> SessionConsensusWireResponse {
 
 #[async_trait]
 impl SessionBackend for ConsensusSessionStore {
+    fn restore_scan_cursor_profile(&self) -> Option<crate::RestoreScanCursorProfile> {
+        Some(crate::RestoreScanCursorProfile::DurableOpaqueV1)
+    }
+
     fn backend_instance_identity(&self) -> Option<BackendInstanceIdentity> {
         Some(BackendInstanceIdentity::for_shared(&self.inner))
     }
@@ -1017,10 +1271,16 @@ impl SessionBackend for ConsensusSessionStore {
         request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
         request.validate()?;
-        let logical_time = self.logical_read_time().await?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
+        let logical_time =
+            tokio::time::timeout_at(deadline, self.logical_read_time_before(deadline))
+                .await
+                .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)??;
         self.inner
             .backend
-            .consensus_scan_restore_records_at(request, logical_time)
+            .consensus_scan_restore_records_at(request, logical_time, deadline)
             .await
     }
 
@@ -1231,6 +1491,14 @@ mod membership_tests {
         ));
     }
 
+    #[test]
+    fn corrupt_durable_state_is_typed_as_recovery_required() {
+        assert_eq!(
+            ConsensusSessionStoreOpenError::RecoveryRequired,
+            ConsensusSessionStoreOpenError::from(SessionConsensusStorageError::CorruptState)
+        );
+    }
+
     #[tokio::test]
     async fn store_and_forwarded_services_fail_closed_before_exact_admission() {
         let directory = tempfile::tempdir().expect("membership admission directory");
@@ -1245,9 +1513,11 @@ mod membership_tests {
         .await
         .expect("open uninitialized consensus store");
 
+        let uninitialized = store.probe_durable_readiness().await;
+        assert_eq!(uninitialized.state(), DurableReadinessState::NoQuorum);
         assert_eq!(
-            store.probe_durable_readiness().await.state(),
-            DurableReadinessState::NoQuorum
+            uninitialized.recovery_progress().state(),
+            DurableRecoveryState::AwaitingQuorum
         );
         assert!(matches!(
             store
@@ -1277,7 +1547,12 @@ mod membership_tests {
             .await
             .expect("admit exact singleton membership");
         assert!(store.exact_membership_is_admitted());
-        assert!(store.probe_durable_readiness().await.is_ready());
+        let initialized = store.probe_durable_readiness().await;
+        assert!(initialized.is_ready());
+        assert_eq!(
+            initialized.recovery_progress().state(),
+            DurableRecoveryState::Synchronized
+        );
     }
 }
 

@@ -661,7 +661,7 @@ async fn test_additional_security_policy_verifications() {
         "Expected list_policy_history to reject tenant mismatch, got: {res_history:?}"
     );
 
-    let conn = backend.conn();
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
     #[cfg(feature = "dangerous-test-hooks")]
     {
         // 3. Database transaction commit failures correctly trigger audit events
@@ -680,7 +680,7 @@ async fn test_additional_security_policy_verifications() {
         TEST_COMMIT_FAIL.store(false, Ordering::Relaxed);
 
         {
-            let db = conn.lock().await;
+            let db = &conn;
             let mut stmt = db
                 .prepare(
                     "SELECT action, details FROM security_policy_audit WHERE action = 'APPLY_FAILURE'",
@@ -712,7 +712,7 @@ async fn test_additional_security_policy_verifications() {
         .unwrap();
 
     {
-        let db = conn.lock().await;
+        let db = &conn;
         db.execute("DROP TABLE security_policy_active", []).unwrap();
     }
 
@@ -725,7 +725,7 @@ async fn test_additional_security_policy_verifications() {
     );
 
     {
-        let db = conn.lock().await;
+        let db = &conn;
         let mut stmt = db.prepare("SELECT action, details FROM security_policy_audit WHERE action = 'ROLLBACK_FAILURE'").unwrap();
         let mut rows = stmt.query([]).unwrap();
         let mut found = false;
@@ -776,8 +776,7 @@ async fn test_security_policy_audit_corruption_fails_closed() {
         .unwrap();
 
     {
-        let conn = backend.conn();
-        let db = conn.lock().await;
+        let db = rusqlite::Connection::open(&db_path).unwrap();
         db.execute(
             "UPDATE security_policy_audit SET entry_hmac = ?1 WHERE tenant = ?2",
             rusqlite::params![vec![0x01_u8, 0x02, 0x03], tenant],

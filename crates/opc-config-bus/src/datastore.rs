@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
 use opc_config_model::{IdempotencyKey, OpcConfig, RollbackTarget};
-use opc_crypto::{decrypt_envelope, encrypt_envelope};
+use opc_crypto::{decrypt_envelope, encrypt_attested_envelope};
 use opc_key::{ConfigAad, EnvelopeAad, KeyProvider, Zeroizing};
 use opc_types::TxId;
 
@@ -165,11 +165,12 @@ where
         record.plaintext_digest = Some(compute_plaintext_digest(plaintext.as_slice()));
         let aad = build_config_envelope_aad(&record, self.store_kind())?;
         let schema_digest = record.schema_digest;
-        record.encrypted_blob =
-            encrypt_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
+        let envelope =
+            encrypt_attested_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
                 .await
                 .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?;
-        Ok(record.with_config(SealedConfig::new(schema_digest)))
+        record.encrypted_blob = envelope.encoded().to_vec();
+        Ok(record.with_config(SealedConfig::newly_encrypted(schema_digest, envelope)))
     }
 
     async fn decrypt_record(

@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current schema version. Bump this and add a migration step to evolve the schema.
-pub const SCHEMA_VERSION: &str = "1.8.1";
+pub const SCHEMA_VERSION: &str = "1.9.0";
 /// Cap SQLite lock waits on async runtime workers.
 pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 100;
 
@@ -91,44 +91,6 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             scope TEXT NOT NULL,
             correlation_id TEXT NULL,
             occurred_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS consensus_state (
-            node_id INTEGER PRIMARY KEY,
-            current_term INTEGER NOT NULL,
-            voted_for INTEGER NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS consensus_log (
-            log_index INTEGER PRIMARY KEY,
-            term INTEGER NOT NULL,
-            op_type TEXT NOT NULL,
-            payload BLOB NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS consensus_applied (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            applied_index INTEGER NOT NULL
-        );
-
-        INSERT OR IGNORE INTO consensus_applied (id, applied_index) VALUES (1, 0);
-
-        CREATE TABLE IF NOT EXISTS consensus_membership (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            cluster_id TEXT NOT NULL,
-            node_id INTEGER NOT NULL,
-            voting_members TEXT NOT NULL,
-            non_voting_members TEXT NOT NULL,
-            old_voting_members TEXT NULL,
-            removed_members TEXT NOT NULL DEFAULT '[]',
-            epoch INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS consensus_snapshot (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            snapshot_index INTEGER NOT NULL,
-            snapshot_term INTEGER NOT NULL,
-            snapshot_data BLOB NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS audit_trail_tx_id_idx ON audit_trail(tx_id);
@@ -493,6 +455,13 @@ pub fn run_migrations(conn: &Connection, from_version: &str) -> Result<(), rusql
         // SQLite schema instead of a hand-maintained SQL string.
         current = "1.8.1".to_string();
     }
+    if current == "1.8.1" {
+        // The legacy custom-consensus tables are intentionally retained here:
+        // their contents may include an unprovable appended suffix. The
+        // Openraft adapter inspects them under an immediate transaction,
+        // rejects nonempty authority, and drops only proven-empty tables.
+        current = "1.9.0".to_string();
+    }
 
     let _ = current;
 
@@ -537,6 +506,8 @@ pub fn current_schema_digest(conn: &Connection) -> Result<String, rusqlite::Erro
     let mut stmt = conn.prepare(
         "SELECT type, name, sql FROM sqlite_master \
          WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+           AND name NOT LIKE 'consensus_%' \
+           AND name NOT LIKE 'config_raft_%' \
          ORDER BY type, name",
     )?;
     let mut rows = stmt.query([])?;
@@ -904,34 +875,6 @@ mod fixture_tests {
         )
         .expect("insert alarm_audit");
 
-        conn.execute(
-            "INSERT INTO consensus_state (node_id, current_term, voted_for) VALUES (?1, ?2, ?3)",
-            params![7_i64, 42_i64, 7_i64],
-        )
-        .expect("insert consensus_state");
-
-        conn.execute(
-            "INSERT INTO consensus_log (log_index, term, op_type, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![1_i64, 42_i64, "NOOP", vec![0xAB_u8, 0xCD_u8].as_slice()],
-        )
-        .expect("insert consensus_log");
-
-        conn.execute(
-            "INSERT INTO consensus_membership (id, cluster_id, node_id, voting_members, non_voting_members, old_voting_members, removed_members, epoch) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                1_i64,
-                "cluster-a",
-                7_i64,
-                "[7]",
-                "[]",
-                Option::<&str>::None,
-                "[]",
-                5_i64,
-            ],
-        )
-        .expect("insert consensus_membership");
-
         conn.close().expect("close fixture cleanly");
     }
 
@@ -993,35 +936,5 @@ mod fixture_tests {
             .expect("read alarm_audit");
         assert_eq!(action, "CREATE");
         assert_eq!(outcome, "success");
-
-        let (term, voted_for): (i64, Option<i64>) = conn
-            .query_row(
-                "SELECT current_term, voted_for FROM consensus_state WHERE node_id = 7",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read consensus_state");
-        assert_eq!(term, 42);
-        assert_eq!(voted_for, Some(7));
-
-        let (index, payload): (i64, Vec<u8>) = conn
-            .query_row(
-                "SELECT log_index, payload FROM consensus_log WHERE log_index = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read consensus_log");
-        assert_eq!(index, 1);
-        assert_eq!(payload, vec![0xAB, 0xCD]);
-
-        let (cluster_id, epoch): (String, i64) = conn
-            .query_row(
-                "SELECT cluster_id, epoch FROM consensus_membership WHERE id = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read consensus_membership");
-        assert_eq!(cluster_id, "cluster-a");
-        assert_eq!(epoch, 5);
     }
 }
