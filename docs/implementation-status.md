@@ -384,16 +384,17 @@ renewed SVID on a subsequent new call/full handshake and wrong-scope rejection;
 they do not exercise seamless old-connection retirement. The complete
 trust-bundle, revocation, authentication-age, multi-process, seamless
 continuity, and soak lifecycle remains open. #159 implements ordinary
-response/watch frame and write-deadline
-enforcement plus wire-only stable-ID/transaction-ID containment.
-#167 owns the production stable-ID model/persistence/privacy/audit/migration
-contract; #168 owns the canonical durable transaction-ID type and migration
+response/watch frame and write-deadline enforcement plus transaction-ID wire
+containment. #167 now supplies the production `StableId` model, bounded Serde,
+store/cache/Openraft/restore/replication/watch enforcement, privacy derivation,
+and version-2 migration audit/runbook; #168 owns the canonical durable
+transaction-ID type and migration
 coordinated with #127/#128/#143. #177 removes `opc-persist`'s private TCP
 transport entirely: config consensus consumes the shared `opc-consensus` ports,
 while production mTLS deadlines and credential lifecycle remain
 `opc-session-net`/CNF responsibilities. #143 owns distributed and
-payload-key production qualification; neither #167 nor #168 is closed or
-qualified by #159.
+payload-key production qualification; #168 is not closed or qualified by
+#159.
 
 For revision-2 rollout, any retained stable/transaction ID outside the wire
 profile requires a decoder-first #167/#168 migration or coherent store

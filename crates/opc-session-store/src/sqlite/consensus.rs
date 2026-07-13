@@ -2116,6 +2116,25 @@ pub(crate) fn apply_entries_sync(
 }
 
 pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
+    let invalid_stable_id = conn
+        .query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM session_records
+                WHERE typeof(stable_id) != 'blob'
+                   OR length(stable_id) NOT BETWEEN 1 AND 64
+            )
+            "#,
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_error)?;
+    if invalid_stable_id {
+        return Err(invalid_data(
+            "session consensus snapshot stable identifier is invalid",
+        ));
+    }
+
     let mut record_stmt = conn
         .prepare(
             r#"
@@ -2653,6 +2672,35 @@ mod tests {
             stable_id: Bytes::from_static(b"state-machine-fault-session")
                 .try_into()
                 .expect("valid stable ID"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_snapshot_validation_rejects_invalid_stable_ids_first() {
+        for stable_id in [Vec::new(), vec![0x5a_u8; crate::STABLE_ID_MAX_BYTES + 1]] {
+            let backend = SqliteSessionBackend::in_memory().expect("backend");
+            let conn = backend.conn.lock().await;
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+                .expect("allow corrupt snapshot fixture");
+            conn.execute(
+                r#"
+                INSERT INTO session_records (
+                    tenant, nf_kind, key_type, stable_id, generation, owner,
+                    fence, state_class, state_type, expires_at, payload, encoding
+                ) VALUES ('tenant-a', 'smf', 'pdu-session', ?1, 1, 'owner-a',
+                          1, 'authoritative-session', 'state-a', NULL, X'', 0)
+                "#,
+                [stable_id],
+            )
+            .expect("inject invalid stable ID");
+
+            let error = validate_sealed_state_sync(&conn)
+                .expect_err("invalid stable ID must reject snapshot");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "session consensus snapshot stable identifier is invalid"
+            );
         }
     }
 

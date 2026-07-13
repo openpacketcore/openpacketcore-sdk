@@ -166,6 +166,8 @@ fn relational_identity_violations_are_counted_without_values() {
 fn stable_id_audit_covers_exact_bounds_and_sqlite_types_without_values() {
     let (_dir, path) = database();
     let conn = Connection::open(&path).expect("open fixture");
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+        .expect("allow legacy-invalid audit fixtures");
     for (rowid, stable_id) in [
         (1_i64, vec![0x11_u8; 1]),
         (2_i64, vec![0x22_u8; STABLE_ID_MAX_BYTES]),

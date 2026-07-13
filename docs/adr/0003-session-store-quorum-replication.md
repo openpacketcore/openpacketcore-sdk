@@ -365,19 +365,21 @@ operation-family/reason categories and must not include keys, payloads, owners,
 transaction IDs, peer identities, or backend/peer-controlled error text.
 
 The revision-1 to revision-2 transition requires the same drained coordinated
-stop/upgrade/start as other exact-profile changes. #159 does not rewrite
-persisted record/log bytes, but its stable-ID and transaction-ID rules are
-wire-only containment, not a production persistence contract. Before strict
-revision-2 startup, quiesce writers and inventory every retained record, log,
-snapshot, restore source, and replay source. Any out-of-profile value requires a
-decoder-first, product-aware migration or coherent store replacement under
-#167/#168: the migration reader must decode the legacy representation before
+stop/upgrade/start as other exact-profile changes. #167 promotes the stable-ID
+rule from wire containment into the `StableId` domain type, SQLite/cache/
+Openraft/restore/replication/watch boundaries, and a version-2 count-only
+legacy audit without rewriting compliant record/log bytes. Before strict
+startup, quiesce writers and audit every retained record, log, snapshot,
+restore source, and replay source. Any out-of-profile value requires a
+decoder-first, product-aware migration or coherent store replacement under the
+#167 runbook and #168: the migration reader must decode the legacy representation before
 rewriting it, must not silently truncate/hash/rename durable identities, and the
 strict decoder must verify the result before writers restart. Rollback likewise
 installs a decoder for the retained target representation before old writers, or
 uses a coherent checkpoint/reviewed reverse migration. All participants must
-move together; independent `OPCH`/#135 rollback barriers still apply. #167 owns
-the production stable-ID model/persistence/privacy/audit contract; #168 owns the
+move together; independent `OPCH`/#135 rollback barriers still apply. #167 now
+supplies the production stable-ID model/persistence/privacy/audit contract;
+#168 owns the
 canonical durable transaction-ID type and migration coordinated with
 #127/#128/#143.
 Session-net's bounded call remains the shared production transport contract.

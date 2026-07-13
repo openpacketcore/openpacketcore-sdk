@@ -23,6 +23,9 @@ Optional root re-exports are controlled by Cargo features:
 - `testkit` -> `opc-sbi?/testkit`
 
 The `prelude` module gathers commonly used types from the enabled features.
+With `session`, this includes the validated `StableId` type and its exact
+1..=64-byte production limits; callers cannot bypass the session-store
+admission contract through the facade.
 
 Example:
 

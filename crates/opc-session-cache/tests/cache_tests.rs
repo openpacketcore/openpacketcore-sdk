@@ -28,6 +28,19 @@ fn test_session_key() -> SessionKey {
     }
 }
 
+#[test]
+fn cache_keys_share_the_model_wide_stable_id_boundary() {
+    for (width, accepted) in [
+        (0, false),
+        (1, true),
+        (opc_session_store::STABLE_ID_MAX_BYTES, true),
+        (opc_session_store::STABLE_ID_MAX_BYTES + 1, false),
+    ] {
+        let stable_id = opc_session_store::StableId::new(bytes::Bytes::from(vec![0xa5; width]));
+        assert_eq!(stable_id.is_ok(), accepted, "stable ID width {width}");
+    }
+}
+
 #[tokio::test]
 async fn cache_delegates_backend_adapter_instance_identity() {
     let backend: Arc<dyn SessionBackend> = Arc::new(FakeSessionBackend::new());

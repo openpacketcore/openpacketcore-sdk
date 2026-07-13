@@ -122,8 +122,9 @@ operator-selected checkpoint without becoming a second runtime authority; see
 the [recovery runbook](session-store-legacy-recovery.md). #133 provides bounded
 applied-state restore with snapshot-bound cursors. Watch and expiry hardening
 remain #145/#148, and network/resource/rotation qualification remains #143 and
-the #162 -> #161 -> #163 -> #158 -> #164 credential chain. Stable IDs,
-durable transaction IDs, and log-range cursors remain #167/#168/#171.
+the #162 -> #161 -> #163 -> #158 -> #164 credential chain. The model-wide
+bounded stable-ID contract is implemented under #167. Durable transaction IDs
+and log-range cursors remain #168/#171.
 
 ### Configured topology admission
 
@@ -473,12 +474,14 @@ record, log, snapshot, and restore source.
 
 The revision-1 to revision-2 profile transition uses the same coordinated
 stop/upgrade/start and verification; it is not a same-ALPN rolling upgrade.
-#159 does not rewrite persisted store bytes. In-profile stores need no format
-conversion, but strict revision-2 transport rejects retained empty/over-64-byte
-stable IDs and empty/over-128-byte UTF-8 transaction IDs. Before startup,
-quiesce writers, inventory every record/log/snapshot/restore/replay source, and
-perform a decoder-first product-aware migration or coherent store replacement
-under #167/#168. The migration reader must decode the legacy representation
+#167 does not rewrite compliant persisted stable-ID bytes. Its `StableId`
+newtype and new-database SQLite checks enforce 1..=64 bytes throughout the
+model/store/network stack; existing files and snapshots require the version-2
+count-only audit. Strict revision-2 transport also rejects empty/over-128-byte
+UTF-8 transaction IDs. Before startup, quiesce writers, audit every
+record/log/snapshot/restore/replay source, and perform a decoder-first
+product-aware migration or coherent store replacement under the #167 runbook
+and #168. The migration reader must decode the legacy representation
 before rewrite, must not truncate/hash/rename durable identities, and the strict
 decoder must verify the result before writers restart. Rollback must first
 install a decoder that reads the retained target representation, or restore a

@@ -41,6 +41,15 @@ pub const STABLE_ID_MAX_BYTES: usize = 64;
 /// Width of the canonical tenant-scoped HMAC-SHA256 stable identifier.
 pub const STABLE_ID_HMAC_SHA256_BYTES: usize = 32;
 
+/// Minimum accepted tenant privacy-key width for stable-ID derivation.
+pub const STABLE_ID_PRIVACY_KEY_MIN_BYTES: usize = 16;
+
+/// Maximum accepted tenant privacy-key width for stable-ID derivation.
+pub const STABLE_ID_PRIVACY_KEY_MAX_BYTES: usize = 64;
+
+/// Maximum canonical subject bytes hashed by one stable-ID derivation.
+pub const STABLE_ID_CANONICAL_SUBJECT_MAX_BYTES: usize = 256;
+
 const STABLE_ID_HMAC_SHA256_DOMAIN: &[u8] = b"openpacketcore/session-stable-id/hmac-sha256/v1";
 
 /// Redaction-safe reason that stable-identifier construction failed.
@@ -54,12 +63,15 @@ pub enum StableIdError {
     /// The identifier was empty or exceeded the production width.
     #[error("stable session identifier must contain 1 to 64 bytes")]
     InvalidWidth,
-    /// Keyed derivation was requested with an empty privacy key.
-    #[error("stable session identifier privacy key must not be empty")]
-    EmptyPrivacyKey,
+    /// Keyed derivation used a privacy key outside the supported width.
+    #[error("stable session identifier privacy key must contain 16 to 64 bytes")]
+    InvalidPrivacyKeyWidth,
     /// Keyed derivation was requested with an empty canonical subject.
     #[error("stable session identifier canonical subject must not be empty")]
     EmptyCanonicalSubject,
+    /// Keyed derivation used an oversized canonical subject.
+    #[error("stable session identifier canonical subject exceeds 256 bytes")]
+    CanonicalSubjectTooLong,
 }
 
 /// Bounded opaque identifier within a session key's tenant/NF/type scope.
@@ -106,15 +118,20 @@ impl StableId {
         tenant: &TenantId,
         canonical_subject: &[u8],
     ) -> Result<Self, StableIdError> {
-        if tenant_privacy_key.is_empty() {
-            return Err(StableIdError::EmptyPrivacyKey);
+        if !(STABLE_ID_PRIVACY_KEY_MIN_BYTES..=STABLE_ID_PRIVACY_KEY_MAX_BYTES)
+            .contains(&tenant_privacy_key.len())
+        {
+            return Err(StableIdError::InvalidPrivacyKeyWidth);
         }
         if canonical_subject.is_empty() {
             return Err(StableIdError::EmptyCanonicalSubject);
         }
+        if canonical_subject.len() > STABLE_ID_CANONICAL_SUBJECT_MAX_BYTES {
+            return Err(StableIdError::CanonicalSubjectTooLong);
+        }
 
         let mut mac = Hmac::<Sha256>::new_from_slice(tenant_privacy_key)
-            .map_err(|_| StableIdError::EmptyPrivacyKey)?;
+            .map_err(|_| StableIdError::InvalidPrivacyKeyWidth)?;
         mac.update(STABLE_ID_HMAC_SHA256_DOMAIN);
         update_len_prefixed_mac(&mut mac, tenant.as_str().as_bytes());
         update_len_prefixed_mac(&mut mac, canonical_subject);
@@ -987,12 +1004,28 @@ mod tests {
         assert_ne!(first, other_tenant);
         assert_eq!(first.len(), STABLE_ID_HMAC_SHA256_BYTES);
         assert_eq!(
+            first
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "c16a015f5237260ac501cd987c8c45e43b8bfb642a94c10bc245d2b2e9ab7676"
+        );
+        assert_eq!(
             StableId::derive_hmac_sha256(b"", &tenant_a, b"canonical-supi-001010000000001"),
-            Err(StableIdError::EmptyPrivacyKey)
+            Err(StableIdError::InvalidPrivacyKeyWidth)
         );
         assert_eq!(
             StableId::derive_hmac_sha256(b"tenant-a-privacy-key", &tenant_a, b""),
             Err(StableIdError::EmptyCanonicalSubject)
+        );
+        assert_eq!(
+            StableId::derive_hmac_sha256(
+                b"tenant-a-privacy-key",
+                &tenant_a,
+                &vec![0xa5; STABLE_ID_CANONICAL_SUBJECT_MAX_BYTES + 1],
+            ),
+            Err(StableIdError::CanonicalSubjectTooLong)
         );
     }
 

@@ -136,7 +136,7 @@ impl<'a> OwnedSessionMutationContext<'a> {
 ///     tenant: TenantId::new("ref-smf")?,
 ///     nf_kind: NetworkFunctionKind::new("smf")?,
 ///     key_type: SessionKeyType::PduSession,
-///     stable_id: bytes::Bytes::from_static(b"seid-1"),
+///     stable_id: bytes::Bytes::from_static(b"seid-1").try_into()?,
 /// };
 /// let (session, mut failures) = OwnedSession::acquire(
 ///     store,

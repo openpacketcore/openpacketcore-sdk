@@ -83,14 +83,14 @@ fn subscriber_context_state_type() -> Result<StateType, BoxError> {
         .map_err(|err| static_value_error("session state type", err))
 }
 
-fn session_key_from_pseudonym(pseudonym: &str) -> Result<SessionKey, BoxError> {
+fn session_key_from_stable_id(
+    stable_id: opc_session_store::StableId,
+) -> Result<SessionKey, BoxError> {
     Ok(SessionKey {
         tenant: TenantId::new(SYSTEM_TENANT)?,
         nf_kind: amf_nf_kind()?,
         key_type: SessionKeyType::SubscriberContext,
-        stable_id: opc_session_store::StableId::new(bytes::Bytes::copy_from_slice(
-            pseudonym.as_bytes(),
-        ))?,
+        stable_id,
     })
 }
 
@@ -247,6 +247,7 @@ pub struct UeSessionContext {
 
 struct SubscriberPrivacyAlias {
     pseudonym: String,
+    stable_id: opc_session_store::StableId,
     redacted_identity: String,
 }
 
@@ -717,9 +718,14 @@ impl AmfLite {
             .kms_provider
             .get_active_key(KeyPurpose::Session, &tenant)
             .await?;
-        let digest_key = DigestKey::new(
-            key_handle.keyed_digest(SUBSCRIBER_PRIVACY_KEY_DOMAIN, b"subscriber-supi"),
-        );
+        let privacy_key =
+            key_handle.keyed_digest(SUBSCRIBER_PRIVACY_KEY_DOMAIN, b"subscriber-supi");
+        let stable_id = opc_session_store::StableId::derive_hmac_sha256(
+            &privacy_key,
+            &tenant,
+            imsi.as_bytes(),
+        )?;
+        let digest_key = DigestKey::new(privacy_key);
         let digest = opc_privacy::hash_identifier(&digest_key, IdentifierType::Supi, imsi);
         let redacted_identity = TelcoIdentifier::new(IdentifierType::Imsi, imsi)
             .redact(RedactionLevel::Class, None)
@@ -727,6 +733,7 @@ impl AmfLite {
 
         Ok(SubscriberPrivacyAlias {
             pseudonym: format!("supi-digest:{digest}"),
+            stable_id,
             redacted_identity,
         })
     }
@@ -735,7 +742,7 @@ impl AmfLite {
     /// exposing the permanent identifier in store keys.
     pub async fn session_key_for_subscriber(&self, imsi: &str) -> Result<SessionKey, BoxError> {
         let alias = self.subscriber_privacy_alias(imsi).await?;
-        session_key_from_pseudonym(&alias.pseudonym)
+        session_key_from_stable_id(alias.stable_id)
     }
 
     async fn complete_startup(&self, timeout: Duration) -> Result<(), RuntimeError> {
@@ -772,7 +779,7 @@ impl AmfLite {
         lease_ttl: Duration,
     ) -> Result<(), BoxError> {
         let alias = self.subscriber_privacy_alias(imsi).await?;
-        let key = session_key_from_pseudonym(&alias.pseudonym)?;
+        let key = session_key_from_stable_id(alias.stable_id)?;
 
         // Acquire lease (fenced CAS lease)
         let owner = amf_owner_id()?;

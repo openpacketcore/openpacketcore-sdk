@@ -56,6 +56,45 @@ fn test_record(
     }
 }
 
+#[test]
+fn new_sqlite_schema_enforces_stable_id_type_and_width() {
+    let file = NamedTempFile::new().expect("temporary SQLite file");
+    drop(SqliteSessionBackend::open(file.path()).expect("initialize schema"));
+    let connection = rusqlite::Connection::open(file.path()).expect("open raw SQLite");
+
+    for (index, width) in [1_usize, opc_session_store::STABLE_ID_MAX_BYTES]
+        .into_iter()
+        .enumerate()
+    {
+        connection
+            .execute(
+                "INSERT INTO key_fences (tenant, nf_kind, key_type, stable_id, fence) \
+                 VALUES (?1, 'smf', 'pdu-session', ?2, 1)",
+                rusqlite::params![format!("valid-{index}"), vec![0xa5_u8; width]],
+            )
+            .expect("in-profile stable ID");
+    }
+
+    for (index, value) in [
+        rusqlite::types::Value::Blob(Vec::new()),
+        rusqlite::types::Value::Blob(vec![0xa5_u8; opc_session_store::STABLE_ID_MAX_BYTES + 1]),
+        rusqlite::types::Value::Text("raw-subscriber-value".to_string()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = connection
+            .execute(
+                "INSERT INTO key_fences (tenant, nf_kind, key_type, stable_id, fence) \
+                 VALUES (?1, 'smf', 'pdu-session', ?2, 1)",
+                rusqlite::params![format!("invalid-{index}"), value],
+            )
+            .expect_err("out-of-profile stable ID");
+        assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
+        assert!(!error.to_string().contains("raw-subscriber-value"));
+    }
+}
+
 #[tokio::test]
 async fn test_sqlite_capabilities_are_truthful_for_single_node_backend() {
     let backend = SqliteSessionBackend::in_memory().unwrap();

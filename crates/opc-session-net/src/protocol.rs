@@ -61,7 +61,7 @@ pub const MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES: usize = 65_536;
 pub const MAX_SESSION_NET_BATCH_OPERATIONS: usize = 256;
 pub const MAX_SESSION_NET_REBUILD_ENTRIES: usize = 65_536;
 /// Maximum transport width for a digest-oriented session stable identifier.
-pub const MAX_SESSION_NET_STABLE_ID_BYTES: usize = 64;
+pub const MAX_SESSION_NET_STABLE_ID_BYTES: usize = opc_session_store::STABLE_ID_MAX_BYTES;
 /// Maximum UTF-8 width retained for a durable replication transaction ID.
 pub const MAX_SESSION_NET_REPLICATION_TX_ID_BYTES: usize = 128;
 /// Canonical hyphenated UUID width used by CAS idempotency request IDs.

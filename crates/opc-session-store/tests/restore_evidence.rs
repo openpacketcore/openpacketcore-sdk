@@ -404,9 +404,10 @@ fn restore_scan_page_validation_rejects_untrusted_contract_violations() {
 }
 
 #[test]
-fn restore_page_retained_byte_ceiling_accepts_exact_and_rejects_one_over() {
-    let mut records = (0_u8..4)
-        .map(|prefix| {
+fn bounded_stable_ids_keep_maximum_payload_page_below_retained_ceiling() {
+    let payload_per_record = RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES / RESTORE_SCAN_MAX_PAGE_SIZE;
+    let mut records = (0..RESTORE_SCAN_MAX_PAGE_SIZE)
+        .map(|index| {
             let mut record = record(
                 "restore-owner",
                 b"placeholder",
@@ -414,39 +415,30 @@ fn restore_page_retained_byte_ceiling_accepts_exact_and_rejects_one_over() {
                 1,
                 1,
             );
-            record.key.stable_id = vec![prefix; opc_session_store::STABLE_ID_MAX_BYTES]
-                .try_into()
-                .expect("maximum stable ID");
-            record.payload = EncryptedSessionPayload::new(Vec::<u8>::new());
+            let mut stable_id = vec![0_u8; opc_session_store::STABLE_ID_MAX_BYTES];
+            stable_id[..8].copy_from_slice(
+                &u64::try_from(index)
+                    .expect("restore index fits u64")
+                    .to_be_bytes(),
+            );
+            record.key.stable_id = stable_id.try_into().expect("maximum stable ID");
+            record.payload = EncryptedSessionPayload::new(vec![0_u8; payload_per_record]);
             record
         })
         .collect::<Vec<_>>();
-    let metadata_bytes = RestoreScanPage::new(records.clone(), 0, None)
-        .retained_bytes()
-        .expect("bounded record metadata");
-    let filler_bytes = RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES
-        .checked_sub(metadata_bytes)
-        .expect("four key allocations fit the retained-page ceiling");
-    assert!(filler_bytes <= RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES);
-    records[0].payload = EncryptedSessionPayload::new(vec![0_u8; filler_bytes]);
-
     let exact = RestoreScanPage::new(records.clone(), 0, None);
-    assert_eq!(
-        exact.retained_bytes().expect("exact retained size"),
-        RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES
+    assert!(
+        exact.retained_bytes().expect("bounded retained size")
+            < RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES
     );
     exact
         .validate_for_request(&RestoreScanRequest::all(records.len()))
-        .expect("the exact retained-byte ceiling is valid");
+        .expect("maximum profile page is valid");
 
-    records[0].payload = EncryptedSessionPayload::new(vec![0_u8; filler_bytes + 1]);
+    records[0].payload = EncryptedSessionPayload::new(vec![0_u8; payload_per_record + 1]);
     let one_over = RestoreScanPage::new(records, 0, None);
-    assert_eq!(
-        one_over.retained_bytes().expect("one-over retained size"),
-        RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES + 1
-    );
     assert!(matches!(
-        one_over.validate_for_request(&RestoreScanRequest::all(4)),
+        one_over.validate_for_request(&RestoreScanRequest::all(RESTORE_SCAN_MAX_PAGE_SIZE)),
         Err(StoreError::InvalidRestoreScanResponse(_))
     ));
 }
@@ -697,6 +689,8 @@ async fn sqlite_restore_rejects_legacy_stable_id_above_production_width() {
     let path = directory.path().join("session.sqlite");
     let backend = opc_session_store::SqliteSessionBackend::open(&path).expect("sqlite");
     let raw = rusqlite::Connection::open(&path).expect("raw sqlite");
+    raw.execute_batch("PRAGMA ignore_check_constraints = ON")
+        .expect("allow legacy-invalid stable ID fixture");
     raw.execute(
         r#"
         INSERT INTO session_records (
@@ -882,6 +876,8 @@ async fn sqlite_restore_key_preflight_accepts_exact_and_rejects_one_over() {
         let path = directory.path().join("session.sqlite");
         let backend = opc_session_store::SqliteSessionBackend::open(&path).expect("sqlite");
         let raw = rusqlite::Connection::open(&path).expect("raw sqlite");
+        raw.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow raw boundary fixture");
         raw.execute(
             r#"
             INSERT INTO session_records (
@@ -899,6 +895,11 @@ async fn sqlite_restore_key_preflight_accepts_exact_and_rejects_one_over() {
             .await
     }
 
+    let minimum = scan_key_of_size(opc_session_store::STABLE_ID_MIN_BYTES)
+        .await
+        .expect("the minimum production stable ID is accepted");
+    assert_eq!(minimum.records[0].key.stable_id.len(), 1);
+
     let exact = scan_key_of_size(opc_session_store::STABLE_ID_MAX_BYTES)
         .await
         .expect("the production stable ID ceiling is accepted");
@@ -907,6 +908,14 @@ async fn sqlite_restore_key_preflight_accepts_exact_and_rejects_one_over() {
         opc_session_store::STABLE_ID_MAX_BYTES
     );
     assert!(exact.complete);
+
+    let empty = scan_key_of_size(0)
+        .await
+        .expect_err("empty key is rejected before row-owned allocation");
+    assert_eq!(
+        empty,
+        StoreError::Serialization("persisted stable session identifier is invalid".into())
+    );
 
     let one_over = scan_key_of_size(opc_session_store::STABLE_ID_MAX_BYTES + 1)
         .await
