@@ -100,6 +100,42 @@ fn cli_returns_versioned_count_only_json_and_stable_exit_codes() {
 }
 
 #[test]
+fn cli_duplicate_json_fields_never_exit_success_or_hide_tx_id_cardinality() {
+    let (_dir, path) = database();
+    let conn = Connection::open(&path).expect("open fixture");
+    for (sequence, tx_id, encoded) in [
+        (1_i64, "tx-1", r#"{"tx_id":"tx-1","tx_id":"tx-1"}"#),
+        (
+            2_i64,
+            "tx-2",
+            r#"{"sequence":2,"sequence":2,"tx_id":"tx-2"}"#,
+        ),
+        (
+            3_i64,
+            "tx-3",
+            r#"{"sequence":3,"tx_id":"tx-3","op":{"owner":"x","owner":"x"}}"#,
+        ),
+    ] {
+        conn.execute(
+            r#"
+            INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp)
+            VALUES (?1, ?2, ?3, '2030-01-01T00:00:00Z')
+            "#,
+            params![sequence, tx_id, encoded],
+        )
+        .expect("insert duplicate-key fixture");
+    }
+    drop(conn);
+
+    let output = run(&path, "3");
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("audit JSON");
+    assert_eq!(report["status"], "violations_found");
+    assert_eq!(report["violations"]["invalid_replication_tx_id_fields"], 1);
+    assert_eq!(report["violations"]["invalid_replication_entries"], 3);
+}
+
+#[test]
 fn cli_rejects_missing_or_invalid_required_budgets_without_echoing_arguments() {
     let (_dir, path) = database();
     let invalid = run(&path, "0");

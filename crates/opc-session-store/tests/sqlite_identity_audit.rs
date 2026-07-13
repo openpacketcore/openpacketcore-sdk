@@ -4,8 +4,8 @@ use opc_session_store::sqlite::audit::{
     SqliteIdentityAuditLimits, SqliteIdentityAuditStatus, SQLITE_IDENTITY_AUDIT_REPORT_VERSION,
 };
 use opc_session_store::{
-    FenceToken, OwnerId, ReplicationEntry, ReplicationOp, SessionKey, SessionKeyType,
-    SqliteSessionBackend, OWNER_ID_MAX_BYTES, REPLICATION_TX_ID_MAX_BYTES,
+    FenceToken, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend, SessionKey,
+    SessionKeyType, SqliteSessionBackend, OWNER_ID_MAX_BYTES, REPLICATION_TX_ID_MAX_BYTES,
     SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_MAX_BYTES,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -337,6 +337,63 @@ fn replication_transaction_id_audit_is_exact_bounded_and_cross_checks_json() {
     assert_eq!(report.scanned().replication_entries(), 8);
     assert_eq!(report.violations().invalid_replication_tx_id_fields(), 6);
     assert_eq!(report.violations().invalid_replication_entries(), 2);
+}
+
+#[tokio::test]
+async fn duplicate_json_fields_match_runtime_rejection_and_exact_audit_counters() {
+    for (duplicate, invalid_tx_id) in [
+        ("tx_id", true),
+        ("sequence", false),
+        ("nested_owner", false),
+    ] {
+        let (_dir, path) = database();
+        let valid = serde_json::to_string(&replication_entry(1, "owner-a")).expect("entry JSON");
+        let encoded = match duplicate {
+            "tx_id" => valid.replacen('{', r#"{"tx_id":"tx-1","#, 1),
+            "sequence" => valid.replacen('{', r#"{"sequence":1,"#, 1),
+            "nested_owner" => {
+                let duplicate_owner = r#""owner":"owner-a","owner":"owner-a""#;
+                let encoded = valid.replacen(r#""owner":"owner-a""#, duplicate_owner, 1);
+                assert_ne!(
+                    encoded, valid,
+                    "owner fixture must be nested in the operation"
+                );
+                encoded
+            }
+            _ => unreachable!("fixed duplicate-field fixture"),
+        };
+        assert!(
+            serde_json::from_str::<ReplicationEntry>(&encoded).is_err(),
+            "runtime typed decode must reject duplicate {duplicate}"
+        );
+
+        let conn = Connection::open(&path).expect("open fixture");
+        insert_replication_json(&conn, 1, &encoded);
+        drop(conn);
+
+        let encoded_bytes = u64::try_from(encoded.len()).expect("entry width");
+        let report =
+            audit_sqlite_identity_invariants(&path, limits(1, encoded_bytes, encoded_bytes))
+                .expect("audit succeeds");
+        assert_eq!(
+            report.status(),
+            SqliteIdentityAuditStatus::ViolationsFound,
+            "duplicate {duplicate} must never be certified"
+        );
+        assert_eq!(report.scanned().replication_entries(), 1);
+        assert_eq!(
+            report.violations().invalid_replication_tx_id_fields(),
+            u64::from(invalid_tx_id),
+            "duplicate {duplicate} transaction-ID count"
+        );
+        assert_eq!(report.violations().invalid_replication_entries(), 1);
+
+        let backend = SqliteSessionBackend::open(&path).expect("open runtime backend");
+        assert!(
+            backend.get_replication_log(1, 1).await.is_err(),
+            "runtime hydration must reject duplicate {duplicate}"
+        );
+    }
 }
 
 #[test]

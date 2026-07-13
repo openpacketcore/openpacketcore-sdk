@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -25,6 +25,20 @@ pub const SQLITE_IDENTITY_AUDIT_REPORT_VERSION: u32 = 3;
 pub const SQLITE_IDENTITY_AUDIT_PAGE_ROWS: u32 = 256;
 
 const SQLITE_AUDIT_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Deserialize)]
+struct ReplicationTxIdProbe {
+    tx_id: ReplicationTxId,
+}
+
+// Struct deserialization streams the bounded source, rejects a duplicate
+// `tx_id`, and ignores unrelated fields. The strict decode below owns every
+// other field/cardinality violation.
+fn probe_replication_tx_id(encoded: &str) -> Option<ReplicationTxId> {
+    serde_json::from_str::<ReplicationTxIdProbe>(encoded)
+        .ok()
+        .map(|probe| probe.tx_id)
+}
 
 /// Caller-approved work limits for one SQLite identity audit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -950,15 +964,9 @@ fn scan_replication_entries(conn: &Connection, state: &mut AuditState) -> Result
                     return Err(());
                 };
                 state.json_bytes_seen = next_total;
-                let entry_value = serde_json::from_str::<serde_json::Value>(&entry_json).ok();
-                let encoded_tx_id = entry_value
-                    .as_ref()
-                    .and_then(|value| value.as_object())
-                    .and_then(|object| object.get("tx_id"))
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|value| ReplicationTxId::new(value).ok());
-                let entry = entry_value
-                    .and_then(|value| serde_json::from_value::<ReplicationEntry>(value).ok())
+                let encoded_tx_id = probe_replication_tx_id(&entry_json);
+                let entry = serde_json::from_str::<ReplicationEntry>(&entry_json)
+                    .ok()
                     .and_then(|entry| entry.into_validated().ok());
                 let stored_sequence = u64::try_from(sequence)
                     .ok()
