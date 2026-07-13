@@ -2,6 +2,7 @@ use opc_identity::{
     build_identity_state, IdentityState, SvidDocument, TrustBundle, TrustBundleSet,
 };
 use opc_tls::{
+    peer_tls_identity_from_client_connection, peer_tls_identity_from_server_connection,
     TlsConfigBuilder, TlsHandshakeRunError, TlsMaterialAvailability, TlsMaterialController,
     TlsMaterialError, TlsMaterialReloadReason, MAX_TLS_CONCURRENT_HANDSHAKES,
     MAX_TLS_HANDSHAKE_EPOCH_RETRIES, MAX_TLS_MATERIAL_CHAIN_CERTIFICATES,
@@ -38,6 +39,21 @@ fn test_ca(name: &str) -> (rcgen::Certificate, KeyPair) {
     (certificate, key)
 }
 
+fn test_ca_with_validity(
+    name: &str,
+    not_before: time::OffsetDateTime,
+    not_after: time::OffsetDateTime,
+) -> (rcgen::Certificate, KeyPair) {
+    let mut parameters = CertificateParams::default();
+    parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    parameters.distinguished_name.push(DnType::CommonName, name);
+    parameters.not_before = not_before;
+    parameters.not_after = not_after;
+    let key = KeyPair::generate().expect("generate bounded CA key");
+    let certificate = parameters.self_signed(&key).expect("sign bounded CA");
+    (certificate, key)
+}
+
 fn material(
     spiffe_id: &str,
     ca: &rcgen::Certificate,
@@ -71,6 +87,148 @@ fn material(
     TestMaterial {
         leaf_der: certificate.der().as_ref().to_vec(),
         state,
+    }
+}
+
+fn test_intermediate_ca(
+    root: &rcgen::Certificate,
+    root_key: &KeyPair,
+    not_before: time::OffsetDateTime,
+    not_after: time::OffsetDateTime,
+) -> (rcgen::Certificate, KeyPair) {
+    let mut parameters = CertificateParams::default();
+    parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    parameters
+        .distinguished_name
+        .push(DnType::CommonName, "short-lived intermediate");
+    parameters.not_before = not_before;
+    parameters.not_after = not_after;
+    let key = KeyPair::generate().expect("generate intermediate key");
+    let certificate = parameters
+        .signed_by(&key, root, root_key)
+        .expect("sign intermediate");
+    (certificate, key)
+}
+
+fn material_via_intermediate(
+    spiffe_id: &str,
+    intermediate: &rcgen::Certificate,
+    intermediate_key: &KeyPair,
+    root: &rcgen::Certificate,
+    not_before: time::OffsetDateTime,
+    not_after: time::OffsetDateTime,
+) -> TestMaterial {
+    let mut parameters = CertificateParams::default();
+    parameters.subject_alt_names.push(SanType::URI(
+        rcgen::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
+    ));
+    parameters.not_before = not_before;
+    parameters.not_after = not_after;
+    let key = KeyPair::generate().expect("generate leaf key");
+    let certificate = parameters
+        .signed_by(&key, intermediate, intermediate_key)
+        .expect("sign leaf through intermediate");
+    let mut bundles = TrustBundleSet::new();
+    bundles.insert(TrustBundle {
+        trust_domain: opc_identity::TrustDomain::new("example.test").expect("trust domain"),
+        certificates: vec![root.der().clone()],
+    });
+    let state = build_identity_state(
+        vec![
+            certificate.der().clone(),
+            intermediate.der().clone(),
+            root.der().clone(),
+        ],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        bundles,
+    )
+    .expect("valid intermediate test material");
+    TestMaterial {
+        leaf_der: certificate.der().as_ref().to_vec(),
+        state,
+    }
+}
+
+fn material_via_root(
+    spiffe_id: &str,
+    root: &rcgen::Certificate,
+    root_key: &KeyPair,
+    not_before: time::OffsetDateTime,
+    not_after: time::OffsetDateTime,
+    present_root: bool,
+) -> TestMaterial {
+    let mut parameters = CertificateParams::default();
+    parameters.subject_alt_names.push(SanType::URI(
+        rcgen::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
+    ));
+    parameters.not_before = not_before;
+    parameters.not_after = not_after;
+    let key = KeyPair::generate().expect("generate leaf key");
+    let certificate = parameters
+        .signed_by(&key, root, root_key)
+        .expect("sign root-issued leaf");
+    let mut cert_chain = vec![certificate.der().clone()];
+    if present_root {
+        cert_chain.push(root.der().clone());
+    }
+    let mut bundles = TrustBundleSet::new();
+    bundles.insert(TrustBundle {
+        trust_domain: opc_identity::TrustDomain::new("example.test").expect("trust domain"),
+        certificates: vec![root.der().clone()],
+    });
+    let state = build_identity_state(
+        cert_chain,
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        bundles,
+    )
+    .expect("valid root-issued test material");
+    TestMaterial {
+        leaf_der: certificate.der().as_ref().to_vec(),
+        state,
+    }
+}
+
+fn unchecked_intermediate_temporal_material(
+    baseline: &IdentityState,
+    spiffe_id: &str,
+    root: &rcgen::Certificate,
+    root_key: &KeyPair,
+    intermediate_validity: (time::OffsetDateTime, time::OffsetDateTime),
+    leaf_validity: (time::OffsetDateTime, time::OffsetDateTime),
+) -> IdentityState {
+    let (intermediate_not_before, intermediate_not_after) = intermediate_validity;
+    let (leaf_not_before, leaf_not_after) = leaf_validity;
+    let (intermediate, intermediate_key) = test_intermediate_ca(
+        root,
+        root_key,
+        intermediate_not_before,
+        intermediate_not_after,
+    );
+    let mut parameters = CertificateParams::default();
+    parameters.subject_alt_names.push(SanType::URI(
+        rcgen::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
+    ));
+    parameters.not_before = leaf_not_before;
+    parameters.not_after = leaf_not_after;
+    let key = KeyPair::generate().expect("generate temporal-chain leaf key");
+    let certificate = parameters
+        .signed_by(&key, &intermediate, &intermediate_key)
+        .expect("sign temporal-chain leaf");
+    let mut identity = baseline.identity.clone();
+    identity.expires_at = Timestamp::from_offset_datetime(leaf_not_after);
+    IdentityState {
+        identity,
+        svid: SvidDocument {
+            spiffe_id: SpiffeId::new(spiffe_id).expect("SPIFFE test identity"),
+            cert_chain: vec![
+                certificate.der().clone(),
+                intermediate.der().clone(),
+                root.der().clone(),
+            ],
+            private_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            expires_at: Timestamp::from_offset_datetime(leaf_not_after),
+        },
+        trust_bundles: baseline.trust_bundles.clone(),
     }
 }
 
@@ -227,6 +385,20 @@ async fn controller_pins_identity_retains_invalid_candidates_and_versions_rollba
         controller.status().reason(),
         Some(TlsMaterialReloadReason::InvalidCertificateChain)
     );
+
+    let mut malformed_chain = material_b.state.clone();
+    malformed_chain
+        .svid
+        .cert_chain
+        .insert(1, rustls_pki_types::CertificateDer::from(vec![0xde, 0xad]));
+    source_tx
+        .send(Some(malformed_chain))
+        .expect("publish malformed chain");
+    assert_eq!(
+        controller.status().reason(),
+        Some(TlsMaterialReloadReason::InvalidCertificateChain)
+    );
+    assert_eq!(controller.status().epoch().get(), 1);
 
     let mut invalid_trust = material_b.state.clone();
     invalid_trust
@@ -669,4 +841,291 @@ async fn last_good_expiry_fails_closed_with_stable_status() {
         Err(TlsMaterialError::Unavailable)
     ));
     drop(source_tx);
+}
+
+#[test]
+fn intermediate_temporal_failures_are_classified_before_initial_and_update_rebuilds() {
+    let (root, root_key) = test_ca("temporal intermediate root");
+    let baseline = material(CLIENT_ID, &root, &root_key, None).state;
+    let base = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("second-aligned test time");
+    let scenarios = [
+        (
+            base - time::Duration::hours(2),
+            base - time::Duration::hours(1),
+            TlsMaterialReloadReason::ExpiredMaterial,
+        ),
+        (
+            base + time::Duration::hours(1),
+            base + time::Duration::hours(2),
+            TlsMaterialReloadReason::NotYetValidMaterial,
+        ),
+    ];
+
+    for (intermediate_not_before, intermediate_not_after, expected_reason) in scenarios {
+        let candidate = unchecked_intermediate_temporal_material(
+            &baseline,
+            CLIENT_ID,
+            &root,
+            &root_key,
+            (intermediate_not_before, intermediate_not_after),
+            (
+                base - time::Duration::minutes(1),
+                base + time::Duration::hours(4),
+            ),
+        );
+
+        let (_initial_tx, initial_rx) = watch::channel(Some(candidate.clone()));
+        let initial = TlsMaterialController::new(initial_rx);
+        assert_eq!(initial.status().epoch().get(), 0);
+        assert_eq!(
+            initial.status().availability(),
+            TlsMaterialAvailability::Unavailable
+        );
+        assert_eq!(initial.status().reason(), Some(expected_reason));
+        assert!(initial.status().certificate_chain_expires_at().is_none());
+
+        let (update_tx, update_rx) = watch::channel(Some(baseline.clone()));
+        let update = TlsMaterialController::new(update_rx);
+        assert_eq!(update.status().epoch().get(), 1);
+        update_tx
+            .send(Some(candidate))
+            .expect("publish temporal intermediate candidate");
+        assert_eq!(update.status().epoch().get(), 1);
+        assert_eq!(
+            update.status().availability(),
+            TlsMaterialAvailability::RetainingLastGood
+        );
+        assert_eq!(update.status().reason(), Some(expected_reason));
+        assert!(update.status().certificate_chain_expires_at().is_some());
+    }
+}
+
+#[tokio::test]
+async fn intermediate_expiry_bounds_local_and_peer_chain_evidence() {
+    let (root, root_key) = test_ca("chain-expiry root");
+    let base = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("second-aligned test time");
+    // Leave ample setup headroom on loaded CI workers before crossing the
+    // real wall-clock X.509 boundary.
+    let intermediate_not_after = base + time::Duration::seconds(10);
+    let leaf_not_after = base + time::Duration::hours(1);
+    let expected_chain_expiry = Timestamp::from_offset_datetime(intermediate_not_after);
+    let (intermediate, intermediate_key) = test_intermediate_ca(
+        &root,
+        &root_key,
+        base - time::Duration::minutes(1),
+        intermediate_not_after,
+    );
+    let client = material_via_intermediate(
+        CLIENT_ID,
+        &intermediate,
+        &intermediate_key,
+        &root,
+        base - time::Duration::minutes(1),
+        leaf_not_after,
+    );
+    let server = material_via_intermediate(
+        SERVER_ID,
+        &intermediate,
+        &intermediate_key,
+        &root,
+        base - time::Duration::minutes(1),
+        leaf_not_after,
+    );
+    let (_client_tx, client_rx) = watch::channel(Some(client.state));
+    let (_server_tx, server_rx) = watch::channel(Some(server.state));
+    let client_controller = TlsMaterialController::new(client_rx);
+    let server_controller = TlsMaterialController::new(server_rx);
+
+    for status in [client_controller.status(), server_controller.status()] {
+        assert_eq!(
+            status.certificate_chain_expires_at(),
+            Some(expected_chain_expiry)
+        );
+        assert!(status.leaf_expires_at().expect("leaf expiry") > expected_chain_expiry);
+    }
+
+    let client_config = TlsConfigBuilder::from_material_controller(client_controller.clone())
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("client config");
+    let server_config = TlsConfigBuilder::from_material_controller(server_controller.clone())
+        .allow_any_trusted_peer()
+        .build_authenticated_server_config()
+        .expect("server config");
+    let client_attempt = client_config.begin_handshake().expect("client snapshot");
+    let server_attempt = server_config.begin_handshake().expect("server snapshot");
+    assert_eq!(
+        client_attempt.certificate_chain_expires_at(),
+        expected_chain_expiry
+    );
+    assert_eq!(
+        server_attempt.certificate_chain_expires_at(),
+        expected_chain_expiry
+    );
+    assert!(client_attempt.leaf_expires_at() > expected_chain_expiry);
+    assert!(server_attempt.leaf_expires_at() > expected_chain_expiry);
+
+    let mut client_connection = rustls::ClientConnection::new(
+        client_attempt.rustls_config(),
+        ServerName::try_from("localhost")
+            .expect("server name")
+            .to_owned(),
+    )
+    .expect("client connection");
+    let mut server_connection =
+        rustls::ServerConnection::new(server_attempt.rustls_config()).expect("server connection");
+    complete_handshake_with_phase(
+        &mut client_connection,
+        &mut server_connection,
+        usize::MAX,
+        &mut || {},
+    );
+
+    let server_peer = peer_tls_identity_from_client_connection(&client_connection)
+        .expect("authenticated server evidence");
+    assert_eq!(server_peer.spiffe_id().as_str(), SERVER_ID);
+    assert_eq!(
+        server_peer.certificate_chain_expires_at(),
+        expected_chain_expiry
+    );
+    assert!(server_peer.leaf_expires_at() > expected_chain_expiry);
+    let client_peer = peer_tls_identity_from_server_connection(&server_connection)
+        .expect("authenticated client evidence");
+    assert_eq!(client_peer.spiffe_id().as_str(), CLIENT_ID);
+    assert_eq!(
+        client_peer.certificate_chain_expires_at(),
+        expected_chain_expiry
+    );
+    assert!(client_peer.leaf_expires_at() > expected_chain_expiry);
+
+    for admission in [
+        client_attempt.admit().expect("admit client"),
+        server_attempt.admit().expect("admit server"),
+    ] {
+        assert_eq!(
+            admission.certificate_chain_expires_at(),
+            expected_chain_expiry
+        );
+        assert!(admission.leaf_expires_at() > expected_chain_expiry);
+    }
+
+    let remaining = (intermediate_not_after - time::OffsetDateTime::now_utc())
+        .try_into()
+        .unwrap_or(Duration::ZERO);
+    tokio::time::sleep(remaining.saturating_add(Duration::from_millis(100))).await;
+    for controller in [client_controller, server_controller] {
+        let status = controller.status();
+        assert_eq!(status.availability(), TlsMaterialAvailability::Unavailable);
+        assert_eq!(
+            status.reason(),
+            Some(TlsMaterialReloadReason::LastGoodExpired)
+        );
+        assert!(status.leaf_expires_at().is_none());
+        assert!(status.certificate_chain_expires_at().is_none());
+    }
+    assert!(matches!(
+        client_config.begin_handshake(),
+        Err(TlsMaterialError::Unavailable)
+    ));
+    assert!(matches!(
+        server_config.begin_handshake(),
+        Err(TlsMaterialError::Unavailable)
+    ));
+}
+
+#[test]
+fn only_redundantly_presented_roots_bound_local_and_peer_chain_expiry() {
+    let base = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("second-aligned test time");
+    let root_not_after = base + time::Duration::hours(1);
+    let leaf_not_after = base + time::Duration::hours(2);
+    let expected_root_expiry = Timestamp::from_offset_datetime(root_not_after);
+    let expected_leaf_expiry = Timestamp::from_offset_datetime(leaf_not_after);
+    let (root, root_key) = test_ca_with_validity(
+        "presentation-boundary root",
+        base - time::Duration::hours(1),
+        root_not_after,
+    );
+    let trust_bundle_only_root = material_via_root(
+        CLIENT_ID,
+        &root,
+        &root_key,
+        base - time::Duration::minutes(1),
+        leaf_not_after,
+        false,
+    );
+    let redundantly_presented_root = material_via_root(
+        SERVER_ID,
+        &root,
+        &root_key,
+        base - time::Duration::minutes(1),
+        leaf_not_after,
+        true,
+    );
+    let (_client_tx, client_rx) = watch::channel(Some(trust_bundle_only_root.state));
+    let (_server_tx, server_rx) = watch::channel(Some(redundantly_presented_root.state));
+    let client_controller = TlsMaterialController::new(client_rx);
+    let server_controller = TlsMaterialController::new(server_rx);
+    assert_eq!(
+        client_controller.status().certificate_chain_expires_at(),
+        Some(expected_leaf_expiry)
+    );
+    assert_eq!(
+        server_controller.status().certificate_chain_expires_at(),
+        Some(expected_root_expiry)
+    );
+
+    let client_config = TlsConfigBuilder::from_material_controller(client_controller)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("client config");
+    let server_config = TlsConfigBuilder::from_material_controller(server_controller)
+        .allow_any_trusted_peer()
+        .build_authenticated_server_config()
+        .expect("server config");
+    let client_attempt = client_config.begin_handshake().expect("client snapshot");
+    let server_attempt = server_config.begin_handshake().expect("server snapshot");
+    assert_eq!(
+        client_attempt.certificate_chain_expires_at(),
+        expected_leaf_expiry
+    );
+    assert_eq!(
+        server_attempt.certificate_chain_expires_at(),
+        expected_root_expiry
+    );
+    let mut client_connection = rustls::ClientConnection::new(
+        client_attempt.rustls_config(),
+        ServerName::try_from("localhost")
+            .expect("server name")
+            .to_owned(),
+    )
+    .expect("client connection");
+    let mut server_connection =
+        rustls::ServerConnection::new(server_attempt.rustls_config()).expect("server connection");
+    complete_handshake_with_phase(
+        &mut client_connection,
+        &mut server_connection,
+        usize::MAX,
+        &mut || {},
+    );
+
+    let server_peer = peer_tls_identity_from_client_connection(&client_connection)
+        .expect("authenticated server evidence");
+    assert_eq!(server_peer.leaf_expires_at(), expected_leaf_expiry);
+    assert_eq!(
+        server_peer.certificate_chain_expires_at(),
+        expected_root_expiry
+    );
+    let client_peer = peer_tls_identity_from_server_connection(&server_connection)
+        .expect("authenticated client evidence");
+    assert_eq!(client_peer.leaf_expires_at(), expected_leaf_expiry);
+    assert_eq!(
+        client_peer.certificate_chain_expires_at(),
+        expected_leaf_expiry
+    );
 }

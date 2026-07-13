@@ -444,17 +444,38 @@ Authenticated direct and consensus transports use one validated
 maximum authentication age, a 30-second drain window, 50 ms through 1 second
 bounded reconnect backoff, and up to 30 seconds of stable directed-peer
 rotation jitter. A connection's hard deadline is the earliest of its maximum
-age, local leaf expiry, and peer leaf expiry. Retirement begins one drain window
-before that hard deadline, or immediately when less than one drain window
-remains.
+age, the earliest expiry in the local presented certificate chain, and the
+earliest expiry in the peer presented certificate chain. Every certificate
+configured/presented in an SVID chain contributes to that bound, including a
+redundantly presented root. Production SVID chains should omit the trust anchor,
+so this normally means the leaf plus its presented intermediates. Certificates
+that appear only in a configured trust bundle are not independently scanned,
+and the time an anchor is removed is not an expiry-deadline input. Retirement
+begins one drain window before that hard deadline, or immediately when less than
+one drain window remains.
 
 At TLS completion the transport retains exact monotonic deadline evidence for
-both leaves and the coherent `TlsMaterialEpoch` admitted by `opc-tls`. A later
-material epoch, or `SessionReauthenticationControl::request_reauthentication`,
-starts cooperative retirement after the configured stable jitter. Configure a
-shared control with `with_reauthentication_control`, and configure non-default
-finite bounds with `with_connection_lifecycle`, on every client/peer and
-listener that must rotate together.
+both presented chains and the coherent `TlsMaterialEpoch` admitted by
+`opc-tls`. A later material epoch, or
+`SessionReauthenticationControl::request_reauthentication`, starts cooperative
+retirement after the configured stable jitter. Configure a shared control with
+`with_reauthentication_control`, and configure non-default finite bounds with
+`with_connection_lifecycle`, on every client/peer and listener that must rotate
+together.
+
+The bounded same-issuer credential-compromise/revocation mechanism is
+short-lived SVID expiry, not material rotation or connection reauthentication.
+Choose the SVID validity bound as the maximum acceptable exposure window.
+Publishing replacement material and retiring connections moves cooperative
+participants to the replacement, but does not revoke the old certificate/key:
+its holder can establish a fresh connection until the earliest expiry in that
+old presented chain while its issuer remains trusted. The transport does not
+implement immediate generic CRL, OCSP, certificate/identity denylist, or other
+selective same-issuer revocation. Removing a root is instead a trust-anchor
+cutover for every chain that depends on it; it rejects those chains on later
+full handshakes and, with reauthentication, drains connections established
+under the previous trust material. Root removal is not a certificate-expiry
+deadline.
 
 Retirement has these invariants:
 
@@ -526,18 +547,21 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
 - Session-net disables TLS session caches, tickets, resumption, early data, and
   0-RTT. Every reconnect pays for a full mutual-TLS handshake so SVID rotation
   cannot reuse a cached peer certificate or authority decision.
-- Authenticated connections now retire at a finite age, exact local/peer leaf
-  expiry, material-epoch change, or explicit reauthentication request. Both
-  sides stop new admission at the soft boundary, bound the transport wait and
+- Authenticated connections now retire at a finite age, exact earliest
+  local/peer presented-chain expiry, material-epoch change, or explicit
+  reauthentication request. Both sides stop new admission at the soft boundary,
+  bound the transport wait and
   connection-slot lifetime by the hard deadline, and reconnect through a
   complete mutual-TLS/application handshake. An already-admitted supervised
   backend mutation may still finish later and therefore remains typed
   ambiguous and non-retryable. Legacy watches resume from the exact delivered
   cursor. Scoped real-mTLS tests cover retained connections and continuous
   request/watch recycling. #164 and #143 still own multi-process fleet
-  trust-overlap, revocation, reconnect-storm, resource, soak, and release
-  evidence. The 365-day session TTL remains unrelated to certificate lifetime,
-  trust-bundle lifetime, or authentication age.
+  trust-overlap/removal, short-lived-SVID expiry, root-cutover,
+  reconnect-storm, resource, soak, and release evidence. Any production
+  acceptance criteria must explicitly acknowledge that immediate generic
+  revocation remains unsupported. The 365-day session TTL remains unrelated to
+  certificate lifetime, trust-bundle lifetime, or authentication age.
 - The configuration ID is a SHA-256 digest of the cluster ID, explicit
   generation, and the full sorted descriptor set. Changing a member ID,
   endpoint, TLS identity, failure domain, backing identity, cluster, or
@@ -713,7 +737,8 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
 - Retain #171's bounded cursor contract and add distributed
   failure and soak evidence. Connection continuity, bounded authentication age,
   and full-handshake reauthentication are implemented; complete fleet
-  trust-bundle overlap/removal, revocation, reconnect-storm,
+  trust-bundle overlap/removal, short-lived-SVID expiry and compromise response,
+  reconnect-storm,
   multi-process/deployed-network, payload-protection-key, and production
   qualification evidence remains under #164/#143. Close those evidence gates
   before treating this as production transport.
@@ -728,8 +753,12 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
 - `tests/authenticated_replica_identity.rs` covers exact v5 profile/identity,
   routing aliases, certificate/claim/scope mismatches, downgrade and malformed
   Hello, local and peer leaf-expiry retirement, overlapping trust rotation,
-  old-trust rejection, fresh nonce/profile/ALPN checks on replacements,
-  relabeling, and replayed challenge responses over mTLS.
+  old-trust rejection, fresh nonce/profile/ALPN checks on
+  replacements, relabeling, and replayed challenge responses over mTLS.
+- `opc-tls/tests/material_epochs.rs` proves effective configured/presented-chain
+  expiry across a real mutual-TLS handshake, and `src/lifecycle.rs` unit tests
+  prove the corresponding local/peer retirement deadlines and fixed metric
+  reasons. This component evidence is not a fleet rotation test.
 - `tests/consensus_transport.rs` covers the shared consensus-only ALPN,
   complete call deadlines, scope binding, a renewed SVID observed on a
   subsequent new call/full handshake, wrong rotated identities, and rejection

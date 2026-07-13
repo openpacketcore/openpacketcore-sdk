@@ -33,11 +33,11 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 pub use crate::consensus::RemoteAddrResolver;
-use crate::error::ProtocolError;
+use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::identity::RemoteReplicaBinding;
 use crate::lifecycle::{
-    directed_connection_key, ConnectionLifecycle, ConnectionLifecyclePolicy, LeafExpiryEvidence,
-    SessionReauthenticationControl,
+    directed_connection_key, CertificateExpiryEvidence, ConnectionLifecycle,
+    ConnectionLifecyclePolicy, SessionReauthenticationControl,
 };
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
@@ -356,22 +356,6 @@ const fn unavailable_capabilities() -> BackendCapabilities {
 const REMOTE_PROTOCOL_VIOLATION: &str =
     "remote session backend response violated the protocol contract";
 
-fn classify_tls_connect_error(error: io::Error) -> ProtocolError {
-    if let Some(rustls_error) = error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<tokio_rustls::rustls::Error>())
-    {
-        return match rustls_error {
-            tokio_rustls::rustls::Error::NoApplicationProtocol
-            | tokio_rustls::rustls::Error::AlertReceived(
-                tokio_rustls::rustls::AlertDescription::NoApplicationProtocol,
-            ) => ProtocolError::UnexpectedResponse,
-            _ => ProtocolError::Authentication,
-        };
-    }
-    ProtocolError::Io(error)
-}
-
 impl From<RemoteRequestFailure> for ReplicaReadinessFailure {
     fn from(failure: RemoteRequestFailure) -> Self {
         match failure {
@@ -553,7 +537,7 @@ async fn open_connection_attempt(
                     let tls_stream = connector
                         .connect(server_name, tcp)
                         .await
-                        .map_err(classify_tls_connect_error)?;
+                        .map_err(classify_tls_io_error)?;
                     if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
                         return Err(ProtocolError::UnexpectedResponse);
                     }
@@ -564,10 +548,16 @@ async fn open_connection_attempt(
                         return Err(ProtocolError::Authentication);
                     }
                     let tls_completed_at = tokio::time::Instant::now();
-                    let local_expiry =
-                        LeafExpiryEvidence::capture(attempt.leaf_expires_at(), tls_completed_at);
-                    let peer_expiry =
-                        LeafExpiryEvidence::capture(peer.leaf_expires_at(), tls_completed_at);
+                    let local_expiry = CertificateExpiryEvidence::capture(
+                        attempt.leaf_expires_at(),
+                        attempt.certificate_chain_expires_at(),
+                        tls_completed_at,
+                    );
+                    let peer_expiry = CertificateExpiryEvidence::capture(
+                        peer.leaf_expires_at(),
+                        peer.certificate_chain_expires_at(),
+                        tls_completed_at,
+                    );
 
                     let (mut reader, mut writer) = tokio::io::split(tls_stream);
                     let (contract_profile, frame_limits, cas_idempotency_epoch) =

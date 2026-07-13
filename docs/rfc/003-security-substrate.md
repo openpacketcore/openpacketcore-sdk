@@ -165,12 +165,25 @@ clients without process restart.
 
 Rotation requirements:
 
-- New connections use the latest identity immediately after reload.
-- Existing connections are reauthenticated on stream boundaries or at a
-  configurable maximum connection age.
+- After the controller accepts and publishes a new epoch, new handshakes use
+  that coherent snapshot.
+- Existing connections are cooperatively retired after a material change,
+  explicit reauthentication request, or configurable maximum connection age;
+  replacements complete a full handshake.
 - Expired identities are not accepted.
-- Bundle removal revokes future handshakes.
+- Trust-anchor removal cuts over future handshakes: every chain that depends on
+  the removed anchor is rejected.
 - Rotation failures emit critical telemetry.
+
+The bounded response to compromise of a certificate/key under an issuer that
+remains trusted MUST be short-lived SVID expiry, not rotation or
+reauthentication. Replacing material moves cooperative workloads to the new
+SVID, but the old certificate/key can establish another full handshake until
+the earliest expiry across every certificate in its presented SVID chain while
+its issuer remains trusted. The TLS substrate does not implement immediate
+generic CRL, OCSP, certificate/identity denylist, or other selective
+same-issuer revocation. Removing a root is instead a trust-anchor cutover for
+all chains that depend on it; it is not a certificate-expiry deadline.
 
 For Kubernetes projected Secrets, production consumers MUST resolve one
 relative `..data` target and read the leaf chain, key, intermediates, and trust
@@ -192,18 +205,27 @@ status or events.
 A validated candidate is published with a process-local monotonic generation.
 Rollback is another publication and therefore advances that generation. An
 invalid candidate retains the exact last-known-good identity, but never beyond
-the leaf's expiry; expiry clears the identity and reports a typed unavailable
-state. This source-level publication contract precedes #162's coherent
-per-handshake TLS epoch and #163's bounded connection reauthentication.
+the leaf's expiry; its ongoing expiry monitor schedules clearing from that leaf
+expiry and is not the authority for an earlier intermediate expiry. Expiry
+clears the source identity and reports a typed unavailable state. This
+source-level publication contract precedes #162's coherent per-handshake TLS
+epoch and #163's bounded connection reauthentication. Source `Ready` alone is
+not TLS readiness; consumers MUST gate on the controller status described
+below.
 
 `opc-tls::TlsMaterialController` MUST revalidate each identity state under fixed
 certificate, trust-anchor, private-key, and aggregate byte bounds before it can
 become handshake authority. It MUST pin the explicit local SPIFFE identity or
-the first accepted identity, retain an invalid candidate's predecessor only
-until leaf expiry, and assign every accepted update or rollback a new opaque
+the first accepted identity. It MUST pre-scan every certificate configured in
+the presented SVID chain and retain an invalid candidate's predecessor only
+until the earliest expiry in that chain. A redundantly presented root therefore
+bounds the controller lifetime; a root appearing only in a trust bundle is not
+independently scanned for this deadline. Production SVID chains SHOULD omit the
+trust anchor. Every accepted update or rollback receives a new opaque
 process-local epoch. Status and errors MUST contain only closed reason codes,
-epoch, availability, and leaf expiry; identity text, paths, PEM, keys, and
-parser/application error text are forbidden.
+epoch, availability, leaf expiry, and effective presented-chain expiry;
+identity text, paths, PEM, keys, and parser/application error text are
+forbidden.
 
 Every production handshake MUST freeze one controller snapshot before rustls
 construction so certificate resolution and peer verification use the same
@@ -212,8 +234,15 @@ the caller MUST verify that epoch is still current before admitting the
 connection. A changed epoch MUST discard the connection and retry within the
 fixed SDK retry/concurrency limits. Tickets, resumption, early data, half-RTT
 data, and 0-RTT MUST remain disabled. This admission record carries the exact
-epoch and local leaf expiry; #163 separately owns retirement of connections
-after admission.
+epoch, local leaf expiry, and effective local configured/presented-chain expiry;
+#163 separately combines the local and peer presented-chain expiries when
+retiring connections after admission.
+
+These reload, admission, and retirement mechanisms are scoped implementation
+primitives, not fleet qualification. Multi-process trust overlap/removal,
+short-lived-SVID expiry and root-cutover evidence, reconnect/resource/soak
+bounds, and the explicit unsupported generic-revocation limitation remain open
+under #164/#143.
 
 ## 5. Transport Security
 
@@ -603,6 +632,11 @@ Required metrics:
 - `opc_security_audit_chain_verify_total{outcome}`
 - `opc_security_redactions_total{source}`
 
+For TLS readiness and lifecycle reporting, SVID expiry means the controller's
+effective earliest configured/presented-chain expiry, not an assumption that
+the leaf always expires first. Certificates present only in trust bundles are
+not independently included in that expiry value.
+
 Metrics MUST control label cardinality. Raw SPIFFE IDs SHOULD be exposed through
 logs, not high-cardinality metrics, unless explicitly enabled.
 
@@ -644,9 +678,11 @@ should have deterministic test fixtures and no hidden global state.
 - Projected-material exact-limit/one-over, last-good retention, expiry,
   rollback-generation, and redaction tests.
 - TLS material rotation during every handshake/application phase, exact
-  epoch/expiry admission, identity continuity, rollback, repeated-rotation
-  retry exhaustion, concurrent-operation bounds, cancellation, and redaction.
-- Trust bundle rotation revokes removed trust domain.
+  epoch/effective-chain-expiry admission, identity continuity, rollback,
+  repeated-rotation retry exhaustion, concurrent-operation bounds,
+  cancellation, and redaction.
+- Trust-anchor cutover rejects every future handshake whose chain depends on
+  the removed anchor.
 - gNSI policy staging and rollback.
 - Management commit rejected after NACM policy update removes permission.
 - Shadow-security store not visible through ordinary gNMI `Get`.

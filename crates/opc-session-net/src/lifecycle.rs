@@ -255,6 +255,8 @@ pub(crate) enum RetirementReason {
     MaximumAge,
     LocalLeafExpiry,
     PeerLeafExpiry,
+    LocalCertificateChainExpiry,
+    PeerCertificateChainExpiry,
     MaterialEpoch,
     Explicit,
 }
@@ -337,8 +339,26 @@ impl RetirementReason {
             Self::MaximumAge => "maximum_age",
             Self::LocalLeafExpiry => "local_leaf_expiry",
             Self::PeerLeafExpiry => "peer_leaf_expiry",
+            Self::LocalCertificateChainExpiry => "local_certificate_chain_expiry",
+            Self::PeerCertificateChainExpiry => "peer_certificate_chain_expiry",
             Self::MaterialEpoch => "material_epoch",
             Self::Explicit => "explicit",
+        }
+    }
+
+    fn retirement_counter(self) -> &'static std::sync::atomic::AtomicU64 {
+        match self {
+            Self::MaximumAge => &METRICS.session_net_lifecycle_retirement_maximum_age,
+            Self::LocalLeafExpiry => &METRICS.session_net_lifecycle_retirement_local_leaf_expiry,
+            Self::PeerLeafExpiry => &METRICS.session_net_lifecycle_retirement_peer_leaf_expiry,
+            Self::LocalCertificateChainExpiry => {
+                &METRICS.session_net_lifecycle_retirement_local_certificate_chain_expiry
+            }
+            Self::PeerCertificateChainExpiry => {
+                &METRICS.session_net_lifecycle_retirement_peer_certificate_chain_expiry
+            }
+            Self::MaterialEpoch => &METRICS.session_net_lifecycle_retirement_material_epoch,
+            Self::Explicit => &METRICS.session_net_lifecycle_retirement_explicit,
         }
     }
 }
@@ -360,8 +380,8 @@ pub(crate) struct ConnectionLifecycle {
 #[allow(dead_code)] // retained as exact per-connection authentication evidence
 struct ConnectionAuthenticationEvidence {
     handshake_completed_at: tokio::time::Instant,
-    local_leaf_expiry: Option<LeafExpiryEvidence>,
-    peer_leaf_expiry: Option<LeafExpiryEvidence>,
+    local_certificate_expiry: Option<CertificateExpiryEvidence>,
+    peer_certificate_expiry: Option<CertificateExpiryEvidence>,
     material_epoch: Option<opc_tls::TlsMaterialEpoch>,
 }
 
@@ -371,42 +391,65 @@ impl fmt::Debug for ConnectionAuthenticationEvidence {
             .debug_struct("ConnectionAuthenticationEvidence")
             .field("handshake_completed_at", &"<redacted>")
             .field(
-                "local_leaf_expiry",
-                &self.local_leaf_expiry.map(|_| "<redacted>"),
+                "local_certificate_expiry",
+                &self.local_certificate_expiry.map(|_| "<redacted>"),
             )
             .field(
-                "peer_leaf_expiry",
-                &self.peer_leaf_expiry.map(|_| "<redacted>"),
+                "peer_certificate_expiry",
+                &self.peer_certificate_expiry.map(|_| "<redacted>"),
             )
             .field("material_epoch", &self.material_epoch.map(|_| "<redacted>"))
             .finish()
     }
 }
 
-/// Exact certificate expiry plus the monotonic deadline captured at TLS
-/// completion. Keeping both prevents a later wall-clock adjustment or slow
-/// application bootstrap from changing the authenticated evidence.
+/// Exact leaf and effective presented-certificate-chain expiries plus the
+/// monotonic deadline captured at TLS completion. Keeping all three values
+/// prevents a later wall-clock adjustment or slow application bootstrap from
+/// changing either the authenticated evidence or its fixed retirement reason.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LeafExpiryEvidence {
-    expires_at: opc_types::Timestamp,
+pub(crate) struct CertificateExpiryEvidence {
+    leaf_expires_at: opc_types::Timestamp,
+    certificate_chain_expires_at: opc_types::Timestamp,
     deadline: tokio::time::Instant,
 }
 
-impl LeafExpiryEvidence {
+impl CertificateExpiryEvidence {
     pub(crate) fn capture(
-        expires_at: opc_types::Timestamp,
+        leaf_expires_at: opc_types::Timestamp,
+        certificate_chain_expires_at: opc_types::Timestamp,
         tls_completed_at: tokio::time::Instant,
     ) -> Self {
         Self {
-            expires_at,
-            deadline: wall_expiry_deadline(expires_at, tls_completed_at),
+            leaf_expires_at,
+            certificate_chain_expires_at,
+            deadline: wall_expiry_deadline(
+                leaf_expires_at.min(certificate_chain_expires_at),
+                tls_completed_at,
+            ),
+        }
+    }
+
+    fn local_retirement_reason(self) -> RetirementReason {
+        if self.certificate_chain_expires_at < self.leaf_expires_at {
+            RetirementReason::LocalCertificateChainExpiry
+        } else {
+            RetirementReason::LocalLeafExpiry
+        }
+    }
+
+    fn peer_retirement_reason(self) -> RetirementReason {
+        if self.certificate_chain_expires_at < self.leaf_expires_at {
+            RetirementReason::PeerCertificateChainExpiry
+        } else {
+            RetirementReason::PeerLeafExpiry
         }
     }
 }
 
-impl fmt::Debug for LeafExpiryEvidence {
+impl fmt::Debug for CertificateExpiryEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("LeafExpiryEvidence(<redacted>)")
+        formatter.write_str("CertificateExpiryEvidence(<redacted>)")
     }
 }
 
@@ -414,8 +457,8 @@ impl ConnectionLifecycle {
     pub(crate) fn new(
         policy: ConnectionLifecyclePolicy,
         established_at: tokio::time::Instant,
-        local_leaf_expiry: Option<LeafExpiryEvidence>,
-        peer_leaf_expiry: Option<LeafExpiryEvidence>,
+        local_certificate_expiry: Option<CertificateExpiryEvidence>,
+        peer_certificate_expiry: Option<CertificateExpiryEvidence>,
         generation: u64,
         material_epoch: Option<opc_tls::TlsMaterialEpoch>,
     ) -> Result<Self, ConnectionLifecycleError> {
@@ -428,20 +471,18 @@ impl ConnectionLifecycle {
         // identical.
         let mut hard_deadline = maximum_age_deadline;
         let mut reason = RetirementReason::MaximumAge;
-        if let Some(deadline) =
-            local_leaf_expiry.map(|evidence| evidence.deadline.max(established_at))
-        {
+        if let Some(evidence) = local_certificate_expiry {
+            let deadline = evidence.deadline.max(established_at);
             if deadline <= hard_deadline {
                 hard_deadline = deadline;
-                reason = RetirementReason::LocalLeafExpiry;
+                reason = evidence.local_retirement_reason();
             }
         }
-        if let Some(deadline) =
-            peer_leaf_expiry.map(|evidence| evidence.deadline.max(established_at))
-        {
+        if let Some(evidence) = peer_certificate_expiry {
+            let deadline = evidence.deadline.max(established_at);
             if deadline <= hard_deadline {
                 hard_deadline = deadline;
-                reason = RetirementReason::PeerLeafExpiry;
+                reason = evidence.peer_retirement_reason();
             }
         }
         let retire_at = hard_deadline
@@ -452,8 +493,8 @@ impl ConnectionLifecycle {
             policy,
             evidence: ConnectionAuthenticationEvidence {
                 handshake_completed_at: established_at,
-                local_leaf_expiry,
-                peer_leaf_expiry,
+                local_certificate_expiry,
+                peer_certificate_expiry,
                 material_epoch,
             },
             retire_at,
@@ -528,20 +569,7 @@ impl ConnectionLifecycle {
             return;
         }
         self.metrics.begin_draining();
-        match reason {
-            RetirementReason::MaximumAge => &METRICS.session_net_lifecycle_retirement_maximum_age,
-            RetirementReason::LocalLeafExpiry => {
-                &METRICS.session_net_lifecycle_retirement_local_leaf_expiry
-            }
-            RetirementReason::PeerLeafExpiry => {
-                &METRICS.session_net_lifecycle_retirement_peer_leaf_expiry
-            }
-            RetirementReason::MaterialEpoch => {
-                &METRICS.session_net_lifecycle_retirement_material_epoch
-            }
-            RetirementReason::Explicit => &METRICS.session_net_lifecycle_retirement_explicit,
-        }
-        .fetch_add(1, Ordering::Relaxed);
+        reason.retirement_counter().fetch_add(1, Ordering::Relaxed);
         tracing::debug!(reason = reason.as_str(), "session connection retired");
     }
 
@@ -663,6 +691,18 @@ mod tests {
         .expect("policy")
     }
 
+    fn certificate_expiry_evidence(
+        leaf_expires_at: opc_types::Timestamp,
+        certificate_chain_expires_at: opc_types::Timestamp,
+        deadline: tokio::time::Instant,
+    ) -> CertificateExpiryEvidence {
+        CertificateExpiryEvidence {
+            leaf_expires_at,
+            certificate_chain_expires_at,
+            deadline,
+        }
+    }
+
     #[test]
     fn policy_rejects_unbounded_or_misordered_values() {
         assert_eq!(
@@ -706,14 +746,16 @@ mod tests {
         let lifecycle = ConnectionLifecycle::new(
             policy(),
             now,
-            Some(LeafExpiryEvidence {
-                expires_at: local_timestamp,
-                deadline: now + Duration::from_secs(40),
-            }),
-            Some(LeafExpiryEvidence {
-                expires_at: peer_timestamp,
-                deadline: now + Duration::from_secs(20),
-            }),
+            Some(certificate_expiry_evidence(
+                local_timestamp,
+                local_timestamp,
+                now + Duration::from_secs(40),
+            )),
+            Some(certificate_expiry_evidence(
+                peer_timestamp,
+                peer_timestamp,
+                now + Duration::from_secs(20),
+            )),
             0,
             None,
         )
@@ -723,28 +765,28 @@ mod tests {
         assert_eq!(
             lifecycle
                 .evidence()
-                .peer_leaf_expiry
-                .map(|value| value.expires_at),
+                .peer_certificate_expiry
+                .map(|value| value.leaf_expires_at),
             Some(peer_timestamp)
         );
         assert_eq!(
             lifecycle
                 .evidence()
-                .local_leaf_expiry
-                .map(|value| value.expires_at),
+                .local_certificate_expiry
+                .map(|value| value.leaf_expires_at),
             Some(local_timestamp)
         );
         assert_eq!(
             lifecycle
                 .evidence()
-                .peer_leaf_expiry
+                .peer_certificate_expiry
                 .map(|value| value.deadline),
             Some(now + Duration::from_secs(20))
         );
         assert_eq!(
             lifecycle
                 .evidence()
-                .local_leaf_expiry
+                .local_certificate_expiry
                 .map(|value| value.deadline),
             Some(now + Duration::from_secs(40))
         );
@@ -769,14 +811,12 @@ mod tests {
         let lifecycle = ConnectionLifecycle::new(
             policy(),
             now,
-            Some(LeafExpiryEvidence {
-                expires_at,
-                deadline,
-            }),
-            Some(LeafExpiryEvidence {
-                expires_at,
-                deadline,
-            }),
+            Some(certificate_expiry_evidence(
+                expires_at, expires_at, deadline,
+            )),
+            Some(certificate_expiry_evidence(
+                expires_at, expires_at, deadline,
+            )),
             0,
             None,
         )
@@ -788,6 +828,53 @@ mod tests {
             Some(RetirementReason::PeerLeafExpiry)
         );
         assert_eq!(lifecycle.hard_deadline().expect("hard deadline"), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn earlier_chain_expiry_uses_distinct_local_and_peer_reasons() {
+        let now = tokio::time::Instant::now();
+        let wall_now = opc_types::Timestamp::now_utc();
+        let leaf_expires_at = wall_now.add_seconds(40).expect("leaf expiry");
+        let chain_expires_at = wall_now.add_seconds(20).expect("chain expiry");
+        let deadline = now + Duration::from_secs(20);
+        let evidence = certificate_expiry_evidence(leaf_expires_at, chain_expires_at, deadline);
+
+        let local = ConnectionLifecycle::new(policy(), now, Some(evidence), None, 0, None)
+            .expect("local lifecycle");
+        assert_eq!(
+            local.retirement(now + Duration::from_secs(10)),
+            Some(RetirementReason::LocalCertificateChainExpiry)
+        );
+        assert_eq!(
+            RetirementReason::LocalCertificateChainExpiry.as_str(),
+            "local_certificate_chain_expiry"
+        );
+        assert!(std::ptr::eq(
+            RetirementReason::LocalCertificateChainExpiry.retirement_counter(),
+            &METRICS.session_net_lifecycle_retirement_local_certificate_chain_expiry
+        ));
+        assert_eq!(
+            local
+                .evidence()
+                .local_certificate_expiry
+                .map(|value| value.certificate_chain_expires_at),
+            Some(chain_expires_at)
+        );
+
+        let peer = ConnectionLifecycle::new(policy(), now, None, Some(evidence), 0, None)
+            .expect("peer lifecycle");
+        assert_eq!(
+            peer.retirement(now + Duration::from_secs(10)),
+            Some(RetirementReason::PeerCertificateChainExpiry)
+        );
+        assert_eq!(
+            RetirementReason::PeerCertificateChainExpiry.as_str(),
+            "peer_certificate_chain_expiry"
+        );
+        assert!(std::ptr::eq(
+            RetirementReason::PeerCertificateChainExpiry.retirement_counter(),
+            &METRICS.session_net_lifecycle_retirement_peer_certificate_chain_expiry
+        ));
     }
 
     #[tokio::test(start_paused = true)]

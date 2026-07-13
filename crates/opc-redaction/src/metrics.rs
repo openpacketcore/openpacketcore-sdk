@@ -519,6 +519,8 @@ pub struct SdkMetrics {
     pub session_net_lifecycle_retirement_maximum_age: AtomicU64,
     pub session_net_lifecycle_retirement_local_leaf_expiry: AtomicU64,
     pub session_net_lifecycle_retirement_peer_leaf_expiry: AtomicU64,
+    pub session_net_lifecycle_retirement_local_certificate_chain_expiry: AtomicU64,
+    pub session_net_lifecycle_retirement_peer_certificate_chain_expiry: AtomicU64,
     pub session_net_lifecycle_retirement_material_epoch: AtomicU64,
     pub session_net_lifecycle_retirement_explicit: AtomicU64,
     pub session_net_lifecycle_active_connections: AtomicI64,
@@ -685,6 +687,8 @@ impl SdkMetrics {
             session_net_lifecycle_retirement_maximum_age: AtomicU64::new(0),
             session_net_lifecycle_retirement_local_leaf_expiry: AtomicU64::new(0),
             session_net_lifecycle_retirement_peer_leaf_expiry: AtomicU64::new(0),
+            session_net_lifecycle_retirement_local_certificate_chain_expiry: AtomicU64::new(0),
+            session_net_lifecycle_retirement_peer_certificate_chain_expiry: AtomicU64::new(0),
             session_net_lifecycle_retirement_material_epoch: AtomicU64::new(0),
             session_net_lifecycle_retirement_explicit: AtomicU64::new(0),
             session_net_lifecycle_active_connections: AtomicI64::new(0),
@@ -886,6 +890,10 @@ impl SdkMetrics {
         self.session_net_lifecycle_retirement_local_leaf_expiry
             .store(0, Ordering::Relaxed);
         self.session_net_lifecycle_retirement_peer_leaf_expiry
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_retirement_local_certificate_chain_expiry
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_retirement_peer_certificate_chain_expiry
             .store(0, Ordering::Relaxed);
         self.session_net_lifecycle_retirement_material_epoch
             .store(0, Ordering::Relaxed);
@@ -1813,6 +1821,18 @@ pub fn export_prometheus_text() -> String {
                 .load(Ordering::Relaxed),
         ),
         (
+            "local_certificate_chain_expiry",
+            METRICS
+                .session_net_lifecycle_retirement_local_certificate_chain_expiry
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "peer_certificate_chain_expiry",
+            METRICS
+                .session_net_lifecycle_retirement_peer_certificate_chain_expiry
+                .load(Ordering::Relaxed),
+        ),
+        (
             "material_epoch",
             METRICS
                 .session_net_lifecycle_retirement_material_epoch
@@ -2633,6 +2653,12 @@ mod tests {
             .session_net_lifecycle_retirement_peer_leaf_expiry
             .store(25, Ordering::Relaxed);
         METRICS
+            .session_net_lifecycle_retirement_local_certificate_chain_expiry
+            .store(43, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_retirement_peer_certificate_chain_expiry
+            .store(44, Ordering::Relaxed);
+        METRICS
             .session_net_lifecycle_retirement_material_epoch
             .store(26, Ordering::Relaxed);
         METRICS
@@ -2790,6 +2816,12 @@ mod tests {
             "opc_session_net_connection_retirements_total{reason=\"peer_leaf_expiry\"} 25\n"
         ));
         assert!(exported.contains(
+            "opc_session_net_connection_retirements_total{reason=\"local_certificate_chain_expiry\"} 43\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_net_connection_retirements_total{reason=\"peer_certificate_chain_expiry\"} 44\n"
+        ));
+        assert!(exported.contains(
             "opc_session_net_connection_retirements_total{reason=\"material_epoch\"} 26\n"
         ));
         assert!(exported
@@ -2914,6 +2946,8 @@ mod tests {
             &metrics.session_net_lifecycle_retirement_maximum_age,
             &metrics.session_net_lifecycle_retirement_local_leaf_expiry,
             &metrics.session_net_lifecycle_retirement_peer_leaf_expiry,
+            &metrics.session_net_lifecycle_retirement_local_certificate_chain_expiry,
+            &metrics.session_net_lifecycle_retirement_peer_certificate_chain_expiry,
             &metrics.session_net_lifecycle_retirement_material_epoch,
             &metrics.session_net_lifecycle_retirement_explicit,
             &metrics.session_net_lifecycle_drain_started,
@@ -2954,6 +2988,8 @@ mod tests {
             &metrics.session_net_lifecycle_retirement_maximum_age,
             &metrics.session_net_lifecycle_retirement_local_leaf_expiry,
             &metrics.session_net_lifecycle_retirement_peer_leaf_expiry,
+            &metrics.session_net_lifecycle_retirement_local_certificate_chain_expiry,
+            &metrics.session_net_lifecycle_retirement_peer_certificate_chain_expiry,
             &metrics.session_net_lifecycle_retirement_material_epoch,
             &metrics.session_net_lifecycle_retirement_explicit,
             &metrics.session_net_lifecycle_drain_started,

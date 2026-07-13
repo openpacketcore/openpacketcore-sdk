@@ -28,11 +28,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing;
 
-use crate::error::ProtocolError;
+use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::identity::{LocalReplicaBinding, SessionClusterId};
 use crate::lifecycle::{
-    directed_connection_key, material_status_matches_admission, ConnectionLifecycle,
-    ConnectionLifecyclePolicy, LeafExpiryEvidence, SessionReauthenticationControl,
+    directed_connection_key, material_status_matches_admission, CertificateExpiryEvidence,
+    ConnectionLifecycle, ConnectionLifecyclePolicy, SessionReauthenticationControl,
 };
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
@@ -2026,8 +2026,8 @@ enum ConnectionPeerIdentity {
 struct PendingServerLifecycle {
     handshake: Option<opc_tls::TlsServerHandshake>,
     tls_config: Option<opc_tls::AuthenticatedServerConfig>,
-    local_leaf_expiry: Option<LeafExpiryEvidence>,
-    peer_leaf_expiry: Option<LeafExpiryEvidence>,
+    local_certificate_expiry: Option<CertificateExpiryEvidence>,
+    peer_certificate_expiry: Option<CertificateExpiryEvidence>,
     established_at: tokio::time::Instant,
     generation: u64,
 }
@@ -2037,8 +2037,8 @@ impl PendingServerLifecycle {
         Self {
             handshake: None,
             tls_config: None,
-            local_leaf_expiry: None,
-            peer_leaf_expiry: None,
+            local_certificate_expiry: None,
+            peer_certificate_expiry: None,
             established_at: tokio::time::Instant::now(),
             generation,
         }
@@ -2070,8 +2070,8 @@ impl PendingServerLifecycle {
         let lifecycle = ConnectionLifecycle::new(
             policy,
             self.established_at,
-            self.local_leaf_expiry,
-            self.peer_leaf_expiry,
+            self.local_certificate_expiry,
+            self.peer_certificate_expiry,
             self.generation,
             epoch,
         )
@@ -2086,8 +2086,8 @@ impl PendingServerLifecycle {
         ConnectionLifecycle::new(
             policy,
             self.established_at,
-            self.local_leaf_expiry,
-            self.peer_leaf_expiry,
+            self.local_certificate_expiry,
+            self.peer_certificate_expiry,
             self.generation,
             self.handshake
                 .as_ref()
@@ -2199,16 +2199,23 @@ async fn handle_connection(
                     "TLS handshake timed out",
                 ))
             })?
-            .map_err(ProtocolError::Io)?;
+            .map_err(classify_tls_io_error)?;
         let established_at = tokio::time::Instant::now();
         if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
-            return Err(ProtocolError::Authentication);
+            return Err(ProtocolError::UnexpectedResponse);
         }
         let peer = opc_tls::peer_tls_identity_from_server_connection(tls_stream.get_ref().1)
             .map_err(|_| ProtocolError::Authentication)?;
-        let local_leaf_expiry =
-            LeafExpiryEvidence::capture(handshake.leaf_expires_at(), established_at);
-        let peer_leaf_expiry = LeafExpiryEvidence::capture(peer.leaf_expires_at(), established_at);
+        let local_certificate_expiry = CertificateExpiryEvidence::capture(
+            handshake.leaf_expires_at(),
+            handshake.certificate_chain_expires_at(),
+            established_at,
+        );
+        let peer_certificate_expiry = CertificateExpiryEvidence::capture(
+            peer.leaf_expires_at(),
+            peer.certificate_chain_expires_at(),
+            established_at,
+        );
         let (mut r, mut w) = tokio::io::split(tls_stream);
         dispatch(
             backend,
@@ -2219,8 +2226,8 @@ async fn handle_connection(
             PendingServerLifecycle {
                 handshake: Some(handshake),
                 tls_config: Some(tls_config),
-                local_leaf_expiry: Some(local_leaf_expiry),
-                peer_leaf_expiry: Some(peer_leaf_expiry),
+                local_certificate_expiry: Some(local_certificate_expiry),
+                peer_certificate_expiry: Some(peer_certificate_expiry),
                 established_at,
                 generation,
             },

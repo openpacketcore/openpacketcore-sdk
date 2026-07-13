@@ -471,6 +471,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed fuzz corpora for the GTP-U, NAS, Diameter, and IKEv2 targets.
 
 ### Changed
+- **TLS certificate lifetimes — `opc-tls` and `opc-session-net`:** coherent
+  material admission and retained-connection deadlines now use the earliest
+  expiry across every certificate in the configured or peer-presented chain,
+  while preserving the exact leaf expiry and distinct fixed local/peer
+  earlier-chain retirement metrics. Expired/future intermediates receive typed
+  temporal rejection before chain rebuild. Server and client paths now classify
+  certificate/trust, TLS-protocol/ALPN, and transport failures consistently.
+  `TlsMaterialStatus` and `TlsAdmittedConnection` serialize the additional
+  redaction-safe chain-expiry timestamp, so strict JSON consumers must accept
+  that additive field. Short-lived SVID expiry is the bounded same-issuer
+  compromise mechanism; generic CRL/OCSP/denylist revocation remains
+  unsupported, and #164 fleet rotation qualification remains open.
 - **BREAKING — `opc-persist`:** #177 replaces the crate's custom Raft-style
   config engine and `QuorumConfigStore` majority wrapper with
   `ConsensusConfigStore` on the exact-pinned `opc-consensus` Openraft engine.
