@@ -556,7 +556,33 @@ fn generate_leafref_check(
         quote! { entry.#leaf_field_ident }
     };
 
-    let validate_expr = if leaf_node.config {
+    let validate_expr = if leaf_node.kind == SchemaNodeKind::LeafList {
+        let missing_error = if is_leaf_sensitive {
+            quote! {
+                ValidationError::semantics(format!(
+                    "Leaf-list value at index {} not found in target path {}",
+                    index,
+                    #target_path,
+                ))
+            }
+        } else {
+            quote! {
+                ValidationError::semantics(format!(
+                    "Leaf-list value {:?} at index {} not found in target path {}",
+                    v,
+                    index,
+                    #target_path,
+                ))
+            }
+        };
+        quote! {
+            for (index, v) in #leaf_access.iter().enumerate() {
+                if !#set_ident.contains(v) {
+                    return Err(#missing_error);
+                }
+            }
+        }
+    } else if leaf_node.config {
         quote! {
             if let Some(ref v) = #leaf_access.as_option() {
                 if !#set_ident.contains(*v) {

@@ -64,12 +64,18 @@ Current scope:
 
 - Deterministic ingestion, validation, canonicalization, and Rust generation for
   the supported OpenPacketCore YANG subset.
+- Absolute `leafref` validation for both scalar leaves and leaf-lists. Generated
+  leaf-list checks validate every element against the referenced target set and
+  identify the unresolved element and its index without changing scalar-leaf
+  behavior. Empty leaf-lists require no matching target value.
 - Fail-closed diagnostics for unsupported or unsafe constructs.
 
 Known constraints:
 
 - `deviation`, arbitrary `extension`, and unresolved `if-feature` usage are
   reported through diagnostics rather than silently accepted.
+- Relative `leafref` paths are outside the supported subset and must be modeled
+  with an absolute schema path.
 - Generated behavior is bounded by the supported subset and should be validated
   with generated tests before production use.
 

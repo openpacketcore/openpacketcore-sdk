@@ -597,6 +597,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-yanggen`: generated semantic validation now supports an absolute
+  `leafref` on a `leaf-list` by checking each vector element against the target
+  set. Generated code compiles, accepts empty and fully resolved lists, and
+  reports the unresolved value and index while the scalar-leaf path remains
+  unchanged.
 - `opc-session-store`: `FakeSessionBackend` now stages compound replicated
   entries and whole-state rebuilds before atomically swapping live data. A late
   child/replay failure no longer leaves partial records, leases, fences,
