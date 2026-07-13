@@ -1394,6 +1394,7 @@ version = "0.2.0"
 dependencies = [
  "opc-key",
  "rand 0.10.1",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

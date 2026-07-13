@@ -136,6 +136,9 @@ pub struct SqliteBackend {
     /// The shared database connection protected by an async mutex.
     /// All DB operations hold this lock for the duration of the call.
     conn: Arc<AsyncMutex<rusqlite::Connection>>,
+    /// Shared admission for config-consensus blocking work, including startup
+    /// before the consensus core exists.
+    config_consensus_worker_gate: Arc<tokio::sync::Semaphore>,
     /// Audit HMAC key used to seal and verify local audit-trail rows.
     audit_key: Arc<AuditKey>,
     /// Cached preflight result (populated after first successful preflight).
@@ -213,6 +216,10 @@ impl SqliteBackend {
         self.conn.clone()
     }
 
+    pub(crate) fn config_consensus_worker_gate(&self) -> Arc<tokio::sync::Semaphore> {
+        self.config_consensus_worker_gate.clone()
+    }
+
     pub(crate) const fn is_ephemeral(&self) -> bool {
         self.ephemeral
     }
@@ -270,6 +277,7 @@ impl SqliteBackend {
             ephemeral,
             min_free_bytes,
             conn: Arc::new(AsyncMutex::new(conn)),
+            config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
             cached_caps: std::sync::OnceLock::new(),
             #[cfg(feature = "dangerous-test-hooks")]

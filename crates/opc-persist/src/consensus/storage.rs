@@ -1414,21 +1414,62 @@ mod tests {
         )
         .await
         .expect("storage");
+        log.core
+            .run_sqlite(|conn| {
+                conn.execute("CREATE TABLE timeout_probe (value INTEGER NOT NULL)", [])
+                    .map(|_| ())
+                    .map_err(|_| sqlite::invalid_data("create timeout probe failed"))
+            })
+            .await
+            .expect("timeout probe table");
         let started = std::time::Instant::now();
         let interrupted = log
             .core
-            .run_sqlite_with_test_timeout(Duration::from_millis(25), |conn| {
-                conn.query_row(
-                    "WITH RECURSIVE counter(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM counter WHERE value < 100000000) SELECT sum(value) FROM counter",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|_| ())
-                .map_err(|_| sqlite::invalid_data("bounded SQLite test query interrupted"))
-            })
+            .run_sqlite_with_test_timeout_controlled(
+                Duration::from_millis(25),
+                |conn, cancellation| {
+                    let tx = conn
+                        .unchecked_transaction()
+                        .map_err(|_| sqlite::invalid_data("timeout probe transaction failed"))?;
+                    tx.execute("INSERT INTO timeout_probe (value) VALUES (1)", [])
+                        .map_err(|_| sqlite::invalid_data("timeout probe insert failed"))?;
+                    while !cancellation.is_cancelled() {
+                        std::thread::yield_now();
+                    }
+                    tx.commit()
+                        .map_err(|_| sqlite::invalid_data("timeout probe commit failed"))
+                },
+            )
             .await;
         assert!(interrupted.is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
+
+        let committed = log
+            .core
+            .run_sqlite(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM timeout_probe", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|_| sqlite::invalid_data("timeout probe count failed"))
+            })
+            .await
+            .expect("timeout probe count");
+        assert_eq!(0, committed, "timed-out transaction must be rolled back");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let committed_after_delay = log
+            .core
+            .run_sqlite(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM timeout_probe", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|_| sqlite::invalid_data("delayed timeout probe count failed"))
+            })
+            .await
+            .expect("delayed timeout probe count");
+        assert_eq!(
+            0, committed_after_delay,
+            "no SQLite work may commit after the timeout error returns"
+        );
 
         let follow_up = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1441,6 +1482,77 @@ mod tests {
         .expect("canceled worker releases admission")
         .expect("follow-up query");
         assert_eq!(1, follow_up);
+    }
+
+    #[tokio::test]
+    async fn initialization_timeout_cancels_before_authority_and_allows_retry() {
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let backend = SqliteBackend::open_with_audit_key(
+            temp.path().join("config.sqlite"),
+            true,
+            0,
+            shared_audit_key(),
+        )
+        .await
+        .expect("backend");
+        let snapshot_path = temp.path().join("snapshots");
+        let admitted = admit_snapshot_directory(&backend, snapshot_path.clone())
+            .expect("admitted snapshot directory");
+        let progress = Arc::new(ConfigDurableProgress::default());
+
+        let result = sqlite::ConfigConsensusCore::initialize_with_test_timeout(
+            &backend,
+            admitted,
+            identity(),
+            members(),
+            progress,
+            None,
+            Duration::from_millis(25),
+            |cancellation| {
+                while !cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ConfigConsensusStorageError::BackendUnavailable)),
+            "initialization must lose authority when timeout wins"
+        );
+
+        let identity_tables = {
+            let conn = backend.conn();
+            let conn = tokio::time::timeout(Duration::from_secs(1), conn.lock())
+                .await
+                .expect("timed-out initialization releases connection");
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'config_raft_identity'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("identity table count")
+        };
+        assert_eq!(0, identity_tables, "timeout must roll back identity claim");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let conn = backend.conn();
+            let conn = conn.lock().await;
+            let identity_tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'config_raft_identity'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("delayed identity table count");
+            assert_eq!(
+                0, identity_tables,
+                "no identity authority may appear after timeout returns"
+            );
+        }
+
+        open(&backend, &snapshot_path, identity(), members())
+            .await
+            .expect("clean retry after canceled initialization");
     }
 
     #[tokio::test]

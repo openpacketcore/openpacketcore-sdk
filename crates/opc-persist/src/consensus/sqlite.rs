@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -136,6 +136,58 @@ CREATE TABLE config_raft_legacy_recovery (
 /// Hard ceiling for one serialized config Openraft entry on disk.
 pub(crate) const CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
 const CONFIG_CONSENSUS_RETAINED_REQUEST_OUTCOMES: u64 = 4_096;
+const SQLITE_WORK_RUNNING: u8 = 0;
+const SQLITE_WORK_CANCELLED: u8 = 1;
+const SQLITE_WORK_COMMITTING: u8 = 2;
+
+pub(crate) struct SqliteWorkCancellation {
+    state: AtomicU8,
+}
+
+impl SqliteWorkCancellation {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(SQLITE_WORK_RUNNING),
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == SQLITE_WORK_CANCELLED
+    }
+
+    fn cancel_before_commit(&self) -> bool {
+        self.state
+            .compare_exchange(
+                SQLITE_WORK_RUNNING,
+                SQLITE_WORK_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn authorize_commit(&self) -> Result<(), ConfigConsensusStorageError> {
+        self.state
+            .compare_exchange(
+                SQLITE_WORK_RUNNING,
+                SQLITE_WORK_COMMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)
+    }
+
+    fn check(&self) -> Result<(), ConfigConsensusStorageError> {
+        if self.is_cancelled() {
+            Err(ConfigConsensusStorageError::BackendUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+type InitializationCommitHook = Box<dyn FnOnce(&SqliteWorkCancellation) + Send>;
 
 const AUTHORITY_TABLES: &[&str] = &[
     "config_history",
@@ -189,26 +241,112 @@ impl ConfigConsensusCore {
         durable_progress: Arc<super::storage::ConfigDurableProgress>,
         recovery: Option<StagedLegacyRecovery>,
     ) -> Result<Self, ConfigConsensusStorageError> {
+        Self::initialize_with_timeout(
+            backend,
+            snapshot_directory,
+            identity,
+            expected_members,
+            durable_progress,
+            recovery,
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn initialize_with_test_timeout<F>(
+        backend: &SqliteBackend,
+        snapshot_directory: super::storage::AdmittedSnapshotDirectory,
+        identity: ConsensusIdentity,
+        expected_members: BTreeSet<ConsensusNodeId>,
+        durable_progress: Arc<super::storage::ConfigDurableProgress>,
+        recovery: Option<StagedLegacyRecovery>,
+        timeout: Duration,
+        before_commit: F,
+    ) -> Result<Self, ConfigConsensusStorageError>
+    where
+        F: FnOnce(&SqliteWorkCancellation) + Send + 'static,
+    {
+        Self::initialize_with_timeout(
+            backend,
+            snapshot_directory,
+            identity,
+            expected_members,
+            durable_progress,
+            recovery,
+            timeout,
+            Some(Box::new(before_commit)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn initialize_with_timeout(
+        backend: &SqliteBackend,
+        snapshot_directory: super::storage::AdmittedSnapshotDirectory,
+        identity: ConsensusIdentity,
+        expected_members: BTreeSet<ConsensusNodeId>,
+        durable_progress: Arc<super::storage::ConfigDurableProgress>,
+        recovery: Option<StagedLegacyRecovery>,
+        timeout: Duration,
+        before_commit: Option<InitializationCommitHook>,
+    ) -> Result<Self, ConfigConsensusStorageError> {
         validate_expected_members(&expected_members)
             .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?;
+        if timeout.is_zero() {
+            return Err(ConfigConsensusStorageError::BackendUnavailable);
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(ConfigConsensusStorageError::BackendUnavailable)?;
+        let worker_gate = backend.config_consensus_worker_gate();
+        let permit = tokio::time::timeout_at(deadline, worker_gate.clone().acquire_owned())
+            .await
+            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         let conn = backend.conn();
-        let worker_conn = conn.clone();
+        let worker_conn = tokio::time::timeout_at(deadline, conn.clone().lock_owned())
+            .await
+            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         let worker_members = expected_members.clone();
         let worker_audit_key = backend.audit_key().clone();
-        let worker = tokio::task::spawn_blocking(move || {
-            let guard = worker_conn.blocking_lock();
-            initialize_schema(
-                &guard,
+        let cancellation = Arc::new(SqliteWorkCancellation::new());
+        let worker_cancellation = cancellation.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let progress_cancellation = worker_cancellation.clone();
+            worker_conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
+            let result = initialize_schema(
+                &worker_conn,
                 identity,
                 &worker_members,
                 &worker_audit_key,
                 recovery.as_ref(),
-            )
+                &worker_cancellation,
+                before_commit,
+            );
+            worker_conn.progress_handler(0, None::<fn() -> bool>);
+            result
         });
-        tokio::time::timeout(Duration::from_secs(30), worker)
-            .await
-            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)??;
+        let initialization = match tokio::time::timeout_at(deadline, &mut worker).await {
+            Ok(joined) => joined.map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?,
+            Err(_) if cancellation.cancel_before_commit() => {
+                // Cancellation won before commit authorization. Observe the
+                // worker exit so no transaction can outlive this error.
+                let _ = worker.await;
+                return Err(ConfigConsensusStorageError::BackendUnavailable);
+            }
+            Err(_) => {
+                // Commit authorization won the race. Its result is authority,
+                // so wait for and report the actual durable outcome.
+                worker
+                    .await
+                    .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+            }
+        };
+        initialization?;
         let super::storage::AdmittedSnapshotDirectory {
             path: snapshot_dir,
             binding_path: snapshot_binding_path,
@@ -224,7 +362,7 @@ impl ConfigConsensusCore {
             _snapshot_dir_guard: snapshot_dir_guard,
             snapshot_binding_path: Arc::new(snapshot_binding_path),
             durable_progress,
-            sqlite_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            sqlite_worker_gate: worker_gate,
         })
     }
 
@@ -233,19 +371,21 @@ impl ConfigConsensusCore {
         T: Send + 'static,
         F: FnOnce(&Connection) -> io::Result<T> + Send + 'static,
     {
-        self.run_sqlite_with_timeout(Duration::from_secs(30), operation)
-            .await
+        self.run_sqlite_with_timeout(Duration::from_secs(30), move |conn, _cancellation| {
+            operation(conn)
+        })
+        .await
     }
 
     #[cfg(test)]
-    pub(crate) async fn run_sqlite_with_test_timeout<T, F>(
+    pub(crate) async fn run_sqlite_with_test_timeout_controlled<T, F>(
         &self,
         timeout: Duration,
         operation: F,
     ) -> io::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> io::Result<T> + Send + 'static,
+        F: FnOnce(&Connection, &SqliteWorkCancellation) -> io::Result<T> + Send + 'static,
     {
         self.run_sqlite_with_timeout(timeout, operation).await
     }
@@ -253,7 +393,7 @@ impl ConfigConsensusCore {
     async fn run_sqlite_with_timeout<T, F>(&self, timeout: Duration, operation: F) -> io::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> io::Result<T> + Send + 'static,
+        F: FnOnce(&Connection, &SqliteWorkCancellation) -> io::Result<T> + Send + 'static,
     {
         if timeout.is_zero() {
             return Err(invalid_data(
@@ -268,32 +408,53 @@ impl ConfigConsensusCore {
                 .await
                 .map_err(|_| invalid_data("config consensus SQLite admission timed out"))?
                 .map_err(|_| invalid_data("config consensus SQLite worker is closed"))?;
-        let conn = self.conn.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = cancelled.clone();
+        let conn = tokio::time::timeout_at(deadline, self.conn.clone().lock_owned())
+            .await
+            .map_err(|_| invalid_data("config consensus SQLite connection timed out"))?;
+        let cancellation = Arc::new(SqliteWorkCancellation::new());
+        let worker_cancellation = cancellation.clone();
         let std_deadline = std::time::Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| invalid_data("config consensus SQLite deadline overflow"))?;
         let mut worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let conn = conn.blocking_lock();
+            let commit_cancellation = worker_cancellation.clone();
+            conn.commit_hook(Some(move || {
+                commit_cancellation.authorize_commit().is_err()
+            }));
+            let progress_cancellation = worker_cancellation.clone();
             conn.progress_handler(
                 1_000,
                 Some(move || {
-                    worker_cancelled.load(Ordering::Acquire)
+                    progress_cancellation.is_cancelled()
                         || std::time::Instant::now() >= std_deadline
                 }),
             );
-            let result = operation(&conn);
+            let result = operation(&conn, &worker_cancellation);
+            conn.commit_hook(None::<fn() -> bool>);
             conn.progress_handler(0, None::<fn() -> bool>);
             result
         });
         match tokio::time::timeout_at(deadline, &mut worker).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(invalid_data("config consensus SQLite worker failed")),
+            Err(_) if cancellation.cancel_before_commit() => {
+                // Cancellation won before SQLite authorized any commit. Drain
+                // the worker so neither the transaction nor its connection
+                // can outlive this error return.
+                match worker.await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(_)) => Err(invalid_data("config consensus SQLite operation timed out")),
+                    Err(_) => Err(invalid_data("config consensus SQLite worker failed")),
+                }
+            }
             Err(_) => {
-                cancelled.store(true, Ordering::Release);
-                Err(invalid_data("config consensus SQLite operation timed out"))
+                // SQLite authorized a commit before the timeout won. Drain it
+                // and report the actual durable result instead of returning an
+                // ambiguous timeout after authority may have changed.
+                worker
+                    .await
+                    .map_err(|_| invalid_data("config consensus SQLite worker failed"))?
             }
         }
     }
@@ -305,9 +466,11 @@ fn initialize_schema(
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
     recovery: Option<&StagedLegacyRecovery>,
+    cancellation: &Arc<SqliteWorkCancellation>,
+    before_commit: Option<InitializationCommitHook>,
 ) -> Result<(), ConfigConsensusStorageError> {
     if let Some(recovery) = recovery {
-        validate_legacy_recovery_snapshot(recovery, audit_key)?;
+        validate_legacy_recovery_snapshot(recovery, audit_key, cancellation)?;
         let path = recovery
             .path
             .to_str()
@@ -315,8 +478,15 @@ fn initialize_schema(
         conn.execute("ATTACH DATABASE ?1 AS config_legacy_approved", [path])
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     }
-    let result =
-        initialize_schema_transaction(conn, identity, expected_members, audit_key, recovery);
+    let result = initialize_schema_transaction(
+        conn,
+        identity,
+        expected_members,
+        audit_key,
+        recovery,
+        cancellation,
+        before_commit,
+    );
     if recovery.is_some() {
         let detach = conn.execute("DETACH DATABASE config_legacy_approved", []);
         if result.is_ok() && detach.is_err() {
@@ -332,7 +502,10 @@ fn initialize_schema_transaction(
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
     recovery: Option<&StagedLegacyRecovery>,
+    cancellation: &SqliteWorkCancellation,
+    before_commit: Option<InitializationCommitHook>,
 ) -> Result<(), ConfigConsensusStorageError> {
+    cancellation.check()?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     if !table_exists(&tx, "config_raft_identity")
@@ -342,7 +515,7 @@ fn initialize_schema_transaction(
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         match (legacy_nonempty, recovery) {
             (true, None) => return Err(ConfigConsensusStorageError::RecoveryRequired),
-            (true, Some(_)) => import_approved_legacy_snapshot(&tx, audit_key)?,
+            (true, Some(_)) => import_approved_legacy_snapshot(&tx, audit_key, cancellation)?,
             (false, Some(_)) => return Err(ConfigConsensusStorageError::InvalidIdentity),
             (false, None) => {}
         }
@@ -395,6 +568,10 @@ fn initialize_schema_transaction(
     } else {
         validate_existing_schema(&tx, identity, expected_members, audit_key, false)?;
     }
+    if let Some(before_commit) = before_commit {
+        before_commit(cancellation);
+    }
+    cancellation.authorize_commit()?;
     tx.commit()
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)
 }
@@ -448,12 +625,15 @@ pub(crate) fn completed_legacy_recovery_matches_sync(
 fn validate_legacy_recovery_snapshot(
     recovery: &StagedLegacyRecovery,
     audit_key: &AuditKey,
+    cancellation: &Arc<SqliteWorkCancellation>,
 ) -> Result<(), ConfigConsensusStorageError> {
     let conn = Connection::open_with_flags(
         &recovery.path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+    let progress_cancellation = cancellation.clone();
+    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
@@ -488,10 +668,12 @@ fn validate_legacy_recovery_snapshot(
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     let mut transaction_ids = Vec::new();
     for row in rows {
+        cancellation.check()?;
         transaction_ids.push(row.map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?);
     }
     drop(statement);
     for tx_id in transaction_ids {
+        cancellation.check()?;
         let stored = SqliteBackend::load_by_tx_id_bytes(&conn, &tx_id, audit_key)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?
             .ok_or(ConfigConsensusStorageError::CorruptState)?;
@@ -509,6 +691,7 @@ fn validate_legacy_recovery_snapshot(
 fn import_approved_legacy_snapshot(
     tx: &Transaction<'_>,
     audit_key: &AuditKey,
+    cancellation: &SqliteWorkCancellation,
 ) -> Result<(), ConfigConsensusStorageError> {
     for table in [
         "config_lifecycle_audit",
@@ -516,6 +699,7 @@ fn import_approved_legacy_snapshot(
         "audit_trail",
         "config_history",
     ] {
+        cancellation.check()?;
         tx.execute(&format!("DELETE FROM {table}"), [])
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     }
@@ -534,19 +718,21 @@ fn import_approved_legacy_snapshot(
             "id, tx_id, action, principal, occurred_at, details",
         ),
     ] {
+        cancellation.check()?;
         tx.execute(
             &format!("INSERT INTO {table} ({columns}) SELECT {columns} FROM config_legacy_approved.{table}"),
             [],
         )
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     }
-    reseal_imported_audit(tx, audit_key)?;
+    reseal_imported_audit(tx, audit_key, cancellation)?;
     Ok(())
 }
 
 fn reseal_imported_audit(
     tx: &Transaction<'_>,
     audit_key: &AuditKey,
+    cancellation: &SqliteWorkCancellation,
 ) -> Result<(), ConfigConsensusStorageError> {
     let mut statement = tx
         .prepare("SELECT tx_id, principal FROM config_history ORDER BY version ASC")
@@ -558,10 +744,12 @@ fn reseal_imported_audit(
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     let mut configs = Vec::new();
     for row in rows {
+        cancellation.check()?;
         configs.push(row.map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?);
     }
     drop(statement);
     for (tx_id, principal) in configs {
+        cancellation.check()?;
         let mut stored = SqliteBackend::load_by_tx_id_bytes(tx, &tx_id, audit_key)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?
             .ok_or(ConfigConsensusStorageError::CorruptState)?;
@@ -570,6 +758,7 @@ fn reseal_imported_audit(
         let tenant = crate::types::extract_tenant(&principal);
         let mut previous = [0_u8; 32];
         for entry in &mut stored.audit {
+            cancellation.check()?;
             entry.yang_path = super::types::tokenize_audit_path(&entry.yang_path, audit_key)
                 .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
             if entry.previous_value.is_some() {
@@ -2252,9 +2441,6 @@ fn validate_history_chain_sync(conn: &Connection) -> io::Result<Option<(Vec<u8>,
             ));
         }
         let version = checked_u64(version)?;
-        if version == 0 {
-            return Err(invalid_data("config consensus history version is invalid"));
-        }
         match &head {
             None if parent_tx_id.is_none() => {}
             Some((previous_tx_id, previous_version))
@@ -2645,6 +2831,8 @@ mod tests {
             &expected_members(),
             backend.audit_key(),
             None,
+            &Arc::new(SqliteWorkCancellation::new()),
+            None,
         )
         .expect("config consensus schema");
         drop(conn);
@@ -2679,18 +2867,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_validation_accepts_arbitrary_initial_version_but_rejects_non_linear_chains() {
+    async fn history_validation_accepts_bootstrap_and_arbitrary_origins_but_rejects_forks() {
         let backend = initialized_backend().await;
         let shared_conn = backend.conn();
         let conn = shared_conn.lock().await;
         let first = [0x01_u8; 16];
         let second = [0x02_u8; 16];
-        insert_history_metadata(&conn, &first, None, 41);
-        insert_history_metadata(&conn, &second, Some(&first), 42);
-        assert_eq!(
-            Some((second.to_vec(), 42)),
-            validate_history_chain_sync(&conn).expect("valid non-one origin")
-        );
+        for first_version in [ConfigVersion::INITIAL.get(), 41] {
+            conn.execute("DELETE FROM config_history", [])
+                .expect("reset history origin");
+            insert_history_metadata(&conn, &first, None, first_version);
+            insert_history_metadata(&conn, &second, Some(&first), first_version + 1);
+            assert_eq!(
+                Some((second.to_vec(), first_version + 1)),
+                validate_history_chain_sync(&conn).expect("valid history origin")
+            );
+        }
 
         conn.execute_batch("PRAGMA foreign_keys = OFF;")
             .expect("permit malformed external history fixtures");
@@ -2936,6 +3128,8 @@ mod tests {
                 &expected_members(),
                 backend.audit_key(),
                 None,
+                &Arc::new(SqliteWorkCancellation::new()),
+                None,
             )
         );
     }
@@ -3014,6 +3208,8 @@ mod tests {
                 identity(),
                 &expected_members(),
                 backend.audit_key(),
+                None,
+                &Arc::new(SqliteWorkCancellation::new()),
                 None,
             )
         );

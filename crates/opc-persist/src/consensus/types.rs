@@ -504,8 +504,7 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
 }
 
 fn validate_record_representability(record: &CommitRecord) -> Result<(), PersistError> {
-    if record.version.get() == 0
-        || record.version.get() > i64::MAX as u64
+    if record.version.get() > i64::MAX as u64
         || record.principal.is_empty()
         || record.principal.len() > CONFIG_PRINCIPAL_MAX_BYTES
         || record.principal.chars().any(char::is_control)
