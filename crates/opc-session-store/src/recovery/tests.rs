@@ -1366,6 +1366,203 @@ fn planning_rejects_untrusted_legacy_schema_objects() {
     );
 }
 
+#[test]
+fn planning_rejects_current_tables_with_same_name_and_weakened_ddl() {
+    for (suffix, replacement) in [
+        (
+            "type",
+            r#"
+            CREATE TABLE consensus_vote (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                term TEXT NOT NULL CHECK (term >= 0),
+                node_id INTEGER CHECK (node_id > 0),
+                vote_json BLOB NOT NULL,
+                FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+            );
+            "#,
+        ),
+        (
+            "not-null",
+            r#"
+            CREATE TABLE consensus_vote (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                term INTEGER NOT NULL CHECK (term >= 0),
+                node_id INTEGER CHECK (node_id > 0),
+                vote_json BLOB,
+                FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+            );
+            "#,
+        ),
+        (
+            "primary-key",
+            r#"
+            CREATE TABLE consensus_vote (
+                singleton INTEGER NOT NULL CHECK (singleton = 1),
+                configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                term INTEGER NOT NULL CHECK (term >= 0),
+                node_id INTEGER CHECK (node_id > 0),
+                vote_json BLOB NOT NULL,
+                FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+            );
+            "#,
+        ),
+        (
+            "check",
+            r#"
+            CREATE TABLE consensus_vote (
+                singleton INTEGER PRIMARY KEY,
+                configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                term INTEGER NOT NULL CHECK (term >= 0),
+                node_id INTEGER CHECK (node_id > 0),
+                vote_json BLOB NOT NULL,
+                FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+            );
+            "#,
+        ),
+        (
+            "foreign-key",
+            r#"
+            CREATE TABLE consensus_vote (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                term INTEGER NOT NULL CHECK (term >= 0),
+                node_id INTEGER CHECK (node_id > 0),
+                vote_json BLOB NOT NULL
+            );
+            "#,
+        ),
+        (
+            "default",
+            r#"
+            CREATE TABLE consensus_vote (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                term INTEGER NOT NULL DEFAULT 0 CHECK (term >= 0),
+                node_id INTEGER CHECK (node_id > 0),
+                vote_json BLOB NOT NULL,
+                FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+            );
+            "#,
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("current schema test root");
+        let ids = [
+            replica_id(&format!("weakened-{suffix}-a")),
+            replica_id(&format!("weakened-{suffix}-b")),
+            replica_id(&format!("weakened-{suffix}-c")),
+        ];
+        let replicas = vec![
+            create_legacy_replica(temp.path(), ids[0].clone(), 1),
+            create_legacy_replica(temp.path(), ids[1].clone(), 1),
+            create_legacy_replica(temp.path(), ids[2].clone(), 2),
+        ];
+        let members = node_set(&ids);
+        let log_id = LogId::new(
+            CommittedLeaderId::new(1, *members.first().expect("node")),
+            0,
+        );
+        for replica in &replicas {
+            claim_current_replica(replica, &members, log_id);
+        }
+        Connection::open(&replicas[1].database_path)
+            .expect("open weakened current schema")
+            .execute_batch(&format!("DROP TABLE consensus_vote; {replacement}"))
+            .expect("install same-name weakened current table");
+
+        let manager = recovery(AllowRecovery);
+        assert_eq!(
+            manager.plan(
+                &context(),
+                identity(),
+                members,
+                &replicas,
+                &ids[0],
+                &ids[2..],
+                RecoveryDecisionBasis::VerifiedCommittedMajority,
+                RecoveryLimits::default(),
+            ),
+            Err(RecoveryError::CorruptReplica),
+            "current same-name {suffix} weakening must fail closed"
+        );
+    }
+}
+
+#[test]
+fn planning_accepts_the_supported_operator_recovery_cursor_migration() {
+    let temp = tempfile::tempdir().expect("current migration test root");
+    let ids = [
+        replica_id("operator-migration-a"),
+        replica_id("operator-migration-b"),
+        replica_id("operator-migration-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 7),
+        create_legacy_replica(temp.path(), ids[2].clone(), 41),
+    ];
+    let members = node_set(&ids);
+    let leader = *members.iter().next().expect("leader");
+    let fork_leader = *members.iter().nth(1).expect("fork leader");
+    let majority_log = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    let fork_log = LogId::new(CommittedLeaderId::new(4, fork_leader), 0);
+    claim_current_replica(&replicas[0], &members, majority_log);
+    claim_current_replica(&replicas[1], &members, majority_log);
+    claim_current_replica(&replicas[2], &members, fork_log);
+
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open migrated replica");
+        conn.execute_batch(
+            r#"
+            DROP TABLE consensus_operator_recovery;
+            CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+                recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+                last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+                pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+                pending_plan_digest BLOB CHECK (
+                    pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+                ),
+                CHECK (
+                    (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+                    OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+                ),
+                FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+            );
+            "#,
+        )
+        .expect("install pre-cursor operator recovery schema");
+        conn.execute(
+            "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest) VALUES (1, ?1, 1, ?2, NULL, NULL)",
+            params![
+                i64::try_from(identity().configuration_epoch().get())
+                    .expect("configuration epoch"),
+                [0x66_u8; 32].as_slice(),
+            ],
+        )
+        .expect("restore operator recovery state");
+        consensus::ensure_operator_recovery_schema_sync(&conn, identity())
+            .expect("migrate the operator recovery cursor floor");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint migrated replica");
+    }
+
+    let _plan = recovery(AllowRecovery)
+        .plan(
+            &context(),
+            identity(),
+            members,
+            &replicas,
+            &ids[0],
+            &ids[2..],
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            RecoveryLimits::default(),
+        )
+        .expect("the exact supported operator recovery migration remains recoverable");
+}
+
 #[tokio::test]
 async fn three_way_current_fork_requires_and_uses_majority_committed_checkpoint() {
     let temp = tempfile::tempdir().expect("temporary directory");
@@ -2092,6 +2289,12 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
             .state(),
         RecoveryExecutionState::Rejoined
     );
+    for store in &stores {
+        assert!(
+            store.probe_durable_readiness().await.is_ready(),
+            "a completed execute retry must not recreate the fleet recovery latch"
+        );
+    }
     assert_eq!(
         manager
             .finalize(

@@ -374,6 +374,39 @@ CREATE TABLE consensus_operator_recovery (
 );
 "#;
 
+/// Install the exact consensus DDL used by production into an empty schema.
+///
+/// Recovery uses this only to derive a canonical, bounded schema manifest. A
+/// boolean selects the supported add-on form created when an older current
+/// database first gains the operator-recovery table.
+pub(crate) fn install_recovery_validation_schema_sync(
+    conn: &Connection,
+    operator_recovery_add_on: bool,
+) -> io::Result<()> {
+    if operator_recovery_add_on {
+        conn.execute_batch(OPERATOR_RECOVERY_SCHEMA)
+            .map_err(db_error)?;
+    } else {
+        conn.execute_batch(CONSENSUS_SCHEMA).map_err(db_error)?;
+    }
+    Ok(())
+}
+
+/// Reproduce the supported pre-cursor operator-recovery schema migration.
+///
+/// SQLite records `ALTER TABLE ... ADD COLUMN` by appending the column to the
+/// original `sqlite_master.sql` text, so its canonical DDL is distinct from a
+/// table created directly at the current version. Recovery must recognize the
+/// result without weakening validation to column-name checks.
+pub(crate) fn install_migrated_operator_recovery_validation_schema_sync(
+    conn: &Connection,
+) -> io::Result<()> {
+    conn.execute_batch(PRE_CURSOR_OPERATOR_RECOVERY_SCHEMA)
+        .map_err(db_error)?;
+    conn.execute_batch(OPERATOR_RECOVERY_CURSOR_MIGRATION)
+        .map_err(db_error)
+}
+
 /// Shared persistence resources used by the log store, state machine, and
 /// snapshot builder. One async mutex serializes every vote/log/state write.
 #[derive(Clone)]
@@ -601,6 +634,27 @@ CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
 );
 "#;
 
+const PRE_CURSOR_OPERATOR_RECOVERY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS consensus_operator_recovery (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+    last_plan_digest BLOB NOT NULL CHECK (length(last_plan_digest) = 32),
+    pending_epoch INTEGER CHECK (pending_epoch > recovery_epoch),
+    pending_plan_digest BLOB CHECK (
+        pending_plan_digest IS NULL OR length(pending_plan_digest) = 32
+    ),
+    CHECK (
+        (pending_epoch IS NULL AND pending_plan_digest IS NULL)
+        OR (pending_epoch IS NOT NULL AND pending_plan_digest IS NOT NULL)
+    ),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+"#;
+
+const OPERATOR_RECOVERY_CURSOR_MIGRATION: &str =
+    "ALTER TABLE consensus_operator_recovery ADD COLUMN watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0);";
+
 pub(crate) fn ensure_operator_recovery_schema_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -615,10 +669,8 @@ pub(crate) fn ensure_operator_recovery_schema_sync(
         )
         .map_err(db_error)?;
     if !has_cursor_floor {
-        conn.execute_batch(
-            "ALTER TABLE consensus_operator_recovery ADD COLUMN watch_cursor_invalidation_floor INTEGER NOT NULL DEFAULT 0 CHECK (watch_cursor_invalidation_floor >= 0);",
-        )
-        .map_err(db_error)?;
+        conn.execute_batch(OPERATOR_RECOVERY_CURSOR_MIGRATION)
+            .map_err(db_error)?;
     }
     conn.execute(
         "INSERT OR IGNORE INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, NULL, NULL, 0)",

@@ -1445,6 +1445,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-mgmt-audit"
+version = "0.2.0"
+dependencies = [
+ "opc-config-model",
+ "opc-redaction",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "opc-proto-pfcp"
 version = "0.2.0"
 dependencies = [
@@ -1535,9 +1545,13 @@ dependencies = [
  "bytes",
  "futures-util",
  "hmac",
+ "libc",
+ "nix",
+ "opc-config-model",
  "opc-consensus",
  "opc-crypto",
  "opc-key",
+ "opc-mgmt-audit",
  "opc-redaction",
  "opc-types",
  "rand 0.10.1",
@@ -1550,6 +1564,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

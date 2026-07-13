@@ -288,6 +288,22 @@ impl SqliteSessionBackend {
         })
     }
 
+    /// Build the exact standalone schema used by the production constructor
+    /// and return its connection to internal schema validators.
+    ///
+    /// Keeping this behind the adapter prevents recovery code from maintaining
+    /// a second, potentially weaker copy of the session-table definitions.
+    pub(crate) fn canonical_schema_connection() -> Result<Connection, StoreError> {
+        let Self { conn, .. } = Self::in_memory()?;
+        Arc::try_unwrap(conn)
+            .map(tokio::sync::Mutex::into_inner)
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "canonical session schema connection is unexpectedly shared".into(),
+                )
+            })
+    }
+
     /// Replace the default `SystemClock`.
     ///
     /// The clock drives record TTL expiry and server-side lease expiry

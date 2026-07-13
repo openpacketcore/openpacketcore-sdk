@@ -38,6 +38,8 @@ const FILE_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file-ident
 const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-state/v1\0";
 const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 17;
+const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
 
 pub(super) struct InspectionInput<'a> {
     pub(super) key: &'a RecoveryIntegrityKey,
@@ -876,54 +878,98 @@ fn validate_exact_recovery_schema(
     require_recovery_table: bool,
 ) -> Result<(), RecoveryError> {
     let has_restore_scan_state = validate_restore_scan_schema_if_present(conn)?;
-    let mut expected = BTreeSet::from([
-        "consensus_applied",
-        "consensus_committed",
-        "consensus_identity",
-        "consensus_log",
-        "consensus_machine",
-        "consensus_membership",
-        "consensus_operator_recovery",
-        "consensus_purged",
-        "consensus_request_outcomes",
-        "consensus_snapshot",
-        "consensus_vote",
-        "key_fences",
-        "lease_globals",
-        "leases",
-        "session_records",
-        "session_replication_log",
-    ]);
-    if has_restore_scan_state {
-        expected.insert("restore_scan_state");
+    let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    consensus::install_recovery_validation_schema_sync(&canonical, false)
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    let mut expected = recovery_schema_manifest(&canonical)?;
+
+    let canonical_operator = expected
+        .remove("consensus_operator_recovery")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+    expected
+        .remove("restore_scan_state")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+
+    canonical
+        .execute_batch("DROP TABLE consensus_operator_recovery")
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    consensus::install_recovery_validation_schema_sync(&canonical, true)
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    let add_on_operator = schema_object_sql(&canonical, "consensus_operator_recovery")?
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+    canonical
+        .execute_batch("DROP TABLE consensus_operator_recovery")
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    consensus::install_migrated_operator_recovery_validation_schema_sync(&canonical)
+        .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    let migrated_operator = schema_object_sql(&canonical, "consensus_operator_recovery")?
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+
+    let mut observed = recovery_schema_manifest(conn)?;
+    match observed.remove("restore_scan_state") {
+        Some(_) if has_restore_scan_state => {}
+        None if has_restore_scan_state => return Err(RecoveryError::CorruptReplica),
+        None => {}
+        Some(_) => return Err(RecoveryError::CorruptReplica),
     }
-    let mut statement = conn
-        .prepare(
-            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
-        )
-        .map_err(|_| RecoveryError::CorruptReplica)?;
-    let objects = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|_| RecoveryError::CorruptReplica)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| RecoveryError::CorruptReplica)?;
-    let observed = objects
-        .iter()
-        .map(|(_, name)| name.as_str())
-        .collect::<BTreeSet<_>>();
-    let expected_without_recovery = expected
-        .iter()
-        .copied()
-        .filter(|name| *name != "consensus_operator_recovery")
-        .collect::<BTreeSet<_>>();
-    let exact_names =
-        observed == expected || (!require_recovery_table && observed == expected_without_recovery);
-    if !exact_names || objects.iter().any(|(kind, _)| kind != "table") {
+    match observed.remove("consensus_operator_recovery") {
+        Some(sql)
+            if sql == canonical_operator || sql == add_on_operator || sql == migrated_operator => {}
+        Some(_) => return Err(RecoveryError::CorruptReplica),
+        None if require_recovery_table => return Err(RecoveryError::CorruptReplica),
+        None => {}
+    }
+    if observed != expected {
         return Err(RecoveryError::CorruptReplica);
     }
     Ok(())
+}
+
+fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String>, RecoveryError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let mut rows = statement
+        .query([])
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let mut manifest = BTreeMap::new();
+    while let Some(row) = rows.next().map_err(|_| RecoveryError::CorruptReplica)? {
+        if manifest.len() >= MAX_CURRENT_SCHEMA_OBJECTS {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        let kind = row
+            .get::<_, String>(0)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        let name = row
+            .get::<_, String>(1)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        let sql = row
+            .get::<_, Option<String>>(2)
+            .map_err(|_| RecoveryError::CorruptReplica)?
+            .ok_or(RecoveryError::CorruptReplica)?;
+        if kind != "table"
+            || name.len() > MAX_SCHEMA_SQL_BYTES
+            || sql.len() > MAX_SCHEMA_SQL_BYTES
+            || manifest.insert(name, normalize_schema_sql(&sql)).is_some()
+        {
+            return Err(RecoveryError::CorruptReplica);
+        }
+    }
+    Ok(manifest)
+}
+
+fn schema_object_sql(conn: &Connection, name: &str) -> Result<Option<String>, RecoveryError> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|sql| sql.map(|sql| normalize_schema_sql(&sql)))
+    .map_err(|_| RecoveryError::CorruptReplica)
 }
 
 fn hash_legacy_state(
@@ -1261,7 +1307,6 @@ pub(super) fn backup_and_reset_replica(
         return Err(RecoveryError::StalePlan);
     }
     let execution_locks = acquire_fleet_execution_locks(input.key, input.plan, input.replicas)?;
-    ensure_fleet_latches(input.key, input.plan, input.replicas)?;
     let workflow_dir = workflow_directory(input.backup_root, input.plan, true)?;
     let mut workflow =
         read_workflow(input.key, input.plan, &workflow_dir)?.unwrap_or(WorkflowRecord {
@@ -1295,6 +1340,14 @@ pub(super) fn backup_and_reset_replica(
                 .collect(),
         });
     validate_workflow_shape(input.plan, &workflow)?;
+    // A completed execute retry must remain read-only with respect to the
+    // fleet latch. Finalization has already cleared it on the successful path,
+    // and recreating it here would regress every voter back to not-ready. If a
+    // prior finalization crashed before clearing an existing latch, only a
+    // finalize retry is authorized to remove it.
+    if workflow.state != RecoveryExecutionState::Rejoined {
+        ensure_fleet_latches(input.key, input.plan, input.replicas)?;
+    }
     let checkpoint_replica = if workflow.checkpoint_database_digest.is_some() {
         for target in input.targets {
             verify_target_backup(input.key, input.plan, target, &workflow_dir)?;
