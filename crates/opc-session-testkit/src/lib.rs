@@ -3,6 +3,8 @@
 //! Provides clock skew, network partition, and fault injection fixtures.
 //! This is an internal testkit crate and is not published.
 
+pub mod qualification;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};

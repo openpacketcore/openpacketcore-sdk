@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-profile/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "maturity",
+    "qualification_complete",
+    "workspace",
+    "artifacts",
+    "platforms",
+    "topology",
+    "protocol",
+    "bounds",
+    "provisional_test_thresholds",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-profile/v1" },
+    "profile_id": { "const": "opc-session-openraft-ha/v1" },
+    "maturity": { "const": "experimental" },
+    "qualification_complete": { "const": false },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "rust_msrv", "source_revision"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "rust_msrv": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "source_revision": { "const": "required-in-evidence" }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "crate_name",
+          "version",
+          "publish",
+          "required_features",
+          "excluded_features"
+        ],
+        "properties": {
+          "crate_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "version": { "type": "string", "minLength": 1, "maxLength": 32 },
+          "publish": { "type": "boolean" },
+          "required_features": {
+            "type": "array",
+            "maxItems": 32,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+          },
+          "excluded_features": {
+            "type": "array",
+            "maxItems": 32,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+          }
+        }
+      }
+    },
+    "platforms": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target", "status"],
+        "properties": {
+          "target": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "status": { "const": "qualification-pending" }
+        }
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "member_counts",
+        "maximum_members",
+        "quorum_rule",
+        "distinct_failure_domain_per_voter",
+        "distinct_backing_store_per_voter",
+        "stable_identity_independent_of_route"
+      ],
+      "properties": {
+        "member_counts": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "integer", "minimum": 3 } },
+        "maximum_members": { "type": "integer", "minimum": 5 },
+        "quorum_rule": { "const": "floor(n/2)+1" },
+        "distinct_failure_domain_per_voter": { "const": true },
+        "distinct_backing_store_per_voter": { "const": true },
+        "stable_identity_independent_of_route": { "const": true }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "consensus_alpn",
+        "transport_revision",
+        "wire_schema_revision",
+        "error_set_revision",
+        "consensus_schema_version",
+        "min_frame_bytes",
+        "max_frame_bytes",
+        "max_rpc_payload_bytes",
+        "legacy_direct_backend_enabled"
+      ],
+      "properties": {
+        "consensus_alpn": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "transport_revision": { "type": "integer", "minimum": 1 },
+        "wire_schema_revision": { "type": "integer", "minimum": 1 },
+        "error_set_revision": { "type": "integer", "minimum": 1 },
+        "consensus_schema_version": { "type": "integer", "minimum": 1 },
+        "min_frame_bytes": { "type": "integer", "minimum": 1 },
+        "max_frame_bytes": { "type": "integer", "minimum": 1 },
+        "max_rpc_payload_bytes": { "type": "integer", "minimum": 1 },
+        "legacy_direct_backend_enabled": { "const": false }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_timeout_millis",
+        "max_session_ttl_seconds",
+        "max_stable_id_bytes",
+        "max_replication_transaction_id_bytes",
+        "max_replication_operation_depth",
+        "max_replication_operations_per_entry",
+        "max_replication_log_page_entries",
+        "max_watch_backlog_entries",
+        "max_restore_page_records",
+        "max_restore_page_payload_bytes",
+        "max_restore_examined_rows",
+        "max_restore_sqlite_work_millis"
+      ],
+      "properties": {
+        "operation_timeout_millis": { "type": "integer", "minimum": 1 },
+        "max_session_ttl_seconds": { "type": "integer", "minimum": 1 },
+        "max_stable_id_bytes": { "type": "integer", "minimum": 1 },
+        "max_replication_transaction_id_bytes": { "type": "integer", "minimum": 1 },
+        "max_replication_operation_depth": { "type": "integer", "minimum": 1 },
+        "max_replication_operations_per_entry": { "type": "integer", "minimum": 1 },
+        "max_replication_log_page_entries": { "type": "integer", "minimum": 1 },
+        "max_watch_backlog_entries": { "type": "integer", "minimum": 1 },
+        "max_restore_page_records": { "type": "integer", "minimum": 1 },
+        "max_restore_page_payload_bytes": { "type": "integer", "minimum": 1 },
+        "max_restore_examined_rows": { "type": "integer", "minimum": 1 },
+        "max_restore_sqlite_work_millis": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "provisional_test_thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acknowledged_write_loss",
+        "stale_owner_mutation_successes",
+        "conflicting_committed_entries",
+        "watch_gaps",
+        "max_startup_millis",
+        "max_single_member_failover_millis",
+        "max_restart_catchup_millis",
+        "minimum_soak_seconds"
+      ],
+      "properties": {
+        "acknowledged_write_loss": { "const": 0 },
+        "stale_owner_mutation_successes": { "const": 0 },
+        "conflicting_committed_entries": { "const": 0 },
+        "watch_gaps": { "const": 0 },
+        "max_startup_millis": { "type": "integer", "minimum": 1 },
+        "max_single_member_failover_millis": { "type": "integer", "minimum": 1 },
+        "max_restart_catchup_millis": { "type": "integer", "minimum": 1 },
+        "minimum_soak_seconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "history_schema",
+        "evidence_schema",
+        "independent_checker",
+        "required_topologies",
+        "required_transport_modes",
+        "foundation_transport_mode",
+        "foundation_counts_for_tls_rotation",
+        "unresolved_dependencies"
+      ],
+      "properties": {
+        "history_schema": { "const": "session-ha-history.schema.json" },
+        "evidence_schema": { "const": "session-ha-evidence.schema.json" },
+        "independent_checker": { "const": "scripts/check-session-ha-history.py" },
+        "required_topologies": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "integer", "minimum": 3 } },
+        "required_transport_modes": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "enum": ["mtls"] } },
+        "foundation_transport_mode": { "const": "loopback-plaintext-test-only" },
+        "foundation_counts_for_tls_rotation": { "const": false },
+        "unresolved_dependencies": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "type": "integer", "minimum": 1 } }
+      }
+    }
+  }
+}

@@ -7,16 +7,23 @@ description = "Chaos and failure testing testkit for OpenPacketCore session repl
 
 [dependencies]
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
+opc-session-net = { path = "../opc-session-net", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 async-trait = { workspace = true }
 futures-util = "0.3"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tempfile = "3"
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "test-util"] }
 time = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 
 [lints]
 workspace = true
