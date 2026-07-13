@@ -94,7 +94,7 @@
     "conflicting_committed_entries": 0,
     "watch_gaps": 0,
     "max_startup_millis": 30000,
-    "max_single_member_failover_millis": 30000,
+    "max_single_member_stop_service_continuity_millis": 30000,
     "max_restart_catchup_millis": 120000,
     "minimum_soak_seconds": 86400
   },

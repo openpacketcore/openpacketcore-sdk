@@ -4,10 +4,13 @@
   "experimental": true,
   "qualification_complete": false,
   "source_revision": "0000000000000000000000000000000000000000",
+  "source_tree_status": "clean",
   "artifact": {
     "name": "opc-session-quorum-node",
     "version": "0.2.0",
-    "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cargo_profile": "debug",
+    "foundation_feature_overrides": ["opc-session-net/insecure-test"]
   },
   "environment": {
     "rustc_version": "rustc fixture",
@@ -23,12 +26,15 @@
     "started_at_utc": "2026-07-13T00:00:00Z",
     "completed_at_utc": "2026-07-13T00:00:01Z",
     "profile_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "configuration_digest_domain": "opc-session-ha/configuration-set/v1",
     "configuration_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "fault_schedule_digest_domain": "opc-session-ha/fault-schedule-set/v1",
     "fault_schedule_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
   },
   "topology": {
     "members": 3,
     "independent_processes": true,
+    "storage_identity_digest_domain": "opc-session-ha/storage-identity/v1",
     "storage_identity_sha256": [
       "sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -78,7 +84,7 @@
   },
   "results": {
     "startup_millis": 1000,
-    "failover_millis": 1000,
+    "single_member_stop_service_continuity_millis": 1000,
     "restart_catchup_millis": 1000,
     "acknowledged_write_loss": 0,
     "stale_owner_mutation_successes": 0,
@@ -97,6 +103,7 @@
     "network_partition_faults",
     "packet_faults",
     "clock_skew",
+    "leader_follower_crash_matrix",
     "crash_point_matrix",
     "version_migration_rollback",
     "resource_soak",

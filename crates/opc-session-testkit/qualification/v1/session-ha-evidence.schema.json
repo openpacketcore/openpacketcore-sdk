@@ -9,6 +9,7 @@
     "experimental",
     "qualification_complete",
     "source_revision",
+    "source_tree_status",
     "artifact",
     "environment",
     "execution",
@@ -29,14 +30,23 @@
     "experimental": { "const": true },
     "qualification_complete": { "const": false },
     "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "source_tree_status": { "enum": ["clean", "dirty_unqualified"] },
     "artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "version", "sha256"],
+      "required": ["name", "version", "sha256", "cargo_profile", "foundation_feature_overrides"],
       "properties": {
         "name": { "const": "opc-session-quorum-node" },
         "version": { "type": "string", "minLength": 1, "maxLength": 32 },
-        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "cargo_profile": { "enum": ["debug", "release"] },
+        "foundation_feature_overrides": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": { "const": "opc-session-net/insecure-test" }
+        }
       }
     },
     "environment": {
@@ -64,7 +74,21 @@
             { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
           ]
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "container_status": { "const": "collected" },
+            "container_image_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+          }
+        },
+        {
+          "properties": {
+            "container_status": { "const": "not_collected_in_foundation" },
+            "container_image_digest": { "const": null }
+          }
+        }
+      ]
     },
     "execution": {
       "type": "object",
@@ -74,7 +98,9 @@
         "started_at_utc",
         "completed_at_utc",
         "profile_sha256",
+        "configuration_digest_domain",
         "configuration_sha256",
+        "fault_schedule_digest_domain",
         "fault_schedule_sha256"
       ],
       "properties": {
@@ -82,7 +108,9 @@
         "started_at_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
         "completed_at_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
         "profile_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "configuration_digest_domain": { "const": "opc-session-ha/configuration-set/v1" },
         "configuration_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "fault_schedule_digest_domain": { "const": "opc-session-ha/fault-schedule-set/v1" },
         "fault_schedule_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
       }
     },
@@ -92,6 +120,7 @@
       "required": [
         "members",
         "independent_processes",
+        "storage_identity_digest_domain",
         "storage_identity_sha256",
         "transport_mode",
         "counts_for_tls_rotation"
@@ -99,6 +128,7 @@
       "properties": {
         "members": { "oneOf": [{ "const": 3 }, { "const": 5 }] },
         "independent_processes": { "const": true },
+        "storage_identity_digest_domain": { "const": "opc-session-ha/storage-identity/v1" },
         "storage_identity_sha256": {
           "type": "array",
           "minItems": 3,
@@ -171,7 +201,21 @@
           "uniqueItems": true,
           "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "collection_status": { "const": "collected" },
+            "digests": { "minItems": 1 }
+          }
+        },
+        {
+          "properties": {
+            "collection_status": { "const": "not_collected_in_foundation" },
+            "digests": { "maxItems": 0 }
+          }
+        }
+      ]
     },
     "metrics": {
       "type": "object",
@@ -185,23 +229,37 @@
           "uniqueItems": true,
           "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
         }
-      }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "collection_status": { "const": "collected" },
+            "digests": { "minItems": 1 }
+          }
+        },
+        {
+          "properties": {
+            "collection_status": { "const": "not_collected_in_foundation" },
+            "digests": { "maxItems": 0 }
+          }
+        }
+      ]
     },
     "results": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "startup_millis",
-        "failover_millis",
+        "single_member_stop_service_continuity_millis",
         "restart_catchup_millis",
         "acknowledged_write_loss",
         "stale_owner_mutation_successes",
         "history_checker_violations"
       ],
       "properties": {
-        "startup_millis": { "type": "integer", "minimum": 0 },
-        "failover_millis": { "type": "integer", "minimum": 0 },
-        "restart_catchup_millis": { "type": "integer", "minimum": 0 },
+        "startup_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
+        "single_member_stop_service_continuity_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
+        "restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 },
         "acknowledged_write_loss": { "const": 0 },
         "stale_owner_mutation_successes": { "const": 0 },
         "history_checker_violations": { "const": 0 }
@@ -244,6 +302,7 @@
           "network_partition_faults",
           "packet_faults",
           "clock_skew",
+          "leader_follower_crash_matrix",
           "crash_point_matrix",
           "version_migration_rollback",
           "resource_soak",

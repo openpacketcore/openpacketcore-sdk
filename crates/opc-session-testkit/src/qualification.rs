@@ -146,7 +146,7 @@ pub struct QualificationThresholds {
     pub conflicting_committed_entries: u64,
     pub watch_gaps: u64,
     pub max_startup_millis: u64,
-    pub max_single_member_failover_millis: u64,
+    pub max_single_member_stop_service_continuity_millis: u64,
     pub max_restart_catchup_millis: u64,
     pub minimum_soak_seconds: u64,
 }

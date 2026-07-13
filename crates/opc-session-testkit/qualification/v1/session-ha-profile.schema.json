@@ -168,7 +168,7 @@
         "conflicting_committed_entries",
         "watch_gaps",
         "max_startup_millis",
-        "max_single_member_failover_millis",
+        "max_single_member_stop_service_continuity_millis",
         "max_restart_catchup_millis",
         "minimum_soak_seconds"
       ],
@@ -178,7 +178,7 @@
         "conflicting_committed_entries": { "const": 0 },
         "watch_gaps": { "const": 0 },
         "max_startup_millis": { "type": "integer", "minimum": 1 },
-        "max_single_member_failover_millis": { "type": "integer", "minimum": 1 },
+        "max_single_member_stop_service_continuity_millis": { "type": "integer", "minimum": 1 },
         "max_restart_catchup_millis": { "type": "integer", "minimum": 1 },
         "minimum_soak_seconds": { "type": "integer", "minimum": 1 }
       }

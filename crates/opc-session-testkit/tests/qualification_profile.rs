@@ -91,12 +91,32 @@ fn is_sha256(value: &str) -> bool {
         .is_some_and(|digest| is_lower_hex(digest, 64))
 }
 
+fn is_utc_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 20
+        && [4, 7].into_iter().all(|index| bytes[index] == b'-')
+        && bytes[10] == b'T'
+        && [13, 16].into_iter().all(|index| bytes[index] == b':')
+        && bytes[19] == b'Z'
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
+}
+
 fn validate_exact_evidence_fields(evidence: &Value) -> Result<(), String> {
     let revision = evidence["source_revision"]
         .as_str()
         .ok_or_else(|| "source revision missing".to_owned())?;
     if !is_lower_hex(revision, 40) {
         return Err("source revision is not exact lowercase hexadecimal".to_owned());
+    }
+    if !matches!(
+        evidence["source_tree_status"].as_str(),
+        Some("clean" | "dirty_unqualified")
+    ) || evidence["artifact"]["foundation_feature_overrides"]
+        != serde_json::json!(["opc-session-net/insecure-test"])
+    {
+        return Err("source state or foundation feature profile is invalid".to_owned());
     }
     let mut digests = vec![
         evidence["artifact"]["sha256"].as_str(),
@@ -148,6 +168,56 @@ fn validate_exact_evidence_fields(evidence: &Value) -> Result<(), String> {
         .collect::<BTreeSet<_>>();
     if storage.len() != members || distinct_storage.len() != storage.len() {
         return Err("storage identities are not distinct per voter".to_owned());
+    }
+
+    let started = evidence["execution"]["started_at_utc"]
+        .as_str()
+        .ok_or_else(|| "execution start missing".to_owned())?;
+    let completed = evidence["execution"]["completed_at_utc"]
+        .as_str()
+        .ok_or_else(|| "execution completion missing".to_owned())?;
+    if !is_utc_timestamp(started) || !is_utc_timestamp(completed) || started > completed {
+        return Err("execution timestamps are malformed or reversed".to_owned());
+    }
+
+    let profile: SessionHaQualificationProfile = serde_json::from_str(SESSION_HA_PROFILE_JSON)
+        .map_err(|_| "profile unavailable".to_owned())?;
+    let results = &evidence["results"];
+    let startup_within_bound = results["startup_millis"]
+        .as_u64()
+        .is_some_and(|value| value <= profile.provisional_test_thresholds.max_startup_millis);
+    let continuity_within_bound = results["single_member_stop_service_continuity_millis"]
+        .as_u64()
+        .is_some_and(|value| {
+            value
+                <= profile
+                    .provisional_test_thresholds
+                    .max_single_member_stop_service_continuity_millis
+        });
+    let catchup_within_bound = results["restart_catchup_millis"]
+        .as_u64()
+        .is_some_and(|value| {
+            value
+                <= profile
+                    .provisional_test_thresholds
+                    .max_restart_catchup_millis
+        });
+    if !(startup_within_bound && continuity_within_bound && catchup_within_bound) {
+        return Err("execution result is missing or outside provisional bounds".to_owned());
+    }
+
+    for field in ["logs", "metrics"] {
+        let status = evidence[field]["collection_status"].as_str();
+        let digest_count = evidence[field]["digests"]
+            .as_array()
+            .map(Vec::len)
+            .ok_or_else(|| "collection digests missing".to_owned())?;
+        if !matches!(
+            (status, digest_count),
+            (Some("collected"), 1..) | (Some("not_collected_in_foundation"), 0)
+        ) {
+            return Err("collection status and digests disagree".to_owned());
+        }
     }
     Ok(())
 }
@@ -371,7 +441,7 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
     assert!(
         profile
             .provisional_test_thresholds
-            .max_single_member_failover_millis
+            .max_single_member_stop_service_continuity_millis
             > 0
     );
     assert!(
@@ -563,5 +633,27 @@ fn schemas_prevent_premature_production_or_tls_rotation_claims() {
     assert!(validate_exact_evidence_fields(&evidence).is_err());
     evidence["source_revision"] = "0000000000000000000000000000000000000000".into();
     evidence["artifact"]["sha256"] = "sha256:ABC".into();
+    assert!(validate_exact_evidence_fields(&evidence).is_err());
+
+    let mut evidence: Value =
+        serde_json::from_str(EVIDENCE_FIXTURE).expect("evidence fixture JSON");
+    evidence["source_tree_status"] = "unknown".into();
+    assert!(validate_exact_evidence_fields(&evidence).is_err());
+
+    let mut evidence: Value =
+        serde_json::from_str(EVIDENCE_FIXTURE).expect("evidence fixture JSON");
+    evidence["execution"]["completed_at_utc"] = "2026-07-12T23:59:59Z".into();
+    assert!(validate_exact_evidence_fields(&evidence).is_err());
+
+    let mut evidence: Value =
+        serde_json::from_str(EVIDENCE_FIXTURE).expect("evidence fixture JSON");
+    evidence["results"]["startup_millis"] = (-1).into();
+    assert!(validate_exact_evidence_fields(&evidence).is_err());
+
+    let mut evidence: Value =
+        serde_json::from_str(EVIDENCE_FIXTURE).expect("evidence fixture JSON");
+    evidence["logs"]["digests"] = serde_json::json!([
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ]);
     assert!(validate_exact_evidence_fields(&evidence).is_err());
 }

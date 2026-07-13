@@ -1,9 +1,11 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::{BTreeSet, HashMap};
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -15,13 +17,15 @@ use opc_session_testkit::qualification::{
     qualification_key_sha256, qualification_owner_sha256, qualification_value_sha256,
     read_bounded_json_line, write_json_line, QualificationMember, QualificationNodeCommand,
     QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
-    QualificationReadinessCode, QUALIFICATION_NODE_SCHEMA_VERSION,
-    QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QualificationReadinessCode, SessionHaQualificationProfile, QUALIFICATION_NODE_SCHEMA_VERSION,
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS, SESSION_HA_EVIDENCE_SCHEMA_JSON,
+    SESSION_HA_PROFILE_JSON,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use time::OffsetDateTime;
 
 const CHILD_START_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -31,6 +35,9 @@ const LEASE_EXPIRY_WAIT: Duration = Duration::from_millis(1_600);
 const SHORT_LEASE_MILLIS: u64 = 1_200;
 const LONG_LEASE_MILLIS: u64 = 60_000;
 const MAX_DATABASE_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PROVENANCE_COMMAND_BYTES: usize = 16 * 1024;
+const EVIDENCE_OUTPUT_DIRECTORY_ENV: &str = "OPC_SESSION_HA_EVIDENCE_DIR";
+const FOUNDATION_RANDOM_SEED_BASE: u64 = 0x0143_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HarnessError {
@@ -271,9 +278,393 @@ fn open_private_file(path: &Path, append: bool) -> Result<File, HarnessError> {
 
 fn sha256_file(path: &Path) -> Result<String, HarnessError> {
     let encoded = fs::read(path)?;
+    Ok(sha256_bytes(&encoded))
+}
+
+fn sha256_bytes(encoded: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(encoded);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn domain_separated_sha256(
+    domain: &str,
+    parts: impl IntoIterator<Item = impl AsRef<[u8]>>,
+) -> Result<String, HarnessError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"opc-session-ha-evidence-domain-v1\0");
+    let domain = domain.as_bytes();
+    hasher.update(
+        u64::try_from(domain.len())
+            .map_err(|_| HarnessError::Evidence)?
+            .to_be_bytes(),
+    );
+    hasher.update(domain);
+    for part in parts {
+        let part = part.as_ref();
+        hasher.update(
+            u64::try_from(part.len())
+                .map_err(|_| HarnessError::Evidence)?
+                .to_be_bytes(),
+        );
+        hasher.update(part);
+    }
     Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn aggregate_file_sha256(domain: &str, paths: &[PathBuf]) -> Result<String, HarnessError> {
+    let mut contents = Vec::with_capacity(paths.len());
+    for path in paths {
+        let content = fs::read(path)?;
+        if content.len() > 1024 * 1024 {
+            return Err(HarnessError::Evidence);
+        }
+        contents.push(content);
+    }
+    domain_separated_sha256(domain, &contents)
+}
+
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
+    let mut file = open_private_file(path, false)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn write_private_json(path: &Path, value: &Value) -> Result<(), HarnessError> {
+    let mut encoded = serde_json::to_vec(value).map_err(|_| HarnessError::Evidence)?;
+    encoded.push(b'\n');
+    write_private_bytes(path, &encoded)
+}
+
+fn command_stdout(
+    program: &str,
+    args: &[&str],
+    current_dir: Option<&Path>,
+) -> Result<String, HarnessError> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    let output = command.output().map_err(|_| HarnessError::Evidence)?;
+    if !output.status.success()
+        || output.stdout.is_empty()
+        || output.stdout.len() > MAX_PROVENANCE_COMMAND_BYTES
+        || output.stdout.contains(&0)
+    {
+        return Err(HarnessError::Evidence);
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim_end().to_owned())
+        .map_err(|_| HarnessError::Evidence)
+}
+
+fn source_provenance(repository: &Path) -> Result<(String, &'static str), HarnessError> {
+    let revision = command_stdout("git", &["rev-parse", "HEAD"], Some(repository))?;
+    if !is_lower_hex(&revision, 40) {
+        return Err(HarnessError::Evidence);
+    }
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .current_dir(repository)
+        .output()
+        .map_err(|_| HarnessError::Evidence)?;
+    if !output.status.success() || output.stdout.len() > MAX_PROVENANCE_COMMAND_BYTES {
+        return Err(HarnessError::Evidence);
+    }
+    let status = if output.stdout.is_empty() {
+        "clean"
+    } else {
+        "dirty_unqualified"
+    };
+    Ok((revision, status))
+}
+
+fn environment_evidence() -> Result<Value, HarnessError> {
+    let rustc_version = command_stdout("rustc", &["--version"], None)?;
+    let cargo_version = command_stdout("cargo", &["--version"], None)?;
+    let rustc_verbose = command_stdout("rustc", &["-vV"], None)?;
+    let target = rustc_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or(HarnessError::Evidence)?;
+    let kernel = command_stdout("uname", &["-sr"], None)?;
+    if rustc_version.len() > 128 || cargo_version.len() > 128 || kernel.len() > 256 {
+        return Err(HarnessError::Evidence);
+    }
+    Ok(json!({
+        "rustc_version": rustc_version,
+        "cargo_version": cargo_version,
+        "target": target,
+        "os": env::consts::OS,
+        "kernel": kernel,
+        "container_status": "not_collected_in_foundation",
+        "container_image_digest": null,
+    }))
+}
+
+fn utc_timestamp(now: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+fn duration_millis(duration: Duration) -> Result<u64, HarnessError> {
+    u64::try_from(duration.as_millis()).map_err(|_| HarnessError::Evidence)
+}
+
+fn structural_schema_for_lightweight_validator(mut schema: Value) -> Value {
+    match &mut schema {
+        Value::Object(object) => {
+            for unsupported in ["maxItems", "maxLength", "maximum", "pattern", "uniqueItems"] {
+                object.remove(unsupported);
+            }
+            for value in object.values_mut() {
+                *value = structural_schema_for_lightweight_validator(value.take());
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                *value = structural_schema_for_lightweight_validator(value.take());
+            }
+        }
+        _ => {}
+    }
+    schema
+}
+
+fn is_lower_hex(value: &str, width: usize) -> bool {
+    value.len() == width
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| is_lower_hex(digest, 64))
+}
+
+fn valid_utc_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return false;
+    }
+    let decimal = |digits: &[u8]| {
+        digits.iter().try_fold(0_u32, |value, digit| {
+            digit
+                .is_ascii_digit()
+                .then_some(value * 10 + u32::from(*digit - b'0'))
+        })
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        decimal(&bytes[0..4]),
+        decimal(&bytes[5..7]),
+        decimal(&bytes[8..10]),
+        decimal(&bytes[11..13]),
+        decimal(&bytes[14..16]),
+        decimal(&bytes[17..19]),
+    ) else {
+        return false;
+    };
+    year >= 1970
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour <= 23
+        && minute <= 59
+        && second <= 60
+}
+
+fn validate_generated_evidence(
+    evidence: &Value,
+    member_count: usize,
+    profile: &SessionHaQualificationProfile,
+) -> Result<(), HarnessError> {
+    let schema: Value = serde_json::from_str(SESSION_HA_EVIDENCE_SCHEMA_JSON)
+        .map_err(|_| HarnessError::Evidence)?;
+    opc_schema_validate::validate(
+        &structural_schema_for_lightweight_validator(schema),
+        evidence,
+    )
+    .map_err(|_| HarnessError::Evidence)?;
+
+    if !evidence["source_revision"]
+        .as_str()
+        .is_some_and(|value| is_lower_hex(value, 40))
+        || !matches!(
+            evidence["source_tree_status"].as_str(),
+            Some("clean" | "dirty_unqualified")
+        )
+        || evidence["artifact"]["foundation_feature_overrides"]
+            != json!(["opc-session-net/insecure-test"])
+    {
+        return Err(HarnessError::Evidence);
+    }
+
+    let mut digests = vec![
+        evidence["artifact"]["sha256"].as_str(),
+        evidence["execution"]["profile_sha256"].as_str(),
+        evidence["execution"]["configuration_sha256"].as_str(),
+        evidence["execution"]["fault_schedule_sha256"].as_str(),
+        evidence["history"]["schedule_sha256"].as_str(),
+        evidence["history"]["sha256"].as_str(),
+        evidence["checker"]["sha256"].as_str(),
+        evidence["checker"]["output_sha256"].as_str(),
+    ];
+    digests.extend(
+        evidence["topology"]["storage_identity_sha256"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(Value::as_str),
+    );
+    if !digests
+        .into_iter()
+        .all(|digest| digest.is_some_and(is_sha256))
+    {
+        return Err(HarnessError::Evidence);
+    }
+
+    let storage = evidence["topology"]["storage_identity_sha256"]
+        .as_array()
+        .ok_or(HarnessError::Evidence)?;
+    let distinct_storage = storage
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    if evidence["topology"]["members"].as_u64() != Some(member_count as u64)
+        || storage.len() != member_count
+        || distinct_storage.len() != member_count
+    {
+        return Err(HarnessError::Evidence);
+    }
+
+    let started = evidence["execution"]["started_at_utc"]
+        .as_str()
+        .ok_or(HarnessError::Evidence)?;
+    let completed = evidence["execution"]["completed_at_utc"]
+        .as_str()
+        .ok_or(HarnessError::Evidence)?;
+    if !valid_utc_timestamp(started) || !valid_utc_timestamp(completed) || started > completed {
+        return Err(HarnessError::Evidence);
+    }
+
+    let results = &evidence["results"];
+    let startup_within_bound = results["startup_millis"]
+        .as_u64()
+        .is_some_and(|value| value <= profile.provisional_test_thresholds.max_startup_millis);
+    let continuity_within_bound = results["single_member_stop_service_continuity_millis"]
+        .as_u64()
+        .is_some_and(|value| {
+            value
+                <= profile
+                    .provisional_test_thresholds
+                    .max_single_member_stop_service_continuity_millis
+        });
+    let catchup_within_bound = results["restart_catchup_millis"]
+        .as_u64()
+        .is_some_and(|value| {
+            value
+                <= profile
+                    .provisional_test_thresholds
+                    .max_restart_catchup_millis
+        });
+    if !(startup_within_bound && continuity_within_bound && catchup_within_bound) {
+        return Err(HarnessError::Evidence);
+    }
+
+    for artifact in ["logs", "metrics"] {
+        if evidence[artifact]["collection_status"] != "not_collected_in_foundation"
+            || evidence[artifact]["digests"] != json!([])
+        {
+            return Err(HarnessError::Evidence);
+        }
+    }
+    if evidence["environment"]["container_status"] != "not_collected_in_foundation"
+        || !evidence["environment"]["container_image_digest"].is_null()
+    {
+        return Err(HarnessError::Evidence);
+    }
+
+    let coverage = evidence["coverage"]
+        .as_array()
+        .ok_or(HarnessError::Evidence)?;
+    let expected_topology = if member_count == 3 {
+        "three_node"
+    } else {
+        "five_node"
+    };
+    let other_topology = if member_count == 3 {
+        "five_node"
+    } else {
+        "three_node"
+    };
+    if !coverage.iter().any(|item| item == expected_topology)
+        || coverage.iter().any(|item| item == other_topology)
+        || !evidence["remaining_acceptance"]
+            .as_array()
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item == "leader_follower_crash_matrix")
+            })
+    {
+        return Err(HarnessError::Evidence);
+    }
+    Ok(())
+}
+
+fn preserve_evidence_bundle(
+    member_count: usize,
+    artifacts: &[(&str, &Path)],
+) -> Result<(), HarnessError> {
+    let Some(configured_root) = env::var_os(EVIDENCE_OUTPUT_DIRECTORY_ENV) else {
+        return Ok(());
+    };
+    let configured_root = PathBuf::from(configured_root);
+    if !configured_root.is_absolute() {
+        return Err(HarnessError::Evidence);
+    }
+    fs::create_dir_all(&configured_root)?;
+    let canonical_root = fs::canonicalize(&configured_root)?;
+    if canonical_root != configured_root
+        || fs::symlink_metadata(&canonical_root)?
+            .file_type()
+            .is_symlink()
+    {
+        return Err(HarnessError::Evidence);
+    }
+    let destination = canonical_root.join(format!("{member_count}-node"));
+    fs::create_dir(&destination)?;
+    for (name, source) in artifacts {
+        let metadata = fs::symlink_metadata(source)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || name.contains('/') {
+            return Err(HarnessError::Evidence);
+        }
+        let target = destination.join(name);
+        fs::copy(source, &target)?;
+        File::open(&target)?.sync_all()?;
+    }
+    File::open(&destination)?.sync_all()?;
+    File::open(&canonical_root)?.sync_all()?;
+    Ok(())
 }
 
 struct ChildNode {
@@ -614,6 +1005,29 @@ impl Fleet {
         self.wait_ready(&(0..self.nodes.len()).collect::<Vec<_>>())
     }
 
+    fn configuration_sha256(&self) -> Result<String, HarnessError> {
+        aggregate_file_sha256("opc-session-ha/configuration-set/v1", &self.configs)
+    }
+
+    fn storage_identity_sha256(&self) -> Result<Vec<String>, HarnessError> {
+        let canonical_root = fs::canonicalize(&self.root)?;
+        let mut identities = Vec::with_capacity(self.databases.len());
+        for database in &self.databases {
+            let canonical = fs::canonicalize(database)?;
+            if !canonical.starts_with(&canonical_root) {
+                return Err(HarnessError::Evidence);
+            }
+            identities.push(domain_separated_sha256(
+                "opc-session-ha/storage-identity/v1",
+                [canonical.as_os_str().as_bytes()],
+            )?);
+        }
+        if identities.iter().collect::<BTreeSet<_>>().len() != self.databases.len() {
+            return Err(HarnessError::Evidence);
+        }
+        Ok(identities)
+    }
+
     fn assert_distinct_encrypted_storage(&self) -> Result<(), HarnessError> {
         let canaries = [
             b"qualification-value-1".as_slice(),
@@ -915,15 +1329,59 @@ fn assert_generation(reply: QualificationNodeReply, generation: u64) -> Result<(
 }
 
 fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
+    let started_at = OffsetDateTime::now_utc();
+    let manifest_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository = manifest_directory.join("../..");
+    let profile_path = manifest_directory.join("qualification/v1/session-ha-profile.json");
+    let evidence_schema_path =
+        manifest_directory.join("qualification/v1/session-ha-evidence.schema.json");
+    let checker = repository.join("scripts/check-session-ha-history.py");
+    let profile: SessionHaQualificationProfile =
+        serde_json::from_str(SESSION_HA_PROFILE_JSON).map_err(|_| HarnessError::Evidence)?;
+
     let schedule = workload(member_count);
     let artifact_workspace = tempfile::tempdir()?;
     let schedule_path = artifact_workspace.path().join("schedule.jsonl");
     let history_path = artifact_workspace.path().join("history.jsonl");
+    let fault_schedule_path = artifact_workspace.path().join("fault-schedule.json");
+    let checker_output_path = artifact_workspace.path().join("checker-output.json");
+    let evidence_path = artifact_workspace.path().join("evidence.json");
     let schedule_sha256 = write_schedule(&schedule_path, &schedule)?;
+
+    let fault_schedule = json!({
+        "schema_version": "opc-session-ha-fault-schedule/v1",
+        "topology_members": member_count,
+        "faults": [
+            {
+                "sequence": 1,
+                "kind": "process_stop",
+                "target_process": "node-0",
+                "target_role": "voter",
+                "bounded": true
+            },
+            {
+                "sequence": 2,
+                "kind": "process_restart",
+                "target_process": "node-0",
+                "target_role": "voter",
+                "bounded": true
+            }
+        ]
+    });
+    write_private_json(&fault_schedule_path, &fault_schedule)?;
+    let fault_schedule_sha256 = aggregate_file_sha256(
+        "opc-session-ha/fault-schedule-set/v1",
+        std::slice::from_ref(&fault_schedule_path),
+    )?;
+
+    let startup_started = Instant::now();
     let mut fleet = Fleet::start(member_count, &schedule_sha256)?;
+    let startup_millis = duration_millis(startup_started.elapsed())?;
+    let configuration_sha256 = fleet.configuration_sha256()?;
+    let storage_identity_sha256 = fleet.storage_identity_sha256()?;
     let mut history = HistoryWriter::new(
         &history_path,
-        schedule_sha256,
+        schedule_sha256.clone(),
         schedule[0].schedule_id.clone(),
         schedule.len(),
     )?;
@@ -961,8 +1419,11 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
         2,
     )?;
 
+    let continuity_started = Instant::now();
     fleet.stop_unclean(0)?;
     fleet.wait_ready(&(1..member_count).collect::<Vec<_>>())?;
+    let single_member_stop_service_continuity_millis =
+        duration_millis(continuity_started.elapsed())?;
     assert_applied(
         invoke_and_record(&mut fleet, &mut history, &schedule[7])?,
         3,
@@ -978,33 +1439,173 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
         return Err(HarnessError::Protocol);
     }
 
+    let restart_started = Instant::now();
     fleet.restart(0)?;
+    let restart_catchup_millis = duration_millis(restart_started.elapsed())?;
     assert_generation(
         invoke_and_record(&mut fleet, &mut history, &schedule[10])?,
         3,
     )?;
     fleet.assert_distinct_encrypted_storage()?;
 
-    let checker =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-session-ha-history.py");
     let output = Command::new("python3")
-        .arg(checker)
+        .arg(&checker)
         .arg("--schedule")
         .arg(&schedule_path)
         .arg("--history")
         .arg(&history_path)
         .output()
         .map_err(|_| HarnessError::Evidence)?;
-    if !output.status.success() {
+    if output.status.code() != Some(0)
+        || output.stdout.is_empty()
+        || output.stdout.len() > MAX_PROVENANCE_COMMAND_BYTES
+    {
         return Err(HarnessError::Evidence);
     }
+    write_private_bytes(&checker_output_path, &output.stdout)?;
     let result: Value =
         serde_json::from_slice(&output.stdout).map_err(|_| HarnessError::Evidence)?;
     if result["status"] != "pass"
         || result["operations_checked"].as_u64() != Some(schedule.len() as u64)
+        || result["checker_version"] != "1"
+        || result["violation_codes"] != json!([])
+        || result["inconclusive_codes"] != json!([])
     {
         return Err(HarnessError::Evidence);
     }
+
+    let (source_revision, source_tree_status) = source_provenance(&repository)?;
+    let environment = environment_evidence()?;
+    let binary_sha256 = sha256_file(&fleet.binary)?;
+    let profile_sha256 = sha256_file(&profile_path)?;
+    let history_sha256 = sha256_file(&history_path)?;
+    let checker_sha256 = sha256_file(&checker)?;
+    let checker_output_sha256 = sha256_file(&checker_output_path)?;
+    let completed_at = OffsetDateTime::now_utc();
+    let topology_coverage = if member_count == 3 {
+        "three_node"
+    } else {
+        "five_node"
+    };
+    let evidence = json!({
+        "schema_version": "opc-session-ha-evidence/v1",
+        "profile_id": "opc-session-openraft-ha/v1",
+        "experimental": true,
+        "qualification_complete": false,
+        "source_revision": source_revision,
+        "source_tree_status": source_tree_status,
+        "artifact": {
+            "name": "opc-session-quorum-node",
+            "version": env!("CARGO_PKG_VERSION"),
+            "sha256": binary_sha256,
+            "cargo_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "foundation_feature_overrides": ["opc-session-net/insecure-test"]
+        },
+        "environment": environment,
+        "execution": {
+            "random_seed": FOUNDATION_RANDOM_SEED_BASE + member_count as u64,
+            "started_at_utc": utc_timestamp(started_at),
+            "completed_at_utc": utc_timestamp(completed_at),
+            "profile_sha256": profile_sha256,
+            "configuration_digest_domain": "opc-session-ha/configuration-set/v1",
+            "configuration_sha256": configuration_sha256,
+            "fault_schedule_digest_domain": "opc-session-ha/fault-schedule-set/v1",
+            "fault_schedule_sha256": fault_schedule_sha256
+        },
+        "topology": {
+            "members": member_count,
+            "independent_processes": true,
+            "storage_identity_digest_domain": "opc-session-ha/storage-identity/v1",
+            "storage_identity_sha256": storage_identity_sha256,
+            "transport_mode": "loopback-plaintext-test-only",
+            "counts_for_tls_rotation": false
+        },
+        "payload_protection": {
+            "mode": "fixed-memory-provider-synthetic-wrapper-only",
+            "synthetic_data_only": true,
+            "counts_for_production_encryption": false
+        },
+        "faults": [
+            { "kind": "process_stop", "target_role": "voter", "bounded": true },
+            { "kind": "process_restart", "target_role": "voter", "bounded": true }
+        ],
+        "history": {
+            "schema_version": "opc-session-ha-history/v1",
+            "schedule_schema_version": "opc-session-ha-schedule/v1",
+            "schedule_sha256": schedule_sha256,
+            "sha256": history_sha256
+        },
+        "checker": {
+            "name": "check-session-ha-history.py",
+            "version": "1",
+            "sha256": checker_sha256,
+            "exit_code": 0,
+            "status": "pass",
+            "output_sha256": checker_output_sha256
+        },
+        "logs": {
+            "collection_status": "not_collected_in_foundation",
+            "digests": []
+        },
+        "metrics": {
+            "collection_status": "not_collected_in_foundation",
+            "digests": []
+        },
+        "results": {
+            "startup_millis": startup_millis,
+            "single_member_stop_service_continuity_millis": single_member_stop_service_continuity_millis,
+            "restart_catchup_millis": restart_catchup_millis,
+            "acknowledged_write_loss": 0,
+            "stale_owner_mutation_successes": 0,
+            "history_checker_violations": 0
+        },
+        "coverage": [
+            "profile_inventory",
+            "independent_history_checker",
+            "lease_acquire_release",
+            "compare_and_set",
+            "linearizable_read",
+            "stale_fence_rejection",
+            "multi_process",
+            "real_tcp",
+            "persistent_sqlite",
+            "process_stop_restart",
+            topology_coverage
+        ],
+        "remaining_acceptance": [
+            "tls_rotation_158_163_164",
+            "kubernetes_3_5_node",
+            "batch_history",
+            "watch_history",
+            "restore_history",
+            "readiness_continuous_gating",
+            "network_partition_faults",
+            "packet_faults",
+            "clock_skew",
+            "leader_follower_crash_matrix",
+            "crash_point_matrix",
+            "version_migration_rollback",
+            "resource_soak",
+            "signed_release_bundle",
+            "distributed_hkms_payload_key_rotation"
+        ]
+    });
+    validate_generated_evidence(&evidence, member_count, &profile)?;
+    write_private_json(&evidence_path, &evidence)?;
+    preserve_evidence_bundle(
+        member_count,
+        &[
+            ("evidence.json", evidence_path.as_path()),
+            ("profile.json", profile_path.as_path()),
+            ("evidence.schema.json", evidence_schema_path.as_path()),
+            ("fault-schedule.json", fault_schedule_path.as_path()),
+            ("schedule.jsonl", schedule_path.as_path()),
+            ("history.jsonl", history_path.as_path()),
+            ("checker-output.json", checker_output_path.as_path()),
+            ("check-session-ha-history.py", checker.as_path()),
+            ("opc-session-quorum-node", fleet.binary.as_path()),
+        ],
+    )?;
     Ok(())
 }
 
