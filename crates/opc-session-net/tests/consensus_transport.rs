@@ -46,6 +46,12 @@ const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
         .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
 );
 
+// Each scenario below starts a complete Openraft fleet in its own Tokio
+// runtime. Running those fleets concurrently is artificial and can starve
+// election/readiness progress on the i686 CI runner, so keep the expensive
+// integration scenarios sequential within this test binary.
+static OPENRAFT_FLEET_TEST_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 struct TestPki {
     ca_cert: rcgen::Certificate,
     ca_key: rcgen::KeyPair,
@@ -1912,6 +1918,10 @@ async fn consensus_inflight_rpc_drains_and_reauthenticates_on_renewed_material()
 async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
     const REPLICAS: [u16; 3] = [1, 2, 3];
 
+    let _fleet_test_permit = OPENRAFT_FLEET_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("Openraft fleet test permit remains open");
     let pki = TestPki::new();
     let manifest = manifest("config-openraft-mtls", 9, 1);
     let directory = tempfile::tempdir().expect("config cluster directory");
@@ -2255,6 +2265,10 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_mtls_openraft_sqlite_boot_restore_and_live_survivor_scan() {
+    let _fleet_test_permit = OPENRAFT_FLEET_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("Openraft fleet test permit remains open");
     const REPLICAS: [u16; 3] = [1, 2, 3];
     const CONSENSUS_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -2683,6 +2697,10 @@ async fn qualify_mtls_fleet_rotation(member_count: usize) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn three_and_five_member_openraft_fleets_rotate_and_rollback_real_mtls() {
+    let _fleet_test_permit = OPENRAFT_FLEET_TEST_PERMIT
+        .acquire()
+        .await
+        .expect("Openraft fleet test permit remains open");
     qualify_mtls_fleet_rotation(3).await;
     qualify_mtls_fleet_rotation(5).await;
 }
