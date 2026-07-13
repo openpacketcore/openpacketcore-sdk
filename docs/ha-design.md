@@ -264,8 +264,8 @@ application/backend mutation or provider work: clients reject before
 resolution/dialing, while servers reject after request receipt but before
 backend dispatch and may return the typed response. The new public error
 variants require external exhaustive matches. Protocol v4 introduced their
-private fixed-width DTOs in error revision 1; current error revision 5 retains
-those encodings and rejects error-revision-4 or older v4 peers during the exact
+private fixed-width DTOs in error revision 1; current error revision 6 retains
+those encodings and rejects error-revision-5 or older v4 peers during the exact
 handshake. Operators must audit legacy
 persisted logs before upgrade because a TTL-bearing entry
 above the bound now fails closed during replay/rebuild rather than being
@@ -397,7 +397,7 @@ confidential cursor and explicit durable-page profile and pins the payload and
 examined-candidate budgets; error-set revision 3 carries stale-cursor,
 direct-CAS idempotency, and work-budget failures. Error-set revision 4 adds
 checked replication-log range outcomes; revision 5 adds non-CAS backend and
-lease ambiguity outcomes. Different exact v4
+lease ambiguity outcomes; revision 6 adds bounded-watch catch-up. Different exact v4
 profiles do not interoperate even though their ALPN text is the same.
 
 Cursor ciphertext is variable-length up to the consensus RPC/key ceiling and
@@ -417,7 +417,7 @@ response budget, a confidential authenticated strictly bounded restore cursor, a
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 4, error-set revision 5, a 4 MiB restore
+profile pins wire-schema revision 4, error-set revision 6, a 4 MiB restore
 payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, the
 31,536,000-second TTL maximum, and
@@ -430,7 +430,8 @@ through 128 UTF-8 bytes, and CAS request IDs, when present, use the canonical
 lowercase hyphenated 36-byte UUID encoding.
 Error-set revision 4 adds checked replication-log range overflow, page-limit,
 and compacted-cursor outcomes; revision 5 adds non-CAS backend and lease
-ambiguity outcomes. A revision-4 or older peer is therefore incompatible.
+ambiguity outcomes; revision 6 adds bounded-watch catch-up. A revision-5 or
+older peer is therefore incompatible.
 
 Every server response and watch item is fully bounded-encoded before a length
 prefix is emitted. Common non-pageable and complete-page successes use one
@@ -565,10 +566,10 @@ recovery remains an offline, operator-authorized campaign.
 ### Coherence & Invalidation Model
 - **Read-Through Population**: When `get` misses the local cache, the record is fetched from the authoritative backend. It is populated in memory only after the cache verifies that the watch cursor is caught up to `max_replication_sequence`. If the cursor is lagging, unavailable, or syncing, the read succeeds from the backend but the value is not cached.
 - **Coherent Cache Hits Only**: Before serving a cached value, the cache checks that the watched sequence is at least the backend's current reported sequence. If the backend is ahead, the cache clears local state, marks the watch unhealthy, and bypasses cache hits until the watch loop catches up or resyncs.
-- **Background Watch Subscription**: Spawns a background task that subscribes to `watch(last_sequence + 1)` on the session store, receiving replication entries in monotonic order. Any mutation (CompareAndSet, DeleteFenced, RefreshTtl, AcquireLease, RenewLease, ReleaseLease) to a key results in the key being evicted from the cache.
+- **Background Watch Subscription**: Spawns a background task that subscribes to the inclusive `watch(last_sequence + 1)` cursor on the session store, receiving replication entries in exact monotonic order. Zero normalizes to one; future and terminal positions never emit lower entries. Any mutation (CompareAndSet, DeleteFenced, RefreshTtl, AcquireLease, RenewLease, ReleaseLease) to a key results in the key being evicted from the cache.
 - **Monotonic Sequence Tracking & Gaps**: The cache tracks the processed sequence number globally. If a gap is detected (`sequence > last_sequence + 1`), indicating missed log entries, the cache invalidates its entire state and triggers a full resync from the current maximum sequence number of the backend.
 - **Idempotency**: Duplicate events (`sequence <= last_sequence`) are detected and ignored, preserving the sequence cursor and cache safety.
-- **Fail-Closed & Gap Recovery**: If the watch stream encounters a connection error, reports a gap, lacks ordered-watch capabilities, or cannot prove the cursor is current, the cache clears its local entries and bypasses local reads. It attempts to re-establish the watch from the latest sequence after querying `max_replication_sequence`; subsequent `get` calls fall back to direct backend lookups until coherence is restored.
+- **Fail-Closed & Gap Recovery**: If the watch stream encounters a connection error, reports a gap, returns `ReplicationWatchCatchUpRequired`, lacks ordered-watch capabilities, or cannot prove the cursor is current, the cache clears all local entries and bypasses local reads. For bounded catch-up it proves a fresh authoritative head only after full invalidation, then subscribes to that head's checked successor; this is the cache's coherent full-resync path, not permission to skip while retaining old values. Compaction instead requires the product's snapshot/rebuild authority. Subsequent `get` calls fall back to direct backend lookups until coherence is restored.
 - **Write-Through Wrapper Safety**: `SessionCache` implements the `SessionBackend` trait and delegates mutations to the authoritative backend. Mutating calls through the wrapper evict affected keys before and after successful writes, so callers do not need to wait for the async watch stream to invalidate their own local writes.
 - **Redacted Diagnostics**: Key operations and lifecycle state transitions (such as resyncs and stream restarts) are logged with redacted session keys, protecting subscriber identifiers from diagnostics exposure.
 

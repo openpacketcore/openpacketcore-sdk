@@ -621,6 +621,87 @@ impl SessionLeaseManager for MalformedReplicationOutputBackend {
 }
 
 #[derive(Clone)]
+struct RejectingWatchBackend {
+    inner: FakeSessionBackend,
+    rejection: StoreError,
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for RejectingWatchBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities().await
+    }
+
+    async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.inner.get(key).await
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.inner.compare_and_set(op).await
+    }
+
+    async fn delete_fenced(&self, lease: &opc_session_store::LeaseGuard) -> Result<(), StoreError> {
+        self.inner.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(
+        &self,
+        ops: Vec<opc_session_store::SessionOp>,
+    ) -> Result<Vec<opc_session_store::SessionOpResult>, StoreError> {
+        self.inner.batch(ops).await
+    }
+
+    async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
+        self.inner.max_replication_sequence().await
+    }
+
+    async fn watch(
+        &self,
+        _start_sequence: u64,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+        StoreError,
+    > {
+        Err(self.rejection.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionLeaseManager for RejectingWatchBackend {
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.acquire(key, owner, ttl).await
+    }
+
+    async fn renew(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.renew(lease, ttl).await
+    }
+
+    async fn release(
+        &self,
+        lease: opc_session_store::LeaseGuard,
+    ) -> Result<(), opc_session_store::LeaseError> {
+        self.inner.release(lease).await
+    }
+}
+
+#[derive(Clone)]
 struct WrongReplicationRangeBackend {
     inner: FakeSessionBackend,
     page: Arc<Vec<ReplicationEntry>>,
@@ -1899,15 +1980,41 @@ async fn authenticated_server_rejects_malformed_backend_log_and_watch_output() {
     ));
     assert_eq!(backend.watch_calls.load(Ordering::SeqCst), 1);
 
-    write_frame(&mut stream, &Request::MaxReplicationSequence)
-        .await
-        .expect("write valid follow-up on retained connection");
-    let follow_up: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
-        .await
-        .expect("read valid follow-up on retained connection");
-    assert!(matches!(follow_up, Response::MaxReplicationSequence(Ok(0))));
+    assert!(
+        read_frame::<_, Response>(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+            .await
+            .is_err(),
+        "corrupt watch metadata terminates the authenticated connection"
+    );
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn mtls_remote_watch_preserves_typed_initial_rejection_and_remains_usable() {
+    let mtls = mtls_configs();
+    let rejection = StoreError::ReplicationWatchCatchUpRequired;
+    let backend = RejectingWatchBackend {
+        inner: FakeSessionBackend::new(),
+        rejection: rejection.clone(),
+    };
+    let (addr, _backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2)));
+
+    let actual = match remote.watch(1).await {
+        Ok(_) => panic!("initial watch rejection must fail the watch call"),
+        Err(error) => error,
+    };
+    assert_eq!(actual, rejection);
+    assert_eq!(
+        remote
+            .max_replication_sequence()
+            .await
+            .expect("independent request after rejected watch"),
+        0
+    );
+
+    handle.abort_and_wait().await;
 }
 
 #[tokio::test]

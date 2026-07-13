@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **BREAKING — `opc-session-store` watch consumers and legacy
+  `opc-session-net` peers:** replication watches now use one documented
+  inclusive cursor contract: zero normalizes to one, existing and future
+  positions (including `u64::MAX`) never receive a lower sequence, and a
+  delivered terminal position closes because no successor can be represented.
+  Fake, standalone SQLite, and Openraft-applied SQLite retain a cursor per
+  watcher and atomically capture at most 64 backlog entries while registering
+  the 64-entry live channel; a larger retained backlog returns the new typed,
+  non-retryable `ReplicationWatchCatchUpRequired` without suggesting a skip
+  cursor. Compaction remains the distinct typed snapshot-before-resume result.
+  Slow consumers are evicted, and cancelled/closed registrations are pruned.
+  The production adapter performs its linearizable barrier before the atomic
+  handoff and publishes only state-machine-applied entries. The compatibility
+  client completes watch setup before returning, preserves an exact typed
+  initial rejection, enforces contiguous sequence metadata before outer
+  encryption/provider work, and terminates its dedicated connection on peer
+  corruption. The v4 wire schema remains revision 4; its error set advances
+  from 5 to 6, so every compatibility peer must be drained and upgraded
+  together. Openraft consensus transport/schema, persisted SQLite rows,
+  snapshots, payload envelopes, AAD, and HKMS placement are unchanged.
 - **BREAKING — `opc-key` remote-seal implementors:**
   `RemoteSealProvider::unseal` now receives the canonical envelope `KeyId`, so
   remote reads select the exact historical key instead of silently using the

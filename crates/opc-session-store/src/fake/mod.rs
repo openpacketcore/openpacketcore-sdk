@@ -16,15 +16,15 @@ use std::{
 
 use async_trait::async_trait;
 use opc_types::Timestamp;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
 use crate::{
     backend::{
         next_replication_sequence, validate_replication_log_page_owned,
         validate_replication_prefix, validate_replication_prefix_owned, validate_session_ops_ttls,
         BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
-        ReplicationLogRange, ReplicationOp, ReplicationTxId, SessionBackend, SessionOp,
-        SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        ReplicationLogRange, ReplicationOp, ReplicationTxId, ReplicationWatchCursor,
+        SessionBackend, SessionOp, SessionOpResult, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -32,6 +32,7 @@ use crate::{
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, OwnerId, SessionKey, SessionKeyType, StableId},
     record::StoredSessionRecord,
+    replication_watch::{prepare_watch_registration, ReplicationWatcher},
     restore::{
         compare_restore_records, restore_record_retained_bytes, RestoreScanCursor, RestoreScanPage,
         RestoreScanRequest, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
@@ -60,7 +61,7 @@ struct FakeBackendState {
     compacted_replication_sequence: u64,
     last_replication_sequence: u64,
     replication_log: Vec<ReplicationEntry>,
-    watchers: Vec<mpsc::Sender<Result<ReplicationEntry, StoreError>>>,
+    watchers: Vec<ReplicationWatcher>,
 }
 
 /// Canonical raw tuple used for fake-backend lookup and restore ordering.
@@ -230,9 +231,7 @@ impl FakeSessionBackend {
     }
 
     fn notify_watchers(state: &mut FakeBackendState, entry: &ReplicationEntry) {
-        state
-            .watchers
-            .retain(|watcher| watcher.try_send(Ok(entry.clone())).is_ok());
+        state.watchers.retain_mut(|watcher| watcher.notify(entry));
     }
 
     fn compact_replication_log(state: &mut FakeBackendState, max_replication_entries: usize) {
@@ -1036,51 +1035,28 @@ impl SessionBackend for FakeSessionBackend {
         StoreError,
     > {
         let mut state = self.inner.lock().await;
-        if start_sequence <= state.compacted_replication_sequence
-            && start_sequence <= state.last_replication_sequence
-        {
-            return Err(StoreError::BackendUnavailable(
-                "replication log compacted before requested start".into(),
-            ));
-        }
-        let (tx, rx) = mpsc::channel(WATCH_CHANNEL_CAPACITY);
-
-        // Send existing entries
-        for entry in state
+        let cursor = ReplicationWatchCursor::new(start_sequence);
+        cursor.ensure_not_compacted(state.compacted_replication_sequence)?;
+        let existing = state
             .replication_log
             .iter()
-            .filter(|e| e.sequence >= start_sequence)
-        {
-            if tx.try_send(Ok(entry.clone())).is_err() {
-                break;
-            }
-        }
+            .filter(|entry| entry.sequence >= cursor.first_sequence())
+            .take(MAX_REPLICATION_WATCH_BACKLOG_ENTRIES + 1)
+            .cloned()
+            .collect();
+        let (stream, watcher) = prepare_watch_registration(cursor, existing)?;
 
         state.watchers.retain(|watcher| !watcher.is_closed());
-        state.watchers.push(tx);
+        if let Some(watcher) = watcher {
+            state.watchers.push(watcher);
+        }
         use futures_util::StreamExt;
-        let stream = WatchStream { rx };
         Ok(stream.boxed())
     }
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
         let state = self.inner.lock().await;
         Ok((state.next_fence, state.next_credential_id))
-    }
-}
-
-struct WatchStream {
-    rx: mpsc::Receiver<Result<ReplicationEntry, StoreError>>,
-}
-
-impl futures_util::Stream for WatchStream {
-    type Item = Result<ReplicationEntry, StoreError>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
     }
 }
 

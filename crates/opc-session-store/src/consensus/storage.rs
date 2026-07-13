@@ -716,7 +716,7 @@ async fn notify_watchers(core: &SqliteConsensusCore, notifications: &[Replicatio
     }
     let mut watchers = core.watchers.lock().await;
     for notification in notifications {
-        watchers.retain(|watcher| watcher.try_send(Ok(notification.clone())).is_ok());
+        watchers.retain_mut(|watcher| watcher.notify(notification));
     }
 }
 

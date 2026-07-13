@@ -351,8 +351,8 @@ fail closed even if an outer layer omitted validation.
 
 The new errors are public enum variants, so external exhaustive matches MUST be
 updated. Protocol v4 introduced their private fixed-width DTOs in error
-revision 1; current error revision 5 retains those encodings. An
-error-revision-4 or older v4 decoder is rejected during the exact handshake;
+revision 1; current error revision 6 retains those encodings. An
+error-revision-5 or older v4 decoder is rejected during the exact handshake;
 deployments MUST use the coordinated v4 rollout in §12.3.
 
 ## 8. Record Format
@@ -763,6 +763,54 @@ contract does not create sequencing, commit, snapshot, restore, or watch
 authority and does not change payload envelopes, AAD, HKMS/provider placement,
 or encryption-at-rest boundaries.
 
+#### 11.2.4 Replication-Watch Cursors and Atomic Handoff
+
+`watch(start_sequence)` MUST use one inclusive 1-based cursor contract.
+Sequence zero MUST normalize to one. Existing, future, and terminal
+`u64::MAX` positions are valid and MUST NOT receive a lower sequence. A watch
+that delivers `u64::MAX` MUST deliver it once and close because a reconnect
+successor cannot be represented. Otherwise a reconnect MUST use the checked
+successor of the last processed entry.
+
+Backlog capture and live registration MUST be atomic with append/apply
+notification, or use an equivalent checked handoff that cannot lose or
+duplicate an entry. Every registration MUST retain its next eligible sequence.
+A notification below that sequence MAY be ignored when it is either below a
+requested future cursor or the atomic handoff proves it is already present in
+that watch's backlog. A position above the next eligible sequence is an
+integrity gap and MUST close the watch.
+Backlog and live state MUST each have fixed finite bounds. This SDK admits at
+most 64 captured backlog entries and 64 queued live entries per watch. More
+retained backlog MUST return `ReplicationWatchCatchUpRequired` without a skip
+cursor. The caller MUST invalidate dependent state, perform a coherent
+snapshot or full-cache catch-up, and reconnect from the position that procedure
+proves. Blind retry is forbidden. A compacted cursor remains the distinct
+`ReplicationLogCursorCompacted { resume_from }` result and MUST NOT use its
+resume point until a coherent snapshot covers the missing interval. Live
+channel overflow MUST evict the slow consumer; cancellation and stream close
+MUST NOT permit registrations to accumulate without bound.
+
+The production Openraft adapter MUST complete its linearizable barrier before
+the atomic local handoff and MUST publish only application-journal entries
+emitted by state-machine apply. An uncommitted or merely log-appended local
+entry MUST NOT be observable. Raw append/rebuild beside Openraft remains
+forbidden. The legacy session-net client MUST complete watch setup within its
+absolute deadline before returning: an initial typed store rejection is
+returned exactly, not converted into disconnect/retry ambiguity. After
+acceptance it MUST require every authenticated-peer item to equal the next
+inclusive sequence and MUST terminate the dedicated connection on duplicate,
+gap, invalid, or otherwise corrupt metadata before an outer encryption wrapper
+performs provider work. Errors and diagnostics MUST be redaction-safe, and a
+subsequent independent request MUST use a usable freshly authenticated
+connection.
+
+`ReplicationWatchCatchUpRequired` advances the quarantined protocol-v4 error
+set from revision 5 to revision 6. The wire schema remains revision 4. All
+legacy compatibility peers MUST be drained and upgraded together; this is not
+a rolling mixed-profile transition. The Openraft consensus profile, persisted
+SQLite/journal/snapshot format, payload envelopes, AAD, and HKMS/provider
+placement are unchanged.
+
 Replicas MUST apply events only if `generation` and `fence` are newer according
 to the state class rules.
 
@@ -825,7 +873,7 @@ Serde boundary MUST delegate to private fixed-width v4 DTOs. `Hello` and
 server's optional `cas_idempotency_epoch`, and direct CAS carries an optional
 `idempotency_epoch`. Exhaustive Rust construction and matching MUST account for
 the new fields. The profile pins wire-schema revision 4 and error-set revision
-5; owner, custom-key, and state-type
+6; owner, custom-key, and state-type
 bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `max_frame_size = 16777216`;
 `stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
@@ -1060,7 +1108,7 @@ directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
 The v3-to-v4 transition, and same-v4 exact-profile transitions through
-wire-schema revision 4 and error-set revision 5, are coordinated
+wire-schema revision 4 and error-set revision 6, are coordinated
 stop/upgrade/start boundaries, not rolling
 deployments. Operators MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore

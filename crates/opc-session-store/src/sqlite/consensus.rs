@@ -265,7 +265,6 @@ pub(crate) fn clear_operator_recovery_latch_sync(
     .sync_all()
 }
 
-type ConsensusWatcher = tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>;
 type ConsensusAppliedMembership = (
     Option<LogId<SessionConsensusNodeId>>,
     StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
@@ -421,7 +420,7 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) caps: BackendCapabilities,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
-    pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<ConsensusWatcher>>>,
+    pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
 }
@@ -1645,6 +1644,7 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::InvalidReplicationLogRange
         | StoreError::ReplicationLogPageTooLarge { .. }
         | StoreError::ReplicationLogCursorCompacted { .. }
+        | StoreError::ReplicationWatchCatchUpRequired
         | StoreError::ReplicationOperationLimitExceeded
         | StoreError::Crypto(_)
         | StoreError::Serialization(_)

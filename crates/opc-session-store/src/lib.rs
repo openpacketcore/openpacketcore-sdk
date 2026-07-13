@@ -39,6 +39,7 @@ pub mod quorum;
 pub mod readiness;
 pub mod record;
 pub mod recovery;
+mod replication_watch;
 pub mod restore;
 pub mod sqlite;
 pub mod store;
@@ -51,9 +52,10 @@ pub use backend::{
     validate_replication_prefix_owned, validate_session_ops_ttls, BackendInstanceIdentity,
     BackendPeerBinding, BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult,
     EncryptingSessionBackend, RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange,
-    ReplicationOp, ReplicationTxId, ReplicationTxIdError, SessionBackend, SessionOp,
-    SessionOpResult, MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
-    MAX_REPLICATION_OPERATION_DEPTH, REPLICATION_TX_ID_CANONICAL_BYTES,
+    ReplicationOp, ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor, SessionBackend,
+    SessionOp, SessionOpResult, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, REPLICATION_TX_ID_CANONICAL_BYTES,
     REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 pub use capability::{

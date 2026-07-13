@@ -88,6 +88,15 @@ pub enum StoreError {
         /// First retained sequence after the compacted interval.
         resume_from: u64,
     },
+    /// The requested watch position has more retained history than one
+    /// bounded registration can safely hand off to the live stream.
+    ///
+    /// This is not a retryable availability failure and intentionally carries
+    /// no cursor that could invite a caller to skip history. The consumer must
+    /// invalidate dependent state, perform its coherent snapshot/catch-up
+    /// procedure, and then open a new watch from the proven position.
+    #[error("replication watch requires coherent catch-up")]
+    ReplicationWatchCatchUpRequired,
     /// A replication operation tree exceeded the SDK-wide depth or node-count
     /// limit. The error intentionally carries no observed count, depth, path,
     /// key, or transaction data, so it is safe to expose to authenticated

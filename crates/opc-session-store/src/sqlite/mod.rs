@@ -22,8 +22,8 @@ use crate::{
     backend::{
         validate_replication_log_page_owned, validate_replication_prefix_owned,
         validate_session_ops_ttls, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-        ReplicationEntry, ReplicationLogRange, SessionBackend, SessionOp, SessionOpResult,
-        REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES, WATCH_CHANNEL_CAPACITY,
+        ReplicationEntry, ReplicationLogRange, ReplicationWatchCursor, SessionBackend, SessionOp,
+        SessionOpResult, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -31,6 +31,9 @@ use crate::{
     lease::{LeaseGuard, SessionLeaseManager},
     model::{OwnerId, SessionKey},
     record::StoredSessionRecord,
+    replication_watch::{
+        prepare_watch_registration, watch_backlog_query_limit, ReplicationWatcher,
+    },
     restore::{RestoreScanPage, RestoreScanRequest},
     ttl::{checked_session_deadline, validate_session_ttl},
 };
@@ -40,7 +43,6 @@ pub(crate) mod consensus;
 pub(crate) mod lease;
 pub(crate) mod ops;
 pub(crate) mod replication;
-pub(crate) mod watch;
 
 const SQLITE_SESSION_MAX_VALUE_BYTES: usize = 1_048_576;
 const CONSENSUS_AUTHORITY_REQUIRED: &str = "consensus_authority_required";
@@ -112,9 +114,11 @@ pub struct SqliteSessionBackend {
     operation_workers: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
-    watchers: Arc<
-        tokio::sync::Mutex<Vec<tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>>>,
-    >,
+    watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
+    #[cfg(test)]
+    pub(crate) watch_registration_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(crate) watch_backlog_captured: Arc<AtomicBool>,
 }
 
 struct RestoreScanCancellation {
@@ -390,6 +394,10 @@ impl SqliteSessionBackend {
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            watch_registration_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            watch_backlog_captured: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -861,20 +869,34 @@ impl SqliteSessionBackend {
         futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
         StoreError,
     > {
-        let existing = self
-            .consensus_get_replication_log(start_sequence, 10_000)
-            .await?;
-        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
-        for entry in existing {
-            if tx.try_send(Ok(entry)).is_err() {
-                break;
-            }
-        }
+        let cursor = ReplicationWatchCursor::new(start_sequence);
         let mut watchers = self.watchers.lock().await;
+        let existing = self
+            .consensus_get_replication_log(
+                cursor.first_sequence(),
+                watch_backlog_query_limit(cursor),
+            )
+            .await?;
+        #[cfg(test)]
+        self.pause_after_watch_backlog_capture().await?;
+        let (stream, watcher) = prepare_watch_registration(cursor, existing)?;
         watchers.retain(|watcher| !watcher.is_closed());
-        watchers.push(tx);
+        if let Some(watcher) = watcher {
+            watchers.push(watcher);
+        }
         use futures_util::StreamExt;
-        Ok(watch::SqliteWatchStream { rx }.boxed())
+        Ok(stream.boxed())
+    }
+
+    #[cfg(test)]
+    async fn pause_after_watch_backlog_capture(&self) -> Result<(), StoreError> {
+        self.watch_backlog_captured.store(true, Ordering::SeqCst);
+        let permit = Arc::clone(&self.watch_registration_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| StoreError::BackendUnavailable("watch registration unavailable".into()))?;
+        drop(permit);
+        Ok(())
     }
 }
 
@@ -1265,7 +1287,7 @@ impl SessionBackend for SqliteSessionBackend {
 
         if should_notify {
             let mut watchers = self.watchers.lock().await;
-            watchers.retain(|watcher| watcher.try_send(Ok(entry.clone())).is_ok());
+            watchers.retain_mut(|watcher| watcher.notify(&entry));
         }
 
         Ok(())
@@ -1290,22 +1312,20 @@ impl SessionBackend for SqliteSessionBackend {
         futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
         StoreError,
     > {
-        let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
-
-        // Query existing entries starting from start_sequence
-        let existing = self.get_replication_log(start_sequence, 10000).await?;
-        for entry in existing {
-            if tx.try_send(Ok(entry)).is_err() {
-                break;
-            }
+        let cursor = ReplicationWatchCursor::new(start_sequence);
+        let mut watchers = self.watchers.lock().await;
+        let existing = self
+            .get_replication_log(cursor.first_sequence(), watch_backlog_query_limit(cursor))
+            .await?;
+        #[cfg(test)]
+        self.pause_after_watch_backlog_capture().await?;
+        let (stream, watcher) = prepare_watch_registration(cursor, existing)?;
+        watchers.retain(|watcher| !watcher.is_closed());
+        if let Some(watcher) = watcher {
+            watchers.push(watcher);
         }
 
-        let mut watchers = self.watchers.lock().await;
-        watchers.retain(|watcher| !watcher.is_closed());
-        watchers.push(tx);
-
         use futures_util::StreamExt;
-        let stream = watch::SqliteWatchStream { rx };
         Ok(stream.boxed())
     }
 
@@ -1840,6 +1860,20 @@ mod restore_cancellation_tests {
 #[cfg(test)]
 mod watcher_lifetime_tests {
     use super::*;
+    use crate::ReplicationOp;
+    use futures_util::StreamExt;
+    use opc_types::Timestamp;
+
+    fn watch_entry(sequence: u64) -> ReplicationEntry {
+        ReplicationEntry {
+            sequence,
+            tx_id: format!("sqlite-watch-{sequence}")
+                .try_into()
+                .expect("transaction ID"),
+            op: ReplicationOp::Batch { ops: Vec::new() },
+            timestamp: Timestamp::now_utc(),
+        }
+    }
 
     #[tokio::test]
     async fn repeated_idle_watch_disconnects_are_pruned_before_registration() {
@@ -1856,5 +1890,116 @@ mod watcher_lifetime_tests {
             "closed idle watchers cannot accumulate without a later mutation"
         );
         drop(live);
+    }
+
+    #[tokio::test]
+    async fn append_between_backlog_capture_and_registration_is_delivered_once() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        backend
+            .replicate_entry(watch_entry(1))
+            .await
+            .expect("seed backlog");
+
+        let held_registration = Arc::clone(&backend.watch_registration_gate)
+            .acquire_owned()
+            .await
+            .expect("hold registration failpoint");
+        let watch_backend = backend.clone();
+        let watch = tokio::spawn(async move { watch_backend.watch(1).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !backend.watch_backlog_captured.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watch captures backlog before registration");
+
+        let append_backend = backend.clone();
+        let append =
+            tokio::spawn(async move { append_backend.replicate_entry(watch_entry(2)).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if backend
+                    .max_replication_sequence()
+                    .await
+                    .expect("read committed standalone head")
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("append commits while notification waits on registration");
+
+        drop(held_registration);
+        let mut stream = watch
+            .await
+            .expect("watch task")
+            .expect("atomic watch registration");
+        append
+            .await
+            .expect("append task")
+            .expect("append notification");
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("backlog entry")
+                .expect("valid")
+                .sequence,
+            1
+        );
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("live entry")
+                .expect("valid")
+                .sequence,
+            2
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), stream.next())
+                .await
+                .is_err(),
+            "handoff must not duplicate the append"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_sqlite_watch_receiver_is_evicted_at_the_live_bound() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let mut stream = backend.watch(1).await.expect("register slow watcher");
+        for sequence in 1..=u64::try_from(crate::backend::WATCH_CHANNEL_CAPACITY + 1)
+            .expect("bounded fixture width")
+        {
+            backend
+                .replicate_entry(watch_entry(sequence))
+                .await
+                .expect("append live watch fixture");
+        }
+
+        for expected in 1..=u64::try_from(crate::backend::WATCH_CHANNEL_CAPACITY)
+            .expect("bounded fixture width")
+        {
+            assert_eq!(
+                stream
+                    .next()
+                    .await
+                    .expect("buffered live item")
+                    .expect("valid live item")
+                    .sequence,
+                expected
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next())
+                .await
+                .expect("closed slow watcher deadline")
+                .is_none(),
+            "slow watcher must close rather than retain more live state"
+        );
     }
 }

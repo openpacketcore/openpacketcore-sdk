@@ -117,7 +117,7 @@ pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractPr
     };
 
 const WIRE_SCHEMA_REVISION: u16 = 4;
-const ERROR_SET_REVISION: u16 = 5;
+const ERROR_SET_REVISION: u16 = 6;
 
 /// Exact semantic and resource-bound contract required by protocol v4.
 ///
@@ -1365,6 +1365,7 @@ enum WireStoreError {
     InvalidReplicationLogRange,
     ReplicationLogPageTooLarge { requested: u64, max: u64 },
     ReplicationLogCursorCompacted { resume_from: u64 },
+    ReplicationWatchCatchUpRequired,
     ReplicationOperationLimitExceeded,
     InvalidSessionTtl,
     LeaseHeld,
@@ -1397,6 +1398,7 @@ enum WireStoreErrorRef<'a> {
     InvalidReplicationLogRange,
     ReplicationLogPageTooLarge { requested: u64, max: u64 },
     ReplicationLogCursorCompacted { resume_from: u64 },
+    ReplicationWatchCatchUpRequired,
     ReplicationOperationLimitExceeded,
     InvalidSessionTtl,
     LeaseHeld,
@@ -1463,6 +1465,7 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
                     resume_from: *resume_from,
                 }
             }
+            StoreError::ReplicationWatchCatchUpRequired => Self::ReplicationWatchCatchUpRequired,
             StoreError::ReplicationOperationLimitExceeded => {
                 Self::ReplicationOperationLimitExceeded
             }
@@ -1542,6 +1545,9 @@ impl TryFrom<WireStoreError> for StoreError {
             }
             WireStoreError::ReplicationLogCursorCompacted { resume_from } => {
                 Self::ReplicationLogCursorCompacted { resume_from }
+            }
+            WireStoreError::ReplicationWatchCatchUpRequired => {
+                Self::ReplicationWatchCatchUpRequired
             }
             WireStoreError::ReplicationOperationLimitExceeded => {
                 Self::ReplicationOperationLimitExceeded
@@ -3939,7 +3945,7 @@ mod tests {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/4");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
         assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 4);
-        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 5);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 6);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
 
@@ -3948,7 +3954,7 @@ mod tests {
             profile,
             serde_json::json!({
                 "wire_schema_revision": 4,
-                "error_set_revision": 5,
+                "error_set_revision": 6,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 4194304,
                 "max_restore_scan_page_retained_bytes": 8388608,
@@ -4107,6 +4113,7 @@ mod tests {
                 max: 1,
             },
             StoreError::ReplicationLogCursorCompacted { resume_from: 7 },
+            StoreError::ReplicationWatchCatchUpRequired,
             StoreError::ReplicationOperationLimitExceeded,
             StoreError::InvalidSessionTtl,
             StoreError::LeaseHeld,
