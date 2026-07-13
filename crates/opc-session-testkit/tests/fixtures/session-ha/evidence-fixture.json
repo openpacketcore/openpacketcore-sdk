@@ -51,6 +51,8 @@
   ],
   "history": {
     "schema_version": "opc-session-ha-history/v1",
+    "schedule_schema_version": "opc-session-ha-schedule/v1",
+    "schedule_sha256": "sha256:0945a97ace03d5b8e9c49e912afc226498e9b439f8a1620d68d01e7d83bfa542",
     "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   },
   "checker": {

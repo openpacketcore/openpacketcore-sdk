@@ -99,6 +99,7 @@
     "minimum_soak_seconds": 86400
   },
   "evidence": {
+    "schedule_schema": "session-ha-schedule.schema.json",
     "history_schema": "session-ha-history.schema.json",
     "evidence_schema": "session-ha-evidence.schema.json",
     "independent_checker": "scripts/check-session-ha-history.py",

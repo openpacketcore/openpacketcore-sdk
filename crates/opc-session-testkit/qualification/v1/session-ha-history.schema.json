@@ -5,6 +5,7 @@
   "additionalProperties": false,
   "required": [
     "schema_version",
+    "schedule_sha256",
     "history_id",
     "operation_index",
     "history_operation_count",
@@ -16,6 +17,7 @@
   ],
   "properties": {
     "schema_version": { "const": "opc-session-ha-history/v1" },
+    "schedule_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "history_id": { "type": "string", "minLength": 1, "maxLength": 128 },
     "operation_index": { "type": "integer", "minimum": 1 },
     "history_operation_count": { "type": "integer", "minimum": 1 },
@@ -68,7 +70,7 @@
           "properties": {
             "kind": { "const": "read" },
             "key_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-            "outcome": { "enum": ["success", "unavailable"] },
+            "outcome": { "enum": ["success", "indeterminate", "unavailable"] },
             "record": {
               "oneOf": [
                 { "const": null },

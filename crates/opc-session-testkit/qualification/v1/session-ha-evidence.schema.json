@@ -127,9 +127,11 @@
     "history": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "sha256"],
+      "required": ["schema_version", "schedule_schema_version", "schedule_sha256", "sha256"],
       "properties": {
         "schema_version": { "const": "opc-session-ha-history/v1" },
+        "schedule_schema_version": { "const": "opc-session-ha-schedule/v1" },
+        "schedule_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
         "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
       }
     },

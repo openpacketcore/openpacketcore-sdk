@@ -29,6 +29,9 @@ pub const SESSION_HA_PROFILE_SCHEMA_JSON: &str =
 /// JSON Schema for one independent history-checker input operation.
 pub const SESSION_HA_HISTORY_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-ha-history.schema.json");
+/// JSON Schema for one immutable qualification workload invocation.
+pub const SESSION_HA_SCHEDULE_SCHEMA_JSON: &str =
+    include_str!("../qualification/v1/session-ha-schedule.schema.json");
 /// JSON Schema for one experimental qualification evidence record.
 pub const SESSION_HA_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-ha-evidence.schema.json");
@@ -145,6 +148,7 @@ pub struct QualificationThresholds {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationEvidenceRequirements {
+    pub schedule_schema: String,
     pub history_schema: String,
     pub evidence_schema: String,
     pub independent_checker: String,

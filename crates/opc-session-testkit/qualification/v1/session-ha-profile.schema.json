@@ -187,6 +187,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "schedule_schema",
         "history_schema",
         "evidence_schema",
         "independent_checker",
@@ -197,6 +198,7 @@
         "unresolved_dependencies"
       ],
       "properties": {
+        "schedule_schema": { "const": "session-ha-schedule.schema.json" },
         "history_schema": { "const": "session-ha-history.schema.json" },
         "evidence_schema": { "const": "session-ha-evidence.schema.json" },
         "independent_checker": { "const": "scripts/check-session-ha-history.py" },
