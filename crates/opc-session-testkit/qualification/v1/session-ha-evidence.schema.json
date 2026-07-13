@@ -157,10 +157,22 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["kind", "target_role", "bounded"],
+        "required": [
+          "kind",
+          "target_process",
+          "target_role",
+          "observed_node_id",
+          "observed_leader_id",
+          "observed_term",
+          "bounded"
+        ],
         "properties": {
           "kind": { "enum": ["process_stop", "process_restart"] },
-          "target_role": { "enum": ["voter"] },
+          "target_process": { "type": "string", "pattern": "^node-[0-4]$" },
+          "target_role": { "const": "follower" },
+          "observed_node_id": { "type": "integer", "minimum": 1 },
+          "observed_leader_id": { "type": "integer", "minimum": 1 },
+          "observed_term": { "type": "integer", "minimum": 1 },
           "bounded": { "const": true }
         }
       }

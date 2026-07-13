@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_MAX_LEASE_HANDLES,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
+use tokio::net::TcpListener;
 
 const QUALIFICATION_TENANT: &str = "session-ha-qualification";
 const QUALIFICATION_KEY_ID: &str = "session-ha-qualification-key-v1";
@@ -51,8 +53,15 @@ struct QualificationNode {
 }
 
 impl QualificationNode {
-    async fn open(config: &QualificationNodeConfig) -> Result<Self, NodeFailure> {
+    async fn open(
+        config: &QualificationNodeConfig,
+        listener: TcpListener,
+    ) -> Result<Self, NodeFailure> {
         secure_qualification_paths(config)?;
+        let expected_addr = config.members[config.node_index].dial_addr;
+        if listener.local_addr().map_err(|_| NodeFailure)? != expected_addr {
+            return Err(NodeFailure);
+        }
         let descriptors = config
             .members
             .iter()
@@ -122,10 +131,9 @@ impl QualificationNode {
             .await
             .map_err(|_| NodeFailure)?,
         );
-        let expected_addr = config.members[config.node_index].dial_addr;
         let (server, actual_addr) =
             SessionConsensusServer::new_insecure(store.rpc_handler(), local_binding)
-                .listen(expected_addr)
+                .listen_on(listener)
                 .await
                 .map_err(|_| NodeFailure)?;
         if actual_addr != expected_addr {
@@ -157,6 +165,9 @@ impl QualificationNode {
 
     async fn handle(&mut self, command: QualificationNodeCommand) -> QualificationNodeReply {
         match command {
+            QualificationNodeCommand::Configure => QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::InvalidRequest,
+            },
             QualificationNodeCommand::Initialize => match self.store.initialize_cluster().await {
                 Ok(()) => QualificationNodeReply::Initialized,
                 Err(_) => QualificationNodeReply::Error {
@@ -324,9 +335,13 @@ impl QualificationNode {
             _ => QualificationReadinessCode::RecoveryRequired,
         };
         let progress = report.recovery_progress();
+        let status = self.store.status();
         QualificationNodeReply::Readiness {
             ready: report.is_ready(),
             reason_code,
+            node_id: status.node_id.get(),
+            term: status.term,
+            leader_id: status.leader_id.map(|node_id| node_id.get()),
             configured_voters: report.configured_voters(),
             required_quorum: report.required_quorum(),
             committed_index: report.committed_barrier_index(),
@@ -440,31 +455,84 @@ fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<(), No
     Ok(())
 }
 
-fn config_path_from_args() -> Result<PathBuf, NodeFailure> {
+struct NodeArguments {
+    config_path: PathBuf,
+    node_index: usize,
+    bind_addr: SocketAddr,
+}
+
+fn arguments() -> Result<NodeArguments, NodeFailure> {
     let mut args = env::args_os();
     let _program = args.next().ok_or(NodeFailure)?;
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--config")) {
         return Err(NodeFailure);
     }
-    let path = PathBuf::from(args.next().ok_or(NodeFailure)?);
-    if args.next().is_some() || !path.is_absolute() {
+    let config_path = PathBuf::from(args.next().ok_or(NodeFailure)?);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--node-index")) {
         return Err(NodeFailure);
     }
-    Ok(path)
+    let node_index = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value < 5)
+        .ok_or(NodeFailure)?;
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--bind-addr")) {
+        return Err(NodeFailure);
+    }
+    let bind_addr = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+        .filter(|value| value.ip().is_loopback())
+        .ok_or(NodeFailure)?;
+    if args.next().is_some() || !config_path.is_absolute() {
+        return Err(NodeFailure);
+    }
+    Ok(NodeArguments {
+        config_path,
+        node_index,
+        bind_addr,
+    })
 }
 
 fn run() -> Result<(), NodeFailure> {
-    let config = load_config(&config_path_from_args()?)?;
+    let arguments = arguments()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .map_err(|_| NodeFailure)?;
-    let mut node = runtime.block_on(QualificationNode::open(&config))?;
+    let listener = runtime
+        .block_on(TcpListener::bind(arguments.bind_addr))
+        .map_err(|_| NodeFailure)?;
+    let bind_addr = listener.local_addr().map_err(|_| NodeFailure)?;
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = BufWriter::new(stdout.lock());
+    write_json_line(
+        &mut writer,
+        &QualificationNodeReply::Bound {
+            node_index: arguments.node_index,
+            bind_addr,
+        },
+    )
+    .map_err(|_| NodeFailure)?;
+
+    let configure = read_bounded_json_line::<_, QualificationNodeCommand>(&mut reader)
+        .map_err(|_| NodeFailure)?
+        .ok_or(NodeFailure)?;
+    if !matches!(configure, QualificationNodeCommand::Configure) {
+        return Err(NodeFailure);
+    }
+    let config = load_config(&arguments.config_path)?;
+    if config.node_index != arguments.node_index
+        || config.members[config.node_index].dial_addr != bind_addr
+    {
+        return Err(NodeFailure);
+    }
+    let mut node = runtime.block_on(QualificationNode::open(&config, listener))?;
     write_json_line(
         &mut writer,
         &QualificationNodeReply::Started {

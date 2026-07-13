@@ -51,12 +51,20 @@
   "faults": [
     {
       "kind": "process_stop",
-      "target_role": "voter",
+      "target_process": "node-2",
+      "target_role": "follower",
+      "observed_node_id": 3,
+      "observed_leader_id": 1,
+      "observed_term": 1,
       "bounded": true
     },
     {
       "kind": "process_restart",
-      "target_role": "voter",
+      "target_process": "node-2",
+      "target_role": "follower",
+      "observed_node_id": 3,
+      "observed_leader_id": 1,
+      "observed_term": 1,
       "bounded": true
     }
   ],

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -49,6 +50,27 @@ fn run_checker_pair(schedule: &str, history: &str) -> Output {
         .arg(manifest.join("tests/fixtures/session-ha").join(history))
         .output()
         .expect("run independent history checker pair")
+}
+
+fn run_checker_paths(schedule: &Path, history: &Path) -> Output {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    Command::new("python3")
+        .arg(manifest.join("../../scripts/check-session-ha-history.py"))
+        .arg("--schedule")
+        .arg(schedule)
+        .arg("--history")
+        .arg(history)
+        .output()
+        .expect("run independent history checker with generated inputs")
+}
+
+fn assert_canonical_invalid_input(output: &Output) {
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        b"{\"checker\":\"check-session-ha-history.py\",\"checker_version\":\"1\",\"inconclusive_codes\":[],\"operations_checked\":0,\"status\":\"invalid_input\",\"violation_codes\":[]}\n"
+    );
 }
 
 fn structural_schema_for_lightweight_validator(mut schema: Value) -> Value {
@@ -218,6 +240,27 @@ fn validate_exact_evidence_fields(evidence: &Value) -> Result<(), String> {
         ) {
             return Err("collection status and digests disagree".to_owned());
         }
+    }
+    let faults = evidence["faults"]
+        .as_array()
+        .ok_or_else(|| "fault evidence missing".to_owned())?;
+    if faults.len() != 2
+        || !faults.iter().all(|fault| {
+            fault["target_process"] == "node-2"
+                && fault["target_role"] == "follower"
+                && fault["observed_node_id"]
+                    .as_u64()
+                    .is_some_and(|value| value > 0)
+                && fault["observed_leader_id"]
+                    .as_u64()
+                    .is_some_and(|value| value > 0)
+                && fault["observed_node_id"] != fault["observed_leader_id"]
+                && fault["observed_term"]
+                    .as_u64()
+                    .is_some_and(|value| value > 0)
+        })
+    {
+        return Err("fault evidence does not identify an observed follower".to_owned());
     }
     Ok(())
 }
@@ -528,6 +571,65 @@ fn inventory_pins_workspace_msrv_publish_state_and_openraft_version() {
 }
 
 #[test]
+fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository = manifest.join("../..");
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+        .current_dir(repository)
+        .output()
+        .expect("run locked Cargo metadata");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: Value = serde_json::from_slice(&output.stdout).expect("Cargo metadata JSON");
+    let packages = metadata["packages"].as_array().expect("metadata packages");
+    let package = |name: &str| {
+        packages
+            .iter()
+            .find(|package| package["name"] == name)
+            .unwrap_or_else(|| panic!("missing metadata package {name}"))
+    };
+
+    let consensus = package("opc-consensus");
+    let openraft = consensus["dependencies"]
+        .as_array()
+        .expect("opc-consensus dependencies")
+        .iter()
+        .find(|dependency| dependency["name"] == "openraft")
+        .expect("Openraft dependency");
+    assert_eq!(openraft["req"], "=0.9.24");
+    assert_eq!(
+        openraft["features"],
+        serde_json::json!(["serde", "storage-v2", "single-term-leader"])
+    );
+    assert_eq!(openraft["uses_default_features"], true);
+
+    let network = package("opc-session-net");
+    assert_eq!(
+        network["features"],
+        serde_json::json!({
+            "default": [],
+            "insecure-test": [],
+            "legacy-session-net-compat": []
+        })
+    );
+    let testkit = package("opc-session-testkit");
+    let foundation_network = testkit["dependencies"]
+        .as_array()
+        .expect("testkit dependencies")
+        .iter()
+        .find(|dependency| dependency["name"] == "opc-session-net")
+        .expect("testkit session-net dependency");
+    assert_eq!(
+        foundation_network["features"],
+        serde_json::json!(["insecure-test"])
+    );
+}
+
+#[test]
 fn history_and_evidence_fixtures_satisfy_strict_schemas() {
     let schedule_schema: Value =
         serde_json::from_str(SESSION_HA_SCHEDULE_SCHEMA_JSON).expect("schedule schema JSON");
@@ -608,6 +710,52 @@ fn independent_checker_binds_schedule_and_preserves_unknown_invocations() {
         crossing_output["inconclusive_codes"],
         serde_json::json!(["lease_expiry_ambiguity"])
     );
+}
+
+#[test]
+fn checker_rejects_hostile_bounded_json_without_traceback_or_stderr() {
+    let directory = tempfile::tempdir().expect("hostile checker directory");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let history = manifest.join("tests/fixtures/session-ha/history-valid.jsonl");
+
+    let huge_integer = directory.path().join("huge-integer.jsonl");
+    let huge = format!("{{\"value\":{}}}\n", "9".repeat(32 * 1024));
+    assert!(huge.len() <= 64 * 1024);
+    fs::write(&huge_integer, huge).expect("write bounded huge integer");
+    assert_canonical_invalid_input(&run_checker_paths(&huge_integer, &history));
+
+    let deep_nesting = directory.path().join("deep-nesting.jsonl");
+    let nested = format!("{}0{}", "[".repeat(2_000), "]".repeat(2_000));
+    let deep = format!("{{\"value\":{nested}}}\n");
+    assert!(deep.len() <= 64 * 1024);
+    fs::write(&deep_nesting, deep).expect("write bounded deep nesting");
+    assert_canonical_invalid_input(&run_checker_paths(&deep_nesting, &history));
+}
+
+#[test]
+fn checker_rejects_equal_and_descending_scheduled_cas_generations() {
+    let directory = tempfile::tempdir().expect("CAS checker directory");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let history = manifest.join("tests/fixtures/session-ha/history-valid.jsonl");
+    let base = SCHEDULE_FIXTURE
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("schedule row"))
+        .collect::<Vec<_>>();
+
+    for (name, expected, new) in [("equal", 1, 1), ("descending", 2, 1)] {
+        let mut rows = base.clone();
+        rows[5]["operation"]["expected_generation"] = expected.into();
+        rows[5]["operation"]["new_generation"] = new.into();
+        let mut encoded = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).expect("encode schedule row"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        encoded.push('\n');
+        let schedule = directory.path().join(format!("{name}.jsonl"));
+        fs::write(&schedule, encoded).expect("write invalid CAS schedule");
+        assert_canonical_invalid_input(&run_checker_paths(&schedule, &history));
+    }
 }
 
 #[test]

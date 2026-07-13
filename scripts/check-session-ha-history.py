@@ -24,6 +24,7 @@ CHECKER_VERSION = "1"
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_LINE_BYTES = 64 * 1024
 MAX_OPERATIONS = 10_000
+MAX_JSON_INTEGER_DIGITS = 20
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -38,6 +39,19 @@ def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise InputError("duplicate JSON object field")
         value[key] = item
     return value
+
+
+def parse_bounded_int(raw: str) -> int:
+    """Reject oversized integer tokens before Python allocates a big integer."""
+    digits = raw[1:] if raw.startswith("-") else raw
+    if not digits or len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise InputError("JSON integer token is outside checker bounds")
+    return int(raw)
+
+
+def reject_json_constant(_: str) -> None:
+    """Reject non-standard NaN and infinity JSON tokens."""
+    raise InputError("non-standard JSON constant")
 
 
 def load_jsonl(
@@ -63,8 +77,13 @@ def load_jsonl(
         if not line or len(line.encode("utf-8")) > MAX_LINE_BYTES:
             raise InputError("JSON line is outside checker bounds")
         try:
-            row = json.loads(line, object_pairs_hook=reject_duplicate_keys)
-        except (json.JSONDecodeError, InputError) as error:
+            row = json.loads(
+                line,
+                object_pairs_hook=reject_duplicate_keys,
+                parse_int=parse_bounded_int,
+                parse_constant=reject_json_constant,
+            )
+        except (json.JSONDecodeError, InputError, ValueError, RecursionError) as error:
             raise InputError("invalid JSON line") from error
         if not isinstance(row, dict):
             raise InputError("JSON line is not an object")
@@ -169,8 +188,10 @@ def validate_scheduled_operation(operation: Any) -> None:
         )
         bounded_string(operation["key"], 64)
         bounded_string(operation["lease_operation_id"], 128)
-        optional_generation(operation["expected_generation"])
-        bounded_int(operation["new_generation"], 1)
+        expected_generation = optional_generation(operation["expected_generation"])
+        new_generation = bounded_int(operation["new_generation"], 1)
+        if expected_generation is not None and new_generation <= expected_generation:
+            raise InputError("scheduled CAS generation does not advance")
         if (
             not isinstance(operation["value"], str)
             or len(operation["value"].encode("utf-8")) > 512
@@ -273,8 +294,10 @@ def validate_history_operation(operation: Any) -> None:
         for name in ("key_sha256", "owner_sha256", "value_sha256"):
             exact_sha256(operation[name])
         bounded_int(operation["fence"], 1)
-        optional_generation(operation["expected_generation"])
-        bounded_int(operation["new_generation"], 1)
+        expected_generation = optional_generation(operation["expected_generation"])
+        new_generation = bounded_int(operation["new_generation"], 1)
+        if expected_generation is not None and new_generation <= expected_generation:
+            raise InputError("history CAS generation does not advance")
         if operation["outcome"] not in {
             "success",
             "conflict",
@@ -538,7 +561,7 @@ def main() -> int:
             history, schedule_id, schedule_count, schedule_sha256
         )
         result = evaluate(schedule, history_by_id)
-    except InputError:
+    except (InputError, ValueError, RecursionError):
         return emit("invalid_input", 3)
     if result.violations:
         return emit("fail", 1, result)

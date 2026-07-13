@@ -168,7 +168,7 @@ pub struct QualificationEvidenceRequirements {
 }
 
 /// Configuration for one real process in the plaintext qualification fleet.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationNodeConfig {
     pub schema_version: u16,
@@ -325,7 +325,7 @@ fn is_exact_sha256(value: &str) -> bool {
 }
 
 /// One immutable fleet member descriptor plus its local test dial route.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationMember {
     pub node_index: usize,
@@ -366,6 +366,7 @@ pub enum QualificationConfigError {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QualificationNodeCommand {
+    Configure,
     Initialize,
     Probe,
     Acquire {
@@ -393,6 +394,7 @@ pub enum QualificationNodeCommand {
 impl fmt::Debug for QualificationNodeCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Configure => formatter.write_str("QualificationNodeCommand::Configure"),
             Self::Initialize => formatter.write_str("QualificationNodeCommand::Initialize"),
             Self::Probe => formatter.write_str("QualificationNodeCommand::Probe"),
             Self::Acquire { .. } => formatter.write_str("QualificationNodeCommand::Acquire"),
@@ -412,7 +414,7 @@ impl QualificationNodeCommand {
     /// consulted by the child process.
     pub fn validate(&self) -> Result<(), QualificationCommandError> {
         match self {
-            Self::Initialize | Self::Probe | Self::Shutdown => Ok(()),
+            Self::Configure | Self::Initialize | Self::Probe | Self::Shutdown => Ok(()),
             Self::Acquire {
                 lease_handle,
                 stable_id,
@@ -489,6 +491,10 @@ pub enum QualificationCommandError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QualificationNodeReply {
+    Bound {
+        node_index: usize,
+        bind_addr: SocketAddr,
+    },
     Started {
         node_index: usize,
     },
@@ -496,6 +502,9 @@ pub enum QualificationNodeReply {
     Readiness {
         ready: bool,
         reason_code: QualificationReadinessCode,
+        node_id: u64,
+        term: u64,
+        leader_id: Option<u64>,
         configured_voters: usize,
         required_quorum: usize,
         committed_index: Option<u64>,

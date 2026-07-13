@@ -543,6 +543,24 @@ impl SessionConsensusServer {
         self,
         bind_addr: SocketAddr,
     ) -> io::Result<(SessionConsensusServerHandle, SocketAddr)> {
+        self.validate_listener_configuration()?;
+        let listener = TcpListener::bind(bind_addr).await?;
+        self.serve_listener(listener).await
+    }
+
+    /// Start accepting consensus connections from an already-bound listener.
+    ///
+    /// This preserves listener ownership across multi-process discovery and
+    /// configuration, avoiding a release-and-rebind race in orchestrators.
+    pub async fn listen_on(
+        self,
+        listener: TcpListener,
+    ) -> io::Result<(SessionConsensusServerHandle, SocketAddr)> {
+        self.validate_listener_configuration()?;
+        self.serve_listener(listener).await
+    }
+
+    fn validate_listener_configuration(&self) -> io::Result<()> {
         if self.max_connections == 0 || self.max_connections > Semaphore::MAX_PERMITS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -567,8 +585,13 @@ impl SessionConsensusServer {
                 "consensus timeout is not representable",
             ));
         }
+        Ok(())
+    }
 
-        let listener = TcpListener::bind(bind_addr).await?;
+    async fn serve_listener(
+        self,
+        listener: TcpListener,
+    ) -> io::Result<(SessionConsensusServerHandle, SocketAddr)> {
         let bound_addr = listener.local_addr()?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let connection_tasks = Arc::new(std::sync::Mutex::new(ConnectionTaskRegistry {
