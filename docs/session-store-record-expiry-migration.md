@@ -114,7 +114,7 @@ restore traffic.
 ## Protocol transition and rollback
 
 The bounded authority preflight changes the exact compatibility contract to
-`opc-session-net/5`, wire-schema revision 5, error-set revision 8, and the
+`opc-session-net/5`, wire-schema revision 6, error-set revision 8, and the
 dedicated consensus contract to `opc-session-consensus/2`, transport/wire
 revision 2, error-set revision 4. Drain and upgrade all clients, servers,
 wrappers, and consensus members together. Mixed versions or revisions fail

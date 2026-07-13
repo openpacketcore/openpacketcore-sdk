@@ -429,7 +429,7 @@ on any `invalid_record_expiry_fields`, invalid nested replication entry, or
 incomplete result. Follow the complete backup, re-authoring, OpenRaft recovery,
 verification, and fleet-wide rollback procedure in
 [`session-store-record-expiry-migration.md`](session-store-record-expiry-migration.md).
-The compatibility profile moves to `opc-session-net/5`, wire revision 5,
+The compatibility profile moves to `opc-session-net/5`, wire revision 6,
 error revision 8; consensus moves to `opc-session-consensus/2`, transport/wire
 revision 2, error revision 4. Both are coordinated drained upgrades, not
 rolling changes.
@@ -729,16 +729,15 @@ identity mismatch fails before engine dispatch. The outer consensus frame is
 bounded for the shared compact Openraft payload; transport code does not decode
 commands or make consensus decisions.
 
-Real-mTLS tests now qualify a correctly scoped renewed client/server SVID on a
-subsequent new call/full handshake and rejection when either rotated identity
-falls outside the bound peer scope. They do not exercise an in-flight or
-retained old connection. Seamless operation during rotation is not yet
-qualified. #161 atomic identity/trust reload and #162 bounded material epochs
-are implemented. #163 peer reauthentication across an epoch and #164 rotation
-qualification remain under umbrella #158. A production CNF must keep old/new trust overlapped,
-retire old connections, enforce revocation and maximum authentication age,
-bound reconnect storms, and supply multi-process/soak and seamless-continuity
-evidence; #143 still owns the wider distributed qualification.
+#161 atomic identity/trust reload, #162 bounded material epochs, and #163 finite
+peer reauthentication are implemented. Clients and listeners retain exact
+handshake epoch and local/peer leaf-expiry evidence, stop new admission at the
+soft retirement boundary, bound already admitted work by the hard deadline,
+and repeat the complete mutual-TLS/application handshake on replacements.
+Legacy watches resume from the exact caller-delivered sequence. #164 still
+owns fleet rotation qualification under umbrella #158; a production CNF must
+qualify old/new trust overlap and removal, revocation, reconnect storms, and
+multi-process/soak continuity. #143 owns the wider distributed qualification.
 
 When TLS material is mounted as a Kubernetes projected Secret, construct
 `ProjectedSvidSource` with the mount root and relative Secret-key paths. Do not
@@ -768,9 +767,20 @@ Alert on `local_identity_changed`, `last_good_expired`,
 `material_limit_exceeded`, and `epoch_retry_limit` without attaching identity
 or parser text. An invalid candidate leaves an unexpired prior epoch usable;
 an expired prior epoch gates new connections. Epochs reset with the process and
-must never be used as cluster membership/configuration epochs. #163 still owns
-draining admitted connections by epoch, revocation, and maximum authentication
-age, so #162 alone is not a seamless-rotation production claim.
+must never be used as cluster membership/configuration epochs. Configure the
+same finite `ConnectionLifecyclePolicy` on peers and listeners and share a
+`SessionReauthenticationControl` for CNF orchestration. Defaults are a
+15-minute maximum authentication age, 30-second drain, 50 ms through 1 second
+reconnect backoff, and at most 30 seconds of directed stable jitter. Use the
+forward and reverse trust/leaf procedure in
+[`consensus-operator-runbook.md`](consensus-operator-runbook.md#7-shared-mtls-certificate-rotation).
+
+Alert on the fixed connection retirement, active/draining, drain-overrun,
+connection-outcome, reconnect, and watch-slow-consumer metrics. Do not add
+endpoint, SPIFFE ID, certificate, key, transaction, or payload labels. A zero
+draining gauge does not prove current-material authentication; require fresh
+durable readiness and exercise every directed peer path before old-trust
+removal.
 
 ### Legacy direct-backend session-net v5 rollout boundary
 
@@ -786,13 +796,14 @@ Session-net deliberately disables TLS resumption, session tickets, early data,
 and 0-RTT; budget every reconnect as a full mutual-TLS handshake so the live
 SVID is revalidated after rotation.
 
-Full handshakes make renewed credentials observable, but they are not proof of
-seamless rotation. #161 and #162 are implemented; the #163 -> #164
-implementation and qualification chain under umbrella #158, and #143 distributed qualification
-apply before this compatibility surface could be admitted to a production
-migration. `MAX_SESSION_TTL` controls
-session/lease state only; it does not define
-certificate expiry, trust-bundle validity, or authentication age.
+Bounded retained-connection retirement and full-handshake reauthentication are
+implemented under #163. #164/#143 fleet evidence still applies before this
+compatibility surface could be admitted to a production migration.
+`MAX_SESSION_TTL` controls session/lease state only; it does not define
+certificate expiry, trust-bundle validity, or authentication age. The direct
+wire-schema revision-6 upgrade remains a coordinated drained
+stop/upgrade/start; only subsequent credential rotations within a uniform
+revision-6 fleet use seamless lifecycle recycling.
 
 A successful restore page may be shorter than requested to respect the backend
 4 MiB payload, 8 MiB retained-page, 8 MiB examined key/filter metadata, or
@@ -894,7 +905,7 @@ live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
 configured frame bound remains
 separate. #159 now enforces that negotiated bound and one
 absolute write deadline across every ordinary response/watch item. The profile
-pins wire-schema revision 5, error-set revision 8,
+pins wire-schema revision 6, error-set revision 8,
 `max_restore_scan_examined_rows = 4096`,
 `min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
 owner/custom-key/state-type bounds,
@@ -1027,11 +1038,11 @@ and coordinate cutover with #127/#128/#143. The shared
 session-net call deadline and `ConsensusConfigStore`'s complete
 routing/quorum/commit/apply operation deadline remain separate bounded layers;
 the removed private config TCP timeout is not a production setting. A renewed
-SVID on a subsequent new call/full handshake and wrong-scope rejection have
-scoped real-mTLS qualification. #161 atomic reload and #162 coherent material
-epochs are implemented; seamless connection retirement and the complete
-trust-bundle/revocation/authentication-age fleet lifecycle remain #163 -> #164
-under umbrella #158. The remaining distributed/payload-key production evidence
+SVID rotation has scoped real-mTLS qualification. #161 atomic reload, #162
+coherent material epochs, and #163 finite connection retirement are
+implemented; complete fleet trust removal, revocation, reconnect-storm, and
+multi-process continuity evidence remains #164 under umbrella #158. The
+remaining distributed/payload-key production evidence
 stays open in #143.
 
 #167 does not rewrite persisted session-store bytes. In-profile stable IDs need

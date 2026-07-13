@@ -31,8 +31,8 @@ use tracing;
 use crate::error::ProtocolError;
 use crate::identity::{LocalReplicaBinding, SessionClusterId};
 use crate::lifecycle::{
-    directed_connection_key, wall_expiry_deadline, ConnectionLifecycle, ConnectionLifecyclePolicy,
-    SessionReauthenticationControl,
+    directed_connection_key, material_status_matches_admission, ConnectionLifecycle,
+    ConnectionLifecyclePolicy, LeafExpiryEvidence, SessionReauthenticationControl,
 };
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
@@ -200,6 +200,7 @@ enum ResponseFamily {
     AcquireLease,
     RenewLease,
     ReleaseLease,
+    ConnectionRetiring,
 }
 
 impl ResponseFamily {
@@ -222,6 +223,7 @@ impl ResponseFamily {
             Self::AcquireLease => "acquire_lease",
             Self::RenewLease => "renew_lease",
             Self::ReleaseLease => "release_lease",
+            Self::ConnectionRetiring => "connection_retiring",
         }
     }
 }
@@ -239,6 +241,19 @@ fn connection_failure_reason(error: &ProtocolError) -> &'static str {
         ProtocolError::UnexpectedResponse => "unexpected_response",
         ProtocolError::Serialization(_) => "serialization",
     }
+}
+
+fn record_server_connection_failure(error: &ProtocolError) {
+    match error {
+        ProtocolError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            &METRICS.session_net_connection_failure_timeout
+        }
+        ProtocolError::Io(_) => &METRICS.session_net_connection_failure_transport,
+        ProtocolError::Authentication => &METRICS.session_net_connection_failure_authentication,
+        ProtocolError::BackendUnavailable(_) => &METRICS.session_net_connection_failure_backend,
+        _ => &METRICS.session_net_connection_failure_protocol,
+    }
+    .fetch_add(1, Ordering::Relaxed);
 }
 
 fn capabilities_for_transport(
@@ -1921,19 +1936,27 @@ impl SessionReplicationServer {
                                 }
                                 let conn_handle = tokio::spawn(async move {
                                     let _permit = permit;
-                                    if let Err(error) = handle_connection(
+                                    METRICS
+                                        .session_net_connection_attempts
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    let result = handle_connection(
                                         backend,
                                         stream,
                                         tls_config,
                                         cas_idempotency_cache,
                                         dispatch_config,
                                     )
-                                    .await
-                                    {
+                                    .await;
+                                    if let Err(error) = result {
+                                        record_server_connection_failure(&error);
                                         tracing::debug!(
                                             reason = connection_failure_reason(&error),
                                             "connection handler exited"
                                         );
+                                    } else {
+                                        METRICS
+                                            .session_net_connection_successes
+                                            .fetch_add(1, Ordering::Relaxed);
                                     }
                                 });
                                 registry.handles.push(conn_handle);
@@ -2003,7 +2026,8 @@ enum ConnectionPeerIdentity {
 struct PendingServerLifecycle {
     handshake: Option<opc_tls::TlsServerHandshake>,
     tls_config: Option<opc_tls::AuthenticatedServerConfig>,
-    peer_leaf_expiry: Option<opc_types::Timestamp>,
+    local_leaf_expiry: Option<LeafExpiryEvidence>,
+    peer_leaf_expiry: Option<LeafExpiryEvidence>,
     established_at: tokio::time::Instant,
     generation: u64,
 }
@@ -2013,6 +2037,7 @@ impl PendingServerLifecycle {
         Self {
             handshake: None,
             tls_config: None,
+            local_leaf_expiry: None,
             peer_leaf_expiry: None,
             established_at: tokio::time::Instant::now(),
             generation,
@@ -2033,32 +2058,42 @@ impl PendingServerLifecycle {
         if admitted_generation != self.generation {
             return Err(ProtocolError::Authentication);
         }
-        let (local_expiry, epoch) = match self.handshake {
+        let epoch = match self.handshake {
             Some(handshake) => {
                 let admission = handshake
                     .admit()
                     .map_err(|_| ProtocolError::Authentication)?;
-                (
-                    Some(wall_expiry_deadline(
-                        admission.leaf_expires_at(),
-                        self.established_at,
-                    )),
-                    Some(admission.epoch()),
-                )
+                Some(admission.epoch())
             }
-            None => (None, None),
+            None => None,
         };
         let lifecycle = ConnectionLifecycle::new(
             policy,
             self.established_at,
-            local_expiry,
-            self.peer_leaf_expiry
-                .map(|expiry| wall_expiry_deadline(expiry, self.established_at)),
+            self.local_leaf_expiry,
+            self.peer_leaf_expiry,
             self.generation,
             epoch,
         )
         .map_err(|_| ProtocolError::InvalidWireValue)?;
         Ok((lifecycle, self.tls_config))
+    }
+
+    fn provisional_lifecycle(
+        &self,
+        policy: ConnectionLifecyclePolicy,
+    ) -> Result<ConnectionLifecycle, ProtocolError> {
+        ConnectionLifecycle::new(
+            policy,
+            self.established_at,
+            self.local_leaf_expiry,
+            self.peer_leaf_expiry,
+            self.generation,
+            self.handshake
+                .as_ref()
+                .map(opc_tls::TlsServerHandshake::epoch),
+        )
+        .map_err(|_| ProtocolError::InvalidWireValue)
     }
 }
 
@@ -2118,7 +2153,10 @@ fn spawn_connection_lifecycle(
                 };
                 tokio::select! {
                     _ = server_cancellation.cancelled() => cancellation.cancel(),
-                    _ = tokio::time::sleep_until(hard_deadline) => cancellation.cancel(),
+                    _ = tokio::time::sleep_until(hard_deadline) => {
+                        lifecycle.record_hard_overrun();
+                        cancellation.cancel();
+                    },
                 }
                 return;
             }
@@ -2168,6 +2206,9 @@ async fn handle_connection(
         }
         let peer = opc_tls::peer_tls_identity_from_server_connection(tls_stream.get_ref().1)
             .map_err(|_| ProtocolError::Authentication)?;
+        let local_leaf_expiry =
+            LeafExpiryEvidence::capture(handshake.leaf_expires_at(), established_at);
+        let peer_leaf_expiry = LeafExpiryEvidence::capture(peer.leaf_expires_at(), established_at);
         let (mut r, mut w) = tokio::io::split(tls_stream);
         dispatch(
             backend,
@@ -2178,7 +2219,8 @@ async fn handle_connection(
             PendingServerLifecycle {
                 handshake: Some(handshake),
                 tls_config: Some(tls_config),
-                peer_leaf_expiry: Some(peer.leaf_expires_at()),
+                local_leaf_expiry: Some(local_leaf_expiry),
+                peer_leaf_expiry: Some(peer_leaf_expiry),
                 established_at,
                 generation,
             },
@@ -2221,18 +2263,86 @@ where
         backend_slots,
         restore_scan_timeout,
         restore_scan_slots,
-        cancellation,
+        cancellation: server_cancellation,
         lifecycle_policy,
         reauthentication,
     } = dispatch_config;
 
-    // Hello handshake — bounded so a peer that connects and stalls is reaped.
-    let hello: BootstrapRequest = read_frame_within(
-        reader,
-        max_frame_size.min(MAX_HANDSHAKE_FRAME_SIZE),
-        idle_timeout,
-    )
-    .await?;
+    // Start the authentication clock at TLS completion, not after a peer
+    // eventually sends Hello. A stalled peer cannot retain a slot past the
+    // certificate/age hard bound, and no application admission starts after
+    // the soft boundary.
+    let bootstrap_lifecycle = pending_lifecycle.provisional_lifecycle(lifecycle_policy)?;
+    let cancellation = Arc::new(ServerCancellation::default());
+    let bootstrap_hard_deadline = bootstrap_lifecycle
+        .hard_deadline()
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
+    let bootstrap_server_cancellation = server_cancellation.clone();
+    let bootstrap_cancellation = cancellation.clone();
+    let bootstrap_hard_lifecycle = bootstrap_lifecycle.clone();
+    let _bootstrap_hard_task = LifecycleTask(tokio::spawn(async move {
+        tokio::select! {
+            _ = bootstrap_server_cancellation.cancelled() => {}
+            _ = tokio::time::sleep_until(bootstrap_hard_deadline) => {
+                let now = tokio::time::Instant::now();
+                let _ = bootstrap_hard_lifecycle.retirement(now);
+                bootstrap_hard_lifecycle.record_hard_overrun();
+            }
+        }
+        bootstrap_cancellation.cancel();
+    }));
+    let mut bootstrap_reauthentication_rx = reauthentication.subscribe();
+    let mut bootstrap_material_rx = pending_lifecycle
+        .tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
+    let hello: BootstrapRequest = {
+        let hello_read = read_frame_within(
+            reader,
+            max_frame_size.min(MAX_HANDSHAKE_FRAME_SIZE),
+            idle_timeout,
+        );
+        tokio::pin!(hello_read);
+        loop {
+            let now = tokio::time::Instant::now();
+            let current_material_status = pending_lifecycle
+                .tls_config
+                .as_ref()
+                .map(opc_tls::AuthenticatedServerConfig::material_status);
+            let mismatch = bootstrap_lifecycle.evidence_mismatch_reason(
+                reauthentication.generation(),
+                current_material_status.map(|status| status.epoch()),
+            );
+            if let Some(reason) = mismatch {
+                bootstrap_lifecycle.record_forced_retirement(reason);
+                return Err(ProtocolError::Authentication);
+            }
+            if !material_status_matches_admission(
+                bootstrap_lifecycle.admitted_material_epoch(),
+                current_material_status,
+            ) || bootstrap_lifecycle.retirement(now).is_some()
+            {
+                return Err(ProtocolError::Authentication);
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(ProtocolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "session bootstrap authentication deadline expired",
+                    )));
+                }
+                changed = bootstrap_reauthentication_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(ProtocolError::Authentication);
+                    }
+                }
+                _ = wait_server_material_change(&mut bootstrap_material_rx) => {}
+                _ = tokio::time::sleep_until(bootstrap_lifecycle.retire_at()) => {}
+                result = &mut hello_read => break result?,
+            }
+        }
+    };
     let BootstrapRequest::Hello(BootstrapHello {
         contract_version,
         node_id,
@@ -2244,6 +2354,7 @@ where
         contract_profile,
         requested_response_frame_size,
     }) = hello;
+    drop(bootstrap_lifecycle);
 
     if contract_version != CONTRACT_VERSION {
         write_bootstrap_ack(
@@ -2417,27 +2528,21 @@ where
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .epoch();
-    write_bootstrap_ack(
-        writer,
-        Some(binding.local_replica_id().as_str().to_string()),
-        Some(client_replica_id.as_str().to_string()),
-        Some(binding.cluster_id().as_str().to_string()),
-        Some(binding.configuration_id().to_hex()),
-        Some(binding.configuration_epoch().get()),
-        Some(handshake_nonce),
-        Some(cas_idempotency_epoch),
-        Some(accepted_response_frame_size),
-        Some(server_request_frame_size),
-        idle_timeout,
-        &cancellation,
-    )
-    .await?;
-
-    // Application identity, manifest, nonce, version and exact profile have
-    // now completed. Admit the same immutable TLS material epoch only after
-    // that complete negotiation, then start the cooperative retirement clock.
+    // Validate the immutable TLS material and explicit generation before an
+    // Accepted frame can become caller-visible. A rotation during bootstrap
+    // closes the connection without publishing a false application admission.
+    let mut admission_reauthentication_rx = reauthentication.subscribe();
     let (mut lifecycle, lifecycle_tls_config) =
-        pending_lifecycle.admit(lifecycle_policy, reauthentication.generation())?;
+        match pending_lifecycle.admit(lifecycle_policy, reauthentication.generation()) {
+            Ok(admitted) => admitted,
+            // Peer identity and scope already succeeded. A failure here is a
+            // concurrent local material/generation retirement, so close
+            // before Accepted and let the client retry pre-transmission.
+            Err(_) => return Ok(()),
+        };
+    let mut admission_material_rx = lifecycle_tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
     let peer_key = directed_connection_key(
         b"direct",
         client_replica_id.as_str(),
@@ -2445,43 +2550,135 @@ where
     )
     .to_vec();
     let now = tokio::time::Instant::now();
+    let admitted_material_epoch = lifecycle.admitted_material_epoch();
+    let current_material_status = lifecycle_tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedServerConfig::material_status);
     lifecycle.observe_rotation(
         now,
         reauthentication.generation(),
-        lifecycle_tls_config
-            .as_ref()
-            .map(|config| config.material_status().epoch()),
+        current_material_status.map(|status| status.epoch()),
         &peer_key,
     );
-    if lifecycle.retirement(now).is_some() {
+    if admission_reauthentication_rx.has_changed().unwrap_or(true)
+        || !material_status_matches_admission(admitted_material_epoch, current_material_status)
+        || lifecycle.retirement(now).is_some()
+    {
         return Ok(());
     }
-    let server_cancellation = cancellation;
+    drop(_bootstrap_hard_task);
     let cancellation = Arc::new(ServerCancellation::default());
+    let admitted_generation = lifecycle.admitted_generation();
     let (_lifecycle_task, mut retirement_rx) = spawn_connection_lifecycle(
         lifecycle,
         peer_key,
-        lifecycle_tls_config,
-        reauthentication,
-        server_cancellation,
+        lifecycle_tls_config.clone(),
+        reauthentication.clone(),
+        server_cancellation.clone(),
         cancellation.clone(),
     );
+    {
+        let acknowledgement = write_bootstrap_ack(
+            writer,
+            Some(binding.local_replica_id().as_str().to_string()),
+            Some(client_replica_id.as_str().to_string()),
+            Some(binding.cluster_id().as_str().to_string()),
+            Some(binding.configuration_id().to_hex()),
+            Some(binding.configuration_epoch().get()),
+            Some(handshake_nonce),
+            Some(cas_idempotency_epoch),
+            Some(accepted_response_frame_size),
+            Some(server_request_frame_size),
+            idle_timeout,
+            &cancellation,
+        );
+        tokio::pin!(acknowledgement);
+        loop {
+            tokio::select! {
+                biased;
+                _ = server_cancellation.cancelled() => return Ok(()),
+                changed = admission_reauthentication_rx.changed() => {
+                    if changed.is_err() || reauthentication.generation() != admitted_generation {
+                        return Ok(());
+                    }
+                }
+                _ = wait_server_material_change(&mut admission_material_rx) => {
+                    let status = lifecycle_tls_config
+                        .as_ref()
+                        .map(opc_tls::AuthenticatedServerConfig::material_status);
+                    if !material_status_matches_admission(admitted_material_epoch, status) {
+                        return Ok(());
+                    }
+                }
+                _ = retirement_rx.changed() => return Ok(()),
+                result = &mut acknowledgement => {
+                    result?;
+                    break;
+                }
+            }
+        }
+    }
 
     let transport_payload_limit = conservative_payload_budget(max_frame_size)
         .min(conservative_payload_budget(effective_response_frame_size));
 
     // Dispatch loop
     loop {
-        if *retirement_rx.borrow() {
-            return Ok(());
-        }
-        let inbound_result = tokio::select! {
-            biased;
-            changed = retirement_rx.changed() => {
-                let _ = changed;
-                return Ok(());
+        // Keep one exact request read pinned while soft retirement races
+        // admission. If retirement wins, finishing this authenticated frame
+        // is only correlation: the request is never validated for dispatch,
+        // sent to the backend, or inserted into an outcome cache. A complete
+        // fixed response therefore proves that this request did not execute.
+        let inbound_result = {
+            let inbound_read = read_request_frame_within(reader, max_frame_size, idle_timeout);
+            tokio::pin!(inbound_read);
+            let mut admitted_request = None;
+            let retiring = if *retirement_rx.borrow() {
+                true
+            } else {
+                tokio::select! {
+                    biased;
+                    changed = retirement_rx.changed() => {
+                        let _ = changed;
+                        true
+                    }
+                    inbound = &mut inbound_read => {
+                        admitted_request = Some(inbound);
+                        false
+                    },
+                }
+            };
+            if retiring {
+                let correlated_request = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Ok(()),
+                    inbound = &mut inbound_read => inbound,
+                };
+                match correlated_request {
+                    Ok(_request_never_dispatched) => {
+                        write_post_auth_response(
+                            writer,
+                            &Response::ConnectionRetiring,
+                            effective_response_frame_size,
+                            idle_timeout,
+                            ResponseFamily::ConnectionRetiring,
+                            &cancellation,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(ProtocolError::Io(error))
+                        if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            inbound = read_request_frame_within(reader, max_frame_size, idle_timeout) => inbound,
+            match admitted_request {
+                Some(inbound) => inbound,
+                None => inbound_read.await,
+            }
         };
         let inbound = match inbound_result {
             Ok(request) => request,

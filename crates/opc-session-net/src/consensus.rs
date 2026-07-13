@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
+use opc_redaction::metrics::METRICS;
 use opc_session_store::{
     ReplicaId, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
@@ -26,8 +27,8 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::error::ProtocolError;
 use crate::identity::{LocalReplicaBinding, RemoteReplicaBinding};
 use crate::lifecycle::{
-    directed_connection_key, wall_expiry_deadline, ConnectionLifecycle, ConnectionLifecyclePolicy,
-    SessionReauthenticationControl,
+    directed_connection_key, material_status_matches_admission, ConnectionLifecycle,
+    ConnectionLifecyclePolicy, LeafExpiryEvidence, SessionReauthenticationControl,
 };
 use crate::protocol::{
     checked_frame_size, checked_wire_frame_size, negotiate_response_frame_size, read_frame,
@@ -190,6 +191,19 @@ fn map_protocol_error(error: &ProtocolError) -> SessionConsensusPeerError {
     }
 }
 
+fn record_consensus_server_connection_failure(error: &ProtocolError) {
+    match error {
+        ProtocolError::Io(error) if error.kind() == io::ErrorKind::TimedOut => {
+            &METRICS.session_net_connection_failure_timeout
+        }
+        ProtocolError::Io(_) => &METRICS.session_net_connection_failure_transport,
+        ProtocolError::Authentication => &METRICS.session_net_connection_failure_authentication,
+        ProtocolError::BackendUnavailable(_) => &METRICS.session_net_connection_failure_backend,
+        _ => &METRICS.session_net_connection_failure_protocol,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
+
 fn map_tls_connect_error(error: io::Error) -> SessionConsensusPeerError {
     if error
         .get_ref()
@@ -350,137 +364,204 @@ impl RemoteSessionConsensusPeer {
             if tokio::time::Instant::now() >= deadline {
                 return Err(SessionConsensusPeerError::Timeout);
             }
-            let admitted_generation = self.reauthentication.generation();
-            let mut connection = if let Some(tls_config) = &self.tls_config {
-                let outcome = tls_config
-                    .run_handshake(|attempt| {
-                        let target = self.target.clone();
-                        let binding = self.binding.clone();
-                        async move {
-                            let addr = target
-                                .resolve()
-                                .await
-                                .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                            let tcp = TcpStream::connect(addr)
-                                .await
-                                .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                            let connector = tokio_rustls::TlsConnector::from(
-                                consensus_client_tls_config(attempt.rustls_config()),
-                            );
-                            let server_name = target.tls_server_name(addr)?;
-                            let tls_stream = connector
-                                .connect(server_name, tcp)
-                                .await
-                                .map_err(map_tls_connect_error)?;
-                            if tls_stream.get_ref().1.alpn_protocol()
-                                != Some(SESSION_CONSENSUS_ALPN)
-                            {
-                                return Err(SessionConsensusPeerError::Authentication);
+            METRICS
+                .session_net_connection_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            let connection_result = async {
+                let admitted_generation = self.reauthentication.generation();
+                let connection = if let Some(tls_config) = &self.tls_config {
+                    let outcome = tls_config
+                        .run_handshake(|attempt| {
+                            let target = self.target.clone();
+                            let binding = self.binding.clone();
+                            async move {
+                                let addr = target
+                                    .resolve()
+                                    .await
+                                    .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                                let tcp = TcpStream::connect(addr)
+                                    .await
+                                    .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                                let connector = tokio_rustls::TlsConnector::from(
+                                    consensus_client_tls_config(attempt.rustls_config()),
+                                );
+                                let server_name = target.tls_server_name(addr)?;
+                                let tls_stream = connector
+                                    .connect(server_name, tcp)
+                                    .await
+                                    .map_err(map_tls_connect_error)?;
+                                if tls_stream.get_ref().1.alpn_protocol()
+                                    != Some(SESSION_CONSENSUS_ALPN)
+                                {
+                                    return Err(SessionConsensusPeerError::Authentication);
+                                }
+                                let peer = opc_tls::peer_tls_identity_from_client_connection(
+                                    tls_stream.get_ref().1,
+                                )
+                                .map_err(|_| SessionConsensusPeerError::Authentication)?;
+                                if peer.spiffe_id().as_str() != binding.remote_spiffe_id().as_str()
+                                {
+                                    return Err(SessionConsensusPeerError::Authentication);
+                                }
+                                let tls_completed_at = tokio::time::Instant::now();
+                                let local_expiry = LeafExpiryEvidence::capture(
+                                    attempt.leaf_expires_at(),
+                                    tls_completed_at,
+                                );
+                                let peer_expiry = LeafExpiryEvidence::capture(
+                                    peer.leaf_expires_at(),
+                                    tls_completed_at,
+                                );
+                                let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                                let (response_frame_size, request_frame_size) =
+                                    self.bootstrap(&mut reader, &mut writer, deadline).await?;
+                                Ok::<_, SessionConsensusPeerError>((
+                                    Box::new(reader) as Box<dyn AsyncRead + Unpin + Send>,
+                                    Box::new(writer) as Box<dyn AsyncWrite + Unpin + Send>,
+                                    response_frame_size,
+                                    request_frame_size,
+                                    tls_completed_at,
+                                    local_expiry,
+                                    peer_expiry,
+                                ))
                             }
-                            let peer = opc_tls::peer_tls_identity_from_client_connection(
-                                tls_stream.get_ref().1,
-                            )
-                            .map_err(|_| SessionConsensusPeerError::Authentication)?;
-                            if peer.spiffe_id().as_str() != binding.remote_spiffe_id().as_str() {
-                                return Err(SessionConsensusPeerError::Authentication);
+                        })
+                        .await
+                        .map_err(|error| match error {
+                            opc_tls::TlsHandshakeRunError::Material(_) => {
+                                SessionConsensusPeerError::Authentication
                             }
-                            let tls_completed_at = tokio::time::Instant::now();
-                            let (mut reader, mut writer) = tokio::io::split(tls_stream);
-                            let (response_frame_size, request_frame_size) =
-                                self.bootstrap(&mut reader, &mut writer, deadline).await?;
-                            Ok::<_, SessionConsensusPeerError>((
-                                Box::new(reader) as Box<dyn AsyncRead + Unpin + Send>,
-                                Box::new(writer) as Box<dyn AsyncWrite + Unpin + Send>,
-                                response_frame_size,
-                                request_frame_size,
-                                tls_completed_at,
-                                peer.leaf_expires_at(),
-                            ))
-                        }
-                    })
-                    .await
-                    .map_err(|error| match error {
-                        opc_tls::TlsHandshakeRunError::Material(_) => {
-                            SessionConsensusPeerError::Authentication
-                        }
-                        opc_tls::TlsHandshakeRunError::Operation(error) => error,
-                    })?;
-                let admission = outcome.admission();
-                let (parts, _) = outcome.into_parts();
-                let (
-                    reader,
-                    writer,
-                    response_frame_size,
-                    request_frame_size,
-                    tls_completed_at,
-                    peer_expiry,
-                ) = parts;
-                ConsensusConnection {
-                    reader,
-                    writer,
-                    response_frame_size,
-                    request_frame_size,
-                    lifecycle: ConnectionLifecycle::new(
-                        self.lifecycle_policy,
+                            opc_tls::TlsHandshakeRunError::Operation(error) => error,
+                        })?;
+                    let admission = outcome.admission();
+                    let (parts, _) = outcome.into_parts();
+                    let (
+                        reader,
+                        writer,
+                        response_frame_size,
+                        request_frame_size,
                         tls_completed_at,
-                        Some(wall_expiry_deadline(
-                            admission.leaf_expires_at(),
+                        local_expiry,
+                        peer_expiry,
+                    ) = parts;
+                    ConsensusConnection {
+                        reader,
+                        writer,
+                        response_frame_size,
+                        request_frame_size,
+                        lifecycle: ConnectionLifecycle::new(
+                            self.lifecycle_policy,
                             tls_completed_at,
-                        )),
-                        Some(wall_expiry_deadline(peer_expiry, tls_completed_at)),
-                        admitted_generation,
-                        Some(admission.epoch()),
-                    )
-                    .map_err(|_| SessionConsensusPeerError::Protocol)?,
+                            Some(local_expiry),
+                            Some(peer_expiry),
+                            admitted_generation,
+                            Some(admission.epoch()),
+                        )
+                        .map_err(|_| SessionConsensusPeerError::Protocol)?,
+                    }
+                } else {
+                    let addr = self
+                        .target
+                        .resolve()
+                        .await
+                        .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                    let tcp = TcpStream::connect(addr)
+                        .await
+                        .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                    let (mut reader, mut writer) = tokio::io::split(tcp);
+                    let established_at = tokio::time::Instant::now();
+                    let (response_frame_size, request_frame_size) =
+                        self.bootstrap(&mut reader, &mut writer, deadline).await?;
+                    ConsensusConnection {
+                        reader: Box::new(reader),
+                        writer: Box::new(writer),
+                        response_frame_size,
+                        request_frame_size,
+                        lifecycle: ConnectionLifecycle::new(
+                            self.lifecycle_policy,
+                            established_at,
+                            None,
+                            None,
+                            admitted_generation,
+                            None,
+                        )
+                        .map_err(|_| SessionConsensusPeerError::Protocol)?,
+                    }
+                };
+                Ok::<_, SessionConsensusPeerError>(connection)
+            }
+            .await;
+            let mut connection = match connection_result {
+                Ok(connection) => {
+                    METRICS
+                        .session_net_connection_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    connection
                 }
-            } else {
-                let addr = self
-                    .target
-                    .resolve()
-                    .await
-                    .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                let tcp = TcpStream::connect(addr)
-                    .await
-                    .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                let (mut reader, mut writer) = tokio::io::split(tcp);
-                let established_at = tokio::time::Instant::now();
-                let (response_frame_size, request_frame_size) =
-                    self.bootstrap(&mut reader, &mut writer, deadline).await?;
-                ConsensusConnection {
-                    reader: Box::new(reader),
-                    writer: Box::new(writer),
-                    response_frame_size,
-                    request_frame_size,
-                    lifecycle: ConnectionLifecycle::new(
-                        self.lifecycle_policy,
-                        established_at,
-                        None,
-                        None,
-                        admitted_generation,
-                        None,
-                    )
-                    .map_err(|_| SessionConsensusPeerError::Protocol)?,
+                Err(error) => {
+                    match error {
+                        SessionConsensusPeerError::Unavailable => {
+                            &METRICS.session_net_connection_failure_transport
+                        }
+                        SessionConsensusPeerError::Timeout => {
+                            &METRICS.session_net_connection_failure_timeout
+                        }
+                        SessionConsensusPeerError::Authentication => {
+                            &METRICS.session_net_connection_failure_authentication
+                        }
+                        SessionConsensusPeerError::Rejected => {
+                            &METRICS.session_net_connection_failure_backend
+                        }
+                        _ => &METRICS.session_net_connection_failure_protocol,
+                    }
+                    .fetch_add(1, Ordering::Relaxed);
+                    if !matches!(
+                        error,
+                        SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout
+                    ) {
+                        return Err(error);
+                    }
+                    METRICS
+                        .session_net_reconnect_attempts
+                        .fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .session_net_reconnect_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    let now = tokio::time::Instant::now();
+                    let retry_at = now.checked_add(backoff).unwrap_or(deadline).min(deadline);
+                    tokio::time::sleep_until(retry_at).await;
+                    backoff = self.lifecycle_policy.next_backoff(backoff);
+                    continue;
                 }
             };
             let now = tokio::time::Instant::now();
             let current_generation = self.reauthentication.generation();
+            let current_material_epoch = self
+                .tls_config
+                .as_ref()
+                .map(|config| config.material_status().epoch());
             connection.lifecycle.observe_rotation(
                 now,
                 current_generation,
-                self.tls_config
-                    .as_ref()
-                    .map(|config| config.material_status().epoch()),
+                current_material_epoch,
                 &directed_connection_key(
                     b"consensus",
                     self.binding.local_replica_id().as_str(),
                     self.binding.remote_replica_id().as_str(),
                 ),
             );
-            if current_generation == admitted_generation
-                && connection.lifecycle.retirement(now).is_none()
-            {
+            let mismatch = connection
+                .lifecycle
+                .evidence_mismatch_reason(current_generation, current_material_epoch);
+            if mismatch.is_none() && connection.lifecycle.retirement(now).is_none() {
                 break connection;
             }
+            if let Some(reason) = mismatch {
+                connection.lifecycle.record_forced_retirement(reason);
+            }
+            METRICS
+                .session_net_reconnect_attempts
+                .fetch_add(1, Ordering::Relaxed);
             let retry_at = now.checked_add(backoff).unwrap_or(deadline).min(deadline);
             tokio::time::sleep_until(retry_at).await;
             backoff = self.lifecycle_policy.next_backoff(backoff);
@@ -578,7 +659,7 @@ impl RemoteSessionConsensusPeer {
             Ok(response)
         };
         tokio::pin!(call);
-        let mut lifecycle = connection.lifecycle;
+        let mut lifecycle = connection.lifecycle.clone();
         let mut reauthentication_rx = self.reauthentication.subscribe();
         let mut material_rx = self
             .tls_config
@@ -598,13 +679,18 @@ impl RemoteSessionConsensusPeer {
                     self.binding.remote_replica_id().as_str(),
                 ),
             );
-            let hard_deadline = lifecycle
+            let lifecycle_hard_deadline = lifecycle
                 .hard_deadline()
-                .map_err(|_| SessionConsensusPeerError::Protocol)?
-                .min(deadline);
+                .map_err(|_| SessionConsensusPeerError::Protocol)?;
+            let hard_deadline = lifecycle_hard_deadline.min(deadline);
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(hard_deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= lifecycle_hard_deadline {
+                        let _ = lifecycle.retirement(now);
+                        lifecycle.record_hard_overrun();
+                    }
                     return Err(SessionConsensusPeerError::Timeout);
                 }
                 response = &mut call => return response,
@@ -786,6 +872,7 @@ impl SessionConsensusServer {
         let listener = TcpListener::bind(bind_addr).await?;
         let bound_addr = listener.local_addr()?;
         let cancellation = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let connection_tasks = Arc::new(std::sync::Mutex::new(ConnectionTaskRegistry {
             stopping: false,
             handles: Vec::new(),
@@ -823,10 +910,14 @@ impl SessionConsensusServer {
                 let tls_config = tls_config.clone();
                 let binding = binding.clone();
                 let cancellation = accept_cancellation.clone();
+                let shutdown_rx = shutdown_rx.clone();
                 let reauthentication = reauthentication.clone();
                 let handle = tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = handle_consensus_connection(
+                    METRICS
+                        .session_net_connection_attempts
+                        .fetch_add(1, Ordering::Relaxed);
+                    let result = handle_consensus_connection(
                         stream,
                         tls_config,
                         binding,
@@ -835,10 +926,18 @@ impl SessionConsensusServer {
                         idle_timeout,
                         rpc_timeout,
                         cancellation,
+                        shutdown_rx,
                         lifecycle_policy,
                         reauthentication,
                     )
                     .await;
+                    if let Err(error) = result {
+                        record_consensus_server_connection_failure(&error);
+                    } else {
+                        METRICS
+                            .session_net_connection_successes
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 });
                 registry.handles.push(handle);
             }
@@ -849,6 +948,7 @@ impl SessionConsensusServer {
                 accept_handle,
                 connection_tasks,
                 cancellation,
+                shutdown_tx,
             },
             bound_addr,
         ))
@@ -867,12 +967,14 @@ pub struct SessionConsensusServerHandle {
     accept_handle: tokio::task::JoinHandle<()>,
     connection_tasks: Arc<std::sync::Mutex<ConnectionTaskRegistry>>,
     cancellation: Arc<AtomicBool>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl SessionConsensusServerHandle {
     /// Schedule immediate cancellation of the listener and all connections.
     pub fn abort(&self) {
         self.cancellation.store(true, Ordering::Release);
+        self.shutdown_tx.send_replace(true);
         self.accept_handle.abort();
         let mut registry = self
             .connection_tasks
@@ -912,7 +1014,8 @@ enum ConnectionPeerIdentity {
 struct PendingConsensusLifecycle {
     handshake: Option<opc_tls::TlsServerHandshake>,
     tls_config: Option<opc_tls::AuthenticatedServerConfig>,
-    peer_leaf_expiry: Option<opc_types::Timestamp>,
+    local_leaf_expiry: Option<LeafExpiryEvidence>,
+    peer_leaf_expiry: Option<LeafExpiryEvidence>,
     established_at: tokio::time::Instant,
     generation: u64,
 }
@@ -922,6 +1025,7 @@ impl PendingConsensusLifecycle {
         Self {
             handshake: None,
             tls_config: None,
+            local_leaf_expiry: None,
             peer_leaf_expiry: None,
             established_at: tokio::time::Instant::now(),
             generation,
@@ -942,32 +1046,42 @@ impl PendingConsensusLifecycle {
         if current_generation != self.generation {
             return Err(ProtocolError::Authentication);
         }
-        let (local_expiry, epoch) = match self.handshake {
+        let epoch = match self.handshake {
             Some(handshake) => {
                 let admission = handshake
                     .admit()
                     .map_err(|_| ProtocolError::Authentication)?;
-                (
-                    Some(wall_expiry_deadline(
-                        admission.leaf_expires_at(),
-                        self.established_at,
-                    )),
-                    Some(admission.epoch()),
-                )
+                Some(admission.epoch())
             }
-            None => (None, None),
+            None => None,
         };
         let lifecycle = ConnectionLifecycle::new(
             policy,
             self.established_at,
-            local_expiry,
-            self.peer_leaf_expiry
-                .map(|expiry| wall_expiry_deadline(expiry, self.established_at)),
+            self.local_leaf_expiry,
+            self.peer_leaf_expiry,
             self.generation,
             epoch,
         )
         .map_err(|_| ProtocolError::InvalidWireValue)?;
         Ok((lifecycle, self.tls_config))
+    }
+
+    fn provisional_lifecycle(
+        &self,
+        policy: ConnectionLifecyclePolicy,
+    ) -> Result<ConnectionLifecycle, ProtocolError> {
+        ConnectionLifecycle::new(
+            policy,
+            self.established_at,
+            self.local_leaf_expiry,
+            self.peer_leaf_expiry,
+            self.generation,
+            self.handshake
+                .as_ref()
+                .map(opc_tls::TlsServerHandshake::epoch),
+        )
+        .map_err(|_| ProtocolError::InvalidWireValue)
     }
 }
 
@@ -984,6 +1098,7 @@ fn spawn_consensus_lifecycle(
     edge_key: [u8; 32],
     tls_config: Option<opc_tls::AuthenticatedServerConfig>,
     reauthentication: SessionReauthenticationControl,
+    mut server_shutdown: tokio::sync::watch::Receiver<bool>,
     connection_cancellation: Arc<AtomicBool>,
 ) -> (
     ConsensusLifecycleTask,
@@ -1016,13 +1131,23 @@ fn spawn_consensus_lifecycle(
                         return;
                     }
                 };
-                tokio::time::sleep_until(hard_deadline).await;
+                tokio::select! {
+                    _ = server_shutdown.changed() => {}
+                    _ = tokio::time::sleep_until(hard_deadline) => {
+                        lifecycle.record_hard_overrun();
+                    }
+                }
                 hard_tx.send_replace(true);
                 connection_cancellation.store(true, Ordering::Release);
                 return;
             }
             tokio::select! {
                 biased;
+                _ = server_shutdown.changed() => {
+                    hard_tx.send_replace(true);
+                    connection_cancellation.store(true, Ordering::Release);
+                    return;
+                }
                 _ = reauthentication_rx.changed() => {}
                 _ = wait_consensus_material_change(&mut material_rx) => {}
                 _ = tokio::time::sleep_until(lifecycle.retire_at()) => {}
@@ -1042,6 +1167,7 @@ async fn handle_consensus_connection(
     idle_timeout: Duration,
     rpc_timeout: Duration,
     cancellation: Arc<AtomicBool>,
+    server_shutdown: tokio::sync::watch::Receiver<bool>,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
 ) -> Result<(), ProtocolError> {
@@ -1067,6 +1193,9 @@ async fn handle_consensus_connection(
         }
         let peer = opc_tls::peer_tls_identity_from_server_connection(tls_stream.get_ref().1)
             .map_err(|_| ProtocolError::Authentication)?;
+        let local_leaf_expiry =
+            LeafExpiryEvidence::capture(handshake.leaf_expires_at(), established_at);
+        let peer_leaf_expiry = LeafExpiryEvidence::capture(peer.leaf_expires_at(), established_at);
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
         dispatch_consensus(
             &mut reader,
@@ -1075,7 +1204,8 @@ async fn handle_consensus_connection(
             PendingConsensusLifecycle {
                 handshake: Some(handshake),
                 tls_config: Some(tls_config),
-                peer_leaf_expiry: Some(peer.leaf_expires_at()),
+                local_leaf_expiry: Some(local_leaf_expiry),
+                peer_leaf_expiry: Some(peer_leaf_expiry),
                 established_at,
                 generation,
             },
@@ -1085,6 +1215,7 @@ async fn handle_consensus_connection(
             idle_timeout,
             rpc_timeout,
             &cancellation,
+            server_shutdown,
             lifecycle_policy,
             reauthentication,
         )
@@ -1102,6 +1233,7 @@ async fn handle_consensus_connection(
             idle_timeout,
             rpc_timeout,
             &cancellation,
+            server_shutdown,
             lifecycle_policy,
             reauthentication,
         )
@@ -1142,7 +1274,8 @@ async fn dispatch_consensus<R, W>(
     max_frame_size: usize,
     idle_timeout: Duration,
     rpc_timeout: Duration,
-    cancellation: &AtomicBool,
+    global_cancellation: &AtomicBool,
+    server_shutdown: tokio::sync::watch::Receiver<bool>,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
 ) -> Result<(), ProtocolError>
@@ -1150,9 +1283,78 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let hello: SessionConsensusBootstrapRequest =
-        read_frame_within(reader, MAX_HANDSHAKE_FRAME_SIZE, idle_timeout).await?;
+    let bootstrap_lifecycle = pending_lifecycle.provisional_lifecycle(lifecycle_policy)?;
+    let bootstrap_cancellation =
+        Arc::new(AtomicBool::new(global_cancellation.load(Ordering::Acquire)));
+    let bootstrap_hard_deadline = bootstrap_lifecycle
+        .hard_deadline()
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
+    let mut bootstrap_task_shutdown = server_shutdown.clone();
+    let task_cancellation = bootstrap_cancellation.clone();
+    let bootstrap_hard_lifecycle = bootstrap_lifecycle.clone();
+    let _bootstrap_hard_task = ConsensusLifecycleTask(tokio::spawn(async move {
+        tokio::select! {
+            _ = bootstrap_task_shutdown.changed() => {}
+            _ = tokio::time::sleep_until(bootstrap_hard_deadline) => {
+                let now = tokio::time::Instant::now();
+                let _ = bootstrap_hard_lifecycle.retirement(now);
+                bootstrap_hard_lifecycle.record_hard_overrun();
+            }
+        }
+        task_cancellation.store(true, Ordering::Release);
+    }));
+    let server_cancellation = bootstrap_cancellation.as_ref();
+    let mut bootstrap_shutdown = server_shutdown.clone();
+    let mut bootstrap_reauthentication_rx = reauthentication.subscribe();
+    let mut bootstrap_material_rx = pending_lifecycle
+        .tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
+    let hello: SessionConsensusBootstrapRequest = {
+        let hello_read = read_frame_within(reader, MAX_HANDSHAKE_FRAME_SIZE, idle_timeout);
+        tokio::pin!(hello_read);
+        loop {
+            let now = tokio::time::Instant::now();
+            let current_material_status = pending_lifecycle
+                .tls_config
+                .as_ref()
+                .map(opc_tls::AuthenticatedServerConfig::material_status);
+            let mismatch = bootstrap_lifecycle.evidence_mismatch_reason(
+                reauthentication.generation(),
+                current_material_status.map(|status| status.epoch()),
+            );
+            if let Some(reason) = mismatch {
+                bootstrap_lifecycle.record_forced_retirement(reason);
+                return Err(ProtocolError::Authentication);
+            }
+            if !material_status_matches_admission(
+                bootstrap_lifecycle.admitted_material_epoch(),
+                current_material_status,
+            ) || bootstrap_lifecycle.retirement(now).is_some()
+            {
+                return Err(ProtocolError::Authentication);
+            }
+            tokio::select! {
+                biased;
+                _ = bootstrap_shutdown.changed() => {
+                    return Err(ProtocolError::Io(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "consensus server stopped during bootstrap",
+                    )));
+                }
+                changed = bootstrap_reauthentication_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(ProtocolError::Authentication);
+                    }
+                }
+                _ = wait_consensus_material_change(&mut bootstrap_material_rx) => {}
+                _ = tokio::time::sleep_until(bootstrap_lifecycle.retire_at()) => {}
+                result = &mut hello_read => break result?,
+            }
+        }
+    };
     let SessionConsensusBootstrapRequest::Hello(hello) = hello;
+    drop(bootstrap_lifecycle);
     if hello.transport_revision != SESSION_CONSENSUS_TRANSPORT_REVISION
         || !hello.contract_profile.is_current()
     {
@@ -1160,7 +1362,7 @@ where
             writer,
             SessionConsensusPeerError::Protocol,
             idle_timeout,
-            cancellation,
+            server_cancellation,
         )
         .await?;
         return Err(ProtocolError::ContractMismatch);
@@ -1173,7 +1375,7 @@ where
                     writer,
                     SessionConsensusPeerError::Protocol,
                     idle_timeout,
-                    cancellation,
+                    server_cancellation,
                 )
                 .await?;
                 return Err(error);
@@ -1185,7 +1387,7 @@ where
             writer,
             SessionConsensusPeerError::Protocol,
             idle_timeout,
-            cancellation,
+            server_cancellation,
         )
         .await?;
         return Err(ProtocolError::ContractMismatch);
@@ -1199,7 +1401,7 @@ where
                 writer,
                 SessionConsensusPeerError::Protocol,
                 idle_timeout,
-                cancellation,
+                server_cancellation,
             )
             .await?;
             return Err(ProtocolError::InvalidWireValue);
@@ -1212,7 +1414,7 @@ where
                 writer,
                 SessionConsensusPeerError::Protocol,
                 idle_timeout,
-                cancellation,
+                server_cancellation,
             )
             .await?;
             return Err(ProtocolError::InvalidWireValue);
@@ -1240,61 +1442,106 @@ where
                 SessionConsensusPeerError::Authentication
             },
             idle_timeout,
-            cancellation,
+            server_cancellation,
         )
         .await?;
         return Err(ProtocolError::Authentication);
     }
 
-    let write_deadline = tokio::time::Instant::now()
-        .checked_add(idle_timeout)
-        .ok_or(ProtocolError::InvalidWireValue)?;
-    write_frame_bounded_until_cancellable(
-        writer,
-        &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
-            transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
-            contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
-            identity: binding.consensus_identity(),
-            server_node_id: binding.local_consensus_node_id(),
-            accepted_sender_node_id: hello.sender_node_id,
-            handshake_nonce: hello.handshake_nonce,
-            accepted_response_frame_size: requested_response_frame_size,
-            server_request_frame_size,
-        }),
-        MAX_HANDSHAKE_FRAME_SIZE,
-        write_deadline,
-        cancellation,
-    )
-    .await?;
-
+    let mut admission_reauthentication_rx = reauthentication.subscribe();
     let (mut lifecycle, lifecycle_tls_config) =
-        pending_lifecycle.admit(lifecycle_policy, reauthentication.generation())?;
+        match pending_lifecycle.admit(lifecycle_policy, reauthentication.generation()) {
+            Ok(admitted) => admitted,
+            // Authentication and scope already succeeded. This is a local
+            // epoch/generation retirement, not a permanent peer failure.
+            Err(_) => return Ok(()),
+        };
+    let mut admission_material_rx = lifecycle_tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
     let edge_key = directed_connection_key(
         b"consensus",
         sender_replica_id.as_str(),
         binding.local_replica_id().as_str(),
     );
     let now = tokio::time::Instant::now();
+    let admitted_material_epoch = lifecycle.admitted_material_epoch();
+    let current_material_status = lifecycle_tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedServerConfig::material_status);
     lifecycle.observe_rotation(
         now,
         reauthentication.generation(),
-        lifecycle_tls_config
-            .as_ref()
-            .map(|config| config.material_status().epoch()),
+        current_material_status.map(|status| status.epoch()),
         &edge_key,
     );
-    if lifecycle.retirement(now).is_some() {
+    if admission_reauthentication_rx.has_changed().unwrap_or(true)
+        || !material_status_matches_admission(admitted_material_epoch, current_material_status)
+        || lifecycle.retirement(now).is_some()
+    {
         return Ok(());
     }
+    drop(_bootstrap_hard_task);
     let connection_cancellation = Arc::new(AtomicBool::new(false));
+    let admitted_generation = lifecycle.admitted_generation();
+    let mut admission_shutdown = server_shutdown.clone();
     let (_lifecycle_task, mut retirement_rx, mut hard_rx) = spawn_consensus_lifecycle(
         lifecycle,
         edge_key,
-        lifecycle_tls_config,
-        reauthentication,
+        lifecycle_tls_config.clone(),
+        reauthentication.clone(),
+        server_shutdown,
         connection_cancellation.clone(),
     );
-    let cancellation = connection_cancellation.as_ref();
+    let write_deadline = tokio::time::Instant::now()
+        .checked_add(idle_timeout)
+        .ok_or(ProtocolError::InvalidWireValue)?;
+    let accepted = SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+        transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+        contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+        identity: binding.consensus_identity(),
+        server_node_id: binding.local_consensus_node_id(),
+        accepted_sender_node_id: hello.sender_node_id,
+        handshake_nonce: hello.handshake_nonce,
+        accepted_response_frame_size: requested_response_frame_size,
+        server_request_frame_size,
+    });
+    {
+        let acknowledgement = write_frame_bounded_until_cancellable(
+            writer,
+            &accepted,
+            MAX_HANDSHAKE_FRAME_SIZE,
+            write_deadline,
+            connection_cancellation.as_ref(),
+        );
+        tokio::pin!(acknowledgement);
+        loop {
+            tokio::select! {
+                biased;
+                _ = admission_shutdown.changed() => return Ok(()),
+                changed = admission_reauthentication_rx.changed() => {
+                    if changed.is_err() || reauthentication.generation() != admitted_generation {
+                        return Ok(());
+                    }
+                }
+                _ = wait_consensus_material_change(&mut admission_material_rx) => {
+                    let status = lifecycle_tls_config
+                        .as_ref()
+                        .map(opc_tls::AuthenticatedServerConfig::material_status);
+                    if !material_status_matches_admission(admitted_material_epoch, status) {
+                        return Ok(());
+                    }
+                }
+                _ = hard_rx.changed() => return Ok(()),
+                _ = retirement_rx.changed() => return Ok(()),
+                result = &mut acknowledgement => {
+                    result?;
+                    break;
+                }
+            }
+        }
+    }
+    let connection_cancellation = connection_cancellation.as_ref();
 
     loop {
         if *retirement_rx.borrow() || *hard_rx.borrow() {
@@ -1356,7 +1603,7 @@ where
                 &outbound,
                 effective_response_frame_size,
                 deadline,
-                cancellation,
+                connection_cancellation,
             ) => result?,
         }
     }
