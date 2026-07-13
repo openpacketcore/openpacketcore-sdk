@@ -20,7 +20,7 @@ use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, Generation, OwnerId,
     QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
     ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity, SessionBackend, SessionKey,
-    SessionKeyType, StateClass, StateType, StoredSessionRecord,
+    SessionKeyType, StableId, StateClass, StateType, StoredSessionRecord,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, TenantId};
@@ -716,7 +716,8 @@ async fn server_revalidates_a_rotated_client_svid_instead_of_resuming_identity()
         tenant: TenantId::new("tenant-a").expect("tenant"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(b"credential-rotation-cas"),
+        stable_id: StableId::new(Bytes::from_static(b"credential-rotation-cas"))
+            .expect("stable ID"),
     };
     let owner = OwnerId::new("credential-rotation-owner").expect("owner");
     write_frame(

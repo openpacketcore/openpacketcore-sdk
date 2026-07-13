@@ -617,6 +617,22 @@ cluster epoch or membership identity. Page on `generation_retry_limit`,
 `read_attempt_timeout`, and `last_good_expired`; the last reason stays active
 until a validated replacement is published.
 
+Construct one shared `TlsMaterialController` from the identity source and pass
+clones through `TlsConfigBuilder::from_material_controller`. Pin the expected
+local SPIFFE ID explicitly when configuration already knows it; otherwise the
+first valid state becomes the process-lifetime pin. Use `run_handshake` for the
+complete TLS plus application bootstrap and retain its admitted epoch/leaf
+expiry with the connection. A raw `rustls_config()` call is compatibility-only
+and does not supply epoch-current application admission.
+
+Alert on `local_identity_changed`, `last_good_expired`,
+`material_limit_exceeded`, and `epoch_retry_limit` without attaching identity
+or parser text. An invalid candidate leaves an unexpired prior epoch usable;
+an expired prior epoch gates new connections. Epochs reset with the process and
+must never be used as cluster membership/configuration epochs. #163 still owns
+draining admitted connections by epoch, revocation, and maximum authentication
+age, so #162 alone is not a seamless-rotation production claim.
+
 ### Legacy direct-backend session-net v4 rollout boundary
 
 The opt-in legacy `opc-session-net` v4 surface carries cursor-paged remote

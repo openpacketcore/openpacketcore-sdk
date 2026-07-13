@@ -66,6 +66,9 @@ fn projected_source() -> ProjectedSvidSource {
 ## Relationships
 
 - Feeds `opc-tls` with `IdentityState`.
+- `opc-tls::TlsMaterialController` revalidates and pins those states into
+  immutable per-handshake material epochs; identity publication remains owned
+  here and handshake/application admission remains owned by `opc-tls`.
 - Uses `opc-types` for tenant, NF kind, instance, SPIFFE ID, and timestamps.
 - Used by security testkits to exercise SVID rotation and trust-bundle changes.
 
@@ -100,9 +103,10 @@ projected generation restarts at zero with the process and must not be persisted
 or compared across process restarts. Rollback to an earlier Kubernetes Secret
 payload is a new successful publication and receives a larger generation.
 
-The projected source makes identity material publication coherent. It does not
-retire already authenticated TLS connections; coherent per-handshake TLS epochs
-are tracked by #162 and bounded connection reauthentication by #163.
+The projected source makes identity material publication coherent. `opc-tls`
+now turns accepted states into coherent per-handshake epochs under #162. Neither
+layer retires already authenticated TLS connections; bounded connection
+reauthentication remains #163.
 
 ## Roadmap
 

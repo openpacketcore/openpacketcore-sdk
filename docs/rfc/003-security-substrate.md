@@ -196,6 +196,25 @@ the leaf's expiry; expiry clears the identity and reports a typed unavailable
 state. This source-level publication contract precedes #162's coherent
 per-handshake TLS epoch and #163's bounded connection reauthentication.
 
+`opc-tls::TlsMaterialController` MUST revalidate each identity state under fixed
+certificate, trust-anchor, private-key, and aggregate byte bounds before it can
+become handshake authority. It MUST pin the explicit local SPIFFE identity or
+the first accepted identity, retain an invalid candidate's predecessor only
+until leaf expiry, and assign every accepted update or rollback a new opaque
+process-local epoch. Status and errors MUST contain only closed reason codes,
+epoch, availability, and leaf expiry; identity text, paths, PEM, keys, and
+parser/application error text are forbidden.
+
+Every production handshake MUST freeze one controller snapshot before rustls
+construction so certificate resolution and peer verification use the same
+leaf/key/chain/trust material. After mutual TLS and application negotiation,
+the caller MUST verify that epoch is still current before admitting the
+connection. A changed epoch MUST discard the connection and retry within the
+fixed SDK retry/concurrency limits. Tickets, resumption, early data, half-RTT
+data, and 0-RTT MUST remain disabled. This admission record carries the exact
+epoch and local leaf expiry; #163 separately owns retirement of connections
+after admission.
+
 ## 5. Transport Security
 
 ### 5.1 gRPC Transports
@@ -565,6 +584,9 @@ should have deterministic test fixtures and no hidden global state.
   proving that no mixed generation is published.
 - Projected-material exact-limit/one-over, last-good retention, expiry,
   rollback-generation, and redaction tests.
+- TLS material rotation during every handshake/application phase, exact
+  epoch/expiry admission, identity continuity, rollback, repeated-rotation
+  retry exhaustion, concurrent-operation bounds, cancellation, and redaction.
 - Trust bundle rotation revokes removed trust domain.
 - gNSI policy staging and rollback.
 - Management commit rejected after NACM policy update removes permission.

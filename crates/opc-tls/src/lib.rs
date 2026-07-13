@@ -16,9 +16,21 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+mod material;
+pub use material::{
+    TlsAdmittedConnection, TlsClientHandshake, TlsHandshakeOutcome, TlsHandshakeRunError,
+    TlsMaterialAvailability, TlsMaterialController, TlsMaterialEpoch, TlsMaterialError,
+    TlsMaterialReloadReason, TlsMaterialStatus, TlsServerHandshake, MAX_TLS_CONCURRENT_HANDSHAKES,
+    MAX_TLS_HANDSHAKE_EPOCH_RETRIES, MAX_TLS_MATERIAL_CHAIN_CERTIFICATES,
+    MAX_TLS_MATERIAL_PRIVATE_KEY_BYTES, MAX_TLS_MATERIAL_TOTAL_BYTES,
+    MAX_TLS_MATERIAL_TRUST_ANCHORS, MAX_TLS_MATERIAL_TRUST_BUNDLES,
+};
+
 const TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
 const TLS13_WITH_TLS12_COMPAT: [&rustls::SupportedProtocolVersion; 2] =
     [&rustls::version::TLS13, &rustls::version::TLS12];
+const RAW_CONFIG_MATERIAL_SETTINGS_ERROR: &str =
+    "TLS material pinning requires an authenticated TLS config builder";
 
 fn protocol_versions(compat_mode: bool) -> &'static [&'static rustls::SupportedProtocolVersion] {
     if compat_mode {
@@ -373,12 +385,97 @@ pub type ClientConfig = rustls::ClientConfig;
 #[derive(Clone)]
 pub struct AuthenticatedClientConfig {
     config: Arc<rustls::ClientConfig>,
+    controller: TlsMaterialController,
+    policy: PeerPolicy,
+    compat_mode: bool,
+    allow_unconstrained_peer_policy: bool,
 }
 
 impl AuthenticatedClientConfig {
     /// Clone the shared rustls configuration for a connection or connector.
     pub fn rustls_config(&self) -> Arc<rustls::ClientConfig> {
         Arc::clone(&self.config)
+    }
+
+    /// Current coherent material-controller status.
+    pub fn material_status(&self) -> TlsMaterialStatus {
+        self.controller.status()
+    }
+
+    /// Freeze one coherent client certificate/key/trust snapshot.
+    ///
+    /// Use the returned fixed config for TLS and call
+    /// [`TlsClientHandshake::admit`] only after application negotiation.
+    pub fn begin_handshake(&self) -> Result<TlsClientHandshake, TlsMaterialError> {
+        let snapshot = self.controller.snapshot()?;
+        let config = fixed_client_config(
+            &snapshot,
+            self.policy.clone(),
+            self.compat_mode,
+            self.allow_unconstrained_peer_policy,
+        )?;
+        Ok(TlsClientHandshake::new(
+            Arc::new(config),
+            self.controller.clone(),
+            snapshot,
+        ))
+    }
+
+    /// Run TLS plus application negotiation with bounded epoch-change retries.
+    ///
+    /// `operation` must return only after both TLS and the application protocol
+    /// have completed their admission handshake. Cancellation drops the current
+    /// immutable attempt and does not publish or retain partial state.
+    pub async fn run_handshake<T, E, F, Fut>(
+        &self,
+        mut operation: F,
+    ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
+    where
+        F: FnMut(TlsClientHandshake) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let _permit = self
+            .controller
+            .acquire_handshake()
+            .await
+            .map_err(TlsHandshakeRunError::Material)?;
+        for retry in 0..=MAX_TLS_HANDSHAKE_EPOCH_RETRIES {
+            let handshake = self
+                .begin_handshake()
+                .map_err(TlsHandshakeRunError::Material)?;
+            let value = match operation(handshake.clone()).await {
+                Ok(value) => value,
+                Err(error) => match handshake.admit() {
+                    Err(TlsMaterialError::EpochChanged)
+                        if retry < MAX_TLS_HANDSHAKE_EPOCH_RETRIES =>
+                    {
+                        continue;
+                    }
+                    Err(TlsMaterialError::EpochChanged) => {
+                        return Err(TlsHandshakeRunError::Material(
+                            TlsMaterialError::EpochRetryLimit,
+                        ));
+                    }
+                    Err(material_error) => {
+                        return Err(TlsHandshakeRunError::Material(material_error));
+                    }
+                    Ok(_) => return Err(TlsHandshakeRunError::Operation(error)),
+                },
+            };
+            match handshake.admit() {
+                Ok(admission) => return Ok(TlsHandshakeOutcome { value, admission }),
+                Err(TlsMaterialError::EpochChanged) if retry < MAX_TLS_HANDSHAKE_EPOCH_RETRIES => {}
+                Err(TlsMaterialError::EpochChanged) => {
+                    return Err(TlsHandshakeRunError::Material(
+                        TlsMaterialError::EpochRetryLimit,
+                    ));
+                }
+                Err(error) => return Err(TlsHandshakeRunError::Material(error)),
+            }
+        }
+        Err(TlsHandshakeRunError::Material(
+            TlsMaterialError::EpochRetryLimit,
+        ))
     }
 }
 
@@ -396,12 +493,93 @@ impl fmt::Debug for AuthenticatedClientConfig {
 #[derive(Clone)]
 pub struct AuthenticatedServerConfig {
     config: Arc<rustls::ServerConfig>,
+    controller: TlsMaterialController,
+    policy: PeerPolicy,
+    compat_mode: bool,
+    allow_unconstrained_peer_policy: bool,
 }
 
 impl AuthenticatedServerConfig {
     /// Clone the shared rustls configuration for a connection or acceptor.
     pub fn rustls_config(&self) -> Arc<rustls::ServerConfig> {
         Arc::clone(&self.config)
+    }
+
+    /// Current coherent material-controller status.
+    pub fn material_status(&self) -> TlsMaterialStatus {
+        self.controller.status()
+    }
+
+    /// Freeze one coherent server certificate/key/trust snapshot.
+    ///
+    /// Use the returned fixed config for TLS and call
+    /// [`TlsServerHandshake::admit`] only after application negotiation.
+    pub fn begin_handshake(&self) -> Result<TlsServerHandshake, TlsMaterialError> {
+        let snapshot = self.controller.snapshot()?;
+        let config = fixed_server_config(
+            &snapshot,
+            self.policy.clone(),
+            self.compat_mode,
+            self.allow_unconstrained_peer_policy,
+        )?;
+        Ok(TlsServerHandshake::new(
+            Arc::new(config),
+            self.controller.clone(),
+            snapshot,
+        ))
+    }
+
+    /// Run TLS plus application negotiation with bounded epoch-change retries.
+    pub async fn run_handshake<T, E, F, Fut>(
+        &self,
+        mut operation: F,
+    ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
+    where
+        F: FnMut(TlsServerHandshake) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let _permit = self
+            .controller
+            .acquire_handshake()
+            .await
+            .map_err(TlsHandshakeRunError::Material)?;
+        for retry in 0..=MAX_TLS_HANDSHAKE_EPOCH_RETRIES {
+            let handshake = self
+                .begin_handshake()
+                .map_err(TlsHandshakeRunError::Material)?;
+            let value = match operation(handshake.clone()).await {
+                Ok(value) => value,
+                Err(error) => match handshake.admit() {
+                    Err(TlsMaterialError::EpochChanged)
+                        if retry < MAX_TLS_HANDSHAKE_EPOCH_RETRIES =>
+                    {
+                        continue;
+                    }
+                    Err(TlsMaterialError::EpochChanged) => {
+                        return Err(TlsHandshakeRunError::Material(
+                            TlsMaterialError::EpochRetryLimit,
+                        ));
+                    }
+                    Err(material_error) => {
+                        return Err(TlsHandshakeRunError::Material(material_error));
+                    }
+                    Ok(_) => return Err(TlsHandshakeRunError::Operation(error)),
+                },
+            };
+            match handshake.admit() {
+                Ok(admission) => return Ok(TlsHandshakeOutcome { value, admission }),
+                Err(TlsMaterialError::EpochChanged) if retry < MAX_TLS_HANDSHAKE_EPOCH_RETRIES => {}
+                Err(TlsMaterialError::EpochChanged) => {
+                    return Err(TlsHandshakeRunError::Material(
+                        TlsMaterialError::EpochRetryLimit,
+                    ));
+                }
+                Err(error) => return Err(TlsHandshakeRunError::Material(error)),
+            }
+        }
+        Err(TlsHandshakeRunError::Material(
+            TlsMaterialError::EpochRetryLimit,
+        ))
     }
 }
 
@@ -483,6 +661,8 @@ pub fn peer_spiffe_id_from_server_connection(
 
 pub struct TlsConfigBuilder {
     state_rx: watch::Receiver<Option<IdentityState>>,
+    material_controller: Option<TlsMaterialController>,
+    local_spiffe_id: Option<SpiffeId>,
     policy: PeerPolicy,
     compat_mode: bool,
     allow_unconstrained_peer_policy: bool,
@@ -492,10 +672,30 @@ impl TlsConfigBuilder {
     pub fn new(state_rx: watch::Receiver<Option<IdentityState>>) -> Self {
         Self {
             state_rx,
+            material_controller: None,
+            local_spiffe_id: None,
             policy: PeerPolicy::default(),
             compat_mode: false,
             allow_unconstrained_peer_policy: false,
         }
+    }
+
+    /// Build client/server configs from one already shared material controller.
+    pub fn from_material_controller(controller: TlsMaterialController) -> Self {
+        Self {
+            state_rx: controller.source_receiver(),
+            material_controller: Some(controller),
+            local_spiffe_id: None,
+            policy: PeerPolicy::default(),
+            compat_mode: false,
+            allow_unconstrained_peer_policy: false,
+        }
+    }
+
+    /// Pin the local SPIFFE identity instead of pinning the first valid update.
+    pub fn with_local_spiffe_id(mut self, local_spiffe_id: SpiffeId) -> Self {
+        self.local_spiffe_id = Some(local_spiffe_id);
+        self
     }
 
     pub fn with_policy(mut self, policy: PeerPolicy) -> Self {
@@ -520,6 +720,11 @@ impl TlsConfigBuilder {
     }
 
     pub fn build_client_config(self) -> Result<rustls::ClientConfig, rustls::Error> {
+        self.validate_raw_config_material_settings()?;
+        self.build_reloadable_client_config()
+    }
+
+    fn build_reloadable_client_config(self) -> Result<rustls::ClientConfig, rustls::Error> {
         self.validate_peer_policy()?;
 
         static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
@@ -546,6 +751,8 @@ impl TlsConfigBuilder {
             .with_client_cert_resolver(resolver);
 
         client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        client_config.resumption = rustls::client::Resumption::disabled();
+        client_config.enable_early_data = false;
 
         Ok(client_config)
     }
@@ -555,13 +762,34 @@ impl TlsConfigBuilder {
     pub fn build_authenticated_client_config(
         self,
     ) -> Result<AuthenticatedClientConfig, rustls::Error> {
-        let config = self.build_client_config()?;
+        self.validate_material_controller_configuration()?;
+        let controller = self.material_controller.clone().unwrap_or_else(|| {
+            match self.local_spiffe_id.clone() {
+                Some(local_spiffe_id) => {
+                    TlsMaterialController::new_pinned(self.state_rx.clone(), local_spiffe_id)
+                }
+                None => TlsMaterialController::new(self.state_rx.clone()),
+            }
+        });
+        let policy = self.policy.clone();
+        let compat_mode = self.compat_mode;
+        let allow_unconstrained_peer_policy = self.allow_unconstrained_peer_policy;
+        let config = self.build_reloadable_client_config()?;
         Ok(AuthenticatedClientConfig {
             config: Arc::new(config),
+            controller,
+            policy,
+            compat_mode,
+            allow_unconstrained_peer_policy,
         })
     }
 
     pub fn build_server_config(self) -> Result<rustls::ServerConfig, rustls::Error> {
+        self.validate_raw_config_material_settings()?;
+        self.build_reloadable_server_config()
+    }
+
+    fn build_reloadable_server_config(self) -> Result<rustls::ServerConfig, rustls::Error> {
         self.validate_peer_policy()?;
 
         static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
@@ -581,10 +809,12 @@ impl TlsConfigBuilder {
             state_rx: self.state_rx,
         });
 
-        let server_config = rustls::ServerConfig::builder_with_provider(provider)
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(protocol_versions(self.compat_mode))?
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(resolver);
+
+        disable_server_resumption(&mut server_config);
 
         Ok(server_config)
     }
@@ -594,9 +824,25 @@ impl TlsConfigBuilder {
     pub fn build_authenticated_server_config(
         self,
     ) -> Result<AuthenticatedServerConfig, rustls::Error> {
-        let config = self.build_server_config()?;
+        self.validate_material_controller_configuration()?;
+        let controller = self.material_controller.clone().unwrap_or_else(|| {
+            match self.local_spiffe_id.clone() {
+                Some(local_spiffe_id) => {
+                    TlsMaterialController::new_pinned(self.state_rx.clone(), local_spiffe_id)
+                }
+                None => TlsMaterialController::new(self.state_rx.clone()),
+            }
+        });
+        let policy = self.policy.clone();
+        let compat_mode = self.compat_mode;
+        let allow_unconstrained_peer_policy = self.allow_unconstrained_peer_policy;
+        let config = self.build_reloadable_server_config()?;
         Ok(AuthenticatedServerConfig {
             config: Arc::new(config),
+            controller,
+            policy,
+            compat_mode,
+            allow_unconstrained_peer_policy,
         })
     }
 
@@ -609,6 +855,89 @@ impl TlsConfigBuilder {
         }
 
         Ok(())
+    }
+
+    fn validate_material_controller_configuration(&self) -> Result<(), rustls::Error> {
+        if self.material_controller.is_some() && self.local_spiffe_id.is_some() {
+            return Err(rustls::Error::General(
+                "a shared TLS material controller already owns local identity pinning".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_raw_config_material_settings(&self) -> Result<(), rustls::Error> {
+        if self.material_controller.is_some() || self.local_spiffe_id.is_some() {
+            return Err(rustls::Error::General(
+                RAW_CONFIG_MATERIAL_SETTINGS_ERROR.to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn fixed_client_config(
+    snapshot: &material::TlsMaterialSnapshot,
+    policy: PeerPolicy,
+    compat_mode: bool,
+    allow_unconstrained_peer_policy: bool,
+) -> Result<rustls::ClientConfig, TlsMaterialError> {
+    let (_state_tx, state_rx) = watch::channel(Some(snapshot.state.as_ref().clone()));
+    let mut builder = TlsConfigBuilder::new(state_rx)
+        .with_policy(policy)
+        .with_compat_mode(compat_mode);
+    if allow_unconstrained_peer_policy {
+        builder = builder.allow_any_trusted_peer();
+    }
+    builder
+        .build_client_config()
+        .map_err(|_| TlsMaterialError::Configuration)
+}
+
+fn fixed_server_config(
+    snapshot: &material::TlsMaterialSnapshot,
+    policy: PeerPolicy,
+    compat_mode: bool,
+    allow_unconstrained_peer_policy: bool,
+) -> Result<rustls::ServerConfig, TlsMaterialError> {
+    let (_state_tx, state_rx) = watch::channel(Some(snapshot.state.as_ref().clone()));
+    let mut builder = TlsConfigBuilder::new(state_rx)
+        .with_policy(policy)
+        .with_compat_mode(compat_mode);
+    if allow_unconstrained_peer_policy {
+        builder = builder.allow_any_trusted_peer();
+    }
+    builder
+        .build_server_config()
+        .map_err(|_| TlsMaterialError::Configuration)
+}
+
+fn disable_server_resumption(config: &mut rustls::ServerConfig) {
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.ticketer = Arc::new(DisabledSessionTickets);
+    config.send_tls13_tickets = 0;
+    config.max_early_data_size = 0;
+    config.send_half_rtt_data = false;
+}
+
+#[derive(Debug)]
+struct DisabledSessionTickets;
+
+impl rustls::server::ProducesTickets for DisabledSessionTickets {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    fn lifetime(&self) -> u32 {
+        0
+    }
+
+    fn encrypt(&self, _plain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn decrypt(&self, _cipher: &[u8]) -> Option<Vec<u8>> {
+        None
     }
 }
 
@@ -703,6 +1032,22 @@ mod policy_tests {
         panic!("TLS handshake did not complete within the bounded exchange");
     }
 
+    fn assert_raw_material_setting_rejected<T>(result: Result<T, rustls::Error>) {
+        let error = match result {
+            Ok(_) => panic!("raw config builder accepted a material-controller setting"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            rustls::Error::General(message) if message == RAW_CONFIG_MATERIAL_SETTINGS_ERROR
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!("unexpected error: {RAW_CONFIG_MATERIAL_SETTINGS_ERROR}")
+        );
+        assert!(!format!("{error:?}").contains("spiffe://"));
+    }
+
     #[test]
     fn unconstrained_policy_authorizes_any_peer() {
         // Pins (and documents) the allow-all behavior of an unconfigured policy.
@@ -778,6 +1123,45 @@ mod policy_tests {
     }
 
     #[test]
+    fn raw_builders_reject_explicit_local_identity_pinning() {
+        let (_tx, rx) = watch::channel(None);
+        let local_spiffe_id = SpiffeId::new(
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/default/nf/smf/instance/local-0",
+        )
+        .unwrap();
+
+        assert_raw_material_setting_rejected(
+            TlsConfigBuilder::new(rx.clone())
+                .with_local_spiffe_id(local_spiffe_id.clone())
+                .allow_any_trusted_peer()
+                .build_client_config(),
+        );
+        assert_raw_material_setting_rejected(
+            TlsConfigBuilder::new(rx)
+                .with_local_spiffe_id(local_spiffe_id)
+                .allow_any_trusted_peer()
+                .build_server_config(),
+        );
+    }
+
+    #[test]
+    fn raw_builders_reject_shared_material_controller() {
+        let (_tx, rx) = watch::channel(None);
+        let controller = TlsMaterialController::new(rx);
+
+        assert_raw_material_setting_rejected(
+            TlsConfigBuilder::from_material_controller(controller.clone())
+                .allow_any_trusted_peer()
+                .build_client_config(),
+        );
+        assert_raw_material_setting_rejected(
+            TlsConfigBuilder::from_material_controller(controller)
+                .allow_any_trusted_peer()
+                .build_server_config(),
+        );
+    }
+
+    #[test]
     fn authenticated_config_wrappers_are_cloneable_and_redacted() {
         let (_client_tx, client_rx) = watch::channel(None);
         let client = TlsConfigBuilder::new(client_rx)
@@ -798,8 +1182,15 @@ mod policy_tests {
             format!("{server:?}"),
             "AuthenticatedServerConfig([redacted])"
         );
-        assert!(Arc::strong_count(&client.clone().rustls_config()) >= 2);
-        assert!(Arc::strong_count(&server.clone().rustls_config()) >= 2);
+        let client_rustls = client.clone().rustls_config();
+        let server_rustls = server.clone().rustls_config();
+        assert!(Arc::strong_count(&client_rustls) >= 2);
+        assert!(Arc::strong_count(&server_rustls) >= 2);
+        assert!(!client_rustls.enable_early_data);
+        assert!(!server_rustls.ticketer.enabled());
+        assert_eq!(server_rustls.send_tls13_tickets, 0);
+        assert_eq!(server_rustls.max_early_data_size, 0);
+        assert!(!server_rustls.send_half_rtt_data);
     }
 
     #[test]
