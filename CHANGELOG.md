@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-tls`: a shared `TlsMaterialController` and immutable per-handshake
+  client/server snapshots. Accepted same-identity rotations and rollbacks
+  advance an opaque epoch; invalid, oversized, expired, wrong-key/chain/trust,
+  or identity-changing candidates retain only the unexpired prior snapshot.
+  Bounded `run_handshake` helpers retry an epoch change through TLS plus
+  application negotiation, publish exact admitted epoch/leaf-expiry evidence,
+  redact operation errors, cap concurrent attempts, and keep tickets,
+  resumption, early data, and 0-RTT disabled. Existing `rustls_config()` and
+  identity-source event APIs remain source compatible.
 - `opc-identity`: a production `ProjectedSvidSource` for Kubernetes projected
   Secrets. It resolves one immutable `..data` target, detects and boundedly
   retries every mid-read generation switch, enforces exact file/total/
