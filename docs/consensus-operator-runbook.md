@@ -299,11 +299,13 @@ session-net.
    `request_reauthentication()` on the controls for both outbound peers and
    listeners. The generation is monotonic and process-local; never set it back.
 5. During the deterministic jitter/drain interval, verify no new work enters
-   old connections, in-flight operations finish once within the hard deadline,
-   replacements complete full mutual TLS/application negotiation, drain
-   overruns stay zero, and durable readiness remains fresh. Investigate closed
-   metric outcomes only; do not add peer identities or certificate text as
-   labels.
+   old connections, transport waits and connection slots end within the hard
+   deadline, replacements complete full mutual TLS/application negotiation,
+   drain overruns stay zero, and durable readiness remains fresh. An admitted
+   supervised mutation may finish after transport closure; treat its outcome as
+   ambiguous, never replay it automatically, and use authoritative readback or
+   its existing idempotency/fencing contract. Investigate closed metric outcomes
+   only; do not add peer identities or certificate text as labels.
 6. Prove every directed peer path has established current-material
    authentication. A listener bind, material publication, zero draining gauge,
    or cached capability alone is not proof. Exercise the fresh linearizable

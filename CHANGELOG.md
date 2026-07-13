@@ -121,18 +121,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   direct and consensus connection now applies one finite
   `ConnectionLifecyclePolicy`, retaining exact admitted material epoch,
   handshake time, and local/peer leaf-expiry evidence. Clients and servers stop
-  new admission at soft retirement, bound already admitted work by the hard
-  deadline, and repeat mutual TLS plus identity, nonce, ALPN, version, and exact
-  profile checks on replacements. `SessionReauthenticationControl` provides a
+  new admission at soft retirement, bound the transport wait and connection
+  slot by the hard deadline, and repeat mutual TLS plus identity, nonce, ALPN,
+  version, and exact profile checks on replacements.
+  `SessionReauthenticationControl` provides a
   cooperative CNF trigger with deterministic directed-peer jitter and bounded
   reconnect backoff. Legacy watches resume from the exact delivered successor;
   mutations retry only after the complete fixed `ConnectionRetiring`
   no-dispatch proof. Direct v5 wire-schema revision advances from 5 to 6 and
   requires a coordinated drained full-profile upgrade; the consensus-only
   profile remains transport/wire revision 2. Fixed lifecycle/reconnect metrics
-  use closed redaction-safe labels. Payload encryption, persisted records,
-  Openraft state, consensus payloads, HKMS/provider placement, and key material
-  are unchanged. #164/#143 retain fleet trust-removal, revocation,
+  use closed redaction-safe labels. A supervised backend mutation may finish
+  after transport retirement; that path remains typed ambiguous, is never
+  automatically retried, and requires authoritative readback or its existing
+  operation-bound idempotency/fencing contract. Payload encryption, persisted
+  records, Openraft state, consensus payloads, HKMS/provider placement, and key
+  material are unchanged. #164/#143 retain fleet trust-removal, revocation,
   reconnect-storm, resource, and soak qualification.
 - **BREAKING — `opc-proto-diameter`:** trusted dictionary decode now resolves
   exactly one command by application id, command code, and request/answer role

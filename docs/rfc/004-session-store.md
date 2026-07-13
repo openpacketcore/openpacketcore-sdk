@@ -1299,13 +1299,17 @@ jitter no greater than the configured bound.
 
 After soft retirement the client MUST NOT assign a new operation to the
 connection and the server MUST NOT read or dispatch another request. An
-operation admitted before retirement MAY complete once within its existing
-operation deadline, but transport ownership MUST close it by the lifecycle hard
-deadline and MUST release every connection/task slot. A replacement MUST repeat
-DNS/route resolution, mutual TLS, live certificate identity, nonce/challenge,
-ALPN, version, and exact contract-profile checks. TLS resumption, cached peer
-authority, plaintext fallback, and task-abort reauthentication MUST NOT replace
-that handshake.
+operation admitted before retirement MAY return once within its existing
+operation deadline, but transport ownership MUST stop waiting by the lifecycle
+hard deadline and MUST release every connection/task slot. Dropping the backend
+future requests cancellation but MUST NOT be interpreted as rollback: bounded
+supervised mutation work MAY finish later. Such an outcome MUST remain typed
+ambiguous, MUST NOT be automatically replayed, and requires authoritative
+readback or the operation's existing idempotency/fencing contract. A replacement
+MUST repeat DNS/route resolution, mutual TLS, live certificate identity,
+nonce/challenge, ALPN, version, and exact contract-profile checks. TLS
+resumption, cached peer authority, plaintext fallback, and task-abort
+reauthentication MUST NOT replace that handshake.
 
 The legacy direct profile MAY automatically retry a mutation after retirement
 only when it has decoded the complete fixed `ConnectionRetiring` response,
@@ -1450,9 +1454,11 @@ and trust bundles without interrupting service, while still enforcing
 revocation and a documented maximum authentication age on long-lived
 connections. #161 atomic reload, #162 coherent material epochs, and #163 finite
 connection retirement/reauthentication are implemented. On epoch change or an
-explicit orchestration request, both sides MUST stop new admission, drain only
-already admitted work within the finite hard deadline, and repeat the full
-mutual-TLS and application handshake on replacements.
+explicit orchestration request, both sides MUST stop new admission, end the
+transport wait and release connection slots within the finite hard deadline,
+and repeat the full mutual-TLS and application handshake on replacements.
+Already-admitted supervised mutations retain the ambiguity/readback contract
+above if their bounded backend work finishes later.
 
 An operator MUST publish overlapping old/new trust before new leaves, preserve
 the exact stable SPIFFE and consensus scope, trigger reauthentication, and
