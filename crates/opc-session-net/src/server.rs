@@ -2424,7 +2424,9 @@ mod tests {
         let timestamp = opc_types::Timestamp::now_utc();
         ReplicationEntry {
             sequence,
-            tx_id: format!("log-{sequence}"),
+            tx_id: format!("log-{sequence}")
+                .try_into()
+                .expect("valid transaction ID"),
             op: ReplicationOp::CompareAndSet {
                 key,
                 expected_generation: None,
@@ -2987,7 +2989,9 @@ mod tests {
         }
         let response = Response::WatchEntry(Ok(ReplicationEntry {
             sequence: 1,
-            tx_id: "malformed-watch-tree".to_string(),
+            tx_id: "malformed-watch-tree"
+                .try_into()
+                .expect("valid transaction ID"),
             op: operation,
             timestamp: opc_types::Timestamp::now_utc(),
         }));
@@ -3131,7 +3135,9 @@ mod tests {
         fn wide_entry(sequence: u64) -> ReplicationEntry {
             ReplicationEntry {
                 sequence,
-                tx_id: format!("wide-{sequence}"),
+                tx_id: format!("wide-{sequence}")
+                    .try_into()
+                    .expect("valid transaction ID"),
                 op: ReplicationOp::Batch {
                     ops: (0..100_000)
                         .map(|_| ReplicationOp::Batch { ops: Vec::new() })

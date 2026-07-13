@@ -23,9 +23,11 @@ Optional root re-exports are controlled by Cargo features:
 - `testkit` -> `opc-sbi?/testkit`
 
 The `prelude` module gathers commonly used types from the enabled features.
-With `session`, this includes the validated `StableId` type and its exact
-1..=64-byte production limits; callers cannot bypass the session-store
-admission contract through the facade.
+With `session`, this includes the validated `StableId` and `ReplicationTxId`
+types and their exact 1..=64-byte and 1..=128-byte production limits; callers
+cannot bypass the session-store admission contract through the facade. New
+replication coordinator IDs use the canonical fixed 32-byte lowercase
+hexadecimal representation while valid legacy IDs remain exact.
 
 Example:
 

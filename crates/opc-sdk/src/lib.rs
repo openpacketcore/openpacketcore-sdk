@@ -188,10 +188,11 @@ pub mod prelude {
         QuorumTopologyError, QuorumTopologyMode, QuorumTopologySummary, ReplicaBackingIdentity,
         ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaReadinessFailure,
         ReplicaReadinessObservation, ReplicaReadinessOutcome, ReplicaTlsIdentity,
-        ReplicaTopologyField, ReplicaTopologyFieldError, SessionStoreBackend,
-        ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS, REPLICA_IDENTITY_MAX_BYTES,
-        REPLICA_ID_MAX_BYTES, STABLE_ID_CANONICAL_SUBJECT_MAX_BYTES, STABLE_ID_HMAC_SHA256_BYTES,
-        STABLE_ID_MAX_BYTES, STABLE_ID_MIN_BYTES, STABLE_ID_PRIVACY_KEY_MAX_BYTES,
-        STABLE_ID_PRIVACY_KEY_MIN_BYTES,
+        ReplicaTopologyField, ReplicaTopologyFieldError, ReplicationTxId, ReplicationTxIdError,
+        SessionStoreBackend, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
+        REPLICATION_TX_ID_CANONICAL_BYTES, REPLICATION_TX_ID_MAX_BYTES,
+        REPLICATION_TX_ID_MIN_BYTES, REPLICA_IDENTITY_MAX_BYTES, REPLICA_ID_MAX_BYTES,
+        STABLE_ID_CANONICAL_SUBJECT_MAX_BYTES, STABLE_ID_HMAC_SHA256_BYTES, STABLE_ID_MAX_BYTES,
+        STABLE_ID_MIN_BYTES, STABLE_ID_PRIVACY_KEY_MAX_BYTES, STABLE_ID_PRIVACY_KEY_MIN_BYTES,
     };
 }

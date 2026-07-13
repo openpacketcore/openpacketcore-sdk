@@ -10,6 +10,7 @@ use super::ops::{
 use crate::{
     backend::{
         next_replication_sequence, validate_replication_prefix, ReplicationEntry, ReplicationOp,
+        ReplicationTxId, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
     },
     capability::BackendCapabilities,
     error::StoreError,
@@ -28,6 +29,34 @@ pub(crate) fn stored_replication_sequence(sequence: i64) -> Result<u64, StoreErr
         return Err(StoreError::InvalidReplicationSequence);
     }
     Ok(sequence)
+}
+
+pub(crate) fn hydrate_replication_entry(
+    stored_sequence: i64,
+    stored_tx_id: Option<String>,
+    encoded: &str,
+) -> Result<ReplicationEntry, StoreError> {
+    let stored_sequence = stored_replication_sequence(stored_sequence)?;
+    let stored_tx_id: ReplicationTxId = stored_tx_id
+        .ok_or_else(|| {
+            StoreError::Serialization("persisted replication transaction ID is invalid".into())
+        })?
+        .try_into()
+        .map_err(|_| {
+            StoreError::Serialization("persisted replication transaction ID is invalid".into())
+        })?;
+    let entry: ReplicationEntry = serde_json::from_str(encoded)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let entry = entry.into_validated()?;
+    if entry.sequence != stored_sequence {
+        return Err(StoreError::InvalidReplicationSequence);
+    }
+    if entry.tx_id != stored_tx_id {
+        return Err(StoreError::Serialization(
+            "persisted replication transaction ID is inconsistent".into(),
+        ));
+    }
+    Ok(entry)
 }
 
 pub(crate) fn apply_replicated_op_sync(
@@ -368,18 +397,30 @@ pub(crate) fn replicate_entry_sync(
 
     if entry.sequence <= max_seq {
         // Check for duplicate delivery and idempotency
-        let existing_entry_json: Option<String> = tx
+        let existing: Option<(Option<String>, String)> = tx
             .query_row(
-                "SELECT entry_json FROM session_replication_log WHERE sequence = ?1",
-                params![sqlite_sequence],
-                |row| row.get(0),
+                r#"
+                SELECT CASE
+                           WHEN typeof(tx_id) = 'text'
+                            AND length(CAST(tx_id AS BLOB)) BETWEEN ?2 AND ?3
+                           THEN tx_id
+                       END,
+                       entry_json
+                FROM session_replication_log
+                WHERE sequence = ?1
+                "#,
+                params![
+                    sqlite_sequence,
+                    REPLICATION_TX_ID_MIN_BYTES,
+                    REPLICATION_TX_ID_MAX_BYTES
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        if let Some(existing_entry_json) = existing_entry_json {
-            let existing: ReplicationEntry = serde_json::from_str(&existing_entry_json)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let existing = existing.into_validated()?;
+        if let Some((stored_tx_id, existing_entry_json)) = existing {
+            let existing =
+                hydrate_replication_entry(sqlite_sequence, stored_tx_id, &existing_entry_json)?;
             if existing == *entry {
                 return Ok(false); // Already applied, do not notify watchers again
             }
@@ -405,7 +446,12 @@ pub(crate) fn replicate_entry_sync(
 
     tx.execute(
         "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) VALUES (?1, ?2, ?3, ?4)",
-        params![sqlite_sequence, entry.tx_id, entry_json, timestamp_str],
+        params![
+            sqlite_sequence,
+            entry.tx_id.as_str(),
+            entry_json,
+            timestamp_str
+        ],
     )
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
@@ -456,7 +502,7 @@ pub(crate) fn rebuild_replication_state_sync(
             "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) VALUES (?1, ?2, ?3, ?4)",
             params![
                 sqlite_replication_sequence(entry.sequence)?,
-                entry.tx_id,
+                entry.tx_id.as_str(),
                 entry_json,
                 timestamp_str
             ],

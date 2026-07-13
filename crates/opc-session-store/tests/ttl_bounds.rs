@@ -492,7 +492,7 @@ fn replication_entry(
 ) -> ReplicationEntry {
     ReplicationEntry {
         sequence,
-        tx_id: tx_id.to_owned(),
+        tx_id: tx_id.try_into().expect("valid transaction ID"),
         op,
         timestamp,
     }

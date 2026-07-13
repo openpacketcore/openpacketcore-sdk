@@ -439,8 +439,9 @@ campaigns.
   transaction IDs. A migration must be decoder-first: while writers are
   quiesced, install or run a reviewed reader that can decode the legacy retained
   representation before it rewrites or replaces any data; apply the
-  product-aware semantic policy from #167 (stable IDs) and #168 (durable
-  transaction IDs); verify that the strict revision-2 decoder accepts the
+  product-aware semantic policy from #167 (stable IDs) and the
+  [#168 durable transaction-ID runbook](../../docs/session-store-replication-tx-id-migration.md);
+  verify that the strict revision-2 decoder accepts the
   result; only then start revision-2 writers. Never truncate, hash, or rename a
   durable key or idempotency identity as an implicit transport fix.
 - Once a live or replayable `OPCH` envelope has been written, a v3 rollback
@@ -535,18 +536,19 @@ campaigns.
   #133; recovery remains #128/#129. #134's fixed-width v4 boundary and #135's
   model-level decode boundary are implemented but do not provide any of those
   distributed properties.
-- #159 contains stable IDs and replication transaction IDs at the wire boundary
-  only. The production model/persistence stable-ID contract, privacy policy,
-  audit, and migration remain #167. A canonical durable `ReplicationEntry`
-  transaction-ID type plus persistence migration remains #168 and must be
-  coordinated with #128/#143. #177 removes `opc-persist`'s private config TCP
+- #159 contains stable IDs and replication transaction IDs at the wire
+  boundary. #167 supplies the production stable-ID contract. #168 now makes
+  the 1-through-128-byte transaction-ID invariant structural across the model,
+  persistence, recovery, and wire DTO; new coordinator writes use fixed
+  32-byte lowercase hexadecimal IDs while valid legacy strings remain exact.
+  Its version-3 audit and coordinated migration must be used with #128/#143.
+  #177 removes `opc-persist`'s private config TCP
   path and composes config consensus through these shared peer/handler ports;
   it does not define a second deadline or credential lifecycle.
 
 ## Roadmap
 
-- Close #128/#129, #145, #148, and the model/persistence work in
-  #167/#168/#171; and add distributed
+- Close #145, #148, and #171; and add distributed
   failure and soak evidence. A renewed SVID on a subsequent new call/full
   handshake and wrong-scope rejection now have scoped real-mTLS qualification;
   seamless continuity/connection retirement, complete trust-bundle,

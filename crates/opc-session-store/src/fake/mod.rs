@@ -22,8 +22,8 @@ use crate::{
     backend::{
         next_replication_sequence, validate_replication_page_owned, validate_replication_prefix,
         validate_replication_prefix_owned, validate_session_ops_ttls, BackendInstanceIdentity,
-        CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
-        SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, ReplicationTxId,
+        SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -669,9 +669,11 @@ impl FakeSessionBackend {
         };
 
         state.last_replication_sequence = sequence;
+        let mut request_bytes = [0_u8; 16];
+        request_bytes[8..].copy_from_slice(&sequence.to_be_bytes());
         let entry = ReplicationEntry {
             sequence,
-            tx_id: format!("fake-direct-{sequence}"),
+            tx_id: ReplicationTxId::from_request_bytes(request_bytes),
             op,
             timestamp,
         };

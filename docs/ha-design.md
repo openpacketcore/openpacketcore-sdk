@@ -123,8 +123,10 @@ the [recovery runbook](session-store-legacy-recovery.md). #133 provides bounded
 applied-state restore with snapshot-bound cursors. Watch and expiry hardening
 remain #145/#148, and network/resource/rotation qualification remains #143 and
 the #161 -> #162 -> #163 -> #164 credential chain under umbrella #158. Stable
-ID bounds are implemented under #167. Durable transaction IDs and log-range
-cursors remain #168/#171.
+ID bounds are implemented under #167. #168 adds the bounded durable
+transaction-ID type, canonical coordinator mint, exact legacy preservation,
+SQLite/snapshot/recovery validation, and version-3 migration audit. Log-range
+cursors remain #171.
 
 ### Configured topology admission
 
@@ -477,7 +479,7 @@ The revision-1 to revision-2 profile transition uses the same coordinated
 stop/upgrade/start and verification; it is not a same-ALPN rolling upgrade.
 #167 does not rewrite compliant persisted stable-ID bytes. Its `StableId`
 newtype and new-database SQLite checks enforce 1..=64 bytes throughout the
-model/store/network stack; existing files and snapshots require the version-2
+model/store/network stack; existing files and snapshots require the version-3
 count-only audit. Strict revision-2 transport also rejects empty/over-128-byte
 UTF-8 transaction IDs. Before startup, quiesce writers, audit every
 record/log/snapshot/restore/replay source, and perform a decoder-first
@@ -652,7 +654,8 @@ implement a second quorum algorithm.
   fixed redaction-safe fallbacks, authenticated slow-reader reaping, connection
   slot recovery, ambiguous mutation outcomes, and deterministic shutdown.
   Passing those tests demonstrates the #159 transport boundary only; it does
-  not close #167/#168 retained-identity work, the complete seamless credential
-  lifecycle, or #143 production qualification. #177 reuses this shared
+  not close #171 log-range cursor work, the complete seamless credential
+  lifecycle, or #143 production qualification. #167/#168 separately supply
+  the structural retained-identity and migration contracts. #177 reuses this shared
   transport boundary for config consensus instead of maintaining a separate
   config TCP deadline or credential path.

@@ -80,7 +80,9 @@ where
     let err = backend
         .replicate_entry(ReplicationEntry {
             sequence,
-            tx_id: format!("replicated-cas-{sequence}"),
+            tx_id: format!("replicated-cas-{sequence}")
+                .try_into()
+                .expect("valid transaction ID"),
             op: ReplicationOp::CompareAndSet {
                 key: key.clone(),
                 expected_generation: None,

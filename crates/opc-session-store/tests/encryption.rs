@@ -87,7 +87,7 @@ fn test_replication_entry(sequence: u64, tx_id: &str) -> ReplicationEntry {
     let key = test_key();
     ReplicationEntry {
         sequence,
-        tx_id: tx_id.to_string(),
+        tx_id: tx_id.try_into().expect("valid transaction ID"),
         op: ReplicationOp::CompareAndSet {
             key: key.clone(),
             expected_generation: None,
@@ -113,7 +113,7 @@ fn crypto_then_invalid_ttl_entry(sequence: u64, tx_id: &str) -> ReplicationEntry
     let timestamp = Timestamp::now_utc();
     ReplicationEntry {
         sequence,
-        tx_id: tx_id.to_owned(),
+        tx_id: tx_id.try_into().expect("valid transaction ID"),
         timestamp,
         op: ReplicationOp::Batch {
             ops: vec![
@@ -156,7 +156,9 @@ fn nested_replication_entry(sequence: u64, tag: &str) -> ReplicationEntry {
 
     ReplicationEntry {
         sequence,
-        tx_id: format!("{tag}-tx-{sequence}"),
+        tx_id: format!("{tag}-tx-{sequence}")
+            .try_into()
+            .expect("valid transaction ID"),
         timestamp,
         op: ReplicationOp::Batch {
             ops: vec![
@@ -208,7 +210,9 @@ fn wrap_operation_to_depth(mut op: ReplicationOp, depth: usize) -> ReplicationOp
 fn boundary_depth_entry(sequence: u64, depth: usize, tag: &str) -> ReplicationEntry {
     ReplicationEntry {
         sequence,
-        tx_id: format!("{tag}-tx"),
+        tx_id: format!("{tag}-tx")
+            .try_into()
+            .expect("valid transaction ID"),
         op: wrap_operation_to_depth(boundary_cas_op(sequence, tag), depth),
         timestamp: Timestamp::now_utc(),
     }
@@ -221,7 +225,9 @@ fn boundary_count_entry(sequence: u64, node_count: usize, tag: &str) -> Replicat
     ops.extend((1..(node_count - 1)).map(|_| ReplicationOp::Batch { ops: Vec::new() }));
     ReplicationEntry {
         sequence,
-        tx_id: format!("{tag}-tx"),
+        tx_id: format!("{tag}-tx")
+            .try_into()
+            .expect("valid transaction ID"),
         op: ReplicationOp::Batch { ops },
         timestamp: Timestamp::now_utc(),
     }
@@ -1448,7 +1454,7 @@ async fn remote_sealing_replication_log_seals_and_unseals_nested_batch_cas_recor
     backend
         .replicate_entry(ReplicationEntry {
             sequence: 2,
-            tx_id: "remote-batch-cas".to_string(),
+            tx_id: "remote-batch-cas".try_into().expect("valid transaction ID"),
             op: ReplicationOp::Batch {
                 ops: vec![ReplicationOp::CompareAndSet {
                     key: key.clone(),

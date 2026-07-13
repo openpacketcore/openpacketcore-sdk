@@ -8,7 +8,7 @@ use tempfile::NamedTempFile;
 fn entry(sequence: u64, tx_id: &str) -> ReplicationEntry {
     ReplicationEntry {
         sequence,
-        tx_id: tx_id.to_owned(),
+        tx_id: tx_id.try_into().expect("valid transaction ID"),
         op: ReplicationOp::Batch { ops: Vec::new() },
         timestamp: Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH),
     }

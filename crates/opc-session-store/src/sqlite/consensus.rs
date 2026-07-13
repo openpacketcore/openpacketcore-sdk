@@ -17,7 +17,10 @@ use opc_types::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-use crate::backend::{CompareAndSetResult, ReplicationEntry, ReplicationOp};
+use crate::backend::{
+    CompareAndSetResult, ReplicationEntry, ReplicationOp, ReplicationTxId,
+    REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
+};
 use crate::capability::BackendCapabilities;
 use crate::consensus::storage::SessionConsensusStorageError;
 use crate::consensus::types::{
@@ -1597,10 +1600,6 @@ fn payload_digest(command: &SessionConsensusCommand) -> io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn request_id_hex(request_id: SessionConsensusRequestId) -> String {
-    crate::hex::encode_lower(request_id.as_bytes())
-}
-
 fn lease_error_to_store(error: LeaseError) -> StoreError {
     match error {
         LeaseError::AlreadyHeld => StoreError::LeaseHeld,
@@ -1925,7 +1924,7 @@ fn store_replication_notification_sync(
 ) -> io::Result<ReplicationEntry> {
     let entry = ReplicationEntry {
         sequence: watch_sequence,
-        tx_id: request_id_hex(request_id),
+        tx_id: ReplicationTxId::from_request_bytes(*request_id.as_bytes()),
         op,
         timestamp: logical_time,
     };
@@ -1936,7 +1935,7 @@ fn store_replication_notification_sync(
         "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) VALUES (?1, ?2, ?3, ?4)",
         params![
             checked_positive_i64(entry.sequence)?,
-            entry.tx_id,
+            entry.tx_id.as_str(),
             serde_json::to_string(&entry).map_err(|_| invalid_data("session replication notification encoding failed"))?,
             ops::format_rfc3339_normalized(entry.timestamp),
         ],
@@ -2206,23 +2205,57 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
     }
 
     let mut stmt = conn
-        .prepare("SELECT entry_json FROM session_replication_log ORDER BY sequence ASC")
+        .prepare(
+            r#"
+            SELECT sequence,
+                   CASE
+                       WHEN typeof(tx_id) = 'text'
+                        AND length(CAST(tx_id AS BLOB)) BETWEEN ?1 AND ?2
+                       THEN tx_id
+                   END,
+                   entry_json
+            FROM session_replication_log
+            ORDER BY sequence ASC
+            "#,
+        )
         .map_err(db_error)?;
     let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
+        .query_map(
+            params![REPLICATION_TX_ID_MIN_BYTES, REPLICATION_TX_ID_MAX_BYTES],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
         .map_err(db_error)?;
     let mut expected = read_watch_cursor_invalidation_floor_sync(conn)?
         .checked_add(1)
         .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
     for row in rows {
-        let encoded = row.map_err(db_error)?;
+        let (stored_sequence, stored_tx_id, encoded) = row.map_err(db_error)?;
+        let stored_sequence = checked_u64(stored_sequence)?;
+        let stored_tx_id: ReplicationTxId = stored_tx_id
+            .ok_or_else(|| invalid_data("persisted session replication transaction ID is invalid"))?
+            .try_into()
+            .map_err(|_| invalid_data("persisted session replication transaction ID is invalid"))?;
         let entry: ReplicationEntry = serde_json::from_str(&encoded)
             .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
-        if entry.sequence != expected {
+        if stored_sequence != expected || entry.sequence != stored_sequence {
             return Err(invalid_data(
                 "persisted session replication log is not contiguous",
             ));
         }
+        if entry.tx_id != stored_tx_id {
+            return Err(invalid_data(
+                "persisted session replication transaction ID is inconsistent",
+            ));
+        }
+        entry
+            .validate()
+            .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
         validate_sealed_replication_op(&entry.op)?;
         expected = expected
             .checked_add(1)

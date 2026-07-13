@@ -21,6 +21,10 @@ evidence.
 - `ReplicationEntry::validate_sequence`, `validate_replication_prefix`,
   `validate_replication_page`, and `next_replication_sequence` define the
   checked 1-based log-position contract shared by adapters and consumers.
+- `ReplicationTxId` makes the 1-through-128-byte durable idempotency/fork
+  identity structural. New committed coordinator writes mint the fixed
+  32-byte lowercase hexadecimal consensus request ID; valid legacy strings
+  remain exact and are never normalized.
 - `ReplicationEntry::into_validated`, `validate_replication_prefix_owned`, and
   `validate_replication_page_owned` consume caller-owned values and dismantle a
   rejected operation tree iteratively, avoiding recursive-drop exposure on the
@@ -285,13 +289,15 @@ consistent snapshot in fixed 256-row pages, and applies `--max-rows` across
 that order. The two JSON budgets bound individual and cumulative replication
 entries before strict `ReplicationEntry` decoding and domain validation.
 
-Report schema version 2 contains only the requested limits, per-table scanned
+Report schema version 3 contains only the requested limits, per-table scanned
 counts, violation counts (`invalid_owner_fields`,
-`invalid_session_key_type_fields`, `invalid_stable_id_fields`, and
-`invalid_replication_entries`), and an optional bounded `incomplete_reason`.
-Relational stable-ID validation reads only SQLite type and length. It never
-emits the database path, row
-identity, tenant, owner, key type, stable ID, payload, transaction, or raw JSON.
+`invalid_session_key_type_fields`, `invalid_stable_id_fields`,
+`invalid_replication_tx_id_fields`, and `invalid_replication_entries`), and an
+optional bounded `incomplete_reason`. Relational stable-ID validation reads
+only SQLite type and length. Transaction-ID validation retrieves at most 128
+bytes and cross-checks the exact relational and encoded representations. It
+never emits the database path, row identity, tenant, owner, key type, stable
+ID, payload, transaction, or raw JSON.
 The command contract is:
 
 - `compliant` JSON on stdout and exit 0 only after the complete snapshot fits
@@ -317,6 +323,8 @@ quarantined; after upgrade, take a fresh compliant snapshot before reopening
 rollback/recovery coverage. The complete operator procedure, including
 application-owned deterministic rekey requirements and rollback, is in
 [`session-store-stable-id-migration.md`](../../docs/session-store-stable-id-migration.md).
+The durable idempotency/fork-identity procedure is in
+[`session-store-replication-tx-id-migration.md`](../../docs/session-store-replication-tx-id-migration.md).
 
 The identity audit deliberately does not read, decrypt, or classify payload
 bytes in live records or nested `ReplicationOp::CompareAndSet` log entries;
@@ -735,15 +743,18 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   does not rewrite persisted store bytes, but the strict transport rejects
   empty/over-64-byte stable IDs and empty/over-128-byte UTF-8 transaction IDs in
   retained records/logs. Before startup, use a decoder-first, product-aware
-  migration or coherent store replacement: quiesce writers, ensure the migration
-  reader can decode the legacy representation, follow the #167 stable-ID runbook
-  and #168 without
-  truncating or renaming durable identities, then verify with the strict decoder
-  before enabling revision-3 writers. Rollback likewise installs a decoder for
-  the retained target representation before old writers restart, or restores a
-  coherent checkpoint/reverse migration. #167 now supplies the production
-  stable-ID model/persistence/privacy/audit contract; #168 owns the durable canonical
-  transaction-ID type and migration coordinated with #127/#128/#143. This
+  migration or coherent store replacement: quiesce writers, ensure the
+  migration reader can decode the legacy representation, follow the #167
+  stable-ID runbook and the
+  [#168 transaction-ID runbook](../../docs/session-store-replication-tx-id-migration.md)
+  without truncating or renaming durable identities, then verify with the
+  strict decoder before enabling revision-3 writers. Rollback likewise installs
+  a decoder for the retained target representation before old writers restart,
+  or restores a coherent checkpoint/reverse migration. #167 now supplies the production
+  stable-ID model/persistence/privacy/audit contract. #168 supplies the bounded
+  durable transaction-ID type, canonical coordinator mint, exact legacy
+  preservation, SQLite/recovery checks, and version-3 audit coordinated with
+  #127/#128/#143. This
   supplies no durable authority or distributed/payload-key qualification
   (#143). Shared real-mTLS tests now qualify a renewed SVID on a subsequent new
   call/full handshake and wrong-scope rejection. They do not exercise seamless
@@ -758,8 +769,8 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
 - Complete watch handoff correctness (#145), absolute-expiry admission (#148),
-  production stable-ID and transaction-ID persistence contracts (#167/#168),
-  and persisted peer logical-RPC deadlines (#169), then complete the production
+  log-range cursors (#171), and persisted peer logical-RPC deadlines (#169),
+  then complete the production
   qualification profile. A renewed SVID on a subsequent new call/full handshake
   and wrong-scope rejection have scoped real-mTLS coverage; seamless connection
   retirement and the broader certificate/trust, revocation,

@@ -1099,6 +1099,11 @@ async fn cold_start_concurrent_mutations_share_one_gap_free_committed_sequence()
             entry.sequence,
             u64::try_from(offset + 1).expect("test index")
         );
+        assert!(entry.tx_id.is_canonical());
+        assert_eq!(
+            entry.tx_id.len(),
+            opc_session_store::REPLICATION_TX_ID_CANONICAL_BYTES
+        );
     }
     let transaction_ids = logs[0]
         .iter()
