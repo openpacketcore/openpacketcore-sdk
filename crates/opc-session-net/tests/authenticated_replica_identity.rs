@@ -11,9 +11,9 @@ use opc_session_net::protocol::{
     SESSION_NET_ALPN,
 };
 use opc_session_net::{
-    RemoteAddrResolver, RemoteReplicaBinding, RemoteSessionBackend, Request, Response,
-    SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
-    SessionReplicationManifest, SessionReplicationServer,
+    ConnectionLifecyclePolicy, RemoteAddrResolver, RemoteReplicaBinding, RemoteSessionBackend,
+    Request, Response, SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
+    SessionReauthenticationControl, SessionReplicationManifest, SessionReplicationServer,
 };
 use opc_session_store::fake::FakeSessionBackend;
 use opc_session_store::{
@@ -22,7 +22,10 @@ use opc_session_store::{
     ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity, SessionBackend, SessionKey,
     SessionKeyType, StableId, StateClass, StateType, StoredSessionRecord,
 };
-use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
+use opc_tls::{
+    AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder,
+    TlsMaterialAvailability, TlsMaterialEpoch,
+};
 use opc_types::{NetworkFunctionKind, TenantId};
 
 const SERVER_REPLICA: u16 = 2;
@@ -63,6 +66,19 @@ impl TestPki {
     }
 
     fn identity_state(&self, replica: u16) -> opc_identity::IdentityState {
+        self.identity_state_with_trust_and_validity(
+            replica,
+            &[&self.ca_cert],
+            time::Duration::days(1),
+        )
+    }
+
+    fn identity_state_with_trust_and_validity(
+        &self,
+        replica: u16,
+        trust_anchors: &[&rcgen::Certificate],
+        validity: time::Duration,
+    ) -> opc_identity::IdentityState {
         let mut params = rcgen::CertificateParams::default();
         params
             .distinguished_name
@@ -72,7 +88,7 @@ impl TestPki {
         ));
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::days(1);
-        params.not_after = now + time::Duration::days(1);
+        params.not_after = now + validity;
         let key = rcgen::KeyPair::generate().expect("leaf key");
         let cert = params
             .signed_by(&key, &self.ca_cert, &self.ca_key)
@@ -82,12 +98,46 @@ impl TestPki {
         let private_key = parse_key_pem(&key.serialize_pem()).expect("private key PEM");
         let trust_domain = opc_identity::TrustDomain::new("test-domain").expect("trust domain");
         let mut trust_bundles = opc_identity::TrustBundleSet::new();
+        let trust_pem = trust_anchors
+            .iter()
+            .map(|certificate| certificate.pem())
+            .collect::<String>();
         trust_bundles.insert(TrustBundle {
             trust_domain,
-            certificates: parse_certs_pem(&self.ca_cert.pem()).expect("CA PEM"),
+            certificates: parse_certs_pem(&trust_pem).expect("CA PEM"),
         });
         build_identity_state(certs, private_key, trust_bundles).expect("identity state")
     }
+}
+
+fn lifecycle_policy() -> ConnectionLifecyclePolicy {
+    ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(4),
+        Duration::from_millis(10),
+        Duration::from_millis(50),
+        Duration::ZERO,
+    )
+    .expect("connection lifecycle policy")
+}
+
+async fn wait_for_material_epoch_change(
+    status: impl Fn() -> opc_tls::TlsMaterialStatus,
+    previous: TlsMaterialEpoch,
+) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let current = status();
+            if current.epoch() != previous
+                && current.availability() == TlsMaterialAvailability::Ready
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("material epoch update");
 }
 
 fn replica_id(replica: u16) -> ReplicaId {
@@ -376,6 +426,375 @@ async fn start_single_probe_server(
         }
     });
     (addr, handle)
+}
+
+async fn start_two_connection_probe_server(
+    authenticated: AuthenticatedServerConfig,
+) -> (
+    SocketAddr,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Vec<Request>>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("two-connection listener");
+    let addr = listener.local_addr().expect("two-connection address");
+    let (first_closed_tx, first_closed_rx) = tokio::sync::oneshot::channel();
+    let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut hellos = Vec::with_capacity(3);
+        let mut first_closed_tx = Some(first_closed_tx);
+        let mut continue_rx = Some(continue_rx);
+        for connection in 0..3 {
+            let (tcp, _) = listener.accept().await.expect("probe accept");
+            let handshake = authenticated.begin_handshake().expect("server material");
+            let mut config = handshake.rustls_config().as_ref().clone();
+            config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
+            let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(config))
+                .accept(tcp)
+                .await
+                .expect("probe mutual TLS");
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(SESSION_NET_ALPN));
+            let hello: Request = read_frame(&mut tls, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("probe Hello");
+            write_frame(&mut tls, &successful_hello_ack(&hello))
+                .await
+                .expect("probe HelloAck");
+            handshake.admit().expect("server material admission");
+            hellos.push(hello);
+
+            if connection == 0 {
+                let request = read_frame::<_, Request>(&mut tls, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("initial probe request");
+                assert!(matches!(request, Request::MaxReplicationSequence));
+                write_frame(&mut tls, &Response::MaxReplicationSequence(Ok(11)))
+                    .await
+                    .expect("initial probe response");
+                while let Ok(request) =
+                    read_frame::<_, Request>(&mut tls, DEFAULT_MAX_FRAME_SIZE).await
+                {
+                    assert!(matches!(request, Request::MaxReplicationSequence));
+                    write_frame(&mut tls, &Response::MaxReplicationSequence(Ok(11)))
+                        .await
+                        .expect("retained probe response");
+                }
+                first_closed_tx
+                    .take()
+                    .expect("first close sender")
+                    .send(())
+                    .expect("report first connection close");
+                continue_rx
+                    .take()
+                    .expect("continue receiver")
+                    .await
+                    .expect("continue after material renewal");
+                continue;
+            }
+
+            match read_frame::<_, Request>(&mut tls, DEFAULT_MAX_FRAME_SIZE).await {
+                Ok(request) => {
+                    assert!(matches!(request, Request::MaxReplicationSequence));
+                    write_frame(&mut tls, &Response::MaxReplicationSequence(Ok(22)))
+                        .await
+                        .expect("replacement probe response");
+                    return hellos;
+                }
+                Err(_) => {
+                    // A material publication after the client froze its
+                    // immutable attempt must invalidate that attempt and retry
+                    // the complete TLS + Hello negotiation on a new socket.
+                }
+            }
+        }
+        panic!("current-material replacement did not dispatch within three attempts")
+    });
+    (addr, first_closed_rx, continue_tx, handle)
+}
+
+fn assert_exact_replacement_hello(first: &Request, replacement: &Request) {
+    let (
+        Request::Hello {
+            contract_version: first_version,
+            contract_profile: first_profile,
+            handshake_nonce: Some(first_nonce),
+            ..
+        },
+        Request::Hello {
+            contract_version: replacement_version,
+            contract_profile: replacement_profile,
+            handshake_nonce: Some(replacement_nonce),
+            ..
+        },
+    ) = (first, replacement)
+    else {
+        panic!("both connections must perform complete Hello negotiation");
+    };
+    assert_eq!(*first_version, CONTRACT_VERSION);
+    assert_eq!(*replacement_version, CONTRACT_VERSION);
+    assert_eq!(*first_profile, Some(CURRENT_CONTRACT_PROFILE));
+    assert_eq!(*replacement_profile, Some(CURRENT_CONTRACT_PROFILE));
+    assert_ne!(first_nonce, replacement_nonce);
+}
+
+async fn assert_real_mtls_leaf_expiry_reconnects(short_local_leaf: bool) {
+    let pki = TestPki::new();
+    let trust = [&pki.ca_cert];
+    let short = time::Duration::seconds(7);
+    let long = time::Duration::days(1);
+    let client_validity = if short_local_leaf { short } else { long };
+    let server_validity = if short_local_leaf { long } else { short };
+    let (client_tx, client_rx) = tokio::sync::watch::channel(Some(
+        pki.identity_state_with_trust_and_validity(1, &trust, client_validity),
+    ));
+    let (server_tx, server_rx) = tokio::sync::watch::channel(Some(
+        pki.identity_state_with_trust_and_validity(SERVER_REPLICA, &trust, server_validity),
+    ));
+    let client_config = TlsConfigBuilder::new(client_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("expiring client config");
+    let server_config = TlsConfigBuilder::new(server_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_server_config()
+        .expect("expiring server config");
+    let (addr, first_closed, continue_sender, server) =
+        start_two_connection_probe_server(server_config.clone()).await;
+    let manifest = manifest("cluster-expiry", "generation-expiry");
+    let reconnect_allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let reconnect_notify = Arc::new(tokio::sync::Notify::new());
+    let gated_resolver: RemoteAddrResolver = {
+        let reconnect_allowed = reconnect_allowed.clone();
+        let reconnect_notify = reconnect_notify.clone();
+        Arc::new(move || {
+            let reconnect_allowed = reconnect_allowed.clone();
+            let reconnect_notify = reconnect_notify.clone();
+            Box::pin(async move {
+                while !reconnect_allowed.load(std::sync::atomic::Ordering::Acquire) {
+                    reconnect_notify.notified().await;
+                }
+                Ok(addr)
+            })
+        })
+    };
+    let backend = RemoteSessionBackend::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("server binding"),
+        gated_resolver,
+        client_config.clone(),
+        Some(Duration::from_secs(3)),
+    )
+    .with_connection_lifecycle(lifecycle_policy());
+
+    assert_eq!(backend.probe_replication_head().await, Ok(11));
+    reconnect_allowed.store(false, std::sync::atomic::Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    let replacement_probe = tokio::spawn({
+        let backend = backend.clone();
+        async move { backend.probe_replication_head().await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), first_closed)
+        .await
+        .expect("leaf soft deadline must reject reuse of the retained connection")
+        .expect("leaf close signal");
+
+    if short_local_leaf {
+        let previous = client_config.material_status().epoch();
+        client_tx.send_replace(Some(
+            pki.identity_state_with_trust_and_validity(1, &trust, long),
+        ));
+        wait_for_material_epoch_change(|| client_config.material_status(), previous).await;
+    } else {
+        let previous = server_config.material_status().epoch();
+        server_tx.send_replace(Some(pki.identity_state_with_trust_and_validity(
+            SERVER_REPLICA,
+            &trust,
+            long,
+        )));
+        wait_for_material_epoch_change(|| server_config.material_status(), previous).await;
+    }
+    continue_sender
+        .send(())
+        .expect("continue with renewed material");
+    reconnect_allowed.store(true, std::sync::atomic::Ordering::Release);
+    reconnect_notify.notify_one();
+
+    assert_eq!(replacement_probe.await.expect("replacement probe"), Ok(22));
+    let hellos = server.await.expect("replacement server");
+    assert!(hellos.len() >= 2);
+    assert_exact_replacement_hello(
+        hellos.first().expect("initial Hello"),
+        hellos.last().expect("replacement Hello"),
+    );
+}
+
+#[tokio::test]
+async fn real_mtls_local_and_peer_leaf_expiry_force_exact_reauthentication() {
+    assert_real_mtls_leaf_expiry_reconnects(true).await;
+    assert_real_mtls_leaf_expiry_reconnects(false).await;
+}
+
+#[tokio::test]
+async fn overlapping_trust_rotation_reauthenticates_and_rejects_removed_old_trust() {
+    let old_pki = TestPki::new();
+    let new_pki = TestPki::new();
+    let old_trust = [&old_pki.ca_cert];
+    let overlap = [&old_pki.ca_cert, &new_pki.ca_cert];
+    let new_trust = [&new_pki.ca_cert];
+    let validity = time::Duration::days(1);
+    let (client_tx, client_rx) = tokio::sync::watch::channel(Some(
+        old_pki.identity_state_with_trust_and_validity(1, &old_trust, validity),
+    ));
+    let (server_tx, server_rx) = tokio::sync::watch::channel(Some(
+        old_pki.identity_state_with_trust_and_validity(SERVER_REPLICA, &old_trust, validity),
+    ));
+    let client_config = TlsConfigBuilder::new(client_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("rotating client config");
+    let server_config = TlsConfigBuilder::new(server_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_server_config()
+        .expect("rotating server config");
+    let manifest = manifest("cluster-trust-rotation", "generation-trust-rotation");
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let reauthentication = SessionReauthenticationControl::new();
+    let server = SessionReplicationServer::new(
+        Arc::new(FakeSessionBackend::new()),
+        server_config.clone(),
+        binding,
+    )
+    .with_connection_lifecycle(lifecycle_policy())
+    .with_reauthentication_control(reauthentication.clone());
+    let (handle, addr) = server
+        .listen("127.0.0.1:0".parse().expect("listen address"))
+        .await
+        .expect("rotation listener");
+    let backend = remote(&manifest, 1, SERVER_REPLICA, addr, client_config.clone())
+        .with_connection_lifecycle(lifecycle_policy())
+        .with_reauthentication_control(reauthentication.clone());
+
+    assert_eq!(backend.probe_replication_head().await, Ok(0));
+
+    let client_epoch = client_config.material_status().epoch();
+    let server_epoch = server_config.material_status().epoch();
+    client_tx.send_replace(Some(
+        old_pki.identity_state_with_trust_and_validity(1, &overlap, validity),
+    ));
+    server_tx.send_replace(Some(old_pki.identity_state_with_trust_and_validity(
+        SERVER_REPLICA,
+        &overlap,
+        validity,
+    )));
+    wait_for_material_epoch_change(|| client_config.material_status(), client_epoch).await;
+    wait_for_material_epoch_change(|| server_config.material_status(), server_epoch).await;
+    reauthentication
+        .request_reauthentication()
+        .expect("reauthenticate on overlapping trust");
+    assert_eq!(backend.probe_replication_head().await, Ok(0));
+
+    let client_epoch = client_config.material_status().epoch();
+    let server_epoch = server_config.material_status().epoch();
+    client_tx.send_replace(Some(
+        new_pki.identity_state_with_trust_and_validity(1, &overlap, validity),
+    ));
+    server_tx.send_replace(Some(new_pki.identity_state_with_trust_and_validity(
+        SERVER_REPLICA,
+        &overlap,
+        validity,
+    )));
+    wait_for_material_epoch_change(|| client_config.material_status(), client_epoch).await;
+    wait_for_material_epoch_change(|| server_config.material_status(), server_epoch).await;
+    reauthentication
+        .request_reauthentication()
+        .expect("reauthenticate on renewed leaves");
+    assert_eq!(backend.probe_replication_head().await, Ok(0));
+
+    let client_epoch = client_config.material_status().epoch();
+    let server_epoch = server_config.material_status().epoch();
+    client_tx.send_replace(Some(
+        new_pki.identity_state_with_trust_and_validity(1, &new_trust, validity),
+    ));
+    server_tx.send_replace(Some(new_pki.identity_state_with_trust_and_validity(
+        SERVER_REPLICA,
+        &new_trust,
+        validity,
+    )));
+    wait_for_material_epoch_change(|| client_config.material_status(), client_epoch).await;
+    wait_for_material_epoch_change(|| server_config.material_status(), server_epoch).await;
+    reauthentication
+        .request_reauthentication()
+        .expect("reauthenticate after old-trust removal");
+    assert_eq!(backend.probe_replication_head().await, Ok(0));
+
+    let old_client = TlsConfigBuilder::new(
+        tokio::sync::watch::channel(Some(
+            old_pki.identity_state_with_trust_and_validity(1, &overlap, validity),
+        ))
+        .1,
+    )
+    .allow_any_trusted_peer()
+    .build_authenticated_client_config()
+    .expect("old client config");
+    let old_client_result =
+        try_raw_tls_connection_with_alpn(addr, old_client, vec![SESSION_NET_ALPN.to_vec()]).await;
+    let old_client_admitted = if let Ok(mut connection) = old_client_result {
+        let binding = manifest
+            .bind_local(replica_id(1))
+            .expect("old client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("old server binding");
+        write_frame(&mut connection, &hello_for(&binding))
+            .await
+            .is_ok()
+            && matches!(
+                read_frame::<_, Response>(&mut connection, DEFAULT_MAX_FRAME_SIZE).await,
+                Ok(Response::HelloAck { .. })
+            )
+    } else {
+        false
+    };
+    assert!(
+        !old_client_admitted,
+        "new-only server trust must reject the old client issuer before application admission"
+    );
+
+    let new_client = TlsConfigBuilder::new(
+        tokio::sync::watch::channel(Some(
+            new_pki.identity_state_with_trust_and_validity(1, &new_trust, validity),
+        ))
+        .1,
+    )
+    .allow_any_trusted_peer()
+    .build_authenticated_client_config()
+    .expect("new-only client config");
+    let old_server = TlsConfigBuilder::new(
+        tokio::sync::watch::channel(Some(old_pki.identity_state_with_trust_and_validity(
+            SERVER_REPLICA,
+            &overlap,
+            validity,
+        )))
+        .1,
+    )
+    .allow_any_trusted_peer()
+    .build_authenticated_server_config()
+    .expect("old server config");
+    let (old_addr, old_server_task) = start_single_probe_server(old_server, 33).await;
+    assert!(
+        try_raw_tls_connection_with_alpn(old_addr, new_client, vec![SESSION_NET_ALPN.to_vec()])
+            .await
+            .is_err(),
+        "new-only client trust must reject the old server issuer"
+    );
+    old_server_task.await.expect("old server rejection task");
+    handle.abort();
 }
 
 #[tokio::test]

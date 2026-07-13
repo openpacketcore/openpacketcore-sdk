@@ -134,7 +134,7 @@ evidence.
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 5, error-set revision 8,
+  Its profile pins wire-schema revision 6, error-set revision 8,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -727,9 +727,9 @@ rounding. New deadlines remain exact, the tolerance does not enlarge
 `MAX_SESSION_TTL`, and larger deadline mismatches still fail closed.
 
 This TTL is application-state lifetime, not certificate expiry, trust-bundle
-validity, or maximum authentication age. Seamless certificate/trust rotation
-for the networked production profile remains a qualification requirement in
-#143.
+validity, or maximum authentication age. `opc-session-net` supplies finite
+connection reauthentication under #163; fleet trust/revocation and deployed
+continuity evidence remains #164/#143.
 
 Caller-authored absolute `StoredSessionRecord::expires_at` has a separate but
 equal finite horizon. Relative to the mutation authority's one captured
@@ -915,7 +915,7 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   stabilization does not attest wrapper composition.
 - The #135 identity/model boundary and offline SQLite audit are implemented,
   but do not establish durable sequencing, fork recovery, restore authority,
-  seamless rotation, or production HA. Fixed-width v5 wire admission is
+  fleet rotation qualification, or production HA. Fixed-width v5 wire admission is
   implemented under #134.
 - #159 closes per-connection outbound frame allocation and slow-reader write
   bounds. Protocol-v4 wire-schema revision 3 carries #133's confidential
@@ -944,11 +944,11 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   preservation, SQLite/recovery checks, and current version-4 audit coordinated with
   #127/#128/#143. This
   supplies no durable authority or distributed/payload-key qualification
-  (#143). Shared real-mTLS tests now qualify a renewed SVID on a subsequent new
-  call/full handshake and wrong-scope rejection. They do not exercise seamless
-  old-connection retirement. Broader multi-process rotation/soak and the
-  complete trust-bundle, revocation, authentication-age, and seamless
-  continuity lifecycle remain separate production gates. #177 removes
+  (#143). #163 shared real-mTLS tests now qualify bounded retained-connection
+  retirement, complete reauthentication, and request/watch continuity. Broader
+  multi-process rotation/soak and complete trust-bundle removal, revocation,
+  reconnect-storm, and seamless continuity evidence remain #164/#143
+  production gates. #177 removes
   `opc-persist`'s private config TCP path and reuses the shared consensus ports;
   #159 does not define a second config deadline or credential lifecycle.
 
@@ -959,10 +959,9 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 - Retain #171's bounded log-range cursor contract and complete persisted peer
   logical-RPC deadlines (#169),
   then complete the production
-  qualification profile. A renewed SVID on a subsequent new call/full handshake
-  and wrong-scope rejection have scoped real-mTLS coverage; seamless connection
-  retirement and the broader certificate/trust, revocation,
-  authentication-age, multi-process, and soak work remains open under #158;
+  qualification profile. Finite connection retirement and reauthentication are
+  implemented under #163; broader certificate/trust removal, revocation,
+  reconnect-storm, multi-process, and soak evidence remains #164/#158;
   distributed payload-protection evidence remains #143. Remote-seal historical
   selection is implemented; old-key retirement remains KMS/operator-owned and
   requires external proof across live state and every retained artifact. The

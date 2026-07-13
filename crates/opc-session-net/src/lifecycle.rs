@@ -1,9 +1,11 @@
 //! Bounded authentication lifetime for session transport connections.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use opc_redaction::metrics::METRICS;
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
@@ -66,11 +68,15 @@ impl ConnectionLifecyclePolicy {
         {
             return Err(ConnectionLifecycleError::InvalidPolicy);
         }
+        let rotation_hard_span = rotation_jitter
+            .checked_add(rotation_drain_window)
+            .ok_or(ConnectionLifecycleError::InvalidPolicy)?;
         let now = tokio::time::Instant::now();
         if now.checked_add(maximum_authentication_age).is_none()
             || now.checked_add(rotation_drain_window).is_none()
             || now.checked_add(reconnect_backoff_max).is_none()
             || now.checked_add(rotation_jitter).is_none()
+            || now.checked_add(rotation_hard_span).is_none()
         {
             return Err(ConnectionLifecycleError::InvalidPolicy);
         }
@@ -112,10 +118,15 @@ impl ConnectionLifecyclePolicy {
         self,
         now: tokio::time::Instant,
     ) -> Result<(), ConnectionLifecycleError> {
+        let rotation_hard_span = self
+            .rotation_jitter
+            .checked_add(self.rotation_drain_window)
+            .ok_or(ConnectionLifecycleError::InvalidPolicy)?;
         if now.checked_add(self.maximum_authentication_age).is_none()
             || now.checked_add(self.rotation_drain_window).is_none()
             || now.checked_add(self.reconnect_backoff_max).is_none()
             || now.checked_add(self.rotation_jitter).is_none()
+            || now.checked_add(rotation_hard_span).is_none()
         {
             return Err(ConnectionLifecycleError::InvalidPolicy);
         }
@@ -238,6 +249,78 @@ pub(crate) enum RetirementReason {
     Explicit,
 }
 
+const LIFECYCLE_METRIC_ACTIVE: u8 = 0;
+const LIFECYCLE_METRIC_DRAINING: u8 = 1;
+
+#[derive(Debug)]
+struct LifecycleConnectionMetrics {
+    state: AtomicU8,
+    hard_overrun_recorded: AtomicBool,
+}
+
+impl LifecycleConnectionMetrics {
+    fn new() -> Self {
+        METRICS
+            .session_net_lifecycle_active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            state: AtomicU8::new(LIFECYCLE_METRIC_ACTIVE),
+            hard_overrun_recorded: AtomicBool::new(false),
+        }
+    }
+
+    fn begin_draining(&self) {
+        if self
+            .state
+            .compare_exchange(
+                LIFECYCLE_METRIC_ACTIVE,
+                LIFECYCLE_METRIC_DRAINING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        decrement_gauge(&METRICS.session_net_lifecycle_active_connections);
+        METRICS
+            .session_net_lifecycle_draining_connections
+            .fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .session_net_lifecycle_drain_started
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_hard_overrun(&self) {
+        self.begin_draining();
+        if !self.hard_overrun_recorded.swap(true, Ordering::AcqRel) {
+            METRICS
+                .session_net_lifecycle_drain_overruns
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for LifecycleConnectionMetrics {
+    fn drop(&mut self) {
+        match self.state.load(Ordering::Acquire) {
+            LIFECYCLE_METRIC_DRAINING => {
+                decrement_gauge(&METRICS.session_net_lifecycle_draining_connections);
+                METRICS
+                    .session_net_lifecycle_drain_completed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => decrement_gauge(&METRICS.session_net_lifecycle_active_connections),
+        }
+    }
+}
+
+fn decrement_gauge(gauge: &AtomicI64) {
+    let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1).max(0))
+    });
+}
+
 impl RetirementReason {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -250,7 +333,7 @@ impl RetirementReason {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ConnectionLifecycle {
     policy: ConnectionLifecyclePolicy,
     evidence: ConnectionAuthenticationEvidence,
@@ -259,23 +342,70 @@ pub(crate) struct ConnectionLifecycle {
     reason: RetirementReason,
     generation: u64,
     rotation_retire_at: Option<(tokio::time::Instant, RetirementReason)>,
+    retirement_recorded: Arc<AtomicBool>,
+    metrics: Arc<LifecycleConnectionMetrics>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[allow(dead_code)] // retained as exact per-connection authentication evidence
 struct ConnectionAuthenticationEvidence {
     handshake_completed_at: tokio::time::Instant,
-    local_leaf_expiry: Option<tokio::time::Instant>,
-    peer_leaf_expiry: Option<tokio::time::Instant>,
+    local_leaf_expiry: Option<LeafExpiryEvidence>,
+    peer_leaf_expiry: Option<LeafExpiryEvidence>,
     material_epoch: Option<opc_tls::TlsMaterialEpoch>,
+}
+
+impl fmt::Debug for ConnectionAuthenticationEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectionAuthenticationEvidence")
+            .field("handshake_completed_at", &"<redacted>")
+            .field(
+                "local_leaf_expiry",
+                &self.local_leaf_expiry.map(|_| "<redacted>"),
+            )
+            .field(
+                "peer_leaf_expiry",
+                &self.peer_leaf_expiry.map(|_| "<redacted>"),
+            )
+            .field("material_epoch", &self.material_epoch.map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Exact certificate expiry plus the monotonic deadline captured at TLS
+/// completion. Keeping both prevents a later wall-clock adjustment or slow
+/// application bootstrap from changing the authenticated evidence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeafExpiryEvidence {
+    expires_at: opc_types::Timestamp,
+    deadline: tokio::time::Instant,
+}
+
+impl LeafExpiryEvidence {
+    pub(crate) fn capture(
+        expires_at: opc_types::Timestamp,
+        tls_completed_at: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            expires_at,
+            deadline: wall_expiry_deadline(expires_at, tls_completed_at),
+        }
+    }
+}
+
+impl fmt::Debug for LeafExpiryEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LeafExpiryEvidence(<redacted>)")
+    }
 }
 
 impl ConnectionLifecycle {
     pub(crate) fn new(
         policy: ConnectionLifecyclePolicy,
         established_at: tokio::time::Instant,
-        local_leaf_expiry: Option<tokio::time::Instant>,
-        peer_leaf_expiry: Option<tokio::time::Instant>,
+        local_leaf_expiry: Option<LeafExpiryEvidence>,
+        peer_leaf_expiry: Option<LeafExpiryEvidence>,
         generation: u64,
         material_epoch: Option<opc_tls::TlsMaterialEpoch>,
     ) -> Result<Self, ConnectionLifecycleError> {
@@ -288,13 +418,17 @@ impl ConnectionLifecycle {
         // identical.
         let mut hard_deadline = maximum_age_deadline;
         let mut reason = RetirementReason::MaximumAge;
-        if let Some(deadline) = local_leaf_expiry.map(|deadline| deadline.max(established_at)) {
+        if let Some(deadline) =
+            local_leaf_expiry.map(|evidence| evidence.deadline.max(established_at))
+        {
             if deadline <= hard_deadline {
                 hard_deadline = deadline;
                 reason = RetirementReason::LocalLeafExpiry;
             }
         }
-        if let Some(deadline) = peer_leaf_expiry.map(|deadline| deadline.max(established_at)) {
+        if let Some(deadline) =
+            peer_leaf_expiry.map(|evidence| evidence.deadline.max(established_at))
+        {
             if deadline <= hard_deadline {
                 hard_deadline = deadline;
                 reason = RetirementReason::PeerLeafExpiry;
@@ -317,6 +451,8 @@ impl ConnectionLifecycle {
             reason,
             generation,
             rotation_retire_at: None,
+            retirement_recorded: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(LifecycleConnectionMetrics::new()),
         })
     }
 
@@ -347,20 +483,76 @@ impl ConnectionLifecycle {
         }
     }
 
-    pub(crate) fn retirement(self, now: tokio::time::Instant) -> Option<RetirementReason> {
+    pub(crate) const fn admitted_generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn admitted_material_epoch(&self) -> Option<opc_tls::TlsMaterialEpoch> {
+        self.evidence.material_epoch
+    }
+
+    pub(crate) const fn rotation_was_observed(&self) -> bool {
+        self.rotation_retire_at.is_some()
+    }
+
+    pub(crate) fn evidence_mismatch_reason(
+        &self,
+        current_generation: u64,
+        current_material_epoch: Option<opc_tls::TlsMaterialEpoch>,
+    ) -> Option<RetirementReason> {
+        if current_generation != self.generation {
+            Some(RetirementReason::Explicit)
+        } else if current_material_epoch != self.evidence.material_epoch {
+            Some(RetirementReason::MaterialEpoch)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn record_forced_retirement(&self, reason: RetirementReason) {
+        self.record_retirement(reason);
+    }
+
+    fn record_retirement(&self, reason: RetirementReason) {
+        if self.retirement_recorded.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.metrics.begin_draining();
+        match reason {
+            RetirementReason::MaximumAge => &METRICS.session_net_lifecycle_retirement_maximum_age,
+            RetirementReason::LocalLeafExpiry => {
+                &METRICS.session_net_lifecycle_retirement_local_leaf_expiry
+            }
+            RetirementReason::PeerLeafExpiry => {
+                &METRICS.session_net_lifecycle_retirement_peer_leaf_expiry
+            }
+            RetirementReason::MaterialEpoch => {
+                &METRICS.session_net_lifecycle_retirement_material_epoch
+            }
+            RetirementReason::Explicit => &METRICS.session_net_lifecycle_retirement_explicit,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(reason = reason.as_str(), "session connection retired");
+    }
+
+    pub(crate) fn retirement(&self, now: tokio::time::Instant) -> Option<RetirementReason> {
         let (deadline, reason) = self
             .rotation_retire_at
             .filter(|(deadline, _)| *deadline <= self.retire_at)
             .unwrap_or((self.retire_at, self.reason));
-        (now >= deadline).then_some(reason)
+        if now < deadline {
+            return None;
+        }
+        self.record_retirement(reason);
+        Some(reason)
     }
 
-    pub(crate) fn retire_at(self) -> tokio::time::Instant {
+    pub(crate) fn retire_at(&self) -> tokio::time::Instant {
         self.rotation_retire_at
             .map_or(self.retire_at, |(deadline, _)| deadline.min(self.retire_at))
     }
 
-    pub(crate) fn hard_deadline(self) -> Result<tokio::time::Instant, ConnectionLifecycleError> {
+    pub(crate) fn hard_deadline(&self) -> Result<tokio::time::Instant, ConnectionLifecycleError> {
         let rotation_hard_deadline = self
             .rotation_retire_at
             .map(|(deadline, _)| {
@@ -376,8 +568,12 @@ impl ConnectionLifecycle {
         )
     }
 
+    pub(crate) fn record_hard_overrun(&self) {
+        self.metrics.record_hard_overrun();
+    }
+
     #[cfg(test)]
-    fn evidence(self) -> ConnectionAuthenticationEvidence {
+    fn evidence(&self) -> ConnectionAuthenticationEvidence {
         self.evidence
     }
 }
@@ -424,6 +620,24 @@ pub(crate) fn directed_connection_key(
     hasher.finalize().into()
 }
 
+pub(crate) fn material_status_matches_admission(
+    admitted_epoch: Option<opc_tls::TlsMaterialEpoch>,
+    status: Option<opc_tls::TlsMaterialStatus>,
+) -> bool {
+    match (admitted_epoch, status) {
+        (None, None) => true,
+        (Some(epoch), Some(status)) => {
+            status.epoch() == epoch
+                && matches!(
+                    status.availability(),
+                    opc_tls::TlsMaterialAvailability::Ready
+                        | opc_tls::TlsMaterialAvailability::RetainingLastGood
+                )
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +667,16 @@ mod tests {
         );
         assert_eq!(
             ConnectionLifecyclePolicy::try_new(
+                Duration::MAX,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                Duration::MAX,
+            ),
+            Err(ConnectionLifecycleError::InvalidPolicy)
+        );
+        assert_eq!(
+            ConnectionLifecyclePolicy::try_new(
                 Duration::from_secs(1),
                 Duration::from_secs(2),
                 Duration::from_millis(2),
@@ -466,11 +690,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn earliest_age_or_leaf_expiry_retires_and_drain_is_bounded() {
         let now = tokio::time::Instant::now();
+        let wall_now = opc_types::Timestamp::now_utc();
+        let local_timestamp = wall_now.add_seconds(40).expect("local expiry");
+        let peer_timestamp = wall_now.add_seconds(20).expect("peer expiry");
         let lifecycle = ConnectionLifecycle::new(
             policy(),
             now,
-            Some(now + Duration::from_secs(40)),
-            Some(now + Duration::from_secs(20)),
+            Some(LeafExpiryEvidence {
+                expires_at: local_timestamp,
+                deadline: now + Duration::from_secs(40),
+            }),
+            Some(LeafExpiryEvidence {
+                expires_at: peer_timestamp,
+                deadline: now + Duration::from_secs(20),
+            }),
             0,
             None,
         )
@@ -478,11 +711,31 @@ mod tests {
         assert_eq!(lifecycle.retirement(now), None);
         assert_eq!(lifecycle.evidence().handshake_completed_at, now);
         assert_eq!(
-            lifecycle.evidence().peer_leaf_expiry,
+            lifecycle
+                .evidence()
+                .peer_leaf_expiry
+                .map(|value| value.expires_at),
+            Some(peer_timestamp)
+        );
+        assert_eq!(
+            lifecycle
+                .evidence()
+                .local_leaf_expiry
+                .map(|value| value.expires_at),
+            Some(local_timestamp)
+        );
+        assert_eq!(
+            lifecycle
+                .evidence()
+                .peer_leaf_expiry
+                .map(|value| value.deadline),
             Some(now + Duration::from_secs(20))
         );
         assert_eq!(
-            lifecycle.evidence().local_leaf_expiry,
+            lifecycle
+                .evidence()
+                .local_leaf_expiry
+                .map(|value| value.deadline),
             Some(now + Duration::from_secs(40))
         );
         tokio::time::advance(Duration::from_secs(10)).await;
@@ -497,12 +750,72 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn expiry_shorter_than_drain_retires_immediately_and_peer_wins_ties() {
+        let now = tokio::time::Instant::now();
+        let expires_at = opc_types::Timestamp::now_utc()
+            .add_seconds(5)
+            .expect("expiry");
+        let deadline = now + Duration::from_secs(5);
+        let lifecycle = ConnectionLifecycle::new(
+            policy(),
+            now,
+            Some(LeafExpiryEvidence {
+                expires_at,
+                deadline,
+            }),
+            Some(LeafExpiryEvidence {
+                expires_at,
+                deadline,
+            }),
+            0,
+            None,
+        )
+        .expect("lifecycle");
+
+        assert_eq!(lifecycle.retire_at(), now);
+        assert_eq!(
+            lifecycle.retirement(now),
+            Some(RetirementReason::PeerLeafExpiry)
+        );
+        assert_eq!(lifecycle.hard_deadline().expect("hard deadline"), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn explicit_and_epoch_rotation_are_cooperative_and_stable() {
         let now = tokio::time::Instant::now();
         let mut lifecycle =
             ConnectionLifecycle::new(policy(), now, None, None, 3, None).expect("lifecycle");
         lifecycle.observe_rotation(now, 4, None, b"replica-a");
         assert_eq!(lifecycle.retirement(now), Some(RetirementReason::Explicit));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_transition_and_hard_overrun_are_shared_exactly_once() {
+        let now = tokio::time::Instant::now();
+        let lifecycle =
+            ConnectionLifecycle::new(policy(), now, None, None, 0, None).expect("lifecycle");
+        let sibling = lifecycle.clone();
+
+        assert_eq!(
+            lifecycle.metrics.state.load(Ordering::Acquire),
+            LIFECYCLE_METRIC_ACTIVE
+        );
+        assert!(!lifecycle.retirement_recorded.load(Ordering::Acquire));
+        lifecycle.record_forced_retirement(RetirementReason::Explicit);
+        sibling.record_forced_retirement(RetirementReason::MaximumAge);
+        assert!(lifecycle.retirement_recorded.load(Ordering::Acquire));
+        assert_eq!(
+            lifecycle.metrics.state.load(Ordering::Acquire),
+            LIFECYCLE_METRIC_DRAINING
+        );
+
+        lifecycle.record_hard_overrun();
+        sibling.record_hard_overrun();
+        assert!(lifecycle
+            .metrics
+            .hard_overrun_recorded
+            .load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(&lifecycle.metrics, &sibling.metrics));
     }
 
     #[test]

@@ -273,22 +273,65 @@ remains the existing `opc-session-net`/CNF shared-transport responsibility; do
 not add a config-only listener or a private credential-update path in
 `opc-persist`.
 
-Follow the shared transport procedure:
+Before the campaign, every participant must already run the same session-net
+contract profile. The revision-5-to-6 binary/schema transition is a coordinated
+drained stop/upgrade/start; connection reauthentication does not make a mixed
+profile rolling upgrade safe. Configure the same finite
+`ConnectionLifecyclePolicy` on peers and listeners, share an orchestration
+`SessionReauthenticationControl`, and alert on the fixed lifecycle/reconnect
+metrics. Preserve the encryption/HKMS composition above consensus; rotation
+must not move plaintext, a provider handle, or raw key material into Openraft or
+session-net.
 
-1. Publish trust that accepts both old and new issuers.
-2. Install renewed leaves while preserving exact peer and consensus scope.
-3. Retire or reconnect old connections so peers perform fresh mutual
-   authentication.
-4. Gate traffic on fresh durable readiness and verify every peer path.
-5. Remove old trust only after the required authentication age and rollback
-   window have elapsed.
+### 7.1 Forward rotation
 
-Real-mTLS tests prove that a subsequent new call/full handshake observes a
-renewed correctly scoped SVID and rejects a wrongly scoped rotated identity.
-They do not exercise an in-flight or retained old connection. Keep seamless
-connection retirement, trust-bundle, revocation, authentication-age,
-multi-process/soak, and production-release gates open until their own evidence
-passes.
+1. Confirm all members are durably ready, all directed peer routes are healthy,
+   active/draining gauges are understood, and reconnect/authentication failures
+   are at baseline. Record the currently admitted material epoch without
+   treating its process-local number as cluster identity.
+2. Publish a trust bundle that accepts both old and new issuers/anchors. Wait
+   for `TlsMaterialAvailability::Ready` on every member. Do not continue from
+   `Unavailable`; `RetainingLastGood` means the candidate still needs repair.
+3. Publish renewed leaves and keys atomically through one projected `..data`
+   generation. Preserve the exact canonical SPIFFE ID, logical replica,
+   cluster/configuration/epoch, role, and consensus scope.
+4. Wait for every member to report a coherent new material epoch, then invoke
+   `request_reauthentication()` on the controls for both outbound peers and
+   listeners. The generation is monotonic and process-local; never set it back.
+5. During the deterministic jitter/drain interval, verify no new work enters
+   old connections, in-flight operations finish once within the hard deadline,
+   replacements complete full mutual TLS/application negotiation, drain
+   overruns stay zero, and durable readiness remains fresh. Investigate closed
+   metric outcomes only; do not add peer identities or certificate text as
+   labels.
+6. Prove every directed peer path has established current-material
+   authentication. A listener bind, material publication, zero draining gauge,
+   or cached capability alone is not proof. Exercise the fresh linearizable
+   readiness path and representative traffic on every member.
+7. Keep old trust through the maximum authentication age, configured jitter and
+   drain bound, observation window, and approved rollback window. Then remove
+   old trust atomically, trigger reauthentication again, and prove the old
+   issuer is rejected while all directed current-material paths remain ready.
+
+### 7.2 Rollback
+
+Before old-trust removal, republish the previous leaf/key through a new atomic
+material generation while the overlapping bundle still trusts it, wait for
+Ready, and trigger a new reauthentication generation. Never decrement a
+material or reauthentication epoch and never count an old retained connection
+as rollback proof.
+
+After old-trust removal, first republish the overlapping bundle and prove it
+Ready everywhere. Only then republish the previous leaf/key, trigger a new
+reauthentication generation, and repeat every directed-path and durable-ready
+check. If the previous leaf is expired or revoked, it is not a valid rollback;
+issue a new correctly scoped leaf from a trusted authority instead. If overlap
+cannot be restored coherently, stop traffic and use the coordinated release
+rollback procedure rather than enabling plaintext or weakening identity checks.
+
+#163 provides the in-process bounded-retirement and request/watch continuity
+mechanism. #164/#143 still gate production claims on multi-process trust
+overlap/removal, revocation, reconnect-storm, resource, and soak evidence.
 
 ## 8. Snapshots, backups, and rollback
 
@@ -337,11 +380,11 @@ three-node formation, partition/failover/heal, response loss, restart, and
 snapshots through in-process shared peer ports. The AMF-lite test composes the
 real outer encryption wrapper and qualifies the three-node provider/HKMS
 boundary through key rotation plus durable canaries;
-the shared transport test covers a renewed SVID on a subsequent new call/full
-handshake and wrong-scope rejection, not seamless retained-connection
-retirement. That suite also forms a real three-node config Openraft cluster and
+the shared transport tests cover bounded retained-connection retirement,
+overlapping trust, complete replacement handshakes, and old/wrong-scope trust
+rejection. That suite also forms a real three-node config Openraft cluster and
 commits/linearizably reads through the loopback mTLS peer/server. The evidence
 does not alone qualify remote HKMS, out-of-process/deployed-network
 compatibility, restart/rejoin under deployed storage, resource limits, soak,
-seamless certificate rotation, or a carrier release. Track that remaining
+fleet-scale certificate rotation/soak, or a carrier release. Track that remaining
 evidence under `GAP-001-006`.

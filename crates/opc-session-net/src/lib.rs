@@ -12,6 +12,18 @@
 //! replica IDs and manifest scope to the canonical SPIFFE identities extracted
 //! from the live mutual-TLS connection, and prove the exact same
 //! [`SessionConsensusContractProfile`] before an operation is dispatched.
+//!
+//! Every authenticated direct and consensus connection also has one finite
+//! [`ConnectionLifecyclePolicy`]. The transport records the completed
+//! handshake's material epoch and local/peer leaf-expiry evidence, stops
+//! admitting new work at the earliest retirement boundary, and bounds work
+//! already in flight by the hard deadline. Material publication or an explicit
+//! [`SessionReauthenticationControl`] request drains existing connections;
+//! replacements always repeat the complete mutual-TLS and application-profile
+//! handshake. Direct watch streams reconnect from the exact next
+//! caller-visible sequence. Protocol-profile upgrades remain coordinated
+//! stop/upgrade/start operations; this lifecycle provides seamless credential
+//! rotation only after every participant already runs the same profile.
 
 #![forbid(unsafe_code)]
 

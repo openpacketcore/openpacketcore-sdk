@@ -117,6 +117,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redact operation errors, cap concurrent attempts, and keep tickets,
   resumption, early data, and 0-RTT disabled. Existing `rustls_config()` and
   identity-source event APIs remain source compatible.
+- **BREAKING — legacy direct `opc-session-net` peers:** every authenticated
+  direct and consensus connection now applies one finite
+  `ConnectionLifecyclePolicy`, retaining exact admitted material epoch,
+  handshake time, and local/peer leaf-expiry evidence. Clients and servers stop
+  new admission at soft retirement, bound already admitted work by the hard
+  deadline, and repeat mutual TLS plus identity, nonce, ALPN, version, and exact
+  profile checks on replacements. `SessionReauthenticationControl` provides a
+  cooperative CNF trigger with deterministic directed-peer jitter and bounded
+  reconnect backoff. Legacy watches resume from the exact delivered successor;
+  mutations retry only after the complete fixed `ConnectionRetiring`
+  no-dispatch proof. Direct v5 wire-schema revision advances from 5 to 6 and
+  requires a coordinated drained full-profile upgrade; the consensus-only
+  profile remains transport/wire revision 2. Fixed lifecycle/reconnect metrics
+  use closed redaction-safe labels. Payload encryption, persisted records,
+  Openraft state, consensus payloads, HKMS/provider placement, and key material
+  are unchanged. #164/#143 retain fleet trust-removal, revocation,
+  reconnect-storm, resource, and soak qualification.
 - **BREAKING — `opc-proto-diameter`:** trusted dictionary decode now resolves
   exactly one command by application id, command code, and request/answer role
   before applying vendor-aware per-command AVP cardinality. Conservative SWm
@@ -178,7 +195,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutation; timeout/unavailability is retry-safe because only a consensus
   logical-time floor may have committed. `RecordExpiryPreflightLimitExceeded`
   is fieldless and redaction-safe. The legacy exact transport becomes
-  `opc-session-net/5`, wire-schema revision 5, error-set revision 8; the
+  `opc-session-net/5`, wire-schema revision 6, error-set revision 8; the
   consensus exact transport becomes `opc-session-consensus/2`, transport/wire
   revision 2, error-set revision 4. Both require a coordinated drained
   full-profile upgrade. The count-only SQLite audit advances to report version 4,
@@ -474,9 +491,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fencing, and migration tests plus an AMF-lite provider-backed encryption,
   key-rotation, follower/snapshot/restart, shared-wire/live-artifact canary, and
   exact provider-call integration are three-node provider/HKMS-boundary
-  qualification. Shared transport tests cover
-  a renewed SVID on a subsequent new call/full handshake and reject wrong
-  rotated identities; they do not prove seamless old-connection retirement.
+  qualification. Shared transport tests cover finite retained-connection
+  retirement, full-handshake reauthentication, request/watch continuity, and
+  rejection of removed or wrong-scope trust.
   The suite also forms a real three-node config Openraft cluster and
   commits/linearizably reads through the existing mTLS peer/server. Remote-HKMS,
   out-of-process/deployed-network integration, resource, soak, seamless fleet
@@ -622,8 +639,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Session-net's response deadline remains part of the shared production
   transport. #177 removes `opc-persist`'s private TCP peer/server and uses the
   same transport-neutral consensus ports instead of defining another deadline,
-  retry, or certificate lifecycle. Seamless
-  credential/trust rotation remains #158, while distributed
+  retry, or certificate lifecycle. #163 implements the shared finite connection
+  lifecycle; fleet credential/trust evidence remains #164/#158, while distributed
   resource/failover/soak plus payload-protection qualification remains #143.
 - **BREAKING — `opc-session-store`:** the old backend-bearing quorum member and
   raw-vector coordinator surfaces are removed. Migrate HA callers through a
