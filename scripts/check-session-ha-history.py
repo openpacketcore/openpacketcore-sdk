@@ -321,7 +321,7 @@ def validate_history_operation(operation: Any) -> None:
 
 @dataclass
 class KeyState:
-    active_lease: tuple[str, int, int, int] | None = None
+    active_lease: tuple[str, int, int, int, int] | None = None
     record: dict[str, Any] | None = None
     maximum_fence: int = 0
 
@@ -337,12 +337,29 @@ def same_record(left: dict[str, Any] | None, right: dict[str, Any] | None) -> bo
     return left == right
 
 
+def active_lease_time_state(
+    state: KeyState, operation_started_ns: int, operation_completed_ns: int
+) -> str:
+    if state.active_lease is None:
+        return "absent"
+    _, _, acquisition_started_ns, acquisition_completed_ns, ttl_millis = (
+        state.active_lease
+    )
+    ttl_ns = ttl_millis * 1_000_000
+    if operation_completed_ns < acquisition_started_ns + ttl_ns:
+        return "valid"
+    if operation_started_ns >= acquisition_completed_ns + ttl_ns:
+        state.active_lease = None
+        return "expired"
+    return "ambiguous"
+
+
 def evaluate(
     schedule: list[dict[str, Any]], history_by_id: dict[str, dict[str, Any]]
 ) -> CheckResult:
     result = CheckResult()
     states: dict[str, KeyState] = {}
-    leases: dict[str, tuple[str, str, int, int, int]] = {}
+    leases: dict[str, tuple[str, str, int, int, int, int]] = {}
     uncertain_keys: set[str] = set()
     scheduled_ids = {row["operation_id"] for row in schedule}
     if set(history_by_id) - scheduled_ids:
@@ -372,6 +389,15 @@ def evaluate(
         if observed["key_sha256"] != digest("key", key):
             result.violations.add("schedule_history_mismatch")
             continue
+        if (
+            active_lease_time_state(
+                state, history["started_ns"], history["completed_ns"]
+            )
+            == "ambiguous"
+        ):
+            result.inconclusive.add("lease_expiry_ambiguity")
+            uncertain_keys.add(key)
+            continue
         outcome = observed["outcome"]
         if outcome in {"indeterminate", "unavailable"}:
             result.inconclusive.add("unknown_operation_outcome")
@@ -395,6 +421,7 @@ def evaluate(
                 state.active_lease = (
                     invocation["owner"],
                     fence,
+                    history["started_ns"],
                     history["completed_ns"],
                     invocation["ttl_millis"],
                 )
@@ -402,6 +429,7 @@ def evaluate(
                     key,
                     invocation["owner"],
                     fence,
+                    history["started_ns"],
                     history["completed_ns"],
                     invocation["ttl_millis"],
                 )
@@ -410,10 +438,7 @@ def evaluate(
             if source is None or source[0] != key:
                 result.violations.add("lease_reference_violation")
                 continue
-            _, owner, fence, acquired_ns, ttl_millis = source
-            if history["started_ns"] - acquired_ns >= ttl_millis * 1_000_000:
-                result.inconclusive.add("lease_expiry_ambiguity")
-                continue
+            _, owner, fence, _, _, _ = source
             if (
                 observed["owner_sha256"] != digest("owner", owner)
                 or observed["fence"] != fence
@@ -457,10 +482,7 @@ def evaluate(
             if source is None or source[0] != key:
                 result.violations.add("lease_reference_violation")
                 continue
-            _, owner, fence, acquired_ns, ttl_millis = source
-            if history["started_ns"] - acquired_ns >= ttl_millis * 1_000_000:
-                result.inconclusive.add("lease_expiry_ambiguity")
-                continue
+            _, owner, fence, _, _, _ = source
             if (
                 observed["owner_sha256"] != digest("owner", owner)
                 or observed["fence"] != fence

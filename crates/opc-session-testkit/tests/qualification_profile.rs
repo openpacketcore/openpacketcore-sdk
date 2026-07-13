@@ -39,6 +39,18 @@ fn run_checker(history: &str) -> Output {
         .expect("run independent history checker")
 }
 
+fn run_checker_pair(schedule: &str, history: &str) -> Output {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    Command::new("python3")
+        .arg(manifest.join("../../scripts/check-session-ha-history.py"))
+        .arg("--schedule")
+        .arg(manifest.join("tests/fixtures/session-ha").join(schedule))
+        .arg("--history")
+        .arg(manifest.join("tests/fixtures/session-ha").join(history))
+        .output()
+        .expect("run independent history checker pair")
+}
+
 fn structural_schema_for_lightweight_validator(mut schema: Value) -> Value {
     match &mut schema {
         Value::Object(object) => {
@@ -376,6 +388,11 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
     assert_eq!(profile.evidence.required_transport_modes, ["mtls"]);
     assert!(!profile.evidence.foundation_counts_for_tls_rotation);
     assert_eq!(
+        profile.evidence.foundation_payload_protection,
+        "fixed-memory-provider-synthetic-wrapper-only"
+    );
+    assert!(!profile.evidence.foundation_counts_for_production_encryption);
+    assert_eq!(
         profile.evidence.unresolved_dependencies,
         [143, 158, 163, 164]
     );
@@ -495,6 +512,32 @@ fn independent_checker_binds_schedule_and_preserves_unknown_invocations() {
     let invalid_output: Value =
         serde_json::from_slice(&invalid.stdout).expect("checker invalid output");
     assert_eq!(invalid_output["status"], "invalid_input");
+
+    let ambiguous = run_checker_pair(
+        "schedule-lease-expiry-ambiguous.jsonl",
+        "history-lease-expiry-ambiguous.jsonl",
+    );
+    assert_eq!(ambiguous.status.code(), Some(2));
+    let ambiguous_output: Value =
+        serde_json::from_slice(&ambiguous.stdout).expect("checker ambiguity output");
+    assert_eq!(ambiguous_output["status"], "inconclusive");
+    assert_eq!(
+        ambiguous_output["inconclusive_codes"],
+        serde_json::json!(["lease_expiry_ambiguity"])
+    );
+
+    let crossing = run_checker_pair(
+        "schedule-lease-expiry-crossing.jsonl",
+        "history-lease-expiry-crossing.jsonl",
+    );
+    assert_eq!(crossing.status.code(), Some(2));
+    let crossing_output: Value =
+        serde_json::from_slice(&crossing.stdout).expect("checker crossing output");
+    assert_eq!(crossing_output["status"], "inconclusive");
+    assert_eq!(
+        crossing_output["inconclusive_codes"],
+        serde_json::json!(["lease_expiry_ambiguity"])
+    );
 }
 
 #[test]

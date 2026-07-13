@@ -162,6 +162,8 @@ pub struct QualificationEvidenceRequirements {
     pub required_transport_modes: Vec<String>,
     pub foundation_transport_mode: String,
     pub foundation_counts_for_tls_rotation: bool,
+    pub foundation_payload_protection: String,
+    pub foundation_counts_for_production_encryption: bool,
     pub unresolved_dependencies: Vec<u64>,
 }
 
@@ -539,6 +541,7 @@ pub enum QualificationNodeErrorCode {
     InitializationUnavailable,
     BackendUnavailable,
     LeaseRejected,
+    LeaseHandleDuplicate,
     LeaseHandleMissing,
     MutationRejected,
 }

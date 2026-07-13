@@ -107,6 +107,8 @@
     "required_transport_modes": ["mtls"],
     "foundation_transport_mode": "loopback-plaintext-test-only",
     "foundation_counts_for_tls_rotation": false,
+    "foundation_payload_protection": "fixed-memory-provider-synthetic-wrapper-only",
+    "foundation_counts_for_production_encryption": false,
     "unresolved_dependencies": [143, 158, 163, 164]
   }
 }

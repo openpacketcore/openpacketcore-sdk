@@ -170,12 +170,8 @@ impl QualificationNode {
                 owner,
                 ttl_millis,
             } => {
-                if self.leases.len() >= QUALIFICATION_MAX_LEASE_HANDLES
-                    && !self.leases.contains_key(&lease_handle)
-                {
-                    return QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::InvalidRequest,
-                    };
+                if let Err(code) = validate_new_lease_handle(&self.leases, &lease_handle) {
+                    return QualificationNodeReply::Error { code };
                 }
                 let key = match qualification_key(&stable_id) {
                     Ok(key) => key,
@@ -299,7 +295,10 @@ impl QualificationNode {
                     };
                 };
                 match self.protected.release(lease).await {
-                    Ok(()) => QualificationNodeReply::Released,
+                    Ok(()) => {
+                        remove_released_lease(&mut self.leases, &lease_handle, true);
+                        QualificationNodeReply::Released
+                    }
                     Err(error) => QualificationNodeReply::Error {
                         code: map_lease_error(&error),
                     },
@@ -339,6 +338,29 @@ impl QualificationNode {
         if let Some(server) = self.server.take() {
             server.abort_and_wait().await;
         }
+    }
+}
+
+fn validate_new_lease_handle<T>(
+    leases: &HashMap<String, T>,
+    lease_handle: &str,
+) -> Result<(), QualificationNodeErrorCode> {
+    if leases.contains_key(lease_handle) {
+        Err(QualificationNodeErrorCode::LeaseHandleDuplicate)
+    } else if leases.len() >= QUALIFICATION_MAX_LEASE_HANDLES {
+        Err(QualificationNodeErrorCode::InvalidRequest)
+    } else {
+        Ok(())
+    }
+}
+
+fn remove_released_lease<T>(
+    leases: &mut HashMap<String, T>,
+    lease_handle: &str,
+    release_succeeded: bool,
+) {
+    if release_succeeded {
+        leases.remove(lease_handle);
     }
 }
 
@@ -494,5 +516,37 @@ fn main() -> ExitCode {
             eprintln!("qualification node failed");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_and_bounded_lease_handles_fail_before_backend_work() {
+        let mut leases = HashMap::new();
+        leases.insert("existing".to_owned(), ());
+        assert_eq!(
+            validate_new_lease_handle(&leases, "existing"),
+            Err(QualificationNodeErrorCode::LeaseHandleDuplicate)
+        );
+        for index in 1..QUALIFICATION_MAX_LEASE_HANDLES {
+            leases.insert(format!("lease-{index}"), ());
+        }
+        assert_eq!(
+            validate_new_lease_handle(&leases, "new"),
+            Err(QualificationNodeErrorCode::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn release_removes_only_a_confirmed_successful_handle() {
+        let mut leases = HashMap::from([("lease".to_owned(), ())]);
+        remove_released_lease(&mut leases, "lease", false);
+        assert!(leases.contains_key("lease"));
+        remove_released_lease(&mut leases, "lease", true);
+        assert!(!leases.contains_key("lease"));
+        assert_eq!(validate_new_lease_handle(&leases, "lease"), Ok(()));
     }
 }

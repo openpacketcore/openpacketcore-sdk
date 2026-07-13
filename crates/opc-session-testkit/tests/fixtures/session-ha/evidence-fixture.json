@@ -37,6 +37,11 @@
     "transport_mode": "loopback-plaintext-test-only",
     "counts_for_tls_rotation": false
   },
+  "payload_protection": {
+    "mode": "fixed-memory-provider-synthetic-wrapper-only",
+    "synthetic_data_only": true,
+    "counts_for_production_encryption": false
+  },
   "faults": [
     {
       "kind": "process_stop",
@@ -95,6 +100,7 @@
     "crash_point_matrix",
     "version_migration_rollback",
     "resource_soak",
-    "signed_release_bundle"
+    "signed_release_bundle",
+    "distributed_hkms_payload_key_rotation"
   ]
 }

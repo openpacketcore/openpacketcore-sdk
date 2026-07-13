@@ -13,6 +13,7 @@
     "environment",
     "execution",
     "topology",
+    "payload_protection",
     "faults",
     "history",
     "checker",
@@ -107,6 +108,16 @@
         },
         "transport_mode": { "const": "loopback-plaintext-test-only" },
         "counts_for_tls_rotation": { "const": false }
+      }
+    },
+    "payload_protection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "synthetic_data_only", "counts_for_production_encryption"],
+      "properties": {
+        "mode": { "const": "fixed-memory-provider-synthetic-wrapper-only" },
+        "synthetic_data_only": { "const": true },
+        "counts_for_production_encryption": { "const": false }
       }
     },
     "faults": {
@@ -236,7 +247,8 @@
           "crash_point_matrix",
           "version_migration_rollback",
           "resource_soak",
-          "signed_release_bundle"
+          "signed_release_bundle",
+          "distributed_hkms_payload_key_rotation"
         ]
       }
     }

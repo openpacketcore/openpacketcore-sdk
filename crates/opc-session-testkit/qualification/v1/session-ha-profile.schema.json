@@ -195,6 +195,8 @@
         "required_transport_modes",
         "foundation_transport_mode",
         "foundation_counts_for_tls_rotation",
+        "foundation_payload_protection",
+        "foundation_counts_for_production_encryption",
         "unresolved_dependencies"
       ],
       "properties": {
@@ -206,6 +208,8 @@
         "required_transport_modes": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "enum": ["mtls"] } },
         "foundation_transport_mode": { "const": "loopback-plaintext-test-only" },
         "foundation_counts_for_tls_rotation": { "const": false },
+        "foundation_payload_protection": { "const": "fixed-memory-provider-synthetic-wrapper-only" },
+        "foundation_counts_for_production_encryption": { "const": false },
         "unresolved_dependencies": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "type": "integer", "minimum": 1 } }
       }
     }
