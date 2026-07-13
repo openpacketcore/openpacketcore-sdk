@@ -49,8 +49,23 @@ const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
 // Each scenario below starts a complete Openraft fleet in its own Tokio
 // runtime. Running those fleets concurrently is artificial and can starve
 // election/readiness progress on the i686 CI runner, so keep the expensive
-// integration scenarios sequential within this test binary.
-static OPENRAFT_FLEET_TEST_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+// integration scenarios sequential within this test binary. The synchronous
+// wrapper holds this guard until after its runtime has shut down, preventing a
+// following fleet from overlapping background work owned by the prior runtime.
+static OPENRAFT_FLEET_TEST_GUARD: StdMutex<()> = StdMutex::new(());
+
+fn run_openraft_fleet_test(worker_threads: usize, scenario: impl std::future::Future<Output = ()>) {
+    let _fleet_test_guard = OPENRAFT_FLEET_TEST_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("Openraft fleet test runtime");
+    runtime.block_on(scenario);
+    drop(runtime);
+}
 
 struct TestPki {
     ca_cert: rcgen::Certificate,
@@ -1914,14 +1929,9 @@ async fn consensus_inflight_rpc_drains_and_reauthenticates_on_renewed_material()
     server.abort_and_wait().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
+async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter_case() {
     const REPLICAS: [u16; 3] = [1, 2, 3];
 
-    let _fleet_test_permit = OPENRAFT_FLEET_TEST_PERMIT
-        .acquire()
-        .await
-        .expect("Openraft fleet test permit remains open");
     let pki = TestPki::new();
     let manifest = manifest("config-openraft-mtls", 9, 1);
     let directory = tempfile::tempdir().expect("config cluster directory");
@@ -2263,12 +2273,15 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_mtls_openraft_sqlite_boot_restore_and_live_survivor_scan() {
-    let _fleet_test_permit = OPENRAFT_FLEET_TEST_PERMIT
-        .acquire()
-        .await
-        .expect("Openraft fleet test permit remains open");
+#[test]
+fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
+    run_openraft_fleet_test(
+        4,
+        config_openraft_forms_and_commits_over_the_shared_mtls_adapter_case(),
+    );
+}
+
+async fn real_mtls_openraft_sqlite_boot_restore_and_live_survivor_scan_case() {
     const REPLICAS: [u16; 3] = [1, 2, 3];
     const CONSENSUS_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -2539,6 +2552,14 @@ async fn real_mtls_openraft_sqlite_boot_restore_and_live_survivor_scan() {
     }
 }
 
+#[test]
+fn real_mtls_openraft_sqlite_boot_restore_and_live_survivor_scan() {
+    run_openraft_fleet_test(
+        4,
+        real_mtls_openraft_sqlite_boot_restore_and_live_survivor_scan_case(),
+    );
+}
+
 fn fleet_identity_states(
     leaves: &[RotationLeaf],
     intermediate: &RotationIntermediate,
@@ -2695,14 +2716,14 @@ async fn qualify_mtls_fleet_rotation(member_count: usize) {
     fleet.finish().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn three_and_five_member_openraft_fleets_rotate_and_rollback_real_mtls() {
-    let _fleet_test_permit = OPENRAFT_FLEET_TEST_PERMIT
-        .acquire()
-        .await
-        .expect("Openraft fleet test permit remains open");
-    qualify_mtls_fleet_rotation(3).await;
-    qualify_mtls_fleet_rotation(5).await;
+#[test]
+fn three_member_openraft_fleet_rotates_and_rolls_back_real_mtls() {
+    run_openraft_fleet_test(8, qualify_mtls_fleet_rotation(3));
+}
+
+#[test]
+fn five_member_openraft_fleet_rotates_and_rolls_back_real_mtls() {
+    run_openraft_fleet_test(8, qualify_mtls_fleet_rotation(5));
 }
 
 #[tokio::test]
