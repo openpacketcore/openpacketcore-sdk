@@ -458,15 +458,12 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use opc_consensus::engine::{Entry, EntryPayload};
-    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
     use crate::consensus::{
         SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusRequestId, SessionMutationIntent,
+        SessionConsensusConfigurationId,
     };
-    use crate::model::{OwnerId, SessionKey, SessionKeyType};
 
     #[derive(Debug)]
     struct MockPeer {
@@ -639,54 +636,11 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn oversized_append_asks_openraft_to_split_entries() {
-        let local_node_id = node_id(1);
-        let identity = identity(1);
-        let command = super::super::SessionConsensusCommand {
-            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
-            identity,
-            request_id: SessionConsensusRequestId::from_bytes([3; 16]),
-            logical_time: Timestamp::now_utc(),
-            intent: SessionMutationIntent::AcquireLease {
-                key: SessionKey {
-                    tenant: TenantId::from_static("test-tenant"),
-                    nf_kind: NetworkFunctionKind::smf(),
-                    key_type: SessionKeyType::PduSession,
-                    stable_id: Bytes::from(vec![
-                        0xa5;
-                        opc_consensus::CONSENSUS_MAX_RPC_PAYLOAD_BYTES + 1
-                    ]),
-                },
-                owner: OwnerId::new("replica-1").expect("valid test owner"),
-                ttl: Duration::from_secs(30),
-            },
-        };
-        let request = AppendEntriesRequest {
-            vote: Vote::new_committed(7, local_node_id),
-            prev_log_id: None,
-            entries: vec![Entry::<SessionRaftTypeConfig> {
-                log_id: Default::default(),
-                payload: EntryPayload::Normal(command),
-            }],
-            leader_commit: None,
-        };
-        let factory = SessionRaftNetworkFactory::try_new(identity, local_node_id, BTreeMap::new())
-            .expect("valid empty routing table");
-        let network = SessionRaftNetwork {
-            identity: factory.identity,
-            local_node_id,
-            target: node_id(2),
-            peer: None,
-        };
-
-        let error = network
-            .append(&request, RPCOption::new(Duration::from_secs(1)))
-            .await
-            .expect_err("oversized append must be split");
-        match error {
-            EngineRpcError::PayloadTooLarge(error) => assert_eq!(error.entries_hint(), 1),
-            other => panic!("unexpected oversized append error: {other}"),
-        }
+    #[test]
+    fn stable_id_domain_prevents_oversized_append_payloads() {
+        assert_eq!(
+            crate::StableId::new(Bytes::from(vec![0xa5; crate::STABLE_ID_MAX_BYTES + 1])),
+            Err(crate::StableIdError::InvalidWidth)
+        );
     }
 }

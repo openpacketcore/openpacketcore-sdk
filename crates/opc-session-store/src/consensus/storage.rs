@@ -945,7 +945,9 @@ mod tests {
             tenant: TenantId::from_static("storage-test"),
             nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"opaque-stable-id"),
+            stable_id: Bytes::from_static(b"opaque-stable-id")
+                .try_into()
+                .expect("valid stable ID"),
         }
     }
 

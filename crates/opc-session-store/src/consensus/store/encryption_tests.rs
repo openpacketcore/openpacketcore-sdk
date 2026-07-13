@@ -159,7 +159,9 @@ fn key(label: &'static [u8]) -> SessionKey {
         tenant: tenant(),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(label),
+        stable_id: Bytes::from_static(label)
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 

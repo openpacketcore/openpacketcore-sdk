@@ -22,7 +22,22 @@ fn test_session_key() -> SessionKey {
         tenant: opc_types::TenantId::new("test-tenant").unwrap(),
         nf_kind: opc_types::NetworkFunctionKind::new("amf").unwrap(),
         key_type: opc_session_store::SessionKeyType::SubscriberContext,
-        stable_id: bytes::Bytes::copy_from_slice(&[0xAA; 16]),
+        stable_id: bytes::Bytes::copy_from_slice(&[0xAA; 16])
+            .try_into()
+            .expect("valid stable ID"),
+    }
+}
+
+#[test]
+fn cache_keys_share_the_model_wide_stable_id_boundary() {
+    for (width, accepted) in [
+        (0, false),
+        (1, true),
+        (opc_session_store::STABLE_ID_MAX_BYTES, true),
+        (opc_session_store::STABLE_ID_MAX_BYTES + 1, false),
+    ] {
+        let stable_id = opc_session_store::StableId::new(bytes::Bytes::from(vec![0xa5; width]));
+        assert_eq!(stable_id.is_ok(), accepted, "stable ID width {width}");
     }
 }
 

@@ -79,7 +79,9 @@ fn test_key_with_stable_id(stable_id: &'static [u8]) -> SessionKey {
         tenant: TenantId::new("tenant-a").unwrap(),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(stable_id),
+        stable_id: Bytes::from_static(stable_id)
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 

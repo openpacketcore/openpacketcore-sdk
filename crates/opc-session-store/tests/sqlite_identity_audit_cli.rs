@@ -38,7 +38,7 @@ fn cli_returns_versioned_count_only_json_and_stable_exit_codes() {
     assert_eq!(compliant.status.code(), Some(0));
     let compliant_json: serde_json::Value =
         serde_json::from_slice(&compliant.stdout).expect("compliant JSON");
-    assert_eq!(compliant_json["report_version"], 1);
+    assert_eq!(compliant_json["report_version"], 2);
     assert_eq!(compliant_json["status"], "compliant");
     assert!(compliant.stderr.is_empty());
 

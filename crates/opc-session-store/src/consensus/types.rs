@@ -196,3 +196,46 @@ impl<T> SessionConsensusRpc<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    use super::*;
+    use crate::{OwnerId, SessionKeyType, StableId, STABLE_ID_MAX_BYTES};
+
+    #[test]
+    fn consensus_intent_serde_enforces_stable_id_before_admission() {
+        let key = SessionKey {
+            tenant: TenantId::from_static("consensus-stable-id-test"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from(vec![0xa5; STABLE_ID_MAX_BYTES]))
+                .expect("maximum stable ID"),
+        };
+        let intent = SessionMutationIntent::AcquireLease {
+            key,
+            owner: OwnerId::new("owner-a").expect("owner"),
+            ttl: Duration::from_secs(60),
+        };
+        let valid = serde_json::to_value(intent).expect("valid intent");
+
+        for (width, accepted) in [
+            (0, false),
+            (1, true),
+            (STABLE_ID_MAX_BYTES, true),
+            (STABLE_ID_MAX_BYTES + 1, false),
+        ] {
+            let mut wire = valid.clone();
+            wire["AcquireLease"]["key"]["stable_id"] = serde_json::json!(vec![0xa5_u8; width]);
+            let decoded = serde_json::from_value::<SessionMutationIntent>(wire);
+            assert_eq!(decoded.is_ok(), accepted, "stable ID width {width}");
+            if let Err(error) = decoded {
+                assert!(!error.to_string().contains("165"));
+            }
+        }
+    }
+}

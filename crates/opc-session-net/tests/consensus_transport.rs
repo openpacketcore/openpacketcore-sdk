@@ -177,7 +177,9 @@ fn restore_key(label: &'static [u8]) -> SessionKey {
         tenant: TenantId::from_static("mtls-restore-tenant"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(label),
+        stable_id: Bytes::from_static(label)
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 

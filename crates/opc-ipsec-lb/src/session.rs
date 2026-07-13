@@ -155,13 +155,19 @@ impl SessionOwnershipKeyspace {
         Self { tenant, nf_kind }
     }
 
-    fn key(&self, stable_id: Vec<u8>) -> SessionKey {
-        SessionKey {
+    fn key(&self, stable_id: Vec<u8>) -> Result<SessionKey, IpsecLbError> {
+        let stable_id = opc_session_store::StableId::new(Bytes::from(stable_id)).map_err(|_| {
+            IpsecLbError::InvalidConfig {
+                field: "session_store_stable_id",
+                reason: "ownership key exceeds the session-store production profile",
+            }
+        })?;
+        Ok(SessionKey {
             tenant: self.tenant.clone(),
             nf_kind: self.nf_kind.clone(),
             key_type: SessionKeyType::other(OWNERSHIP_KEY_TYPE).expect("static ownership key type"),
-            stable_id: Bytes::from(stable_id),
-        }
+            stable_id,
+        })
     }
 }
 
@@ -170,7 +176,7 @@ impl SessionOwnershipKeyResolver for SessionOwnershipKeyspace {
         let mut stable_id = Vec::with_capacity(SHARD_KEY_PREFIX.len() + 2);
         stable_id.extend_from_slice(SHARD_KEY_PREFIX);
         stable_id.extend_from_slice(&shard.get().to_be_bytes());
-        Ok(self.key(stable_id))
+        self.key(stable_id)
     }
 
     fn sa_key(&self, sa: SaId) -> Result<SessionKey, IpsecLbError> {
@@ -188,7 +194,7 @@ impl SessionOwnershipKeyResolver for SessionOwnershipKeyspace {
                 stable_id.extend_from_slice(&spi.to_be_bytes());
             }
         }
-        Ok(self.key(stable_id))
+        self.key(stable_id)
     }
 }
 

@@ -813,7 +813,9 @@ async fn changed_source_stale_target_and_corrupt_backup_fail_closed() {
         tenant: TenantId::from_static("tenant-a"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(b"latched-legacy-probe"),
+        stable_id: Bytes::from_static(b"latched-legacy-probe")
+            .try_into()
+            .expect("valid stable ID"),
     };
     assert!(matches!(
         restarted_legacy.get(&probe_key).await,
@@ -2019,7 +2021,9 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
         tenant: TenantId::from_static("tenant-a"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(b"legacy-protected-session"),
+        stable_id: Bytes::from_static(b"legacy-protected-session")
+            .try_into()
+            .expect("valid stable ID"),
     };
     let protected_lease = protected
         .acquire(
@@ -2340,7 +2344,9 @@ async fn recovery_epoch_is_durable_idempotent_and_invalidates_old_credentials() 
         tenant: TenantId::from_static("recovery-epoch-tenant"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(b"recovery-epoch-session"),
+        stable_id: Bytes::from_static(b"recovery-epoch-session")
+            .try_into()
+            .expect("valid stable ID"),
     };
     let guard = backend
         .acquire(
