@@ -23,6 +23,9 @@ use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode, ValidationLevel};
 ))]
 use opc_proto_diameter::apps::APP_DICTIONARIES;
 
+#[cfg(feature = "app-swm")]
+use opc_proto_diameter::apps::SWM_PROJECTED_PROFILE_DICTIONARIES;
+
 /// Every decode entry point the fuzz targets exercise. Must never panic,
 /// regardless of input. Decode returning `Err` is expected and fine.
 fn exercise_message(data: &[u8]) {
@@ -45,6 +48,38 @@ fn exercise_message(data: &[u8]) {
 
     // Owned decode path.
     let _ = OwnedMessage::decode_owned(Bytes::copy_from_slice(data), DecodeContext::default());
+
+    // Application-aware command/cardinality paths.
+    #[cfg(any(
+        feature = "app-gx",
+        feature = "app-rf",
+        feature = "app-s6a",
+        feature = "app-s6b",
+        feature = "app-swm",
+        feature = "app-swx"
+    ))]
+    {
+        let _ =
+            Message::decode_with_dictionary(data, DecodeContext::conservative(), APP_DICTIONARIES);
+        let _ = OwnedMessage::decode_owned_with_dictionary(
+            Bytes::copy_from_slice(data),
+            DecodeContext::conservative(),
+            APP_DICTIONARIES,
+        );
+        #[cfg(feature = "app-swm")]
+        {
+            let _ = Message::decode_with_dictionary(
+                data,
+                DecodeContext::conservative(),
+                SWM_PROJECTED_PROFILE_DICTIONARIES,
+            );
+            let _ = OwnedMessage::decode_owned_with_dictionary(
+                Bytes::copy_from_slice(data),
+                DecodeContext::conservative(),
+                SWM_PROJECTED_PROFILE_DICTIONARIES,
+            );
+        }
+    }
 
     // Dictionary-aware validation (grouped AVP recursion, depth-limited).
     #[cfg(any(

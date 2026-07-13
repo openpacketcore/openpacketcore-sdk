@@ -325,10 +325,18 @@ mod tests {
     fn base_dictionary_contains_peer_commands() {
         let dictionary = dictionary();
         assert!(dictionary
-            .find_command(COMMAND_CAPABILITIES_EXCHANGE, CommandKind::Request)
+            .find_command(
+                APPLICATION_ID_COMMON_MESSAGES,
+                COMMAND_CAPABILITIES_EXCHANGE,
+                CommandKind::Request,
+            )
             .is_some());
         assert!(dictionary
-            .find_command(COMMAND_DEVICE_WATCHDOG, CommandKind::Answer)
+            .find_command(
+                APPLICATION_ID_COMMON_MESSAGES,
+                COMMAND_DEVICE_WATCHDOG,
+                CommandKind::Answer,
+            )
             .is_some());
     }
 

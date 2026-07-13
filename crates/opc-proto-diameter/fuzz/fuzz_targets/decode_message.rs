@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opc_proto_diameter::apps::APP_DICTIONARIES;
+use opc_proto_diameter::apps::{APP_DICTIONARIES, SWM_PROJECTED_PROFILE_DICTIONARIES};
 use opc_proto_diameter::{Message, OwnedMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode, ValidationLevel};
 
@@ -28,6 +28,28 @@ fuzz_target!(|data: &[u8]| {
     let _ = OwnedMessage::decode_owned(
         bytes::Bytes::copy_from_slice(data),
         DecodeContext::default(),
+    );
+
+    // Application-aware command resolution and cardinality validation.
+    let _ = Message::decode_with_dictionary(
+        data,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+    );
+    let _ = OwnedMessage::decode_owned_with_dictionary(
+        bytes::Bytes::copy_from_slice(data),
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+    );
+    let _ = Message::decode_with_dictionary(
+        data,
+        DecodeContext::conservative(),
+        SWM_PROJECTED_PROFILE_DICTIONARIES,
+    );
+    let _ = OwnedMessage::decode_owned_with_dictionary(
+        bytes::Bytes::copy_from_slice(data),
+        DecodeContext::conservative(),
+        SWM_PROJECTED_PROFILE_DICTIONARIES,
     );
 
     // Dictionary-aware validation (grouped AVP recursion, depth-limited).

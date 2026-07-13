@@ -228,6 +228,59 @@ pub enum CommandKind {
     Answer,
 }
 
+/// Command-specific occurrence constraint for an AVP.
+///
+/// Diameter AVP repeatability is defined by each command grammar. It is not a
+/// global property of an AVP code, so decoders must resolve a command before
+/// using this metadata to exempt an AVP from duplicate rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AvpCardinality {
+    /// The AVP may be absent and may occur at most once.
+    ZeroOrOne,
+    /// The AVP may occur any number of times.
+    ZeroOrMore,
+}
+
+impl AvpCardinality {
+    /// Return whether this cardinality permits more than one occurrence.
+    pub const fn allows_multiple(self) -> bool {
+        matches!(self, Self::ZeroOrMore)
+    }
+}
+
+/// One AVP occurrence rule from a Diameter command grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CommandAvpRule {
+    key: AvpKey,
+    cardinality: AvpCardinality,
+}
+
+impl CommandAvpRule {
+    /// Create a command-specific AVP occurrence rule.
+    pub const fn new(key: AvpKey, cardinality: AvpCardinality) -> Self {
+        Self { key, cardinality }
+    }
+
+    /// Return the vendor-aware AVP key governed by this rule.
+    pub const fn key(self) -> AvpKey {
+        self.key
+    }
+
+    /// Return the command-specific occurrence constraint.
+    pub const fn cardinality(self) -> AvpCardinality {
+        self.cardinality
+    }
+}
+
+/// Failure to resolve exactly one application-aware command grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandLookupError {
+    /// No dictionary defines the requested application, code, and role.
+    Missing,
+    /// More than one dictionary defines the requested application, code, and role.
+    Ambiguous,
+}
+
 /// Metadata for a Diameter command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandDefinition {
@@ -237,6 +290,7 @@ pub struct CommandDefinition {
     application_id: ApplicationId,
     proxiable: bool,
     spec_ref: SpecRef,
+    avp_rules: &'static [CommandAvpRule],
 }
 
 impl CommandDefinition {
@@ -256,7 +310,14 @@ impl CommandDefinition {
             application_id,
             proxiable,
             spec_ref,
+            avp_rules: &[],
         }
+    }
+
+    /// Attach command-specific AVP occurrence metadata.
+    pub const fn with_avp_rules(mut self, avp_rules: &'static [CommandAvpRule]) -> Self {
+        self.avp_rules = avp_rules;
+        self
     }
 
     /// Return the command code.
@@ -287,6 +348,23 @@ impl CommandDefinition {
     /// Return the specification reference for this command definition.
     pub const fn spec_ref(&self) -> &SpecRef {
         &self.spec_ref
+    }
+
+    /// Return the command-specific AVP occurrence metadata.
+    pub const fn avp_rules(&self) -> &'static [CommandAvpRule] {
+        self.avp_rules
+    }
+
+    /// Return the occurrence rule for a vendor-aware AVP key, when declared.
+    pub fn find_avp_rule(&self, key: AvpKey) -> Option<&CommandAvpRule> {
+        self.avp_rules.iter().find(|rule| rule.key() == key)
+    }
+
+    /// Return whether the command grammar explicitly permits this AVP to repeat.
+    pub fn allows_multiple(&self, key: AvpKey) -> bool {
+        self.find_avp_rule(key)
+            .map(|rule| rule.cardinality().allows_multiple())
+            .unwrap_or(false)
     }
 }
 
@@ -388,11 +466,18 @@ impl Dictionary {
             .find(|definition| definition.id() == id)
     }
 
-    /// Find a command definition by code and request/answer role.
-    pub fn find_command(&self, code: CommandCode, kind: CommandKind) -> Option<&CommandDefinition> {
-        self.commands
-            .iter()
-            .find(|definition| definition.code() == code && definition.kind() == kind)
+    /// Find a command definition by application, code, and request/answer role.
+    pub fn find_command(
+        &self,
+        application_id: ApplicationId,
+        code: CommandCode,
+        kind: CommandKind,
+    ) -> Option<&CommandDefinition> {
+        self.commands.iter().find(|definition| {
+            definition.application_id() == application_id
+                && definition.code() == code
+                && definition.kind() == kind
+        })
     }
 
     /// Find an AVP definition by code plus optional vendor identifier.
@@ -428,12 +513,38 @@ impl<'a> DictionarySet<'a> {
     /// Find a command definition in the set.
     pub fn find_command(
         self,
+        application_id: ApplicationId,
         code: CommandCode,
         kind: CommandKind,
     ) -> Option<&'a CommandDefinition> {
-        self.dictionaries
-            .iter()
-            .find_map(|dictionary| dictionary.find_command(code, kind))
+        self.resolve_command(application_id, code, kind).ok()
+    }
+
+    /// Resolve exactly one application-aware command grammar.
+    ///
+    /// Layered dictionary sets fail closed when the same command is supplied
+    /// by multiple profiles. Callers must select one trusted profile instead
+    /// of relying on dictionary order to choose security-critical cardinality.
+    pub fn resolve_command(
+        self,
+        application_id: ApplicationId,
+        code: CommandCode,
+        kind: CommandKind,
+    ) -> Result<&'a CommandDefinition, CommandLookupError> {
+        let mut match_definition = None;
+        for dictionary in self.dictionaries {
+            for definition in dictionary.commands().iter().filter(|definition| {
+                definition.application_id() == application_id
+                    && definition.code() == code
+                    && definition.kind() == kind
+            }) {
+                if match_definition.is_some() {
+                    return Err(CommandLookupError::Ambiguous);
+                }
+                match_definition = Some(definition);
+            }
+        }
+        match_definition.ok_or(CommandLookupError::Missing)
     }
 
     /// Find an AVP definition in the set.

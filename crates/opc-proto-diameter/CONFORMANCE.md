@@ -41,12 +41,18 @@ This document defines the conformance status of the `opc-proto-diameter` crate.
 
 - Per-region AVP count limit via `DecodeContext::max_ies`.
 - Duplicate AVP-key policy: `Reject`, `First`, `Last`.
+- Trusted command-aware validation resolves application id, command code, and
+  request/answer role uniquely, then permits a duplicate only when that
+  command profile explicitly marks the vendor-aware AVP key repeatable.
+- Missing and ambiguous command profiles fail closed. Raw/non-command decode
+  retains blanket duplicate rejection under `DuplicateIePolicy::Reject`.
 - Dictionary-defined grouped AVP recursion bounded by
   `DecodeContext::max_depth`.
 - Raw AVP-region validation checks lengths, counts, duplicates, padding, and
   dictionary-defined grouped-AVP recursion; it preserves unknown AVPs as opaque
   bytes. Unknown-mandatory rejection is a typed-layer policy enforced by the
-  `peer` and application parsers (see below), not by the raw validator.
+  `peer` and application parsers (see below), not by the raw or command-
+  cardinality validator.
 
 ### 4. Base peer procedures (RFC 6733 §5.3–5.5)
 
@@ -123,12 +129,15 @@ profile material is accepted only when Result-Code is exactly
 remains `None`; an unresolved or ambiguous profile fails closed, and the
 resolver independently returns `None` for any invalid profile.
 
-Until #131 makes duplicate rejection command-cardinality aware, the generic
-`DecodeContext::conservative()` pre-scan treats this profile's repeated
-`APN-Configuration` extension AVPs as duplicates. Consumers of the repeated
-extension must explicitly use `DuplicateIePolicy::Last`; the typed parser still
-rejects every duplicated singleton with `set_once`. This exception is scoped to
-the opt-in projection profile and is not a baseline SWm cardinality claim.
+The baseline SWm command profile marks `State` repeatable and keeps
+`APN-Configuration` singleton. The separate
+`SWM_PROJECTED_PROFILE_DICTIONARIES` profile also marks APN-Configuration
+repeatable for explicitly configured peers. `Message::decode_with_dictionary`
+supports both with `DecodeContext::conservative()` while all undeclared,
+unknown, and nested grouped keys retain duplicate rejection. Supplying both
+profiles is ambiguous and fails closed; typed `set_once` checks independently
+protect singleton fields. The opt-in profile remains an interoperability
+extension and is not a baseline SWm cardinality claim.
 
 The modeled APN-Configuration child subset is `Context-Identifier`,
 `Service-Selection`, `PDN-Type`, `EPS-Subscribed-QoS-Profile` (QCI +
@@ -166,7 +175,9 @@ preallocate from a wire-declared length. Three layers guard them:
 
 - **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
   fuzz corpus entry, byte-truncations of each entry, and hostile constant
-  inputs through the message and AVP decode entry points under `catch_unwind`.
+  inputs through raw, owned, dictionary-command, and AVP decode entry points
+  under `catch_unwind`. Seeds include repeated SWm State and the explicit
+  projected two-APN profile.
   Runs in ordinary `cargo test`; no nightly toolchain or libFuzzer required.
 - **Corpus generator flag-validation guard** — `fuzz/generate_corpus.py
   self-test` exercises the `avp()` helper's acceptance of valid flags and

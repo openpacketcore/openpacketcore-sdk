@@ -46,8 +46,9 @@ use opc_protocol::{
 };
 
 pub use dictionary::{
-    ApplicationDefinition, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey, CommandDefinition,
-    CommandKind, Dictionary, DictionarySet, FlagRequirement,
+    ApplicationDefinition, AvpCardinality, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey,
+    CommandAvpRule, CommandDefinition, CommandKind, CommandLookupError, Dictionary, DictionarySet,
+    FlagRequirement,
 };
 
 /// Diameter protocol version defined by RFC 6733.
@@ -477,6 +478,33 @@ pub struct Message<'a> {
 }
 
 impl<'a> Message<'a> {
+    /// Decode a message against exactly one trusted application command grammar.
+    ///
+    /// Unlike [`BorrowDecode::decode`], this entry point permits only AVPs that
+    /// the resolved command metadata explicitly marks repeatable to bypass
+    /// [`DuplicateIePolicy::Reject`]. Command resolution includes application
+    /// identifier, command code, and request/answer role, and fails closed when
+    /// the supplied dictionary set is missing or ambiguous.
+    pub fn decode_with_dictionary(
+        input: &'a [u8],
+        ctx: DecodeContext,
+        dictionaries: DictionarySet<'_>,
+    ) -> DecodeResult<'a, Self> {
+        // Decode framing and all non-duplicate structural constraints first.
+        // Command-aware validation below applies the caller's actual duplicate
+        // policy after the header has selected one trusted grammar.
+        let framing_ctx = DecodeContext {
+            duplicate_ie_policy: DuplicateIePolicy::First,
+            ..ctx
+        };
+        let (tail, message) = Self::decode(input, framing_ctx)?;
+        message.resolve_command(dictionaries)?;
+        if ctx.validation_level != ValidationLevel::HeaderOnly {
+            message.validate_command_avps_with_dictionary(ctx, dictionaries)?;
+        }
+        Ok((tail, message))
+    }
+
     /// Return an iterator over raw top-level AVPs.
     pub fn avps(&self, ctx: DecodeContext) -> RawAvpIterator<'a> {
         RawAvpIterator::new(self.raw_avps, ctx)
@@ -501,7 +529,53 @@ impl<'a> Message<'a> {
             DIAMETER_HEADER_LEN,
             0,
             Some(dictionaries),
+            None,
         )
+    }
+
+    /// Validate this message using its uniquely resolved command cardinality.
+    ///
+    /// Error offsets are relative to the Diameter message start. Only
+    /// top-level AVPs explicitly declared repeatable by the resolved command
+    /// may repeat; nested grouped regions retain reject-all duplicate behavior.
+    pub fn validate_command_avps_with_dictionary(
+        &self,
+        ctx: DecodeContext,
+        dictionaries: DictionarySet<'_>,
+    ) -> Result<(), DecodeError> {
+        let command = self.resolve_command(dictionaries)?;
+        validate_avp_region_at(
+            self.raw_avps,
+            ctx,
+            DIAMETER_HEADER_LEN,
+            0,
+            Some(dictionaries),
+            Some(command),
+        )
+    }
+
+    fn resolve_command<'dictionary>(
+        &self,
+        dictionaries: DictionarySet<'dictionary>,
+    ) -> Result<&'dictionary CommandDefinition, DecodeError> {
+        dictionaries
+            .resolve_command(
+                self.header.application_id,
+                self.header.command_code,
+                self.header.flags.command_kind(),
+            )
+            .map_err(|error| {
+                let reason = match error {
+                    CommandLookupError::Missing => {
+                        "diameter command grammar is missing for application, code, and role"
+                    }
+                    CommandLookupError::Ambiguous => {
+                        "diameter command grammar is ambiguous for application, code, and role"
+                    }
+                };
+                DecodeError::new(DecodeErrorCode::Structural { reason }, 5)
+                    .with_spec_ref(SpecRef::new("ietf", "RFC6733", "3"))
+            })
     }
 
     fn encoded_len(&self) -> Result<u32, EncodeError> {
@@ -598,6 +672,20 @@ impl OwnedMessage {
             raw_avps: &self.raw_avps,
             tail: &[],
         }
+    }
+
+    /// Decode an owned message against exactly one trusted command grammar.
+    pub fn decode_owned_with_dictionary(
+        input: Bytes,
+        ctx: DecodeContext,
+        dictionaries: DictionarySet<'_>,
+    ) -> Result<Self, DecodeError> {
+        let (_, borrowed) = Message::decode_with_dictionary(&input, ctx, dictionaries)?;
+        let msg_end = borrowed.header.length as usize;
+        Ok(Self {
+            header: borrowed.header,
+            raw_avps: input.slice(DIAMETER_HEADER_LEN..msg_end),
+        })
     }
 }
 
@@ -803,7 +891,7 @@ impl<'a> RawAvp<'a> {
     ///
     /// The returned error offsets are relative to the grouped value slice.
     pub fn validate_grouped_value(&self, ctx: DecodeContext) -> Result<(), DecodeError> {
-        validate_avp_region_at(self.value, ctx, 0, 1, None)
+        validate_avp_region_at(self.value, ctx, 0, 1, None, None)
     }
 
     /// Validate this AVP's value and dictionary-defined nested grouped AVPs recursively.
@@ -814,7 +902,7 @@ impl<'a> RawAvp<'a> {
         ctx: DecodeContext,
         dictionaries: DictionarySet<'_>,
     ) -> Result<(), DecodeError> {
-        validate_avp_region_at(self.value, ctx, 0, 1, Some(dictionaries))
+        validate_avp_region_at(self.value, ctx, 0, 1, Some(dictionaries), None)
     }
 
     fn encoded_lens(&self) -> Result<(u32, usize), EncodeError> {
@@ -877,7 +965,7 @@ impl<'a> Iterator for RawAvpIterator<'a> {
 /// grouped AVP values without dictionary metadata; use
 /// [`validate_avp_region_with_dictionary`] for dictionary-defined grouped AVPs.
 pub fn validate_avp_region(input: &[u8], ctx: DecodeContext) -> Result<(), DecodeError> {
-    validate_avp_region_at(input, ctx, 0, 0, None)
+    validate_avp_region_at(input, ctx, 0, 0, None, None)
 }
 
 /// Validate a Diameter AVP region using dictionary metadata for grouped AVPs.
@@ -890,7 +978,7 @@ pub fn validate_avp_region_with_dictionary(
     ctx: DecodeContext,
     dictionaries: DictionarySet<'_>,
 ) -> Result<(), DecodeError> {
-    validate_avp_region_at(input, ctx, 0, 0, Some(dictionaries))
+    validate_avp_region_at(input, ctx, 0, 0, Some(dictionaries), None)
 }
 
 fn decode_raw_avp<'a>(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, RawAvp<'a>> {
@@ -976,7 +1064,7 @@ fn decode_raw_avp<'a>(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, R
 }
 
 fn validate_top_level_avps(input: &[u8], ctx: DecodeContext) -> Result<(), DecodeError> {
-    validate_avp_region_at(input, ctx, DIAMETER_HEADER_LEN, 0, None)
+    validate_avp_region_at(input, ctx, DIAMETER_HEADER_LEN, 0, None, None)
 }
 
 fn validate_avp_region_at(
@@ -985,6 +1073,7 @@ fn validate_avp_region_at(
     base_offset: usize,
     depth: usize,
     dictionaries: Option<DictionarySet<'_>>,
+    command: Option<&CommandDefinition>,
 ) -> Result<(), DecodeError> {
     let spec_ref = SpecRef::new("ietf", "RFC6733", "4");
     // This catches public grouped-value entry points (which start at depth 1)
@@ -1023,7 +1112,11 @@ fn validate_avp_region_at(
 
         if ctx.duplicate_ie_policy == DuplicateIePolicy::Reject {
             let key = avp.header.key();
-            if !seen_keys.get_or_insert_with(HashSet::new).insert(key) {
+            let repeated = !seen_keys.get_or_insert_with(HashSet::new).insert(key);
+            let repeatable = command
+                .map(|definition| definition.allows_multiple(key))
+                .unwrap_or(false);
+            if repeated && !repeatable {
                 return Err(
                     DecodeError::new(DecodeErrorCode::DuplicateIe, offset).with_spec_ref(spec_ref)
                 );
@@ -1043,7 +1136,7 @@ fn validate_avp_region_at(
                 DecodeError::new(DecodeErrorCode::LengthOverflow, offset)
                     .with_spec_ref(spec_ref.clone())
             })?;
-            validate_avp_region_at(avp.value, ctx, child_base, child_depth, dictionaries)?;
+            validate_avp_region_at(avp.value, ctx, child_base, child_depth, dictionaries, None)?;
         }
 
         let consumed = before.checked_sub(next.len()).ok_or_else(|| {
@@ -1108,6 +1201,39 @@ mod tests {
     use super::*;
     use bytes::BufMut;
     use quickcheck::{Arbitrary, Gen, TestResult};
+
+    const CARDINALITY_TEST_APPLICATION: ApplicationId = ApplicationId::new(4_242);
+    const CARDINALITY_TEST_COMMAND: CommandCode = CommandCode::new(4_243);
+    const CARDINALITY_TEST_AVP: AvpCode = AvpCode::new(4_244);
+    const CARDINALITY_TEST_VENDOR: VendorId = VendorId::new(10_415);
+    static CARDINALITY_TEST_RULES: [CommandAvpRule; 1] = [CommandAvpRule::new(
+        AvpKey::vendor(CARDINALITY_TEST_AVP, CARDINALITY_TEST_VENDOR),
+        AvpCardinality::ZeroOrMore,
+    )];
+    static CARDINALITY_TEST_COMMANDS: [CommandDefinition; 1] = [CommandDefinition::new(
+        CARDINALITY_TEST_COMMAND,
+        "Cardinality-Test-Request",
+        CommandKind::Request,
+        CARDINALITY_TEST_APPLICATION,
+        false,
+        SpecRef::new("ietf", "RFC6733", "4"),
+    )
+    .with_avp_rules(&CARDINALITY_TEST_RULES)];
+    static CARDINALITY_TEST_AVPS: [AvpDefinition; 1] = [AvpDefinition::new(
+        AvpKey::vendor(CARDINALITY_TEST_AVP, CARDINALITY_TEST_VENDOR),
+        "Cardinality-Test-AVP",
+        AvpDataType::OctetString,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("ietf", "RFC6733", "4"),
+    )];
+    static CARDINALITY_TEST_DICTIONARY: Dictionary = Dictionary::new(
+        "diameter-cardinality-property-test",
+        &[],
+        &CARDINALITY_TEST_COMMANDS,
+        &CARDINALITY_TEST_AVPS,
+    );
+    static CARDINALITY_TEST_DICTIONARIES: DictionarySet<'static> =
+        DictionarySet::new(&[&CARDINALITY_TEST_DICTIONARY]);
 
     #[derive(Clone, Debug)]
     struct ValidDiameterMessageBytes(Vec<u8>);
@@ -1220,6 +1346,80 @@ mod tests {
 
             TestResult::passed()
         }
+
+        fn prop_command_repeatability_is_vendor_aware(other_vendor: u32) -> bool {
+            let other_vendor = if other_vendor == CARDINALITY_TEST_VENDOR.get() {
+                other_vendor.wrapping_add(1)
+            } else {
+                other_vendor
+            };
+            let ctx = DecodeContext {
+                unknown_ie_policy: opc_protocol::UnknownIePolicy::Preserve,
+                ..DecodeContext::conservative()
+            };
+
+            let allowed_avp = encode_empty_vendor_cardinality_avp(CARDINALITY_TEST_VENDOR);
+            let mut allowed_region = BytesMut::new();
+            allowed_region.put_slice(&allowed_avp);
+            allowed_region.put_slice(&allowed_avp);
+            let allowed = encode_cardinality_test_message(&allowed_region);
+
+            let other_avp = encode_empty_vendor_cardinality_avp(VendorId::new(other_vendor));
+            let mut other_region = BytesMut::new();
+            other_region.put_slice(&other_avp);
+            other_region.put_slice(&other_avp);
+            let other = encode_cardinality_test_message(&other_region);
+
+            let mut mixed_region = BytesMut::new();
+            mixed_region.put_slice(&allowed_avp);
+            mixed_region.put_slice(&other_avp);
+            let mixed = encode_cardinality_test_message(&mixed_region);
+
+            Message::decode_with_dictionary(&allowed, ctx, CARDINALITY_TEST_DICTIONARIES).is_ok()
+                && Message::decode_with_dictionary(&mixed, ctx, CARDINALITY_TEST_DICTIONARIES)
+                    .is_ok()
+                && matches!(
+                    Message::decode_with_dictionary(
+                        &other,
+                        ctx,
+                        CARDINALITY_TEST_DICTIONARIES,
+                    ),
+                    Err(error) if matches!(error.code(), DecodeErrorCode::DuplicateIe)
+                        && error.offset() == DIAMETER_HEADER_LEN + other_avp.len()
+                )
+        }
+    }
+
+    fn encode_empty_vendor_cardinality_avp(vendor_id: VendorId) -> BytesMut {
+        let avp = RawAvp {
+            header: AvpHeader::vendor(CARDINALITY_TEST_AVP, vendor_id, false),
+            value: &[],
+            padding: &[],
+        };
+        let mut encoded = BytesMut::new();
+        if let Err(error) = avp.encode(&mut encoded, EncodeContext::default()) {
+            panic!("cardinality test AVP encode failed: {error}");
+        }
+        encoded
+    }
+
+    fn encode_cardinality_test_message(raw_avps: &[u8]) -> BytesMut {
+        let message = Message {
+            header: Header::new(
+                CommandFlags::request(false),
+                CARDINALITY_TEST_COMMAND,
+                CARDINALITY_TEST_APPLICATION,
+                1,
+                2,
+            ),
+            raw_avps,
+            tail: &[],
+        };
+        let mut encoded = BytesMut::new();
+        if let Err(error) = message.encode(&mut encoded, EncodeContext::default()) {
+            panic!("cardinality test message encode failed: {error}");
+        }
+        encoded
     }
 
     fn raw_avp_views(message: &Message<'_>, ctx: DecodeContext) -> Vec<RawAvpView> {

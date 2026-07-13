@@ -147,6 +147,22 @@ static APP_DICTIONARY_REFS: &[&Dictionary] = &[
 /// Dictionary set layering RFC 6733 base metadata before 3GPP application metadata.
 pub static APP_DICTIONARIES: DictionarySet<'static> = DictionarySet::new(APP_DICTIONARY_REFS);
 
+#[cfg(feature = "app-swm")]
+static SWM_PROJECTED_PROFILE_DICTIONARY_REFS: &[&Dictionary] = &[
+    base::dictionary(),
+    &APP_DICTIONARY,
+    swm::projected_profile_dictionary(),
+];
+
+/// Dictionary set for the explicitly configured SWm projected APN profile.
+///
+/// This set replaces the baseline SWm dictionary rather than layering both
+/// command profiles. It includes RFC 6733 base AVPs and fails closed if callers
+/// add another definition for the selected SWm command.
+#[cfg(feature = "app-swm")]
+pub static SWM_PROJECTED_PROFILE_DICTIONARIES: DictionarySet<'static> =
+    DictionarySet::new(SWM_PROJECTED_PROFILE_DICTIONARY_REFS);
+
 /// Return the static initial 3GPP application dictionary scaffold.
 pub const fn dictionary() -> &'static Dictionary {
     &APP_DICTIONARY

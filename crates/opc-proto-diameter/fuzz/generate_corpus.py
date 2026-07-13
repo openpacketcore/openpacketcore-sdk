@@ -261,6 +261,42 @@ def main() -> None:
         "swm_der",
     )
 
+    # 8. SWm DER with two State AVPs. State is repeatable in the command
+    #    grammar even under conservative dictionary-aware duplicate rejection.
+    repeated_state_der = der_avps
+    repeated_state_der += avp(24, 0x00, b"state-one", None)
+    repeated_state_der += avp(24, 0x00, b"state-two", None)
+    write_corpus(
+        msg_dir,
+        header(0xC0, 268, 16777264, 0x9999999A, 0xAAAAAAAB, repeated_state_der),
+        "swm_der_repeated_state",
+    )
+
+    # 9. SWm DEA carrying the opt-in projected APN profile. The two
+    #    APN-Configuration AVPs are repeatable only in that explicit profile.
+    dea_avps = b""
+    dea_avps += avp(263, 0x40, b"sess;swm;001", None)
+    dea_avps += avp(258, 0x40, u32(16777264), None)
+    dea_avps += avp(274, 0x40, u32(3), None)
+    dea_avps += avp(268, 0x40, u32(2001), None)
+    dea_avps += avp(264, 0x40, b"aaa.home.example", None)
+    dea_avps += avp(296, 0x40, b"home.example", None)
+    dea_avps += avp(462, 0x40, b"\x03\x18\x00\x04", None)
+    dea_avps += avp(1423, 0xC0, u32(8), vendor=10415)
+    apn_one = avp(1423, 0xC0, u32(7), vendor=10415)
+    apn_one += avp(493, 0x40, b"internet.mnc001.mcc001.gprs", None)
+    apn_one += avp(1456, 0xC0, u32(2), vendor=10415)
+    apn_two = avp(1423, 0xC0, u32(8), vendor=10415)
+    apn_two += avp(493, 0x40, b"ims.mnc001.mcc001.gprs", None)
+    apn_two += avp(1456, 0xC0, u32(1), vendor=10415)
+    dea_avps += avp(1430, 0xC0, apn_one, vendor=10415)
+    dea_avps += avp(1430, 0xC0, apn_two, vendor=10415)
+    write_corpus(
+        msg_dir,
+        header(0x40, 268, 16777264, 0x9999999B, 0xAAAAAAAC, dea_avps),
+        "swm_dea_projected_apn_profile",
+    )
+
     # -------------------------------------------------------------------------
     # Malformed message seeds (must not panic the decode surface)
     # -------------------------------------------------------------------------

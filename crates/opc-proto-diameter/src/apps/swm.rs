@@ -26,8 +26,8 @@ use super::VENDOR_ID_3GPP;
 use crate::avp::dictionary::Redacted;
 use crate::base;
 use crate::dictionary::{
-    ApplicationDefinition, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey, CommandDefinition,
-    CommandKind, Dictionary,
+    ApplicationDefinition, AvpCardinality, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey,
+    CommandAvpRule, CommandDefinition, CommandKind, Dictionary,
 };
 use crate::{ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage};
 
@@ -86,6 +86,35 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 1] = [CommandAvpRule::new(
+    AvpKey::ietf(AVP_STATE),
+    AvpCardinality::ZeroOrMore,
+)];
+
+static SWM_ANSWER_AVP_RULES: [CommandAvpRule; 3] = [
+    CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_APN_CONFIGURATION, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_CONTEXT_IDENTIFIER, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
+static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 3] = [
+    CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_APN_CONFIGURATION, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_CONTEXT_IDENTIFIER, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
 /// SWm Diameter-EAP-Request command definition.
 pub const COMMAND_DIAMETER_EAP_REQUEST: CommandDefinition = CommandDefinition::new(
     COMMAND_DIAMETER_EAP,
@@ -94,7 +123,8 @@ pub const COMMAND_DIAMETER_EAP_REQUEST: CommandDefinition = CommandDefinition::n
     APPLICATION_ID,
     true,
     SpecRef::new("3gpp", "TS29273", "DER"),
-);
+)
+.with_avp_rules(&SWM_REQUEST_AVP_RULES);
 
 /// SWm Diameter-EAP-Answer command definition.
 pub const COMMAND_DIAMETER_EAP_ANSWER: CommandDefinition = CommandDefinition::new(
@@ -104,7 +134,24 @@ pub const COMMAND_DIAMETER_EAP_ANSWER: CommandDefinition = CommandDefinition::ne
     APPLICATION_ID,
     true,
     SpecRef::new("3gpp", "TS29273", "DEA"),
-);
+)
+.with_avp_rules(&SWM_ANSWER_AVP_RULES);
+
+/// SWm DEA command profile for an explicitly negotiated APN-Configuration-Profile projection.
+///
+/// This is intentionally separate from [`COMMAND_DIAMETER_EAP_ANSWER`]: the
+/// baseline TS 29.273 DEA grammar permits at most one APN-Configuration, while
+/// this opt-in extension projects the repeatable TS 29.272 subscription profile.
+pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
+    CommandDefinition::new(
+        COMMAND_DIAMETER_EAP,
+        "Diameter-EAP-Answer (projected APN profile)",
+        CommandKind::Answer,
+        APPLICATION_ID,
+        true,
+        SpecRef::new("3gpp", "TS29273", "DEA extension AVP projection"),
+    )
+    .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
 const SWM_AVPS: [AvpDefinition; 18] = [
     AvpDefinition::new(
@@ -243,9 +290,28 @@ pub static DICTIONARY: Dictionary = Dictionary::new(
     &SWM_AVPS,
 );
 
+/// Static SWm dictionary for peers explicitly configured for the projected APN profile.
+///
+/// Supply this dictionary instead of [`DICTIONARY`]. Supplying both makes the
+/// DEA grammar ambiguous and dictionary-aware decode fails closed.
+pub static PROJECTED_PROFILE_DICTIONARY: Dictionary = Dictionary::new(
+    "diameter-3gpp-swm-projected-apn-profile",
+    &[APPLICATION],
+    &[
+        COMMAND_DIAMETER_EAP_REQUEST,
+        COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE,
+    ],
+    &SWM_AVPS,
+);
+
 /// Return the static SWm dictionary subset.
 pub const fn dictionary() -> &'static Dictionary {
     &DICTIONARY
+}
+
+/// Return the opt-in projected APN profile dictionary.
+pub const fn projected_profile_dictionary() -> &'static Dictionary {
+    &PROJECTED_PROFILE_DICTIONARY
 }
 
 /// Auth-Request-Type values used by SWm.

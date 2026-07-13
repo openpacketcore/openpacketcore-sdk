@@ -12,10 +12,25 @@ use opc_proto_diameter::apps::swm::{
 use opc_proto_diameter::{
     apps, base, ApplicationId, AvpCode, AvpDataType, AvpHeader, AvpKey, CommandCode, CommandFlags,
     CommandKind, DictionarySet, Header, Message, OwnedMessage, RawAvp, VendorId,
+    DIAMETER_HEADER_LEN,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DuplicateIePolicy, Encode, EncodeContext, UnknownIePolicy,
 };
+
+#[cfg(feature = "app-swm")]
+static SWM_BASELINE_DICTIONARIES: DictionarySet<'static> =
+    DictionarySet::new(&[base::dictionary(), apps::swm::dictionary()]);
+
+#[cfg(feature = "app-swm")]
+static SWM_AMBIGUOUS_DICTIONARIES: DictionarySet<'static> = DictionarySet::new(&[
+    base::dictionary(),
+    apps::swm::dictionary(),
+    apps::swm::projected_profile_dictionary(),
+]);
+
+#[cfg(feature = "app-swm")]
+static BASE_ONLY_DICTIONARIES: DictionarySet<'static> = DictionarySet::new(&[base::dictionary()]);
 
 fn encode_message(message: &opc_proto_diameter::OwnedMessage) -> BytesMut {
     let mut encoded = BytesMut::new();
@@ -44,7 +59,11 @@ fn rf_dictionary_contains_application_command_and_avps() {
     assert_eq!(app.name(), "3GPP Rf accounting over Diameter accounting");
 
     let acr = dictionary
-        .find_command(apps::rf::COMMAND_ACCOUNTING, CommandKind::Request)
+        .find_command(
+            apps::rf::APPLICATION_ID,
+            apps::rf::COMMAND_ACCOUNTING,
+            CommandKind::Request,
+        )
         .expect("ACR command must be present");
     assert_eq!(acr.name(), "Accounting-Request");
 
@@ -74,7 +93,11 @@ fn swm_dictionary_contains_application_command_and_avps() {
     assert_eq!(app.name(), "3GPP SWm");
 
     let der = dictionary
-        .find_command(apps::swm::COMMAND_DIAMETER_EAP, CommandKind::Request)
+        .find_command(
+            apps::swm::APPLICATION_ID,
+            apps::swm::COMMAND_DIAMETER_EAP,
+            CommandKind::Request,
+        )
         .expect("DER command must be present");
     assert_eq!(der.name(), "Diameter-EAP-Request");
 
@@ -510,6 +533,47 @@ fn encode_raw_vendor_avp(
     avp.encode(&mut dst, EncodeContext::default())
         .expect("raw vendor AVP encode must succeed");
     dst
+}
+
+#[cfg(feature = "app-swm")]
+fn nth_top_level_avp_offset(
+    raw_avps: &[u8],
+    code: AvpCode,
+    vendor_id: Option<VendorId>,
+    occurrence: usize,
+) -> usize {
+    let mut offset = 0usize;
+    let mut matched = 0usize;
+    while offset < raw_avps.len() {
+        let flags = raw_avps[offset + 4];
+        let length = ((raw_avps[offset + 5] as usize) << 16)
+            | ((raw_avps[offset + 6] as usize) << 8)
+            | raw_avps[offset + 7] as usize;
+        let encoded_code = AvpCode::new(u32::from_be_bytes([
+            raw_avps[offset],
+            raw_avps[offset + 1],
+            raw_avps[offset + 2],
+            raw_avps[offset + 3],
+        ]));
+        let encoded_vendor = if flags & 0x80 != 0 {
+            Some(VendorId::new(u32::from_be_bytes([
+                raw_avps[offset + 8],
+                raw_avps[offset + 9],
+                raw_avps[offset + 10],
+                raw_avps[offset + 11],
+            ])))
+        } else {
+            None
+        };
+        if encoded_code == code && encoded_vendor == vendor_id {
+            if matched == occurrence {
+                return DIAMETER_HEADER_LEN + offset;
+            }
+            matched += 1;
+        }
+        offset += (length + 3) & !3;
+    }
+    panic!("constructed message must contain the requested AVP occurrence")
 }
 
 #[cfg(feature = "app-rf")]
@@ -1244,6 +1308,360 @@ fn swm_dea_default_context_identifier_round_trip() {
             .map(|apn| apn.service_selection.as_ref().as_str()),
         Some("ims.mnc001.mcc001.gprs")
     );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_command_cardinality_accepts_repeated_state_conservatively() {
+    let mut request = sample_swm_request();
+    request.state_avps = vec![b"state-one".to_vec(), b"state-two".to_vec()];
+    let built = apps::swm::build_swm_diameter_eap_request(&request, 1, 2, EncodeContext::default())
+        .expect("repeatable State AVPs must encode");
+    let encoded = encode_message(&built);
+
+    let raw_error = Message::decode(&encoded, DecodeContext::conservative())
+        .expect_err("raw conservative decode must retain reject-all behavior");
+    assert!(matches!(
+        raw_error.code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
+
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("SWm grammar must permit repeated State AVPs");
+    assert!(tail.is_empty());
+    let parsed = apps::swm::parse_swm_diameter_eap_request(&decoded, DecodeContext::conservative())
+        .expect("typed singleton guards must coexist with repeatable State");
+    assert_eq!(parsed.state_avps, request.state_avps);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_dea_command_cardinality_accepts_repeated_state_conservatively() {
+    let mut answer = sample_swm_answer();
+    answer.state_avps = vec![b"state-one".to_vec(), b"state-two".to_vec()];
+    let built = apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default())
+        .expect("repeatable DEA State AVPs must encode");
+    let encoded = encode_message(&built);
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect("baseline SWm DEA grammar must permit repeated State AVPs");
+    assert!(tail.is_empty());
+    let parsed = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative())
+        .expect("typed DEA parser must retain repeated State values");
+    assert_eq!(parsed.state_avps, answer.state_avps);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_projected_profile_alone_permits_repeated_apn_configuration() {
+    let mut answer = sample_swm_answer();
+    answer.default_context_identifier = Some(8);
+    answer.apn_configurations = vec![sample_apn_configuration(), sample_ims_apn_configuration()];
+    let built = apps::swm::build_swm_diameter_eap_answer(&answer, 1, 2, EncodeContext::default())
+        .expect("projected APN profile must encode");
+    let encoded = encode_message(&built);
+    let expected_second = nth_top_level_avp_offset(
+        &built.raw_avps,
+        apps::swm::AVP_APN_CONFIGURATION,
+        Some(apps::VENDOR_ID_3GPP),
+        1,
+    );
+
+    let baseline_error = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_BASELINE_DICTIONARIES,
+    )
+    .expect_err("baseline SWm DEA permits at most one APN-Configuration");
+    assert!(matches!(
+        baseline_error.code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
+    assert_eq!(baseline_error.offset(), expected_second);
+
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        apps::SWM_PROJECTED_PROFILE_DICTIONARIES,
+    )
+    .expect("opt-in projected profile must permit repeated APN-Configuration");
+    assert!(tail.is_empty());
+    let parsed = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative())
+        .expect("typed DEA parser must accept the projected repeatable field");
+    assert_eq!(parsed, answer);
+
+    let owned = OwnedMessage::decode_owned_with_dictionary(
+        encoded.clone().freeze(),
+        DecodeContext::conservative(),
+        apps::SWM_PROJECTED_PROFILE_DICTIONARIES,
+    )
+    .expect("owned projected-profile decode must use the same command cardinality");
+    assert_eq!(owned.header, built.header);
+    assert_eq!(owned.raw_avps, built.raw_avps);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_projected_answer_repeatability_does_not_apply_to_request() {
+    let request = apps::swm::build_swm_diameter_eap_request(
+        &sample_swm_request(),
+        1,
+        2,
+        EncodeContext::default(),
+    )
+    .expect("sample DER must encode");
+    let mut raw_avps = BytesMut::from(request.raw_avps.as_ref());
+    raw_avps.extend_from_slice(&raw_apn_configuration_avp(
+        7,
+        b"internet.mnc001.mcc001.gprs",
+        2,
+    ));
+    raw_avps.extend_from_slice(&raw_apn_configuration_avp(8, b"ims.mnc001.mcc001.gprs", 1));
+    let message = OwnedMessage {
+        header: request.header,
+        raw_avps: raw_avps.freeze(),
+    };
+    let expected = nth_top_level_avp_offset(
+        &message.raw_avps,
+        apps::swm::AVP_APN_CONFIGURATION,
+        Some(apps::VENDOR_ID_3GPP),
+        1,
+    );
+    let encoded = encode_message(&message);
+    let error = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        apps::SWM_PROJECTED_PROFILE_DICTIONARIES,
+    )
+    .expect_err("answer-only APN repeatability must not apply to a DER");
+    assert!(matches!(
+        error.code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
+    assert_eq!(error.offset(), expected);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_command_cardinality_rejects_singletons_at_second_offset() {
+    let context_identifier = encode_raw_vendor_avp(
+        apps::swm::AVP_CONTEXT_IDENTIFIER,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &7u32.to_be_bytes(),
+    );
+    let message = build_raw_swm_dea_with_extras(&[context_identifier.clone(), context_identifier]);
+    let expected = nth_top_level_avp_offset(
+        &message.raw_avps,
+        apps::swm::AVP_CONTEXT_IDENTIFIER,
+        Some(apps::VENDOR_ID_3GPP),
+        1,
+    );
+    let encoded = encode_message(&message);
+    let error = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        apps::SWM_PROJECTED_PROFILE_DICTIONARIES,
+    )
+    .expect_err("top-level default Context-Identifier must remain singleton");
+    assert!(matches!(
+        error.code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
+    assert_eq!(error.offset(), expected);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_command_cardinality_rejects_base_singletons_at_second_offset() {
+    let cases = [
+        (
+            encode_raw_avp(base::AVP_SESSION_ID, true, b"second-session"),
+            base::AVP_SESSION_ID,
+        ),
+        (
+            encode_raw_avp(base::AVP_RESULT_CODE, true, &2001u32.to_be_bytes()),
+            base::AVP_RESULT_CODE,
+        ),
+    ];
+
+    for (duplicate, code) in cases {
+        let message = build_raw_swm_dea_with_extras(&[duplicate]);
+        let expected = nth_top_level_avp_offset(&message.raw_avps, code, None, 1);
+        let encoded = encode_message(&message);
+        let error = Message::decode_with_dictionary(
+            &encoded,
+            DecodeContext::conservative(),
+            apps::SWM_PROJECTED_PROFILE_DICTIONARIES,
+        )
+        .expect_err("base command AVPs must remain singleton");
+        assert!(matches!(
+            error.code(),
+            opc_protocol::DecodeErrorCode::DuplicateIe
+        ));
+        assert_eq!(error.offset(), expected);
+    }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_command_cardinality_rejects_grouped_singleton_child() {
+    let first_child = encode_raw_vendor_avp(
+        apps::swm::AVP_CONTEXT_IDENTIFIER,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &7u32.to_be_bytes(),
+    );
+    let mut children = BytesMut::new();
+    children.extend_from_slice(&first_child);
+    children.extend_from_slice(&first_child);
+    let grouped = encode_raw_vendor_avp(
+        apps::swm::AVP_APN_CONFIGURATION,
+        apps::VENDOR_ID_3GPP,
+        true,
+        &children,
+    );
+    let message = build_raw_swm_dea_with_extras(&[grouped]);
+    let grouped_offset = nth_top_level_avp_offset(
+        &message.raw_avps,
+        apps::swm::AVP_APN_CONFIGURATION,
+        Some(apps::VENDOR_ID_3GPP),
+        0,
+    );
+    let expected = grouped_offset + 12 + first_child.len();
+    let encoded = encode_message(&message);
+    let error = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        apps::SWM_PROJECTED_PROFILE_DICTIONARIES,
+    )
+    .expect_err("grouped singleton children must retain reject-all behavior");
+    assert!(matches!(
+        error.code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
+    assert_eq!(error.offset(), expected);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_command_grammar_rejects_duplicate_unknown_vendor_key() {
+    let unknown = encode_raw_vendor_avp(
+        AvpCode::new(60_001),
+        VendorId::new(60_002),
+        false,
+        b"opaque",
+    );
+    let message = build_raw_swm_dea_with_extras(&[unknown.clone(), unknown]);
+    let expected = nth_top_level_avp_offset(
+        &message.raw_avps,
+        AvpCode::new(60_001),
+        Some(VendorId::new(60_002)),
+        1,
+    );
+    let encoded = encode_message(&message);
+    let error = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        apps::SWM_PROJECTED_PROFILE_DICTIONARIES,
+    )
+    .expect_err("unknown vendor-specific AVPs must not gain repeatability");
+    assert!(matches!(
+        error.code(),
+        opc_protocol::DecodeErrorCode::DuplicateIe
+    ));
+    assert_eq!(error.offset(), expected);
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_command_grammar_rejects_unknown_mandatory_avp() {
+    let unknown =
+        encode_raw_vendor_avp(AvpCode::new(60_003), VendorId::new(60_004), true, b"opaque");
+    let message = build_raw_swm_dea_with_extras(&[unknown]);
+    let encoded = encode_message(&message);
+    let (tail, decoded) = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        apps::SWM_PROJECTED_PROFILE_DICTIONARIES,
+    )
+    .expect("command-cardinality validation leaves unknown policy to the typed parser");
+    assert!(tail.is_empty());
+    let error = apps::swm::parse_swm_diameter_eap_answer(&decoded, DecodeContext::conservative())
+        .expect_err("unknown mandatory AVPs must remain fail closed in the typed parser");
+    assert!(matches!(
+        error.code(),
+        opc_protocol::DecodeErrorCode::UnknownCriticalIe
+    ));
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_command_grammar_fails_closed_when_missing_or_ambiguous() {
+    let built = apps::swm::build_swm_diameter_eap_answer(
+        &sample_swm_answer(),
+        1,
+        2,
+        EncodeContext::default(),
+    )
+    .expect("sample DEA must encode");
+    let encoded = encode_message(&built);
+
+    let missing_error = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        BASE_ONLY_DICTIONARIES,
+    )
+    .expect_err("missing application grammar must fail closed");
+    assert!(matches!(
+        missing_error.code(),
+        opc_protocol::DecodeErrorCode::Structural { .. }
+    ));
+
+    for mismatched in [
+        {
+            let mut message = built.clone();
+            message.header.application_id = ApplicationId::new(apps::swm::APPLICATION_ID.get() + 1);
+            message
+        },
+        {
+            let mut message = built.clone();
+            message.header.command_code =
+                CommandCode::new(apps::swm::COMMAND_DIAMETER_EAP.get() + 1);
+            message
+        },
+    ] {
+        let mismatched_encoded = encode_message(&mismatched);
+        let error = Message::decode_with_dictionary(
+            &mismatched_encoded,
+            DecodeContext::conservative(),
+            apps::SWM_PROJECTED_PROFILE_DICTIONARIES,
+        )
+        .expect_err("application and command mismatches must fail closed");
+        assert!(matches!(
+            error.code(),
+            opc_protocol::DecodeErrorCode::Structural { .. }
+        ));
+        assert_eq!(error.offset(), 5);
+    }
+
+    let ambiguous_error = Message::decode_with_dictionary(
+        &encoded,
+        DecodeContext::conservative(),
+        SWM_AMBIGUOUS_DICTIONARIES,
+    )
+    .expect_err("multiple command profiles must fail closed");
+    assert!(matches!(
+        ambiguous_error.code(),
+        opc_protocol::DecodeErrorCode::Structural { .. }
+    ));
 }
 
 #[test]
