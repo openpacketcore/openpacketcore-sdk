@@ -1115,12 +1115,21 @@ impl RemoteSessionBackend {
             .checked_add(self.deadline)
             .ok_or(RemoteRequestFailure::Protocol)?;
         let mut last_failure = None;
-        let mut request_in_flight = true;
+        let transmission_started = AtomicBool::new(false);
+        let pretransmission_failure = StdMutex::new(None);
         let attempts = async {
             let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
             loop {
-                request_in_flight = true;
-                match self.do_request(&req, operation_deadline, None).await {
+                transmission_started.store(false, Ordering::Release);
+                match self
+                    .do_request(
+                        &req,
+                        operation_deadline,
+                        Some(&transmission_started),
+                        &pretransmission_failure,
+                    )
+                    .await
+                {
                     Ok(resp) => return Ok(resp),
                     Err(attempt) => {
                         let failure = attempt.failure;
@@ -1136,7 +1145,9 @@ impl RemoteSessionBackend {
                                 .fetch_add(1, Ordering::Relaxed);
                         }
                         last_failure = Some(failure);
-                        request_in_flight = false;
+                        if !attempt.request_may_have_reached_server {
+                            transmission_started.store(false, Ordering::Release);
+                        }
                         tokio::time::sleep(backoff).await;
                         backoff = self.lifecycle_policy.next_backoff(backoff);
                     }
@@ -1145,8 +1156,14 @@ impl RemoteSessionBackend {
         };
         match tokio::time::timeout_at(operation_deadline, attempts).await {
             Ok(res) => res,
-            Err(_) if request_in_flight => Err(RemoteRequestFailure::Timeout),
-            Err(_) => Err(last_failure.unwrap_or(RemoteRequestFailure::Timeout)),
+            Err(_) if transmission_started.load(Ordering::Acquire) => {
+                Err(RemoteRequestFailure::Timeout)
+            }
+            Err(_) => Err(pretransmission_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .or(last_failure)
+                .unwrap_or(RemoteRequestFailure::Timeout)),
         }
     }
 
@@ -1270,12 +1287,18 @@ impl RemoteSessionBackend {
         deadline: tokio::time::Instant,
     ) -> Result<NegotiatedResponse, RemoteRequestAttemptFailure> {
         let transmission_started = AtomicBool::new(false);
+        let pretransmission_failure = StdMutex::new(None);
         let attempts = async {
             let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
             loop {
                 transmission_started.store(false, Ordering::Release);
                 match self
-                    .do_request(req, deadline, Some(&transmission_started))
+                    .do_request(
+                        req,
+                        deadline,
+                        Some(&transmission_started),
+                        &pretransmission_failure,
+                    )
                     .await
                 {
                     Err(attempt) if attempt.failure == RemoteRequestFailure::ConnectionRetiring => {
@@ -1297,7 +1320,14 @@ impl RemoteSessionBackend {
         match tokio::time::timeout_at(deadline, attempts).await {
             Ok(result) => result,
             Err(_) => Err(RemoteRequestAttemptFailure {
-                failure: RemoteRequestFailure::Timeout,
+                failure: if transmission_started.load(Ordering::Acquire) {
+                    RemoteRequestFailure::Timeout
+                } else {
+                    pretransmission_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .unwrap_or(RemoteRequestFailure::Timeout)
+                },
                 request_may_have_reached_server: transmission_started.load(Ordering::Acquire),
                 invalidates_contract: false,
             }),
@@ -1332,6 +1362,7 @@ impl RemoteSessionBackend {
         req: &Request,
         operation_deadline: tokio::time::Instant,
         transmission_started: Option<&AtomicBool>,
+        pretransmission_failure: &StdMutex<Option<RemoteRequestFailure>>,
     ) -> Result<NegotiatedResponse, RemoteRequestAttemptFailure> {
         self.ensure_pool_lifecycle_monitor();
         let mut guard = self.conn.lock().await;
@@ -1347,12 +1378,14 @@ impl RemoteSessionBackend {
         let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
         let mut conn = loop {
             if tokio::time::Instant::now() >= operation_deadline {
-                return Err(RemoteRequestAttemptFailure::before_transmission(
-                    &ProtocolError::Io(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "session connection admission deadline expired",
-                    )),
-                ));
+                return Err(RemoteRequestAttemptFailure {
+                    failure: pretransmission_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .unwrap_or(RemoteRequestFailure::Timeout),
+                    request_may_have_reached_server: false,
+                    invalidates_contract: false,
+                });
             }
             let from_pool = candidate.is_some();
             let mut candidate_connection = match candidate.take() {
@@ -1361,6 +1394,10 @@ impl RemoteSessionBackend {
                     Ok(connection) => connection,
                     Err(error) => {
                         let attempt = RemoteRequestAttemptFailure::before_transmission(&error);
+                        *pretransmission_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(attempt.failure);
                         if !attempt.failure.is_retryable() {
                             return Err(attempt);
                         }
@@ -1410,6 +1447,9 @@ impl RemoteSessionBackend {
             if (mismatch.is_none() || scheduled_pool_rotation)
                 && candidate_connection.lifecycle.retirement(now).is_none()
             {
+                *pretransmission_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 self.pool_lifecycle_monitor.acknowledge_admission(
                     candidate_connection.lifecycle.admitted_generation(),
                     candidate_connection.lifecycle.admitted_material_epoch(),
@@ -1428,6 +1468,10 @@ impl RemoteSessionBackend {
             METRICS
                 .session_net_reconnect_attempts
                 .fetch_add(1, Ordering::Relaxed);
+            *pretransmission_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(RemoteRequestFailure::Timeout);
             let retry_at = now
                 .checked_add(backoff)
                 .unwrap_or(operation_deadline)
@@ -2270,11 +2314,13 @@ impl SessionBackend for RemoteSessionBackend {
                 connection,
                 cursor,
                 tx,
-                config,
-                deadline,
-                task_terminal,
-                reauthentication_rx,
-                material_rx,
+                WatchStreamContext {
+                    config,
+                    deadline,
+                    terminal_error: task_terminal,
+                    reauthentication_rx,
+                    material_rx,
+                },
             )
             .await;
             if let Err(e) = result {
@@ -2623,16 +2669,27 @@ async fn reconnect_watch(
     }
 }
 
+struct WatchStreamContext {
+    config: WatchConnectionConfig,
+    deadline: Duration,
+    terminal_error: Arc<std::sync::Mutex<Option<StoreError>>>,
+    reauthentication_rx: tokio::sync::watch::Receiver<u64>,
+    material_rx: Option<opc_tls::TlsMaterialStatusReceiver>,
+}
+
 async fn read_watch_stream(
     connection: Connection,
     cursor: ReplicationWatchCursor,
     tx: tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
-    config: WatchConnectionConfig,
-    deadline: Duration,
-    terminal_error: Arc<std::sync::Mutex<Option<StoreError>>>,
-    mut reauthentication_rx: tokio::sync::watch::Receiver<u64>,
-    mut material_rx: Option<opc_tls::TlsMaterialStatusReceiver>,
+    context: WatchStreamContext,
 ) -> Result<(), ProtocolError> {
+    let WatchStreamContext {
+        config,
+        deadline,
+        terminal_error,
+        mut reauthentication_rx,
+        mut material_rx,
+    } = context;
     let mut connection = Some(connection);
     let mut expected_sequence = cursor.first_sequence();
 
@@ -3880,6 +3937,78 @@ mod tests {
             .await
             .expect_err("connect failure is known not applied");
         assert!(matches!(error, StoreError::BackendUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn bounded_pretransmission_retry_preserves_the_last_transport_classification() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unreachable address");
+        let unreachable = listener.local_addr().expect("unreachable address");
+        drop(listener);
+        let resolver: RemoteAddrResolver = Arc::new(move || async move { Ok(unreachable) }.boxed());
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_millis(150)),
+        );
+
+        assert!(matches!(
+            backend
+                .send_request_classified(Request::MaxReplicationSequence)
+                .await,
+            Err(RemoteRequestFailure::Transport)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_prior_pretransmission_transport_does_not_mask_post_write_mutation_ambiguity() {
+        let fixture = FakeSessionBackend::new();
+        let key = match valid_deadline_entry().op {
+            ReplicationOp::RefreshTtl { key, .. } => key,
+            _ => unreachable!("fixture operation is fixed"),
+        };
+        let lease = fixture
+            .acquire(
+                &key,
+                OwnerId::new("mixed-failure-owner").expect("owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("fixture lease");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unreachable address");
+        let unreachable = listener.local_addr().expect("unreachable address");
+        drop(listener);
+        let (server_addr, server) = response_loss_server().await;
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = {
+            let resolutions = resolutions.clone();
+            Arc::new(move || {
+                let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Ok(unreachable)
+                    } else {
+                        Ok(server_addr)
+                    }
+                }
+                .boxed()
+            })
+        };
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(1)),
+        );
+
+        assert!(matches!(
+            backend
+                .send_backend_mutation_once(Request::DeleteFenced { lease })
+                .await,
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        ));
+        assert!(resolutions.load(Ordering::SeqCst) >= 2);
+        assert_eq!(server.await.expect("response-loss server"), 1);
     }
 
     async fn warmed_malicious_response_server(
@@ -6145,7 +6274,7 @@ mod tests {
             METRICS
                 .session_net_watch_slow_consumers
                 .load(Ordering::Relaxed)
-                >= before + 1
+                > before
         );
         server.await.expect("slow-watch server");
     }
