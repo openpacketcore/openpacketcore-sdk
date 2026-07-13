@@ -34,6 +34,31 @@ process. Do not deploy an old config consensus listener beside Openraft, and
 do not place a custom majority writer in front of or behind
 `ConsensusConfigStore`.
 
+### 1.1 Interim source-build release boundary
+
+The session and configuration adapters use one fixed runtime profile from
+`opc-consensus`; operators cannot tune either domain onto a different election
+or heartbeat regime. This workspace revision exact-pins
+`https://github.com/openpacketcore/openraft` at
+`f607e636406b16bd0ad7925dbb631da1b7a4cd96` so every election campaign samples
+a fresh timeout. Confirm the lock resolves only `openraft` and
+`openraft-macros` 0.9.24 from that full revision. Do not substitute registry
+0.9.24, a branch, a tag, or a downstream partial patch.
+
+This is an interim source-build profile. The 26 workspace crates in the
+machine-readable `source_build_gate.affected_workspace_crates` closure must
+remain `publish = false`; build the SDK/CNF from the locked git workspace. The
+gate may be removed only after an official stable Openraft release contains the
+fix, the workspace uses an exact registry pin/checksum, and the complete #143
+qualification is rerun. A source-build artifact is not production HA evidence:
+the profile remains experimental and must not bypass the product's release
+approval.
+
+An Openraft source change does not change the protection boundary above.
+Payload envelopes and AAD remain stable; HKMS/KMS provider calls, handles, and
+raw keys remain outside consensus. At-rest metadata/database protection remains
+the responsibility of the separately qualified storage or volume layer.
+
 ## 2. New-cluster bootstrap
 
 ### 2.1 Prepare immutable identity and storage
@@ -375,6 +400,23 @@ Run the default package contract and formatting check:
 cargo test --locked -p opc-persist
 cargo fmt --all --check
 ```
+
+Verify the temporary engine and distribution boundary before producing an
+artifact:
+
+```bash
+cargo test --locked -p opc-session-testkit --test qualification_profile
+python3 scripts/publish-order.py --check
+cargo deny check sources
+```
+
+The leader-loss qualification must observe the actual leader before stopping
+it, require a different surviving leader at a strictly higher term, exercise a
+write/read while the old leader is down, restart its same durable state, and
+wait for convergence. A follower-only fault, listener bind, or stale leader
+observation is not equivalent evidence. Current 3- and 5-process foundation
+evidence covers this transition over loopback plaintext test transport only;
+it does not satisfy #143's deployed-network or mTLS acceptance criteria.
 
 Current config tests cover sealed/redacted singleton persistence, direct-write
 fencing, fail-closed legacy admission, exact approved-snapshot recovery,

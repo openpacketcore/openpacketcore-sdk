@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Experimental HA qualification — `opc-consensus`, `opc-session-store`, and
+  `opc-persist`:** both durable domains now use one fail-closed Openraft runtime
+  profile and the exact `openpacketcore/openraft` revision
+  `f607e636406b16bd0ad7925dbb631da1b7a4cd96`, which resamples the election
+  timeout for each campaign. Actual-leader-loss tests require a different
+  survivor leader at a strictly higher term, continued lease/CAS operation,
+  restart catch-up, and convergence; the retained 3- and 5-process foundation
+  evidence records the observed transition and independently checks the
+  original workload history. Because this is a git-only interim dependency,
+  the mechanically derived 26-crate normal reverse-dependency closure is
+  `publish = false` until an official stable Openraft release contains the fix,
+  the workspace returns to a registry checksum pin, and #143 is fully
+  requalified. The profile remains `experimental`; deployed-network, complete
+  fault-matrix, resource/soak, payload-key, and candidate-release evidence are
+  still open. Payload envelopes, AAD, HKMS/KMS placement, and at-rest encryption
+  responsibilities are unchanged.
 - **BREAKING — `opc-session-store` watch consumers and legacy
   `opc-session-net` peers:** replication watches now use one documented
   inclusive cursor contract: zero normalizes to one, existing and future

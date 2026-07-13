@@ -56,11 +56,19 @@ async fn partition_and_recover() {
 - Synthetic `.invalid` endpoints and SPIFFE-like IDs are descriptor metadata,
   not live authenticated network membership evidence.
 - Node isolation exercises Openraft quorum loss and healing after a fleet has
-  formed. It does not by itself qualify cold-start races, multi-process
-  restart/rejoin, legacy-fork repair, real mTLS transport, or carrier failover.
+  formed. The multi-process foundation additionally observes and stops the
+  actual leader in 3- and 5-member fleets, requires a different higher-term
+  survivor, exercises outage work, and bounds same-disk restart/catch-up.
+  These loopback plaintext tests do not by themselves qualify cold-start races,
+  deployed-network/mTLS behavior, complete crash matrices, multi-node
+  restart/rejoin, legacy-fork repair, or carrier failover.
 - Long-running network, resource, and soak qualification remains #143. Watch
   handoff and bounded replication-log cursor/retention semantics are
   implemented under #145/#171.
+- The machine-readable profile remains `experimental` with
+  `qualification_complete = false`. Its exact Openraft git pin and 26-crate
+  source-build gate may be removed only after an official fixed stable release,
+  registry checksum pin, and full #143 requalification.
 - Restore assertions panic like normal test assertions.
 
 ## Roadmap
