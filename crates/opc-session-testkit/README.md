@@ -58,7 +58,8 @@ async fn partition_and_recover() {
 - Node isolation exercises Openraft quorum loss and healing after a fleet has
   formed. The multi-process foundation additionally observes and stops the
   actual leader in 3- and 5-member fleets, requires a different higher-term
-  survivor, exercises outage work, and bounds same-disk restart/catch-up.
+  survivor, records a generation read while the old leader is down, and bounds
+  same-disk restart/catch-up.
   These loopback plaintext tests do not by themselves qualify cold-start races,
   deployed-network/mTLS behavior, complete crash matrices, multi-node
   restart/rejoin, legacy-fork repair, or carrier failover.

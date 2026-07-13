@@ -410,13 +410,15 @@ python3 scripts/publish-order.py --check
 cargo deny check sources
 ```
 
-The leader-loss qualification must observe the actual leader before stopping
-it, require a different surviving leader at a strictly higher term, exercise a
-write/read while the old leader is down, restart its same durable state, and
-wait for convergence. A follower-only fault, listener bind, or stale leader
-observation is not equivalent evidence. Current 3- and 5-process foundation
-evidence covers this transition over loopback plaintext test transport only;
-it does not satisfy #143's deployed-network or mTLS acceptance criteria.
+Domain-level leader-loss tests observe the actual leader before stopping it,
+require a different survivor at a strictly higher term, then commit session
+lease/CAS work or a configuration transaction before restart and convergence.
+The current 3- and 5-process foundation separately records a generation read
+while the old leader is down; that read is transition evidence outside its
+original 15-operation history checker. A follower-only fault, listener bind,
+or stale leader observation is not equivalent evidence. This foundation uses
+loopback plaintext test transport only and does not satisfy #143's
+deployed-network or mTLS acceptance criteria.
 
 Current config tests cover sealed/redacted singleton persistence, direct-write
 fencing, fail-closed legacy admission, exact approved-snapshot recovery,

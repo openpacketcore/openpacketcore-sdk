@@ -683,10 +683,12 @@ implement a second quorum algorithm.
 - **Observed-leader process failover**: The 3- and 5-process foundation harness
   requires two coherent leader observations before stopping that process,
   records a different survivor leader at a strictly higher term, proves a
-  lease/CAS/read while the old leader is down, then restarts the same durable
+  generation read while the old leader is down, then restarts the same durable
   node and bounds full catch-up. The independent checker still validates the
   original 15-operation history; the added outage read is explicit transition
-  evidence, not falsely attributed to that checker.
+  evidence, not falsely attributed to that checker. Separate domain-level
+  tests commit session lease/CAS work and a configuration transaction through
+  the surviving majority before convergence.
 - **Ambiguous response retry**: A delivered-but-lost forwarded response can be
   retried with the same durable request identity and produces exactly one
   committed application event.

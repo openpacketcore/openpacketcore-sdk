@@ -12,10 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `opc-persist`:** both durable domains now use one fail-closed Openraft runtime
   profile and the exact `openpacketcore/openraft` revision
   `f607e636406b16bd0ad7925dbb631da1b7a4cd96`, which resamples the election
-  timeout for each campaign. Actual-leader-loss tests require a different
-  survivor leader at a strictly higher term, continued lease/CAS operation,
-  restart catch-up, and convergence; the retained 3- and 5-process foundation
-  evidence records the observed transition and independently checks the
+  timeout for each campaign. Domain-level actual-leader-loss tests require a
+  different survivor leader at a strictly higher term, continue session
+  lease/CAS or configuration transactions, and verify restart convergence. The
+  retained 3- and 5-process foundation records the observed transition and a
+  generation read while the old leader is down, then independently checks its
   original workload history. Because this is a git-only interim dependency,
   the mechanically derived 26-crate normal reverse-dependency closure is
   `publish = false` until an official stable Openraft release contains the fix,

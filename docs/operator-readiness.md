@@ -567,10 +567,12 @@ steering selection remains fail-closed as `Unsupported`.
    sealed state-machine image.
 6. **Observed-Leader Foundation Evidence**: The 3- and 5-process harness
    coherently observes the actual leader, stops that process, requires a
-   different survivor at a strictly higher term, performs lease/CAS/read work,
-   restarts the same durable node, and waits for convergence. The retained
-   original 15-operation history is independently checked; the added outage
-   read is separately identified as transition evidence. This is loopback
+   different survivor at a strictly higher term, performs a generation read
+   while the old leader is down, restarts the same durable node, and waits for
+   convergence. The retained original 15-operation history is independently
+   checked; the added outage read is separately identified as transition
+   evidence. Separate domain-level tests commit session lease/CAS work and a
+   configuration transaction after isolating the old leader. This is loopback
    plaintext test transport, not deployed-network or mTLS qualification.
 7. **Remaining Qualification**: #128 makes current-format repair exclusively
    Openraft-owned, rejects committed/applied truncation and stale snapshots,
