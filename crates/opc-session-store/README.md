@@ -37,8 +37,8 @@ evidence.
   `MAX_REPLICATION_OPERATIONS_PER_ENTRY` (256) bound every replication
   operation tree. The root is depth 1, and every operation node, including
   each `Batch`, counts toward the per-entry total.
-- `MAX_SESSION_TTL` (365 days), `validate_session_ttl`, and
-  `checked_session_deadline` define the common checked TTL/deadline contract.
+- `MAX_SESSION_TTL` (365 days), `MAX_RECORD_EXPIRY_CLOCK_SKEW` (zero), and the
+  TTL/absolute-expiry validators define the checked lifetime contract.
 - `SessionKey`, bounded `StableId`, `SessionKeyType`, `StateClass`, `StateType`,
   `Generation`, `OwnerId`, and `FenceToken` describe session identity and
   ownership.
@@ -121,20 +121,20 @@ evidence.
   remains below 2 KiB and fits the legacy adapter's minimum frame.
   Exact response sizing returns typed `RestoreScanResponseTooLarge` without a
   partial frame unless peers negotiated a sufficient frame (up to 16 MiB).
-- `opc-session-net` protocol v4 can transport only the durable opaque restore
+- `opc-session-net` protocol v5 can transport only the durable opaque restore
   page profile. Compatibility offset cursors from `FakeSessionBackend` are
   local test evidence and are rejected by both remote client and server; this
   RPC does not create a second quorum or restore authority. Peer-page checks
   enforce structural bounds, order, scope, and claimed cursor progress only;
   production completeness comes from the barrier-confirmed local
   Openraft-applied state.
-- The v4 adapter uses private fixed-width DTOs: `u32` request limits and
+- The v5 adapter uses private fixed-width DTOs: `u32` request limits and
   restore-response budget; an exact confidential authenticated restore cursor;
   `u64` counts,
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 4, error-set revision 6,
+  Its profile pins wire-schema revision 5, error-set revision 8,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -151,7 +151,8 @@ evidence.
   stale-cursor, work-budget, and direct-CAS idempotency outcomes; revision 4
   adds the replication-log range, page-limit, and compacted-cursor outcomes;
   revision 5 adds the non-CAS backend and lease ambiguity outcomes; revision 6
-  adds the typed bounded-watch catch-up outcome.
+  adds the typed bounded-watch catch-up outcome; and revision 7 adds
+  absolute-record-expiry rejection.
   Hello requests the
   client's response limit, while HelloAck reports the accepted response limit
   and server request limit;
@@ -199,14 +200,14 @@ evidence.
   `BackendOperationOutcomeUnavailable`, or
   `LeaseError::OperationOutcomeUnavailable`, respectively. Reads remain
   retryable. Consensus-gated SQLite reads use the same supervised worker path.
-- The exact `opc-session-net/4` ALPN, version, and contract profile have no v3
+- The exact `opc-session-net/5` ALPN, version, and contract profile have no
   fallback or downgrade negotiation. Public session-net `Request`/`Response`
   remain, but `Hello`/`HelloAck` gain an optional `contract_profile`, so
   exhaustive construction and matching must account for the new field. The
   revision-2 public profile also adds `max_frame_size`, which is source-breaking
   for external struct literals/destructuring and requires the same coordinated
   fleet upgrade.
-- Every protocol-v4 response and watch item is fully bounded-encoded before its
+- Every protocol-v5 response and watch item is fully bounded-encoded before its
   length prefix is emitted. Common non-pageable and complete-page successes use
   one bounded encode with no sizing preflight. If a complete pageable response
   is too large, that direct attempt emits no prefix; bounded logarithmic sizing
@@ -311,7 +312,8 @@ opc-session-store-audit identity-invariants \
   --database /path/to/session-store.db \
   --max-rows N \
   --max-entry-json-bytes N \
-  --max-total-json-bytes N
+  --max-total-json-bytes N \
+  --expiry-reference 2026-07-13T18:00:00Z
 ```
 
 All three budgets are required and non-zero;
@@ -323,15 +325,20 @@ consistent snapshot in fixed 256-row pages, and applies `--max-rows` across
 that order. The two JSON budgets bound individual and cumulative replication
 entries before strict `ReplicationEntry` decoding and domain validation.
 
-Report schema version 3 contains only the requested limits, per-table scanned
-counts, violation counts (`invalid_owner_fields`,
+Report schema version 4 contains only the requested limits, the expiry
+reference, per-table scanned counts, violation counts (`invalid_owner_fields`,
 `invalid_session_key_type_fields`, `invalid_stable_id_fields`,
-`invalid_replication_tx_id_fields`, and `invalid_replication_entries`), and an
-optional bounded `incomplete_reason`. Relational stable-ID validation reads
-only SQLite type and length. Transaction-ID validation retrieves at most 128
-bytes and cross-checks the exact relational and encoded representations. It
+`invalid_replication_tx_id_fields`, `invalid_replication_entries`, and
+`invalid_record_expiry_fields`), and an optional bounded `incomplete_reason`.
+Relational expiry is checked against the reported reference; nested
+compatibility CAS expiry is checked against its immutable replication-entry
+timestamp. Relational stable-ID validation reads only SQLite type and length.
+Transaction-ID validation retrieves at most 128 bytes and cross-checks the
+exact relational and encoded representations. It
 never emits the database path, row identity, tenant, owner, key type, stable
-ID, payload, transaction, or raw JSON.
+ID, payload, transaction, rejected row timestamp, or raw JSON. Omitting
+`--expiry-reference` uses current UTC, but an explicit recorded RFC 3339 value
+is required for a reproducible migration campaign.
 The command contract is:
 
 - `compliant` JSON on stdout and exit 0 only after the complete snapshot fits
@@ -359,6 +366,9 @@ application-owned deterministic rekey requirements and rollback, is in
 [`session-store-stable-id-migration.md`](../../docs/session-store-stable-id-migration.md).
 The durable idempotency/fork-identity procedure is in
 [`session-store-replication-tx-id-migration.md`](../../docs/session-store-replication-tx-id-migration.md).
+The absolute-expiry audit, re-authoring, OpenRaft recovery, and rollback
+procedure is in
+[`session-store-record-expiry-migration.md`](../../docs/session-store-record-expiry-migration.md).
 
 The identity audit deliberately does not read, decrypt, or classify payload
 bytes in live records or nested `ReplicationOp::CompareAndSet` log entries;
@@ -443,15 +453,16 @@ descriptors and consensus-only peers. No dummy local database or legacy
 `RemoteSessionBackend` is constructed for a remote vote.
 
 Production replication uses `SessionConsensusServer` and
-`RemoteSessionConsensusPeer` on the exact `opc-session-consensus/1` ALPN. The
+`RemoteSessionConsensusPeer` on the exact `opc-session-consensus/2` ALPN. The
 live certificate's canonical SPIFFE URI, logical `ReplicaId`, stable node ID,
 cluster, configuration digest, epoch, peer role, and fresh challenge must all
 agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
 only the dial address; a bare self ID such as `epdg-app-0` can correctly name
 the member whose route is an FQDN because the SDK never compares those strings.
-The exact consensus contract uses wire-schema revision 1 and error-set revision
-2. Error-set revision 1 fails before dispatch because forwarded applied
-responses can now carry the non-CAS ambiguity outcome. Drain traffic and
+The exact consensus contract uses transport/wire-schema revision 2 and
+error-set revision 4. The wire adds the bounded payload-free expiry-authority
+preflight, and the error set adds `RecordExpiryPreflightLimitExceeded`.
+Revision 1/error revision 3 or older fails before dispatch. Drain traffic and
 writers, then stop and upgrade every consensus member together; mixed-profile
 rolling operation is unsupported.
 
@@ -619,10 +630,11 @@ These rules constrain range selection only. They do not create sequencing,
 commit, snapshot, restore, or watch authority and do not change payload
 envelopes, AAD, provider/HKMS placement, or encryption-at-rest composition.
 The replication-log range outcomes were introduced in quarantined session-net
-v4 error-set revision 4. Revision 5 additionally carries non-CAS backend and
-lease ambiguity outcomes; the current revision 6 adds bounded-watch catch-up.
-Drain and upgrade all compatibility participants together before restoring
-traffic.
+v4 error-set revision 4. Historical v4 revisions 5 through 7 added non-CAS
+backend/lease ambiguity, bounded-watch catch-up, and absolute-record-expiry
+rejection. Current v5 error revision 8 adds the bounded expiry-preflight limit
+outcome and uses a distinct ALPN. Drain and upgrade all
+compatibility participants together before restoring traffic.
 
 ### Replication-watch cursor and handoff contract
 
@@ -664,11 +676,12 @@ connection with a redaction-safe protocol failure before an outer encryption
 wrapper can invoke its provider. A typed backend stream error also ends that
 stream; the next independent request uses a fresh authenticated connection.
 
-This adds `StoreError::ReplicationWatchCatchUpRequired` and advances only the
-legacy protocol-v4 error set from revision 5 to 6. Exact-profile negotiation
-therefore requires a coordinated stop/upgrade/start. The wire schema,
+`StoreError::ReplicationWatchCatchUpRequired` introduced the legacy
+protocol-v4 error-set transition from revision 5 to 6. Exact-profile
+negotiation requires a coordinated stop/upgrade/start. The wire schema,
 Openraft consensus profile, persisted journal/snapshot format, encryption
-envelopes, AAD, and local/remote HKMS boundary do not change.
+envelopes, AAD, and local/remote HKMS boundary did not change for that
+transition.
 
 ### TTL input contract
 
@@ -700,10 +713,11 @@ typed response on the same connection. The same checks remain in local backends
 so direct callers and peers that did not validate at their first boundary still
 fail closed.
 
-This is a compatibility boundary. The two public error enums gain new variants,
-so external exhaustive matches must add arms. Protocol v4 introduced their
-private fixed-width DTOs in error revision 1; current error revision 6 retains
-those encodings and an error-revision-5 or older v4 peer is not admitted. Before upgrading a store created by an older SDK, audit
+This is a compatibility boundary. The public error enums gain variants, so
+external exhaustive matches must add arms. Protocol v4 introduced the TTL
+fixed-width DTOs in error revision 1; current v5 error revision 8 retains those
+encodings and adds the bounded expiry-preflight outcome. An error-revision-7 or
+older peer is not admitted. Before upgrading a store created by an older SDK, audit
 its persisted replication log for TTL-bearing
 operations above 365 days. Such legacy entries now fail closed during replay or
 rebuild; the SDK does not silently clamp or rewrite them. Replicated
@@ -717,9 +731,43 @@ validity, or maximum authentication age. Seamless certificate/trust rotation
 for the networked production profile remains a qualification requirement in
 #143.
 
-The duration contract does not yet bound a caller-authored absolute
-`StoredSessionRecord::expires_at`; that separate admission/migration invariant
-is tracked by #148.
+Caller-authored absolute `StoredSessionRecord::expires_at` has a separate but
+equal finite horizon. Relative to the mutation authority's one captured
+reference timestamp, a finite expiry may be past, immediate, or at most
+`MAX_SESSION_TTL` in the future. The exact maximum is accepted; one nanosecond
+more is rejected with fieldless `StoreError::InvalidRecordExpiry`.
+`MAX_RECORD_EXPIRY_CLOCK_SKEW` is zero: coordinator clock synchronization is an
+operator prerequisite, not a silent retention extension. Arithmetic saturates
+at the timestamp range maximum and cannot unwind.
+
+`None` intentionally means non-expiring and is accepted for
+`AuthoritativeSession`, `DataplaneLookup`, `ReplicatedDr`, and
+`TelemetryDerived`. It is rejected for `EphemeralProcedure`, whose existing
+profile requires per-key expiry to collect abandoned procedure state. Direct
+Fake/SQLite operations and whole batches use one injected backend-clock value.
+Forwarding wrappers delegate that authority and never substitute a process
+wall clock. Compatibility replication validates every nested CAS against the
+immutable `ReplicationEntry::timestamp`.
+
+Production OpenRaft leaders validate before proposal against the command's
+leader-authored logical time. Apply, replay, and follower paths repeat the
+verdict against the same committed metadata; follower clocks never decide it.
+Remote and consensus clients never substitute their wall clock for authenticated
+coordinator authority. Every forwarding wrapper MUST obtain the bounded,
+payload-free authority preflight before cache invalidation, provider/HKMS work,
+or sealing. The actual authenticated CAS/batch dispatcher repeats that
+preflight before idempotency admission or backend dispatch. Invalid input and
+preflight timeout/unavailability perform no provider call or requested state
+mutation; the caller may retry because only a consensus logical-time floor may
+have committed. Payload encryption, AAD, key selection, and HKMS placement are
+unchanged.
+
+Existing valid rows keep their representation. The version-4 count-only audit
+accepts a pinned `--expiry-reference`, counts invalid relational deadlines,
+and validates compatibility-log CAS deadlines against entry timestamps. It
+never clamps or repairs data. Follow the drained backup, product-aware
+re-authoring, OpenRaft rebootstrap, and rollback procedure in
+[`session-store-record-expiry-migration.md`](../../docs/session-store-record-expiry-migration.md).
 
 ### Bounded protected replication trees
 
@@ -738,7 +786,7 @@ complete returned page or watch item finishes before read-side transformation
 or caller exposure; the backend has necessarily already produced that read.
 Post-decode traversal and tree reassembly are iterative, and rejected owned
 trees are dismantled iteratively, so accepted transformation and consuming
-rejection do not recurse through the operation tree. Protocol v4 carries the
+rejection do not recurse through the operation tree. Protocol v5 carries the
 same depth-16/256-node rules in the exact contract profile and bounds its private
 DTO collections before domain construction. Batch requests admit at most 256
 operations; replication-log pages and rebuild prefixes admit at most 65,536
@@ -863,11 +911,11 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   networked HA.
 - Nested replicated CAS payloads are protected under the bounded iterative
   contract above. This is confidentiality and input-boundary hardening, not
-  consensus, durable authority, or production HA. Protocol v4 wire
+  consensus, durable authority, or production HA. Protocol v5 wire
   stabilization does not attest wrapper composition.
 - The #135 identity/model boundary and offline SQLite audit are implemented,
   but do not establish durable sequencing, fork recovery, restore authority,
-  seamless rotation, or production HA. Fixed-width v4 wire admission is
+  seamless rotation, or production HA. Fixed-width v5 wire admission is
   implemented under #134.
 - #159 closes per-connection outbound frame allocation and slow-reader write
   bounds. Protocol-v4 wire-schema revision 3 carries #133's confidential
@@ -893,7 +941,7 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   or restores a coherent checkpoint/reverse migration. #167 now supplies the production
   stable-ID model/persistence/privacy/audit contract. #168 supplies the bounded
   durable transaction-ID type, canonical coordinator mint, exact legacy
-  preservation, SQLite/recovery checks, and version-3 audit coordinated with
+  preservation, SQLite/recovery checks, and current version-4 audit coordinated with
   #127/#128/#143. This
   supplies no durable authority or distributed/payload-key qualification
   (#143). Shared real-mTLS tests now qualify a renewed SVID on a subsequent new
@@ -908,8 +956,8 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
-- Complete watch handoff correctness (#145), absolute-expiry admission (#148),
-  log-range cursors (#171), and persisted peer logical-RPC deadlines (#169),
+- Retain #171's bounded log-range cursor contract and complete persisted peer
+  logical-RPC deadlines (#169),
   then complete the production
   qualification profile. A renewed SVID on a subsequent new call/full handshake
   and wrong-scope rejection have scoped real-mTLS coverage; seamless connection

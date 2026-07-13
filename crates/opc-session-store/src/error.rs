@@ -109,6 +109,17 @@ pub enum StoreError {
     /// authenticated peers.
     #[error("invalid session TTL")]
     InvalidSessionTtl,
+    /// A caller-authored record deadline exceeded the bounded absolute-expiry
+    /// policy, or an ephemeral-procedure record omitted its required deadline.
+    /// The error contains no timestamp, key, state type, or payload metadata
+    /// and is safe to return to authenticated peers.
+    #[error("invalid session record expiry")]
+    InvalidRecordExpiry,
+    /// One expiry-preflight request exceeded the fixed descriptor limit. The
+    /// error carries no observed count, timestamp, state class, key, or
+    /// payload metadata and is safe to return to authenticated peers.
+    #[error("session record-expiry preflight limit exceeded")]
+    RecordExpiryPreflightLimitExceeded,
     /// Another owner currently holds an unexpired lease on the key, so this
     /// caller cannot acquire single-writer authority for it.
     #[error("lease held by another owner")]

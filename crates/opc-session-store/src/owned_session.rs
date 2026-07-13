@@ -394,6 +394,12 @@ impl OwnedSessionMutationError {
             StoreError::InvalidSessionTtl => Self::StoreRejected {
                 code: "invalid-session-ttl",
             },
+            StoreError::InvalidRecordExpiry => Self::StoreRejected {
+                code: "invalid-record-expiry",
+            },
+            StoreError::RecordExpiryPreflightLimitExceeded => Self::StoreRejected {
+                code: "record-expiry-preflight-limit-exceeded",
+            },
             StoreError::NotFound => Self::StoreRejected { code: "not-found" },
             StoreError::CasConflict => Self::StoreRejected {
                 code: "cas-conflict",

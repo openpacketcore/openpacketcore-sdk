@@ -504,7 +504,8 @@ async fn write_ownership_marker(
         fence: lease.fence(),
         state_class: StateClass::EphemeralProcedure,
         state_type: StateType::from_static("smf-ownership"),
-        expires_at: None,
+        // The marker must not outlive the lease that authorizes this owner.
+        expires_at: Some(lease.expires_at()),
         payload: EncryptedSessionPayload::new(Bytes::from_static(b"smf-ref-ok")),
     };
 
@@ -1004,4 +1005,36 @@ pub fn build_session_report_request(
         ))?);
     msg.ies.push(InformationElement::from_typed(&usage_report)?);
     Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn write_ownership_marker_uses_the_held_lease_deadline() -> Result<(), SmfError> {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let owner = OwnerId::new("smf-marker-test").map_err(SmfError::SessionStore)?;
+        let key = ownership_key(&owner)?;
+        let (ownership, _failures) = OwnedSession::acquire(
+            store.clone(),
+            key.clone(),
+            owner,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .await?;
+        let expected_expiry = ownership.lease().lock().await.expires_at();
+
+        write_ownership_marker(&store, &ownership).await?;
+
+        let Some(record) = store.get(&key).await? else {
+            panic!("ownership marker was not written");
+        };
+        assert_eq!(record.state_class, StateClass::EphemeralProcedure);
+        assert_eq!(record.expires_at, Some(expected_expiry));
+
+        ownership.release().await?;
+        Ok(())
+    }
 }

@@ -21,7 +21,7 @@ use rusqlite::{
 use crate::{
     backend::{
         validate_replication_log_page_owned, validate_replication_prefix_owned,
-        validate_session_ops_ttls, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+        validate_session_ops_at, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
         ReplicationEntry, ReplicationLogRange, ReplicationWatchCursor, SessionBackend, SessionOp,
         SessionOpResult, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
     },
@@ -35,7 +35,7 @@ use crate::{
         prepare_watch_registration, watch_backlog_query_limit, ReplicationWatcher,
     },
     restore::{RestoreScanPage, RestoreScanRequest},
-    ttl::{checked_session_deadline, validate_session_ttl},
+    ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
 };
 
 pub mod audit;
@@ -561,6 +561,23 @@ impl SqliteSessionBackend {
         self.caps
     }
 
+    /// Read the last committed state-machine logical time after a caller-owned
+    /// Openraft linearizable barrier. This path is read-only and allocates no
+    /// sequencing authority.
+    pub(crate) async fn consensus_logical_time(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<Option<opc_types::Timestamp>, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::logical_time_sync(conn, identity).map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session consensus logical time is unavailable".into(),
+                )
+            })
+        })
+        .await
+    }
+
     /// Read at a logical timestamp already committed by the consensus state
     /// machine. This path is read-only: expiry affects visibility but never
     /// prunes physical rows outside a committed command.
@@ -1017,6 +1034,10 @@ impl SessionBackend for SqliteSessionBackend {
         .unwrap_or_else(|_| BackendCapabilities::minimal())
     }
 
+    fn record_expiry_reference(&self) -> Option<opc_types::Timestamp> {
+        Some(self.clock.now_utc())
+    }
+
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         let key = key.clone();
         let now = self.clock.now_utc();
@@ -1036,6 +1057,7 @@ impl SessionBackend for SqliteSessionBackend {
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
         let now = self.clock.now_utc();
+        validate_stored_record_expiry_at(&op.new_record, now)?;
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::CompareAndSet, move |conn| {
             let tx = standalone_transaction(conn)?;
@@ -1078,8 +1100,8 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
-        validate_session_ops_ttls(&ops)?;
         let now = self.clock.now_utc();
+        validate_session_ops_at(&ops, now)?;
         for op in &ops {
             if let SessionOp::RefreshTtl { ttl, .. } = op {
                 checked_session_deadline(now, *ttl)?;

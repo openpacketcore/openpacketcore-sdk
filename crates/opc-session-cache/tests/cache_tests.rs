@@ -323,6 +323,71 @@ async fn test_update_invalidates_cache() {
 }
 
 #[tokio::test]
+async fn invalid_consensus_expiry_does_not_invalidate_a_populated_cache() {
+    let cluster = ConsensusTestCluster::start(1).await;
+    let coord = Arc::new(cluster.store(0));
+    let cache = SessionCache::new(coord.clone());
+    wait_for_watch_ready(&cache).await;
+
+    let key = test_session_key();
+    let lease = coord
+        .acquire(
+            &key,
+            OwnerId::from_str("expiry-cache-owner").expect("owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("lease");
+    coord
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: make_record(&key, 1, &lease),
+        })
+        .await
+        .expect("initial record");
+    wait_for_sequence(&cache, coord.max_replication_sequence().await.unwrap()).await;
+    cache.get(&key).await.expect("cache read").expect("record");
+    assert_eq!(cache.len().await, 1);
+    let sequence_before = coord.max_replication_sequence().await.expect("sequence");
+
+    let mut invalid = make_record(&key, 2, &lease);
+    invalid.expires_at = Some(
+        opc_types::Timestamp::from_str("9999-12-31T23:59:59.999999999Z")
+            .expect("far-future expiry"),
+    );
+    assert_eq!(
+        cache
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: Some(Generation::new(1)),
+                new_record: invalid,
+            })
+            .await,
+        Err(StoreError::InvalidRecordExpiry)
+    );
+
+    assert_eq!(cache.len().await, 1, "preflight must precede invalidation");
+    assert_eq!(
+        coord.max_replication_sequence().await.expect("sequence"),
+        sequence_before,
+        "invalid preflight must not publish a watch mutation"
+    );
+    assert_eq!(
+        coord
+            .get(&key)
+            .await
+            .expect("authoritative read")
+            .expect("record")
+            .generation
+            .get(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn test_delete_invalidates_cache() {
     let cluster = ConsensusTestCluster::start(1).await;
     let coord = Arc::new(cluster.store(0));

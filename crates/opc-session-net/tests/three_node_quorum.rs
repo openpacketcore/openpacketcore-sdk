@@ -11,13 +11,15 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
+use opc_key::{KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing};
 use opc_session_net::{
     LocalReplicaBinding, RemoteAddrResolver, RemoteReplicaBinding, RemoteSessionBackend,
     SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
     SessionReplicationManifest, SessionReplicationServer,
 };
 use opc_session_store::backend::{
-    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionBackend,
+    CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, ReplicationEntry, ReplicationOp,
+    SessionBackend, SessionOp,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::fake::{FakeBackendLimits, FakeSessionBackend};
@@ -28,13 +30,90 @@ use opc_session_store::model::{
 use opc_session_store::quorum::SessionStoreBackend;
 use opc_session_store::record::{EncryptedSessionPayload, StoredSessionRecord};
 use opc_session_store::{
-    QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity, RestoreScanRequest, RestoreScanScope,
-    SqliteSessionBackend, StoreError, MAX_REPLICATION_LOG_PAGE_ENTRIES,
-    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    QuorumReplicaDescriptor, RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaReadinessFailure, ReplicaTlsIdentity,
+    RestoreScanRequest, RestoreScanScope, SqliteSessionBackend, StoreError,
+    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    MAX_REPLICATION_OPERATION_DEPTH, MAX_SESSION_TTL,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+
+#[derive(Default)]
+struct CountingUnavailableKeyProvider {
+    calls: AtomicUsize,
+}
+
+struct CountingWorkingKeyProvider {
+    inner: MemoryKeyProvider,
+    calls: AtomicUsize,
+}
+
+impl CountingWorkingKeyProvider {
+    fn for_tenant(tenant: &TenantId) -> Self {
+        let inner = MemoryKeyProvider::new();
+        inner
+            .insert_active_key(
+                KeyId::new("session-net-preflight-test-key").expect("test key ID"),
+                KeyPurpose::Session,
+                tenant.clone(),
+                Zeroizing::new([0x5a; 32]),
+            )
+            .expect("insert test session key");
+        Self {
+            inner,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl KeyProvider for CountingWorkingKeyProvider {
+    async fn get_active_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<KeyHandle, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_active_key(purpose, tenant).await
+    }
+
+    async fn get_key_by_id(&self, key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_key_by_id(key_id).await
+    }
+
+    async fn rotate_key(&self, purpose: KeyPurpose, tenant: &TenantId) -> Result<KeyId, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.rotate_key(purpose, tenant).await
+    }
+}
+
+#[async_trait::async_trait]
+impl KeyProvider for CountingUnavailableKeyProvider {
+    async fn get_active_key(
+        &self,
+        _purpose: KeyPurpose,
+        _tenant: &TenantId,
+    ) -> Result<KeyHandle, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(KeyError::Unavailable)
+    }
+
+    async fn get_key_by_id(&self, _key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(KeyError::Unavailable)
+    }
+
+    async fn rotate_key(
+        &self,
+        _purpose: KeyPurpose,
+        _tenant: &TenantId,
+    ) -> Result<KeyId, KeyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(KeyError::Unavailable)
+    }
+}
 
 #[derive(Clone)]
 struct TestMtls {
@@ -296,6 +375,10 @@ impl SessionBackend for ReplicationDispatchSpy {
         self.inner.capabilities().await
     }
 
+    fn record_expiry_reference(&self) -> Option<Timestamp> {
+        self.inner.record_expiry_reference()
+    }
+
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         self.inner.get(key).await
     }
@@ -390,6 +473,11 @@ struct CancellableStallBackend {
     inner: FakeSessionBackend,
     active: Arc<AtomicUsize>,
     get_calls: Arc<AtomicUsize>,
+    preflight_calls: Arc<AtomicUsize>,
+    preflight_behavior: Arc<AtomicUsize>,
+    last_preflight_len: Arc<AtomicUsize>,
+    compare_and_set_calls: Arc<AtomicUsize>,
+    batch_calls: Arc<AtomicUsize>,
     delete_calls: Arc<AtomicUsize>,
     delete_effects: Arc<AtomicUsize>,
 }
@@ -400,6 +488,11 @@ impl CancellableStallBackend {
             inner: FakeSessionBackend::new(),
             active: Arc::new(AtomicUsize::new(0)),
             get_calls: Arc::new(AtomicUsize::new(0)),
+            preflight_calls: Arc::new(AtomicUsize::new(0)),
+            preflight_behavior: Arc::new(AtomicUsize::new(0)),
+            last_preflight_len: Arc::new(AtomicUsize::new(0)),
+            compare_and_set_calls: Arc::new(AtomicUsize::new(0)),
+            batch_calls: Arc::new(AtomicUsize::new(0)),
             delete_calls: Arc::new(AtomicUsize::new(0)),
             delete_effects: Arc::new(AtomicUsize::new(0)),
         }
@@ -432,7 +525,25 @@ impl SessionBackend for CancellableStallBackend {
         unreachable!("stall completes only when its future is cancelled")
     }
 
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        self.preflight_calls.fetch_add(1, Ordering::SeqCst);
+        self.last_preflight_len
+            .store(preflights.len(), Ordering::SeqCst);
+        match self.preflight_behavior.load(Ordering::SeqCst) {
+            0 => {
+                self.stall().await;
+                unreachable!("stall completes only when its future is cancelled")
+            }
+            1 => Ok(()),
+            _ => Err(StoreError::InvalidRecordExpiry),
+        }
+    }
+
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.compare_and_set_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.compare_and_set(op).await
     }
 
@@ -460,6 +571,7 @@ impl SessionBackend for CancellableStallBackend {
         &self,
         ops: Vec<opc_session_store::SessionOp>,
     ) -> Result<Vec<opc_session_store::SessionOpResult>, StoreError> {
+        self.batch_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.batch(ops).await
     }
 
@@ -1440,6 +1552,257 @@ async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() 
 }
 
 #[tokio::test]
+async fn remote_preflight_timeout_is_retry_safe_and_never_reaches_key_provider() {
+    let mtls = mtls_configs();
+    let backend = CancellableStallBackend::new();
+    let key = test_key_with_stable_id(b"preflight-timeout");
+    let owner = OwnerId::new("preflight-timeout-owner").expect("owner");
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("lease before server start");
+    let server = SessionReplicationServer::new(
+        Arc::new(backend.clone()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_backend_operation_timeout(Duration::from_millis(50))
+    .with_backend_operation_concurrency(1);
+    let (handle, addr) = server
+        .listen("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect("start preflight-timeout server");
+    let provider = Arc::new(CountingUnavailableKeyProvider::default());
+    let encrypted = EncryptingSessionBackend::new(
+        Arc::new(remote_backend(
+            &mtls,
+            1,
+            2,
+            addr,
+            Some(Duration::from_secs(1)),
+        )),
+        Arc::clone(&provider),
+        "remote-preflight-timeout",
+    );
+    let mut record = test_record(&key, &owner, lease.fence(), Generation::new(1));
+    record.expires_at = Some(Timestamp::from_offset_datetime(
+        Timestamp::now_utc()
+            .as_offset_datetime()
+            .checked_add(time::Duration::days(1))
+            .expect("finite expiry"),
+    ));
+    let error = encrypted
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease,
+            expected_generation: None,
+            new_record: record,
+        })
+        .await
+        .expect_err("preflight must time out before encryption");
+    assert!(matches!(error, StoreError::BackendUnavailable(_)));
+    assert_eq!(backend.preflight_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert!(backend
+        .inner
+        .get(&key)
+        .await
+        .expect("backend read")
+        .is_none());
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn authenticated_cas_preflights_before_idempotency_cache_and_key_provider_work() {
+    use opc_session_net::protocol::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let authority = CancellableStallBackend::new();
+    let key = test_key_with_stable_id(b"server-cas-authority-preflight");
+    let owner = OwnerId::new("server-cas-authority-owner").expect("owner");
+    let lease = authority
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("lease before server start");
+    let provider = Arc::new(CountingWorkingKeyProvider::for_tenant(&key.tenant));
+    let encrypted = EncryptingSessionBackend::new(
+        Arc::new(authority.clone()),
+        Arc::clone(&provider),
+        "server-cas-authority-preflight",
+    );
+    let server = SessionReplicationServer::new(
+        Arc::new(encrypted),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_backend_operation_timeout(Duration::from_millis(50))
+    .with_backend_operation_concurrency(1);
+    let (handle, addr) = server
+        .listen("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect("start authority-preflight server");
+    let (mut stream, epoch) =
+        authenticated_raw_stream_with_epoch(&mtls, 1, 2, addr, DEFAULT_MAX_FRAME_SIZE).await;
+    let mut record = test_record(&key, &owner, lease.fence(), Generation::new(1));
+    record.expires_at = Some(Timestamp::from_offset_datetime(
+        Timestamp::now_utc()
+            .as_offset_datetime()
+            .checked_add(time::Duration::days(1))
+            .expect("finite expiry"),
+    ));
+    let request = Request::CompareAndSet {
+        op: CompareAndSet {
+            key: key.clone(),
+            lease,
+            expected_generation: None,
+            new_record: record,
+        },
+        request_id: Some(uuid::Uuid::from_u128(148).hyphenated().to_string()),
+        idempotency_epoch: Some(epoch.hyphenated().to_string()),
+    };
+
+    write_frame(&mut stream, &request)
+        .await
+        .expect("write CAS with stalled authority preflight");
+    let timed_out: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("typed preflight timeout");
+    assert!(matches!(
+        timed_out,
+        Response::CompareAndSet(Err(StoreError::BackendUnavailable(_)))
+    ));
+    assert_eq!(authority.preflight_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.compare_and_set_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert!(authority
+        .inner
+        .get(&key)
+        .await
+        .expect("inspect backend")
+        .is_none());
+
+    // The same authenticated idempotency key remains executable: the timed
+    // out authority preflight did not enter or tombstone the CAS cache.
+    authority.preflight_behavior.store(1, Ordering::SeqCst);
+    write_frame(&mut stream, &request)
+        .await
+        .expect("retry the exact CAS after authority recovery");
+    let recovered: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("definitive CAS after authority recovery");
+    assert!(matches!(
+        recovered,
+        Response::CompareAndSet(Ok(CompareAndSetResult::Success))
+    ));
+    assert_eq!(authority.preflight_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(authority.compare_and_set_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(authority
+        .inner
+        .get(&key)
+        .await
+        .expect("inspect committed backend record")
+        .is_some());
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn authenticated_batch_preflights_every_cas_before_backend_dispatch() {
+    use opc_session_net::protocol::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let authority = CancellableStallBackend::new();
+    authority.preflight_behavior.store(2, Ordering::SeqCst);
+    let first_key = test_key_with_stable_id(b"server-batch-preflight-first");
+    let second_key = test_key_with_stable_id(b"server-batch-preflight-second");
+    let owner = OwnerId::new("server-batch-authority-owner").expect("owner");
+    let first_lease = authority
+        .acquire(&first_key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("first lease");
+    let second_lease = authority
+        .acquire(&second_key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("second lease");
+    let mut second_record = test_record(
+        &second_key,
+        &owner,
+        second_lease.fence(),
+        Generation::new(1),
+    );
+    second_record.expires_at = Some(Timestamp::from_offset_datetime(
+        Timestamp::now_utc()
+            .as_offset_datetime()
+            .checked_add(time::Duration::days(1))
+            .expect("finite expiry"),
+    ));
+    let request = Request::Batch {
+        ops: vec![
+            SessionOp::CompareAndSet(CompareAndSet {
+                key: first_key.clone(),
+                lease: first_lease.clone(),
+                expected_generation: None,
+                new_record: test_record(
+                    &first_key,
+                    &owner,
+                    first_lease.fence(),
+                    Generation::new(1),
+                ),
+            }),
+            SessionOp::CompareAndSet(CompareAndSet {
+                key: second_key.clone(),
+                lease: second_lease,
+                expected_generation: None,
+                new_record: second_record,
+            }),
+        ],
+    };
+    let server = SessionReplicationServer::new(
+        Arc::new(authority.clone()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    );
+    let (handle, addr) = server
+        .listen("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect("start batch-preflight server");
+    let mut stream = authenticated_raw_stream(&mtls, 1, 2, addr, DEFAULT_MAX_FRAME_SIZE).await;
+
+    write_frame(&mut stream, &request)
+        .await
+        .expect("write batch requiring authority preflight");
+    let rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("typed batch preflight rejection");
+    assert!(matches!(
+        rejected,
+        Response::Batch(Err(StoreError::InvalidRecordExpiry))
+    ));
+    assert_eq!(authority.preflight_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.last_preflight_len.load(Ordering::SeqCst), 2);
+    assert_eq!(authority.batch_calls.load(Ordering::SeqCst), 0);
+    assert!(authority
+        .inner
+        .get(&first_key)
+        .await
+        .expect("inspect first record")
+        .is_none());
+    assert!(authority
+        .inner
+        .get(&second_key)
+        .await
+        .expect("inspect second record")
+        .is_none());
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn remote_client_rejects_zero_sequence_before_resolve_or_retry() {
     let mtls = mtls_configs();
     let backend = ReplicationDispatchSpy::new();
@@ -2060,14 +2423,15 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
     let hello: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
         .await
         .expect("read authenticated hello response");
-    assert!(matches!(
-        hello,
+    let idempotency_epoch = match hello {
         Response::HelloAck {
             contract_version: CONTRACT_VERSION,
             handshake_nonce: Some(echoed),
+            cas_idempotency_epoch: Some(epoch),
             ..
-        } if echoed == nonce
-    ));
+        } if echoed == nonce => epoch,
+        response => panic!("unexpected authenticated hello response: {response:?}"),
+    };
 
     let key = test_key_with_stable_id(b"wire-invalid-ttl-canary");
     let owner = OwnerId::new("wire-invalid-ttl-owner").expect("test owner");
@@ -2109,6 +2473,60 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
         response => panic!("unexpected valid acquire response: {response:?}"),
     };
     assert_eq!(backend.acquire_calls.load(Ordering::SeqCst), 1);
+
+    let mut invalid_record = test_record(&key, &owner, lease.fence(), Generation::new(1));
+    invalid_record.expires_at = Some(Timestamp::from_offset_datetime(
+        Timestamp::now_utc()
+            .as_offset_datetime()
+            .checked_add(time::Duration::seconds(
+                i64::try_from(MAX_SESSION_TTL.as_secs()).expect("test TTL fits i64") + 86_400,
+            ))
+            .expect("far-future test expiry"),
+    ));
+    let invalid_cas = CompareAndSet {
+        key: key.clone(),
+        lease: lease.clone(),
+        expected_generation: None,
+        new_record: invalid_record,
+    };
+    write_frame(
+        &mut stream,
+        &Request::CompareAndSet {
+            op: invalid_cas.clone(),
+            request_id: Some(uuid::Uuid::new_v4().to_string()),
+            idempotency_epoch: Some(idempotency_epoch.to_string()),
+        },
+    )
+    .await
+    .expect("write invalid absolute record expiry");
+    let cas_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed absolute expiry rejection");
+    assert!(matches!(
+        cas_rejected,
+        Response::CompareAndSet(Err(StoreError::InvalidRecordExpiry))
+    ));
+    assert_eq!(backend.compare_and_set_calls.load(Ordering::SeqCst), 0);
+
+    write_frame(
+        &mut stream,
+        &Request::Batch {
+            ops: vec![
+                opc_session_store::SessionOp::Get { key: key.clone() },
+                opc_session_store::SessionOp::CompareAndSet(invalid_cas),
+            ],
+        },
+    )
+    .await
+    .expect("write invalid batched absolute expiry");
+    let batch_expiry_rejected: Response = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+        .await
+        .expect("read typed batched expiry rejection");
+    assert!(matches!(
+        batch_expiry_rejected,
+        Response::Batch(Err(StoreError::InvalidRecordExpiry))
+    ));
+    assert_eq!(backend.batch_calls.load(Ordering::SeqCst), 0);
 
     let mut invalid_renew = serde_json::to_value(Request::RenewLease {
         lease: lease.clone(),
@@ -2250,6 +2668,84 @@ async fn authenticated_server_rejects_wire_invalid_ttls_and_keeps_connection_usa
     assert!(matches!(follow_up, Response::MaxReplicationSequence(Ok(_))));
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn remote_expiry_preflight_rejects_before_client_side_key_provider_work() {
+    let mtls = mtls_configs();
+    let (addr, backend, handle) = start_server(&mtls, 2).await;
+    let remote = Arc::new(remote_backend(
+        &mtls,
+        1,
+        2,
+        addr,
+        Some(Duration::from_secs(2)),
+    ));
+    let provider = Arc::new(CountingUnavailableKeyProvider::default());
+    let encrypted =
+        EncryptingSessionBackend::new(remote, Arc::clone(&provider), "remote-expiry-preflight");
+    let valid_key = test_key_with_stable_id(b"remote-expiry-valid");
+    let invalid_key = test_key_with_stable_id(b"remote-expiry-invalid");
+    let valid_owner = OwnerId::new("remote-expiry-valid-owner").expect("owner");
+    let invalid_owner = OwnerId::new("remote-expiry-invalid-owner").expect("owner");
+    let valid_lease = encrypted
+        .acquire(&valid_key, valid_owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("valid lease");
+    let invalid_lease = encrypted
+        .acquire(&invalid_key, invalid_owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("invalid lease");
+    let valid = test_record(
+        &valid_key,
+        &valid_owner,
+        valid_lease.fence(),
+        Generation::new(1),
+    );
+    let mut invalid = test_record(
+        &invalid_key,
+        &invalid_owner,
+        invalid_lease.fence(),
+        Generation::new(1),
+    );
+    invalid.expires_at = Some(
+        "9999-12-31T23:59:59.999999999Z"
+            .parse()
+            .expect("far-future expiry"),
+    );
+
+    assert_eq!(
+        encrypted
+            .batch(vec![
+                SessionOp::CompareAndSet(CompareAndSet {
+                    key: valid_key.clone(),
+                    lease: valid_lease,
+                    expected_generation: None,
+                    new_record: valid,
+                }),
+                SessionOp::CompareAndSet(CompareAndSet {
+                    key: invalid_key.clone(),
+                    lease: invalid_lease,
+                    expected_generation: None,
+                    new_record: invalid,
+                }),
+            ])
+            .await,
+        Err(StoreError::InvalidRecordExpiry)
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert!(backend
+        .get(&valid_key)
+        .await
+        .expect("valid key read")
+        .is_none());
+    assert!(backend
+        .get(&invalid_key)
+        .await
+        .expect("invalid key read")
+        .is_none());
+
+    handle.abort_and_wait().await;
 }
 
 #[tokio::test]

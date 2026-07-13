@@ -8,12 +8,13 @@ use opc_key::{
     AES_256_GCM_SIV_KEY_LEN,
 };
 use opc_session_store::{
-    BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
-    EncryptingSessionBackend, FakeSessionBackend, FenceToken, Generation, LeaseGuard, OwnerId,
-    RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp, RestoreScanRequest,
-    SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult,
-    SessionPayloadEncoding, StateClass, StateType, StoreError, StoredSessionRecord,
-    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH, MAX_SESSION_TTL,
+    checked_session_deadline, BackendCapabilities, Clock, CompareAndSet, CompareAndSetResult,
+    EncryptedSessionPayload, EncryptingSessionBackend, FakeSessionBackend, FenceToken, Generation,
+    LeaseGuard, OwnerId, RemoteSealingSessionBackend, ReplicationEntry, ReplicationOp,
+    RestoreScanRequest, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionOpResult, SessionPayloadEncoding, StateClass, StateType, StoreError,
+    StoredSessionRecord, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    MAX_SESSION_TTL,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::{
@@ -66,6 +67,15 @@ fn test_key() -> SessionKey {
     }
 }
 
+#[derive(Debug)]
+struct FixedAuthorityClock(Timestamp);
+
+impl Clock for FixedAuthorityClock {
+    fn now_utc(&self) -> Timestamp {
+        self.0
+    }
+}
+
 fn test_record(
     key: SessionKey,
     generation: u64,
@@ -81,6 +91,17 @@ fn test_record(
         expires_at: None,
         payload: EncryptedSessionPayload::new(Bytes::from_static(b"plain-session")),
     }
+}
+
+fn far_future_record(mut record: StoredSessionRecord) -> StoredSessionRecord {
+    let deadline = Timestamp::now_utc()
+        .as_offset_datetime()
+        .checked_add(time::Duration::seconds(
+            i64::try_from(MAX_SESSION_TTL.as_secs()).expect("test TTL fits i64") + 86_400,
+        ))
+        .expect("test far-future deadline");
+    record.expires_at = Some(Timestamp::from_offset_datetime(deadline));
+    record
 }
 
 fn test_replication_entry(sequence: u64, tx_id: &str) -> ReplicationEntry {
@@ -857,6 +878,134 @@ async fn remote_wrapper_rejects_structure_limits_before_provider_or_backend_effe
         Err(StoreError::ReplicationOperationLimitExceeded)
     );
     assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn encrypting_wrapper_rejects_absolute_expiry_before_provider_or_backend() {
+    let inner = Arc::new(FakeSessionBackend::new());
+    let lease = inner
+        .acquire(
+            &test_key(),
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+    let provider = Arc::new(CountingKeyProvider::new(test_provider()));
+    let backend = EncryptingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "absolute-expiry-local",
+    );
+    let new_record = far_future_record(test_record(test_key(), 1, &lease));
+    let operation = CompareAndSet {
+        key: test_key(),
+        lease,
+        expected_generation: None,
+        new_record,
+    };
+
+    assert_eq!(
+        backend.compare_and_set(operation.clone()).await,
+        Err(StoreError::InvalidRecordExpiry)
+    );
+    assert_eq!(
+        backend
+            .batch(vec![
+                SessionOp::Get { key: test_key() },
+                SessionOp::CompareAndSet(operation)
+            ])
+            .await,
+        Err(StoreError::InvalidRecordExpiry)
+    );
+    assert_eq!(provider.calls(), 0);
+    assert_eq!(inner.get(&test_key()).await.expect("record"), None);
+}
+
+#[tokio::test]
+async fn remote_sealing_wrapper_rejects_absolute_expiry_before_provider_or_backend() {
+    let inner = Arc::new(FakeSessionBackend::new());
+    let lease = inner
+        .acquire(
+            &test_key(),
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+    let provider = Arc::new(CountingRemoteSealProvider::new(test_remote_seal_provider()));
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "absolute-expiry-remote",
+    );
+    let mut new_record = test_record(test_key(), 1, &lease);
+    new_record = far_future_record(new_record);
+    let operation = CompareAndSet {
+        key: test_key(),
+        lease,
+        expected_generation: None,
+        new_record,
+    };
+
+    assert_eq!(
+        backend.compare_and_set(operation.clone()).await,
+        Err(StoreError::InvalidRecordExpiry)
+    );
+    assert_eq!(
+        backend
+            .batch(vec![
+                SessionOp::Get { key: test_key() },
+                SessionOp::CompareAndSet(operation)
+            ])
+            .await,
+        Err(StoreError::InvalidRecordExpiry)
+    );
+    assert_eq!(provider.calls(), 0);
+    assert_eq!(inner.get(&test_key()).await.expect("record"), None);
+}
+
+#[tokio::test]
+async fn wrapper_uses_injected_backend_expiry_authority_not_process_wall_clock() {
+    let authority_time = Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("2100 test timestamp"),
+    );
+    let inner = Arc::new(
+        FakeSessionBackend::new().with_clock(Arc::new(FixedAuthorityClock(authority_time))),
+    );
+    let lease = inner
+        .acquire(
+            &test_key(),
+            OwnerId::new("owner-a").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("lease");
+    let provider = Arc::new(CountingKeyProvider::new(test_provider()));
+    let backend = EncryptingSessionBackend::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+        "virtual-authority",
+    );
+    let mut new_record = test_record(test_key(), 1, &lease);
+    new_record.expires_at = Some(
+        checked_session_deadline(authority_time, MAX_SESSION_TTL)
+            .expect("exact authority-relative maximum"),
+    );
+
+    assert_eq!(
+        backend
+            .compare_and_set(CompareAndSet {
+                key: test_key(),
+                lease,
+                expected_generation: None,
+                new_record,
+            })
+            .await,
+        Ok(CompareAndSetResult::Success)
+    );
+    assert!(provider.calls() > 0, "valid record must reach the provider");
+    assert!(inner.get(&test_key()).await.expect("record").is_some());
 }
 
 #[tokio::test]

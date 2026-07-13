@@ -18,6 +18,7 @@ use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError}
 use opc_consensus::engine::{Config, EmptyNode, LogId, SnapshotPolicy, StoredMembership};
 use opc_consensus::{decode_bounded, encode_bounded};
 use opc_types::Timestamp;
+use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -33,9 +34,11 @@ use super::{
     SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::backend::{
-    validate_replication_log_page_owned, validate_replication_prefix_owned,
-    BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
-    ReplicationLogRange, SessionBackend, SessionOp, SessionOpResult,
+    record_expiry_preflights, validate_record_expiry_preflights_at,
+    validate_record_expiry_preflights_profile, validate_replication_log_page_owned,
+    validate_replication_prefix_owned, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+    RecordExpiryPreflight, ReplicationEntry, ReplicationLogRange, SessionBackend, SessionOp,
+    SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
 };
 use crate::capability::{BackendCapabilities, SessionStorePlatformProfile};
 use crate::clock::{Clock, SystemClock};
@@ -51,7 +54,9 @@ use crate::record::StoredSessionRecord;
 use crate::restore::{RestoreScanPage, RestoreScanRequest};
 use crate::sqlite::SqliteSessionBackend;
 use crate::topology::{QuorumTopologyMode, QuorumTopologySummary, ValidatedQuorumTopology};
-use crate::ttl::{checked_session_deadline, validate_session_ttl};
+use crate::ttl::{
+    checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at,
+};
 
 /// Default complete client-operation deadline, including leader discovery,
 /// forwarding, quorum confirmation, commit, and local apply.
@@ -129,8 +134,83 @@ struct ForwardMutationRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum ForwardRequest {
+    Mutation(ForwardMutationRequest),
+    RecordExpiryPreflight {
+        preflights: BoundedRecordExpiryPreflights,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct BoundedRecordExpiryPreflights(Vec<RecordExpiryPreflight>);
+
+impl BoundedRecordExpiryPreflights {
+    fn try_from_slice(preflights: &[RecordExpiryPreflight]) -> Result<Self, StoreError> {
+        validate_record_expiry_preflights_profile(preflights)?;
+        Ok(Self(preflights.to_vec()))
+    }
+
+    fn into_inner(self) -> Vec<RecordExpiryPreflight> {
+        self.0
+    }
+}
+
+struct BoundedRecordExpiryPreflightsVisitor;
+
+impl<'de> Visitor<'de> for BoundedRecordExpiryPreflightsVisitor {
+    type Value = BoundedRecordExpiryPreflights;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "at most {MAX_RECORD_EXPIRY_PREFLIGHTS} record-expiry descriptors"
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if sequence
+            .size_hint()
+            .is_some_and(|size| size > MAX_RECORD_EXPIRY_PREFLIGHTS)
+        {
+            return Err(serde::de::Error::custom(
+                "record-expiry preflight exceeds the operation limit",
+            ));
+        }
+        let mut preflights = Vec::with_capacity(
+            sequence
+                .size_hint()
+                .unwrap_or(0)
+                .min(MAX_RECORD_EXPIRY_PREFLIGHTS),
+        );
+        while let Some(preflight) = sequence.next_element()? {
+            if preflights.len() == MAX_RECORD_EXPIRY_PREFLIGHTS {
+                return Err(serde::de::Error::custom(
+                    "record-expiry preflight exceeds the operation limit",
+                ));
+            }
+            preflights.push(preflight);
+        }
+        Ok(BoundedRecordExpiryPreflights(preflights))
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedRecordExpiryPreflights {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BoundedRecordExpiryPreflightsVisitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ForwardMutationReply {
     Applied(Box<SessionConsensusResponse>),
+    RecordExpiryPreflight(Result<(), StoreError>),
     NotLeader {
         leader: Option<SessionConsensusNodeId>,
     },
@@ -619,7 +699,7 @@ impl ConsensusSessionStore {
                     .call_peer::<_, ForwardMutationReply>(
                         leader,
                         SessionConsensusRpcFamily::ForwardMutation,
-                        &request,
+                        &ForwardRequest::Mutation(request.clone()),
                         deadline,
                     )
                     .await
@@ -688,6 +768,76 @@ impl ConsensusSessionStore {
                         };
                     }
                 }
+                ForwardMutationReply::RecordExpiryPreflight(_) => {
+                    return Err(consensus_outcome_unavailable(&request.intent));
+                }
+            }
+        }
+    }
+
+    async fn preflight_record_expiry_before(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        validate_record_expiry_preflights_profile(preflights)?;
+        self.require_exact_membership_admission()?;
+        let request = ForwardRequest::RecordExpiryPreflight {
+            preflights: BoundedRecordExpiryPreflights::try_from_slice(preflights)?,
+        };
+        let mut preferred = None;
+        loop {
+            let leader = match preferred.take() {
+                Some(leader) => leader,
+                None => self.wait_for_known_leader(deadline).await?,
+            };
+            let reply = if leader == self.inner.local_node_id {
+                let ForwardRequest::RecordExpiryPreflight { preflights } = request.clone() else {
+                    unreachable!("fixed expiry-preflight request")
+                };
+                self.preflight_record_expiry_on_local_leader(preflights.into_inner(), deadline)
+                    .await
+            } else {
+                match self
+                    .call_peer::<_, ForwardMutationReply>(
+                        leader,
+                        SessionConsensusRpcFamily::ForwardMutation,
+                        &request,
+                        deadline,
+                    )
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(ConsensusPeerCallFailure::AfterTransmission) => {
+                        // A valid preflight may have committed only its logical
+                        // time floor. Never run provider work without a
+                        // definitive acknowledgement; an outer retry is safe.
+                        return Err(consensus_unavailable());
+                    }
+                    Err(ConsensusPeerCallFailure::BeforeTransmission) => {
+                        self.wait_for_route_refresh(leader, deadline).await?;
+                        continue;
+                    }
+                }
+            };
+            match reply {
+                ForwardMutationReply::RecordExpiryPreflight(result) => return result,
+                ForwardMutationReply::NotLeader {
+                    leader: next_leader,
+                } => {
+                    preferred = next_leader.filter(|candidate| {
+                        *candidate != leader && self.inner.members.contains(candidate)
+                    });
+                    if preferred.is_none() {
+                        self.wait_for_route_refresh(leader, deadline).await?;
+                    }
+                }
+                ForwardMutationReply::Unavailable => {
+                    self.wait_for_route_refresh(leader, deadline).await?;
+                }
+                ForwardMutationReply::Applied(_) => {
+                    return Err(consensus_unavailable());
+                }
             }
         }
     }
@@ -745,7 +895,16 @@ impl ConsensusSessionStore {
 
         match tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await {
             Err(_) => return ForwardMutationReply::Unavailable,
-            Ok(Ok(_)) => {
+            Ok(Ok(log_id)) => {
+                if let Some(log_id) = log_id {
+                    if self
+                        .wait_for_local_apply(log_id.index, deadline)
+                        .await
+                        .is_err()
+                    {
+                        return ForwardMutationReply::Unavailable;
+                    }
+                }
                 if self.require_exact_membership_admission().is_err() {
                     return ForwardMutationReply::Unavailable;
                 }
@@ -759,14 +918,44 @@ impl ConsensusSessionStore {
             }
         }
 
+        let logical_time = match tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .backend
+                .consensus_logical_time(self.inner.identity),
+        )
+        .await
+        {
+            Ok(Ok(persisted)) => persisted.map_or_else(
+                || self.inner.clock.now_utc(),
+                |persisted| persisted.max(self.inner.clock.now_utc()),
+            ),
+            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
+        };
+        self.propose_on_local_leader(request, logical_time, proposal_guard, deadline)
+            .await
+    }
+
+    async fn propose_on_local_leader(
+        &self,
+        request: ForwardMutationRequest,
+        logical_time: Timestamp,
+        proposal_guard: tokio::sync::OwnedMutexGuard<()>,
+        deadline: tokio::time::Instant,
+    ) -> ForwardMutationReply {
         let outcome_unavailable = consensus_outcome_unavailable(&request.intent);
         let command = super::SessionConsensusCommand {
             schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
             identity: self.inner.identity,
             request_id: request.request_id,
-            logical_time: self.inner.clock.now_utc(),
+            logical_time,
             intent: request.intent,
         };
+        if let Err(error) = validate_consensus_command_preproposal(&command) {
+            return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
+                error,
+            )));
+        }
         if encode_bounded(&command).is_err() {
             let max = self.inner.backend.consensus_capabilities().max_value_bytes;
             return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
@@ -824,6 +1013,121 @@ impl ConsensusSessionStore {
         }
     }
 
+    async fn preflight_record_expiry_on_local_leader(
+        &self,
+        preflights: Vec<RecordExpiryPreflight>,
+        deadline: tokio::time::Instant,
+    ) -> ForwardMutationReply {
+        if let Err(error) = validate_record_expiry_preflights_profile(&preflights) {
+            return ForwardMutationReply::RecordExpiryPreflight(Err(error));
+        }
+        if self.require_exact_membership_admission().is_err() {
+            return ForwardMutationReply::Unavailable;
+        }
+        let recovery_pending = match tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .backend
+                .consensus_operator_recovery_pending(self.inner.identity),
+        )
+        .await
+        {
+            Ok(Ok(pending)) => pending,
+            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
+        };
+        if recovery_pending {
+            return ForwardMutationReply::Unavailable;
+        }
+        let proposal_guard = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.inner.proposal_gate).lock_owned(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => return ForwardMutationReply::Unavailable,
+        };
+        match tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await {
+            Err(_) => return ForwardMutationReply::Unavailable,
+            Ok(Ok(log_id)) => {
+                if let Some(log_id) = log_id {
+                    if self
+                        .wait_for_local_apply(log_id.index, deadline)
+                        .await
+                        .is_err()
+                    {
+                        return ForwardMutationReply::Unavailable;
+                    }
+                }
+                if self.require_exact_membership_admission().is_err() {
+                    return ForwardMutationReply::Unavailable;
+                }
+            }
+            Ok(Err(error)) => {
+                return ForwardMutationReply::NotLeader {
+                    leader: error
+                        .forward_to_leader()
+                        .and_then(|forward| forward.leader_id),
+                };
+            }
+        }
+        let persisted = match tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .backend
+                .consensus_logical_time(self.inner.identity),
+        )
+        .await
+        {
+            Ok(Ok(persisted)) => persisted,
+            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
+        };
+        if persisted.is_some_and(|persisted| {
+            validate_record_expiry_preflights_at(&preflights, persisted).is_ok()
+        }) {
+            return ForwardMutationReply::RecordExpiryPreflight(Ok(()));
+        }
+        let authority_time = persisted.map_or_else(
+            || self.inner.clock.now_utc(),
+            |persisted| persisted.max(self.inner.clock.now_utc()),
+        );
+        if let Err(error) = validate_record_expiry_preflights_at(&preflights, authority_time) {
+            return ForwardMutationReply::RecordExpiryPreflight(Err(error));
+        }
+        if !preflights
+            .iter()
+            .copied()
+            .any(RecordExpiryPreflight::is_finite)
+        {
+            return ForwardMutationReply::RecordExpiryPreflight(Ok(()));
+        }
+
+        let intent = SessionMutationIntent::AdvanceLogicalTime;
+        let reply = self
+            .propose_on_local_leader(
+                ForwardMutationRequest {
+                    request_id: SessionConsensusRequestId::new(),
+                    intent: intent.clone(),
+                },
+                authority_time,
+                proposal_guard,
+                deadline,
+            )
+            .await;
+        match reply {
+            ForwardMutationReply::Applied(response)
+                if committed_response_matches_intent(&intent, &response)
+                    && matches!(response.result, Ok(SessionMutationOutcome::Unit)) =>
+            {
+                ForwardMutationReply::RecordExpiryPreflight(Ok(()))
+            }
+            ForwardMutationReply::Applied(_) => {
+                ForwardMutationReply::RecordExpiryPreflight(Err(consensus_unavailable()))
+            }
+            other => other,
+        }
+    }
+
     pub(crate) async fn commit_operator_recovery(
         &self,
         request_id: SessionConsensusRequestId,
@@ -872,7 +1176,9 @@ impl ConsensusSessionStore {
             ForwardMutationReply::NotLeader { .. } => {
                 Err(OperatorRecoveryCommitError::NotLocalLeader)
             }
-            ForwardMutationReply::Unavailable => Err(OperatorRecoveryCommitError::Unavailable),
+            ForwardMutationReply::Unavailable | ForwardMutationReply::RecordExpiryPreflight(_) => {
+                Err(OperatorRecoveryCommitError::Unavailable)
+            }
         }
     }
 
@@ -1253,10 +1559,17 @@ fn rejected_response_matches_intent(
         )
 }
 
-fn rejected_error_matches_intent(_: &SessionMutationIntent, error: &StoreError) -> bool {
+fn rejected_error_matches_intent(intent: &SessionMutationIntent, error: &StoreError) -> bool {
     // Normal callers validate intent before routing. The only remaining
     // preproposal rejection is the fixed bounded-command encoding limit.
     matches!(error, StoreError::PayloadTooLarge { .. })
+        || matches!(
+            (intent, error),
+            (
+                SessionMutationIntent::CompareAndSet(_),
+                StoreError::InvalidRecordExpiry
+            )
+        )
 }
 
 fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreError) -> bool {
@@ -1268,6 +1581,7 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
                 | StoreError::StaleFence
                 | StoreError::InvalidKey(_)
                 | StoreError::LeaseExpired
+                | StoreError::InvalidRecordExpiry
                 | StoreError::PayloadTooLarge { .. }
         ),
         SessionMutationIntent::DeleteFenced(_) => matches!(
@@ -1321,6 +1635,15 @@ fn exact_uniform_voter_membership(
 
 fn validate_consensus_intent(intent: &SessionMutationIntent) -> Result<(), StoreError> {
     validate_consensus_intent_with_recovery(intent, false)
+}
+
+fn validate_consensus_command_preproposal(
+    command: &super::SessionConsensusCommand,
+) -> Result<(), StoreError> {
+    if let SessionMutationIntent::CompareAndSet(op) = &command.intent {
+        validate_stored_record_expiry_at(&op.new_record, command.logical_time)?;
+    }
+    Ok(())
 }
 
 fn validate_consensus_intent_with_recovery(
@@ -1402,14 +1725,27 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                     .await
             }
             SessionConsensusRpcFamily::ForwardMutation => {
-                let forwarded: ForwardMutationRequest = match decode_bounded(&request.payload) {
+                let forwarded: ForwardRequest = match decode_bounded(&request.payload) {
                     Ok(forwarded) => forwarded,
                     Err(_) => return protocol_rejection(),
                 };
                 let deadline = tokio::time::Instant::now()
                     .checked_add(self.store.inner.operation_timeout)
                     .unwrap_or_else(tokio::time::Instant::now);
-                encode_service_reply(&self.store.apply_on_local_leader(forwarded, deadline).await)
+                let reply = match forwarded {
+                    ForwardRequest::Mutation(request) => {
+                        self.store.apply_on_local_leader(request, deadline).await
+                    }
+                    ForwardRequest::RecordExpiryPreflight { preflights } => {
+                        self.store
+                            .preflight_record_expiry_on_local_leader(
+                                preflights.into_inner(),
+                                deadline,
+                            )
+                            .await
+                    }
+                };
+                encode_service_reply(&reply)
             }
             SessionConsensusRpcFamily::ReadBarrier => {
                 if decode_bounded::<ReadBarrierRequest>(&request.payload).is_err() {
@@ -1458,6 +1794,25 @@ impl SessionBackend for ConsensusSessionStore {
         capabilities
     }
 
+    async fn preflight_record_expiry(
+        &self,
+        preflights: &[RecordExpiryPreflight],
+    ) -> Result<(), StoreError> {
+        validate_record_expiry_preflights_profile(preflights)?;
+        if !preflights
+            .iter()
+            .copied()
+            .any(RecordExpiryPreflight::is_finite)
+        {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.preflight_record_expiry_before(preflights, deadline)
+            .await
+    }
+
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         let logical_time = self.logical_read_time().await?;
         self.inner.backend.consensus_get_at(key, logical_time).await
@@ -1500,8 +1855,9 @@ impl SessionBackend for ConsensusSessionStore {
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
         self.require_exact_membership_admission()?;
-        crate::backend::validate_session_ops_ttls(&ops)?;
+        let preflights = record_expiry_preflights(&ops)?;
         validate_consensus_batch(&ops)?;
+        self.preflight_record_expiry(&preflights).await?;
         let mut results = Vec::with_capacity(ops.len());
         for op in ops {
             results.push(match op {
@@ -1659,6 +2015,8 @@ impl SessionLeaseManager for ConsensusSessionStore {
 
 #[cfg(test)]
 mod membership_tests {
+    use std::sync::Mutex;
+
     use bytes::Bytes;
     use opc_consensus::engine::{CommittedLeaderId, Membership};
     use opc_consensus::{
@@ -1677,6 +2035,25 @@ mod membership_tests {
 
     fn node(value: u64) -> SessionConsensusNodeId {
         SessionConsensusNodeId::new(value).expect("valid test consensus node ID")
+    }
+
+    #[derive(Debug)]
+    struct MutableClock(Mutex<Timestamp>);
+
+    impl MutableClock {
+        fn new(now: Timestamp) -> Self {
+            Self(Mutex::new(now))
+        }
+
+        fn set(&self, now: Timestamp) {
+            *self.0.lock().expect("clock lock") = now;
+        }
+    }
+
+    impl Clock for MutableClock {
+        fn now_utc(&self) -> Timestamp {
+            *self.0.lock().expect("clock lock")
+        }
     }
 
     fn stored_membership(
@@ -1761,6 +2138,53 @@ mod membership_tests {
     }
 
     #[test]
+    fn forwarded_expiry_preflight_is_bounded_during_deserialization() {
+        let key = SessionKey {
+            tenant: TenantId::new("preflight-bound").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"preflight-bound")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let descriptor = RecordExpiryPreflight::from_record(&StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner: OwnerId::new("preflight-bound-owner").expect("owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("preflight-bound"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"must-not-cross-preflight"),
+        });
+        let exact = ForwardRequest::RecordExpiryPreflight {
+            preflights: BoundedRecordExpiryPreflights::try_from_slice(&vec![
+                descriptor;
+                MAX_RECORD_EXPIRY_PREFLIGHTS
+            ])
+            .expect("exact bound"),
+        };
+        let mut encoded = serde_json::to_value(exact).expect("encode exact preflight");
+        let decoded: ForwardRequest =
+            serde_json::from_value(encoded.clone()).expect("decode exact preflight");
+        assert!(matches!(
+            decoded,
+            ForwardRequest::RecordExpiryPreflight { preflights }
+                if preflights.0.len() == MAX_RECORD_EXPIRY_PREFLIGHTS
+        ));
+        let rendered = encoded.to_string();
+        for forbidden in ["stable_id", "payload", "owner", "generation", "fence"] {
+            assert!(!rendered.contains(forbidden));
+        }
+
+        let values = encoded["RecordExpiryPreflight"]["preflights"]
+            .as_array_mut()
+            .expect("preflight array");
+        values.push(values[0].clone());
+        assert!(serde_json::from_value::<ForwardRequest>(encoded).is_err());
+    }
+
+    #[test]
     fn forwarded_mutation_responses_are_bound_to_the_exact_intent() {
         let key = |stable_id: &'static [u8]| SessionKey {
             tenant: TenantId::new("forward-response-binding").expect("tenant"),
@@ -1825,10 +2249,43 @@ mod membership_tests {
         ));
 
         let cas_intent = SessionMutationIntent::CompareAndSet(Box::new(cas));
+        assert!(rejected_response_matches_intent(
+            &cas_intent,
+            &SessionConsensusResponse::rejected(StoreError::InvalidRecordExpiry)
+        ));
+        assert!(!rejected_response_matches_intent(
+            &SessionMutationIntent::DeleteFenced(lease_a.clone()),
+            &SessionConsensusResponse::rejected(StoreError::InvalidRecordExpiry)
+        ));
         assert!(!committed_response_matches_intent(
             &cas_intent,
             &committed(Ok(SessionMutationOutcome::Unit))
         ));
+
+        let SessionMutationIntent::CompareAndSet(cas) = &cas_intent else {
+            unreachable!("CAS intent changed variant")
+        };
+        let mut invalid_cas = cas.as_ref().clone();
+        invalid_cas.new_record.expires_at = Some(Timestamp::from_offset_datetime(
+            checked_session_deadline(logical_time, crate::MAX_SESSION_TTL)
+                .expect("maximum record expiry")
+                .as_offset_datetime()
+                .checked_add(time::Duration::nanoseconds(1))
+                .expect("maximum plus one"),
+        ));
+        let invalid_command = crate::consensus::SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: singleton_topology()
+                .consensus_identity()
+                .expect("consensus topology identity"),
+            request_id: SessionConsensusRequestId::new(),
+            logical_time,
+            intent: SessionMutationIntent::CompareAndSet(Box::new(invalid_cas)),
+        };
+        assert_eq!(
+            validate_consensus_command_preproposal(&invalid_command),
+            Err(StoreError::InvalidRecordExpiry)
+        );
         assert!(!committed_response_matches_intent(
             &cas_intent,
             &committed(Err(StoreError::CasConflict))
@@ -1953,6 +2410,95 @@ mod membership_tests {
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
         );
+    }
+
+    #[tokio::test]
+    async fn committed_expiry_floor_is_idempotent_and_survives_leader_clock_rollback() {
+        let directory = tempfile::tempdir().expect("expiry floor directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("expiry floor SQLite backend");
+        let start = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("test timestamp"),
+        );
+        let clock = Arc::new(MutableClock::new(start));
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            clock.clone(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open expiry floor store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize expiry floor store");
+        let key = SessionKey {
+            tenant: TenantId::new("expiry-floor").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"expiry-floor")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let maximum =
+            checked_session_deadline(start, crate::MAX_SESSION_TTL).expect("maximum expiry");
+        let mut record = StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner: OwnerId::new("expiry-floor-owner").expect("owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("expiry-floor"),
+            expires_at: Some(maximum),
+            payload: EncryptedSessionPayload::new(b"payload-free-preflight"),
+        };
+        let descriptor = RecordExpiryPreflight::from_record(&record);
+
+        store
+            .preflight_record_expiry(&[descriptor])
+            .await
+            .expect("commit first authority floor");
+        let first_log = store.inner.raft.metrics().borrow().last_log_index;
+        clock.set(Timestamp::from_offset_datetime(
+            start
+                .as_offset_datetime()
+                .checked_sub(time::Duration::days(1))
+                .expect("clock rollback"),
+        ));
+        store
+            .preflight_record_expiry(&[descriptor])
+            .await
+            .expect("persisted floor covers repeated preflight");
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            first_log,
+            "nested wrapper preflights must not append another floor"
+        );
+
+        record.expires_at = Some(Timestamp::from_offset_datetime(
+            maximum
+                .as_offset_datetime()
+                .checked_add(time::Duration::nanoseconds(1))
+                .expect("maximum plus one"),
+        ));
+        let invalid = RecordExpiryPreflight::from_record(&record);
+        assert_eq!(
+            store.preflight_record_expiry(&[invalid]).await,
+            Err(StoreError::InvalidRecordExpiry)
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            first_log
+        );
+
+        let response = store
+            .submit_intent(SessionMutationIntent::AdvanceLogicalTime)
+            .await
+            .expect("command after clock rollback");
+        assert_eq!(response.logical_time, Some(start));
     }
 
     #[tokio::test]

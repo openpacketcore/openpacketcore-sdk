@@ -59,8 +59,8 @@ async fn partition_and_recover() {
   formed. It does not by itself qualify cold-start races, multi-process
   restart/rejoin, legacy-fork repair, real mTLS transport, or carrier failover.
 - Long-running network, resource, and soak qualification remains #143. Watch
-  handoff semantics remain #145, and bounded replication-log cursor/retention
-  work remains #171.
+  handoff and bounded replication-log cursor/retention semantics are
+  implemented under #145/#171.
 - Restore assertions panic like normal test assertions.
 
 ## Roadmap

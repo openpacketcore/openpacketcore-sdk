@@ -15,12 +15,12 @@ use opc_key::{
     MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider, Zeroizing,
     AES_256_GCM_SIV_KEY_LEN,
 };
-use opc_types::{NetworkFunctionKind, TenantId};
+use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
 use super::ConsensusSessionStore;
 use crate::backend::{
     CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend,
-    SessionBackend,
+    SessionBackend, SessionOp,
 };
 use crate::consensus::{
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
@@ -315,6 +315,97 @@ fn assert_snapshot_state_is_sealed(snapshot: &Path, inspection_path: &Path) {
         .expect("write snapshot inspection DB");
     assert_sqlite_authority_is_sealed(inspection_path);
     std::fs::remove_file(inspection_path).expect("remove snapshot inspection DB");
+}
+
+fn consensus_authority_counts(database: &Path) -> (u64, u64, u64, u64) {
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open consensus authority counters");
+    connection
+        .query_row(
+            "SELECT machine.application_sequence,
+                    machine.watch_sequence,
+                    (SELECT COUNT(*) FROM session_records),
+                    (SELECT COUNT(*) FROM consensus_log)
+             FROM consensus_machine AS machine
+             WHERE machine.singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            },
+        )
+        .expect("read consensus authority counters")
+}
+
+#[tokio::test]
+async fn invalid_consensus_batch_is_rejected_before_log_or_key_provider_work() {
+    let directory = tempfile::tempdir().expect("qualification directory");
+    let database = directory.path().join("sessions.sqlite");
+    let snapshots = directory.path().join("snapshots");
+    let provider = provider();
+    let store = open_store(&database, &snapshots).await;
+    let encrypted = EncryptingSessionBackend::new(
+        Arc::new(store.clone()),
+        Arc::clone(&provider),
+        "consensus-expiry-preflight",
+    );
+
+    let valid_key = key(b"expiry-preflight-valid");
+    let invalid_key = key(b"expiry-preflight-invalid");
+    let valid_lease = encrypted
+        .acquire(
+            &valid_key,
+            OwnerId::new("expiry-preflight-valid-owner").expect("owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("valid lease");
+    let invalid_lease = encrypted
+        .acquire(
+            &invalid_key,
+            OwnerId::new("expiry-preflight-invalid-owner").expect("owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("invalid lease");
+    let valid = record(valid_key.clone(), &valid_lease, b"valid-plaintext");
+    let mut invalid = record(invalid_key.clone(), &invalid_lease, b"invalid-plaintext");
+    invalid.expires_at = Some(Timestamp::from_offset_datetime(
+        Timestamp::now_utc()
+            .as_offset_datetime()
+            .checked_add(time::Duration::days(366))
+            .expect("far-future expiry"),
+    ));
+    let before = consensus_authority_counts(&database);
+
+    assert_eq!(
+        encrypted
+            .batch(vec![
+                SessionOp::CompareAndSet(CompareAndSet {
+                    key: valid_key,
+                    lease: valid_lease,
+                    expected_generation: None,
+                    new_record: valid,
+                }),
+                SessionOp::CompareAndSet(CompareAndSet {
+                    key: invalid_key,
+                    lease: invalid_lease,
+                    expected_generation: None,
+                    new_record: invalid,
+                }),
+            ])
+            .await,
+        Err(crate::StoreError::InvalidRecordExpiry)
+    );
+    assert_eq!(provider.call_counts(), (0, 0, 0));
+    assert_eq!(consensus_authority_counts(&database), before);
 }
 
 #[tokio::test]

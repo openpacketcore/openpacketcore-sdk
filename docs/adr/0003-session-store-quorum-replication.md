@@ -83,7 +83,7 @@ one-replica Openraft profile that reports `single-replica`, never HA, while
 exercising the same durable engine and state machine.
 
 Production replication uses `SessionConsensusServer` and
-`RemoteSessionConsensusPeer` on the exact `opc-session-consensus/1` ALPN. One
+`RemoteSessionConsensusPeer` on the exact `opc-session-consensus/2` ALPN. One
 immutable consensus identity binds the cluster ID, descriptor-derived
 configuration ID, and monotonic epoch into topology, storage, snapshots, and
 every RPC. Before Openraft dispatch, both sides extract the canonical SPIFFE
@@ -92,6 +92,11 @@ stable node ID, expected opposite member, cluster, configuration, epoch, RPC
 sender, server profile, and fresh challenge. DNS/FQDN/IP aliases remain routing
 inputs only. The legacy writable backend protocol is not a production HA
 authority and is isolated behind an explicit compatibility surface.
+
+The exact consensus profile is transport/wire-schema revision 2 and error-set
+revision 4. It carries the bounded payload-free expiry-authority preflight;
+error revision 4 adds `RecordExpiryPreflightLimitExceeded`. Older profiles
+fail before engine dispatch and require a drained full-membership upgrade.
 
 TLS session caches, tickets, resumption, early data, and 0-RTT are disabled;
 every reconnect performs a full mutual-TLS certificate exchange so rotated
@@ -161,15 +166,15 @@ malformed sequence zero, checked increment, rebuild-prefix, SQLite
 signed-boundary, cache, and authenticated wire rejection are implemented under
 #138. Seamless session-net credential/trust lifecycle remains #158, and its
 distributed production qualification remains #143.
-Watch handoff correctness (#145) and absolute-record-expiry admission (#148)
-also remain open. Bounded nested-CAS protection is implemented under #147;
+Watch handoff correctness is implemented. Absolute-record-expiry admission
+is implemented under #148. Bounded nested-CAS protection is implemented under #147;
 outbound response allocation/frame bounds and slow-reader deadlines are
 implemented under #159. Distributed failure/resource qualification remains
-#143, and seamless credential/trust lifecycle remains the #161 -> #162 -> #163
--> #164 dependency chain under umbrella #158. These remaining gates keep the
-networked profile experimental.
+#143. #161 atomic reload and #162 coherent material epochs are implemented;
+#163 connection reauthentication and #164 fleet qualification remain under
+umbrella #158. These remaining gates keep the networked profile experimental.
 
-The v4 wire uses `u32` for restore/log request limits and the client restore
+The v5 wire uses `u32` for restore/log request limits and the client restore
 response budget; a confidential authenticated strictly bounded restore cursor;
 `u64` excluded counts,
 `max_value_bytes`, and size-bearing store errors; and checked conversion before
@@ -177,7 +182,7 @@ backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile pins wire-schema revision 4, error-set revision 6, a 4 MiB restore
+profile pins wire-schema revision 5, error-set revision 8, a 4 MiB restore
 payload bound, 8 MiB retained-page and examined key/filter-metadata bounds,
 `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
@@ -190,8 +195,11 @@ through 128 UTF-8 bytes, and CAS request IDs, when present, are canonical
 lowercase hyphenated UUIDs with the exact 36-byte encoding. Error-set revision
 4 additionally carries checked replication-log range overflow, page-limit, and
 compacted-cursor outcomes; revision 5 adds non-CAS backend and lease ambiguity
-outcomes; revision 6 adds bounded-watch catch-up. Revision-5 or older peers are
-incompatible. Public
+outcomes; revision 6 adds bounded-watch catch-up; and revision 7 adds
+absolute-record-expiry rejection. Revision 8 adds the bounded expiry-preflight
+limit outcome. Wire revision 4/error revision 7 or older peers are
+incompatible.
+Public
 `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
 `contract_profile`; exhaustive construction and matching must account for the
 new field. The public `ContractProfile::max_frame_size` field is also a Rust
@@ -208,7 +216,7 @@ restart but are node/incarnation-bound, so another node or installed snapshot
 returns typed stale state and requires a first-page restart.
 
 Wire-schema revision 2 adds directional response-budget admission to the exact
-v4 handshake. Hello carries the client's requested response frame size; HelloAck
+v5 handshake. Hello carries the client's requested response frame size; HelloAck
 returns the accepted response size (the client/server minimum) and the server's
 independent request-frame size. Each is a checked `u32` between
 `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes) and
@@ -216,9 +224,9 @@ independent request-frame size. Each is a checked `u32` between
 `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that same minimum.
 This makes unequal client/server limits explicit. The directional fields were
 introduced by wire-schema revision 2 and are retained by the current
-wire-schema revision 4/error-set revision 6 profile. Older exact profiles,
-including error-set revision 5 or older, are incompatible even though all use
-the `opc-session-net/4` ALPN.
+wire-schema revision 5/error-set revision 8 profile. Older exact profiles,
+including wire revision 4/error revision 7 or older, are incompatible; the
+current ALPN is `opc-session-net/5`.
 
 Every response and watch item is fully bounded-encoded before any frame prefix
 is emitted. Common non-pageable and complete-page successes use one bounded
@@ -285,7 +293,8 @@ integer operations rather than floating point or panicking timestamp
 
 The new public error variants require exhaustive callers. Protocol v4
 introduced their private fixed-width DTOs in error revision 1; current error
-revision 6 retains those encodings and rejects an error-revision-5 or older v4
+revision 8 retains those encodings, adds the bounded expiry-preflight outcome,
+and rejects an error-revision-7 or older
 peer during negotiation.
 Operators must first audit persisted legacy
 replication logs: a TTL-bearing entry above 365 days now fails closed during
@@ -300,21 +309,29 @@ encoded bytes. `SessionKeyType::Other` now contains a validated
 variants, and ordering uses canonical string order. Serde, SQLite hydration,
 and session-net decode reuse that admission. Valid identity JSON strings retain their
 shape, but Rust construction is source-breaking and semantic admission is
-stricter. An older v3 peer may emit values v4 rejects, so all clients, servers,
-and wrappers require coordinated stop/upgrade/start. Protocol v4's exact
+stricter. An older peer may emit values v5 rejects, so all clients, servers,
+and wrappers require coordinated stop/upgrade/start. Protocol v5's exact
 profile now binds this admission rule.
 
 Existing SQLite replicas must be drained and checked with
 `opc-session-store-audit identity-invariants` using explicit non-zero
-`--max-rows`, `--max-entry-json-bytes`, and `--max-total-json-bytes` budgets.
+`--max-rows`, `--max-entry-json-bytes`, and `--max-total-json-bytes` budgets
+plus one recorded RFC 3339 `--expiry-reference`.
 The per-entry budget cannot exceed the total or SQLite's signed `i64` length
 range.
 The read-only/query-only audit scans one snapshot in fixed 256-row pages and
-emits version-1 count-only JSON. Only `compliant` with exit 0 passes;
+emits version-4 count-only JSON. Only `compliant` with exit 0 passes;
 `violations_found`/1, `incomplete`/2, and redacted `error`/2 block upgrade. It
 never emits database paths or persisted raw values and never truncates,
 renames, repairs, or rewrites state. A violation requires a reviewed
 semantic-preserving migration or audited store replacement and a new audit.
+
+Forwarding wrappers and authenticated CAS/batch dispatch obtain the bounded,
+payload-free authority verdict before idempotency admission, cache
+invalidation, provider/HKMS work, sealing, or backend dispatch. Invalid input
+and timeout/unavailability cause no provider call or requested mutation; only
+a consensus logical-time floor may have committed, so caller retry is safe.
+Payload envelopes, AAD, key selection, and HKMS placement are unchanged.
 
 New handover envelopes use the `OPCH` magic and an exact version byte. The exact
 bounded non-`OPCH` classifier in RFC 004 §10.3 accepts current-valid original
@@ -368,7 +385,7 @@ payload-protection-key qualification owner; seamless
 SVID/trust-bundle lifecycle remains #158.
 
 Capability/profile validation and fresh readiness have different scopes. The
-former is static admission evidence. A v4 version/profile/authentication or
+former is static admission evidence. A v5 version/profile/authentication or
 malformed-handshake failure clears the remote cache and reports every capability
 boolean false with `max_value_bytes = 0`; a cache retained after transient
 transport loss remains descriptive only. Fresh readiness is a bounded
@@ -385,7 +402,7 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 The revision-1 to revision-2 transition requires the same drained coordinated
 stop/upgrade/start as other exact-profile changes. #167 promotes the stable-ID
 rule from wire containment into the `StableId` domain type, SQLite/cache/
-Openraft/restore/replication/watch boundaries, and a version-3 count-only
+Openraft/restore/replication/watch boundaries, and a current version-4 count-only
 legacy audit without rewriting compliant record/log bytes. Before strict
 startup, quiesce writers and audit every retained record, log, snapshot,
 restore source, and replay source. Any out-of-profile value requires a
@@ -398,7 +415,7 @@ uses a coherent checkpoint/reviewed reverse migration. All participants must
 move together; independent `OPCH`/#135 rollback barriers still apply. #167 now
 supplies the production stable-ID model/persistence/privacy/audit contract.
 #168 supplies the bounded durable transaction-ID type, canonical coordinator
-mint, exact legacy preservation, and version-3 audit/migration coordinated
+mint, exact legacy preservation, and current version-4 audit/migration coordinated
 with #127/#128/#143.
 Session-net's bounded call remains the shared production transport contract.
 #177 removes `opc-persist`'s private config TCP path and composes config

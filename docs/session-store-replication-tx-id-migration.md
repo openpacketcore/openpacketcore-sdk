@@ -31,14 +31,16 @@ non-canonical legacy ID remains distinct and needs no conversion.
      --database /path/to/session-store.db \
      --max-rows N \
      --max-entry-json-bytes N \
-     --max-total-json-bytes N
+     --max-total-json-bytes N \
+     --expiry-reference 2026-07-13T18:00:00Z
    ```
 
-4. Repeat for every retained SQLite image. Accept only report version 3,
-   `status = compliant`, and exit 0.
+4. Repeat for every retained SQLite image. Accept only report version 4 with
+   the recorded `expiry_reference`, `status = compliant`, and exit 0.
 
-Report version 3 adds `invalid_replication_tx_id_fields`. It counts a
-relational `tx_id` that is empty, over 128 UTF-8 bytes, not SQLite `TEXT`, or
+Report version 4 retains `invalid_replication_tx_id_fields` from version 3 and
+adds the expiry reference/count required by #148. The transaction-ID field
+counts a relational `tx_id` that is empty, over 128 UTF-8 bytes, not SQLite `TEXT`, or
 whose `entry_json` lacks an exactly matching valid typed ID.
 `invalid_replication_entries` separately counts malformed JSON, invalid nested
 domain values, or a stored/encoded sequence mismatch. The audit retrieves at
@@ -61,7 +63,7 @@ transaction. While the complete fleet remains drained, choose one reviewed
 operator procedure:
 
 - Restore or re-seed the complete store from a coherent authoritative source
-  whose IDs pass report version 3.
+  whose IDs pass report version 4.
 - If application ownership can prove a one-to-one replacement, use an offline
   legacy-capable decoder with explicit input and work limits. Rewrite the
   relational `tx_id` and the matching `entry_json` together in a shadow copy,
@@ -71,7 +73,7 @@ operator procedure:
 - If those semantics cannot be proven, keep the fleet closed and replace the
   entire coherent store. Do not repair one quorum member independently.
 
-After remediation, run report version 3 over every shadow database and
+After remediation, run report version 4 over every shadow database and
 retained snapshot. Promote only complete compliant results. Keep the original
 backup immutable until cutover and rollback verification finish.
 
@@ -89,7 +91,7 @@ backup immutable until cutover and rollback verification finish.
    validation. Confirm exact same-ID redelivery is idempotent and an
    alternate case or other distinct representation at the same sequence is
    rejected as divergent.
-5. Restart the fleet once with traffic still closed. Re-run report version 3
+5. Restart the fleet once with traffic still closed. Re-run report version 4
    against every candidate image and require fresh durable readiness again.
 6. Take a new coherent compliant snapshot before reopening traffic.
 
@@ -115,7 +117,7 @@ snapshots, and exact transport profile. Never mix old and new writers.
 After any application-owned ID replacement, restore the pre-upgrade backup or
 run a reviewed reverse migration over every journal, snapshot, rebuild,
 recovery, and replay copy before starting old writers. After any rollback,
-run report version 3 again before a later re-upgrade because an old writer can
+run report version 4 again before a later re-upgrade because an old writer can
 mint an arbitrary string.
 
 ## Consensus, recovery, and encryption boundaries
@@ -126,8 +128,8 @@ mint an arbitrary string.
   ID and the exact relational/JSON match before accepting state.
 - #129 legacy recovery rejects invalid IDs during bounded inspection; it does
   not invent replacement identities.
-- #171 log-range cursors are separate work. This migration does not define a
-  cursor or retention scheme.
+- #171 implements the separate log-range cursor and retention contract. This
+  migration does not redefine that contract.
 - Transaction IDs remain journal metadata. The change does not move payload
   encryption into Openraft, call HKMS, alter session envelope AAD, expose raw
   keys, or weaken encryption-at-rest qualification. Errors and debug output do

@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 use crate::{
     backend::{
         next_replication_sequence, validate_replication_log_page_owned,
-        validate_replication_prefix, validate_replication_prefix_owned, validate_session_ops_ttls,
+        validate_replication_prefix, validate_replication_prefix_owned, validate_session_ops_at,
         BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
         ReplicationLogRange, ReplicationOp, ReplicationTxId, ReplicationWatchCursor,
         SessionBackend, SessionOp, SessionOpResult, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
@@ -38,7 +38,7 @@ use crate::{
         RestoreScanRequest, RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES,
         RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
     },
-    ttl::{checked_session_deadline, validate_session_ttl},
+    ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
 };
 
 /// In-memory session backend and lease manager for deterministic tests.
@@ -319,6 +319,7 @@ impl FakeSessionBackend {
         op: CompareAndSet,
         now: Timestamp,
     ) -> Result<CompareAndSetResult, StoreError> {
+        validate_stored_record_expiry_at(&op.new_record, now)?;
         if !self.caps.atomic_compare_and_set {
             return Err(StoreError::CapabilityNotSupported(
                 "atomic_compare_and_set".into(),
@@ -731,6 +732,10 @@ impl SessionBackend for FakeSessionBackend {
         self.caps
     }
 
+    fn record_expiry_reference(&self) -> Option<Timestamp> {
+        Some(self.clock.now_utc())
+    }
+
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
@@ -739,8 +744,9 @@ impl SessionBackend for FakeSessionBackend {
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
-        let mut state = self.inner.lock().await;
         let now = self.clock.now_utc();
+        validate_stored_record_expiry_at(&op.new_record, now)?;
+        let mut state = self.inner.lock().await;
         Self::prune_state(&mut state, now);
         let replication_sequence = self.next_direct_replication_sequence(&state)?;
         let replication_op = ReplicationOp::CompareAndSet {
@@ -805,8 +811,8 @@ impl SessionBackend for FakeSessionBackend {
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
-        validate_session_ops_ttls(&ops)?;
         let now = self.clock.now_utc();
+        validate_session_ops_at(&ops, now)?;
         for op in &ops {
             if let SessionOp::RefreshTtl { ttl, .. } = op {
                 checked_session_deadline(now, *ttl)?;

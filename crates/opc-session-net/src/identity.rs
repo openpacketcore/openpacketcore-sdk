@@ -91,7 +91,7 @@ impl fmt::Debug for SessionClusterId {
     }
 }
 
-/// Legacy operator-controlled generation mixed into the protocol-v4 backend
+/// Legacy operator-controlled generation mixed into the protocol-v5 backend
 /// manifest ID.
 ///
 /// New consensus composition must use [`SessionConfigurationEpoch`] for its

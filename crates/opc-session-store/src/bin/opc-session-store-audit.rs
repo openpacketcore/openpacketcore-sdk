@@ -5,15 +5,18 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
+use std::str::FromStr;
 
 use opc_session_store::sqlite::audit::{
-    audit_sqlite_identity_invariants, SqliteIdentityAuditError, SqliteIdentityAuditLimits,
+    audit_sqlite_identity_invariants_at, SqliteIdentityAuditError, SqliteIdentityAuditLimits,
     SqliteIdentityAuditStatus, SQLITE_IDENTITY_AUDIT_REPORT_VERSION,
 };
+use opc_types::Timestamp;
 use serde::Serialize;
 
 const USAGE: &str = "usage: opc-session-store-audit identity-invariants \
-    --database PATH --max-rows N --max-entry-json-bytes N --max-total-json-bytes N";
+    --database PATH --max-rows N --max-entry-json-bytes N --max-total-json-bytes N \
+    [--expiry-reference RFC3339]";
 
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -25,6 +28,7 @@ struct ErrorResponse {
 struct AuditArgs {
     database: PathBuf,
     limits: SqliteIdentityAuditLimits,
+    expiry_reference: Timestamp,
 }
 
 enum Command {
@@ -75,7 +79,11 @@ fn run() -> i32 {
             }
         }
         Command::Audit(args) => {
-            match audit_sqlite_identity_invariants(args.database, args.limits) {
+            match audit_sqlite_identity_invariants_at(
+                args.database,
+                args.limits,
+                args.expiry_reference,
+            ) {
                 Ok(report) => {
                     let status = report.status();
                     if write_json(io::stdout(), &report).is_err() {
@@ -116,6 +124,7 @@ fn parse_command(args: &[OsString]) -> Result<Command, &'static str> {
     let mut max_rows = None;
     let mut max_entry_json_bytes = None;
     let mut max_total_json_bytes = None;
+    let mut expiry_reference = None;
     let mut index = 1;
     while index < args.len() {
         let flag = &args[index];
@@ -139,6 +148,13 @@ fn parse_command(args: &[OsString]) -> Result<Command, &'static str> {
             if max_total_json_bytes.is_none() {
                 return Err("invalid_arguments");
             }
+        } else if arg_is(flag, "--expiry-reference") && expiry_reference.is_none() {
+            expiry_reference = value
+                .to_str()
+                .and_then(|value| Timestamp::from_str(value).ok());
+            if expiry_reference.is_none() {
+                return Err("invalid_arguments");
+            }
         } else {
             return Err("invalid_arguments");
         }
@@ -152,7 +168,11 @@ fn parse_command(args: &[OsString]) -> Result<Command, &'static str> {
         max_total_json_bytes.ok_or("invalid_arguments")?,
     )
     .map_err(|_| "invalid_limits")?;
-    Ok(Command::Audit(AuditArgs { database, limits }))
+    Ok(Command::Audit(AuditArgs {
+        database,
+        limits,
+        expiry_reference: expiry_reference.unwrap_or_else(Timestamp::now_utc),
+    }))
 }
 
 fn arg_is(value: &OsStr, expected: &str) -> bool {

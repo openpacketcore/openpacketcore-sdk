@@ -478,9 +478,12 @@ pub struct StoredSessionRecord {
     /// Schema discriminator for the payload. Bound into the encryption AAD,
     /// so a payload cannot be reinterpreted under a different state type.
     pub state_type: StateType,
-    /// TTL deadline; `None` means the record never expires. Once passed, the
-    /// record reads as absent and may be pruned — refresh it with a fenced
-    /// `refresh_ttl` before the deadline to keep it alive.
+    /// Absolute TTL deadline. A finite value may be at most
+    /// [`crate::MAX_SESSION_TTL`] after the mutation coordinator's authority
+    /// time; past and immediate deadlines are valid and read as absent.
+    /// `None` intentionally means never expires for every state class except
+    /// [`StateClass::EphemeralProcedure`], whose profile requires a finite
+    /// deadline. Refresh a finite deadline with fenced `refresh_ttl`.
     pub expires_at: Option<Timestamp>,
     /// Payload bytes, either caller-facing plaintext or a sealed envelope
     /// depending on `EncryptedSessionPayload::encoding`.

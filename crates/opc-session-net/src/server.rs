@@ -18,7 +18,9 @@ use opc_session_store::quorum::SessionStoreBackend;
 #[cfg(test)]
 use opc_session_store::RestoreScanCursor;
 use opc_session_store::{
-    validate_session_ttl, ReplicaId, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
+    record_expiry_preflights, validate_session_ttl, validate_stored_record_expiry_profile,
+    RecordExpiryPreflight, ReplicaId, RestoreScanCursorProfile, RestoreScanPage,
+    RestoreScanRequest,
 };
 use opc_types::SpiffeId;
 use sha2::{Digest, Sha256};
@@ -182,6 +184,7 @@ enum ResponseFamily {
     CompareAndSet,
     DeleteFenced,
     RefreshTtl,
+    RecordExpiryPreflight,
     Batch,
     RestoreScan,
     MaxReplicationSequence,
@@ -203,6 +206,7 @@ impl ResponseFamily {
             Self::CompareAndSet => "compare_and_set",
             Self::DeleteFenced => "delete_fenced",
             Self::RefreshTtl => "refresh_ttl",
+            Self::RecordExpiryPreflight => "record_expiry_preflight",
             Self::Batch => "batch",
             Self::RestoreScan => "restore_scan",
             Self::MaxReplicationSequence => "max_replication_sequence",
@@ -492,6 +496,7 @@ fn response_is_ambiguous_outcome(response: &Response) -> bool {
         Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)) => true,
         Response::DeleteFenced(Err(StoreError::BackendOperationOutcomeUnavailable))
         | Response::RefreshTtl(Err(StoreError::BackendOperationOutcomeUnavailable))
+        | Response::RecordExpiryPreflight(Err(StoreError::BackendOperationOutcomeUnavailable))
         | Response::Batch(Err(StoreError::BackendOperationOutcomeUnavailable))
         | Response::ReplicateEntry(Err(StoreError::BackendOperationOutcomeUnavailable))
         | Response::RebuildReplicationState(Err(StoreError::BackendOperationOutcomeUnavailable)) => {
@@ -646,6 +651,7 @@ impl BackendOperationSlots {
 #[derive(Clone, Copy)]
 enum BackendDeadlineOutcome {
     Read,
+    Preflight,
     Mutation,
     CompareAndSet,
     RestoreScan,
@@ -764,6 +770,9 @@ fn store_deadline_error(
             StoreError::CasIdempotencyOutcomeUnavailable
         }
         (BackendDeadlineOutcome::RestoreScan, _) => StoreError::RestoreScanWorkBudgetExceeded,
+        (BackendDeadlineOutcome::Preflight, _) => {
+            StoreError::BackendUnavailable("backend preflight deadline exceeded".to_string())
+        }
         _ => StoreError::BackendUnavailable("backend operation deadline exceeded".to_string()),
     }
 }
@@ -828,6 +837,16 @@ fn normalize_store_backend_outcome<T>(
     outcome: BackendDeadlineOutcome,
 ) -> Result<T, StoreError> {
     match (outcome, result) {
+        (
+            BackendDeadlineOutcome::Preflight,
+            Err(
+                StoreError::BackendUnavailable(_)
+                | StoreError::BackendOperationOutcomeUnavailable
+                | StoreError::CasIdempotencyOutcomeUnavailable,
+            ),
+        ) => Err(StoreError::BackendUnavailable(
+            "backend record-expiry preflight unavailable".into(),
+        )),
         (
             BackendDeadlineOutcome::CompareAndSet,
             Err(
@@ -2339,76 +2358,99 @@ where
                     continue;
                 }
                 let expected_key = op.key.clone();
-                let res = run_store_backend_operation(
-                    reader,
-                    max_frame_size,
-                    operation_deadline,
-                    &cancellation,
-                    ResponseFamily::CompareAndSet,
-                    backend_slots.mutation.clone(),
-                    BackendDeadlineOutcome::CompareAndSet,
-                    async {
-                        if let (Some(request_id), Some(idempotency_epoch)) =
-                            (request_id, idempotency_epoch)
-                        {
-                            let request_id = uuid::Uuid::parse_str(&request_id)
-                                .map_err(|_| StoreError::CasIdempotencyConflict)?;
-                            let idempotency_epoch = uuid::Uuid::parse_str(&idempotency_epoch)
-                                .map_err(|_| StoreError::CasIdempotencyConflict)?;
-                            let operation_digest = cas_operation_digest(
-                                &binding,
-                                &client_replica_id,
-                                request_id,
-                                idempotency_epoch,
-                                &op,
-                            );
-                            match operation_digest {
-                                Ok(operation_digest) => match CasIdempotencyCache::begin(
-                                    &cas_idempotency_cache,
-                                    &client_replica_id,
-                                    request_id,
-                                    idempotency_epoch,
-                                    operation_digest,
-                                    Instant::now(),
-                                ) {
-                                    CasIdempotencyAdmission::Execute(permit) => {
-                                        let result = backend.compare_and_set(op).await;
-                                        let result = if compare_and_set_result_matches_key(
-                                            &expected_key,
-                                            &result,
+                let preflight = RecordExpiryPreflight::from_record(&op.new_record);
+                let expiry_validation = match validate_stored_record_expiry_profile(&op.new_record)
+                {
+                    Ok(()) => {
+                        run_store_backend_operation(
+                            reader,
+                            max_frame_size,
+                            operation_deadline,
+                            &cancellation,
+                            ResponseFamily::CompareAndSet,
+                            backend_slots.mutation.clone(),
+                            BackendDeadlineOutcome::Preflight,
+                            backend.preflight_record_expiry(std::slice::from_ref(&preflight)),
+                        )
+                        .await?
+                    }
+                    Err(error) => Err(error),
+                };
+                let res = match expiry_validation {
+                    Ok(()) => {
+                        run_store_backend_operation(
+                            reader,
+                            max_frame_size,
+                            operation_deadline,
+                            &cancellation,
+                            ResponseFamily::CompareAndSet,
+                            backend_slots.mutation.clone(),
+                            BackendDeadlineOutcome::CompareAndSet,
+                            async {
+                                if let (Some(request_id), Some(idempotency_epoch)) =
+                                    (request_id, idempotency_epoch)
+                                {
+                                    let request_id = uuid::Uuid::parse_str(&request_id)
+                                        .map_err(|_| StoreError::CasIdempotencyConflict)?;
+                                    let idempotency_epoch = uuid::Uuid::parse_str(&idempotency_epoch)
+                                        .map_err(|_| StoreError::CasIdempotencyConflict)?;
+                                    let operation_digest = cas_operation_digest(
+                                        &binding,
+                                        &client_replica_id,
+                                        request_id,
+                                        idempotency_epoch,
+                                        &op,
+                                    );
+                                    match operation_digest {
+                                        Ok(operation_digest) => match CasIdempotencyCache::begin(
+                                            &cas_idempotency_cache,
+                                            &client_replica_id,
+                                            request_id,
+                                            idempotency_epoch,
+                                            operation_digest,
+                                            Instant::now(),
                                         ) {
-                                            result
-                                        } else {
-                                            Err(backend_contract_error())
-                                        };
-                                        if cas_outcome_is_definitive(&result) {
-                                            permit.complete(result.clone());
-                                            result
-                                        } else {
-                                            // A backend availability error can
-                                            // arrive after its commit boundary.
-                                            // Dropping the permit leaves a
-                                            // tombstone so this request ID can
-                                            // never replay a falsely definitive
-                                            // retryable outcome.
-                                            drop(permit);
-                                            Err(StoreError::CasIdempotencyOutcomeUnavailable)
-                                        }
+                                            CasIdempotencyAdmission::Execute(permit) => {
+                                                let result = backend.compare_and_set(op).await;
+                                                let result = if compare_and_set_result_matches_key(
+                                                    &expected_key,
+                                                    &result,
+                                                ) {
+                                                    result
+                                                } else {
+                                                    Err(backend_contract_error())
+                                                };
+                                                if cas_outcome_is_definitive(&result) {
+                                                    permit.complete(result.clone());
+                                                    result
+                                                } else {
+                                                    // A backend availability error can
+                                                    // arrive after its commit boundary.
+                                                    // Dropping the permit leaves a
+                                                    // tombstone so this request ID can
+                                                    // never replay a falsely definitive
+                                                    // retryable outcome.
+                                                    drop(permit);
+                                                    Err(StoreError::CasIdempotencyOutcomeUnavailable)
+                                                }
+                                            }
+                                            CasIdempotencyAdmission::Wait(outcome) => {
+                                                wait_for_cas_outcome(outcome).await
+                                            }
+                                            CasIdempotencyAdmission::Replay(outcome) => outcome,
+                                            CasIdempotencyAdmission::Reject(error) => Err(error),
+                                        },
+                                        Err(error) => Err(error),
                                     }
-                                    CasIdempotencyAdmission::Wait(outcome) => {
-                                        wait_for_cas_outcome(outcome).await
-                                    }
-                                    CasIdempotencyAdmission::Replay(outcome) => outcome,
-                                    CasIdempotencyAdmission::Reject(error) => Err(error),
-                                },
-                                Err(error) => Err(error),
-                            }
-                        } else {
-                            Err(StoreError::CasIdempotencyOutcomeUnavailable)
-                        }
-                    },
-                )
-                .await?;
+                                } else {
+                                    Err(StoreError::CasIdempotencyOutcomeUnavailable)
+                                }
+                            },
+                        )
+                        .await?
+                    }
+                    Err(error) => Err(error),
+                };
                 let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
                 write_post_auth_response_with_fallback_until(
                     writer,
@@ -2474,6 +2516,32 @@ where
                 )
                 .await?;
             }
+            Request::RecordExpiryPreflight { preflights } => {
+                let res = run_store_backend_operation(
+                    reader,
+                    max_frame_size,
+                    operation_deadline,
+                    &cancellation,
+                    ResponseFamily::RecordExpiryPreflight,
+                    backend_slots.mutation.clone(),
+                    BackendDeadlineOutcome::Preflight,
+                    backend.preflight_record_expiry(&preflights),
+                )
+                .await?;
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
+                    writer,
+                    Response::RecordExpiryPreflight(res),
+                    Response::RecordExpiryPreflight(Err(StoreError::BackendUnavailable(
+                        "backend record-expiry preflight unavailable".into(),
+                    ))),
+                    effective_response_frame_size,
+                    response_deadline,
+                    ResponseFamily::RecordExpiryPreflight,
+                    &cancellation,
+                )
+                .await?;
+            }
             Request::Batch { ops } => {
                 let expected_results = ops.len();
                 let expected = bounded_session_op_expectations(&ops);
@@ -2494,7 +2562,23 @@ where
                 } else if expected_results > MAX_SESSION_NET_BATCH_OPERATIONS {
                     Err(StoreError::ReplicationOperationLimitExceeded)
                 } else {
-                    match ops.iter().try_for_each(|op| op.validate_ttls()) {
+                    let expiry_validation = match record_expiry_preflights(&ops) {
+                        Ok(preflights) => {
+                            run_store_backend_operation(
+                                reader,
+                                max_frame_size,
+                                operation_deadline,
+                                &cancellation,
+                                ResponseFamily::Batch,
+                                Arc::clone(&slots),
+                                BackendDeadlineOutcome::Preflight,
+                                backend.preflight_record_expiry(&preflights),
+                            )
+                            .await?
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match expiry_validation {
                         Ok(()) => {
                             run_store_backend_operation(
                                 reader,
@@ -3238,6 +3322,77 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(slots.available_permits(), 1);
         drop(peer);
+    }
+
+    #[tokio::test]
+    async fn expiry_preflight_queue_execute_and_backend_ambiguity_remain_retry_safe() {
+        let slots = Arc::new(Semaphore::new(1));
+        let held = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold preflight slot");
+        let cancellation = ServerCancellation::default();
+        let (peer, mut reader) = tokio::io::duplex(64);
+        let polled = Arc::new(AtomicBool::new(false));
+        let operation_polled = Arc::clone(&polled);
+        let queued = run_store_backend_operation(
+            &mut reader,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            &cancellation,
+            ResponseFamily::RecordExpiryPreflight,
+            Arc::clone(&slots),
+            BackendDeadlineOutcome::Preflight,
+            async move {
+                operation_polled.store(true, Ordering::Release);
+                Ok::<(), StoreError>(())
+            },
+        )
+        .await
+        .expect("preflight queue timeout response");
+        assert!(matches!(queued, Err(StoreError::BackendUnavailable(_))));
+        assert!(!polled.load(Ordering::Acquire));
+        drop(held);
+        drop(peer);
+
+        let (peer, mut reader) = tokio::io::duplex(64);
+        let executed = run_store_backend_operation(
+            &mut reader,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            &cancellation,
+            ResponseFamily::RecordExpiryPreflight,
+            Arc::clone(&slots),
+            BackendDeadlineOutcome::Preflight,
+            std::future::pending::<Result<(), StoreError>>(),
+        )
+        .await
+        .expect("preflight execution timeout response");
+        assert!(matches!(executed, Err(StoreError::BackendUnavailable(_))));
+        drop(peer);
+
+        for reported in [
+            StoreError::BackendUnavailable("backend detail".into()),
+            StoreError::BackendOperationOutcomeUnavailable,
+            StoreError::CasIdempotencyOutcomeUnavailable,
+        ] {
+            let (peer, mut reader) = tokio::io::duplex(64);
+            let normalized = run_store_backend_operation(
+                &mut reader,
+                MIN_NEGOTIATED_FRAME_SIZE,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                &cancellation,
+                ResponseFamily::RecordExpiryPreflight,
+                Arc::clone(&slots),
+                BackendDeadlineOutcome::Preflight,
+                async { Err::<(), StoreError>(reported) },
+            )
+            .await
+            .expect("preflight backend response");
+            assert!(matches!(normalized, Err(StoreError::BackendUnavailable(_))));
+            drop(peer);
+        }
     }
 
     struct SlowCooperativeFrame {

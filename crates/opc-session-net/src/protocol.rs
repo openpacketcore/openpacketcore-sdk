@@ -1,6 +1,6 @@
 #![cfg_attr(not(feature = "legacy-session-net-compat"), allow(dead_code))]
 // The consensus transport reuses the bounded framing core below. The legacy
-// protocol-v4 DTO/conversion graph remains compiled but private in production
+// protocol-v5 DTO/conversion graph remains compiled but private in production
 // so the shared framing code does not fork; its unused compatibility-only
 // branches are intentionally dead unless `legacy-session-net-compat` is set.
 
@@ -9,8 +9,9 @@ use std::{fmt, marker::PhantomData, time::Duration};
 
 use opc_session_store::backend::{
     CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange, ReplicationOp,
-    ReplicationTxId, SessionOp, SessionOpResult, MAX_REPLICATION_LOG_PAGE_ENTRIES,
-    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    ReplicationTxId, SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
+    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -21,10 +22,10 @@ use opc_session_store::model::{
 };
 use opc_session_store::record::StoredSessionRecord;
 use opc_session_store::{
-    RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
-    RestoreScanScope, SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeerError,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, MAX_SESSION_TTL,
-    RESTORE_SCAN_MAX_PAGE_SIZE, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    RecordExpiryPreflight, RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage,
+    RestoreScanRequest, RestoreScanScope, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeerError, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    MAX_SESSION_TTL, RESTORE_SCAN_MAX_PAGE_SIZE, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
 use opc_types::Timestamp;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
@@ -34,10 +35,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ProtocolError;
 
-pub const CONTRACT_VERSION: u32 = 4;
+pub const CONTRACT_VERSION: u32 = 5;
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 8 * 1024;
-/// Smallest post-bootstrap frame budget accepted by protocol v4.
+/// Smallest post-bootstrap frame budget accepted by protocol v5.
 ///
 /// This leaves room for every fixed, redaction-safe terminal response while
 /// also carrying a zero-payload CAS/Get envelope with every bounded profile
@@ -50,7 +51,7 @@ pub const MIN_NEGOTIATED_FRAME_SIZE: usize = 8 * 1024;
 /// ceiling consumes about 8 MiB. This bound leaves deterministic envelope
 /// headroom while remaining below the global per-frame ceiling.
 pub const MIN_SESSION_CONSENSUS_FRAME_SIZE: usize = 9 * 1024 * 1024;
-/// Largest post-bootstrap frame budget accepted by protocol v4.
+/// Largest post-bootstrap frame budget accepted by protocol v5.
 ///
 /// This ceiling bounds one encoded JSON frame independently of the wire's
 /// wider `u32` length prefix. At the conservative one-eighth payload ratio it
@@ -68,11 +69,11 @@ pub const MAX_SESSION_NET_REPLICATION_TX_ID_BYTES: usize =
     opc_session_store::REPLICATION_TX_ID_MAX_BYTES;
 /// Canonical hyphenated UUID width used by CAS idempotency request IDs.
 pub const SESSION_NET_CAS_REQUEST_ID_BYTES: usize = 36;
-pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/4";
+pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/5";
 /// Dedicated ALPN for the least-authority consensus-only transport.
-pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/1";
+pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
 /// Fixed revision of the consensus-only bootstrap and operation DTOs.
-pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 1;
+pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 2;
 
 /// Exact resource and semantic profile for consensus-only connections.
 ///
@@ -110,16 +111,16 @@ impl SessionConsensusContractProfile {
 pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractProfile =
     SessionConsensusContractProfile {
         wire_schema_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
-        error_set_revision: 2,
+        error_set_revision: 4,
         max_rpc_payload_bytes: SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES as u32,
         min_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE as u32,
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
 
-const WIRE_SCHEMA_REVISION: u16 = 4;
-const ERROR_SET_REVISION: u16 = 6;
+const WIRE_SCHEMA_REVISION: u16 = 5;
+const ERROR_SET_REVISION: u16 = 8;
 
-/// Exact semantic and resource-bound contract required by protocol v4.
+/// Exact semantic and resource-bound contract required by protocol v5.
 ///
 /// Peers compare this structure for equality during the frozen bootstrap
 /// exchange. There is no subset negotiation: a mismatch fails before any
@@ -245,7 +246,7 @@ const _: () = {
     assert!(SESSION_NET_CAS_REQUEST_ID_BYTES <= u16::MAX as usize);
 };
 
-/// Convert a local frame budget into the fixed-width v4 wire representation.
+/// Convert a local frame budget into the fixed-width v5 wire representation.
 ///
 /// Only budgets in
 /// [`MIN_NEGOTIATED_FRAME_SIZE`]..=[`MAX_NEGOTIATED_FRAME_SIZE`] implement the
@@ -257,7 +258,7 @@ pub(crate) fn checked_wire_frame_size(size: usize) -> Result<u32, ProtocolError>
     u32::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)
 }
 
-/// Validate and convert a frame budget received from a v4 peer.
+/// Validate and convert a frame budget received from a v5 peer.
 pub(crate) fn checked_frame_size(size: u32) -> Result<usize, ProtocolError> {
     let size = usize::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)?;
     if !(MIN_NEGOTIATED_FRAME_SIZE..=MAX_NEGOTIATED_FRAME_SIZE).contains(&size) {
@@ -266,7 +267,7 @@ pub(crate) fn checked_frame_size(size: u32) -> Result<usize, ProtocolError> {
     Ok(size)
 }
 
-/// Select the response budget enforced by a server for one v4 connection.
+/// Select the response budget enforced by a server for one v5 connection.
 pub(crate) fn negotiate_response_frame_size(
     requested: u32,
     server_max_frame_size: usize,
@@ -303,7 +304,7 @@ pub enum HelloRejectReason {
 /// Frozen bootstrap payload for the first client frame.
 ///
 /// Optional fields remain optional so peers with different contract versions
-/// can exchange a clean version mismatch. A v4 server accepts operations only
+/// can exchange a clean version mismatch. A v5 server accepts operations only
 /// after separately requiring `contract_profile == Some(CURRENT_CONTRACT_PROFILE)`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -455,7 +456,7 @@ pub(crate) enum SessionConsensusTransportResponse {
     },
 }
 
-/// Architecture-independent semantic restore-scan request carried by protocol v4.
+/// Architecture-independent semantic restore-scan request carried by protocol v5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreScanWireRequest {
     scope: RestoreScanScope,
@@ -532,6 +533,9 @@ pub enum Request {
         lease: LeaseGuard,
         ttl: Duration,
     },
+    RecordExpiryPreflight {
+        preflights: Vec<RecordExpiryPreflight>,
+    },
     Batch {
         ops: Vec<SessionOp>,
     },
@@ -596,6 +600,7 @@ pub enum Response {
     ),
     DeleteFenced(Result<(), opc_session_store::error::StoreError>),
     RefreshTtl(Result<(), opc_session_store::error::StoreError>),
+    RecordExpiryPreflight(Result<(), opc_session_store::error::StoreError>),
     Batch(Result<Vec<SessionOpResult>, opc_session_store::error::StoreError>),
     ScanRestoreRecords(Result<RestoreScanPage, opc_session_store::error::StoreError>),
     MaxReplicationSequence(Result<u64, opc_session_store::error::StoreError>),
@@ -692,7 +697,7 @@ pub(crate) fn session_op_results_match_expectations(
 fn validate_session_key_profile(key: &SessionKey) -> Result<(), WireConversionError> {
     if key.stable_id.is_empty() || key.stable_id.len() > MAX_SESSION_NET_STABLE_ID_BYTES {
         return Err(WireConversionError(
-            "session stable ID violates the v4 transport profile",
+            "session stable ID violates the v5 transport profile",
         ));
     }
     Ok(())
@@ -764,6 +769,7 @@ pub(crate) fn validate_request_payload_limit(
         | Request::Get { .. }
         | Request::DeleteFenced { .. }
         | Request::RefreshTtl { .. }
+        | Request::RecordExpiryPreflight { .. }
         | Request::ScanRestoreRecords { .. }
         | Request::MaxReplicationSequence
         | Request::GetReplicationLog { .. }
@@ -779,17 +785,17 @@ fn validate_lease_profile(lease: &LeaseGuard) -> Result<(), WireConversionError>
     validate_session_key_profile(lease.key())?;
     if lease.fence().get() == 0 {
         return Err(WireConversionError(
-            "lease fence violates the v4 transport profile",
+            "lease fence violates the v5 transport profile",
         ));
     }
     if lease.credential_id() == 0 {
         return Err(WireConversionError(
-            "lease credential violates the v4 transport profile",
+            "lease credential violates the v5 transport profile",
         ));
     }
     if lease.expires_at() < lease.acquired_at() {
         return Err(WireConversionError(
-            "lease lifetime violates the v4 transport profile",
+            "lease lifetime violates the v5 transport profile",
         ));
     }
     Ok(())
@@ -815,7 +821,7 @@ fn validate_compare_and_set_result_profile(
 
 fn validate_session_op_profile(op: &SessionOp) -> Result<(), WireConversionError> {
     op.validate_ttls()
-        .map_err(|_| WireConversionError("session TTL violates the v4 transport profile"))?;
+        .map_err(|_| WireConversionError("session TTL violates the v5 transport profile"))?;
     validate_session_op_retained_profile(op)
 }
 
@@ -850,6 +856,10 @@ fn validate_inbound_request_profile(request: &Request) -> Result<(), WireConvers
         Request::Batch { ops } => ops
             .iter()
             .try_for_each(validate_session_op_retained_profile),
+        Request::RecordExpiryPreflight { preflights } => {
+            opc_session_store::validate_record_expiry_preflights_profile(preflights)
+                .map_err(|_| WireConversionError("record expiry violates the v5 transport profile"))
+        }
         Request::ReplicateEntry { entry } => validate_replication_retained_profile(entry),
         Request::RebuildReplicationState { entries } => entries
             .iter()
@@ -880,7 +890,7 @@ fn validate_session_op_result_profile(result: &SessionOpResult) -> Result<(), Wi
 fn validate_replication_entry_profile(entry: &ReplicationEntry) -> Result<(), WireConversionError> {
     entry
         .validate()
-        .map_err(|_| WireConversionError("replication entry violates the v4 contract"))?;
+        .map_err(|_| WireConversionError("replication entry violates the v5 contract"))?;
     validate_replication_retained_profile(entry)
 }
 
@@ -933,7 +943,7 @@ fn into_profile_validated_replication_entry(
 ) -> Result<ReplicationEntry, WireConversionError> {
     let entry = entry
         .into_validated()
-        .map_err(|_| WireConversionError("replication entry violates the v4 contract"))?;
+        .map_err(|_| WireConversionError("replication entry violates the v5 contract"))?;
     match validate_replication_retained_profile(&entry) {
         Ok(()) => Ok(entry),
         Err(error) => {
@@ -969,7 +979,7 @@ pub(crate) fn validate_request_profile(request: &Request) -> Result<(), WireConv
         Request::AcquireLease { key, ttl, .. } => {
             validate_session_key_profile(key)?;
             opc_session_store::validate_session_ttl(*ttl)
-                .map_err(|_| WireConversionError("session TTL violates the v4 transport profile"))
+                .map_err(|_| WireConversionError("session TTL violates the v5 transport profile"))
         }
         Request::CompareAndSet {
             op,
@@ -991,34 +1001,38 @@ pub(crate) fn validate_request_profile(request: &Request) -> Result<(), WireConv
         Request::RefreshTtl { lease, ttl } | Request::RenewLease { lease, ttl } => {
             validate_lease_profile(lease)?;
             opc_session_store::validate_session_ttl(*ttl)
-                .map_err(|_| WireConversionError("session TTL violates the v4 transport profile"))
+                .map_err(|_| WireConversionError("session TTL violates the v5 transport profile"))
         }
         Request::Batch { ops } => {
             if ops.len() > MAX_SESSION_NET_BATCH_OPERATIONS {
-                return Err(WireConversionError("batch exceeds the v4 operation limit"));
+                return Err(WireConversionError("batch exceeds the v5 operation limit"));
             }
             ops.iter().try_for_each(validate_session_op_profile)
+        }
+        Request::RecordExpiryPreflight { preflights } => {
+            opc_session_store::validate_record_expiry_preflights_profile(preflights)
+                .map_err(|_| WireConversionError("record expiry violates the v5 transport profile"))
         }
         Request::ScanRestoreRecords {
             request,
             max_response_frame_size,
         } => {
             RestoreScanRequest::try_from(request.clone()).map_err(|_| {
-                WireConversionError("restore scan request violates the v4 contract")
+                WireConversionError("restore scan request violates the v5 contract")
             })?;
             checked_frame_size(*max_response_frame_size).map_err(|_| {
-                WireConversionError("restore scan frame size violates the v4 contract")
+                WireConversionError("restore scan frame size violates the v5 contract")
             })?;
             Ok(())
         }
         Request::GetReplicationLog { start, limit } => {
             ReplicationLogRange::try_new(*start, *limit).map_err(|_| {
-                WireConversionError("replication log range violates the v4 contract")
+                WireConversionError("replication log range violates the v5 contract")
             })?;
             wire_u32_from_usize(
                 *limit,
                 MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
-                "replication log page exceeds the v4 operation limit",
+                "replication log page exceeds the v5 operation limit",
             )?;
             Ok(())
         }
@@ -1026,7 +1040,7 @@ pub(crate) fn validate_request_profile(request: &Request) -> Result<(), WireConv
         Request::RebuildReplicationState { entries } => {
             if entries.len() > MAX_SESSION_NET_REBUILD_ENTRIES {
                 return Err(WireConversionError(
-                    "replication rebuild exceeds the v4 entry limit",
+                    "replication rebuild exceeds the v5 entry limit",
                 ));
             }
             entries
@@ -1065,6 +1079,7 @@ fn validate_response_profile(response: &Response) -> Result<(), WireConversionEr
         | Response::CompareAndSet(Err(_))
         | Response::DeleteFenced(_)
         | Response::RefreshTtl(_)
+        | Response::RecordExpiryPreflight(_)
         | Response::Batch(Err(_))
         | Response::ScanRestoreRecords(Err(_))
         | Response::MaxReplicationSequence(_)
@@ -1208,10 +1223,10 @@ impl<'a> TryFrom<&'a RestoreScanWireRequest> for WireRestoreScanRequestRef<'a> {
 
     fn try_from(request: &'a RestoreScanWireRequest) -> Result<Self, Self::Error> {
         let domain = RestoreScanRequest::try_from(request.clone())
-            .map_err(|_| WireConversionError("restore scan request violates the v4 contract"))?;
+            .map_err(|_| WireConversionError("restore scan request violates the v5 contract"))?;
         domain
             .validate()
-            .map_err(|_| WireConversionError("restore scan request violates the v4 contract"))?;
+            .map_err(|_| WireConversionError("restore scan request violates the v5 contract"))?;
         Ok(Self {
             scope: &request.scope,
             cursor: request.cursor.clone(),
@@ -1263,7 +1278,7 @@ impl<'a> TryFrom<&'a RestoreScanPage> for WireRestoreScanPageRef<'a> {
             )
         {
             return Err(WireConversionError(
-                "restore scan page violates the v4 contract",
+                "restore scan page violates the v5 contract",
             ));
         }
         page.records.iter().try_for_each(validate_record_profile)?;
@@ -1271,7 +1286,7 @@ impl<'a> TryFrom<&'a RestoreScanPage> for WireRestoreScanPageRef<'a> {
             records: &page.records,
             excluded_count: wire_u64_from_usize(
                 page.excluded_count,
-                "restore excluded count exceeds the v4 wire range",
+                "restore excluded count exceeds the v5 wire range",
             )?,
             next_cursor: page.next_cursor.clone(),
             cursor_profile: page.cursor_profile,
@@ -1322,7 +1337,7 @@ impl TryFrom<&BackendCapabilities> for WireBackendCapabilities {
             restore_scan: capabilities.restore_scan,
             max_value_bytes: wire_u64_from_usize(
                 capabilities.max_value_bytes,
-                "capability size exceeds the v4 wire range",
+                "capability size exceeds the v5 wire range",
             )?,
         })
     }
@@ -1368,6 +1383,8 @@ enum WireStoreError {
     ReplicationWatchCatchUpRequired,
     ReplicationOperationLimitExceeded,
     InvalidSessionTtl,
+    InvalidRecordExpiry,
+    RecordExpiryPreflightLimitExceeded,
     LeaseHeld,
     LeaseExpired,
     Crypto(String),
@@ -1401,6 +1418,8 @@ enum WireStoreErrorRef<'a> {
     ReplicationWatchCatchUpRequired,
     ReplicationOperationLimitExceeded,
     InvalidSessionTtl,
+    InvalidRecordExpiry,
+    RecordExpiryPreflightLimitExceeded,
     LeaseHeld,
     LeaseExpired,
     Crypto(&'a str),
@@ -1424,6 +1443,7 @@ fn safe_capability_name(value: &str) -> &'static str {
         "restore_scan" => "restore_scan",
         "watch" => "watch",
         "lease_coordination" => "lease_coordination",
+        "record_expiry_preflight" => "record_expiry_preflight",
         _ => "unknown_capability",
     }
 }
@@ -1452,11 +1472,11 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
                 Self::ReplicationLogPageTooLarge {
                     requested: wire_u64_from_usize(
                         *requested,
-                        "replication page size exceeds the v4 wire range",
+                        "replication page size exceeds the v5 wire range",
                     )?,
                     max: wire_u64_from_usize(
                         *max,
-                        "replication page limit exceeds the v4 wire range",
+                        "replication page limit exceeds the v5 wire range",
                     )?,
                 }
             }
@@ -1470,13 +1490,17 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
                 Self::ReplicationOperationLimitExceeded
             }
             StoreError::InvalidSessionTtl => Self::InvalidSessionTtl,
+            StoreError::InvalidRecordExpiry => Self::InvalidRecordExpiry,
+            StoreError::RecordExpiryPreflightLimitExceeded => {
+                Self::RecordExpiryPreflightLimitExceeded
+            }
             StoreError::LeaseHeld => Self::LeaseHeld,
             StoreError::LeaseExpired => Self::LeaseExpired,
             StoreError::Crypto(_) => Self::Crypto("cryptographic operation failed"),
             StoreError::Serialization(_) => Self::Serialization("serialization failed"),
             StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge {
-                actual: wire_u64_from_usize(*actual, "payload size exceeds the v4 wire range")?,
-                max: wire_u64_from_usize(*max, "payload limit exceeds the v4 wire range")?,
+                actual: wire_u64_from_usize(*actual, "payload size exceeds the v5 wire range")?,
+                max: wire_u64_from_usize(*max, "payload limit exceeds the v5 wire range")?,
             },
             StoreError::InvalidRestoreScanRequest(_) => {
                 Self::InvalidRestoreScanRequest("restore scan request rejected")
@@ -1488,9 +1512,9 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
                 Self::RestoreScanPageTooLarge {
                     requested: wire_u64_from_usize(
                         *requested,
-                        "restore page size exceeds the v4 wire range",
+                        "restore page size exceeds the v5 wire range",
                     )?,
-                    max: wire_u64_from_usize(*max, "restore page limit exceeds the v4 wire range")?,
+                    max: wire_u64_from_usize(*max, "restore page limit exceeds the v5 wire range")?,
                 }
             }
             StoreError::RestoreScanCursorStale => Self::RestoreScanCursorStale,
@@ -1499,7 +1523,7 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
                 Self::RestoreScanResponseTooLarge {
                     max_bytes: wire_u64_from_usize(
                         *max_bytes,
-                        "restore response limit exceeds the v4 wire range",
+                        "restore response limit exceeds the v5 wire range",
                     )?,
                 }
             }
@@ -1553,6 +1577,10 @@ impl TryFrom<WireStoreError> for StoreError {
                 Self::ReplicationOperationLimitExceeded
             }
             WireStoreError::InvalidSessionTtl => Self::InvalidSessionTtl,
+            WireStoreError::InvalidRecordExpiry => Self::InvalidRecordExpiry,
+            WireStoreError::RecordExpiryPreflightLimitExceeded => {
+                Self::RecordExpiryPreflightLimitExceeded
+            }
             WireStoreError::LeaseHeld => Self::LeaseHeld,
             WireStoreError::LeaseExpired => Self::LeaseExpired,
             WireStoreError::Crypto(_) => Self::Crypto("cryptographic operation failed".to_string()),
@@ -2012,7 +2040,7 @@ impl<'a> TryFrom<&'a ReplicationEntry> for WireReplicationEntryRef<'a> {
                 },
                 ReplicationOp::Batch { ops } => {
                     let child_count = u16::try_from(ops.len()).map_err(|_| {
-                        WireConversionError("replication batch exceeds the v4 wire range")
+                        WireConversionError("replication batch exceeds the v5 wire range")
                     })?;
                     pending.extend(ops.iter().rev());
                     WireReplicationNodeRef::Batch { child_count }
@@ -2025,7 +2053,7 @@ impl<'a> TryFrom<&'a ReplicationEntry> for WireReplicationEntryRef<'a> {
             || operation_nodes.len() > MAX_REPLICATION_OPERATIONS_PER_ENTRY
         {
             return Err(WireConversionError(
-                "replication entry violates the v4 contract",
+                "replication entry violates the v5 contract",
             ));
         }
         Ok(Self {
@@ -2045,7 +2073,7 @@ impl TryFrom<WireReplicationEntry> for ReplicationEntry {
             WireReplicationNodes::Nodes(nodes) => nodes,
             WireReplicationNodes::LimitExceeded => {
                 return Err(WireConversionError(
-                    "replication operation tree exceeds the v4 node limit",
+                    "replication operation tree exceeds the v5 node limit",
                 ));
             }
         };
@@ -2129,7 +2157,7 @@ fn validate_wire_replication_tree(
             ))?;
         if depth > MAX_REPLICATION_OPERATION_DEPTH {
             return Err(WireConversionError(
-                "replication operation tree exceeds the v4 depth limit",
+                "replication operation tree exceeds the v5 depth limit",
             ));
         }
 
@@ -2220,6 +2248,9 @@ enum WireRequestRef<'a> {
         lease: &'a LeaseGuard,
         ttl: &'a Duration,
     },
+    RecordExpiryPreflight {
+        preflights: &'a [RecordExpiryPreflight],
+    },
     Batch {
         ops: &'a [SessionOp],
     },
@@ -2278,6 +2309,9 @@ enum WireRequest {
     RefreshTtl {
         lease: LeaseGuard,
         ttl: Duration,
+    },
+    RecordExpiryPreflight {
+        preflights: BoundedVec<RecordExpiryPreflight, MAX_RECORD_EXPIRY_PREFLIGHTS>,
     },
     Batch {
         ops: BoundedVec<SessionOp, MAX_SESSION_NET_BATCH_OPERATIONS>,
@@ -2365,9 +2399,12 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
             },
             Request::DeleteFenced { lease } => Self::DeleteFenced { lease },
             Request::RefreshTtl { lease, ttl } => Self::RefreshTtl { lease, ttl },
+            Request::RecordExpiryPreflight { preflights } => {
+                Self::RecordExpiryPreflight { preflights }
+            }
             Request::Batch { ops } => {
                 if ops.len() > MAX_SESSION_NET_BATCH_OPERATIONS {
-                    return Err(WireConversionError("batch exceeds the v4 operation limit"));
+                    return Err(WireConversionError("batch exceeds the v5 operation limit"));
                 }
                 Self::Batch { ops }
             }
@@ -2384,7 +2421,7 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
                 limit: wire_u32_from_usize(
                     *limit,
                     MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
-                    "replication log page exceeds the v4 operation limit",
+                    "replication log page exceeds the v5 operation limit",
                 )?,
             },
             Request::ReplicateEntry { entry } => Self::ReplicateEntry {
@@ -2393,7 +2430,7 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
             Request::RebuildReplicationState { entries } => {
                 if entries.len() > MAX_SESSION_NET_REBUILD_ENTRIES {
                     return Err(WireConversionError(
-                        "replication rebuild exceeds the v4 entry limit",
+                        "replication rebuild exceeds the v5 entry limit",
                     ));
                 }
                 Self::RebuildReplicationState {
@@ -2448,6 +2485,9 @@ impl TryFrom<WireRequest> for InboundRequest {
             },
             WireRequest::DeleteFenced { lease } => Request::DeleteFenced { lease },
             WireRequest::RefreshTtl { lease, ttl } => Request::RefreshTtl { lease, ttl },
+            WireRequest::RecordExpiryPreflight { preflights } => Request::RecordExpiryPreflight {
+                preflights: preflights.into_inner(),
+            },
             WireRequest::Batch { ops } => Request::Batch {
                 ops: ops.into_inner(),
             },
@@ -2463,10 +2503,10 @@ impl TryFrom<WireRequest> for InboundRequest {
                 let limit = usize_from_wire_u32(
                     limit,
                     MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
-                    "replication log page exceeds the v4 operation limit",
+                    "replication log page exceeds the v5 operation limit",
                 )?;
                 ReplicationLogRange::try_new(start, limit).map_err(|_| {
-                    WireConversionError("replication log range violates the v4 contract")
+                    WireConversionError("replication log range violates the v5 contract")
                 })?;
                 Request::GetReplicationLog { start, limit }
             }
@@ -2521,7 +2561,7 @@ impl TryFrom<WireRequest> for Request {
             }
             InboundRequest::ReplicateEntryOperationLimitExceeded
             | InboundRequest::RebuildReplicationStateOperationLimitExceeded => Err(
-                WireConversionError("replication operation tree violates the v4 contract"),
+                WireConversionError("replication operation tree violates the v5 contract"),
             ),
         }
     }
@@ -2679,7 +2719,7 @@ impl Serialize for WireSessionOpResultsRef<'_> {
 
         if self.0.len() > MAX_SESSION_NET_BATCH_OPERATIONS {
             return Err(serde::ser::Error::custom(
-                "batch response exceeds the v4 operation limit",
+                "batch response exceeds the v5 operation limit",
             ));
         }
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
@@ -2703,7 +2743,7 @@ impl Serialize for WireReplicationEntriesRef<'_> {
 
         if self.0.len() > MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES {
             return Err(serde::ser::Error::custom(
-                "replication log response exceeds the v4 entry limit",
+                "replication log response exceeds the v5 entry limit",
             ));
         }
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
@@ -2725,6 +2765,7 @@ enum WireResponseRef<'a> {
     CompareAndSet(Result<&'a CompareAndSetResult, WireStoreErrorRef<'a>>),
     DeleteFenced(Result<&'a (), WireStoreErrorRef<'a>>),
     RefreshTtl(Result<&'a (), WireStoreErrorRef<'a>>),
+    RecordExpiryPreflight(Result<&'a (), WireStoreErrorRef<'a>>),
     Batch(Result<WireSessionOpResultsRef<'a>, WireStoreErrorRef<'a>>),
     ScanRestoreRecords(Result<WireRestoreScanPageRef<'a>, WireStoreErrorRef<'a>>),
     MaxReplicationSequence(Result<&'a u64, WireStoreErrorRef<'a>>),
@@ -2752,6 +2793,7 @@ enum WireResponse {
     CompareAndSet(Result<CompareAndSetResult, WireStoreError>),
     DeleteFenced(Result<(), WireStoreError>),
     RefreshTtl(Result<(), WireStoreError>),
+    RecordExpiryPreflight(Result<(), WireStoreError>),
     Batch(
         Result<BoundedVec<WireSessionOpResult, MAX_SESSION_NET_BATCH_OPERATIONS>, WireStoreError>,
     ),
@@ -2824,13 +2866,16 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
             }
             Response::DeleteFenced(result) => Self::DeleteFenced(wire_store_result_ref(result)?),
             Response::RefreshTtl(result) => Self::RefreshTtl(wire_store_result_ref(result)?),
+            Response::RecordExpiryPreflight(result) => {
+                Self::RecordExpiryPreflight(wire_store_result_ref(result)?)
+            }
             Response::Batch(result) => Self::Batch(match result {
                 Ok(results) if results.len() <= MAX_SESSION_NET_BATCH_OPERATIONS => {
                     Ok(WireSessionOpResultsRef(results))
                 }
                 Ok(_) => {
                     return Err(WireConversionError(
-                        "batch response exceeds the v4 operation limit",
+                        "batch response exceeds the v5 operation limit",
                     ));
                 }
                 Err(error) => Err(WireStoreErrorRef::try_from(error)?),
@@ -2848,7 +2893,7 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
                 }
                 Ok(_) => {
                     return Err(WireConversionError(
-                        "replication log response exceeds the v4 entry limit",
+                        "replication log response exceeds the v5 entry limit",
                     ));
                 }
                 Err(error) => Err(WireStoreErrorRef::try_from(error)?),
@@ -2913,6 +2958,9 @@ impl TryFrom<WireResponse> for Response {
             }
             WireResponse::DeleteFenced(result) => Self::DeleteFenced(domain_store_result(result)?),
             WireResponse::RefreshTtl(result) => Self::RefreshTtl(domain_store_result(result)?),
+            WireResponse::RecordExpiryPreflight(result) => {
+                Self::RecordExpiryPreflight(domain_store_result(result)?)
+            }
             WireResponse::Batch(result) => Self::Batch(match result {
                 Ok(results) => Ok(results
                     .into_inner()
@@ -3484,7 +3532,7 @@ where
     )
 }
 
-/// Size one successful point-read response using the exact borrowed v4 DTO.
+/// Size one successful point-read response using the exact borrowed v5 DTO.
 #[cfg(test)]
 pub(crate) fn ensure_get_success_frame_fits(
     record: &Option<StoredSessionRecord>,
@@ -3511,7 +3559,7 @@ pub(crate) fn ensure_replication_log_success_frame_fits_until(
     )
 }
 
-/// Size one successful restore response using the exact borrowed v4 wire DTO.
+/// Size one successful restore response using the exact borrowed v5 wire DTO.
 ///
 /// This avoids cloning record payloads while the server progressively trims a
 /// page to the caller's response budget.
@@ -3583,7 +3631,7 @@ where
     serde_json::from_slice(&payload).map_err(ProtocolError::Serialization)
 }
 
-/// Decode one post-bootstrap operation request through the private v4 DTO.
+/// Decode one post-bootstrap operation request through the private v5 DTO.
 pub(crate) async fn read_request_frame<R>(
     reader: &mut R,
     max_frame_size: usize,
@@ -3597,7 +3645,7 @@ where
     InboundRequest::try_from(wire).map_err(|_| ProtocolError::InvalidWireValue)
 }
 
-/// Decode one post-bootstrap operation response through the private v4 DTO.
+/// Decode one post-bootstrap operation response through the private v5 DTO.
 pub(crate) async fn read_response_frame<R>(
     reader: &mut R,
     max_frame_size: usize,
@@ -3796,8 +3844,8 @@ mod tests {
     }
 
     #[test]
-    fn restore_scan_protocol_v4_frames_round_trip_without_redundant_fields() {
-        assert_eq!(CONTRACT_VERSION, 4);
+    fn restore_scan_protocol_v5_frames_round_trip_without_redundant_fields() {
+        assert_eq!(CONTRACT_VERSION, 5);
 
         let domain_request = RestoreScanRequest {
             scope: RestoreScanScope::all(),
@@ -3900,8 +3948,10 @@ mod tests {
         assert!(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.is_current());
         assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision,
-            2
+            4
         );
+        assert_eq!(SESSION_CONSENSUS_ALPN, b"opc-session-consensus/2");
+        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 2);
         let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
         previous_error_set.error_set_revision = 1;
         assert!(!previous_error_set.is_current());
@@ -3942,10 +3992,10 @@ mod tests {
 
     #[test]
     fn contract_profile_and_bootstrap_frames_are_exact_and_version_tolerant() {
-        assert_eq!(SESSION_NET_ALPN, b"opc-session-net/4");
+        assert_eq!(SESSION_NET_ALPN, b"opc-session-net/5");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
-        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 4);
-        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 6);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 5);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 8);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
 
@@ -3953,8 +4003,8 @@ mod tests {
         assert_eq!(
             profile,
             serde_json::json!({
-                "wire_schema_revision": 4,
-                "error_set_revision": 6,
+                "wire_schema_revision": 5,
+                "error_set_revision": 8,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 4194304,
                 "max_restore_scan_page_retained_bytes": 8388608,
@@ -4037,7 +4087,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_width_limits_and_size_errors_have_golden_v4_shapes() {
+    fn fixed_width_limits_and_size_errors_have_golden_v5_shapes() {
         let request = Request::GetReplicationLog {
             start: u64::MAX,
             limit: 1,
@@ -4095,7 +4145,7 @@ mod tests {
     }
 
     #[test]
-    fn every_store_error_has_a_frozen_v4_round_trip() {
+    fn every_store_error_has_a_frozen_v5_round_trip() {
         let errors = [
             StoreError::NotFound,
             StoreError::StaleFence,
@@ -4116,6 +4166,8 @@ mod tests {
             StoreError::ReplicationWatchCatchUpRequired,
             StoreError::ReplicationOperationLimitExceeded,
             StoreError::InvalidSessionTtl,
+            StoreError::InvalidRecordExpiry,
+            StoreError::RecordExpiryPreflightLimitExceeded,
             StoreError::LeaseHeld,
             StoreError::LeaseExpired,
             StoreError::Crypto("crypto".to_string()),
@@ -4224,6 +4276,16 @@ mod tests {
             Response::Get(Err(StoreError::CapabilityNotSupported(capability)))
                 if capability == "watch"
         ));
+
+        let expiry_preflight: Response = serde_json::from_value(serde_json::json!({
+            "Get": {"Err": {"CapabilityNotSupported": "record_expiry_preflight"}}
+        }))
+        .expect("allowlisted expiry-preflight capability");
+        assert!(matches!(
+            expiry_preflight,
+            Response::Get(Err(StoreError::CapabilityNotSupported(capability)))
+                if capability == "record_expiry_preflight"
+        ));
     }
 
     #[test]
@@ -4296,7 +4358,7 @@ mod tests {
     }
 
     #[test]
-    fn every_lease_error_has_a_frozen_v4_round_trip() {
+    fn every_lease_error_has_a_frozen_v5_round_trip() {
         let errors = [
             LeaseError::AlreadyHeld,
             LeaseError::Expired,
@@ -4520,6 +4582,41 @@ mod tests {
         let mut hostile = json;
         let operations = hostile["Batch"]["ops"].as_array_mut().expect("ops");
         operations.push(operations[0].clone());
+        assert!(serde_json::from_value::<Request>(hostile).is_err());
+    }
+
+    #[test]
+    fn record_expiry_preflight_is_payload_free_and_bounded_during_decode() {
+        let descriptor = RecordExpiryPreflight::from_record(&test_record(
+            test_session_key(),
+            OwnerId::new("expiry-preflight-owner").expect("owner"),
+            FenceToken::new(1),
+        ));
+        let exact = Request::RecordExpiryPreflight {
+            preflights: vec![descriptor; MAX_RECORD_EXPIRY_PREFLIGHTS],
+        };
+        let json = serde_json::to_value(exact).expect("exact expiry preflight");
+        let decoded: Request =
+            serde_json::from_value(json.clone()).expect("decode exact expiry preflight");
+        assert!(matches!(
+            decoded,
+            Request::RecordExpiryPreflight { preflights }
+                if preflights.len() == MAX_RECORD_EXPIRY_PREFLIGHTS
+        ));
+        let rendered = json.to_string();
+        for forbidden in ["stable_id", "payload", "owner", "generation", "fence"] {
+            assert!(!rendered.contains(forbidden));
+        }
+
+        let too_many = Request::RecordExpiryPreflight {
+            preflights: vec![descriptor; MAX_RECORD_EXPIRY_PREFLIGHTS + 1],
+        };
+        assert!(serde_json::to_value(too_many).is_err());
+        let mut hostile = json;
+        let preflights = hostile["RecordExpiryPreflight"]["preflights"]
+            .as_array_mut()
+            .expect("preflights");
+        preflights.push(preflights[0].clone());
         assert!(serde_json::from_value::<Request>(hostile).is_err());
     }
 

@@ -16,7 +16,7 @@ publish = false # experimental: not published until graduation
 [features]
 default = []
 insecure-test = []
-# Quarantined protocol-v4 remote-backend RPCs. This compatibility surface
+# Quarantined protocol-v5 remote-backend RPCs. This compatibility surface
 # includes direct mutations and raw replication-log/rebuild authority and must
 # not be enabled on a production Openraft endpoint.
 legacy-session-net-compat = []
