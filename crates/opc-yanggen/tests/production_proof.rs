@@ -37,6 +37,7 @@ fn create_proof_input() -> CanonicalInput {
                 "/proof:system/proof:dns-servers".to_string(),
                 "/proof:system/proof:admin-password".to_string(),
                 "/proof:system/proof:default-interface".to_string(),
+                "/proof:system/proof:backup-interfaces".to_string(),
                 "/proof:system/other-module:external-leaf".to_string(),
             ],
             source: source.clone(),
@@ -305,7 +306,20 @@ fn create_proof_input() -> CanonicalInput {
             source: source.clone(),
             ..Default::default()
         },
-        // 25. External Leaf from other module
+        // 25. Backup Interfaces (Leaf-list of LeafRefs pointing to interface names)
+        SchemaNode {
+            path: "/proof:system/proof:backup-interfaces".to_string(),
+            module: "proof".to_string(),
+            kind: SchemaNodeKind::LeafList,
+            config: true,
+            type_ref: Some(TypeRef::LeafRef {
+                target_path: "/proof:system/proof:interfaces/proof:interface/proof:name"
+                    .to_string(),
+            }),
+            source: source.clone(),
+            ..Default::default()
+        },
+        // 26. External Leaf from other module
         SchemaNode {
             path: "/proof:system/other-module:external-leaf".to_string(),
             module: "other-module".to_string(),
@@ -315,7 +329,7 @@ fn create_proof_input() -> CanonicalInput {
             source: source.clone(),
             ..Default::default()
         },
-        // 26. Nested External Leaf from other module
+        // 27. Nested External Leaf from other module
         SchemaNode {
             path: "/proof:system/proof:presence-container/other-module:nested-external-leaf"
                 .to_string(),
@@ -771,6 +785,27 @@ fn test_production_proof_codegen() {
         if let Err(e) = sys.validate_semantics(&ctx) {
             panic!("Expected validation to succeed after adding target interface, but got error: {:?}", e);
         }
+    }
+
+    #[test]
+    fn test_leaf_list_leafref_validation() {
+        let ctx = create_ctx();
+        let mut sys = System::default();
+
+        // An empty leaf-list has no references to resolve.
+        assert!(sys.validate_semantics(&ctx).is_ok());
+
+        let add_interface = vec![
+            ConfigDelta::Update(YangPath::new("/proof:system/interfaces/interface[name='eth0']").unwrap(), json!({}).to_string())
+        ];
+        apply_patch(&mut sys, &add_interface).unwrap();
+        sys.backup_interfaces = vec!["eth0".to_string()];
+        assert!(sys.validate_semantics(&ctx).is_ok());
+
+        sys.backup_interfaces.push("missing-peer".to_string());
+        let error = sys.validate_semantics(&ctx).unwrap_err().to_string();
+        assert!(error.contains("missing-peer"), "missing value absent from: {error}");
+        assert!(error.contains("index 1"), "element index absent from: {error}");
     }
 
     #[test]
