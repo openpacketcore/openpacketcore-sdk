@@ -257,8 +257,8 @@ and #127 now supplies Openraft durable commit authority. #128 supplies
 current-format divergence recovery and #129 supplies explicit offline
 legacy-fork recovery. #133 supplies bounded snapshot-bound applied-state
 restore; production qualification (#143) remains open. Seamless certificate
-and trust-bundle lifecycle remains the #162 ->
-#161 -> #163 -> #158 -> #164 chain;
+and trust-bundle lifecycle remains the #161 -> #162 -> #163 -> #164 chain
+under umbrella #158;
 payload-protection-key rotation and distributed production evidence remain
 #143.
 
@@ -1004,6 +1004,8 @@ forms a three-node config Openraft cluster and commits/linearizably reads
 through the existing peer/server types. Any compatibility transport work
 must preserve the single Openraft authority rather than reopen direct mutation
 as a quorum path.
+Seamless SVID/trust-bundle rotation remains #161 -> #162 -> #163 -> #164 under
+umbrella #158.
 
 ### 12.4 Consensus-Only Session Transport
 
@@ -1054,9 +1056,9 @@ production rotation MUST additionally overlap old/new trust, retire old
 connections, enforce revocation and a documented maximum authentication age,
 bound reconnect storms, and supply multi-process/soak evidence. The scoped
 in-process new-call result does not close those fleet lifecycle requirements.
-The required dependency order remains #162 (material epochs), #161 (atomic
-reload), #163 (reauthentication across an epoch), #158 (seamless rotation), and
-#164 (qualification).
+The required dependency order remains #161 (atomic reload), #162 (material
+epochs), #163 (reauthentication across an epoch), and #164 (qualification),
+with #158 remaining open as the umbrella until that evidence passes.
 
 ## 13. Local Cache
 
@@ -1154,8 +1156,8 @@ and trust bundles without interrupting service, while still enforcing
 revocation and a documented maximum authentication age on long-lived
 connections. Consensus reconnects perform a full mutual-TLS handshake, but
 seamless certificate/trust rotation remains the
-#162 -> #161 -> #163 -> #158 -> #164 dependency chain; reconnect-storm and wider distributed
-production evidence remain #143.
+#161 -> #162 -> #163 -> #164 dependency chain under umbrella #158; reconnect-storm and
+wider distributed production evidence remain #143.
 
 ## 15. Observability
 
@@ -1353,5 +1355,5 @@ This RFC is implemented when:
     documented payload-envelope versus full-database boundary is qualified.
 15. Divergence recovery (#128), operator-safe legacy-fork recovery (#129),
     bounded applied-state restore (#133), distributed production qualification
-    (#143), and the #162 -> #161 -> #163 -> #158 -> #164 credential-rotation
-    chain have passed their own acceptance gates.
+    (#143), and the #161 -> #162 -> #163 -> #164 credential-rotation chain
+    under umbrella #158 have passed their own acceptance gates.

@@ -421,13 +421,7 @@ impl DiameterSctpPeer {
     /// association cannot be opened on the current platform/runtime.
     pub async fn connect_association(&self) -> Result<DiameterSctpAssociation, DiameterSctpError> {
         let config = self.sctp_connect_config()?;
-        let association = SctpAssociation::connect(config)
-            .await
-            .map_err(DiameterSctpError::connect)?;
-        Ok(DiameterSctpAssociation {
-            peer: self.clone(),
-            association,
-        })
+        DiameterSctpAssociation::connect_with_config(config, self.security).await
     }
 }
 
@@ -439,6 +433,46 @@ pub struct DiameterSctpAssociation {
 }
 
 impl DiameterSctpAssociation {
+    /// Open a Diameter-framed association from an explicit SCTP client config.
+    ///
+    /// This is the Diameter counterpart to [`SctpAssociation::connect`] and
+    /// preserves the complete local and remote address sets in `config`.
+    /// Callers can therefore use static SCTP multihoming without duplicating
+    /// the SDK's Diameter PPID and notification handling. The first configured
+    /// remote and local addresses are exposed through [`Self::peer`] only as
+    /// the primary transport intent; SCTP remains authoritative for path
+    /// selection across the full validated sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError::SctpConfig`] when `config` is invalid, or
+    /// [`DiameterSctpError::SctpConnect`] when the platform, kernel, namespace,
+    /// or peer cannot open the requested association. A host that lacks static
+    /// multihoming reports [`SctpError::CapabilityUnavailable`]; this function
+    /// never silently reduces the configured address sets.
+    pub async fn connect_with_config(
+        config: SctpConnectConfig,
+        security: DiameterSctpSecurity,
+    ) -> Result<Self, DiameterSctpError> {
+        config.validate().map_err(DiameterSctpError::from)?;
+        let Some(&remote_addr) = config.remote_addrs.first() else {
+            return Err(DiameterSctpError::from(SctpError::InvalidConfig {
+                field: "remote_addrs",
+                reason: "must contain at least one address",
+            }));
+        };
+        let peer = DiameterSctpPeer {
+            remote_addr,
+            local_addr: config.local_addrs.first().copied(),
+            security,
+            max_message_bytes: config.max_message_bytes,
+        };
+        let association = SctpAssociation::connect(config)
+            .await
+            .map_err(DiameterSctpError::connect)?;
+        Ok(Self { peer, association })
+    }
+
     /// Return the configured Diameter SCTP peer intent.
     #[must_use]
     pub const fn peer(&self) -> &DiameterSctpPeer {
@@ -619,6 +653,9 @@ impl DiameterSctpError {
             Self::SctpConfig(_) => "diameter_sctp_config_error",
             Self::SctpConnect(SctpError::UnsupportedPlatform) => {
                 "diameter_sctp_unsupported_platform"
+            }
+            Self::SctpConnect(SctpError::CapabilityUnavailable { .. }) => {
+                "diameter_sctp_capability_unavailable"
             }
             Self::SctpConnect(_) => "diameter_sctp_connect_error",
             Self::SctpSend(_) => "diameter_sctp_send_error",
@@ -1841,6 +1878,31 @@ mod tests {
         assert_eq!(error.as_str(), "diameter_sctp_config_error");
     }
 
+    #[tokio::test]
+    async fn diameter_explicit_connect_rejects_invalid_config_before_socket_open() {
+        let mut config = SctpConnectConfig::new("127.0.0.1:3868".parse().unwrap());
+        config.remote_addrs.clear();
+
+        let error =
+            DiameterSctpAssociation::connect_with_config(config, DiameterSctpSecurity::ClearText)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(error, DiameterSctpError::SctpConfig(_)));
+        assert_eq!(error.as_str(), "diameter_sctp_config_error");
+    }
+
+    #[test]
+    fn diameter_capability_unavailable_has_distinct_error_code() {
+        let error = DiameterSctpError::SctpConnect(SctpError::CapabilityUnavailable {
+            capability: "static_multihoming",
+            source: std::io::Error::from(std::io::ErrorKind::Unsupported),
+        });
+
+        assert_eq!(error.as_str(), "diameter_sctp_capability_unavailable");
+        assert!(!error.is_unsupported_platform());
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn diameter_connect_reports_unsupported_platform_on_non_linux() {
@@ -2424,6 +2486,72 @@ mod tests {
                 .await
                 .expect("multihomed payload timed out");
         assert_eq!(received.payload, Bytes::from_static(b"multihomed-sctp"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP multihoming support"]
+    async fn loopback_diameter_uses_explicit_multihoming_config() {
+        let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
+        server_config
+            .local_addrs
+            .push("127.0.0.2:0".parse().unwrap());
+        let server = SctpEndpoint::bind(server_config).unwrap();
+        let mut server_addresses = server.local_addresses().unwrap();
+        server_addresses.sort_unstable();
+
+        let mut client_config = SctpConnectConfig::new(server_addresses[0]);
+        client_config.remote_addrs = server_addresses.clone();
+        client_config.local_addrs = vec![
+            "127.0.0.3:0".parse().unwrap(),
+            "127.0.0.4:0".parse().unwrap(),
+        ];
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            DiameterSctpAssociation::connect_with_config(
+                client_config,
+                DiameterSctpSecurity::ClearText,
+            ),
+        )
+        .await
+        .expect("multihomed Diameter connect timed out")
+        .unwrap();
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), server.accept())
+            .await
+            .expect("multihomed Diameter association was not accepted")
+            .unwrap();
+
+        let outbound = Bytes::from_static(b"diameter-multihomed-request");
+        client
+            .send_diameter_payload(outbound.clone())
+            .await
+            .unwrap();
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), recv_data(&accepted))
+                .await
+                .expect("multihomed Diameter request timed out");
+        assert_eq!(received.payload, outbound);
+        assert_eq!(received.ppid, DIAMETER_SCTP_PPID);
+
+        let inbound = Bytes::from_static(b"diameter-multihomed-answer");
+        accepted
+            .send(OutboundMessage::ordered(
+                inbound.clone(),
+                DIAMETER_DEFAULT_STREAM_ID,
+                DIAMETER_SCTP_PPID,
+            ))
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_diameter_payload(),
+        )
+        .await
+        .expect("multihomed Diameter answer timed out")
+        .unwrap();
+        assert_eq!(received, inbound);
+        assert_eq!(client.peer().remote_addr, server_addresses[0]);
+        assert_eq!(client.peer().security, DiameterSctpSecurity::ClearText);
     }
 
     #[cfg(target_os = "linux")]
