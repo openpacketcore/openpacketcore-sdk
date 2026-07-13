@@ -20,11 +20,50 @@ import json
 import subprocess
 import sys
 from collections import deque
+from pathlib import Path
+
+
+OPENRAFT_GIT_SOURCE = (
+    "git+https://github.com/openpacketcore/openraft"
+    "?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96"
+)
+SOURCE_BUILD_ONLY = {
+    "opc-alarm",
+    "opc-alarm-k8s",
+    "opc-alarm-testkit",
+    "opc-alarm-yang",
+    "opc-amf-lite",
+    "opc-amf-lite-testkit",
+    "opc-config-bus",
+    "opc-consensus",
+    "opc-gnmi-server",
+    "opc-ipsec-lb",
+    "opc-mgmt-authz",
+    "opc-mgmt-transport",
+    "opc-netconf-server",
+    "opc-persist",
+    "opc-runtime",
+    "opc-sa-mirror",
+    "opc-sbi",
+    "opc-sdk",
+    "opc-sdk-integration",
+    "opc-session-cache",
+    "opc-session-net",
+    "opc-session-store",
+    "opc-session-testkit",
+    "operator-controller",
+    "operator-lifecycle",
+    "operator-lifecycle-cli",
+}
+SOURCE_BUILD_REMOVAL_CONDITION = (
+    "official stable Openraft release containing the fix, registry pin and "
+    "checksum, and full issue #143 requalification"
+)
 
 
 def cargo_metadata() -> dict:
     out = subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        ["cargo", "metadata", "--format-version", "1", "--locked"],
         check=True,
         capture_output=True,
         text=True,
@@ -37,12 +76,77 @@ def main() -> int:
     names_only = "--names" in sys.argv[1:]
     meta = cargo_metadata()
 
-    packages = {p["name"]: p for p in meta["packages"]}
+    workspace_members = set(meta["workspace_members"])
+    packages = {
+        package["name"]: package
+        for package in meta["packages"]
+        if package["id"] in workspace_members
+    }
     publishable = {
         name for name, p in packages.items() if p.get("publish") is None
     }
 
     errors: list[str] = []
+
+    consensus_dependencies = {
+        dependency["name"]: dependency
+        for dependency in packages["opc-consensus"]["dependencies"]
+    }
+    openraft = consensus_dependencies.get("openraft")
+    if openraft is None or openraft.get("source") != OPENRAFT_GIT_SOURCE:
+        errors.append("opc-consensus: Openraft is not pinned to the approved full git rev")
+    resolved_fork_source = (
+        f"{OPENRAFT_GIT_SOURCE}#f607e636406b16bd0ad7925dbb631da1b7a4cd96"
+    )
+    fork_packages = {
+        (package["name"], package["version"])
+        for package in meta["packages"]
+        if package.get("source") == resolved_fork_source
+    }
+    if fork_packages != {("openraft", "0.9.24"), ("openraft-macros", "0.9.24")}:
+        errors.append("resolved Openraft fork package set/version/source is not exact")
+
+    computed_source_closure = {"opc-consensus", "opc-persist", "opc-session-store"}
+    changed = True
+    while changed:
+        changed = False
+        for name, package in packages.items():
+            if name in computed_source_closure:
+                continue
+            if any(
+                dependency["kind"] is None
+                and dependency["name"] in computed_source_closure
+                for dependency in package["dependencies"]
+            ):
+                computed_source_closure.add(name)
+                changed = True
+    if computed_source_closure != SOURCE_BUILD_ONLY:
+        errors.append("Openraft source-build normal reverse-dependency closure drifted")
+
+    for name in sorted(SOURCE_BUILD_ONLY):
+        if packages.get(name, {}).get("publish") != []:
+            errors.append(f"{name}: must remain publish=false while the Openraft fork is pinned")
+
+    profile_path = Path("crates/opc-session-testkit/qualification/v1/session-ha-profile.json")
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    source_gate = profile.get("source_build_gate", {})
+    if set(source_gate.get("affected_workspace_crates", [])) != SOURCE_BUILD_ONLY:
+        errors.append("session HA profile source-build crate closure is not exact")
+    if source_gate.get("openraft_rev") != OPENRAFT_GIT_SOURCE.rsplit("=", 1)[-1]:
+        errors.append("session HA profile Openraft revision is not exact")
+    if source_gate.get("removal_condition") != SOURCE_BUILD_REMOVAL_CONDITION:
+        errors.append("session HA profile source-build removal condition drifted")
+    if source_gate.get("crates_io_check_date") != "2026-07-13":
+        errors.append("session HA profile crates.io check date drifted")
+    if source_gate.get("crates_io_exact_matches") != []:
+        errors.append("session HA profile must not claim an exact crates.io match")
+    profiled_publish = {
+        artifact.get("crate_name"): artifact.get("publish")
+        for artifact in profile.get("artifacts", [])
+    }
+    for name in ["openraft", "opc-consensus", "opc-persist", "opc-session-store"]:
+        if profiled_publish.get(name) is not False:
+            errors.append(f"session HA profile: {name} must remain source-build only")
 
     # Build the intra-workspace dependency graph over publishable crates,
     # and validate version keys on normal (non-dev) path dependencies.
@@ -64,6 +168,10 @@ def main() -> int:
             elif dep["kind"] is None:
                 errors.append(
                     f"{name} (publishable) depends on non-publishable {dep['name']}"
+                )
+            if dep["kind"] is None and dep["name"] in SOURCE_BUILD_ONLY:
+                errors.append(
+                    f"{name} (publishable) depends on source-build-only {dep['name']}"
                 )
 
     # Kahn's algorithm for a deterministic topological order.

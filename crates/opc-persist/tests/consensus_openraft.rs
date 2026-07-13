@@ -1225,25 +1225,36 @@ async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
         .expect("replicated first commit");
 
     let old_leader = cluster.leader();
+    let old_leader_id = cluster.stores[old_leader].status().node_id;
+    let old_term = cluster.stores[old_leader].status().term;
     cluster.isolate(old_leader);
     let survivors = (0..3)
         .filter(|index| *index != old_leader)
         .collect::<Vec<_>>();
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let (new_leader_id, new_term) = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            if survivors.iter().any(|index| {
-                cluster.stores[*index]
-                    .status()
-                    .leader_id
-                    .is_some_and(|leader| leader != cluster.stores[old_leader].status().node_id)
-            }) {
-                return;
+            let statuses = survivors
+                .iter()
+                .map(|index| cluster.stores[*index].status())
+                .collect::<Vec<_>>();
+            if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
+                let new_term = statuses.first().expect("survivor status").term;
+                if new_leader_id != old_leader_id
+                    && new_term > old_term
+                    && statuses.iter().all(|status| {
+                        status.leader_id == Some(new_leader_id) && status.term == new_term
+                    })
+                {
+                    return (new_leader_id, new_term);
+                }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
     .expect("survivor leader election");
+    assert_ne!(new_leader_id, old_leader_id);
+    assert!(new_term > old_term);
 
     let second_id = TxId::new();
     cluster.stores[survivors[0]]

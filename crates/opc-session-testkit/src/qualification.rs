@@ -62,6 +62,7 @@ pub struct SessionHaQualificationProfile {
     pub maturity: String,
     pub qualification_complete: bool,
     pub workspace: QualificationWorkspace,
+    pub source_build_gate: QualificationSourceBuildGate,
     pub artifacts: Vec<QualificationArtifact>,
     pub platforms: Vec<QualificationPlatform>,
     pub topology: QualificationTopology,
@@ -77,6 +78,19 @@ pub struct QualificationWorkspace {
     pub version: String,
     pub rust_msrv: String,
     pub source_revision: String,
+}
+
+/// Exact interim source and publication gate for the patched consensus engine.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationSourceBuildGate {
+    pub tracking_issue: u64,
+    pub openraft_git: String,
+    pub openraft_rev: String,
+    pub affected_workspace_crates: Vec<String>,
+    pub crates_io_check_date: String,
+    pub crates_io_exact_matches: Vec<String>,
+    pub removal_condition: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,6 +162,8 @@ pub struct QualificationThresholds {
     pub max_startup_millis: u64,
     pub max_single_member_stop_service_continuity_millis: u64,
     pub max_restart_catchup_millis: u64,
+    pub max_leader_failover_millis: u64,
+    pub max_leader_restart_catchup_millis: u64,
     pub minimum_soak_seconds: u64,
 }
 

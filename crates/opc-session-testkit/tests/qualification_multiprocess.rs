@@ -65,12 +65,19 @@ enum HarnessStage {
     InitialReadiness,
     Operation,
     FollowerObservation,
+    LeaderObservation,
     StopFollower,
+    StopLeader,
     ContinuityReadiness,
+    LeaderFailoverReadiness,
     RestartBind,
     RestartConfigure,
     RestartInitialize,
     RestartReadiness,
+    LeaderRestartBind,
+    LeaderRestartConfigure,
+    LeaderRestartInitialize,
+    LeaderRestartReadiness,
     ConfigurationEvidence,
     HistoryEvidence,
     ThresholdEvidence,
@@ -939,7 +946,30 @@ fn validate_generated_evidence(
                     .provisional_test_thresholds
                     .max_restart_catchup_millis
         });
-    if !(startup_within_bound && continuity_within_bound && catchup_within_bound) {
+    let leader_failover_within_bound =
+        results["leader_failover_millis"]
+            .as_u64()
+            .is_some_and(|value| {
+                value
+                    <= profile
+                        .provisional_test_thresholds
+                        .max_leader_failover_millis
+            });
+    let leader_restart_within_bound = results["leader_restart_catchup_millis"]
+        .as_u64()
+        .is_some_and(|value| {
+            value
+                <= profile
+                    .provisional_test_thresholds
+                    .max_leader_restart_catchup_millis
+        });
+    if !(startup_within_bound
+        && continuity_within_bound
+        && catchup_within_bound
+        && leader_failover_within_bound
+        && leader_restart_within_bound
+        && results["leader_outage_store_read_succeeded"] == true)
+    {
         return Err(HarnessError::Evidence);
     }
 
@@ -976,14 +1006,72 @@ fn validate_generated_evidence(
         .as_u64()
         .filter(|value| *value > 0)
         .ok_or(HarnessError::Evidence)?;
-    if faults.len() != 2
-        || !faults.iter().all(|fault| {
+    let leader_fault = faults.get(2).ok_or(HarnessError::Evidence)?;
+    let leader_target = leader_fault["target_process"]
+        .as_str()
+        .filter(|target| {
+            target
+                .strip_prefix("node-")
+                .and_then(|index| index.parse::<usize>().ok())
+                .is_some_and(|index| index < member_count)
+        })
+        .ok_or(HarnessError::Evidence)?;
+    let old_leader_id = leader_fault["observed_node_id"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or(HarnessError::Evidence)?;
+    let old_term = leader_fault["observed_term"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or(HarnessError::Evidence)?;
+    if faults.len() != 4
+        || !faults[..2].iter().all(|fault| {
             fault["target_process"] == expected_target
                 && fault["target_role"] == "follower"
                 && fault["observed_node_id"].as_u64() == Some(expected_node_id)
                 && fault["observed_leader_id"].as_u64() == Some(expected_leader_id)
                 && fault["observed_term"].as_u64() == Some(expected_term)
+                && fault["bounded"] == true
         })
+        || !faults[2..].iter().all(|fault| {
+            fault["target_process"] == leader_target
+                && fault["target_role"] == "leader"
+                && fault["observed_node_id"].as_u64() == Some(old_leader_id)
+                && fault["observed_leader_id"].as_u64() == Some(old_leader_id)
+                && fault["observed_term"].as_u64() == Some(old_term)
+                && fault["bounded"] == true
+        })
+    {
+        return Err(HarnessError::Evidence);
+    }
+
+    let transition = &evidence["leader_transition"];
+    let new_leader_process = transition["new_leader_process"]
+        .as_str()
+        .filter(|target| {
+            target
+                .strip_prefix("node-")
+                .and_then(|index| index.parse::<usize>().ok())
+                .is_some_and(|index| index < member_count)
+        })
+        .ok_or(HarnessError::Evidence)?;
+    let new_leader_id = transition["new_leader_node_id"]
+        .as_u64()
+        .filter(|value| *value > 0 && *value != old_leader_id)
+        .ok_or(HarnessError::Evidence)?;
+    let new_term = transition["new_term"]
+        .as_u64()
+        .filter(|value| *value > old_term)
+        .ok_or(HarnessError::Evidence)?;
+    if transition["old_leader_process"] != leader_target
+        || transition["old_leader_node_id"].as_u64() != Some(old_leader_id)
+        || transition["old_term"].as_u64() != Some(old_term)
+        || transition["new_leader_process"] != new_leader_process
+        || transition["new_leader_node_id"].as_u64() != Some(new_leader_id)
+        || transition["new_term"].as_u64() != Some(new_term)
+        || transition["failover_millis"] != results["leader_failover_millis"]
+        || transition["old_leader_restart_catchup_millis"]
+            != results["leader_restart_catchup_millis"]
     {
         return Err(HarnessError::Evidence);
     }
@@ -1005,6 +1093,9 @@ fn validate_generated_evidence(
         || coverage.iter().any(|item| item == other_topology)
         || !coverage.iter().any(|item| item == "lease_expiry_reacquire")
         || !coverage.iter().any(|item| item == "stale_fence_rejection")
+        || !coverage
+            .iter()
+            .any(|item| item == "observed_leader_failover")
         || !evidence["remaining_acceptance"]
             .as_array()
             .is_some_and(|items| {
@@ -1152,31 +1243,24 @@ fn verify_retained_bundle(destination: &Path, member_count: usize) -> Result<(),
     let evidence_faults = evidence["faults"]
         .as_array()
         .ok_or(HarnessError::Evidence)?;
-    let evidence_fault = evidence_faults.first().ok_or(HarnessError::Evidence)?;
-    let expected_target = evidence_fault["target_process"]
-        .as_str()
-        .ok_or(HarnessError::Evidence)?;
-    let expected_node_id = evidence_fault["observed_node_id"]
-        .as_u64()
-        .ok_or(HarnessError::Evidence)?;
-    let expected_leader_id = evidence_fault["observed_leader_id"]
-        .as_u64()
-        .ok_or(HarnessError::Evidence)?;
-    let expected_term = evidence_fault["observed_term"]
-        .as_u64()
-        .ok_or(HarnessError::Evidence)?;
     if fault_schedule["schema_version"] != "opc-session-ha-fault-schedule/v1"
         || fault_schedule["topology_members"].as_u64() != Some(member_count as u64)
         || !fault_schedule["faults"].as_array().is_some_and(|faults| {
-            faults.len() == 2
-                && faults.iter().all(|fault| {
-                    fault["target_process"] == expected_target
-                        && fault["target_role"] == "follower"
-                        && fault["observed_node_id"].as_u64() == Some(expected_node_id)
-                        && fault["observed_leader_id"].as_u64() == Some(expected_leader_id)
-                        && fault["observed_term"].as_u64() == Some(expected_term)
-                        && fault["bounded"] == true
-                })
+            faults.len() == 4
+                && evidence_faults.len() == faults.len()
+                && faults.iter().zip(evidence_faults).enumerate().all(
+                    |(index, (scheduled, retained))| {
+                        scheduled["sequence"].as_u64() == Some((index + 1) as u64)
+                            && scheduled["kind"] == retained["kind"]
+                            && scheduled["target_process"] == retained["target_process"]
+                            && scheduled["target_role"] == retained["target_role"]
+                            && scheduled["observed_node_id"] == retained["observed_node_id"]
+                            && scheduled["observed_leader_id"] == retained["observed_leader_id"]
+                            && scheduled["observed_term"] == retained["observed_term"]
+                            && scheduled["bounded"] == true
+                            && retained["bounded"] == true
+                    },
+                )
         })
     {
         return Err(HarnessError::Evidence);
@@ -2113,8 +2197,17 @@ impl Fleet {
         deadline: Instant,
     ) -> Result<Vec<ReadinessDiagnostic>, HarnessError> {
         let node_indices = (0..self.nodes.len()).collect::<Vec<_>>();
+        self.probe_readiness_round_for(&node_indices, stage, deadline)
+    }
+
+    fn probe_readiness_round_for(
+        &mut self,
+        node_indices: &[usize],
+        stage: HarnessStage,
+        deadline: Instant,
+    ) -> Result<Vec<ReadinessDiagnostic>, HarnessError> {
         let mut readiness = HashMap::new();
-        for node_index in &node_indices {
+        for node_index in node_indices {
             if Instant::now() >= deadline {
                 return Err(readiness_deadline(stage, &readiness));
             }
@@ -2128,7 +2221,7 @@ impl Fleet {
                 return Err(with_readiness(error, &readiness));
             }
         }
-        for node_index in node_indices {
+        for node_index in node_indices.iter().copied() {
             let now = Instant::now();
             if now >= deadline {
                 return Err(readiness_deadline(stage, &readiness));
@@ -2254,40 +2347,155 @@ impl Fleet {
         }
     }
 
+    fn observe_stable_leader(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ReadinessDiagnostic, HarnessError> {
+        let deadline = Instant::now() + timeout;
+        let mut last_readiness;
+        loop {
+            let observed = self.probe_readiness_round(HarnessStage::LeaderObservation, deadline)?;
+            last_readiness = observed.clone();
+            if let Some((leader_id, term)) = coherent_leader_snapshot(&observed, self.nodes.len()) {
+                let confirmed =
+                    self.probe_readiness_round(HarnessStage::LeaderObservation, deadline)?;
+                last_readiness = confirmed.clone();
+                if coherent_leader_snapshot(&confirmed, self.nodes.len()) == Some((leader_id, term))
+                {
+                    if let Some(leader) = confirmed
+                        .iter()
+                        .find(|diagnostic| diagnostic.node_id == leader_id)
+                        .cloned()
+                    {
+                        self.last_readiness = confirmed;
+                        return Ok(leader);
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(readiness_deadline(
+                    HarnessStage::LeaderObservation,
+                    &readiness_map(&last_readiness),
+                ));
+            }
+            thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn observe_stable_replacement_leader(
+        &mut self,
+        survivors: &[usize],
+        old_leader_id: u64,
+        old_term: u64,
+        timeout: Duration,
+    ) -> Result<ReadinessDiagnostic, HarnessError> {
+        let deadline = Instant::now() + timeout;
+        let mut last_readiness;
+        loop {
+            let observed = self.probe_readiness_round_for(
+                survivors,
+                HarnessStage::LeaderFailoverReadiness,
+                deadline,
+            )?;
+            last_readiness = observed.clone();
+            if let Some((leader_id, term)) = coherent_leader_snapshot(&observed, survivors.len()) {
+                if leader_id != old_leader_id && term > old_term {
+                    let confirmed = self.probe_readiness_round_for(
+                        survivors,
+                        HarnessStage::LeaderFailoverReadiness,
+                        deadline,
+                    )?;
+                    last_readiness = confirmed.clone();
+                    if coherent_leader_snapshot(&confirmed, survivors.len())
+                        == Some((leader_id, term))
+                    {
+                        if let Some(leader) = confirmed
+                            .iter()
+                            .find(|diagnostic| diagnostic.node_id == leader_id)
+                            .cloned()
+                        {
+                            self.last_readiness = confirmed;
+                            return Ok(leader);
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(readiness_deadline(
+                    HarnessStage::LeaderFailoverReadiness,
+                    &readiness_map(&last_readiness),
+                ));
+            }
+            thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
     fn stop_unclean(&mut self, node_index: usize) -> Result<(), HarnessError> {
+        self.stop_unclean_at(node_index, HarnessStage::StopFollower)
+    }
+
+    fn stop_unclean_at(
+        &mut self,
+        node_index: usize,
+        stage: HarnessStage,
+    ) -> Result<(), HarnessError> {
         self.nodes[node_index]
             .take()
-            .ok_or_else(|| {
-                stage_error(
-                    HarnessStage::StopFollower,
-                    Some(node_index),
-                    HarnessFailureKind::Disconnected,
-                )
-            })?
-            .kill_unclean(HarnessStage::StopFollower)
+            .ok_or_else(|| stage_error(stage, Some(node_index), HarnessFailureKind::Disconnected))?
+            .kill_unclean(stage)
     }
 
     fn restart(&mut self, node_index: usize) -> Result<(), HarnessError> {
+        self.restart_at(
+            node_index,
+            HarnessStage::RestartBind,
+            HarnessStage::RestartConfigure,
+            HarnessStage::RestartInitialize,
+            HarnessStage::RestartReadiness,
+        )
+    }
+
+    fn restart_leader(&mut self, node_index: usize) -> Result<(), HarnessError> {
+        self.restart_at(
+            node_index,
+            HarnessStage::LeaderRestartBind,
+            HarnessStage::LeaderRestartConfigure,
+            HarnessStage::LeaderRestartInitialize,
+            HarnessStage::LeaderRestartReadiness,
+        )
+    }
+
+    fn restart_at(
+        &mut self,
+        node_index: usize,
+        bind_stage: HarnessStage,
+        configure_stage: HarnessStage,
+        initialize_stage: HarnessStage,
+        readiness_stage: HarnessStage,
+    ) -> Result<(), HarnessError> {
         let bind_addr = self
             .configuration_manifest
             .as_ref()
             .and_then(|manifest| manifest.members.get(node_index))
             .map(|member| member.dial_addr)
             .ok_or(HarnessError::Evidence)?;
-        let actual_addr =
-            self.spawn_node_bound(node_index, bind_addr, HarnessStage::RestartBind)?;
+        let actual_addr = self.spawn_node_bound(node_index, bind_addr, bind_stage)?;
         if actual_addr != bind_addr {
             return Err(stage_error(
-                HarnessStage::RestartBind,
+                bind_stage,
                 Some(node_index),
                 HarnessFailureKind::Protocol,
             ));
         }
-        self.configure_one(node_index, HarnessStage::RestartConfigure)?;
-        self.initialize_one(node_index, HarnessStage::RestartInitialize)?;
+        self.configure_one(node_index, configure_stage)?;
+        self.initialize_one(node_index, initialize_stage)?;
         self.wait_ready(
             &(0..self.nodes.len()).collect::<Vec<_>>(),
-            HarnessStage::RestartReadiness,
+            readiness_stage,
             FLEET_READY_TIMEOUT,
         )
     }
@@ -2798,13 +3006,6 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
         write_private_json(&fault_schedule_path, &fault_schedule),
         HarnessStage::DigestEvidence,
     )?;
-    let fault_schedule_sha256 = at_stage(
-        aggregate_file_sha256(
-            FAULT_SCHEDULE_DIGEST_DOMAIN,
-            std::slice::from_ref(&fault_schedule_path),
-        ),
-        HarnessStage::DigestEvidence,
-    )?;
     let continuity_started = Instant::now();
     fleet.stop_unclean(fault_target_node_index)?;
     fleet.wait_ready(
@@ -2850,6 +3051,111 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
     )?;
     let restart_catchup_millis = at_stage(
         duration_millis(restart_started.elapsed()),
+        HarnessStage::ThresholdEvidence,
+    )?;
+
+    let observed_leader = fleet.observe_stable_leader(FLEET_READY_TIMEOUT)?;
+    let leader_target_node_index = observed_leader.node_index;
+    let leader_target_process = format!("node-{leader_target_node_index}");
+    let fault_schedule = json!({
+        "schema_version": "opc-session-ha-fault-schedule/v1",
+        "topology_members": member_count,
+        "faults": [
+            {
+                "sequence": 1,
+                "kind": "process_stop",
+                "target_process": fault_target_process.clone(),
+                "target_role": "follower",
+                "observed_node_id": observed_follower.node_id,
+                "observed_leader_id": observed_follower.leader_id,
+                "observed_term": observed_follower.term,
+                "bounded": true
+            },
+            {
+                "sequence": 2,
+                "kind": "process_restart",
+                "target_process": fault_target_process.clone(),
+                "target_role": "follower",
+                "observed_node_id": observed_follower.node_id,
+                "observed_leader_id": observed_follower.leader_id,
+                "observed_term": observed_follower.term,
+                "bounded": true
+            },
+            {
+                "sequence": 3,
+                "kind": "process_stop",
+                "target_process": leader_target_process.clone(),
+                "target_role": "leader",
+                "observed_node_id": observed_leader.node_id,
+                "observed_leader_id": observed_leader.leader_id,
+                "observed_term": observed_leader.term,
+                "bounded": true
+            },
+            {
+                "sequence": 4,
+                "kind": "process_restart",
+                "target_process": leader_target_process.clone(),
+                "target_role": "leader",
+                "observed_node_id": observed_leader.node_id,
+                "observed_leader_id": observed_leader.leader_id,
+                "observed_term": observed_leader.term,
+                "bounded": true
+            }
+        ]
+    });
+    at_stage(
+        write_private_json(&fault_schedule_path, &fault_schedule),
+        HarnessStage::DigestEvidence,
+    )?;
+    let fault_schedule_sha256 = at_stage(
+        aggregate_file_sha256(
+            FAULT_SCHEDULE_DIGEST_DOMAIN,
+            std::slice::from_ref(&fault_schedule_path),
+        ),
+        HarnessStage::DigestEvidence,
+    )?;
+
+    let leader_survivors = (0..member_count)
+        .filter(|node_index| *node_index != leader_target_node_index)
+        .collect::<Vec<_>>();
+    let leader_failover_started = Instant::now();
+    fleet.stop_unclean_at(leader_target_node_index, HarnessStage::StopLeader)?;
+    let replacement_leader = fleet.observe_stable_replacement_leader(
+        &leader_survivors,
+        observed_leader.node_id,
+        observed_leader.term,
+        Duration::from_millis(
+            profile
+                .provisional_test_thresholds
+                .max_leader_failover_millis,
+        ),
+    )?;
+    let leader_failover_millis = at_stage(
+        duration_millis(leader_failover_started.elapsed()),
+        HarnessStage::ThresholdEvidence,
+    )?;
+    let replacement_leader_process = format!("node-{}", replacement_leader.node_index);
+    at_stage(
+        assert_generation(
+            fleet.invoke(
+                replacement_leader.node_index,
+                &QualificationNodeCommand::Get {
+                    stable_id: "session-a".to_owned(),
+                },
+            )?,
+            3,
+        ),
+        HarnessStage::Operation,
+    )?;
+    let leader_outage_store_read_succeeded = true;
+
+    let leader_restart_started = Instant::now();
+    at_stage(
+        fleet.restart_leader(leader_target_node_index),
+        HarnessStage::ConfigurationEvidence,
+    )?;
+    let leader_restart_catchup_millis = at_stage(
+        duration_millis(leader_restart_started.elapsed()),
         HarnessStage::ThresholdEvidence,
     )?;
     at_stage(
@@ -3098,8 +3404,36 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
                 "observed_leader_id": observed_follower.leader_id,
                 "observed_term": observed_follower.term,
                 "bounded": true
+            },
+            {
+                "kind": "process_stop",
+                "target_process": leader_target_process.clone(),
+                "target_role": "leader",
+                "observed_node_id": observed_leader.node_id,
+                "observed_leader_id": observed_leader.leader_id,
+                "observed_term": observed_leader.term,
+                "bounded": true
+            },
+            {
+                "kind": "process_restart",
+                "target_process": leader_target_process.clone(),
+                "target_role": "leader",
+                "observed_node_id": observed_leader.node_id,
+                "observed_leader_id": observed_leader.leader_id,
+                "observed_term": observed_leader.term,
+                "bounded": true
             }
         ],
+        "leader_transition": {
+            "old_leader_process": leader_target_process,
+            "old_leader_node_id": observed_leader.node_id,
+            "old_term": observed_leader.term,
+            "new_leader_process": replacement_leader_process,
+            "new_leader_node_id": replacement_leader.node_id,
+            "new_term": replacement_leader.term,
+            "failover_millis": leader_failover_millis,
+            "old_leader_restart_catchup_millis": leader_restart_catchup_millis
+        },
         "history": {
             "schema_version": "opc-session-ha-history/v1",
             "schedule_schema_version": "opc-session-ha-schedule/v1",
@@ -3126,6 +3460,9 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
             "startup_millis": startup_millis,
             "single_member_stop_service_continuity_millis": single_member_stop_service_continuity_millis,
             "restart_catchup_millis": restart_catchup_millis,
+            "leader_failover_millis": leader_failover_millis,
+            "leader_restart_catchup_millis": leader_restart_catchup_millis,
+            "leader_outage_store_read_succeeded": leader_outage_store_read_succeeded,
             "acknowledged_write_loss": 0,
             "stale_owner_mutation_successes": 0,
             "history_checker_violations": 0
@@ -3142,6 +3479,7 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
             "real_tcp",
             "persistent_sqlite",
             "process_stop_restart",
+            "observed_leader_failover",
             topology_coverage
         ],
         "remaining_acceptance": [

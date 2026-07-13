@@ -224,7 +224,30 @@ fn validate_exact_evidence_fields(evidence: &Value) -> Result<(), String> {
                     .provisional_test_thresholds
                     .max_restart_catchup_millis
         });
-    if !(startup_within_bound && continuity_within_bound && catchup_within_bound) {
+    let leader_failover_within_bound =
+        results["leader_failover_millis"]
+            .as_u64()
+            .is_some_and(|value| {
+                value
+                    <= profile
+                        .provisional_test_thresholds
+                        .max_leader_failover_millis
+            });
+    let leader_restart_within_bound = results["leader_restart_catchup_millis"]
+        .as_u64()
+        .is_some_and(|value| {
+            value
+                <= profile
+                    .provisional_test_thresholds
+                    .max_leader_restart_catchup_millis
+        });
+    if !(startup_within_bound
+        && continuity_within_bound
+        && catchup_within_bound
+        && leader_failover_within_bound
+        && leader_restart_within_bound
+        && results["leader_outage_store_read_succeeded"] == true)
+    {
         return Err("execution result is missing or outside provisional bounds".to_owned());
     }
 
@@ -263,16 +286,60 @@ fn validate_exact_evidence_fields(evidence: &Value) -> Result<(), String> {
         .as_u64()
         .filter(|value| *value > 0)
         .ok_or_else(|| "fault observation term is invalid".to_owned())?;
-    if faults.len() != 2
-        || !faults.iter().all(|fault| {
+    let leader_fault = faults
+        .get(2)
+        .ok_or_else(|| "leader fault evidence missing".to_owned())?;
+    let leader_target = leader_fault["target_process"]
+        .as_str()
+        .filter(|target| target.starts_with("node-"))
+        .ok_or_else(|| "leader fault target is invalid".to_owned())?;
+    let old_leader_id = leader_fault["observed_node_id"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "leader fault node is invalid".to_owned())?;
+    let old_term = leader_fault["observed_term"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "leader fault term is invalid".to_owned())?;
+    if faults.len() != 4
+        || !faults[..2].iter().all(|fault| {
             fault["target_process"] == expected_target
                 && fault["target_role"] == "follower"
                 && fault["observed_node_id"].as_u64() == Some(expected_node_id)
                 && fault["observed_leader_id"].as_u64() == Some(expected_leader_id)
                 && fault["observed_term"].as_u64() == Some(expected_term)
         })
+        || !faults[2..].iter().all(|fault| {
+            fault["target_process"] == leader_target
+                && fault["target_role"] == "leader"
+                && fault["observed_node_id"].as_u64() == Some(old_leader_id)
+                && fault["observed_leader_id"].as_u64() == Some(old_leader_id)
+                && fault["observed_term"].as_u64() == Some(old_term)
+        })
     {
-        return Err("fault evidence does not identify an observed follower".to_owned());
+        return Err(
+            "fault evidence does not identify observed follower and leader roles".to_owned(),
+        );
+    }
+    let transition = &evidence["leader_transition"];
+    let new_leader_id = transition["new_leader_node_id"]
+        .as_u64()
+        .filter(|value| *value > 0 && *value != old_leader_id)
+        .ok_or_else(|| "replacement leader is invalid".to_owned())?;
+    let new_term = transition["new_term"]
+        .as_u64()
+        .filter(|value| *value > old_term)
+        .ok_or_else(|| "replacement leader term did not advance".to_owned())?;
+    if transition["old_leader_process"] != leader_target
+        || transition["old_leader_node_id"].as_u64() != Some(old_leader_id)
+        || transition["old_term"].as_u64() != Some(old_term)
+        || transition["new_leader_process"]
+            .as_str()
+            .is_none_or(|process| !process.starts_with("node-"))
+        || transition["new_leader_node_id"].as_u64() != Some(new_leader_id)
+        || transition["new_term"].as_u64() != Some(new_term)
+    {
+        return Err("leader transition does not match observed fault evidence".to_owned());
     }
     Ok(())
 }
@@ -355,6 +422,52 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
     assert_eq!(profile.workspace.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(profile.workspace.rust_msrv, "1.88");
     assert_eq!(profile.workspace.source_revision, "required-in-evidence");
+    assert_eq!(profile.source_build_gate.tracking_issue, 143);
+    assert_eq!(
+        profile.source_build_gate.openraft_git,
+        "https://github.com/openpacketcore/openraft"
+    );
+    assert_eq!(
+        profile.source_build_gate.openraft_rev,
+        "f607e636406b16bd0ad7925dbb631da1b7a4cd96"
+    );
+    assert_eq!(
+        profile.source_build_gate.affected_workspace_crates,
+        [
+            "opc-alarm",
+            "opc-alarm-k8s",
+            "opc-alarm-testkit",
+            "opc-alarm-yang",
+            "opc-amf-lite",
+            "opc-amf-lite-testkit",
+            "opc-config-bus",
+            "opc-consensus",
+            "opc-gnmi-server",
+            "opc-ipsec-lb",
+            "opc-mgmt-authz",
+            "opc-mgmt-transport",
+            "opc-netconf-server",
+            "opc-persist",
+            "opc-runtime",
+            "opc-sa-mirror",
+            "opc-sbi",
+            "opc-sdk",
+            "opc-sdk-integration",
+            "opc-session-cache",
+            "opc-session-net",
+            "opc-session-store",
+            "opc-session-testkit",
+            "operator-controller",
+            "operator-lifecycle",
+            "operator-lifecycle-cli"
+        ]
+    );
+    assert_eq!(profile.source_build_gate.crates_io_check_date, "2026-07-13");
+    assert!(profile.source_build_gate.crates_io_exact_matches.is_empty());
+    assert_eq!(
+        profile.source_build_gate.removal_condition,
+        "official stable Openraft release containing the fix, registry pin and checksum, and full issue #143 requalification"
+    );
 
     assert_eq!(profile.topology.member_counts, [3, 5]);
     assert_eq!(
@@ -455,6 +568,7 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
         BTreeSet::from([
             "openraft",
             "opc-consensus",
+            "opc-persist",
             "opc-session-net",
             "opc-session-store"
         ])
@@ -505,6 +619,18 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
             .max_restart_catchup_millis
             > 0
     );
+    assert!(
+        profile
+            .provisional_test_thresholds
+            .max_leader_failover_millis
+            > 0
+    );
+    assert!(
+        profile
+            .provisional_test_thresholds
+            .max_leader_restart_catchup_millis
+            > 0
+    );
     assert!(profile.provisional_test_thresholds.minimum_soak_seconds > 0);
     assert_eq!(
         profile.evidence.foundation_transport_mode,
@@ -529,15 +655,21 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
         .collect::<BTreeMap<_, _>>();
     let consensus = exact_artifacts["opc-consensus"];
     assert_eq!(consensus.version, "0.2.0");
-    assert!(consensus.publish);
+    assert!(!consensus.publish);
     assert!(consensus.required_features.is_empty());
     assert!(consensus.excluded_features.is_empty());
 
     let store = exact_artifacts["opc-session-store"];
     assert_eq!(store.version, "0.2.0");
-    assert!(store.publish);
+    assert!(!store.publish);
     assert!(store.required_features.is_empty());
     assert!(store.excluded_features.is_empty());
+
+    let persist = exact_artifacts["opc-persist"];
+    assert_eq!(persist.version, "0.2.0");
+    assert!(!persist.publish);
+    assert!(persist.required_features.is_empty());
+    assert!(persist.excluded_features.is_empty());
 
     let network = exact_artifacts["opc-session-net"];
     assert_eq!(network.version, "0.2.0");
@@ -550,7 +682,7 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
 
     let openraft = exact_artifacts["openraft"];
     assert_eq!(openraft.version, "0.9.24");
-    assert!(openraft.publish);
+    assert!(!openraft.publish);
     assert_eq!(
         openraft.required_features,
         ["serde", "single-term-leader", "storage-v2"]
@@ -573,13 +705,26 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
 }
 
 #[test]
-fn inventory_pins_workspace_msrv_publish_state_and_openraft_version() {
+fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let workspace = include_str!("../../../Cargo.toml");
     assert!(workspace.contains("rust-version = \"1.88\""));
-    let network_manifest = include_str!("../../opc-session-net/Cargo.toml");
-    assert!(network_manifest.contains("publish = false"));
+    assert!(workspace.contains("rev = \"f607e636406b16bd0ad7925dbb631da1b7a4cd96\""));
+    for manifest in [
+        include_str!("../../opc-alarm/Cargo.toml"),
+        include_str!("../../opc-consensus/Cargo.toml"),
+        include_str!("../../opc-persist/Cargo.toml"),
+        include_str!("../../opc-sdk/Cargo.toml"),
+        include_str!("../../opc-session-cache/Cargo.toml"),
+        include_str!("../../opc-session-store/Cargo.toml"),
+        include_str!("../../opc-session-net/Cargo.toml"),
+    ] {
+        assert!(manifest.contains("publish = false"));
+    }
     let lockfile = include_str!("../../../Cargo.lock");
     assert!(lockfile.contains("name = \"openraft\"\nversion = \"0.9.24\""));
+    assert!(lockfile.contains(
+        "source = \"git+https://github.com/openpacketcore/openraft?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96#f607e636406b16bd0ad7925dbb631da1b7a4cd96\""
+    ));
 }
 
 #[test]
@@ -587,7 +732,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repository = manifest.join("../..");
     let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+        .args(["metadata", "--format-version", "1", "--locked"])
         .current_dir(repository)
         .output()
         .expect("run locked Cargo metadata");
@@ -612,12 +757,119 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         .iter()
         .find(|dependency| dependency["name"] == "openraft")
         .expect("Openraft dependency");
-    assert_eq!(openraft["req"], "=0.9.24");
+    assert_eq!(openraft["req"], "*");
+    assert_eq!(
+        openraft["source"],
+        "git+https://github.com/openpacketcore/openraft?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96"
+    );
     assert_eq!(
         openraft["features"],
         serde_json::json!(["serde", "storage-v2", "single-term-leader"])
     );
     assert_eq!(openraft["uses_default_features"], true);
+    let resolved_openraft = package("openraft");
+    assert_eq!(resolved_openraft["version"], "0.9.24");
+    assert_eq!(
+        resolved_openraft["source"],
+        "git+https://github.com/openpacketcore/openraft?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96#f607e636406b16bd0ad7925dbb631da1b7a4cd96"
+    );
+    let fork_source = resolved_openraft["source"]
+        .as_str()
+        .expect("resolved Openraft source");
+    let fork_packages = packages
+        .iter()
+        .filter(|package| package["source"].as_str() == Some(fork_source))
+        .map(|package| {
+            (
+                package["name"].as_str().expect("fork package name"),
+                package["version"].as_str().expect("fork package version"),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fork_packages,
+        BTreeSet::from([("openraft", "0.9.24"), ("openraft-macros", "0.9.24")])
+    );
+
+    let source_build_only = BTreeSet::from([
+        "opc-alarm",
+        "opc-alarm-k8s",
+        "opc-alarm-testkit",
+        "opc-alarm-yang",
+        "opc-amf-lite",
+        "opc-amf-lite-testkit",
+        "opc-config-bus",
+        "opc-consensus",
+        "opc-gnmi-server",
+        "opc-ipsec-lb",
+        "opc-mgmt-authz",
+        "opc-mgmt-transport",
+        "opc-netconf-server",
+        "opc-persist",
+        "opc-runtime",
+        "opc-sa-mirror",
+        "opc-sbi",
+        "opc-sdk",
+        "opc-sdk-integration",
+        "opc-session-cache",
+        "opc-session-net",
+        "opc-session-store",
+        "opc-session-testkit",
+        "operator-controller",
+        "operator-lifecycle",
+        "operator-lifecycle-cli",
+    ]);
+    let mut computed_source_closure =
+        BTreeSet::from(["opc-consensus", "opc-persist", "opc-session-store"]);
+    loop {
+        let before = computed_source_closure.len();
+        for workspace_package in packages
+            .iter()
+            .filter(|package| package["source"].is_null())
+        {
+            let name = workspace_package["name"]
+                .as_str()
+                .expect("workspace package name");
+            if workspace_package["dependencies"]
+                .as_array()
+                .expect("workspace package dependencies")
+                .iter()
+                .any(|dependency| {
+                    dependency["kind"].is_null()
+                        && dependency["name"]
+                            .as_str()
+                            .is_some_and(|name| computed_source_closure.contains(name))
+                })
+            {
+                computed_source_closure.insert(name);
+            }
+        }
+        if computed_source_closure.len() == before {
+            break;
+        }
+    }
+    assert_eq!(computed_source_closure, source_build_only);
+    for name in &source_build_only {
+        assert_eq!(package(name)["publish"], serde_json::json!([]));
+    }
+    for publishable in packages
+        .iter()
+        .filter(|package| package["publish"].is_null())
+    {
+        let dependencies = publishable["dependencies"]
+            .as_array()
+            .expect("package dependencies");
+        assert!(
+            dependencies.iter().all(|dependency| {
+                dependency["kind"].as_str() == Some("dev")
+                    || dependency["name"]
+                        .as_str()
+                        .is_none_or(|name| !source_build_only.contains(name))
+            }),
+            "publishable package {} has a normal dependency on the source-build-only closure",
+            publishable["name"]
+        );
+    }
 
     let network = package("opc-session-net");
     assert_eq!(
