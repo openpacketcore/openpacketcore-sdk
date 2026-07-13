@@ -661,6 +661,17 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         StoreError::InvalidKey(_) => {
             IpsecLbError::invalid_config("session_store.key", "session-store key rejected")
         }
+        StoreError::CasIdempotencyConflict => IpsecLbError::invalid_config(
+            "session_store.idempotency",
+            "session-store mutation identity was reused",
+        ),
+        StoreError::CasIdempotencyOutcomeUnavailable => IpsecLbError::io(
+            "session_store_compare_and_set",
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "session-store mutation outcome is unavailable",
+            ),
+        ),
         StoreError::InvalidReplicationSequence => IpsecLbError::invalid_config(
             "session_store.replication",
             "session-store replication metadata rejected",

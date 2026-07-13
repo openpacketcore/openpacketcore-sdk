@@ -177,7 +177,7 @@ backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile pins wire-schema revision 3, error-set revision 2, a 4 MiB restore
+profile pins wire-schema revision 4, error-set revision 3, a 4 MiB restore
 payload bound, 8 MiB retained-page and examined key/filter-metadata bounds,
 `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the

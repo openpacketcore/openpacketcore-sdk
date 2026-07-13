@@ -125,7 +125,7 @@ evidence.
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 3, error-set revision 2,
+  Its profile pins wire-schema revision 4, error-set revision 3,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -138,8 +138,8 @@ evidence.
   Revision 2 added exact directional frame negotiation. Revision 3 replaces
   revision 2's inspectable cursor fields with the confidential authenticated
   token, adds the page cursor profile, and pins the 4 MiB payload plus 4,096
-  examined-candidate bounds; error-set revision 2 carries typed stale-cursor
-  and work-budget outcomes.
+  examined-candidate bounds; error-set revision 3 carries typed stale-cursor,
+  work-budget, and direct-CAS idempotency outcomes.
   Hello requests the
   client's response limit, while HelloAck reports the accepted response limit
   and server request limit;
@@ -149,6 +149,17 @@ evidence.
   Version/profile/authentication or malformed-handshake failure reports every
   capability boolean false with `max_value_bytes = 0`; cached capabilities are
   descriptive and never substitute for fresh quorum evidence.
+- Direct CAS on the quarantined compatibility transport binds a canonical UUID
+  to the authenticated logical peer, complete operation, cluster/configuration
+  identity and epoch, and the server's process-scoped retry epoch. Exact
+  success and conflict outcomes replay through a bounded single-flight cache.
+  Reuse with another peer or operation is `CasIdempotencyConflict`; restart,
+  retention rotation, pressure, or cancellation is
+  `CasIdempotencyOutcomeUnavailable` before any retry mutation. The public
+  remote backend never automatically resubmits an ambiguous CAS. Callers must
+  re-read authoritative state and derive a new mutation. This compatibility
+  cache is not a second durable authority and does not replace Openraft's
+  atomically persisted production command outcomes.
 - The exact `opc-session-net/4` ALPN, version, and contract profile have no v3
   fallback or downgrade negotiation. Public session-net `Request`/`Response`
   remain, but `Hello`/`HelloAck` gain an optional `contract_profile`, so

@@ -363,6 +363,7 @@ where
             expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_string()),
             cluster_id: Some(binding.cluster_id().as_str().to_string()),
             configuration_id: Some(configuration_id.clone()),
+            configuration_epoch: Some(binding.configuration_epoch().get()),
             handshake_nonce: Some(handshake_nonce),
             contract_profile: Some(CURRENT_CONTRACT_PROFILE),
             requested_response_frame_size: Some(requested_response_frame_size),
@@ -389,7 +390,8 @@ where
                 && ack.accepted_client_replica_id.as_deref()
                     == Some(binding.local_replica_id().as_str())
                 && ack.cluster_id.as_deref() == Some(binding.cluster_id().as_str())
-                && ack.configuration_id.as_deref() == Some(configuration_id.as_str());
+                && ack.configuration_id.as_deref() == Some(configuration_id.as_str())
+                && ack.configuration_epoch == Some(binding.configuration_epoch().get());
             if !identity_matches {
                 return Err(ProtocolError::Authentication);
             }
@@ -958,14 +960,23 @@ impl SessionBackend for RemoteSessionBackend {
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
         let expected_key = op.key.clone();
-        match self
+        let response = self
             .send_mutation_once(Request::CompareAndSet {
                 op,
                 request_id: Some(uuid::Uuid::new_v4().to_string()),
                 idempotency_epoch: None,
             })
-            .await?
-        {
+            .await?;
+        if matches!(
+            response,
+            Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable))
+        ) {
+            // The server rotated or lost the bounded retry epoch. Drop this
+            // connection so a separately derived future CAS must complete a
+            // new authenticated handshake and cannot carry the stale epoch.
+            self.conn.lock().await.take();
+        }
+        match response {
             Response::CompareAndSet(res)
                 if compare_and_set_result_matches_key(&expected_key, &res) =>
             {
@@ -1493,6 +1504,7 @@ mod tests {
             expected_server_replica_id,
             cluster_id,
             configuration_id,
+            configuration_epoch,
             handshake_nonce,
             ..
         } = hello
@@ -1506,6 +1518,7 @@ mod tests {
             accepted_client_replica_id: Some(node_id.clone()),
             cluster_id: cluster_id.clone(),
             configuration_id: configuration_id.clone(),
+            configuration_epoch: *configuration_epoch,
             handshake_nonce: *handshake_nonce,
             cas_idempotency_epoch: Some(uuid::Uuid::from_u128(1)),
             accepted_response_frame_size: Some(accepted_response_frame_size),
@@ -1718,6 +1731,7 @@ mod tests {
                     accepted_client_replica_id: None,
                     cluster_id: None,
                     configuration_id: None,
+                    configuration_epoch: None,
                     handshake_nonce: None,
                     cas_idempotency_epoch: None,
                     accepted_response_frame_size: None,

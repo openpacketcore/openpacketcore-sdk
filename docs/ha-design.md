@@ -389,7 +389,8 @@ client/server-minimum `accepted_response_frame_size` plus the independent
 client/server settings are therefore explicit. Revision 3 carries the
 confidential cursor and explicit durable-page profile and pins the payload and
 8 MiB retained-page, 8 MiB examined key/filter-metadata, and
-examined-candidate budgets; error-set revision 2 carries stale-cursor and
+examined-candidate budgets; error-set revision 3 carries stale-cursor,
+direct-CAS idempotency, and
 work-budget failures. Different exact v4
 profiles do not interoperate even though their ALPN text is the same.
 
@@ -410,7 +411,7 @@ response budget, a confidential authenticated strictly bounded restore cursor, a
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 3, error-set revision 2, a 4 MiB restore
+profile pins wire-schema revision 4, error-set revision 3, a 4 MiB restore
 payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, the
 31,536,000-second TTL maximum, and

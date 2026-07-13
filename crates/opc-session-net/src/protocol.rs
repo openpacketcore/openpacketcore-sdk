@@ -114,7 +114,7 @@ pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractPr
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
 
-const WIRE_SCHEMA_REVISION: u16 = 3;
+const WIRE_SCHEMA_REVISION: u16 = 4;
 const ERROR_SET_REVISION: u16 = 3;
 
 /// Exact semantic and resource-bound contract required by protocol v4.
@@ -314,6 +314,8 @@ pub struct BootstrapHello {
     pub cluster_id: Option<String>,
     #[serde(default)]
     pub configuration_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_epoch: Option<u64>,
     #[serde(default)]
     pub handshake_nonce: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -336,6 +338,8 @@ pub struct BootstrapHelloAck {
     pub cluster_id: Option<String>,
     #[serde(default)]
     pub configuration_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_epoch: Option<u64>,
     #[serde(default)]
     pub handshake_nonce: Option<uuid::Uuid>,
     /// Process-scoped server epoch that fences bounded direct-CAS retries.
@@ -359,6 +363,8 @@ struct BootstrapHelloAckRef<'a> {
     accepted_client_replica_id: Option<&'a str>,
     cluster_id: Option<&'a str>,
     configuration_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    configuration_epoch: Option<u64>,
     handshake_nonce: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cas_idempotency_epoch: Option<uuid::Uuid>,
@@ -502,6 +508,7 @@ pub enum Request {
         expected_server_replica_id: Option<String>,
         cluster_id: Option<String>,
         configuration_id: Option<String>,
+        configuration_epoch: Option<u64>,
         handshake_nonce: Option<uuid::Uuid>,
         contract_profile: Option<ContractProfile>,
         requested_response_frame_size: Option<u32>,
@@ -567,6 +574,7 @@ pub enum Response {
         accepted_client_replica_id: Option<String>,
         cluster_id: Option<String>,
         configuration_id: Option<String>,
+        configuration_epoch: Option<u64>,
         handshake_nonce: Option<uuid::Uuid>,
         cas_idempotency_epoch: Option<uuid::Uuid>,
         contract_profile: Option<ContractProfile>,
@@ -2236,6 +2244,7 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
                 expected_server_replica_id,
                 cluster_id,
                 configuration_id,
+                configuration_epoch,
                 handshake_nonce,
                 contract_profile,
                 requested_response_frame_size,
@@ -2245,6 +2254,7 @@ impl<'a> TryFrom<&'a Request> for WireRequestRef<'a> {
                 expected_server_replica_id: expected_server_replica_id.clone(),
                 cluster_id: cluster_id.clone(),
                 configuration_id: configuration_id.clone(),
+                configuration_epoch: *configuration_epoch,
                 handshake_nonce: *handshake_nonce,
                 contract_profile: *contract_profile,
                 requested_response_frame_size: *requested_response_frame_size,
@@ -2337,6 +2347,7 @@ impl TryFrom<WireRequest> for InboundRequest {
                 expected_server_replica_id: hello.expected_server_replica_id,
                 cluster_id: hello.cluster_id,
                 configuration_id: hello.configuration_id,
+                configuration_epoch: hello.configuration_epoch,
                 handshake_nonce: hello.handshake_nonce,
                 contract_profile: hello.contract_profile,
                 requested_response_frame_size: hello.requested_response_frame_size,
@@ -2461,6 +2472,7 @@ impl TryFrom<&Request> for BootstrapRequest {
                 expected_server_replica_id,
                 cluster_id,
                 configuration_id,
+                configuration_epoch,
                 handshake_nonce,
                 contract_profile,
                 requested_response_frame_size,
@@ -2470,6 +2482,7 @@ impl TryFrom<&Request> for BootstrapRequest {
                 expected_server_replica_id: expected_server_replica_id.clone(),
                 cluster_id: cluster_id.clone(),
                 configuration_id: configuration_id.clone(),
+                configuration_epoch: *configuration_epoch,
                 handshake_nonce: *handshake_nonce,
                 contract_profile: *contract_profile,
                 requested_response_frame_size: *requested_response_frame_size,
@@ -2488,6 +2501,7 @@ impl From<BootstrapRequest> for Request {
                 expected_server_replica_id: hello.expected_server_replica_id,
                 cluster_id: hello.cluster_id,
                 configuration_id: hello.configuration_id,
+                configuration_epoch: hello.configuration_epoch,
                 handshake_nonce: hello.handshake_nonce,
                 contract_profile: hello.contract_profile,
                 requested_response_frame_size: hello.requested_response_frame_size,
@@ -2687,6 +2701,7 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
                 accepted_client_replica_id,
                 cluster_id,
                 configuration_id,
+                configuration_epoch,
                 handshake_nonce,
                 cas_idempotency_epoch,
                 contract_profile,
@@ -2698,6 +2713,7 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
                 accepted_client_replica_id: accepted_client_replica_id.as_deref(),
                 cluster_id: cluster_id.as_deref(),
                 configuration_id: configuration_id.as_deref(),
+                configuration_epoch: *configuration_epoch,
                 handshake_nonce: *handshake_nonce,
                 cas_idempotency_epoch: *cas_idempotency_epoch,
                 contract_profile: *contract_profile,
@@ -2794,6 +2810,7 @@ impl TryFrom<WireResponse> for Response {
                 accepted_client_replica_id: hello.accepted_client_replica_id,
                 cluster_id: hello.cluster_id,
                 configuration_id: hello.configuration_id,
+                configuration_epoch: hello.configuration_epoch,
                 handshake_nonce: hello.handshake_nonce,
                 cas_idempotency_epoch: hello.cas_idempotency_epoch,
                 contract_profile: hello.contract_profile,
@@ -2894,6 +2911,7 @@ impl TryFrom<&Response> for BootstrapResponse {
                 accepted_client_replica_id,
                 cluster_id,
                 configuration_id,
+                configuration_epoch,
                 handshake_nonce,
                 cas_idempotency_epoch,
                 contract_profile,
@@ -2905,6 +2923,7 @@ impl TryFrom<&Response> for BootstrapResponse {
                 accepted_client_replica_id: accepted_client_replica_id.clone(),
                 cluster_id: cluster_id.clone(),
                 configuration_id: configuration_id.clone(),
+                configuration_epoch: *configuration_epoch,
                 handshake_nonce: *handshake_nonce,
                 cas_idempotency_epoch: *cas_idempotency_epoch,
                 contract_profile: *contract_profile,
@@ -2930,6 +2949,7 @@ impl From<BootstrapResponse> for Response {
                     accepted_client_replica_id: hello.accepted_client_replica_id,
                     cluster_id: hello.cluster_id,
                     configuration_id: hello.configuration_id,
+                    configuration_epoch: hello.configuration_epoch,
                     handshake_nonce: hello.handshake_nonce,
                     cas_idempotency_epoch: hello.cas_idempotency_epoch,
                     contract_profile: hello.contract_profile,
@@ -3827,6 +3847,7 @@ mod tests {
     fn contract_profile_and_bootstrap_frames_are_exact_and_version_tolerant() {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/4");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
+        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 4);
         assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 3);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
@@ -3835,7 +3856,7 @@ mod tests {
         assert_eq!(
             profile,
             serde_json::json!({
-                "wire_schema_revision": 3,
+                "wire_schema_revision": 4,
                 "error_set_revision": 3,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 4194304,
@@ -3895,6 +3916,7 @@ mod tests {
             accepted_client_replica_id: Some("replica-a".to_string()),
             cluster_id: Some("cluster-a".to_string()),
             configuration_id: Some("00".repeat(32)),
+            configuration_epoch: Some(1),
             handshake_nonce: Some(uuid::Uuid::nil()),
             cas_idempotency_epoch: Some(uuid::Uuid::from_u128(1)),
             contract_profile: Some(CURRENT_CONTRACT_PROFILE),

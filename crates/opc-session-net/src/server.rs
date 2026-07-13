@@ -736,7 +736,7 @@ enum CasIdempotencyState {
         outcome: watch::Sender<Option<CasOutcome>>,
     },
     Complete {
-        outcome: CasOutcome,
+        outcome: Box<CasOutcome>,
         completed_at: Instant,
     },
     Ambiguous {
@@ -810,7 +810,7 @@ impl CasIdempotencyCache {
                     CasIdempotencyAdmission::Wait(outcome.subscribe())
                 }
                 CasIdempotencyState::Complete { outcome, .. } => {
-                    CasIdempotencyAdmission::Replay(outcome.clone())
+                    CasIdempotencyAdmission::Replay(outcome.as_ref().clone())
                 }
                 CasIdempotencyState::Ambiguous { .. } => {
                     CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
@@ -818,9 +818,7 @@ impl CasIdempotencyCache {
             };
         }
 
-        let retained_bytes = CAS_IDEMPOTENCY_ENTRY_OVERHEAD
-            .checked_add(peer.as_str().len())
-            .unwrap_or(usize::MAX);
+        let retained_bytes = CAS_IDEMPOTENCY_ENTRY_OVERHEAD.saturating_add(peer.as_str().len());
         let usage = cache_guard
             .peer_usage
             .get(peer)
@@ -1007,7 +1005,7 @@ impl CasExecutionPermit {
             CasIdempotencyState::InFlight { outcome } => Some(outcome.clone()),
             CasIdempotencyState::Complete { .. } | CasIdempotencyState::Ambiguous { .. } => None,
         };
-        let new_bytes = old_bytes.checked_add(encoded_bytes).unwrap_or(usize::MAX);
+        let new_bytes = old_bytes.saturating_add(encoded_bytes);
         if !cache.resize_entry(&peer, old_bytes, new_bytes) {
             cache.mark_ambiguous(self.request_id, now);
             self.completed = true;
@@ -1016,7 +1014,7 @@ impl CasExecutionPermit {
         if let Some(entry) = cache.entries.get_mut(&self.request_id) {
             entry.retained_bytes = new_bytes;
             entry.state = CasIdempotencyState::Complete {
-                outcome: outcome.clone(),
+                outcome: Box::new(outcome.clone()),
                 completed_at: now,
             };
         }
@@ -1057,9 +1055,13 @@ fn cas_operation_digest(
 ) -> Result<[u8; 32], StoreError> {
     let operation = serde_json::to_vec(operation)
         .map_err(|_| StoreError::Serialization("CAS idempotency encoding failed".into()))?;
+    let contract = serde_json::to_vec(&CURRENT_CONTRACT_PROFILE)
+        .map_err(|_| StoreError::Serialization("CAS contract encoding failed".into()))?;
     let mut hasher = Sha256::new();
     hasher.update(CAS_OPERATION_DIGEST_DOMAIN);
     hash_cas_field(&mut hasher, binding.cluster_id().as_str().as_bytes())?;
+    hash_cas_field(&mut hasher, &CONTRACT_VERSION.to_be_bytes())?;
+    hash_cas_field(&mut hasher, &contract)?;
     hash_cas_field(&mut hasher, binding.configuration_id().as_bytes())?;
     hash_cas_field(
         &mut hasher,
@@ -1425,6 +1427,7 @@ where
         expected_server_replica_id,
         cluster_id,
         configuration_id,
+        configuration_epoch,
         handshake_nonce,
         contract_profile,
         requested_response_frame_size,
@@ -1433,6 +1436,7 @@ where
     if contract_version != CONTRACT_VERSION {
         write_bootstrap_ack(
             writer,
+            None,
             None,
             None,
             None,
@@ -1453,6 +1457,7 @@ where
     if contract_profile != Some(CURRENT_CONTRACT_PROFILE) {
         write_bootstrap_ack(
             writer,
+            None,
             None,
             None,
             None,
@@ -1520,6 +1525,15 @@ where
         )
         .await;
     };
+    let Some(configuration_epoch) = configuration_epoch else {
+        return reject_hello(
+            writer,
+            HelloRejectReason::Malformed,
+            idle_timeout,
+            &cancellation,
+        )
+        .await;
+    };
     let Some(handshake_nonce) = handshake_nonce else {
         return reject_hello(
             writer,
@@ -1575,7 +1589,8 @@ where
     };
     let scope_matches = expected_server_replica_id == *binding.local_replica_id()
         && cluster_id == binding.cluster_id().as_str()
-        && configuration_id == binding.configuration_id().to_hex();
+        && configuration_id == binding.configuration_id().to_hex()
+        && configuration_epoch == binding.configuration_epoch().get();
     if !authenticated_client_matches || !scope_matches {
         return reject_hello(
             writer,
@@ -1596,6 +1611,7 @@ where
         Some(client_replica_id.as_str().to_string()),
         Some(binding.cluster_id().as_str().to_string()),
         Some(binding.configuration_id().to_hex()),
+        Some(binding.configuration_epoch().get()),
         Some(handshake_nonce),
         Some(cas_idempotency_epoch),
         Some(accepted_response_frame_size),
@@ -2260,6 +2276,7 @@ async fn write_bootstrap_ack<W>(
     accepted_client_replica_id: Option<String>,
     cluster_id: Option<String>,
     configuration_id: Option<String>,
+    configuration_epoch: Option<u64>,
     handshake_nonce: Option<uuid::Uuid>,
     cas_idempotency_epoch: Option<uuid::Uuid>,
     accepted_response_frame_size: Option<u32>,
@@ -2279,6 +2296,7 @@ where
             accepted_client_replica_id,
             cluster_id,
             configuration_id,
+            configuration_epoch,
             handshake_nonce,
             cas_idempotency_epoch,
             contract_profile: Some(CURRENT_CONTRACT_PROFILE),
@@ -2485,6 +2503,160 @@ mod tests {
         assert!(matches!(
             CasIdempotencyCache::begin(&cache, &peer, first, epoch, [8; 32], Instant::now()),
             CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyConflict)
+        ));
+
+        let other_peer = ReplicaId::new("replica-b").expect("other peer");
+        assert!(matches!(
+            CasIdempotencyCache::begin(&cache, &other_peer, first, epoch, digest, Instant::now()),
+            CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_cas_duplicates_share_one_exact_conflict() {
+        let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let peer = ReplicaId::new("replica-a").expect("peer");
+        let request_id = uuid::Uuid::from_u128(41);
+        let epoch = cache.lock().expect("cache").epoch();
+        let digest = [9; 32];
+        let CasIdempotencyAdmission::Execute(permit) =
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now())
+        else {
+            panic!("first duplicate must execute");
+        };
+        let CasIdempotencyAdmission::Wait(waiter) =
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now())
+        else {
+            panic!("concurrent duplicate must wait");
+        };
+
+        let conflict = Ok(CompareAndSetResult::Conflict { current: None });
+        permit.complete(conflict.clone());
+        assert_eq!(wait_for_cas_outcome(waiter).await, conflict);
+        assert!(matches!(
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now()),
+            CasIdempotencyAdmission::Replay(Ok(CompareAndSetResult::Conflict { current: None }))
+        ));
+    }
+
+    #[test]
+    fn cancelled_cas_is_retained_as_ambiguous() {
+        let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let peer = ReplicaId::new("replica-a").expect("peer");
+        let request_id = uuid::Uuid::from_u128(42);
+        let epoch = cache.lock().expect("cache").epoch();
+        let digest = [10; 32];
+        let CasIdempotencyAdmission::Execute(permit) =
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now())
+        else {
+            panic!("first request must execute");
+        };
+        drop(permit);
+
+        assert!(matches!(
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now()),
+            CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+    }
+
+    #[test]
+    fn restart_and_retention_rotate_the_cas_epoch_before_reuse() {
+        let peer = ReplicaId::new("replica-a").expect("peer");
+        let request_id = uuid::Uuid::from_u128(43);
+        let digest = [11; 32];
+        let old_cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let old_epoch = old_cache.lock().expect("cache").epoch();
+        let CasIdempotencyAdmission::Execute(permit) = CasIdempotencyCache::begin(
+            &old_cache,
+            &peer,
+            request_id,
+            old_epoch,
+            digest,
+            Instant::now(),
+        ) else {
+            panic!("first request must execute");
+        };
+        permit.complete(Ok(CompareAndSetResult::Success));
+
+        let restarted = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let restarted_epoch = restarted.lock().expect("cache").epoch();
+        assert_ne!(old_epoch, restarted_epoch);
+        assert!(matches!(
+            CasIdempotencyCache::begin(
+                &restarted,
+                &peer,
+                request_id,
+                old_epoch,
+                digest,
+                Instant::now()
+            ),
+            CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+
+        let now = Instant::now();
+        {
+            let mut cache = old_cache.lock().expect("cache");
+            let entry = cache.entries.get_mut(&request_id).expect("entry");
+            entry.state = CasIdempotencyState::Complete {
+                outcome: Box::new(Ok(CompareAndSetResult::Success)),
+                completed_at: now - CAS_IDEMPOTENCY_RESULT_RETENTION,
+            };
+            cache.cleanup(now);
+            assert!(matches!(
+                cache.entries.get(&request_id).map(|entry| &entry.state),
+                Some(CasIdempotencyState::Ambiguous { .. })
+            ));
+            let entry = cache.entries.get_mut(&request_id).expect("tombstone");
+            entry.state = CasIdempotencyState::Ambiguous {
+                since: now - CAS_IDEMPOTENCY_TOMBSTONE_RETENTION,
+            };
+            cache.cleanup(now);
+            assert_ne!(cache.epoch(), old_epoch);
+            assert!(cache.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn one_peer_cannot_consume_another_peers_cas_share() {
+        let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let noisy_peer = ReplicaId::new("replica-noisy").expect("noisy peer");
+        let other_peer = ReplicaId::new("replica-other").expect("other peer");
+        let epoch = cache.lock().expect("cache").epoch();
+        for index in 0..CAS_IDEMPOTENCY_CACHE_PER_PEER_CAPACITY {
+            let request_id = uuid::Uuid::from_u128((index + 1) as u128);
+            let CasIdempotencyAdmission::Execute(permit) = CasIdempotencyCache::begin(
+                &cache,
+                &noisy_peer,
+                request_id,
+                epoch,
+                [12; 32],
+                Instant::now(),
+            ) else {
+                panic!("request inside per-peer share must execute");
+            };
+            permit.complete(Ok(CompareAndSetResult::Success));
+        }
+        assert!(matches!(
+            CasIdempotencyCache::begin(
+                &cache,
+                &noisy_peer,
+                uuid::Uuid::from_u128(u128::MAX),
+                epoch,
+                [12; 32],
+                Instant::now()
+            ),
+            CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+        assert!(matches!(
+            CasIdempotencyCache::begin(
+                &cache,
+                &other_peer,
+                uuid::Uuid::from_u128(u128::MAX - 1),
+                epoch,
+                [13; 32],
+                Instant::now()
+            ),
+            CasIdempotencyAdmission::Execute(_)
         ));
     }
 
