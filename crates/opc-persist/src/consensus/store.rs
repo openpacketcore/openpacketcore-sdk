@@ -371,23 +371,38 @@ impl ConsensusConfigStore {
     }
 
     /// Initialize a pristine cluster or re-admit an already initialized node.
+    ///
+    /// Every member may call this concurrently. On clean first formation only
+    /// the canonical lowest node asks Openraft to initialize; other pristine
+    /// members wait for that exact membership to replicate. Restarted members
+    /// with durable Openraft state skip bootstrap and re-admit normally. Clean
+    /// first formation fails closed if the canonical member is absent.
     pub async fn initialize_cluster(&self) -> Result<(), ConfigConsensusOpenError> {
         self.inner.admitted.store(false, Ordering::Release);
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
-        let initialize = tokio::time::timeout_at(
-            deadline,
-            self.inner.raft.initialize(self.inner.members.clone()),
-        )
-        .await
-        .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?;
-        match initialize {
-            Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
-            Err(RaftError::APIError(InitializeError::NotInMembers(_))) => {
-                return Err(ConfigConsensusOpenError::ClusterFormationRejected)
+        let initialized = tokio::time::timeout_at(deadline, self.inner.raft.is_initialized())
+            .await
+            .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?
+            .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
+        let canonical_bootstrap = self.inner.members.first().copied();
+        if !initialized && canonical_bootstrap == Some(self.inner.local_node_id) {
+            let initialize = tokio::time::timeout_at(
+                deadline,
+                self.inner.raft.initialize(self.inner.members.clone()),
+            )
+            .await
+            .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?;
+            match initialize {
+                Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
+                Err(RaftError::APIError(InitializeError::NotInMembers(_))) => {
+                    return Err(ConfigConsensusOpenError::ClusterFormationRejected)
+                }
+                Err(RaftError::Fatal(_)) => {
+                    return Err(ConfigConsensusOpenError::EngineUnavailable)
+                }
             }
-            Err(RaftError::Fatal(_)) => return Err(ConfigConsensusOpenError::EngineUnavailable),
         }
         self.wait_for_admissible_membership(deadline).await?;
         self.verify_fleet_compatibility(deadline).await?;

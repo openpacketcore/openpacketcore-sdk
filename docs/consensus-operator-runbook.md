@@ -70,9 +70,13 @@ For each node:
 2. Install `ConsensusConfigStore::rpc_handler()` on the authenticated shared
    consensus listener before cluster initialization.
 3. Make all configured peer routes reachable.
-4. Call `initialize_cluster()` on the nodes. Concurrent calls are supported;
-   Openraft performs the one admissible initialization and existing members
-   re-admit the persisted configuration.
+4. Call `initialize_cluster()` on every node. Concurrent calls are supported.
+   On clean first formation only the canonical lowest stable node ID invokes
+   Openraft initialization; other pristine nodes wait for its exact membership
+   to replicate. Nodes reopening persisted Openraft state skip bootstrap and
+   re-admit normally, including a noncanonical persistent majority. Clean
+   first formation fails closed if the canonical node is absent; do not
+   designate a substitute initializer under the same topology epoch.
 5. Keep the node out of traffic readiness until
    `probe_durable_readiness()` succeeds.
 

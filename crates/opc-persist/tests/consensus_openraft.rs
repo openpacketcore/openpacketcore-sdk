@@ -1174,6 +1174,30 @@ async fn legacy_recovery_rejects_symlinked_source_without_claiming_target() {
 }
 
 #[tokio::test]
+async fn pristine_noncanonical_node_waits_and_fails_closed_without_bootstrap_authority() {
+    let cluster = ThreeNodeCluster::build([[0x55; 32]; 3]).await;
+    let error = cluster.stores[1]
+        .initialize_cluster()
+        .await
+        .expect_err("noncanonical pristine node cannot bootstrap alone");
+    assert_eq!(
+        opc_persist::ConfigConsensusOpenError::ClusterFormationRejected,
+        error
+    );
+
+    let (one, two, three) = tokio::join!(
+        cluster.stores[0].initialize_cluster(),
+        cluster.stores[1].initialize_cluster(),
+        cluster.stores[2].initialize_cluster(),
+    );
+    one.expect("initialize canonical node");
+    two.expect("admit second node");
+    three.expect("admit third node");
+    cluster.wait_ready().await;
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
 async fn fresh_fleet_rejects_mismatched_audit_key_compatibility() {
     let cluster = ThreeNodeCluster::build([[0x55; 32], [0x55; 32], [0x56; 32]]).await;
     let (one, two, three) = tokio::join!(
