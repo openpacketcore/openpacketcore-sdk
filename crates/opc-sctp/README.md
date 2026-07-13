@@ -42,6 +42,34 @@ async fn send_ngap(remote: std::net::SocketAddr, payload: Bytes) -> Result<(), S
 }
 ```
 
+Diameter framing can be applied directly to an explicit, validated connect
+configuration. This keeps the SDK's PPID and notification handling while
+allowing the caller to supply the complete static-multihoming address sets:
+
+```rust,no_run
+use bytes::Bytes;
+use opc_sctp::{
+    DiameterSctpAssociation, DiameterSctpError, DiameterSctpSecurity,
+    SctpConnectConfig,
+};
+
+async fn send_diameter(
+    primary_remote: std::net::SocketAddr,
+    additional_remotes: Vec<std::net::SocketAddr>,
+    payload: Bytes,
+) -> Result<(), DiameterSctpError> {
+    let mut config = SctpConnectConfig::new(primary_remote);
+    config.remote_addrs.extend(additional_remotes);
+    let association = DiameterSctpAssociation::connect_with_config(
+        config,
+        DiameterSctpSecurity::ClearText,
+    )
+    .await?;
+    association.send_diameter_payload(payload).await?;
+    Ok(())
+}
+```
+
 ## Relationships
 
 - `opc-libsctp-sys` owns the raw Linux SCTP socket boundary.
@@ -57,6 +85,10 @@ async fn send_ngap(remote: std::net::SocketAddr, payload: Bytes) -> Result<(), S
 - Static multihoming binds every configured local address and connects with the
   complete remote address set on Linux. Address sets are bounded and must use
   one family and port; exactly one address preserves the original syscall path.
+- `DiameterSctpAssociation::connect_with_config` applies the existing Diameter
+  framing to that complete connect configuration. Unsupported kernel or
+  namespace multihoming remains a typed capability error; no address is
+  silently discarded.
 - `capabilities()` advertises build support, kernel policy failures are a typed
   `CapabilityUnavailable` error, and `local_addresses()`/`peer_addresses()`
   expose the kernel-active set. Consumers may therefore choose an explicit
