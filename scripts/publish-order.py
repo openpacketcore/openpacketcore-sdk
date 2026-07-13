@@ -93,8 +93,14 @@ def main() -> int:
         for dependency in packages["opc-consensus"]["dependencies"]
     }
     openraft = consensus_dependencies.get("openraft")
-    if openraft is None or openraft.get("source") != OPENRAFT_GIT_SOURCE:
-        errors.append("opc-consensus: Openraft is not pinned to the approved full git rev")
+    if (
+        openraft is None
+        or openraft.get("source") != OPENRAFT_GIT_SOURCE
+        or openraft.get("req") != "=0.9.24"
+    ):
+        errors.append(
+            "opc-consensus: Openraft is not pinned to the approved version and full git rev"
+        )
     resolved_fork_source = (
         f"{OPENRAFT_GIT_SOURCE}#f607e636406b16bd0ad7925dbb631da1b7a4cd96"
     )

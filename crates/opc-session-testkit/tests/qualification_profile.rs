@@ -708,7 +708,9 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
 fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let workspace = include_str!("../../../Cargo.toml");
     assert!(workspace.contains("rust-version = \"1.88\""));
-    assert!(workspace.contains("rev = \"f607e636406b16bd0ad7925dbb631da1b7a4cd96\""));
+    assert!(workspace.contains(
+        "openraft = { version = \"=0.9.24\", git = \"https://github.com/openpacketcore/openraft\", rev = \"f607e636406b16bd0ad7925dbb631da1b7a4cd96\""
+    ));
     for manifest in [
         include_str!("../../opc-alarm/Cargo.toml"),
         include_str!("../../opc-consensus/Cargo.toml"),
@@ -757,7 +759,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         .iter()
         .find(|dependency| dependency["name"] == "openraft")
         .expect("Openraft dependency");
-    assert_eq!(openraft["req"], "*");
+    assert_eq!(openraft["req"], "=0.9.24");
     assert_eq!(
         openraft["source"],
         "git+https://github.com/openpacketcore/openraft?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96"
