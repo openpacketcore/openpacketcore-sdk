@@ -228,6 +228,9 @@ the live epoch internally and sends a direct CAS only once: transport loss
 after any write/read boundary returns the typed unavailable outcome. The CNF
 must authoritatively re-read and derive a new CAS; it must not resubmit the
 historical operation under either the old or a fresh UUID.
+Diagnostics use only the fixed reasons `stale_epoch`, `identity_reuse`,
+`ambiguous`, and `capacity`; they never include a peer, UUID, digest, key,
+owner, lease, record, or payload.
 
 The cursor's seek key and snapshot metadata remain confidential. Its one clear
 cumulative examined-row position is bound into cursor authentication and lets

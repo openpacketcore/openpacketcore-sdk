@@ -757,6 +757,10 @@ further ten minutes the process epoch rotates and cleanup clears the cache only
 with no CAS in flight. One peer cannot evict another peer's active window.
 These are compatibility-transport safeguards, not a substitute for Openraft's
 atomically persisted production request outcomes.
+Direct-CAS rejection diagnostics are limited to `stale_epoch`,
+`identity_reuse`, `ambiguous`, and `capacity`. They must not carry peer or
+certificate identity, request UUID, digest, key, owner, lease, record, or
+payload fields.
 
 Alert and metric dimensions for outbound delivery must use the finite response
 families and fixed reasons `frame_too_large`, `page_shortened`, `write_timeout`,

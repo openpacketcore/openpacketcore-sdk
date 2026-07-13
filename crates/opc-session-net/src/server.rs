@@ -798,11 +798,13 @@ impl CasIdempotencyCache {
         cache_guard.cleanup(now);
 
         if epoch != cache_guard.epoch {
+            record_cas_idempotency_rejection("stale_epoch");
             return CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable);
         }
 
         if let Some(entry) = cache_guard.entries.get(&request_id) {
             if entry.peer != *peer || entry.operation_digest != operation_digest {
+                record_cas_idempotency_rejection("identity_reuse");
                 return CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyConflict);
             }
             return match &entry.state {
@@ -813,6 +815,7 @@ impl CasIdempotencyCache {
                     CasIdempotencyAdmission::Replay(outcome.as_ref().clone())
                 }
                 CasIdempotencyState::Ambiguous { .. } => {
+                    record_cas_idempotency_rejection("ambiguous");
                     CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
                 }
             };
@@ -835,6 +838,7 @@ impl CasIdempotencyCache {
                 .checked_add(retained_bytes)
                 .is_none_or(|bytes| bytes > CAS_IDEMPOTENCY_CACHE_PER_PEER_MAX_BYTES)
         {
+            record_cas_idempotency_rejection("capacity");
             return CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable);
         }
 
@@ -958,6 +962,14 @@ impl CasIdempotencyCache {
             let _ = notify.send(Some(Err(StoreError::CasIdempotencyOutcomeUnavailable)));
         }
     }
+}
+
+fn record_cas_idempotency_rejection(reason: &'static str) {
+    tracing::debug!(
+        response_family = ResponseFamily::CompareAndSet.code(),
+        reason,
+        "direct CAS idempotency rejected"
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
