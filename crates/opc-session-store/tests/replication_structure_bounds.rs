@@ -84,7 +84,7 @@ fn mixed_tree_with_nodes(node_count: usize) -> ReplicationOp {
 fn entry(sequence: u64, tx_id: &str, op: ReplicationOp) -> ReplicationEntry {
     ReplicationEntry {
         sequence,
-        tx_id: tx_id.to_owned(),
+        tx_id: tx_id.try_into().expect("valid transaction ID"),
         op,
         timestamp: timestamp(),
     }
@@ -328,7 +328,7 @@ fn seed_prefix(now: Timestamp, key: &SessionKey) -> Vec<ReplicationEntry> {
     vec![
         ReplicationEntry {
             sequence: 1,
-            tx_id: "seed-lease".to_owned(),
+            tx_id: "seed-lease".try_into().expect("valid transaction ID"),
             op: ReplicationOp::AcquireLease {
                 key: key.clone(),
                 owner: owner("seed-owner"),
@@ -341,7 +341,7 @@ fn seed_prefix(now: Timestamp, key: &SessionKey) -> Vec<ReplicationEntry> {
         },
         ReplicationEntry {
             sequence: 2,
-            tx_id: "seed-record".to_owned(),
+            tx_id: "seed-record".try_into().expect("valid transaction ID"),
             op: ReplicationOp::CompareAndSet {
                 key: key.clone(),
                 expected_generation: None,

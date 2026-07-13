@@ -13,12 +13,13 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
-    OwnerId, ReplicationEntry, SessionKeyType, OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES,
-    STABLE_ID_MAX_BYTES, STABLE_ID_MIN_BYTES,
+    OwnerId, ReplicationEntry, ReplicationTxId, SessionKeyType, OWNER_ID_MAX_BYTES,
+    REPLICATION_TX_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_MAX_BYTES,
+    STABLE_ID_MIN_BYTES,
 };
 
 /// Version of the count-only SQLite identity-audit report.
-pub const SQLITE_IDENTITY_AUDIT_REPORT_VERSION: u32 = 2;
+pub const SQLITE_IDENTITY_AUDIT_REPORT_VERSION: u32 = 3;
 
 /// Fixed number of SQLite rows requested by each bounded audit page.
 pub const SQLITE_IDENTITY_AUDIT_PAGE_ROWS: u32 = 256;
@@ -144,6 +145,7 @@ pub struct SqliteIdentityAuditViolationCounts {
     invalid_owner_fields: u64,
     invalid_session_key_type_fields: u64,
     invalid_stable_id_fields: u64,
+    invalid_replication_tx_id_fields: u64,
     invalid_replication_entries: u64,
 }
 
@@ -163,6 +165,12 @@ impl SqliteIdentityAuditViolationCounts {
         self.invalid_stable_id_fields
     }
 
+    /// Invalid, missing, or relational/encoded-inconsistent replication
+    /// transaction IDs.
+    pub const fn invalid_replication_tx_id_fields(self) -> u64 {
+        self.invalid_replication_tx_id_fields
+    }
+
     /// Replication entries rejected by strict decode or domain validation.
     pub const fn invalid_replication_entries(self) -> u64 {
         self.invalid_replication_entries
@@ -172,6 +180,7 @@ impl SqliteIdentityAuditViolationCounts {
         self.invalid_owner_fields != 0
             || self.invalid_session_key_type_fields != 0
             || self.invalid_stable_id_fields != 0
+            || self.invalid_replication_tx_id_fields != 0
             || self.invalid_replication_entries != 0
     }
 }
@@ -383,6 +392,21 @@ impl AuditState {
         self.report.violations.invalid_replication_entries = next;
         true
     }
+
+    fn increment_invalid_replication_tx_id(&mut self) -> bool {
+        let Some(next) = self
+            .report
+            .violations
+            .invalid_replication_tx_id_fields
+            .checked_add(1)
+        else {
+            self.report
+                .mark_incomplete(SqliteIdentityAuditIncompleteReason::CounterOverflow);
+            return false;
+        };
+        self.report.violations.invalid_replication_tx_id_fields = next;
+        true
+    }
 }
 
 enum ScanControl {
@@ -459,7 +483,10 @@ fn schema_is_supported(conn: &Connection) -> Result<bool, ()> {
         ("session_records", &["owner", "key_type", "stable_id"][..]),
         ("leases", &["owner", "key_type", "stable_id"][..]),
         ("key_fences", &["key_type", "stable_id"][..]),
-        ("session_replication_log", &["sequence", "entry_json"][..]),
+        (
+            "session_replication_log",
+            &["sequence", "tx_id", "entry_json"][..],
+        ),
     ] {
         for column in columns {
             if !schema_column_exists(conn, table, column)? {
@@ -815,23 +842,29 @@ fn scan_key_fences(conn: &Connection, state: &mut AuditState) -> Result<ScanCont
 
 const REPLICATION_LOG_FIRST_PAGE: &str = r#"
     SELECT sequence,
+           typeof(tx_id), length(CAST(tx_id AS BLOB)),
+           CASE WHEN typeof(tx_id) = 'text'
+                  AND length(CAST(tx_id AS BLOB)) <= ?1 THEN tx_id END,
            typeof(entry_json), length(CAST(entry_json AS BLOB)),
            CASE WHEN typeof(entry_json) = 'text'
-                  AND length(CAST(entry_json AS BLOB)) <= ?1 THEN entry_json END
+                  AND length(CAST(entry_json AS BLOB)) <= ?2 THEN entry_json END
     FROM session_replication_log
     ORDER BY sequence
-    LIMIT ?2
+    LIMIT ?3
 "#;
 
 const REPLICATION_LOG_NEXT_PAGE: &str = r#"
     SELECT sequence,
+           typeof(tx_id), length(CAST(tx_id AS BLOB)),
+           CASE WHEN typeof(tx_id) = 'text'
+                  AND length(CAST(tx_id AS BLOB)) <= ?1 THEN tx_id END,
            typeof(entry_json), length(CAST(entry_json AS BLOB)),
            CASE WHEN typeof(entry_json) = 'text'
-                  AND length(CAST(entry_json AS BLOB)) <= ?1 THEN entry_json END
+                  AND length(CAST(entry_json AS BLOB)) <= ?2 THEN entry_json END
     FROM session_replication_log
-    WHERE sequence > ?2
+    WHERE sequence > ?3
     ORDER BY sequence
-    LIMIT ?3
+    LIMIT ?4
 "#;
 
 fn scan_replication_entries(conn: &Connection, state: &mut AuditState) -> Result<ScanControl, ()> {
@@ -862,24 +895,32 @@ fn scan_replication_entries(conn: &Connection, state: &mut AuditState) -> Result
         let mut rows = match cursor {
             Some(last) => stmt
                 .query(params![
+                    REPLICATION_TX_ID_MAX_BYTES,
                     state.report.limits.max_entry_json_bytes,
                     last,
                     limit
                 ])
                 .map_err(|_| ())?,
             None => stmt
-                .query(params![state.report.limits.max_entry_json_bytes, limit])
+                .query(params![
+                    REPLICATION_TX_ID_MAX_BYTES,
+                    state.report.limits.max_entry_json_bytes,
+                    limit
+                ])
                 .map_err(|_| ())?,
         };
         let mut rows_in_page = 0_u32;
         while let Some(row) = rows.next().map_err(|_| ())? {
             let sequence: i64 = row.get(0).map_err(|_| ())?;
-            let value_type: String = row.get(1).map_err(|_| ())?;
-            let byte_length: Option<i64> = row.get(2).map_err(|_| ())?;
+            let stored_tx_id = bounded_text_value(row, 1, 2, 3, REPLICATION_TX_ID_MAX_BYTES)?
+                .and_then(|value| ReplicationTxId::try_from(value).ok());
+            let value_type: String = row.get(4).map_err(|_| ())?;
+            let byte_length: Option<i64> = row.get(5).map_err(|_| ())?;
             let byte_length = byte_length.and_then(|value| u64::try_from(value).ok());
 
             if value_type != "text" || byte_length.is_none() {
                 if !state.increment_scanned(ScannedTable::ReplicationEntries)
+                    || (stored_tx_id.is_none() && !state.increment_invalid_replication_tx_id())
                     || !state.increment_invalid_replication_entry()
                 {
                     return Ok(ScanControl::Stop);
@@ -904,21 +945,35 @@ fn scan_replication_entries(conn: &Connection, state: &mut AuditState) -> Result
                     );
                     return Ok(ScanControl::Stop);
                 }
-                let entry_json: Option<String> = row.get(3).map_err(|_| ())?;
+                let entry_json: Option<String> = row.get(6).map_err(|_| ())?;
                 let Some(entry_json) = entry_json else {
                     return Err(());
                 };
                 state.json_bytes_seen = next_total;
-                let entry = serde_json::from_str::<ReplicationEntry>(&entry_json)
-                    .ok()
+                let entry_value = serde_json::from_str::<serde_json::Value>(&entry_json).ok();
+                let encoded_tx_id = entry_value
+                    .as_ref()
+                    .and_then(|value| value.as_object())
+                    .and_then(|object| object.get("tx_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| ReplicationTxId::new(value).ok());
+                let entry = entry_value
+                    .and_then(|value| serde_json::from_value::<ReplicationEntry>(value).ok())
                     .and_then(|entry| entry.into_validated().ok());
                 let stored_sequence = u64::try_from(sequence)
                     .ok()
                     .filter(|sequence| *sequence != 0);
                 let valid = stored_sequence
-                    .zip(entry)
+                    .zip(entry.as_ref())
                     .is_some_and(|(stored_sequence, entry)| entry.sequence == stored_sequence);
+                let tx_id_valid = stored_tx_id
+                    .as_ref()
+                    .zip(encoded_tx_id.as_ref())
+                    .is_some_and(|(stored_tx_id, encoded_tx_id)| stored_tx_id == encoded_tx_id);
                 if !state.increment_scanned(ScannedTable::ReplicationEntries) {
+                    return Ok(ScanControl::Stop);
+                }
+                if !tx_id_valid && !state.increment_invalid_replication_tx_id() {
                     return Ok(ScanControl::Stop);
                 }
                 if !valid && !state.increment_invalid_replication_entry() {

@@ -134,7 +134,9 @@ fn nested_refresh_replication_entry(
 ) -> ReplicationEntry {
     ReplicationEntry {
         sequence,
-        tx_id: format!("ttl-boundary-{sequence}"),
+        tx_id: format!("ttl-boundary-{sequence}")
+            .try_into()
+            .expect("valid transaction ID"),
         op: ReplicationOp::Batch {
             ops: vec![ReplicationOp::RefreshTtl {
                 key,
@@ -162,7 +164,9 @@ fn forged_refresh_deadline_entry(
     );
     ReplicationEntry {
         sequence,
-        tx_id: format!("forged-deadline-{sequence}"),
+        tx_id: format!("forged-deadline-{sequence}")
+            .try_into()
+            .expect("valid transaction ID"),
         op: ReplicationOp::RefreshTtl {
             key,
             owner,
@@ -185,7 +189,9 @@ fn operation_tree_at_depth(depth: usize) -> ReplicationOp {
 fn over_depth_replication_entry(sequence: u64) -> ReplicationEntry {
     ReplicationEntry {
         sequence,
-        tx_id: format!("over-depth-{sequence}"),
+        tx_id: format!("over-depth-{sequence}")
+            .try_into()
+            .expect("valid transaction ID"),
         op: operation_tree_at_depth(MAX_REPLICATION_OPERATION_DEPTH + 1),
         timestamp: Timestamp::now_utc(),
     }
@@ -197,7 +203,9 @@ fn over_count_replication_entry(sequence: u64) -> ReplicationEntry {
         .collect();
     ReplicationEntry {
         sequence,
-        tx_id: format!("over-count-{sequence}"),
+        tx_id: format!("over-count-{sequence}")
+            .try_into()
+            .expect("valid transaction ID"),
         op: ReplicationOp::Batch { ops },
         timestamp: Timestamp::now_utc(),
     }
@@ -211,7 +219,9 @@ fn payload_replication_entry(sequence: u64, payload_len: usize) -> ReplicationEn
     let timestamp = Timestamp::now_utc();
     ReplicationEntry {
         sequence,
-        tx_id: format!("log-{sequence}"),
+        tx_id: format!("log-{sequence}")
+            .try_into()
+            .expect("valid transaction ID"),
         op: ReplicationOp::CompareAndSet {
             key,
             expected_generation: None,
@@ -1038,7 +1048,9 @@ async fn remote_client_rejects_zero_sequence_before_resolve_or_retry() {
         Duration::from_millis(100),
         remote.replicate_entry(ReplicationEntry {
             sequence: 0,
-            tx_id: "untrusted-transaction-canary".to_string(),
+            tx_id: "untrusted-transaction-canary"
+                .try_into()
+                .expect("valid transaction ID"),
             op: ReplicationOp::Batch { ops: Vec::new() },
             timestamp: Timestamp::now_utc(),
         }),
@@ -1055,13 +1067,13 @@ async fn remote_client_rejects_zero_sequence_before_resolve_or_retry() {
         .rebuild_replication_state(vec![
             ReplicationEntry {
                 sequence: 1,
-                tx_id: "prefix-one".to_string(),
+                tx_id: "prefix-one".try_into().expect("valid transaction ID"),
                 op: ReplicationOp::Batch { ops: Vec::new() },
                 timestamp: Timestamp::now_utc(),
             },
             ReplicationEntry {
                 sequence: 3,
-                tx_id: "prefix-gap".to_string(),
+                tx_id: "prefix-gap".try_into().expect("valid transaction ID"),
                 op: ReplicationOp::Batch { ops: Vec::new() },
                 timestamp: Timestamp::now_utc(),
             },
@@ -1290,7 +1302,9 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
     let mut malformed = serde_json::to_value(Request::ReplicateEntry {
         entry: ReplicationEntry {
             sequence: 1,
-            tx_id: "wire-transaction-canary".to_string(),
+            tx_id: "wire-transaction-canary"
+                .try_into()
+                .expect("valid transaction ID"),
             op: ReplicationOp::Batch { ops: Vec::new() },
             timestamp: Timestamp::now_utc(),
         },
@@ -1316,13 +1330,13 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
             entries: vec![
                 ReplicationEntry {
                     sequence: 1,
-                    tx_id: "wire-prefix-one".to_string(),
+                    tx_id: "wire-prefix-one".try_into().expect("valid transaction ID"),
                     op: ReplicationOp::Batch { ops: Vec::new() },
                     timestamp: Timestamp::now_utc(),
                 },
                 ReplicationEntry {
                     sequence: 3,
-                    tx_id: "wire-prefix-gap".to_string(),
+                    tx_id: "wire-prefix-gap".try_into().expect("valid transaction ID"),
                     op: ReplicationOp::Batch { ops: Vec::new() },
                     timestamp: Timestamp::now_utc(),
                 },
@@ -1406,7 +1420,7 @@ async fn authenticated_server_rejects_operation_limits_and_keeps_connection_usab
     let mut request = serde_json::to_value(Request::ReplicateEntry {
         entry: ReplicationEntry {
             sequence: 1,
-            tx_id: "wire-over-depth".to_string(),
+            tx_id: "wire-over-depth".try_into().expect("valid transaction ID"),
             op: operation_tree_at_depth(MAX_REPLICATION_OPERATION_DEPTH),
             timestamp: Timestamp::now_utc(),
         },
@@ -2580,7 +2594,9 @@ async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
             .await
             .expect("read sequence before exact replication")
             + 1,
-        tx_id: "transport-exact-replication".to_string(),
+        tx_id: "transport-exact-replication"
+            .try_into()
+            .expect("valid transaction ID"),
         op: ReplicationOp::CompareAndSet {
             key: replication_key,
             expected_generation: None,
@@ -2978,7 +2994,9 @@ async fn plaintext_rebuild_is_rejected_before_backend_dispatch() {
         &opc_session_net::Request::RebuildReplicationState {
             entries: vec![ReplicationEntry {
                 sequence: 1,
-                tx_id: "plaintext-rebuild".to_string(),
+                tx_id: "plaintext-rebuild"
+                    .try_into()
+                    .expect("valid transaction ID"),
                 op: ReplicationOp::AcquireLease {
                     key: test_key(),
                     owner: OwnerId::new("plaintext-owner").unwrap(),

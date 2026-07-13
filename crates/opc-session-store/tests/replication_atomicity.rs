@@ -89,7 +89,7 @@ fn entry(
 ) -> ReplicationEntry {
     ReplicationEntry {
         sequence,
-        tx_id: tx_id.into(),
+        tx_id: tx_id.into().try_into().expect("valid transaction ID"),
         op,
         timestamp,
     }

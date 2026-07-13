@@ -1,11 +1,12 @@
 use bytes::Bytes;
 use opc_session_store::sqlite::audit::{
     audit_sqlite_identity_invariants, SqliteIdentityAuditIncompleteReason,
-    SqliteIdentityAuditLimits, SqliteIdentityAuditStatus,
+    SqliteIdentityAuditLimits, SqliteIdentityAuditStatus, SQLITE_IDENTITY_AUDIT_REPORT_VERSION,
 };
 use opc_session_store::{
     FenceToken, OwnerId, ReplicationEntry, ReplicationOp, SessionKey, SessionKeyType,
-    SqliteSessionBackend, OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_MAX_BYTES,
+    SqliteSessionBackend, OWNER_ID_MAX_BYTES, REPLICATION_TX_ID_MAX_BYTES,
+    SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_MAX_BYTES,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::{params, Connection};
@@ -82,7 +83,9 @@ fn replication_entry(sequence: u64, owner: &str) -> ReplicationEntry {
     };
     ReplicationEntry {
         sequence,
-        tx_id: format!("tx-{sequence}"),
+        tx_id: format!("tx-{sequence}")
+            .try_into()
+            .expect("valid transaction ID"),
         op: ReplicationOp::DeleteFenced {
             key,
             owner: OwnerId::new(owner).expect("owner"),
@@ -266,6 +269,74 @@ fn strict_replication_decode_reuses_nested_identity_validation() {
     assert!(!serde_json::to_string(&report)
         .expect("report JSON")
         .contains("nested-sensitive-owner"));
+}
+
+#[test]
+fn replication_transaction_id_audit_is_exact_bounded_and_cross_checks_json() {
+    let (_dir, path) = database();
+    let conn = Connection::open(&path).expect("open fixture");
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+        .expect("allow legacy-invalid audit fixtures");
+
+    let fixtures = [
+        (rusqlite::types::Value::Text("x".into()), "x".to_string()),
+        (
+            rusqlite::types::Value::Text("m".repeat(REPLICATION_TX_ID_MAX_BYTES)),
+            "m".repeat(REPLICATION_TX_ID_MAX_BYTES),
+        ),
+        (
+            rusqlite::types::Value::Text(String::new()),
+            "encoded-3".into(),
+        ),
+        (
+            rusqlite::types::Value::Text("o".repeat(REPLICATION_TX_ID_MAX_BYTES + 1)),
+            "encoded-4".into(),
+        ),
+        (rusqlite::types::Value::Blob(vec![b'b']), "encoded-5".into()),
+        (
+            rusqlite::types::Value::Text("Case-Sensitive".into()),
+            "case-sensitive".into(),
+        ),
+        (
+            rusqlite::types::Value::Text("encoded-7".into()),
+            String::new(),
+        ),
+        (
+            rusqlite::types::Value::Text("encoded-8".into()),
+            "j".repeat(REPLICATION_TX_ID_MAX_BYTES + 1),
+        ),
+    ];
+    let mut total_json_bytes = 0_u64;
+    for (offset, (stored_tx_id, encoded_tx_id)) in fixtures.into_iter().enumerate() {
+        let sequence = u64::try_from(offset + 1).expect("fixture sequence");
+        let mut entry =
+            serde_json::to_value(replication_entry(sequence, "owner-a")).expect("entry JSON value");
+        entry["tx_id"] = serde_json::Value::String(encoded_tx_id);
+        let encoded = serde_json::to_string(&entry).expect("entry JSON");
+        total_json_bytes += u64::try_from(encoded.len()).expect("entry width");
+        conn.execute(
+            r#"
+            INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp)
+            VALUES (?1, ?2, ?3, '2030-01-01T00:00:00Z')
+            "#,
+            params![sequence, stored_tx_id, encoded],
+        )
+        .expect("insert transaction-ID fixture");
+    }
+    drop(conn);
+
+    let report =
+        audit_sqlite_identity_invariants(&path, limits(10, total_json_bytes, total_json_bytes))
+            .expect("audit succeeds");
+    assert_eq!(
+        report.report_version(),
+        SQLITE_IDENTITY_AUDIT_REPORT_VERSION
+    );
+    assert_eq!(SQLITE_IDENTITY_AUDIT_REPORT_VERSION, 3);
+    assert_eq!(report.status(), SqliteIdentityAuditStatus::ViolationsFound);
+    assert_eq!(report.scanned().replication_entries(), 8);
+    assert_eq!(report.violations().invalid_replication_tx_id_fields(), 6);
+    assert_eq!(report.violations().invalid_replication_entries(), 2);
 }
 
 #[test]

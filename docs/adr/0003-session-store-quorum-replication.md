@@ -367,7 +367,7 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
 The revision-1 to revision-2 transition requires the same drained coordinated
 stop/upgrade/start as other exact-profile changes. #167 promotes the stable-ID
 rule from wire containment into the `StableId` domain type, SQLite/cache/
-Openraft/restore/replication/watch boundaries, and a version-2 count-only
+Openraft/restore/replication/watch boundaries, and a version-3 count-only
 legacy audit without rewriting compliant record/log bytes. Before strict
 startup, quiesce writers and audit every retained record, log, snapshot,
 restore source, and replay source. Any out-of-profile value requires a
@@ -378,10 +378,10 @@ strict decoder must verify the result before writers restart. Rollback likewise
 installs a decoder for the retained target representation before old writers, or
 uses a coherent checkpoint/reviewed reverse migration. All participants must
 move together; independent `OPCH`/#135 rollback barriers still apply. #167 now
-supplies the production stable-ID model/persistence/privacy/audit contract;
-#168 owns the
-canonical durable transaction-ID type and migration coordinated with
-#127/#128/#143.
+supplies the production stable-ID model/persistence/privacy/audit contract.
+#168 supplies the bounded durable transaction-ID type, canonical coordinator
+mint, exact legacy preservation, and version-3 audit/migration coordinated
+with #127/#128/#143.
 Session-net's bounded call remains the shared production transport contract.
 #177 removes `opc-persist`'s private config TCP path and composes config
 consensus through the same transport-neutral peer/handler ports instead of a

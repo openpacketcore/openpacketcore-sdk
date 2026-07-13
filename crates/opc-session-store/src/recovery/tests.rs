@@ -14,7 +14,7 @@ use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membe
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_mgmt_audit::{AuditError, AuditEvent, AuditOutcome, AuditSink};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::Value, Connection};
 use sha2::{Digest, Sha256};
 
 use super::sqlite::{
@@ -37,6 +37,7 @@ use crate::{
     SessionConsensusPeerError, SessionConsensusRpcHandler, SessionConsensusWireRequest,
     SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager,
     SqliteSessionBackend, StateClass, StateType, StoredSessionRecord, SystemClock,
+    REPLICATION_TX_ID_MAX_BYTES,
 };
 
 #[derive(Default)]
@@ -338,7 +339,9 @@ fn insert_legacy_empty_replication(replica: &RecoveryReplica, sequence: u64) {
     let timestamp = Timestamp::now_utc();
     let entry = ReplicationEntry {
         sequence,
-        tx_id: format!("legacy-recovery-{sequence}"),
+        tx_id: format!("legacy-recovery-{sequence}")
+            .try_into()
+            .expect("valid transaction ID"),
         op: ReplicationOp::Batch { ops: Vec::new() },
         timestamp,
     };
@@ -347,7 +350,7 @@ fn insert_legacy_empty_replication(replica: &RecoveryReplica, sequence: u64) {
         "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) VALUES (?1, ?2, ?3, ?4)",
         params![
             i64::try_from(sequence).expect("sequence"),
-            entry.tx_id,
+            entry.tx_id.as_str(),
             serde_json::to_string(&entry).expect("encode legacy replication fixture"),
             crate::sqlite::ops::format_rfc3339_normalized(timestamp),
         ],
@@ -926,7 +929,7 @@ fn legacy_sequence_audit_rejects_hidden_domain_and_row_payload_mismatches() {
         let timestamp = Timestamp::now_utc();
         let entry = ReplicationEntry {
             sequence: payload_sequence,
-            tx_id: "sequence-test".to_string(),
+            tx_id: "sequence-test".try_into().expect("valid transaction ID"),
             op: ReplicationOp::Batch { ops: Vec::new() },
             timestamp,
         };
@@ -955,6 +958,69 @@ fn legacy_sequence_audit_rejects_hidden_domain_and_row_payload_mismatches() {
                 node_set(&ids),
                 &replicas,
                 &first_id,
+                &ids,
+                RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+                RecoveryLimits::default(),
+            ),
+            Err(RecoveryError::CorruptReplica),
+            "case {case} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn legacy_recovery_rejects_unbounded_or_non_text_transaction_ids() {
+    for (case, stored_tx_id) in [
+        ("empty", Value::Text(String::new())),
+        (
+            "oversized",
+            Value::Text("x".repeat(REPLICATION_TX_ID_MAX_BYTES + 1)),
+        ),
+        ("blob", Value::Blob(vec![b'x'])),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let ids = [
+            replica_id(&format!("tx-width-{case}-a")),
+            replica_id(&format!("tx-width-{case}-b")),
+            replica_id(&format!("tx-width-{case}-c")),
+        ];
+        let replicas = vec![
+            create_legacy_replica(temp.path(), ids[0].clone(), 3),
+            create_legacy_replica(temp.path(), ids[1].clone(), 4),
+            create_legacy_replica(temp.path(), ids[2].clone(), 5),
+        ];
+        let timestamp = Timestamp::now_utc();
+        let entry = ReplicationEntry {
+            sequence: 1,
+            tx_id: "valid-encoded-id".try_into().expect("valid transaction ID"),
+            op: ReplicationOp::Batch { ops: Vec::new() },
+            timestamp,
+        };
+        let conn = Connection::open(&replicas[0].database_path).expect("open legacy database");
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow legacy-invalid fixture");
+        conn.execute(
+            "INSERT INTO session_replication_log (sequence, tx_id, entry_json, timestamp) \
+             VALUES (1, ?1, ?2, ?3)",
+            params![
+                stored_tx_id,
+                serde_json::to_string(&entry).expect("entry JSON"),
+                crate::sqlite::ops::format_rfc3339_normalized(timestamp),
+            ],
+        )
+        .expect("insert invalid transaction ID fixture");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint invalid fixture");
+        drop(conn);
+
+        let manager = recovery(AllowRecovery);
+        assert_eq!(
+            manager.plan(
+                &context(),
+                identity(),
+                node_set(&ids),
+                &replicas,
+                &ids[0],
                 &ids,
                 RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
                 RecoveryLimits::default(),

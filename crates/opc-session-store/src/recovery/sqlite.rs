@@ -22,7 +22,9 @@ use crate::consensus::{
     SessionConsensusNodeId, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::sqlite::{consensus, ops};
-use crate::ReplicationEntry;
+use crate::{
+    ReplicationEntry, ReplicationTxId, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
+};
 
 const PATH_MAX_BYTES: usize = 4_096;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
@@ -1191,7 +1193,22 @@ fn validate_replication_sequence_domain(
         .map_err(|error| inspection_sql_error(error, budget))?
     {
         budget.consume_row()?;
-        for column in [1_usize, 2, 3] {
+        let tx_id = match row
+            .get_ref(1)
+            .map_err(|error| inspection_sql_error(error, budget))?
+        {
+            ValueRef::Text(value)
+                if (REPLICATION_TX_ID_MIN_BYTES..=REPLICATION_TX_ID_MAX_BYTES)
+                    .contains(&value.len()) =>
+            {
+                budget.consume_value(value.len())?;
+                let value =
+                    std::str::from_utf8(value).map_err(|_| RecoveryError::CorruptReplica)?;
+                ReplicationTxId::new(value).map_err(|_| RecoveryError::CorruptReplica)?
+            }
+            _ => return Err(RecoveryError::CorruptReplica),
+        };
+        for column in [2_usize, 3] {
             match row
                 .get_ref(column)
                 .map_err(|error| inspection_sql_error(error, budget))?
@@ -1201,7 +1218,6 @@ fn validate_replication_sequence_domain(
             }
         }
         let stored_sequence: i64 = row.get(0).map_err(|_| RecoveryError::CorruptReplica)?;
-        let tx_id: String = row.get(1).map_err(|_| RecoveryError::CorruptReplica)?;
         let encoded: String = row.get(2).map_err(|_| RecoveryError::CorruptReplica)?;
         let timestamp: String = row.get(3).map_err(|_| RecoveryError::CorruptReplica)?;
         let stored_sequence =

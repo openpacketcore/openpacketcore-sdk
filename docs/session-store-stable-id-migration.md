@@ -47,7 +47,7 @@ key rotation.
    ```
 
 4. Repeat the audit for every retained SQLite snapshot or restore/rebuild image
-   that could be installed. Accept only report version 2, `status = compliant`,
+   that could be installed. Accept only report version 3, `status = compliant`,
    and exit 0.
 
 The report is count-only. `invalid_stable_id_fields` counts relational values
@@ -84,12 +84,12 @@ drained:
 
 Never edit a live PVC. Never repair one quorum member independently. Never
 install or retain a non-compliant snapshot after the transition. Run the strict
-decoder and version-2 audit over the complete shadow result before promotion.
+decoder and version-3 audit over the complete shadow result before promotion.
 
 ## Cutover verification
 
 1. Start the coordinated new fleet with traffic still closed.
-2. Require every file and candidate snapshot to produce a compliant version-2
+2. Require every file and candidate snapshot to produce a compliant version-3
    audit report.
 3. Verify exact 1-byte and 64-byte records through local SQLite, restore,
    replication/rebuild/watch, cache, Openraft, and authenticated session-net
