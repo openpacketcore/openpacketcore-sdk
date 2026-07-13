@@ -1,0 +1,2 @@
+{"schema_version":"opc-session-ha-schedule/v1","schedule_id":"lease-expiry-crossing","operation_index":1,"schedule_operation_count":2,"operation_id":"op-1","process_id":"client-a","operation":{"kind":"lease_acquire","key":"session-a","owner":"owner-a","ttl_millis":1}}
+{"schema_version":"opc-session-ha-schedule/v1","schedule_id":"lease-expiry-crossing","operation_index":2,"schedule_operation_count":2,"operation_id":"op-2","process_id":"client-b","operation":{"kind":"read","key":"session-a"}}

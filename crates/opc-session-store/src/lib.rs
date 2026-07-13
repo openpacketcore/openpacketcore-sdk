@@ -76,10 +76,11 @@ pub use consensus::{
     SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusIdentityError,
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpc,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome,
-    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
-    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionMutationIntent,
+    SessionMutationOutcome, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;

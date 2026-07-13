@@ -101,6 +101,23 @@ pub enum ConsensusSessionStoreOpenError {
     ClusterFormationRejected,
 }
 
+/// Redaction-safe current Openraft observation for readiness and operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SessionConsensusStatus {
+    /// Local canonical node ID.
+    pub node_id: SessionConsensusNodeId,
+    /// Current Openraft term.
+    pub term: u64,
+    /// Current leader, when known.
+    pub leader_id: Option<SessionConsensusNodeId>,
+    /// Highest local log index, whether committed or not.
+    pub last_log_index: Option<u64>,
+    /// Highest locally applied log index.
+    pub applied_index: Option<u64>,
+    /// Whether exact configured membership has been admitted and remains live.
+    pub admitted: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperatorRecoveryCommitError {
     NotLocalLeader,
@@ -447,6 +464,37 @@ impl ConsensusSessionStore {
     /// Redaction-safe immutable topology shape.
     pub fn topology(&self) -> &QuorumTopologySummary {
         &self.inner.topology
+    }
+
+    /// Snapshot redaction-safe status directly from the one Openraft engine.
+    pub fn status(&self) -> SessionConsensusStatus {
+        let metrics = self.inner.raft.metrics();
+        let (term, leader_id, last_log_index, applied_index, live_membership_is_exact) = {
+            let current = metrics.borrow();
+            (
+                current.current_term,
+                current.current_leader,
+                current.last_log_index,
+                current.last_applied.as_ref().map(|log_id| log_id.index),
+                current.running_state.is_ok()
+                    && exact_uniform_voter_membership(
+                        current.membership_config.as_ref(),
+                        &self.inner.members,
+                    ),
+            )
+        };
+        let admitted = self.inner.admitted.load(Ordering::Acquire) && live_membership_is_exact;
+        if !admitted {
+            self.inner.admitted.store(false, Ordering::Release);
+        }
+        SessionConsensusStatus {
+            node_id: self.inner.local_node_id,
+            term,
+            leader_id,
+            last_log_index,
+            applied_index,
+            admitted,
+        }
     }
 
     pub(crate) fn recovery_identity(&self) -> SessionConsensusIdentity {

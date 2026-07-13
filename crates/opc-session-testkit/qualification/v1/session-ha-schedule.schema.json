@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-schedule/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schedule_id",
+    "operation_index",
+    "schedule_operation_count",
+    "operation_id",
+    "process_id",
+    "operation"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-schedule/v1" },
+    "schedule_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "operation_index": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "schedule_operation_count": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "operation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "process_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "operation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "key", "owner", "ttl_millis"],
+          "properties": {
+            "kind": { "const": "lease_acquire" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "owner": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "ttl_millis": { "type": "integer", "minimum": 1, "maximum": 31536000000 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "key",
+            "lease_operation_id",
+            "expected_generation",
+            "new_generation",
+            "value"
+          ],
+          "properties": {
+            "kind": { "const": "compare_and_set" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "lease_operation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "expected_generation": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "const": null }] },
+            "new_generation": { "type": "integer", "minimum": 1 },
+            "value": { "type": "string", "maxLength": 512 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "key"],
+          "properties": {
+            "kind": { "const": "read" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 64 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "key", "lease_operation_id"],
+          "properties": {
+            "kind": { "const": "lease_release" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "lease_operation_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+          }
+        }
+      ]
+    }
+  }
+}

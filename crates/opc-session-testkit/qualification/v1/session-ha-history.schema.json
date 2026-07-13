@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-history/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schedule_sha256",
+    "history_id",
+    "operation_index",
+    "history_operation_count",
+    "operation_id",
+    "process_id",
+    "started_ns",
+    "completed_ns",
+    "operation"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-history/v1" },
+    "schedule_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "history_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "operation_index": { "type": "integer", "minimum": 1 },
+    "history_operation_count": { "type": "integer", "minimum": 1 },
+    "operation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "process_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "started_ns": { "type": "integer", "minimum": 0 },
+    "completed_ns": { "type": "integer", "minimum": 0 },
+    "operation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "key_sha256", "owner_sha256", "outcome", "fence"],
+          "properties": {
+            "kind": { "const": "lease_acquire" },
+            "key_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "owner_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "outcome": { "enum": ["success", "rejected", "indeterminate", "unavailable"] },
+            "fence": { "oneOf": [{ "type": "integer", "minimum": 1 }, { "const": null }] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "key_sha256",
+            "owner_sha256",
+            "fence",
+            "expected_generation",
+            "new_generation",
+            "value_sha256",
+            "outcome"
+          ],
+          "properties": {
+            "kind": { "const": "compare_and_set" },
+            "key_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "owner_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "fence": { "type": "integer", "minimum": 1 },
+            "expected_generation": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "const": null }] },
+            "new_generation": { "type": "integer", "minimum": 1 },
+            "value_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "outcome": { "enum": ["success", "conflict", "rejected", "indeterminate", "unavailable"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "key_sha256", "outcome", "record"],
+          "properties": {
+            "kind": { "const": "read" },
+            "key_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "outcome": { "enum": ["success", "indeterminate", "unavailable"] },
+            "record": {
+              "oneOf": [
+                { "const": null },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["generation", "owner_sha256", "fence", "value_sha256"],
+                  "properties": {
+                    "generation": { "type": "integer", "minimum": 1 },
+                    "owner_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                    "fence": { "type": "integer", "minimum": 1 },
+                    "value_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "key_sha256", "owner_sha256", "fence", "outcome"],
+          "properties": {
+            "kind": { "const": "lease_release" },
+            "key_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "owner_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "fence": { "type": "integer", "minimum": 1 },
+            "outcome": { "enum": ["success", "rejected", "indeterminate", "unavailable"] }
+          }
+        }
+      ]
+    }
+  }
+}
