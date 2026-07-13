@@ -50,11 +50,15 @@ persistence authority.
   standalone consensus-node binary are removed rather than retained as a
   compatibility engine.
 
-The shared engine also has one runtime profile. `opc-consensus` owns the
-heartbeat, election range, snapshot-install timeout, replication payload,
-snapshot trigger/chunk, retained-log, and Tokio runtime choices. Session and
-configuration adapters select only their non-secret cluster label; they cannot
-silently drift to separate timing or runtime behavior.
+The shared engine also has one runtime and complete-call profile.
+`opc-consensus` owns the 2,000 ms heartbeat/AppendEntries/read-index ceiling,
+5,000 ms Vote ceiling, `[5,000 ms, 8,000 ms)` election range, 10,000 ms
+snapshot/forward/read-barrier and operation ceilings, 30,000 ms listener
+ceilings, and the contained 1,500 ms cold-connect sub-bound. It also owns the
+replication payload, snapshot trigger/chunk, retained-log, and Tokio runtime
+choices. Session and configuration adapters select only their non-secret
+cluster label; they cannot silently drift to separate timing or runtime
+behavior.
 
 ### Interim engine-source and release gate
 
@@ -215,7 +219,7 @@ gates.
 - `crates/opc-session-net/src/consensus.rs`
 - `crates/opc-session-net/tests/consensus_transport.rs`
 - `crates/opc-session-testkit/tests/qualification_multiprocess.rs`
-- `crates/opc-session-testkit/qualification/v1/session-ha-profile.json`
+- `crates/opc-session-testkit/qualification/v2/session-ha-profile.json`
 - `scripts/publish-order.py`
 - `docs/adr/0002-config-store-consensus-ha.md`
 - `docs/adr/0003-session-store-quorum-replication.md`

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+    DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_key::{
     EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose,
@@ -43,6 +44,12 @@ const PLAINTEXT_BEFORE_ROTATION: &[u8] = b"snapshot-restart-plaintext-canary-bef
 const PLAINTEXT_AFTER_ROTATION: &[u8] = b"snapshot-restart-plaintext-canary-after-key-rotation";
 const RAW_KEY_MATERIAL: &[u8; AES_256_GCM_SIV_KEY_LEN] = &[0x6b; AES_256_GCM_SIV_KEY_LEN];
 const SNAPSHOT_FOOTER_BYTES: usize = 8 + 8 + 32;
+const CONSENSUS_READY_TIMEOUT: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .election_timeout_max_millis
+        .saturating_mul(2)
+        .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
+);
 
 struct CountingKeyProvider {
     inner: Arc<MemoryKeyProvider>,
@@ -151,7 +158,9 @@ async fn open_store(database: &Path, snapshots: &Path) -> ConsensusSessionStore 
         .initialize_cluster()
         .await
         .expect("initialize consensus singleton");
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Readiness evidence follows the shared election/operation timing profile
+    // rather than racing the election minimum.
+    tokio::time::timeout(CONSENSUS_READY_TIMEOUT, async {
         loop {
             if store.probe_durable_readiness().await.is_ready() {
                 return;

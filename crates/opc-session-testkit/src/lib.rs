@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
+use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
 use opc_session_store::{
     Clock, ConsensusSessionStore, DurableReadinessState, QuorumReplicaDescriptor,
     QuorumTopologyConfig, QuorumTopologyError, ReplicaBackingIdentity, ReplicaEndpoint,
@@ -23,6 +24,13 @@ use opc_session_store::{
     ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::Timestamp;
+
+const CONSENSUS_TEST_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .election_timeout_max_millis
+        .saturating_mul(2)
+        .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
+);
 
 /// A SkewableClock wraps a virtual clock and allows injecting positive or negative clock skew.
 #[derive(Debug, Clone)]
@@ -349,7 +357,9 @@ impl ConsensusTestCluster {
     }
 
     async fn wait_ready(&self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        // Cluster formation can require one resampled election after a split
+        // vote and then one complete profiled readiness operation.
+        let deadline = tokio::time::Instant::now() + CONSENSUS_TEST_TRANSITION_TIMEOUT;
         loop {
             let reports = join_all(
                 self.stores

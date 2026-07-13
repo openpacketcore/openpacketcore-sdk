@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Experimental HA transport hardening — `opc-session-net`:** each directed
+  `RemoteSessionConsensusPeer` now retains at most one authenticated connection
+  behind its existing one-call gate. A socket returns to that sole slot only
+  after a complete, correctly correlated, validated successful consensus
+  response; a typed failed response, cancellation, timeout, EOF, bad
+  framing/protocol/authentication, lifecycle
+  retirement, or admitted generation/material mismatch leaves it evicted.
+  Healthy Openraft heartbeats therefore reuse one DNS/TCP/mTLS/bootstrap path
+  without adding multiplexing or another authority, while every replacement
+  repeats the complete admission sequence. `opc-consensus` now owns the one
+  fixed complete-call timing profile used by session and configuration
+  consensus: AppendEntries/Openraft read-index 2 s, Vote 5 s,
+  InstallSnapshot/forwarded mutation/consumer ReadBarrier 10 s, election
+  `[5 s, 8 s)`, the shared operation default 10 s, and server idle/handler
+  ceilings 30 s. A cold DNS/TCP/mTLS/bootstrap phase is capped at 1.5 s inside
+  the already-running family deadline, never added to it. `None` on the
+  source-compatible remote constructors selects this profile; an explicit
+  fixed override remains test/compatibility-only and cannot enlarge the cold
+  cap. Real mTLS tests prove the family boundaries and same-leader/same-term
+  follower-listener restart, 500 ms cold reconnect, catch-up, readiness, and
+  linearizable read within 10 s without a preflight call. Qualification profile
+  and evidence schemas advance to v2 while v1 artifacts remain unchanged.
+  #143 remains experimental/open for out-of-process deployed-network, full
+  failure/resource/soak, payload-key, and candidate-release evidence. Payload
+  envelopes, AAD, Openraft authority, SQLite state, HKMS/provider placement,
+  and at-rest encryption are unchanged.
 - **Experimental HA qualification — `opc-consensus`, `opc-session-store`, and
   `opc-persist`:** both durable domains now use one fail-closed Openraft runtime
   profile and the exact `openpacketcore/openraft` revision

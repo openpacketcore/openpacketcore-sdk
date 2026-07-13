@@ -29,8 +29,11 @@ pub use identity::{
     CONSENSUS_MEMBER_ID_MAX_BYTES, CONSENSUS_NODE_ID_MAX,
 };
 pub use profile::{
-    durable_openraft_config, DurableOpenraftDomain, DurableOpenraftProfile,
-    DurableOpenraftProfileError, DurableOpenraftRuntime, DURABLE_OPENRAFT_PROFILE,
+    durable_openraft_config, validate_durable_consensus_timing_profile,
+    DurableConsensusTimingProfile, DurableConsensusTimingProfileError, DurableOpenraftDomain,
+    DurableOpenraftProfile, DurableOpenraftProfileError, DurableOpenraftRuntime,
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_CONSENSUS_TIMING_PROFILE,
+    DURABLE_OPENRAFT_PROFILE,
 };
 pub use transport::{
     ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler,

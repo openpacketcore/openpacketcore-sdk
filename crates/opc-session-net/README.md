@@ -37,13 +37,37 @@ reordering, addition, removal, and epoch changes. Derived collisions are
 rejected during admission. The legacy `try_new` constructor is deprecated and
 fixes the epoch to 1 only for source compatibility with protocol-v5 callers.
 
-Every consensus connection performs a fresh mutual-TLS handshake and binds the
-certificate SPIFFE identity, logical replica ID, stable node ID, expected
-server, cluster/configuration/epoch, exact transport profile, and a fresh
-handshake nonce before decoding one operation. Each call also carries a fresh
-correlation ID. The client applies one absolute logical deadline to gate
-acquisition, DNS, TCP, TLS, bootstrap, bounded encoding, write, and response
-read; cancellation drops the connection, so a late response cannot be reused.
+Each directed consensus peer retains at most one authenticated connection and
+allows at most one in-flight RPC on it. Establishment performs a fresh
+mutual-TLS handshake and binds the certificate SPIFFE identity, logical replica
+ID, stable node ID, expected server, cluster/configuration/epoch, exact
+transport profile, and a fresh handshake nonce. Each call carries a fresh
+correlation ID; only a complete, correctly correlated, fully validated
+successful response returns the connection to the sole slot. A typed failed
+response, cancellation, timeout, EOF, framing,
+protocol, authentication, evidence mismatch, or lifecycle retirement drops it,
+so a late or partial response cannot be consumed by another Openraft RPC. The
+client applies one absolute logical deadline to gate acquisition and, when a
+connection is required, DNS, TCP, TLS, bootstrap, bounded encoding, write, and
+response read.
+
+This cache removes repeated handshakes from a healthy steady-state heartbeat
+path. A first call, dead cached socket, or replacement still performs DNS, TCP,
+mutual TLS, identity admission, and bootstrap. One absolute family deadline
+starts before gate acquisition. A fresh connection receives the lesser of the
+remaining family budget and a 1,500 ms cold-phase cap; response work keeps only
+the original remaining budget, so cold time is contained and never additive.
+
+| RPC family | Complete deadline |
+|:---|---:|
+| AppendEntries and Openraft read-index confirmation | 2,000 ms |
+| Vote | 5,000 ms |
+| InstallSnapshot | 10,000 ms |
+| ForwardMutation | 10,000 ms |
+| Consumer ReadBarrier | 10,000 ms |
+
+The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
+default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
 The exact consensus contract is transport/wire-schema revision 2 and error-set
 revision 4. Revision 2 carries the payload-free bounded expiry-authority
 preflight used before wrapper/provider work; error revision 4 adds the typed
@@ -72,8 +96,13 @@ mutation or rebuild authority beside Openraft.
   `ReplicaId`; `LocalReplicaBinding::bind_remote` derives the only supported
   production client binding for an admitted peer.
 - `RemoteSessionConsensusPeer::new` and `new_with_resolver` create the
-  authenticated outbound consensus-only port. One absolute deadline covers
-  admission, resolution, connection, TLS, framing, and response receipt.
+  authenticated outbound consensus-only port. Unmodified clones share one
+  bounded connection slot and one call gate per directed peer; clone-local
+  frame, lifecycle, or reauthentication builders detach incompatible cached
+  state. `None` selects the shared family profile. `Some(duration)` remains a
+  source-compatible fixed complete-call test/compatibility override, but cannot
+  enlarge the shared 1,500 ms cold cap. `new_profiled` and
+  `new_profiled_with_resolver` select the production profile explicitly.
 - `SessionConsensusServer::new` accepts only an
   `Arc<dyn SessionConsensusRpcHandler>` and serves only the dedicated consensus
   ALPN.
@@ -491,6 +520,10 @@ Retirement has these invariants:
   use its operation-bound idempotency/fencing contract;
 - a replacement repeats TCP resolution, mutual TLS, canonical SPIFFE identity,
   nonce/challenge, ALPN, version, and exact contract-profile checks;
+- a consensus connection is cached only after a complete correlated successful
+  response passes wire validation; a typed failed response, cancellation, or
+  every uncertain stream position leaves the slot empty, and a subsequent
+  Openraft retry reconnects without an implicit transport replay;
 - the fixed, fully decoded `ConnectionRetiring` response proves that a legacy
   direct mutation was not dispatched and is therefore the only retirement
   signal that permits an automatic mutation retry; EOF, a partial frame, or a
@@ -738,10 +771,9 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   failure and soak evidence. Connection continuity, bounded authentication age,
   and full-handshake reauthentication are implemented; complete fleet
   trust-bundle overlap/removal, short-lived-SVID expiry and compromise response,
-  reconnect-storm,
-  multi-process/deployed-network, payload-protection-key, and production
-  qualification evidence remains under #164/#143. Close those evidence gates
-  before treating this as production transport.
+  reconnect-storm, multi-process/deployed-network, payload-protection-key, and
+  production qualification evidence remains under #164/#143. Close those
+  evidence gates before treating this as production transport.
 - Keep plaintext transport limited to tests.
 - Keep the compatibility server wrapping `SessionStoreBackend` rather than
   owning storage; production authority uses only `SessionConsensusServer`.
@@ -760,12 +792,16 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   prove the corresponding local/peer retirement deadlines and fixed metric
   reasons. This component evidence is not a fleet rotation test.
 - `tests/consensus_transport.rs` covers the shared consensus-only ALPN,
-  complete call deadlines, scope binding, a renewed SVID observed on a
-  subsequent new call/full handshake, wrong rotated identities, and rejection
-  of legacy backend authority. It also forms a real three-node
-  `ConsensusConfigStore` over the existing mTLS peer/server and commits plus
-  linearizably reads through that shared adapter. Out-of-process deployment
-  remains #164/#143 qualification.
+  complete call deadlines, scope binding, validated steady-state connection
+  reuse, cancellation/timeout/dead-socket eviction, exact replacement after an
+  explicit generation or material epoch, finite cached-connection retirement,
+  a renewed SVID observed on a subsequent full handshake, wrong rotated
+  identities, rejection of legacy backend authority, the 1,500 ms contained
+  cold cap, and every 2/5/10-second family. It also forms a real three-node
+  `ConsensusConfigStore` over the existing mTLS peer/server, restarts a follower
+  listener, injects a persistent 500 ms cold delay, and proves same-leader,
+  same-term catch-up/readiness/linearizable read within 10 seconds without a
+  preflight. Out-of-process deployment remains #164/#143 qualification.
 - `tests/three_node_quorum.rs` covers typed TTL and replication-tree-limit
   rejection before resolution and authenticated server dispatch, plus
   connection reuse after rejection, deterministic listener/handler teardown,

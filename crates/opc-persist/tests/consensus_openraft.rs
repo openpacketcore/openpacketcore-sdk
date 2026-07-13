@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opc_consensus::{
     ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler,
-    ConsensusWireRequest, ConsensusWireResponse,
+    ConsensusWireRequest, ConsensusWireResponse, DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_crypto::{encrypt_attested_envelope_with_handle_and_nonce, AuthenticatedEnvelope};
 use opc_key::{
@@ -28,6 +28,15 @@ const PLAINTEXT_CANARY: &[u8] = b"CONFIG-PLAINTEXT-MUST-NEVER-CROSS-RAFT";
 const PROVIDER_ENDPOINT_CANARY: &[u8] = b"hkms+unix:///must-not-cross-raft/provider.sock";
 const OPAQUE_HANDLE_CANARY: &[u8] = b"HKMS-OPAQUE-HANDLE-MUST-NOT-CROSS-RAFT";
 const RAW_KEY_MATERIAL_CANARY: &[u8] = &[0x55; 32];
+// Admit one complete resampled election after a split vote, followed by one
+// complete profiled operation. Cluster formation and survivor-election
+// evidence must follow the shared timing authority.
+const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .election_timeout_max_millis
+        .saturating_mul(2)
+        .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
+);
 
 const FORBIDDEN_RAFT_ARTIFACTS: &[(&str, &[u8])] = &[
     ("configuration plaintext", PLAINTEXT_CANARY),
@@ -231,7 +240,7 @@ impl ThreeNodeCluster {
     }
 
     async fn wait_ready(&self) {
-        tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
             loop {
                 let (one, two, three) = tokio::join!(
                     self.stores[0].probe_durable_readiness(),
@@ -1231,7 +1240,7 @@ async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
     let survivors = (0..3)
         .filter(|index| *index != old_leader)
         .collect::<Vec<_>>();
-    let (new_leader_id, new_term) = tokio::time::timeout(Duration::from_secs(20), async {
+    let (new_leader_id, new_term) = tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
         loop {
             let statuses = survivors
                 .iter()

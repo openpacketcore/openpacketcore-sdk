@@ -115,12 +115,9 @@ impl QualificationNode {
                 .bind_remote(ReplicaId::new(member.replica_id.clone()).map_err(|_| NodeFailure)?)
                 .map_err(|_| NodeFailure)?;
             let node_id = binding.remote_consensus_node_id();
-            let peer: Arc<dyn SessionConsensusPeer> =
-                Arc::new(RemoteSessionConsensusPeer::new_insecure(
-                    binding,
-                    member.dial_addr,
-                    Some(Duration::from_millis(config.operation_timeout_millis)),
-                ));
+            let peer: Arc<dyn SessionConsensusPeer> = Arc::new(
+                RemoteSessionConsensusPeer::new_insecure(binding, member.dial_addr, None),
+            );
             peers.insert(node_id, peer);
         }
 

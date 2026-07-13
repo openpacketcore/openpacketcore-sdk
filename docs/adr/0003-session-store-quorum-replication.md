@@ -98,6 +98,14 @@ revision 4. It carries the bounded payload-free expiry-authority preflight;
 error revision 4 adds `RecordExpiryPreflightLimitExceeded`. Older profiles
 fail before engine dispatch and require a drained full-membership upgrade.
 
+Each directed peer retains at most one single-in-flight authenticated
+connection after a correlated validated success. The shared absolute family
+deadlines are 2 seconds for AppendEntries/Openraft read-index, 5 seconds for
+Vote, and 10 seconds for InstallSnapshot, forwarded mutation, and consumer
+ReadBarrier. A fresh connection has a 1.5-second DNS/TCP/mTLS/bootstrap
+sub-bound contained inside that deadline. Every failure, cancellation, or
+uncertain stream position evicts the connection before Openraft retries.
+
 TLS session caches, tickets, resumption, early data, and 0-RTT are disabled;
 every reconnect performs a full mutual-TLS certificate exchange so rotated
 SVIDs cannot inherit cached replica authority.

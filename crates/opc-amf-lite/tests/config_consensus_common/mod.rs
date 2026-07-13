@@ -10,13 +10,23 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opc_consensus::{
     ConsensusPeer, ConsensusPeerError, ConsensusRpcHandler, ConsensusWireRequest,
-    ConsensusWireResponse,
+    ConsensusWireResponse, DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_persist::{
     AuditKey, ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch,
     ConfigConsensusConfigurationId, ConfigConsensusIdentity, ConfigConsensusNodeId,
     ConfigConsensusTopology, ConsensusConfigStore, SqliteBackend,
 };
+
+pub(super) fn cluster_transition_timeout() -> Duration {
+    let profile = DURABLE_CONSENSUS_TIMING_PROFILE;
+    // Admit one complete resampled election after a split vote, followed by
+    // one complete profiled durable-readiness operation. This is a bounded
+    // test-evidence ceiling derived from the shared timing authority, not an
+    // operator-tunable production deadline.
+    Duration::from_millis(profile.election_timeout_max_millis.saturating_mul(2))
+        .saturating_add(profile.operation_timeout())
+}
 
 #[derive(Clone)]
 struct LoopbackPeer {
@@ -163,7 +173,7 @@ impl ConfigCluster {
     }
 
     pub async fn wait_ready(&self) {
-        tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::time::timeout(cluster_transition_timeout(), async {
             loop {
                 let (one, two, three) = tokio::join!(
                     self.stores[0].probe_durable_readiness(),
@@ -212,7 +222,7 @@ impl ConfigCluster {
     }
 
     pub async fn wait_for_survivor_leader(&self, excluded: usize) -> usize {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(cluster_transition_timeout(), async {
             loop {
                 if let Some(index) = (0..self.stores.len()).find(|index| {
                     *index != excluded

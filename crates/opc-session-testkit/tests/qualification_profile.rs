@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use opc_consensus::{DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROFILE};
 use opc_session_net::{
     CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, MAX_NEGOTIATED_FRAME_SIZE,
     MIN_SESSION_CONSENSUS_FRAME_SIZE, SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION,
@@ -22,7 +23,7 @@ use opc_session_testkit::qualification::{
 };
 use serde_json::Value;
 
-const EVIDENCE_FIXTURE: &str = include_str!("fixtures/session-ha/evidence-fixture.json");
+const EVIDENCE_FIXTURE: &str = include_str!("fixtures/session-ha/evidence-fixture-v2.json");
 const HISTORY_FIXTURE: &str = include_str!("fixtures/session-ha/history-valid.jsonl");
 const SCHEDULE_FIXTURE: &str = include_str!("fixtures/session-ha/schedule-valid.jsonl");
 const OMITTED_HISTORY_FIXTURE: &str =
@@ -415,8 +416,8 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
     let profile: SessionHaQualificationProfile =
         serde_json::from_value(profile_value).expect("strict typed profile");
 
-    assert_eq!(profile.schema_version, "opc-session-ha-profile/v1");
-    assert_eq!(profile.profile_id, "opc-session-openraft-ha/v1");
+    assert_eq!(profile.schema_version, "opc-session-ha-profile/v2");
+    assert_eq!(profile.profile_id, "opc-session-openraft-ha/v2");
     assert_eq!(profile.maturity, "experimental");
     assert!(!profile.qualification_complete);
     assert_eq!(profile.workspace.version, env!("CARGO_PKG_VERSION"));
@@ -511,9 +512,79 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
     );
     assert!(!profile.protocol.legacy_direct_backend_enabled);
 
+    let timing = DURABLE_CONSENSUS_TIMING_PROFILE;
+    assert_eq!(
+        profile.consensus_timing.cold_connect_budget_composition,
+        "contained-within-family-deadline"
+    );
+    assert_eq!(
+        profile.consensus_timing.cold_connect_timeout_millis,
+        timing.cold_connect_timeout_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.append_entries_timeout_millis,
+        timing.append_entries_timeout_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.heartbeat_interval_millis,
+        DURABLE_OPENRAFT_PROFILE.heartbeat_interval_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.vote_timeout_millis,
+        timing.vote_timeout_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.election_timeout_min_millis,
+        DURABLE_OPENRAFT_PROFILE.election_timeout_min_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.election_timeout_max_millis,
+        DURABLE_OPENRAFT_PROFILE.election_timeout_max_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.install_snapshot_timeout_millis,
+        DURABLE_OPENRAFT_PROFILE.install_snapshot_timeout_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.forward_mutation_timeout_millis,
+        timing.forward_mutation_timeout_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.read_barrier_timeout_millis,
+        timing.read_barrier_timeout_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.server_idle_timeout_millis,
+        timing.server_idle_timeout_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.server_handler_timeout_millis,
+        timing.server_handler_timeout_millis
+    );
+    assert_eq!(
+        profile.consensus_timing.heartbeat_interval_millis,
+        profile.consensus_timing.append_entries_timeout_millis
+    );
+    assert!(
+        profile.consensus_timing.cold_connect_timeout_millis
+            < profile.consensus_timing.append_entries_timeout_millis
+    );
+    assert!(
+        profile.consensus_timing.election_timeout_min_millis
+            >= profile.consensus_timing.heartbeat_interval_millis * 2
+    );
+    assert!(
+        profile.consensus_timing.election_timeout_min_millis
+            < profile.consensus_timing.election_timeout_max_millis
+    );
+
     assert_eq!(
         profile.bounds.operation_timeout_millis,
         DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT.as_millis() as u64
+    );
+    assert_eq!(
+        profile.bounds.operation_timeout_millis,
+        timing.operation_timeout_millis
     );
     assert_eq!(
         profile.bounds.max_session_ttl_seconds,

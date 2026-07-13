@@ -11,6 +11,7 @@ use opc_config_model::{
     AuthStrength, RequestId, TransportType, TrustedPrincipal, WorkloadIdentity,
 };
 use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
+use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_mgmt_audit::{AuditError, AuditEvent, AuditOutcome, AuditSink};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -39,6 +40,13 @@ use crate::{
     SqliteSessionBackend, StateClass, StateType, StoredSessionRecord, SystemClock,
     REPLICATION_TX_ID_MAX_BYTES,
 };
+
+const RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .election_timeout_max_millis
+        .saturating_mul(2)
+        .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
+);
 
 #[derive(Default)]
 struct AllowRecovery;
@@ -2267,7 +2275,9 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
         result.expect("initialize recovered campaign membership");
     }
 
-    let deadline = Instant::now() + Duration::from_secs(12);
+    // Campaign finalization and readiness share one bounded window that admits
+    // a split-vote resampling plus a complete profiled operation.
+    let deadline = Instant::now() + RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT;
     let report = loop {
         let mut completed = None;
         for store in &stores {

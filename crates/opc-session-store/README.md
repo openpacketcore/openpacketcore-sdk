@@ -466,6 +466,14 @@ Revision 1/error revision 3 or older fails before dispatch. Drain traffic and
 writers, then stop and upgrade every consensus member together; mixed-profile
 rolling operation is unsupported.
 
+Both durable domains use the shared 10-second operation default. Transport
+families use 2 seconds for AppendEntries/Openraft read-index, 5 seconds for
+Vote, and 10 seconds for InstallSnapshot/forwarded mutation/consumer
+ReadBarrier. One absolute family deadline starts before the per-peer gate; a
+fresh DNS/TCP/mTLS/bootstrap path has a contained 1.5-second sub-bound and does
+not receive additive time. A directed peer caches at most one authenticated,
+single-in-flight connection after a correlated validated success.
+
 Topology admission validates the complete descriptor set, its exact local
 logical member, configuration digest, and stable derived node IDs without
 holding a storage or network adapter. The dedicated consensus transport then
