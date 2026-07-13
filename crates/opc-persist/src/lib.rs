@@ -7,9 +7,9 @@
 //! with a reference SQLite WAL backend. The backend is suitable for single-replica
 //! management-plane state; it is NOT a distributed consensus store.
 //!
-//! The crate also exposes [`ConsensusConfigStore`], a durable consensus prototype
-//! layered over local SQLite replicas. It is a hardening surface for HA work, not
-//! yet a carrier-production consensus backend.
+//! For HA deployments the crate exposes [`ConsensusConfigStore`], whose sole
+//! distributed authority is the SDK's shared Openraft engine. Payload sealing
+//! remains above this crate's consensus boundary.
 //!
 //! ## SQLite Backend Profile
 //!
@@ -96,7 +96,6 @@ mod consensus;
 mod error;
 mod mock;
 mod preflight;
-mod quorum;
 mod schema;
 mod security_policy;
 mod types;
@@ -108,17 +107,22 @@ pub use break_glass::{
     BreakGlassSession, BreakGlassStatus, DefaultBreakGlassApproval, NoopBreakGlassAlarmNotifier,
 };
 pub use consensus::{
-    AppendEntriesRequest, AppendEntriesResponse, ClusterMembership, ConsensusClock,
-    ConsensusConfigStore, ConsensusMetricsDump, ConsensusOp, ConsensusPeer, InstallSnapshotRequest,
-    InstallSnapshotResponse, LogEntry, NodeIdentity, PeerStatusDump, RequestVoteRequest,
-    RequestVoteResponse, Role, TcpPeer, TcpRpcServer, TimeoutNowRequest, TimeoutNowResponse,
+    ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusClusterId,
+    ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId, ConfigConsensusEntryDigest,
+    ConfigConsensusIdentity, ConfigConsensusIdentityError, ConfigConsensusNodeId,
+    ConfigConsensusOpenError, ConfigConsensusPeer, ConfigConsensusRequestId,
+    ConfigConsensusRpcHandler, ConfigConsensusStatus, ConfigConsensusTopology,
+    ConfigConsensusTopologyError, ConsensusConfigStore, LegacyConfigTailDisposition,
+    SharedConfigConsensusClock, SystemConfigConsensusClock, CONFIG_CONSENSUS_COMMAND_VERSION,
+    CONFIG_CONSENSUS_MAX_MEMBERS, CONFIG_CONSENSUS_SNAPSHOT_VERSION,
+    CONFIG_CONSENSUS_STORAGE_VERSION, CONFIG_CONSENSUS_WIRE_VERSION,
+    DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
-pub use error::{ConsensusRpcFamily, ConsensusRpcStage, PersistError, PersistErrorKind};
+pub use error::{PersistError, PersistErrorKind};
 #[cfg(feature = "dangerous-test-hooks")]
 pub use mock::{FaultInjectingStore, FaultType};
 pub use mock::{MockConfigStore, UnsafePathMock};
 pub use preflight::PersistCapabilities;
-pub use quorum::{FencedReplica, QuorumConfigStore};
 pub use security_policy::{
     ActivePolicyMetadata, PolicyHistoryEntry, SecurityPolicyError, SecurityPolicyService,
     SerializablePolicy, SerializableRule, SerializableRuleList, SqliteSecurityPolicyService,
@@ -128,6 +132,6 @@ pub use security_policy::{
     TEST_AUDIT_FAILURE_INSERT_FAIL, TEST_AUDIT_SUCCESS_INSERT_FAIL, TEST_COMMIT_FAIL,
 };
 pub use types::{
-    extract_tenant, redact_entry, AuditKey, AuditOpType, AuditRecord, CommitRecord, CommitSource,
-    RollbackTarget, StoredConfig,
+    extract_tenant, redact_entry, AttestedConfigCommit, AuditKey, AuditOpType, AuditRecord,
+    CommitRecord, CommitSource, RollbackTarget, StoredConfig,
 };

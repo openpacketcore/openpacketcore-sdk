@@ -83,18 +83,35 @@ async fn test_server_admission_control_overload() {
 
     let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
 
-    tokio::spawn(async move {
+    let server_task = tokio::spawn(async move {
         let _ = server.run_with_listener(listener, app).await;
     });
 
+    // This test verifies the first overload response. Retrying a deliberate
+    // 503 would honor the server's `Retry-After: 30` header twice and turn an
+    // immediate assertion into a deterministic 60-second workspace stall.
+    let retry_policy = RetryPolicy::new(1, Duration::ZERO, Duration::ZERO, Jitter::None);
     let client = SbiClientBuilder::new()
         .with_http2_only(false)
+        .with_retry_policy(retry_policy)
         .build()
         .unwrap();
     let consumer = MockConsumer::with_client(client);
 
     let url = format!("http://{addr}");
-    let (status, headers, body) = consumer.send_get(&url, HashMap::new()).await.unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        consumer.send_get(&url, HashMap::new()),
+    )
+    .await;
+
+    server_task.abort();
+    let server_exit = server_task.await;
+    assert!(matches!(server_exit, Err(error) if error.is_cancelled()));
+
+    let (status, headers, body) = response
+        .expect("overload response must be bounded")
+        .expect("overload response must be returned");
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(headers.get("retry-after").map(|s| s.as_str()), Some("30"));

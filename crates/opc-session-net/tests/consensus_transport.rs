@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
@@ -8,6 +8,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+use opc_persist::{
+    AuditKey, ConfigConsensusRequestId, ConfigConsensusTopology, ConfigStore, ConsensusConfigStore,
+    PersistErrorKind, SqliteBackend,
+};
 #[cfg(feature = "legacy-session-net-compat")]
 use opc_session_net::RemoteSessionBackend;
 use opc_session_net::{
@@ -435,6 +439,170 @@ async fn authenticated_consensus_call_uses_stable_manifest_node_ids() {
     );
 
     handle.abort_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
+    let pki = TestPki::new();
+    let manifest = manifest("config-openraft-mtls", 9, 1);
+    let directory = tempfile::tempdir().expect("config cluster directory");
+    let addresses = (0..3)
+        .map(|_| Arc::new(StdRwLock::new(None)))
+        .collect::<Vec<_>>();
+    let node_ids = [1_u16, 2, 3].map(|replica| {
+        manifest
+            .bind_local(replica_id(replica))
+            .expect("local manifest binding")
+            .local_consensus_node_id()
+    });
+    let members = node_ids.iter().copied().collect::<BTreeSet<_>>();
+    let identity = manifest
+        .bind_local(replica_id(1))
+        .expect("identity binding")
+        .consensus_identity();
+
+    let mut stores = Vec::new();
+    for (source, source_replica) in [1_u16, 2, 3].into_iter().enumerate() {
+        let local = manifest
+            .bind_local(replica_id(source_replica))
+            .expect("source binding");
+        let mut peers: BTreeMap<_, Arc<dyn SessionConsensusPeer>> = BTreeMap::new();
+        for (target, target_replica) in [1_u16, 2, 3].into_iter().enumerate() {
+            if source == target {
+                continue;
+            }
+            let binding = local
+                .clone()
+                .bind_remote(replica_id(target_replica))
+                .expect("remote binding");
+            let peer = RemoteSessionConsensusPeer::new_with_resolver(
+                binding,
+                deferred_resolver(
+                    Arc::clone(&addresses[target]),
+                    Arc::new(AtomicBool::new(true)),
+                ),
+                pki.client_config(source_replica),
+                Some(Duration::from_secs(3)),
+            );
+            peers.insert(node_ids[target], Arc::new(peer));
+        }
+        let backend = SqliteBackend::open_with_audit_key(
+            directory.path().join(format!("config-{source}.sqlite")),
+            true,
+            0,
+            AuditKey::new([0x75; 32]).expect("audit key"),
+        )
+        .await
+        .expect("config backend");
+        stores.push(
+            ConsensusConfigStore::open_with_operation_timeout(
+                ConfigConsensusTopology::try_new(identity, node_ids[source], members.clone())
+                    .expect("config topology"),
+                backend,
+                directory.path().join(format!("snapshots-{source}")),
+                peers,
+                Duration::from_secs(8),
+            )
+            .await
+            .expect("config store"),
+        );
+    }
+
+    let mut servers = Vec::new();
+    for (index, replica) in [1_u16, 2, 3].into_iter().enumerate() {
+        let binding = manifest
+            .bind_local(replica_id(replica))
+            .expect("server binding");
+        let (handle, actual) = SessionConsensusServer::new(
+            stores[index].rpc_handler(),
+            pki.server_config(replica),
+            binding,
+        )
+        .listen("127.0.0.1:0".parse().expect("listen address"))
+        .await
+        .expect("config consensus listener");
+        *addresses[index].write().expect("consensus address lock") = Some(actual);
+        servers.push(handle);
+    }
+
+    let (one, two, three) = tokio::join!(
+        stores[0].initialize_cluster(),
+        stores[1].initialize_cluster(),
+        stores[2].initialize_cluster(),
+    );
+    one.expect("initialize config node one");
+    two.expect("initialize config node two");
+    three.expect("initialize config node three");
+    // Real TLS handshakes, Openraft election, and the first read-index round
+    // share a busy multi-threaded test runtime. This evidence deadline is
+    // intentionally wider than the unchanged production operation timeout so
+    // readiness synchronization cannot flake under full-workspace load.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if stores
+                .iter()
+                .any(|store| store.status().leader_id.is_none())
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            let (one, two, three) = tokio::join!(
+                stores[0].probe_durable_readiness(),
+                stores[1].probe_durable_readiness(),
+                stores[2].probe_durable_readiness(),
+            );
+            if one.is_ok() && two.is_ok() && three.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("mTLS config cluster ready");
+
+    let leader = stores
+        .iter()
+        .find_map(|store| store.status().leader_id)
+        .expect("config leader");
+    let follower = stores
+        .iter()
+        .find(|store| store.status().node_id != leader)
+        .expect("config follower");
+    let error = follower
+        .mark_confirmed_idempotent(
+            ConfigConsensusRequestId::from_bytes([0xBC; 16]),
+            opc_types::TxId::new(),
+        )
+        .await
+        .expect_err("committed missing target returns deterministic domain error");
+    assert!(matches!(error.kind(), PersistErrorKind::RollbackNotFound));
+    assert!(follower
+        .load_latest()
+        .await
+        .expect("linearizable mTLS read")
+        .is_none());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if stores
+                .iter()
+                .all(|store| store.status().applied_index.is_some_and(|index| index >= 1))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("committed config command applied on every mTLS peer");
+
+    let _ = tokio::join!(
+        stores[0].shutdown(),
+        stores[1].shutdown(),
+        stores[2].shutdown(),
+    );
+    for server in servers {
+        server.abort_and_wait().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

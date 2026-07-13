@@ -166,10 +166,10 @@ struct ConsensusSessionStoreInner {
 /// SQLite session state coordinated by the SDK's single Openraft engine.
 ///
 /// Call [`Self::open`] first, start the consensus-only network listener using
-/// [`Self::rpc_handler`], then call [`Self::initialize_cluster`]. Calling
-/// initialization concurrently on every pristine member with the same
-/// admitted membership is safe; restart of an initialized member is also
-/// idempotent.
+/// [`Self::rpc_handler`], then call [`Self::initialize_cluster`] on every
+/// member. On clean first formation the method lets only the canonical lowest
+/// node initialize Openraft while the other pristine nodes wait for replicated
+/// membership. Restarted members with durable Openraft state skip bootstrap.
 #[derive(Clone)]
 pub struct ConsensusSessionStore {
     inner: Arc<ConsensusSessionStoreInner>,
@@ -317,24 +317,36 @@ impl ConsensusSessionStore {
     }
 
     /// Initialize pristine members with the exact admitted voting set.
+    ///
+    /// Concurrent calls are expected, but only the canonical lowest pristine
+    /// member invokes Openraft initialization. Other pristine members wait for
+    /// replicated membership, avoiding fixed-timeout split-vote lockstep.
+    /// Clean first formation fails closed if the canonical member is absent.
     pub async fn initialize_cluster(&self) -> Result<(), ConsensusSessionStoreOpenError> {
         self.inner.admitted.store(false, Ordering::Release);
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or(ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
-        let initialize = tokio::time::timeout_at(
-            deadline,
-            self.inner.raft.initialize(self.inner.members.clone()),
-        )
-        .await
-        .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
-        match initialize {
-            Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
-            Err(RaftError::APIError(InitializeError::NotInMembers(_))) => {
-                return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
-            }
-            Err(RaftError::Fatal(_)) => {
-                return Err(ConsensusSessionStoreOpenError::EngineUnavailable);
+        let initialized = tokio::time::timeout_at(deadline, self.inner.raft.is_initialized())
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?
+            .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+        let canonical_bootstrap = self.inner.members.first().copied();
+        if !initialized && canonical_bootstrap == Some(self.inner.local_node_id) {
+            let initialize = tokio::time::timeout_at(
+                deadline,
+                self.inner.raft.initialize(self.inner.members.clone()),
+            )
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
+            match initialize {
+                Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
+                Err(RaftError::APIError(InitializeError::NotInMembers(_))) => {
+                    return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
+                }
+                Err(RaftError::Fatal(_)) => {
+                    return Err(ConsensusSessionStoreOpenError::EngineUnavailable);
+                }
             }
         }
         self.wait_for_exact_membership(deadline).await?;

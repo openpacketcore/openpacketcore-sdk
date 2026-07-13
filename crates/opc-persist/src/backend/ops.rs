@@ -63,7 +63,9 @@ impl ConfigStore for SqliteBackend {
     ) -> Result<(), PersistError> {
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
-        let res = Self::append_commit_impl(&guard, record, audit, self.audit_key.as_ref());
+        let res = Self::ensure_standalone_write_authority(&guard).and_then(|()| {
+            Self::append_commit_impl(&guard, record, audit, self.audit_key.as_ref())
+        });
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_write_success
@@ -83,6 +85,7 @@ impl ConfigStore for SqliteBackend {
         let now = Timestamp::now_utc().to_string();
 
         let res = (|| -> Result<(), PersistError> {
+            Self::ensure_standalone_write_authority(&guard)?;
             let tx = guard
                 .unchecked_transaction()
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
@@ -143,6 +146,7 @@ impl ConfigStore for SqliteBackend {
         let tx_id_bytes = tx_id.as_uuid().as_bytes().to_vec();
 
         let res = (|| -> Result<(), PersistError> {
+            Self::ensure_standalone_write_authority(&guard)?;
             let tx = guard
                 .unchecked_transaction()
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
@@ -224,6 +228,28 @@ impl ConfigStore for SqliteBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl SqliteBackend {
+    /// Reject direct local mutation after the atomic Openraft authority claim.
+    ///
+    /// The consensus initializer and every standalone mutation share the same
+    /// SQLite connection mutex and use an immediate transaction, so a racing
+    /// local write is either included in the legacy-recovery check or observes
+    /// this durable fence and fails closed.
+    fn ensure_standalone_write_authority(conn: &rusqlite::Connection) -> Result<(), PersistError> {
+        let claimed: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_raft_identity')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| PersistError::io("config authority fence is unavailable"))?;
+        if claimed {
+            return Err(PersistError::inconsistent_state(
+                "direct config mutation is disabled after Openraft authority claim",
+            ));
+        }
+        Ok(())
+    }
+
     /// Verify an already-loaded audit chain using this backend's audit key.
     pub fn verify_audit_chain(&self, stored: &StoredConfig) -> Result<(), PersistError> {
         let res = stored.verify_audit_chain(self.audit_key.as_ref());
@@ -454,7 +480,7 @@ impl SqliteBackend {
         Ok(())
     }
 
-    fn load_by_tx_id_bytes(
+    pub(crate) fn load_by_tx_id_bytes(
         conn: &rusqlite::Connection,
         tx_id_bytes: &[u8],
         audit_key: &AuditKey,
@@ -704,6 +730,15 @@ impl SqliteBackend {
         correlation_id: Option<&str>,
         occurred_at: &str,
     ) -> Result<(), PersistError> {
+        #[cfg(feature = "dangerous-test-hooks")]
+        if self
+            .alarm_audit_write_fault
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(PersistError::sqlite(
+                "alarm audit write fault injected".to_owned(),
+            ));
+        }
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO alarm_audit (action, outcome, alarm_id, alarm_type, probable_cause, principal, tenant, reason, scope, correlation_id, occurred_at) \
@@ -758,12 +793,10 @@ impl SqliteBackend {
         Ok(results)
     }
 
-    /// Executes raw SQL on the database for testing.
+    /// Inject an alarm-audit write failure without exposing database authority.
     #[cfg(feature = "dangerous-test-hooks")]
-    pub async fn execute_raw_for_test(&self, sql: &str) -> Result<(), PersistError> {
-        let conn = self.conn.lock().await;
-        conn.execute(sql, [])
-            .map_err(|e| PersistError::sqlite(e.to_string()))?;
-        Ok(())
+    pub fn inject_alarm_audit_write_failure_for_test(&self) {
+        self.alarm_audit_write_fault
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }

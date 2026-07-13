@@ -141,7 +141,7 @@ async fn setup_break_glass_service() -> (
 
 fn verify_break_glass_audit_chain(
     db_path: &std::path::Path,
-    audit_key: &AuditKey,
+    audit_key: &[u8; 32],
     tenant: &str,
 ) -> Result<(), String> {
     // 1. Open SQLite database connection directly
@@ -206,8 +206,7 @@ fn verify_break_glass_audit_chain(
         mac_input.extend_from_slice(&entry.previous_hash);
 
         type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-        let mut mac =
-            HmacSha256::new_from_slice(audit_key.as_bytes()).map_err(|e| e.to_string())?;
+        let mut mac = HmacSha256::new_from_slice(audit_key).map_err(|e| e.to_string())?;
         mac.update(&mac_input);
         let expected_hmac: [u8; 32] = mac.finalize().into_bytes().into();
 
@@ -666,7 +665,8 @@ async fn test_tampering_checks() {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("tampering_check.db");
     let tenant = "test-tenant";
-    let audit_key = AuditKey::new([0x42; 32]).unwrap();
+    let audit_key_bytes = [0x42; 32];
+    let audit_key = AuditKey::new(audit_key_bytes).unwrap();
 
     // Setup service with our DB file
     let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, audit_key.clone())
@@ -726,7 +726,7 @@ async fn test_tampering_checks() {
         .unwrap();
 
     // Verify valid audit chain passes
-    let verify_res = verify_break_glass_audit_chain(&db_path, &audit_key, tenant);
+    let verify_res = verify_break_glass_audit_chain(&db_path, &audit_key_bytes, tenant);
     assert!(
         verify_res.is_ok(),
         "Expected valid audit chain to pass verification"
@@ -744,7 +744,7 @@ async fn test_tampering_checks() {
     }
 
     // Verify verification fails now
-    let verify_res = verify_break_glass_audit_chain(&db_path, &audit_key, tenant);
+    let verify_res = verify_break_glass_audit_chain(&db_path, &audit_key_bytes, tenant);
     assert!(
         verify_res.is_err(),
         "Expected verification to fail after modifying entry field"
@@ -760,7 +760,7 @@ async fn test_tampering_checks() {
         .unwrap();
     }
     assert!(
-        verify_break_glass_audit_chain(&db_path, &audit_key, tenant).is_ok(),
+        verify_break_glass_audit_chain(&db_path, &audit_key_bytes, tenant).is_ok(),
         "Expected verification to pass after restoration"
     );
 
@@ -773,7 +773,7 @@ async fn test_tampering_checks() {
         )
         .unwrap();
     }
-    let verify_res = verify_break_glass_audit_chain(&db_path, &audit_key, tenant);
+    let verify_res = verify_break_glass_audit_chain(&db_path, &audit_key_bytes, tenant);
     assert!(
         verify_res.is_err(),
         "Expected verification to fail after modifying entry HMAC"

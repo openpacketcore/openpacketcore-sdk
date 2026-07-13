@@ -19,6 +19,8 @@
 
 use rand::{rngs::SysRng, TryRng};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "dangerous-test-hooks")]
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
@@ -31,7 +33,6 @@ use crate::types::{extract_tenant, AuditKey, AuditOpType, AuditRecord, CommitSou
 use opc_types::TxId;
 
 mod ops;
-mod replication;
 
 type StoredConfigRow = (
     Vec<u8>,
@@ -108,6 +109,22 @@ pub(crate) fn deserialize_audit_op_type(s: &str) -> Result<AuditOpType, PersistE
 /// SQLite-backed ConfigStore suitable for the reference management-plane store.
 ///
 /// Created via [`SqliteBackend::open`] or `SqliteBackend::in_memory_for_test`.
+/// The connection and audit key are intentionally not exposed; authority is
+/// available only through typed store operations.
+///
+/// ```compile_fail
+/// use opc_persist::SqliteBackend;
+/// fn raw_connection(backend: &SqliteBackend) {
+///     let _ = backend.conn();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use opc_persist::SqliteBackend;
+/// fn raw_audit_key(backend: &SqliteBackend) {
+///     let _ = backend.audit_key();
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct SqliteBackend {
     /// Path to the database (for preflight reporting).
@@ -119,10 +136,17 @@ pub struct SqliteBackend {
     /// The shared database connection protected by an async mutex.
     /// All DB operations hold this lock for the duration of the call.
     conn: Arc<AsyncMutex<rusqlite::Connection>>,
+    /// Shared admission for config-consensus blocking work, including startup
+    /// before the consensus core exists.
+    config_consensus_worker_gate: Arc<tokio::sync::Semaphore>,
     /// Audit HMAC key used to seal and verify local audit-trail rows.
     audit_key: Arc<AuditKey>,
     /// Cached preflight result (populated after first successful preflight).
     cached_caps: std::sync::OnceLock<PersistCapabilities>,
+    /// Narrow fault injection for the alarm-audit adapter. This deliberately
+    /// cannot execute SQL or mutate config/consensus authority.
+    #[cfg(feature = "dangerous-test-hooks")]
+    alarm_audit_write_fault: Arc<AtomicBool>,
 }
 
 impl SqliteBackend {
@@ -184,12 +208,33 @@ impl SqliteBackend {
         Self::open_inner(path.into(), ephemeral, min_free_bytes, audit_key).await
     }
 
-    pub fn audit_key(&self) -> &AuditKey {
+    pub(crate) fn audit_key(&self) -> &AuditKey {
         &self.audit_key
     }
 
-    pub fn conn(&self) -> Arc<AsyncMutex<rusqlite::Connection>> {
+    pub(crate) fn conn(&self) -> Arc<AsyncMutex<rusqlite::Connection>> {
         self.conn.clone()
+    }
+
+    pub(crate) fn config_consensus_worker_gate(&self) -> Arc<tokio::sync::Semaphore> {
+        self.config_consensus_worker_gate.clone()
+    }
+
+    pub(crate) const fn is_ephemeral(&self) -> bool {
+        self.ephemeral
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn durable_device_id(&self) -> Result<u64, PersistError> {
+        use std::os::unix::fs::MetadataExt as _;
+        if self.ephemeral || Self::is_in_memory_database(&self.db_path) {
+            return Err(PersistError::preflight_failed(
+                "ephemeral backends do not have a durable device identity",
+            ));
+        }
+        std::fs::metadata(&self.db_path)
+            .map(|metadata| metadata.dev())
+            .map_err(|_| PersistError::preflight_failed("database backing identity is unavailable"))
     }
 
     fn random_ephemeral_audit_key() -> Result<AuditKey, PersistError> {
@@ -232,8 +277,11 @@ impl SqliteBackend {
             ephemeral,
             min_free_bytes,
             conn: Arc::new(AsyncMutex::new(conn)),
+            config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
             cached_caps: std::sync::OnceLock::new(),
+            #[cfg(feature = "dangerous-test-hooks")]
+            alarm_audit_write_fault: Arc::new(AtomicBool::new(false)),
         };
 
         // Cache the preflight result
@@ -306,6 +354,7 @@ impl SqliteBackend {
             | (Some("1.6.0"), _)
             | (Some("1.7.0"), _)
             | (Some("1.8.0"), _)
+            | (Some("1.8.1"), _)
             | (None, _) => {
                 if let Some(from_version) = current_version.as_deref() {
                     schema::run_migrations(&conn, from_version)

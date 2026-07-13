@@ -345,13 +345,15 @@ campaigns.
 - Session-net disables TLS session caches, tickets, resumption, early data, and
   0-RTT. Every reconnect pays for a full mutual-TLS handshake so SVID rotation
   cannot reuse a cached peer certificate or authority decision.
-- That reconnect behavior is a safety primitive, not seamless-rotation
-  qualification. A production CNF must support certificate and trust-bundle
-  rotation without a service interruption, including trust overlap,
-  long-lived-connection retirement, revocation, reconnect storms, and a
-  documented maximum authentication age. The session-net lifecycle is #158
-  and distributed qualification remains #143. The 365-day session TTL bound is
-  unrelated to
+- Real-mTLS consensus tests now qualify a renewed client/server SVID on a
+  subsequent new call/full handshake and rejection when either rotated
+  identity no longer matches the bound peer. They do not exercise an in-flight
+  or retained old connection and therefore do not qualify seamless continuity
+  or connection retirement.
+  A production CNF still owns trust-bundle overlap, long-lived-connection
+  retirement, revocation, reconnect storms, and a documented maximum
+  authentication age. Multi-process rotation/soak and distributed
+  qualification remain open. The 365-day session TTL bound is unrelated to
   certificate lifetime, trust-bundle lifetime, or authentication age.
 - The configuration ID is a SHA-256 digest of the cluster ID, explicit
   generation, and the full sorted descriptor set. Changing a member ID,
@@ -509,16 +511,20 @@ campaigns.
   only. The production model/persistence stable-ID contract, privacy policy,
   audit, and migration remain #167. A canonical durable `ReplicationEntry`
   transaction-ID type plus persistence migration remains #168 and must be
-  coordinated with #128/#143. `opc-persist` peer RPCs now use their own atomic
-  end-to-end logical deadline under #169.
+  coordinated with #128/#143. #177 removes `opc-persist`'s private config TCP
+  path and composes config consensus through these shared peer/handler ports;
+  it does not define a second deadline or credential lifecycle.
 
 ## Roadmap
 
 - Close #128/#129, #145, #148, and the model/persistence work in
   #167/#168/#171; and add distributed
-  failure and soak evidence. Seamless SVID/trust-bundle lifecycle is #158;
-  payload-protection-key rotation and the complete production qualification
-  remain #143. Close those before treating this as production transport.
+  failure and soak evidence. A renewed SVID on a subsequent new call/full
+  handshake and wrong-scope rejection now have scoped real-mTLS qualification;
+  seamless continuity/connection retirement, complete trust-bundle,
+  revocation, authentication-age, multi-process rotation,
+  payload-protection-key, and production qualification work remains. Close
+  those before treating this as production transport.
 - Keep plaintext transport limited to tests.
 - Keep the compatibility server wrapping `SessionStoreBackend` rather than
   owning storage; production authority uses only `SessionConsensusServer`.
@@ -530,6 +536,13 @@ campaigns.
 - `tests/authenticated_replica_identity.rs` covers exact v4 profile/identity, routing
   aliases, certificate/claim/scope mismatches, downgrade and malformed Hello,
   reconnect/rotation, relabeling, and replayed challenge responses over mTLS.
+- `tests/consensus_transport.rs` covers the shared consensus-only ALPN,
+  complete call deadlines, scope binding, a renewed SVID observed on a
+  subsequent new call/full handshake, wrong rotated identities, and rejection
+  of legacy backend authority. It also forms a real three-node
+  `ConsensusConfigStore` over the existing mTLS peer/server and commits plus
+  linearizably reads through that shared adapter. It does not exercise
+  retained-connection retirement or out-of-process deployment.
 - `tests/three_node_quorum.rs` covers typed TTL and replication-tree-limit
   rejection before resolution and authenticated server dispatch, plus
   connection reuse after rejection, deterministic listener/handler teardown,

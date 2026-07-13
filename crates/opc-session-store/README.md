@@ -61,6 +61,11 @@ evidence.
   `QuorumSessionStore` is a compatibility type alias to that same Openraft
   implementation, not a second quorum algorithm. Callers install its
   consensus RPC handler, then call `initialize_cluster` for pristine storage.
+  Every member may make that call concurrently. On clean first formation only
+  the canonical lowest node initializes Openraft; the other pristine members
+  wait for replicated membership. A member reopening durable Openraft state
+  skips bootstrap and re-admits normally. Clean first formation fails closed
+  when the canonical node is absent.
 - `ConsensusSessionStore::probe_durable_readiness` uses the same bounded
   Openraft linearizable-read barrier as real authoritative operations. It does
   not treat a bound listener or cached capabilities as quorum evidence.
@@ -336,9 +341,15 @@ the resulting `ConsensusIdentity` to `QuorumTopologyConfig::new_consensus`.
 Open each node with its own file-backed `SqliteSessionBackend`, snapshot
 directory, and an exact map of every other stable node ID to a
 `SessionConsensusPeer`. Install `rpc_handler()` on the dedicated authenticated
-consensus listener before concurrently calling `initialize_cluster()` on a
-pristine fleet. Do not form membership from DNS order or start a local writer
-while peers are still unidentified.
+consensus listener before concurrently calling `initialize_cluster()` on the
+fleet. During clean first formation the method admits only the canonical
+lowest stable node ID as the Openraft initializer; other pristine members wait
+for its exact membership to replicate. Persistent members skip initialization
+on restart, so a noncanonical durable majority restarts normally. Do not form
+membership from DNS order or start a local writer while peers are still
+unidentified. Clean first formation requires the canonical node and fails
+closed if it is absent; this restriction does not apply to a fleet reopening
+persisted Openraft membership.
 
 The topology member vector contains only `QuorumReplicaDescriptor` values.
 The node's one local SQLite backend is supplied separately to
@@ -689,22 +700,26 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   coherent checkpoint/reverse migration. #167 owns the production stable-ID
   model/persistence/privacy/audit contract; #168 owns the durable canonical
   transaction-ID type and migration coordinated with #127/#128/#143. This
-  supplies no durable authority, seamless credential rotation (#158), or distributed and
-  payload-key qualification (#143). #169 separately owns `opc-persist`'s
-  replacement of `TcpPeer::timeout`'s per-stage behavior (up to three attempts
-  with backoff) with an
-  atomic end-to-end logical-RPC deadline, safe retry policy, and metrics; #159
-  does not change that behavior.
+  supplies no durable authority or distributed/payload-key qualification
+  (#143). Shared real-mTLS tests now qualify a renewed SVID on a subsequent new
+  call/full handshake and wrong-scope rejection. They do not exercise seamless
+  old-connection retirement. Broader multi-process rotation/soak and the
+  complete trust-bundle, revocation, authentication-age, and seamless
+  continuity lifecycle remain separate production gates. #177 removes
+  `opc-persist`'s private config TCP path and reuses the shared consensus ports;
+  #159 does not define a second config deadline or credential lifecycle.
 
 ## Roadmap
 
 - Keep backend capabilities explicit so HA/profile suitability can fail closed.
 - Continue hardening restore evidence and traffic-blocking gates.
 - Complete watch handoff correctness (#145), absolute-expiry admission (#148),
-  production stable-ID and
-  transaction-ID persistence contracts (#167/#168), and persist peer
-  logical-RPC deadlines (#169), then complete the production qualification
-  profile. Seamless certificate/trust-bundle lifecycle is #158;
+  production stable-ID and transaction-ID persistence contracts (#167/#168),
+  and persisted peer logical-RPC deadlines (#169), then complete the production
+  qualification profile. A renewed SVID on a subsequent new call/full handshake
+  and wrong-scope rejection have scoped real-mTLS coverage; seamless connection
+  retirement and the broader certificate/trust, revocation,
+  authentication-age, multi-process, and soak work remains open under #158;
   remote-seal historical-key rotation is #179, and distributed
   payload-protection evidence remains #143.
 - Keep encryption AAD bound to namespace, NF kind, state type, generation,

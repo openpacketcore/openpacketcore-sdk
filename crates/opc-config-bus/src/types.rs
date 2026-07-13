@@ -372,6 +372,7 @@ impl<C: OpcConfig> StoredConfig<C> {
 pub struct SealedConfig<C: OpcConfig> {
     schema_digest: SchemaDigest,
     legacy_plaintext: Option<C>,
+    fresh_envelope: Option<opc_crypto::AuthenticatedEnvelope>,
     marker: PhantomData<fn() -> C>,
 }
 
@@ -383,8 +384,34 @@ impl<C: OpcConfig> SealedConfig<C> {
         Self {
             schema_digest,
             legacy_plaintext: None,
+            fresh_envelope: None,
             marker: PhantomData,
         }
+    }
+
+    pub(crate) fn newly_encrypted(
+        schema_digest: SchemaDigest,
+        envelope: opc_crypto::AuthenticatedEnvelope,
+    ) -> Self {
+        Self {
+            schema_digest,
+            legacy_plaintext: None,
+            fresh_envelope: Some(envelope),
+            marker: PhantomData,
+        }
+    }
+
+    /// Consume evidence that this exact record was produced by the live
+    /// encrypting adapter. Persisted markers created by [`Self::new`] and
+    /// legacy plaintext markers cannot mint this capability.
+    pub fn claim_fresh_envelope(
+        &self,
+    ) -> Result<opc_crypto::AuthenticatedEnvelopeClaim, StoreError> {
+        self.fresh_envelope
+            .as_ref()
+            .ok_or_else(|| StoreError::crypto("config envelope lacks fresh encryption evidence"))?
+            .claim()
+            .map_err(|_| StoreError::crypto("config envelope evidence was already consumed"))
     }
 
     /// Wraps an unencrypted payload from a record written before envelope
@@ -394,6 +421,7 @@ impl<C: OpcConfig> SealedConfig<C> {
         Self {
             schema_digest: config.schema_digest(),
             legacy_plaintext: Some(config),
+            fresh_envelope: None,
             marker: PhantomData,
         }
     }

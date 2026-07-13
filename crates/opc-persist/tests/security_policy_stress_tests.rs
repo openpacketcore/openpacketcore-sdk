@@ -423,7 +423,7 @@ async fn test_concurrency_stage_and_apply_stress() {
 #[tokio::test]
 async fn test_adversarial_aad_injection_mismatched_tenant() {
     let _guard = TEST_MUTEX.lock().await;
-    let (service, _temp_dir, backend) = setup_stress_service().await;
+    let (service, temp_dir, _backend) = setup_stress_service().await;
 
     // 1. Stage a policy for tenant-a
     let policy_a = make_valid_policy(1);
@@ -434,27 +434,23 @@ async fn test_adversarial_aad_injection_mismatched_tenant() {
         .unwrap();
 
     // Fetch tenant-a's staged entry directly from the DB
-    let conn_mutex = backend.conn();
-    let (version, encrypted_blob): (u64, Vec<u8>) = {
-        let conn = conn_mutex.lock().await;
-        conn.query_row(
+    let conn = rusqlite::Connection::open(temp_dir.path().join("stress_security.db")).unwrap();
+    let (version, encrypted_blob): (u64, Vec<u8>) = conn
+        .query_row(
             "SELECT version, encrypted_blob FROM staged_security_policy WHERE tenant = 'tenant-a'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .unwrap()
-    };
+        .unwrap();
 
     // 2. Perform injection: write tenant-a's encrypted_blob into tenant-b's staged row
-    {
-        let conn = conn_mutex.lock().await;
-        conn.execute(
+    conn.execute(
             "INSERT INTO staged_security_policy (tenant, version, staged_at, principal, encrypted_blob) \
              VALUES ('tenant-b', ?1, '2026-06-08T22:00:00Z', 'spiffe://test-domain/tenant/tenant-b/ns/default/sa/security-admin/nf/amf/instance/0', ?2)",
             rusqlite::params![version, encrypted_blob],
         )
         .unwrap();
-    }
+    drop(conn);
 
     // 3. Attempt validation on tenant-b using tenant-b's admin principal
     let principal_b = get_tenant_admin_principal("tenant-b");
@@ -470,7 +466,7 @@ async fn test_adversarial_aad_injection_mismatched_tenant() {
 #[tokio::test]
 async fn test_adversarial_version_mismatched_tampering() {
     let _guard = TEST_MUTEX.lock().await;
-    let (service, _temp_dir, backend) = setup_stress_service().await;
+    let (service, temp_dir, _backend) = setup_stress_service().await;
 
     // 1. Stage a policy for tenant-a with version 2
     let policy_a = make_valid_policy(2);
@@ -481,9 +477,8 @@ async fn test_adversarial_version_mismatched_tampering() {
         .unwrap();
 
     // 2. Tamper with version: update the metadata column 'version' to 1 (while the blob has version 2 bound in AAD)
-    let conn_mutex = backend.conn();
     {
-        let conn = conn_mutex.lock().await;
+        let conn = rusqlite::Connection::open(temp_dir.path().join("stress_security.db")).unwrap();
         conn.execute(
             "UPDATE staged_security_policy SET version = 1 WHERE tenant = 'tenant-a'",
             [],

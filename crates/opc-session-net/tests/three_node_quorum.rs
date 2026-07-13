@@ -2140,12 +2140,21 @@ async fn replication_log_returns_the_largest_contiguous_prefix_for_the_peer_budg
         payload_replication_entry(2, 4096),
         payload_replication_entry(3, 4096),
     ];
-    let one_entry_budget =
-        serde_json::to_vec(&opc_session_net::Response::GetReplicationLog(Ok(vec![
-            entries[0].clone(),
-        ])))
-        .expect("size one valid replication entry")
-        .len();
+    // RFC 3339 fractional seconds are canonically trimmed, so otherwise
+    // equivalent entries created at different instants can differ by a few
+    // encoded bytes. Every page continuation must fit the chosen one-entry
+    // budget; sizing only the first entry makes this test nondeterministic.
+    let one_entry_budget = entries
+        .iter()
+        .map(|entry| {
+            serde_json::to_vec(&opc_session_net::Response::GetReplicationLog(Ok(vec![
+                entry.clone(),
+            ])))
+            .expect("size one valid replication entry")
+            .len()
+        })
+        .max()
+        .expect("non-empty replication fixture");
     assert!(one_entry_budget >= opc_session_net::protocol::MIN_NEGOTIATED_FRAME_SIZE);
     assert!(
         serde_json::to_vec(&opc_session_net::Response::GetReplicationLog(Ok(entries

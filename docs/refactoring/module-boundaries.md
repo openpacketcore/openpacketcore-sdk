@@ -34,18 +34,16 @@ The primary objectives achieved during this refactoring are:
 * **Facade**: [src/lib.rs](../../crates/opc-persist/src/lib.rs)
 * **Backend Database Modules**:
   * [backend/mod.rs](../../crates/opc-persist/src/backend/mod.rs): Main SqliteBackend facade.
-  * [backend/ops.rs](../../crates/opc-persist/src/backend/ops.rs): Local store CRUD and commit state checks.
-  * [backend/replication.rs](../../crates/opc-persist/src/backend/replication.rs): Consensus WAL logs and snapshot saves.
+  * [backend/ops.rs](../../crates/opc-persist/src/backend/ops.rs): Local store CRUD, audit loading, and the standalone-write authority fence.
 * **Consensus Modules**:
-  * [consensus/mod.rs](../../crates/opc-persist/src/consensus/mod.rs): Consensus facade & engine orchestration.
-  * [consensus/types.rs](../../crates/opc-persist/src/consensus/types.rs): State definitions and client request frames.
-  * [consensus/membership.rs](../../crates/opc-persist/src/consensus/membership.rs): Quorum voter promotion/removal.
-  * [consensus/election.rs](../../crates/opc-persist/src/consensus/election.rs): Campaigns and candidate/leader role transitions.
-  * [consensus/replication.rs](../../crates/opc-persist/src/consensus/replication.rs): AppendEntries logs replicate and index tracking.
-  * [consensus/read_index.rs](../../crates/opc-persist/src/consensus/read_index.rs): Linearizable client queries validation.
-  * [consensus/snapshot.rs](../../crates/opc-persist/src/consensus/snapshot.rs): Compact snapshots saving and verification.
-  * [consensus/transport.rs](../../crates/opc-persist/src/consensus/transport.rs): TCP RPC network bounds framing.
-  * [consensus/identity.rs](../../crates/opc-persist/src/consensus/identity.rs): SPIFFE cert credentials checker.
+  * [consensus/mod.rs](../../crates/opc-persist/src/consensus/mod.rs): Config consensus facade and the shared Openraft type declaration.
+  * [consensus/types.rs](../../crates/opc-persist/src/consensus/types.rs): Exact topology, sealed/redacted commands, durable outcomes, and approved legacy recovery types.
+  * [consensus/store.rs](../../crates/opc-persist/src/consensus/store.rs): `ConfigStore` facade, exact immutable voter admission, linearizable reads, and attested writes.
+  * [consensus/raft_adapter.rs](../../crates/opc-persist/src/consensus/raft_adapter.rs): Bounded `opc-consensus` network and inbound Openraft RPC adapters.
+  * [consensus/storage.rs](../../crates/opc-persist/src/consensus/storage.rs): Openraft log/state-machine storage traits and offline recovery staging.
+  * [consensus/sqlite.rs](../../crates/opc-persist/src/consensus/sqlite.rs): Atomic SQLite authority claim, deterministic apply, snapshots, and exact legacy import.
+  * [consensus/snapshot_file.rs](../../crates/opc-persist/src/consensus/snapshot_file.rs): Redaction-safe seekable snapshot staging file.
+  * Production mTLS is composed through the shared `opc-session-net` transport; `opc-persist` has no private TCP/TLS module.
 * **Security Policy Modules**:
   * [security_policy/mod.rs](../../crates/opc-persist/src/security_policy/mod.rs): Entry point.
   * [security_policy/service.rs](../../crates/opc-persist/src/security_policy/service.rs): Main security policy validator.

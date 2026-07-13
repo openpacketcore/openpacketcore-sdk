@@ -40,6 +40,7 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
+opc-persist = { path = "../opc-persist", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }
 bytes = { workspace = true }
