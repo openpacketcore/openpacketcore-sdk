@@ -639,6 +639,7 @@ async fn load_projected_generation_once<O: ReadPhaseObserver>(
         &target,
         &generation_dir.join(&config.cert_file),
         MAX_PROJECTED_SVID_CERT_FILE_BYTES,
+        budget.remaining(),
     )
     .await?;
     budget.add(cert_bytes.len())?;
@@ -651,6 +652,7 @@ async fn load_projected_generation_once<O: ReadPhaseObserver>(
             &target,
             &generation_dir.join(&config.key_file),
             MAX_PROJECTED_SVID_KEY_FILE_BYTES,
+            budget.remaining(),
         )
         .await?,
     );
@@ -665,6 +667,7 @@ async fn load_projected_generation_once<O: ReadPhaseObserver>(
             &target,
             &generation_dir.join(bundle_file),
             MAX_PROJECTED_SVID_BUNDLE_FILE_BYTES,
+            budget.remaining(),
         )
         .await?;
         budget.add(bytes.len())?;
@@ -732,9 +735,10 @@ async fn ensure_generation_current(
     }
 }
 
-async fn read_bounded_file(
+async fn read_bounded_file_with_aggregate(
     path: &Path,
-    maximum: usize,
+    per_file_maximum: usize,
+    aggregate_remaining: usize,
 ) -> Result<Vec<u8>, ProjectedSvidReloadReason> {
     let metadata = tokio::fs::symlink_metadata(path)
         .await
@@ -742,35 +746,51 @@ async fn read_bounded_file(
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(ProjectedSvidReloadReason::MaterialNotRegular);
     }
-    if metadata.len() > maximum as u64 {
+    if metadata.len() > per_file_maximum as u64 {
         return Err(ProjectedSvidReloadReason::MaterialFileTooLarge);
     }
+    if metadata.len() > aggregate_remaining as u64 {
+        return Err(ProjectedSvidReloadReason::TotalMaterialTooLarge);
+    }
 
-    let file = tokio::fs::File::open(path)
+    let mut file = tokio::fs::File::open(path)
         .await
         .map_err(|_| ProjectedSvidReloadReason::MaterialUnavailable)?;
     let opened_metadata = file
         .metadata()
         .await
         .map_err(|_| ProjectedSvidReloadReason::MaterialUnavailable)?;
-    if !opened_metadata.is_file() || opened_metadata.len() > maximum as u64 {
-        return Err(if opened_metadata.len() > maximum as u64 {
+    if !opened_metadata.is_file() || opened_metadata.len() > per_file_maximum as u64 {
+        return Err(if opened_metadata.len() > per_file_maximum as u64 {
             ProjectedSvidReloadReason::MaterialFileTooLarge
         } else {
             ProjectedSvidReloadReason::MaterialNotRegular
         });
     }
+    if opened_metadata.len() > aggregate_remaining as u64 {
+        return Err(ProjectedSvidReloadReason::TotalMaterialTooLarge);
+    }
 
     let capacity = usize::try_from(opened_metadata.len())
-        .unwrap_or(maximum)
-        .min(maximum);
+        .unwrap_or(per_file_maximum)
+        .min(per_file_maximum)
+        .min(aggregate_remaining);
     let mut bytes = Vec::with_capacity(capacity);
-    file.take((maximum + 1) as u64)
+    let read_limit = per_file_maximum.min(aggregate_remaining);
+    (&mut file)
+        .take(read_limit as u64)
         .read_to_end(&mut bytes)
         .await
         .map_err(|_| ProjectedSvidReloadReason::MaterialUnavailable)?;
-    if bytes.len() > maximum {
+    let final_metadata = file
+        .metadata()
+        .await
+        .map_err(|_| ProjectedSvidReloadReason::MaterialUnavailable)?;
+    if final_metadata.len() > per_file_maximum as u64 || bytes.len() > per_file_maximum {
         return Err(ProjectedSvidReloadReason::MaterialFileTooLarge);
+    }
+    if final_metadata.len() > aggregate_remaining as u64 || bytes.len() > aggregate_remaining {
+        return Err(ProjectedSvidReloadReason::TotalMaterialTooLarge);
     }
     Ok(bytes)
 }
@@ -780,8 +800,9 @@ async fn read_generation_file(
     generation: &Path,
     path: &Path,
     maximum: usize,
+    aggregate_remaining: usize,
 ) -> Result<Vec<u8>, ProjectedSvidReloadReason> {
-    match read_bounded_file(path, maximum).await {
+    match read_bounded_file_with_aggregate(path, maximum, aggregate_remaining).await {
         Ok(bytes) => Ok(bytes),
         Err(reason) => {
             ensure_generation_current(root, generation).await?;
@@ -832,6 +853,10 @@ struct MaterialBudget {
 }
 
 impl MaterialBudget {
+    fn remaining(&self) -> usize {
+        MAX_PROJECTED_SVID_TOTAL_BYTES.saturating_sub(self.bytes)
+    }
+
     fn add(&mut self, bytes: usize) -> Result<(), ProjectedSvidReloadReason> {
         self.bytes = self
             .bytes
@@ -1221,7 +1246,7 @@ mod tests {
             let path = directory.path().join(name);
             fs::write(&path, vec![b'x'; maximum]).expect("write exact-bound file");
             assert_eq!(
-                read_bounded_file(&path, maximum)
+                read_bounded_file_with_aggregate(&path, maximum, usize::MAX)
                     .await
                     .expect("exact file bound")
                     .len(),
@@ -1229,7 +1254,7 @@ mod tests {
             );
             fs::write(&path, vec![b'x'; maximum + 1]).expect("write over-bound file");
             assert_eq!(
-                read_bounded_file(&path, maximum).await,
+                read_bounded_file_with_aggregate(&path, maximum, usize::MAX).await,
                 Err(ProjectedSvidReloadReason::MaterialFileTooLarge)
             );
         }
@@ -1243,43 +1268,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_material_limit_applies_before_candidate_parsing() {
+    async fn load_path_accepts_exact_aggregate_limit_and_rejects_one_over() {
         let directory = TestDirectory::new("aggregate-bound");
-        let generation = directory.path().join("..gen-a");
-        fs::create_dir_all(&generation).expect("create aggregate generation");
-        fs::write(
-            generation.join(CERT_FILE),
-            vec![b'x'; MAX_PROJECTED_SVID_CERT_FILE_BYTES],
-        )
-        .expect("write exact-size certificate file");
-        fs::write(
-            generation.join(KEY_FILE),
-            vec![b'x'; MAX_PROJECTED_SVID_KEY_FILE_BYTES],
-        )
-        .expect("write exact-size private-key file");
-        let bundle_files = (0..3)
+        let material = valid_material(SPIFFE_A);
+        let bundle_files = (0..4)
             .map(|index| PathBuf::from(format!("bundle-{index}.pem")))
             .collect::<Vec<_>>();
-        for bundle_file in &bundle_files {
-            fs::write(
-                generation.join(bundle_file),
-                vec![b'x'; MAX_PROJECTED_SVID_BUNDLE_FILE_BYTES],
-            )
-            .expect("write exact-size bundle file");
-        }
-        switch_generation(directory.path(), "..gen-a");
+        let fixed_bytes = material
+            .cert_chain_pem
+            .len()
+            .checked_add(material.private_key_pem.len())
+            .and_then(|bytes| bytes.checked_add(3 * MAX_PROJECTED_SVID_BUNDLE_FILE_BYTES))
+            .expect("bounded exact candidate size");
+        let final_bundle_exact = MAX_PROJECTED_SVID_TOTAL_BYTES
+            .checked_sub(fixed_bytes)
+            .expect("four bundle files can reach the aggregate limit");
+        assert!(final_bundle_exact >= material.bundle_pem.len());
+        assert!(final_bundle_exact < MAX_PROJECTED_SVID_BUNDLE_FILE_BYTES);
+
+        let write_limited_generation = |name: &str, final_bundle_bytes: usize| {
+            let generation = directory.path().join(name);
+            fs::create_dir_all(&generation).expect("create aggregate generation");
+            fs::write(generation.join(CERT_FILE), &material.cert_chain_pem)
+                .expect("write aggregate certificate");
+            fs::write(generation.join(KEY_FILE), &material.private_key_pem)
+                .expect("write aggregate private key");
+            for (index, bundle_file) in bundle_files.iter().enumerate() {
+                let target_bytes = if index == bundle_files.len() - 1 {
+                    final_bundle_bytes
+                } else {
+                    MAX_PROJECTED_SVID_BUNDLE_FILE_BYTES
+                };
+                let mut bytes = material.bundle_pem.as_bytes().to_vec();
+                bytes.resize(target_bytes, b'\n');
+                fs::write(generation.join(bundle_file), bytes)
+                    .expect("write aggregate trust bundle");
+            }
+        };
+        write_limited_generation("..gen-exact", final_bundle_exact);
+        write_limited_generation("..gen-over", final_bundle_exact + 1);
+
+        switch_generation(directory.path(), "..gen-exact");
         let aggregate_config = ProjectedSvidConfig {
             root: directory.path().to_path_buf(),
             cert_file: PathBuf::from(CERT_FILE),
             key_file: PathBuf::from(KEY_FILE),
-            bundle_files,
+            bundle_files: bundle_files.clone(),
             poll_interval: MIN_PROJECTED_SVID_POLL_INTERVAL,
         };
+        let loaded = load_projected_generation(&aggregate_config, &NoopReadObserver)
+            .await
+            .expect("exact aggregate limit");
+        assert_eq!(loaded.state.identity.spiffe_id.as_str(), SPIFFE_A);
 
+        switch_generation(directory.path(), "..gen-over");
         assert!(matches!(
             load_projected_generation(&aggregate_config, &NoopReadObserver).await,
             Err(ProjectedSvidReloadReason::TotalMaterialTooLarge)
         ));
+
+        let precedence_file = directory.path().join("precedence.pem");
+        fs::write(&precedence_file, b"12345").expect("write precedence file");
+        assert_eq!(
+            read_bounded_file_with_aggregate(&precedence_file, 4, 0).await,
+            Err(ProjectedSvidReloadReason::MaterialFileTooLarge)
+        );
     }
 
     #[test]
