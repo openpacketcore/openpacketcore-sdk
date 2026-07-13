@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-identity`: a production `ProjectedSvidSource` for Kubernetes projected
+  Secrets. It resolves one immutable `..data` target, detects and boundedly
+  retries every mid-read generation switch, enforces exact file/total/
+  certificate/trust/retry limits, retains only unexpired last-known-good
+  material, and publishes an opaque monotonic generation with typed,
+  redaction-safe availability/reason status. Existing file/socket source APIs
+  and reload events remain source compatible.
 - `opc-sctp`: `DiameterSctpAssociation::connect_with_config` now opens the
   existing Diameter-framed send/receive surface over an explicit
   `SctpConnectConfig`, including bounded static local and remote multihoming.

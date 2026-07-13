@@ -580,12 +580,30 @@ commands or make consensus decisions.
 Real-mTLS tests now qualify a correctly scoped renewed client/server SVID on a
 subsequent new call/full handshake and rejection when either rotated identity
 falls outside the bound peer scope. They do not exercise an in-flight or
-retained old connection. A production CNF must still keep old/new trust
-overlapped, retire old connections, enforce revocation and maximum
-authentication age, bound reconnect storms, and supply multi-process/soak and
-seamless-continuity evidence; #143 still owns the wider distributed
-qualification. Treat the test as scoped new-call SVID evidence, not completion
-of seamless continuity or the whole fleet trust lifecycle.
+retained old connection. Seamless operation during rotation is not yet
+qualified. The implementation order is #161 (atomic identity/trust reload),
+#162 (bounded material epochs), and #163 (peer reauthentication across an
+epoch), followed by #164 rotation qualification. #158 remains the umbrella
+until that evidence passes. A production CNF must keep old/new trust overlapped,
+retire old connections, enforce revocation and maximum authentication age,
+bound reconnect storms, and supply multi-process/soak and seamless-continuity
+evidence; #143 still owns the wider distributed qualification.
+
+When TLS material is mounted as a Kubernetes projected Secret, construct
+`ProjectedSvidSource` with the mount root and relative Secret-key paths. Do not
+point the independent-file source at the user-facing `tls.crt`, `tls.key`, and
+bundle symlinks: those links can cross generations during `..data` replacement.
+Gate startup on a `Ready` typed status and non-empty identity state. A
+`RetainingLastGood` status permits existing unexpired material to remain active
+while the candidate is repaired; `Unavailable` must gate new traffic. Never
+retain last-good material past its leaf expiry.
+
+Alert on the fixed projected reload reason codes, not the legacy free-form
+event field. Generation numbers are process-local evidence: rollback advances
+the number, and process restart resets it. Do not use them as a persisted
+cluster epoch or membership identity. Page on `generation_retry_limit`,
+`read_attempt_timeout`, and `last_good_expired`; the last reason stays active
+until a validated replacement is published.
 
 ### Legacy direct-backend session-net v4 rollout boundary
 
@@ -602,9 +620,10 @@ and 0-RTT; budget every reconnect as a full mutual-TLS handshake so the live
 SVID is revalidated after rotation.
 
 Full handshakes make renewed credentials observable, but they are not proof of
-seamless rotation. The #162 -> #161 -> #163 -> #158 -> #164 rotation chain and
-#143 distributed qualification apply before this compatibility surface could
-be admitted to a production migration. `MAX_SESSION_TTL` controls
+seamless rotation. The #161 -> #162 -> #163 -> #164 implementation and
+qualification chain, under umbrella #158, and #143 distributed qualification
+apply before this compatibility surface could be admitted to a production
+migration. `MAX_SESSION_TTL` controls
 session/lease state only; it does not define
 certificate expiry, trust-bundle validity, or authentication age.
 
@@ -801,7 +820,7 @@ the removed private config TCP timeout is not a production setting. A renewed
 SVID on a subsequent new call/full handshake and wrong-scope rejection have
 scoped real-mTLS qualification; seamless connection retirement, complete
 trust-bundle/revocation/authentication-age fleet lifecycle remains
-#162 -> #161 -> #163 -> #158 -> #164. The remaining distributed/payload-key
+#161 -> #162 -> #163 -> #164 under umbrella #158. The remaining distributed/payload-key
 production evidence stays open in #143.
 
 #159 does not rewrite persisted session-store bytes. In-profile stores need no
