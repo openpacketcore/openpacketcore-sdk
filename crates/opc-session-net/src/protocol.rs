@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, marker::PhantomData, time::Duration};
 
 use opc_session_store::backend::{
-    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, SessionOp,
-    SessionOpResult, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, ReplicationTxId,
+    SessionOp, SessionOpResult, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -63,7 +64,8 @@ pub const MAX_SESSION_NET_REBUILD_ENTRIES: usize = 65_536;
 /// Maximum transport width for a digest-oriented session stable identifier.
 pub const MAX_SESSION_NET_STABLE_ID_BYTES: usize = opc_session_store::STABLE_ID_MAX_BYTES;
 /// Maximum UTF-8 width retained for a durable replication transaction ID.
-pub const MAX_SESSION_NET_REPLICATION_TX_ID_BYTES: usize = 128;
+pub const MAX_SESSION_NET_REPLICATION_TX_ID_BYTES: usize =
+    opc_session_store::REPLICATION_TX_ID_MAX_BYTES;
 /// Canonical hyphenated UUID width used by CAS idempotency request IDs.
 pub const SESSION_NET_CAS_REQUEST_ID_BYTES: usize = 36;
 pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/4";
@@ -859,12 +861,6 @@ fn validate_replication_entry_profile(entry: &ReplicationEntry) -> Result<(), Wi
 fn validate_replication_retained_profile(
     entry: &ReplicationEntry,
 ) -> Result<(), WireConversionError> {
-    if entry.tx_id.is_empty() || entry.tx_id.len() > MAX_SESSION_NET_REPLICATION_TX_ID_BYTES {
-        return Err(WireConversionError(
-            "replication transaction ID violates the v4 transport profile",
-        ));
-    }
-
     let mut pending = Vec::with_capacity(MAX_REPLICATION_OPERATION_DEPTH);
     pending.push(&entry.op);
     while let Some(op) = pending.pop() {
@@ -1841,7 +1837,7 @@ struct WireReplicationEntryRef<'a> {
 #[serde(deny_unknown_fields)]
 struct WireReplicationEntry {
     sequence: u64,
-    tx_id: String,
+    tx_id: ReplicationTxId,
     operation_nodes: WireReplicationNodes,
     timestamp: Timestamp,
 }
@@ -1947,7 +1943,7 @@ impl<'a> TryFrom<&'a ReplicationEntry> for WireReplicationEntryRef<'a> {
         }
         Ok(Self {
             sequence: entry.sequence,
-            tx_id: &entry.tx_id,
+            tx_id: entry.tx_id.as_str(),
             operation_nodes,
             timestamp: &entry.timestamp,
         })
@@ -4192,7 +4188,7 @@ mod tests {
     fn replication_entry(op: ReplicationOp) -> ReplicationEntry {
         ReplicationEntry {
             sequence: 1,
-            tx_id: "wire-tree".to_string(),
+            tx_id: "wire-tree".try_into().expect("valid transaction ID"),
             op,
             timestamp: Timestamp::now_utc(),
         }
@@ -4601,28 +4597,20 @@ mod tests {
         let owner = OwnerId::new("replica-a").expect("owner");
         let base = replication_entry(replication_leaf(&key, &owner));
 
-        for (len, accepted) in [
-            (0, false),
-            (1, true),
-            (MAX_SESSION_NET_REPLICATION_TX_ID_BYTES, true),
-            (MAX_SESSION_NET_REPLICATION_TX_ID_BYTES + 1, false),
-        ] {
+        for len in [1, MAX_SESSION_NET_REPLICATION_TX_ID_BYTES] {
             let mut entry = base.clone();
-            entry.tx_id = "t".repeat(len);
-            assert_eq!(
-                serde_json::to_vec(&Response::WatchEntry(Ok(entry.clone()))).is_ok(),
-                accepted,
-                "outbound tx_id length {len}"
-            );
-            assert_eq!(
-                serde_json::to_vec(&Request::ReplicateEntry { entry }).is_ok(),
-                accepted,
-                "outbound retained request tx_id length {len}"
-            );
+            entry.tx_id = ReplicationTxId::new(&"t".repeat(len)).expect("valid transaction ID");
+            assert!(serde_json::to_vec(&Response::WatchEntry(Ok(entry.clone()))).is_ok());
+            assert!(serde_json::to_vec(&Request::ReplicateEntry { entry }).is_ok());
         }
+        assert!(ReplicationTxId::new("").is_err());
+        assert!(
+            ReplicationTxId::new(&"t".repeat(MAX_SESSION_NET_REPLICATION_TX_ID_BYTES + 1)).is_err()
+        );
 
         let mut valid = base;
-        valid.tx_id = "t".repeat(MAX_SESSION_NET_REPLICATION_TX_ID_BYTES);
+        valid.tx_id = ReplicationTxId::new(&"t".repeat(MAX_SESSION_NET_REPLICATION_TX_ID_BYTES))
+            .expect("maximum transaction ID");
         let valid = serde_json::to_value(Response::WatchEntry(Ok(valid)))
             .expect("maximum transaction ID response");
         for (len, accepted) in [
@@ -4643,7 +4631,9 @@ mod tests {
         }
 
         let mut request_entry = replication_entry(replication_leaf(&key, &owner));
-        request_entry.tx_id = "t".repeat(MAX_SESSION_NET_REPLICATION_TX_ID_BYTES);
+        request_entry.tx_id =
+            ReplicationTxId::new(&"t".repeat(MAX_SESSION_NET_REPLICATION_TX_ID_BYTES))
+                .expect("maximum transaction ID");
         let request = serde_json::to_value(Request::RebuildReplicationState {
             entries: vec![request_entry],
         })
@@ -5127,7 +5117,9 @@ mod tests {
         let timestamp = Timestamp::now_utc();
         let entry = ReplicationEntry {
             sequence: 1,
-            tx_id: "protocol-invariant-entry".to_owned(),
+            tx_id: "protocol-invariant-entry"
+                .try_into()
+                .expect("valid transaction ID"),
             op: ReplicationOp::RefreshTtl {
                 key: key.clone(),
                 owner: owner.clone(),

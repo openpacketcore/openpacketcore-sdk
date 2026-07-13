@@ -792,7 +792,13 @@ bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `cas_request_id_bytes = 36`; the 31,536,000-second session TTL maximum;
 restore-page maximum 1,024; and the depth-16/256-node replication-tree rules.
 Every transported stable ID MUST contain 1 through 64 bytes. Every transported
-replication transaction ID MUST contain 1 through 128 UTF-8 bytes. Every CAS
+replication transaction ID MUST contain 1 through 128 UTF-8 bytes and MUST be
+represented by the bounded `ReplicationTxId` domain type before mutation or
+durable sequence allocation. New committed coordinator writes MUST encode the
+16-byte consensus request ID as exactly 32 lowercase hexadecimal bytes. A
+reader MUST preserve any valid legacy representation byte-for-byte and MUST
+NOT trim, case-fold, parse, or normalize it; exact equality remains idempotent
+redelivery and any distinct representation remains divergent. Every CAS
 request ID that is present MUST use the canonical lowercase hyphenated UUID
 representation and therefore contain exactly 36 bytes.
 The public profile's `max_frame_size` addition is a Rust source break for
@@ -969,8 +975,10 @@ complete product-aware handover/nested-payload preflights. A retained-value
 migration MUST be decoder-first: while writers remain quiesced, every migration
 reader MUST be able to decode the legacy representation before any rewrite or
 replacement occurs. Stable IDs MUST follow the product-aware #167
-model/persistence/privacy/audit policy, and durable transaction IDs MUST follow
-the canonical-type/migration policy in #168 coordinated with #127/#128/#143. The
+model/persistence/privacy/audit policy. Durable transaction IDs MUST follow
+the #168 bounded-type and
+[`migration policy`](../session-store-replication-tx-id-migration.md), including
+report version 3 and coordinated cutover with #127/#128/#143. The
 migration MUST NOT silently truncate, hash, or rename a key or idempotency
 identity. Operators MUST verify that the strict revision-3 decoder accepts the
 result; then they MUST stop every session-net client, server, and protection

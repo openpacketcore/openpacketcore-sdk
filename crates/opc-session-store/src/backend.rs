@@ -7,7 +7,7 @@
 //! fencing rule that a write carrying a token lower than the key's recorded
 //! fence is rejected, so a stale owner can never overwrite a newer one.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{fmt, future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
@@ -48,6 +48,168 @@ pub const MAX_REPLICATION_OPERATION_DEPTH: usize = 16;
 /// The limit is fixed across the SDK so all replicas make the same admission
 /// decision and a nested entry cannot trigger unbounded provider calls.
 pub const MAX_REPLICATION_OPERATIONS_PER_ENTRY: usize = 256;
+
+/// Minimum UTF-8 width of a durable replication transaction identity.
+pub const REPLICATION_TX_ID_MIN_BYTES: usize = 1;
+
+/// Maximum UTF-8 width of a durable replication transaction identity.
+///
+/// The limit is model-wide rather than transport-specific: direct callers,
+/// persisted rows, snapshots, rebuilds, watches, and authenticated peers all
+/// admit the same bounded representation.
+pub const REPLICATION_TX_ID_MAX_BYTES: usize = 128;
+
+/// Width of the canonical lowercase hexadecimal representation minted from a
+/// 16-byte committed consensus request identity.
+pub const REPLICATION_TX_ID_CANONICAL_BYTES: usize = 32;
+
+/// Error returned when a replication transaction identity violates its
+/// model-wide width contract.
+///
+/// The error never contains the rejected value or its observed width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid replication transaction ID")]
+pub struct ReplicationTxIdError;
+
+/// Typed, bounded identity of one durable replication transaction.
+///
+/// New consensus-coordinator writes use [`Self::from_request_bytes`], which
+/// emits exactly 32 lowercase hexadecimal bytes from the committed 16-byte
+/// request identity. Existing 1-through-128-byte UTF-8 values remain valid and
+/// are preserved byte-for-byte for mixed-version replay and rollback. Legacy
+/// values are opaque: this type never trims, folds case, parses numbers, or
+/// otherwise normalizes them, because doing so could collapse two previously
+/// distinct fork/idempotency identities.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReplicationTxId(String);
+
+impl ReplicationTxId {
+    /// Validate and retain one legacy-compatible opaque identity.
+    ///
+    /// New production coordinators should use [`Self::from_request_bytes`].
+    pub fn new(value: &str) -> Result<Self, ReplicationTxIdError> {
+        Self::validate(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Mint the canonical identity for a committed 16-byte request identity.
+    pub fn from_request_bytes(request_id: [u8; 16]) -> Self {
+        Self(crate::hex::encode_lower(&request_id))
+    }
+
+    /// Borrow the exact persisted and wire representation.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Return the encoded UTF-8 width.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Return whether the encoded identity is empty.
+    ///
+    /// This is always false for a constructed value and is provided alongside
+    /// [`Self::len`] for conventional collection-like inspection.
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Return whether this value has the canonical coordinator representation.
+    pub fn is_canonical(&self) -> bool {
+        self.0.len() == REPLICATION_TX_ID_CANONICAL_BYTES
+            && self
+                .0
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn validate(value: &str) -> Result<(), ReplicationTxIdError> {
+        if (REPLICATION_TX_ID_MIN_BYTES..=REPLICATION_TX_ID_MAX_BYTES).contains(&value.len()) {
+            Ok(())
+        } else {
+            Err(ReplicationTxIdError)
+        }
+    }
+}
+
+impl TryFrom<String> for ReplicationTxId {
+    type Error = ReplicationTxIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::validate(value.as_str())?;
+        Ok(Self(value))
+    }
+}
+
+impl TryFrom<&str> for ReplicationTxId {
+    type Error = ReplicationTxIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<[u8; 16]> for ReplicationTxId {
+    fn from(value: [u8; 16]) -> Self {
+        Self::from_request_bytes(value)
+    }
+}
+
+impl AsRef<str> for ReplicationTxId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for ReplicationTxId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplicationTxId([redacted])")
+    }
+}
+
+impl serde::Serialize for ReplicationTxId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+struct ReplicationTxIdVisitor;
+
+impl serde::de::Visitor<'_> for ReplicationTxIdVisitor {
+    type Value = ReplicationTxId;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded replication transaction identity")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        ReplicationTxId::new(value).map_err(|_| E::custom("invalid replication transaction ID"))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        ReplicationTxId::try_from(value)
+            .map_err(|_| E::custom("invalid replication transaction ID"))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ReplicationTxId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_string(ReplicationTxIdVisitor)
+    }
+}
 
 /// Atomic compare-and-set operation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -164,7 +326,7 @@ pub struct ReplicationEntry {
     /// Unique id of the originating write, used to tell idempotent
     /// re-delivery of the same entry apart from a divergent entry that
     /// collides on `sequence`.
-    pub tx_id: String,
+    pub tx_id: ReplicationTxId,
     /// The fenced mutation to replay when applying this entry.
     pub op: ReplicationOp,
     /// Coordinator wall-clock time when the entry was created. Informational;

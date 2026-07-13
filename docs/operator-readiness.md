@@ -859,10 +859,13 @@ handoff and absolute-record-expiry admission remain
 #145/#148. Outbound slow-reader and response-frame enforcement is implemented
 under #159. #167 now makes the 1..=64-byte stable-ID invariant structural across
 the complete model/store/network stack and supplies the privacy derivation plus
-version-2 count-only migration audit; use
+version-3 count-only migration audit; use
 [`session-store-stable-id-migration.md`](session-store-stable-id-migration.md)
-before rollout. The canonical durable `ReplicationEntry` transaction-ID type
-and migration remain #168 and must be coordinated with #127/#128/#143. The shared
+before rollout. #168 implements the bounded durable `ReplicationEntry`
+transaction-ID type, canonical 32-byte coordinator mint, exact legacy
+preservation, and relational/JSON consistency audit. Follow the
+[`transaction-ID migration runbook`](session-store-replication-tx-id-migration.md)
+and coordinate cutover with #127/#128/#143. The shared
 session-net call deadline and `ConsensusConfigStore`'s complete
 routing/quorum/commit/apply operation deadline remain separate bounded layers;
 the removed private config TCP timeout is not a production setting. A renewed

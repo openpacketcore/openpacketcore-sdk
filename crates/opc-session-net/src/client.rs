@@ -1536,7 +1536,9 @@ mod tests {
         );
         ReplicationEntry {
             sequence: 1,
-            tx_id: "forged-response-deadline".to_string(),
+            tx_id: "forged-response-deadline"
+                .try_into()
+                .expect("valid transaction ID"),
             op: opc_session_store::ReplicationOp::RefreshTtl {
                 key: SessionKey {
                     tenant: opc_types::TenantId::new("tenant-a").expect("test tenant"),
@@ -1611,7 +1613,9 @@ mod tests {
     fn replication_entry_at_depth(depth: usize) -> ReplicationEntry {
         ReplicationEntry {
             sequence: 1,
-            tx_id: "over-depth-response".to_string(),
+            tx_id: "over-depth-response"
+                .try_into()
+                .expect("valid transaction ID"),
             op: operation_tree_at_depth(depth),
             timestamp: opc_types::Timestamp::now_utc(),
         }
@@ -1623,7 +1627,9 @@ mod tests {
             .collect();
         ReplicationEntry {
             sequence: 1,
-            tx_id: "over-count-response".to_string(),
+            tx_id: "over-count-response"
+                .try_into()
+                .expect("valid transaction ID"),
             op: opc_session_store::ReplicationOp::Batch { ops },
             timestamp: opc_types::Timestamp::now_utc(),
         }
@@ -2131,14 +2137,10 @@ mod tests {
         ]))
         .is_err());
 
-        let mut invalid_tx = valid_deadline_entry();
-        invalid_tx.tx_id = "x".repeat(crate::MAX_SESSION_NET_REPLICATION_TX_ID_BYTES + 1);
-        assert!(matches!(
-            backend
-                .send_request_classified(Request::ReplicateEntry { entry: invalid_tx })
-                .await,
-            Err(RemoteRequestFailure::Protocol)
-        ));
+        assert!(opc_session_store::ReplicationTxId::new(
+            &"x".repeat(crate::MAX_SESSION_NET_REPLICATION_TX_ID_BYTES + 1)
+        )
+        .is_err());
 
         let op = valid_compare_and_set(0).await;
         assert!(matches!(
@@ -3221,7 +3223,7 @@ mod tests {
 
         let lightweight_entry = ReplicationEntry {
             sequence: 1,
-            tx_id: String::new(),
+            tx_id: "t".try_into().expect("valid transaction ID"),
             op: opc_session_store::ReplicationOp::Batch { ops: Vec::new() },
             timestamp: opc_types::Timestamp::now_utc(),
         };

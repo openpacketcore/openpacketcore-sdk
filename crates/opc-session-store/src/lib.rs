@@ -50,8 +50,9 @@ pub use backend::{
     validate_replication_prefix, validate_replication_prefix_owned, validate_session_ops_ttls,
     BackendInstanceIdentity, BackendPeerBinding, BackendPeerScopeIdentity, CompareAndSet,
     CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend, ReplicationEntry,
-    ReplicationOp, SessionBackend, SessionOp, SessionOpResult,
-    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    ReplicationOp, ReplicationTxId, ReplicationTxIdError, SessionBackend, SessionOp,
+    SessionOpResult, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    REPLICATION_TX_ID_CANONICAL_BYTES, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 pub use capability::{
     assert_backend_suitable_for_profile, assert_suitable_for,

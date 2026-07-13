@@ -30,10 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StableId::derive_hmac_sha256` defines the full-width 32-byte,
   tenant-scoped, domain-separated keyed-digest profile for subscriber-derived
   identities. New SQLite stores add matching BLOB/width checks, while existing
-  stores and snapshots require the version-2 count-only identity audit before
+  stores and snapshots require the version-3 count-only identity audit before
   upgrade. Empty, oversized, or non-BLOB legacy identifiers are never echoed,
   truncated, or silently rehashed; follow the documented drain,
   application-owned remediation, re-audit, and rollback procedure.
+- **BREAKING — `opc-session-store` and consumers:** `ReplicationEntry::tx_id`
+  is now the validated `ReplicationTxId` newtype instead of arbitrary `String`.
+  The accepted legacy representation is exactly 1 through 128 UTF-8 bytes and
+  remains byte-for-byte compatible; no trimming, case-folding, parsing, or
+  normalization can collapse fork/idempotency identities. New committed
+  Openraft coordinator writes mint a fixed 32-byte lowercase hexadecimal ID
+  from the 16-byte consensus request identity. Fake/SQLite/cache/encryption,
+  rebuild/watch/snapshot/recovery, session-net, and SDK exports use the typed
+  identity. New SQLite stores enforce `TEXT` plus exact width bounds; runtime
+  hydration cross-checks relational and encoded IDs; report version 3 adds a
+  count-only `invalid_replication_tx_id_fields` migration signal. Follow the
+  coordinated audit/remediation/restart/rollback runbook. This changes no
+  payload envelope, AAD, HKMS call, or encryption-at-rest boundary.
 - `opc-identity`: a production `ProjectedSvidSource` for Kubernetes projected
   Secrets. It resolves one immutable `..data` target, detects and boundedly
   retries every mid-read generation switch, enforces exact file/total/
@@ -413,9 +426,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error text.
   #159 does not rewrite the persisted store format. #167 now promotes its
   stable-ID rule into the structural model/persistence/privacy/audit/migration
-  contract without changing compliant bytes. #168 owns a canonical durable
-  transaction-ID type and migration coordinated
-  with #127/#128/#143. Before revision 2, quiesce writers and use a reviewed
+  contract without changing compliant bytes. #168 now supplies the bounded
+  durable transaction-ID type, canonical coordinator mint, exact legacy
+  preservation, SQLite/recovery validation, and version-3 migration audit
+  coordinated with #127/#128/#143. Before revision 2, quiesce writers and use a reviewed
   decoder-first migration for any out-of-profile retained record, log,
   snapshot, restore source, or replay source; never truncate or rename an
   identity to make it fit. Binary rollback requires a drained coordinated fleet

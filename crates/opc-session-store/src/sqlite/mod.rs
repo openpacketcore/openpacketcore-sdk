@@ -20,7 +20,8 @@ use crate::{
     backend::{
         validate_replication_page_owned, validate_replication_prefix_owned,
         validate_session_ops_ttls, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-        ReplicationEntry, SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+        ReplicationEntry, SessionBackend, SessionOp, SessionOpResult, REPLICATION_TX_ID_MAX_BYTES,
+        REPLICATION_TX_ID_MIN_BYTES, WATCH_CHANNEL_CAPACITY,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -273,7 +274,10 @@ impl SqliteSessionBackend {
             r#"
             CREATE TABLE IF NOT EXISTS session_replication_log (
                 sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
-                tx_id TEXT NOT NULL,
+                tx_id TEXT NOT NULL CHECK (
+                    typeof(tx_id) = 'text'
+                    AND length(CAST(tx_id AS BLOB)) BETWEEN 1 AND 128
+                ),
                 entry_json TEXT NOT NULL,
                 timestamp TEXT NOT NULL
             );
@@ -522,27 +526,47 @@ impl SqliteSessionBackend {
         }
         let mut stmt = conn
             .prepare(
-                "SELECT sequence, entry_json FROM session_replication_log WHERE sequence >= ?1 ORDER BY sequence ASC LIMIT ?2",
+                r#"
+                SELECT sequence,
+                       CASE
+                           WHEN typeof(tx_id) = 'text'
+                            AND length(CAST(tx_id AS BLOB)) BETWEEN ?3 AND ?4
+                           THEN tx_id
+                       END,
+                       entry_json
+                FROM session_replication_log
+                WHERE sequence >= ?1
+                ORDER BY sequence ASC
+                LIMIT ?2
+                "#,
             )
             .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
         let entries = stmt
-            .query_map(params![sqlite_start, sqlite_limit], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map(
+                params![
+                    sqlite_start,
+                    sqlite_limit,
+                    REPLICATION_TX_ID_MIN_BYTES,
+                    REPLICATION_TX_ID_MAX_BYTES
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
             .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
         let mut result = Vec::new();
         for item in entries {
-            let (stored_sequence, json) = item
+            let (stored_sequence, stored_tx_id, json) = item
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-            let stored_sequence = replication::stored_replication_sequence(stored_sequence)?;
-            let entry: ReplicationEntry = serde_json::from_str(&json).map_err(|_| {
-                StoreError::Serialization("session journal entry is invalid".into())
-            })?;
-            let entry = entry.into_validated()?;
-            if entry.sequence != stored_sequence {
-                return Err(StoreError::InvalidReplicationSequence);
-            }
-            result.push(entry);
+            result.push(replication::hydrate_replication_entry(
+                stored_sequence,
+                stored_tx_id,
+                &json,
+            )?);
         }
         validate_replication_page_owned(result)
     }
@@ -813,30 +837,50 @@ impl SessionBackend for SqliteSessionBackend {
         let conn = self.conn.lock().await;
         let tx = standalone_transaction(&conn)?;
         let res = {
-            let mut stmt = tx.prepare(
-                "SELECT sequence, entry_json FROM session_replication_log WHERE sequence >= ?1 ORDER BY sequence ASC LIMIT ?2"
-            )
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            let mut stmt = tx
+                .prepare(
+                    r#"
+                SELECT sequence,
+                       CASE
+                           WHEN typeof(tx_id) = 'text'
+                            AND length(CAST(tx_id AS BLOB)) BETWEEN ?3 AND ?4
+                           THEN tx_id
+                       END,
+                       entry_json
+                FROM session_replication_log
+                WHERE sequence >= ?1
+                ORDER BY sequence ASC
+                LIMIT ?2
+                "#,
+                )
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
             let entries = stmt
-                .query_map(params![sqlite_start, sqlite_limit], |row| {
-                    let sequence: i64 = row.get(0)?;
-                    let json: String = row.get(1)?;
-                    Ok((sequence, json))
-                })
+                .query_map(
+                    params![
+                        sqlite_start,
+                        sqlite_limit,
+                        REPLICATION_TX_ID_MIN_BYTES,
+                        REPLICATION_TX_ID_MAX_BYTES
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
                 .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
             let mut res = Vec::new();
             for item in entries {
-                let (stored_sequence, json) =
+                let (stored_sequence, stored_tx_id, json) =
                     item.map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-                let stored_sequence = replication::stored_replication_sequence(stored_sequence)?;
-                let entry: ReplicationEntry = serde_json::from_str(&json)
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                let entry = entry.into_validated()?;
-                if entry.sequence != stored_sequence {
-                    return Err(StoreError::InvalidReplicationSequence);
-                }
-                res.push(entry);
+                res.push(replication::hydrate_replication_entry(
+                    stored_sequence,
+                    stored_tx_id,
+                    &json,
+                )?);
             }
             validate_replication_page_owned(res)?
         };

@@ -896,7 +896,9 @@ mod tests {
         let timestamp = Timestamp::now_utc();
         ReplicationEntry {
             sequence,
-            tx_id: format!("invalid-ttl-{sequence}"),
+            tx_id: format!("invalid-ttl-{sequence}")
+                .try_into()
+                .expect("valid transaction ID"),
             op: ReplicationOp::RefreshTtl {
                 key,
                 owner: OwnerId::new("owner-a").expect("owner"),
@@ -927,7 +929,9 @@ mod tests {
     fn over_depth_entry(sequence: u64, key: SessionKey) -> ReplicationEntry {
         ReplicationEntry {
             sequence,
-            tx_id: format!("over-depth-{sequence}"),
+            tx_id: format!("over-depth-{sequence}")
+                .try_into()
+                .expect("valid transaction ID"),
             op: operation_tree_at_depth(MAX_REPLICATION_OPERATION_DEPTH + 1, key),
             timestamp: Timestamp::now_utc(),
         }
@@ -942,7 +946,9 @@ mod tests {
         );
         ReplicationEntry {
             sequence,
-            tx_id: format!("over-count-{sequence}"),
+            tx_id: format!("over-count-{sequence}")
+                .try_into()
+                .expect("valid transaction ID"),
             op: ReplicationOp::Batch { ops },
             timestamp: Timestamp::now_utc(),
         }
@@ -1000,7 +1006,7 @@ mod tests {
         entry_tx
             .send(Ok(ReplicationEntry {
                 sequence: 1,
-                tx_id: "tx-1".to_string(),
+                tx_id: "tx-1".try_into().expect("valid transaction ID"),
                 op: ReplicationOp::CompareAndSet {
                     key: key.clone(),
                     expected_generation: Some(Generation::new(1)),
@@ -1133,7 +1139,9 @@ mod tests {
         let error = cache
             .replicate_entry(ReplicationEntry {
                 sequence: 1,
-                tx_id: "nested-invalid-ttl".to_string(),
+                tx_id: "nested-invalid-ttl"
+                    .try_into()
+                    .expect("valid transaction ID"),
                 op: ReplicationOp::Batch {
                     ops: vec![
                         ReplicationOp::DeleteFenced {
@@ -1435,7 +1443,7 @@ mod tests {
         let error = cache
             .replicate_entry(ReplicationEntry {
                 sequence: 0,
-                tx_id: "zero-sequence".to_string(),
+                tx_id: "zero-sequence".try_into().expect("valid transaction ID"),
                 op: ReplicationOp::DeleteFenced {
                     key: key.clone(),
                     owner: OwnerId::new("owner-a").expect("owner"),
@@ -1468,13 +1476,13 @@ mod tests {
             .rebuild_replication_state(vec![
                 ReplicationEntry {
                     sequence: 1,
-                    tx_id: "prefix-one".to_string(),
+                    tx_id: "prefix-one".try_into().expect("valid transaction ID"),
                     op: ReplicationOp::Batch { ops: Vec::new() },
                     timestamp,
                 },
                 ReplicationEntry {
                     sequence: 3,
-                    tx_id: "prefix-gap".to_string(),
+                    tx_id: "prefix-gap".try_into().expect("valid transaction ID"),
                     op: ReplicationOp::Batch { ops: Vec::new() },
                     timestamp,
                 },

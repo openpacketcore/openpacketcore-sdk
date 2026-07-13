@@ -204,7 +204,9 @@ fn stored_record(
 fn nested_delete_entry(sequence: u64, session_key: SessionKey, owner: OwnerId) -> ReplicationEntry {
     ReplicationEntry {
         sequence,
-        tx_id: format!("persistence-test-tx-{sequence}"),
+        tx_id: format!("persistence-test-tx-{sequence}")
+            .try_into()
+            .expect("valid transaction ID"),
         op: ReplicationOp::Batch {
             ops: vec![ReplicationOp::Batch {
                 ops: vec![ReplicationOp::DeleteFenced {
@@ -305,7 +307,7 @@ async fn valid_raw_legacy_record_and_log_hydrate_without_rewrite() {
         insert_raw_replication_json(
             &connection,
             entry.sequence,
-            &entry.tx_id,
+            entry.tx_id.as_str(),
             &serde_json::to_string(&entry).expect("serialize legacy entry"),
         );
     }
@@ -622,7 +624,7 @@ async fn invalid_nested_replication_log_owner_is_redacted_and_read_only() {
         insert_raw_replication_json(
             &connection,
             entry.sequence,
-            &entry.tx_id,
+            entry.tx_id.as_str(),
             &serde_json::to_string(&json).expect("serialize hostile entry"),
         );
     }
@@ -662,7 +664,7 @@ async fn invalid_nested_replication_log_key_type_is_redacted_and_read_only() {
         insert_raw_replication_json(
             &connection,
             entry.sequence,
-            &entry.tx_id,
+            entry.tx_id.as_str(),
             &serde_json::to_string(&json).expect("serialize hostile entry"),
         );
     }
@@ -704,7 +706,7 @@ async fn invalid_nested_replication_log_stable_id_is_redacted_and_read_only() {
         insert_raw_replication_json(
             &connection,
             entry.sequence,
-            &entry.tx_id,
+            entry.tx_id.as_str(),
             &serde_json::to_string(&json).expect("serialize hostile entry"),
         );
     }
