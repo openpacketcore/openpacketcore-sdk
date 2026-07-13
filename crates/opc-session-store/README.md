@@ -134,7 +134,7 @@ evidence.
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 4, error-set revision 5,
+  Its profile pins wire-schema revision 4, error-set revision 6,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -150,7 +150,8 @@ evidence.
   examined-candidate bounds. Error-set revision 3 carries typed restore
   stale-cursor, work-budget, and direct-CAS idempotency outcomes; revision 4
   adds the replication-log range, page-limit, and compacted-cursor outcomes;
-  revision 5 adds the non-CAS backend and lease ambiguity outcomes.
+  revision 5 adds the non-CAS backend and lease ambiguity outcomes; revision 6
+  adds the typed bounded-watch catch-up outcome.
   Hello requests the
   client's response limit, while HelloAck reports the accepted response limit
   and server request limit;
@@ -618,9 +619,56 @@ These rules constrain range selection only. They do not create sequencing,
 commit, snapshot, restore, or watch authority and do not change payload
 envelopes, AAD, provider/HKMS placement, or encryption-at-rest composition.
 The replication-log range outcomes were introduced in quarantined session-net
-v4 error-set revision 4. The current revision 5 additionally carries non-CAS
-backend and lease ambiguity outcomes; drain and upgrade all compatibility
-participants together before restoring traffic.
+v4 error-set revision 4. Revision 5 additionally carries non-CAS backend and
+lease ambiguity outcomes; the current revision 6 adds bounded-watch catch-up.
+Drain and upgrade all compatibility participants together before restoring
+traffic.
+
+### Replication-watch cursor and handoff contract
+
+`watch(start_sequence)` uses an inclusive 1-based cursor. Zero is the
+empty-head sentinel and normalizes to one. An existing cursor first emits that
+entry; a future cursor waits and never receives a lower live entry.
+`u64::MAX` is a valid future/terminal cursor. If that entry is ever delivered,
+the stream closes after the item because a reconnect successor cannot be
+represented. Otherwise reconnect from a processed item uses its checked
+successor.
+
+Backlog capture and live registration share the watcher-registry lock. Fake
+captures under its state lock; SQLite holds the registry while it completes
+the bounded journal query. An append that races this handoff is therefore
+either in the backlog or delivered live exactly once. A notification already
+captured in the backlog, or committed while a requested future cursor is still
+waiting, is below that watcher's live cursor and is ignored; a true gap above
+the next eligible sequence closes the watcher. Each watch owns at most 64
+backlog entries plus a 64-entry live channel. More retained backlog returns the
+fieldless,
+non-retryable `ReplicationWatchCatchUpRequired`: invalidate dependent state,
+perform the product's coherent snapshot/full-cache catch-up, and reconnect
+from the position that procedure proves. It does not provide a cursor or
+permission to skip history. `ReplicationLogCursorCompacted { resume_from }`
+remains distinct and requires snapshot installation before its resume point.
+Slow consumers are evicted when the live channel fills, and closed or
+cancelled registrations are pruned without unbounded accumulation.
+
+`ConsensusSessionStore` completes a linearizable read barrier before the
+atomic local handoff, and only Openraft state-machine apply publishes live
+entries. Merely appending a local Openraft log record cannot make it visible.
+Raw append/rebuild remains rejected beside that authority. The quarantined
+session-net client performs the dedicated watch handshake before returning a
+stream, so an initial typed rejection is returned exactly and is never
+reclassified as disconnect ambiguity. It then requires the first and every
+later entry to match the next inclusive cursor. Invalid, duplicated, skipped,
+or otherwise malformed authenticated-peer metadata terminates the dedicated
+connection with a redaction-safe protocol failure before an outer encryption
+wrapper can invoke its provider. A typed backend stream error also ends that
+stream; the next independent request uses a fresh authenticated connection.
+
+This adds `StoreError::ReplicationWatchCatchUpRequired` and advances only the
+legacy protocol-v4 error set from revision 5 to 6. Exact-profile negotiation
+therefore requires a coordinated stop/upgrade/start. The wire schema,
+Openraft consensus profile, persisted journal/snapshot format, encryption
+envelopes, AAD, and local/remote HKMS boundary do not change.
 
 ### TTL input contract
 
@@ -654,8 +702,8 @@ fail closed.
 
 This is a compatibility boundary. The two public error enums gain new variants,
 so external exhaustive matches must add arms. Protocol v4 introduced their
-private fixed-width DTOs in error revision 1; current error revision 5 retains
-those encodings and an error-revision-4 or older v4 peer is not admitted. Before upgrading a store created by an older SDK, audit
+private fixed-width DTOs in error revision 1; current error revision 6 retains
+those encodings and an error-revision-5 or older v4 peer is not admitted. Before upgrading a store created by an older SDK, audit
 its persisted replication log for TTL-bearing
 operations above 365 days. Such legacy entries now fail closed during replay or
 rebuild; the SDK does not silently clamp or rewrite them. Replicated

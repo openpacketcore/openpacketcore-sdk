@@ -689,6 +689,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::InvalidReplicationLogRange => "invalid_replication_log_range",
         StoreError::ReplicationLogPageTooLarge { .. } => "replication_log_page_too_large",
         StoreError::ReplicationLogCursorCompacted { .. } => "replication_log_cursor_compacted",
+        StoreError::ReplicationWatchCatchUpRequired => "replication_watch_catch_up_required",
         StoreError::ReplicationOperationLimitExceeded => "replication_operation_limit_exceeded",
         StoreError::InvalidSessionTtl => "invalid_session_ttl",
         StoreError::LeaseHeld => "lease_held",

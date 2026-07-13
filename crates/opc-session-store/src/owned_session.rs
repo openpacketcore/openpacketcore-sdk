@@ -385,6 +385,9 @@ impl OwnedSessionMutationError {
             StoreError::ReplicationLogCursorCompacted { .. } => Self::StoreRejected {
                 code: "replication-log-cursor-compacted",
             },
+            StoreError::ReplicationWatchCatchUpRequired => Self::StoreRejected {
+                code: "replication-watch-catch-up-required",
+            },
             StoreError::ReplicationOperationLimitExceeded => Self::StoreRejected {
                 code: "replication-operation-limit-exceeded",
             },

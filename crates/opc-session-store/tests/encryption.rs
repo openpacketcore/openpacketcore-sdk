@@ -1166,6 +1166,16 @@ impl SessionBackend for ReplicationBoundarySpy {
         self.rebuild_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn watch(
+        &self,
+        _start_sequence: u64,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+        StoreError,
+    > {
+        Ok(stream::iter(self.returned_entries.clone().into_iter().map(Ok)).boxed())
+    }
 }
 
 #[async_trait]
@@ -1908,6 +1918,21 @@ async fn encrypting_wrapper_rejects_invalid_replication_metadata_before_crypto_o
         0,
         "invalid returned entry reached decrypt provider"
     );
+    let mut watch = backend.watch(1).await.expect("delegated watch");
+    assert_eq!(
+        watch
+            .next()
+            .await
+            .expect("watch integrity result")
+            .expect_err("entry after requested cursor must fail"),
+        StoreError::InvalidReplicationSequence
+    );
+    assert!(watch.next().await.is_none(), "invalid watch must terminate");
+    assert_eq!(
+        provider.calls(),
+        0,
+        "invalid watch entry reached decrypt provider"
+    );
 }
 
 #[tokio::test]
@@ -2022,6 +2047,21 @@ async fn remote_sealing_wrapper_rejects_invalid_replication_metadata_before_prov
         provider.calls(),
         0,
         "invalid returned entry reached unseal provider"
+    );
+    let mut watch = backend.watch(2).await.expect("delegated remote watch");
+    assert_eq!(
+        watch
+            .next()
+            .await
+            .expect("watch integrity result")
+            .expect_err("entry before requested cursor must fail"),
+        StoreError::InvalidReplicationSequence
+    );
+    assert!(watch.next().await.is_none(), "invalid watch must terminate");
+    assert_eq!(
+        provider.calls(),
+        0,
+        "invalid watch entry reached unseal provider"
     );
 }
 

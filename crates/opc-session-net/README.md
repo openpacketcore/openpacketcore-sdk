@@ -197,7 +197,7 @@ confidential authenticated snapshot-bound
 restore cursor, explicit durable-page profile, fixed 4 MiB restore payload and
 8 MiB retained-page, 8 MiB examined-metadata, and 4,096 examined-candidate
 budgets, and adds exact configuration/process epoch binding for direct CAS.
-The error-set revision is 5. Directional budgets are part of the exact
+The error-set revision is 6. Directional budgets are part of the exact
 handshake. `requested_response_frame_size`,
 `accepted_response_frame_size`, and `server_request_frame_size` are public
 `Option<u32>` bootstrap fields so an older decoder can classify an otherwise
@@ -212,7 +212,7 @@ second independently configurable limit. The accepted response size is the
 smaller of the client's receive limit and the server's configured frame limit;
 the server request size independently bounds frames sent by that client. This
 supports unequal client/server settings without assuming either configured
-limit applies in both directions. A revision-4 or older v4 peer is incompatible
+limit applies in both directions. A revision-5 or older v4 peer is incompatible
 even though the ALPN remains `opc-session-net/4`.
 
 Error-set revision 4 adds typed replication-log range overflow, page-limit,
@@ -231,6 +231,20 @@ installs a coherent snapshot/rebuild through its existing authority path.
 Error-set revision 5 adds non-CAS backend and lease ambiguity outcomes. It is
 another exact-profile transition and does not add a downgrade or rolling
 mixed-revision mode.
+
+Error-set revision 6 adds the fieldless
+`ReplicationWatchCatchUpRequired` outcome. Watch setup is now completed within
+the caller's absolute deadline before `RemoteSessionBackend::watch` returns,
+so an initial typed rejection is returned directly and is not confused with a
+later transport close. Accepted watches require the exact inclusive next
+sequence (zero was normalized to one in the request); future and terminal
+cursors never receive lower items. A duplicate, gap, invalid entry, or other
+authenticated-peer metadata violation ends the dedicated connection with a
+redaction-safe protocol failure before an outer store wrapper can invoke an
+encryption provider. Backlog overflow is non-retryable until the caller has
+invalidated dependent state and completed a coherent catch-up; it never
+supplies a cursor that could skip history. This changes only the exact legacy
+error set and requires a coordinated compatibility-fleet upgrade.
 
 Direct CAS uses a canonical request UUID plus the server's
 `cas_idempotency_epoch` from the authenticated `HelloAck`. The server binds
@@ -456,7 +470,7 @@ campaigns.
   adds public `ContractProfile::max_frame_size`, so external profile struct
   literals and exhaustive destructuring must be updated in the same
   coordinated change.
-- The v4 profile pins wire-schema revision 4 and error-set revision 5;
+- The v4 profile pins wire-schema revision 4 and error-set revision 6;
   `max_restore_scan_page_payload_bytes = 4194304`;
   `max_restore_scan_examined_rows = 4096`;
   `min_frame_size = 8192`; `max_frame_size = 16777216`; the 128-byte
@@ -480,7 +494,7 @@ campaigns.
   that a new peer rejects before dispatch, so unchanged valid JSON shape is not
   a rolling-compatibility claim.
 - Treat every v4 exact-profile migration through wire-schema revision 4 and
-  error-set revision 5 as a
+  error-set revision 6 as a
   coordinated stop/upgrade/start boundary. Drain
   traffic and writers, audit every persisted SQLite replica with the count-only
   `opc-session-store-audit identity-invariants` command, and separately
@@ -556,7 +570,7 @@ campaigns.
   unchanged for entries within the operation-tree contract. The new serialized
   error variants require external exhaustive matches. Their wire representation
   was introduced by v4 error revision 1 and is retained by current error
-  revision 5; an error-revision-4 or older v4 peer fails exact negotiation.
+  revision 6; an error-revision-5 or older v4 peer fails exact negotiation.
   Legacy persisted replication logs must be
   audited before upgrade because an entry carrying a larger TTL now fails
   closed during replay or rebuild rather than being clamped. Cross-field

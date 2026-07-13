@@ -1666,6 +1666,7 @@ mod membership_tests {
     };
 
     use super::*;
+    use crate::backend::ReplicationOp;
     use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
     use crate::record::EncryptedSessionPayload;
     use crate::topology::{
@@ -1952,6 +1953,88 @@ mod membership_tests {
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
         );
+    }
+
+    #[tokio::test]
+    async fn watch_exposes_only_state_machine_applied_application_entries() {
+        let directory = tempfile::tempdir().expect("watch commit gate directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("watch commit gate SQLite backend");
+        let apply_gate = Arc::clone(&backend.consensus_apply_gate);
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open watch commit gate store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize watch commit gate store");
+        let mut watch = store.watch(1).await.expect("register applied watch");
+
+        let held_apply = apply_gate
+            .acquire_owned()
+            .await
+            .expect("hold state-machine apply");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let key = SessionKey {
+            tenant: TenantId::new("watch-commit-gate").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"watch-commit-gate")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let mutation_store = store.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_store
+                .acquire(
+                    &key,
+                    OwnerId::new("watch-commit-owner").expect("owner"),
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if store.inner.raft.metrics().borrow().last_log_index > Some(before) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("proposal reaches Openraft log");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), watch.next())
+                .await
+                .is_err(),
+            "log-only entries must not be visible before state-machine apply"
+        );
+
+        drop(held_apply);
+        mutation
+            .await
+            .expect("acquire task")
+            .expect("committed acquire");
+        let applied = tokio::time::timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("applied watch deadline")
+            .expect("applied watch item")
+            .expect("valid applied entry");
+        assert_eq!(applied.sequence, 1);
+        assert!(matches!(applied.op, ReplicationOp::AcquireLease { .. }));
     }
 
     #[tokio::test]

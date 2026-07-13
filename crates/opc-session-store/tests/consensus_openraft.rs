@@ -783,6 +783,21 @@ async fn assert_differing_replica_compaction_floors_never_union(cluster: &TestCl
             }
         );
     }
+
+    let watch_outcomes =
+        futures_util::future::join_all(cluster.stores.iter().map(|store| store.watch(1))).await;
+    for (index, outcome) in watch_outcomes.into_iter().enumerate() {
+        let error = match outcome {
+            Ok(_) => panic!("a compacted production watch must not skip history"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            StoreError::ReplicationLogCursorCompacted {
+                resume_from: u64::try_from(index + 2).expect("small resume point"),
+            }
+        );
+    }
 }
 
 fn assert_raw_consensus_guard<T>(result: Result<T, StoreError>) {

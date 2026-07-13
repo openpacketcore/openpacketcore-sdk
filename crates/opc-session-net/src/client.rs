@@ -11,10 +11,11 @@ use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_redaction::metrics::METRICS;
 use opc_session_store::backend::{
-    validate_replication_log_page, validate_replication_log_page_owned,
+    next_replication_sequence, validate_replication_log_page, validate_replication_log_page_owned,
     validate_replication_page_owned, validate_replication_prefix_owned, BackendInstanceIdentity,
     BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange,
-    ReplicationOp, SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+    ReplicationOp, ReplicationWatchCursor, SessionBackend, SessionOp, SessionOpResult,
+    WATCH_CHANNEL_CAPACITY,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -597,6 +598,9 @@ fn response_matches_request(request: &Request, response: &Response) -> bool {
             store_result_matches_class(result, StoreResponseClass::Mutation)
         }
         (Request::Watch { .. }, Response::WatchStream) => true,
+        (Request::Watch { .. }, Response::WatchEntry(Err(error))) => {
+            store_error_matches_class(error, StoreResponseClass::Read)
+        }
         (Request::NextLeaseInfo, Response::NextLeaseInfo(result)) => {
             store_result_matches_class(result, StoreResponseClass::Read)
         }
@@ -1602,32 +1606,27 @@ impl SessionBackend for RemoteSessionBackend {
                 "remote watch frame size is outside the negotiated range".to_string(),
             )
         })?;
-        tokio::time::Instant::now()
+        let operation_deadline = tokio::time::Instant::now()
             .checked_add(self.deadline)
             .ok_or_else(|| {
                 StoreError::BackendUnavailable(
                     "remote watch deadline is not representable".to_string(),
                 )
             })?;
-        let target = self.target.clone();
-        let tls_config = self.tls_config.clone();
-        let max_frame_size = self.max_frame_size;
-        let binding = self.binding.clone();
-        let deadline = self.deadline;
+        let cursor = ReplicationWatchCursor::new(start_sequence);
+        let connection = open_watch_connection(
+            self.target.clone(),
+            self.tls_config.clone(),
+            self.max_frame_size,
+            self.binding.clone(),
+            cursor,
+            operation_deadline,
+        )
+        .await?;
 
         let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
-
         tokio::spawn(async move {
-            let result = watch_connect_and_read(
-                target,
-                tls_config,
-                max_frame_size,
-                binding,
-                start_sequence,
-                deadline,
-                tx,
-            )
-            .await;
+            let result = read_watch_stream(connection, cursor, tx).await;
             if let Err(e) = result {
                 tracing::debug!(
                     failure = RemoteRequestFailure::from_protocol_error(&e).reason_code(),
@@ -1714,20 +1713,16 @@ impl SessionLeaseManager for RemoteSessionBackend {
     }
 }
 
-async fn watch_connect_and_read(
+async fn open_watch_connection(
     target: RemoteTarget,
     tls_config: Option<Arc<opc_tls::ClientConfig>>,
     max_frame_size: usize,
     binding: RemoteReplicaBinding,
-    start_sequence: u64,
-    deadline: Duration,
-    tx: tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
-) -> Result<(), ProtocolError> {
-    // Bound connect + handshake by the client deadline. After the handshake,
-    // bounded channel sends backpressure socket reads when consumers lag.
-    let operation_deadline = tokio::time::Instant::now()
-        .checked_add(deadline)
-        .ok_or(ProtocolError::InvalidWireValue)?;
+    cursor: ReplicationWatchCursor,
+    operation_deadline: tokio::time::Instant,
+) -> Result<Connection, StoreError> {
+    // Complete the dedicated watch handshake before returning a stream so a
+    // typed backend rejection cannot be confused with a later disconnect.
     let open = async {
         let mut connection = open_connection(
             target,
@@ -1737,7 +1732,9 @@ async fn watch_connect_and_read(
             operation_deadline,
         )
         .await?;
-        let watch = Request::Watch { start_sequence };
+        let watch = Request::Watch {
+            start_sequence: cursor.first_sequence(),
+        };
         write_frame_bounded_until(
             &mut connection.writer,
             &watch,
@@ -1745,16 +1742,18 @@ async fn watch_connect_and_read(
             operation_deadline,
         )
         .await?;
-        match read_response_frame(
+        let response = read_response_frame(
             &mut connection.reader,
             connection.frame_limits.response_frame_size,
         )
-        .await?
-        {
-            Response::WatchStream => Ok::<_, ProtocolError>((
-                connection.reader,
-                connection.frame_limits.response_frame_size,
-            )),
+        .await?;
+        match response {
+            Response::WatchStream => Ok::<_, ProtocolError>(Ok(connection)),
+            Response::WatchEntry(Err(error))
+                if store_error_matches_class(&error, StoreResponseClass::Read) =>
+            {
+                Ok(Err(error))
+            }
             Response::Error { .. } => Err(ProtocolError::BackendUnavailable(
                 "watch request rejected".to_string(),
             )),
@@ -1764,36 +1763,77 @@ async fn watch_connect_and_read(
             }
         }
     };
-    let (mut reader, response_frame_size) =
-        match tokio::time::timeout_at(operation_deadline, open).await {
-            Ok(res) => res?,
-            Err(_) => {
-                let _ = tx
-                    .send(Err(StoreError::BackendUnavailable(
-                        "remote session watch handshake timed out".to_string(),
-                    )))
-                    .await;
-                return Err(ProtocolError::BackendUnavailable(
-                    "watch handshake timed out".into(),
-                ));
-            }
-        };
+    match tokio::time::timeout_at(operation_deadline, open).await {
+        Ok(Ok(Ok(connection))) => Ok(connection),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(error)) => {
+            let reason = RemoteRequestFailure::from_protocol_error(&error).reason_code();
+            Err(StoreError::BackendUnavailable(format!(
+                "remote session watch handshake failed: {reason}"
+            )))
+        }
+        Err(_) => Err(StoreError::BackendUnavailable(
+            "remote session watch handshake timed out".to_string(),
+        )),
+    }
+}
+
+async fn read_watch_stream(
+    mut connection: Connection,
+    cursor: ReplicationWatchCursor,
+    tx: tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
+) -> Result<(), ProtocolError> {
+    let mut expected_sequence = cursor.first_sequence();
 
     loop {
-        match read_response_frame(&mut reader, response_frame_size).await {
-            Ok(Response::WatchEntry(item)) => {
-                let item = item.and_then(ReplicationEntry::into_validated);
-                if tx.send(item).await.is_err() {
+        match read_response_frame(
+            &mut connection.reader,
+            connection.frame_limits.response_frame_size,
+        )
+        .await
+        {
+            Ok(Response::WatchEntry(Ok(entry))) => {
+                let entry = match entry.into_validated() {
+                    Ok(entry) if entry.sequence == expected_sequence => entry,
+                    Ok(entry) => {
+                        discard_replication_payloads_from_response(Response::WatchEntry(Ok(entry)));
+                        let _ = tx.try_send(Err(StoreError::BackendUnavailable(
+                            "remote session watch failed: protocol".to_string(),
+                        )));
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = tx.try_send(Err(StoreError::BackendUnavailable(
+                            "remote session watch failed: protocol".to_string(),
+                        )));
+                        break;
+                    }
+                };
+                let terminal = expected_sequence == u64::MAX;
+                if !terminal {
+                    expected_sequence = next_replication_sequence(expected_sequence)
+                        .map_err(|_| ProtocolError::InvalidWireValue)?;
+                }
+                if tx.try_send(Ok(entry)).is_err() || terminal {
                     break;
                 }
             }
+            Ok(Response::WatchEntry(Err(error))) => {
+                let error = if store_error_matches_class(&error, StoreResponseClass::Read) {
+                    error
+                } else {
+                    StoreError::BackendUnavailable(
+                        "remote session watch failed: protocol".to_string(),
+                    )
+                };
+                let _ = tx.try_send(Err(error));
+                break;
+            }
             Ok(response) => {
                 discard_replication_payloads_from_response(response);
-                let _ = tx
-                    .send(Err(StoreError::BackendUnavailable(
-                        "unexpected watch frame".into(),
-                    )))
-                    .await;
+                let _ = tx.try_send(Err(StoreError::BackendUnavailable(
+                    "unexpected watch frame".into(),
+                )));
                 break;
             }
             Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -1801,11 +1841,9 @@ async fn watch_connect_and_read(
             }
             Err(e) => {
                 let reason = RemoteRequestFailure::from_protocol_error(&e).reason_code();
-                let _ = tx
-                    .send(Err(StoreError::BackendUnavailable(format!(
-                        "remote session watch failed: {reason}"
-                    ))))
-                    .await;
+                let _ = tx.try_send(Err(StoreError::BackendUnavailable(format!(
+                    "remote session watch failed: {reason}"
+                ))));
                 break;
             }
         }
@@ -1829,6 +1867,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::InvalidReplicationLogRange => "invalid_replication_log_range",
         StoreError::ReplicationLogPageTooLarge { .. } => "replication_log_page_too_large",
         StoreError::ReplicationLogCursorCompacted { .. } => "replication_log_cursor_compacted",
+        StoreError::ReplicationWatchCatchUpRequired => "replication_watch_catch_up_required",
         StoreError::ReplicationOperationLimitExceeded => "replication_operation_limit_exceeded",
         StoreError::InvalidSessionTtl => "invalid_session_ttl",
         StoreError::LeaseHeld => "lease_held",
@@ -3958,6 +3997,49 @@ mod tests {
             error,
             StoreError::BackendUnavailable("remote session watch failed: protocol".to_string())
         );
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_peer_watch_entry_before_requested_cursor_terminates_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write hello ack");
+            let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read watch request");
+            assert!(matches!(request, Request::Watch { start_sequence: 2 }));
+            write_frame(&mut stream, &Response::WatchStream)
+                .await
+                .expect("write watch acknowledgement");
+            write_frame(
+                &mut stream,
+                &Response::WatchEntry(Ok(replication_entry_at_operation_limit())),
+            )
+            .await
+            .expect("write lower watch entry");
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        let mut watch = backend.watch(2).await.expect("create watch stream");
+
+        assert_eq!(
+            watch
+                .next()
+                .await
+                .expect("integrity error item")
+                .expect_err("lower sequence must fail closed"),
+            StoreError::BackendUnavailable("remote session watch failed: protocol".to_string())
+        );
+        assert!(watch.next().await.is_none(), "corrupt stream must close");
         let _ = server.await;
     }
 

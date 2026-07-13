@@ -839,7 +839,7 @@ live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
 configured frame bound remains
 separate. #159 now enforces that negotiated bound and one
 absolute write deadline across every ordinary response/watch item. The profile
-pins wire-schema revision 4, error-set revision 5,
+pins wire-schema revision 4, error-set revision 6,
 `max_restore_scan_examined_rows = 4096`,
 `min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
 owner/custom-key/state-type bounds,
@@ -848,7 +848,7 @@ owner/custom-key/state-type bounds,
 depth-16/256-node trees. Stable IDs contain 1 through 64 bytes, replication
 transaction IDs contain 1 through 128 UTF-8 bytes, and CAS request IDs, when
 present, are canonical lowercase hyphenated UUIDs with the exact 36-byte encoding. A
-revision-4 or older v4 participant is incompatible despite
+revision-5 or older v4 participant is incompatible despite
 sharing the same ALPN, so that profile transition also requires the coordinated
 stop/upgrade/start above. `ContractProfile::max_frame_size` is a public Rust
 source break for external struct literals/destructuring and must be updated in

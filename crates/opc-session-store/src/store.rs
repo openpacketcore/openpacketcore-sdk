@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::{stream::BoxStream, StreamExt};
+use futures_util::stream::BoxStream;
 
 use crate::backend::{
-    validate_replication_log_page_owned, validate_replication_prefix_owned,
-    validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
-    CompareAndSetResult, ReplicationEntry, ReplicationLogRange, SessionBackend, SessionOp,
-    SessionOpResult,
+    enforce_replication_watch_cursor, validate_replication_log_page_owned,
+    validate_replication_prefix_owned, validate_session_ops_ttls, BackendInstanceIdentity,
+    BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange,
+    SessionBackend, SessionOp, SessionOpResult,
 };
 use crate::capability::BackendCapabilities;
 use crate::error::{LeaseError, StoreError};
@@ -189,9 +189,7 @@ impl<B: SessionBackend + SessionLeaseManager> SessionBackend for SessionStore<B>
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
         let stream = self.backend.watch(start_sequence).await?;
-        Ok(stream
-            .map(|result| result.and_then(ReplicationEntry::into_validated))
-            .boxed())
+        Ok(enforce_replication_watch_cursor(stream, start_sequence))
     }
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {

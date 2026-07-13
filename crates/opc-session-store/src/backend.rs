@@ -32,6 +32,17 @@ use crate::{
 /// last processed sequence.
 pub const WATCH_CHANNEL_CAPACITY: usize = 64;
 
+/// Maximum number of already-applied entries retained by one newly-created
+/// replication watch.
+///
+/// The backlog and live channel are independently capped at this value. A
+/// request farther behind than this bounded handoff window fails closed rather
+/// than silently skipping history with
+/// [`StoreError::ReplicationWatchCatchUpRequired`]; callers must obtain a
+/// coherent snapshot or full catch-up that proves a resume position before
+/// reconnecting.
+pub const MAX_REPLICATION_WATCH_BACKLOG_ENTRIES: usize = WATCH_CHANNEL_CAPACITY;
+
 /// Maximum depth of a replication operation tree, counting its root as one.
 ///
 /// This fixed fleet-wide admission limit keeps post-decode validation,
@@ -412,6 +423,84 @@ fn discard_replication_entries_iteratively(entries: Vec<ReplicationEntry>) {
     for entry in entries {
         entry.discard_operation_iteratively();
     }
+}
+
+/// Normalized inclusive start position for a replication watch.
+///
+/// Application-journal entries are 1-based, so the empty-head sentinel zero
+/// means the same thing as sequence one. Any non-zero value is retained
+/// exactly. A future cursor waits without receiving lower entries, including
+/// the terminal `u64::MAX` cursor. Once a terminal entry is delivered, the
+/// stream closes because no reconnect position can be represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationWatchCursor {
+    first_sequence: u64,
+}
+
+impl ReplicationWatchCursor {
+    /// Normalize one caller-supplied inclusive watch position.
+    pub const fn new(start_sequence: u64) -> Self {
+        Self {
+            first_sequence: if start_sequence == 0 {
+                1
+            } else {
+                start_sequence
+            },
+        }
+    }
+
+    /// Return the normalized inclusive first sequence.
+    pub const fn first_sequence(self) -> u64 {
+        self.first_sequence
+    }
+
+    /// Reject a position already removed from retained history.
+    ///
+    /// `resume_from` identifies the first retained entry, but callers may use
+    /// it only after installing state that coherently covers the compacted
+    /// interval.
+    pub fn ensure_not_compacted(self, compacted_through: u64) -> Result<(), StoreError> {
+        if compacted_through != 0 && self.first_sequence <= compacted_through {
+            let resume_from = compacted_through.checked_add(1).ok_or_else(|| {
+                StoreError::BackendUnavailable("replication sequence exhausted".to_string())
+            })?;
+            return Err(StoreError::ReplicationLogCursorCompacted { resume_from });
+        }
+        Ok(())
+    }
+}
+
+/// Enforce the exact inclusive cursor on a delegated watch before a wrapper
+/// performs provider or cache work.
+pub(crate) fn enforce_replication_watch_cursor(
+    stream: futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+    start_sequence: u64,
+) -> futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>> {
+    use futures_util::StreamExt;
+
+    let cursor = ReplicationWatchCursor::new(start_sequence);
+    stream
+        .scan(Some(cursor.first_sequence()), |next_sequence, result| {
+            let output = match next_sequence.take() {
+                None => None,
+                Some(expected) => match result {
+                    Err(error) => Some(Err(error)),
+                    Ok(entry) => match entry.into_validated() {
+                        Ok(entry) if entry.sequence == expected => {
+                            *next_sequence = expected.checked_add(1);
+                            Some(Ok(entry))
+                        }
+                        Ok(entry) => {
+                            discard_replication_entries_iteratively(vec![entry]);
+                            Some(Err(StoreError::InvalidReplicationSequence))
+                        }
+                        Err(error) => Some(Err(error)),
+                    },
+                },
+            };
+            std::future::ready(output)
+        })
+        .boxed()
 }
 
 /// Checked inclusive interval for one replication-log page request.
@@ -1102,7 +1191,23 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// Watch for session changes starting from a specific sequence number.
+    /// Watch committed, applied session changes from an inclusive sequence.
+    ///
+    /// The cursor follows [`ReplicationWatchCursor`]: zero normalizes to one,
+    /// existing and future positions are inclusive, and `u64::MAX` is a valid
+    /// terminal position whose stream closes after delivery. Registration
+    /// must be atomic with backlog capture, compacted positions return
+    /// [`StoreError::ReplicationLogCursorCompacted`], and a bounded backlog or
+    /// slow-consumer overflow rejects or closes the watch without skipping an
+    /// entry. An over-window backlog returns
+    /// [`StoreError::ReplicationWatchCatchUpRequired`], which requires a
+    /// coherent catch-up rather than a blind retry. Reconnect from the last
+    /// processed entry uses its checked successor; a processed terminal entry
+    /// has no reconnect cursor.
+    ///
+    /// Production implementations must expose only entries applied through
+    /// their commit authority. This local contract does not grant sequencing
+    /// or commit authority to standalone adapters.
     async fn watch(
         &self,
         _start_sequence: u64,
@@ -1642,7 +1747,10 @@ where
         let provider = self.provider.clone();
         let backend_namespace = self.backend_namespace.clone();
         Box::pin(async move {
-            let stream = inner.watch(start_sequence).await?;
+            let stream = enforce_replication_watch_cursor(
+                inner.watch(start_sequence).await?,
+                start_sequence,
+            );
             use futures_util::StreamExt;
             let stream = stream.then(move |res| {
                 let provider = provider.clone();
@@ -1650,7 +1758,6 @@ where
                 async move {
                     match res {
                         Ok(entry) => {
-                            let entry = entry.into_validated()?;
                             transform_replication_entry(entry, |record| {
                                 decrypt_record_helper(provider.as_ref(), record, &backend_namespace)
                             })
@@ -2056,7 +2163,10 @@ where
         let provider = self.provider.clone();
         let backend_namespace = self.backend_namespace.clone();
         Box::pin(async move {
-            let stream = inner.watch(start_sequence).await?;
+            let stream = enforce_replication_watch_cursor(
+                inner.watch(start_sequence).await?,
+                start_sequence,
+            );
             use futures_util::StreamExt;
             let stream = stream.then(move |res| {
                 let provider = provider.clone();
@@ -2064,7 +2174,6 @@ where
                 async move {
                     match res {
                         Ok(entry) => {
-                            let entry = entry.into_validated()?;
                             transform_replication_entry(entry, |record| {
                                 remote_unseal_record_helper(
                                     provider.as_ref(),

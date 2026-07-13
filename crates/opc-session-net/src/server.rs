@@ -11,7 +11,7 @@ use opc_redaction::metrics::METRICS;
 use opc_session_store::backend::{
     validate_replication_log_page_owned, validate_replication_page_owned,
     validate_replication_prefix_owned, CompareAndSet, CompareAndSetResult, ReplicationEntry,
-    ReplicationLogRange, ReplicationOp, SessionOpResult,
+    ReplicationLogRange, ReplicationOp, ReplicationWatchCursor, SessionOpResult,
 };
 use opc_session_store::error::{LeaseError, StoreError};
 use opc_session_store::quorum::SessionStoreBackend;
@@ -2862,46 +2862,81 @@ where
                 )
                 .await?;
             }
-            Request::Watch { start_sequence } => match run_store_backend_operation(
-                reader,
-                max_frame_size,
-                operation_deadline,
-                &cancellation,
-                ResponseFamily::Watch,
-                backend_slots.watch_setup.clone(),
-                BackendDeadlineOutcome::Read,
-                backend.watch(start_sequence),
-            )
-            .await?
-            {
-                Ok(mut stream) => {
-                    let response_deadline =
-                        bounded_response_deadline(request_deadline, idle_timeout)?;
-                    write_post_auth_response_until(
-                        writer,
-                        &Response::WatchStream,
-                        effective_response_frame_size,
-                        response_deadline,
-                        ResponseFamily::Watch,
-                        &cancellation,
-                    )
-                    .await?;
-                    while let Some(item) = next_watch_item_or_disconnect(
-                        reader,
-                        max_frame_size,
-                        &cancellation,
-                        &mut stream,
-                    )
-                    .await?
-                    {
+            Request::Watch { start_sequence } => {
+                let cursor = ReplicationWatchCursor::new(start_sequence);
+                match run_store_backend_operation(
+                    reader,
+                    max_frame_size,
+                    operation_deadline,
+                    &cancellation,
+                    ResponseFamily::Watch,
+                    backend_slots.watch_setup.clone(),
+                    BackendDeadlineOutcome::Read,
+                    backend.watch(cursor.first_sequence()),
+                )
+                .await?
+                {
+                    Ok(mut stream) => {
+                        let mut expected_sequence = cursor.first_sequence();
+                        let response_deadline =
+                            bounded_response_deadline(request_deadline, idle_timeout)?;
+                        write_post_auth_response_until(
+                            writer,
+                            &Response::WatchStream,
+                            effective_response_frame_size,
+                            response_deadline,
+                            ResponseFamily::Watch,
+                            &cancellation,
+                        )
+                        .await?;
+                        while let Some(item) = next_watch_item_or_disconnect(
+                            reader,
+                            max_frame_size,
+                            &cancellation,
+                            &mut stream,
+                        )
+                        .await?
+                        {
+                            let deadline = response_write_deadline(idle_timeout)?;
+                            check_response_write_control(deadline, &cancellation)?;
+                            let (item, close_after) = match item {
+                                Ok(entry) => match entry.into_validated() {
+                                    Ok(entry) if entry.sequence == expected_sequence => {
+                                        let terminal = expected_sequence == u64::MAX;
+                                        if !terminal {
+                                            expected_sequence = expected_sequence
+                                                .checked_add(1)
+                                                .ok_or(ProtocolError::InvalidWireValue)?;
+                                        }
+                                        (Ok(entry), terminal)
+                                    }
+                                    Ok(entry) => {
+                                        discard_replication_entries_iteratively(vec![entry]);
+                                        (Err(StoreError::InvalidReplicationSequence), true)
+                                    }
+                                    Err(error) => (Err(error), true),
+                                },
+                                Err(error) => (Err(error), true),
+                            };
+                            check_response_write_control(deadline, &cancellation)?;
+                            let terminate = write_watch_response_until(
+                                writer,
+                                Response::WatchEntry(item),
+                                effective_response_frame_size,
+                                deadline,
+                                &cancellation,
+                            )
+                            .await?;
+                            if terminate || close_after {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(e) => {
                         let deadline = response_write_deadline(idle_timeout)?;
-                        check_response_write_control(deadline, &cancellation)?;
-                        let item =
-                            item.and_then(opc_session_store::ReplicationEntry::into_validated);
-                        check_response_write_control(deadline, &cancellation)?;
                         let terminate = write_watch_response_until(
                             writer,
-                            Response::WatchEntry(item),
+                            Response::WatchEntry(Err(e)),
                             effective_response_frame_size,
                             deadline,
                             &cancellation,
@@ -2912,21 +2947,7 @@ where
                         }
                     }
                 }
-                Err(e) => {
-                    let deadline = response_write_deadline(idle_timeout)?;
-                    let terminate = write_watch_response_until(
-                        writer,
-                        Response::WatchEntry(Err(e)),
-                        effective_response_frame_size,
-                        deadline,
-                        &cancellation,
-                    )
-                    .await?;
-                    if terminate {
-                        return Ok(());
-                    }
-                }
-            },
+            }
             Request::NextLeaseInfo => {
                 let res = run_store_backend_operation(
                     reader,
