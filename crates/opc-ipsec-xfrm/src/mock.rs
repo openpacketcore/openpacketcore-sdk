@@ -11,7 +11,7 @@ use crate::model::{
     AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig,
     LifetimeCurrent, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest,
     RemoveSaRequest, SaReplayState, SaState, SaStatistics, SpiAllocation, XfrmAction,
-    XfrmDirection, XfrmId, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 
 /// One recorded call against the mock backend.
@@ -156,6 +156,8 @@ pub enum MockOperation {
         selector: XfrmSelector,
         /// Policy direction.
         direction: XfrmDirection,
+        /// Optional policy lookup mark.
+        mark: Option<XfrmMark>,
     },
     /// Capability probe.
     Probe,
@@ -175,7 +177,7 @@ pub struct MockXfrmBackend {
 /// Allocated SPI identity used to allow the same SPI value to be reused for a
 /// different destination or protocol.
 type AllocatedSpiKey = (IpAddress, u8, u32);
-type SaKey = (IpAddress, u8, u32);
+type SaKey = (IpAddress, u8, u32, Option<XfrmMark>);
 
 #[derive(Debug)]
 struct MockState {
@@ -258,8 +260,8 @@ impl MockXfrmBackend {
     }
 }
 
-fn sa_key(id: XfrmId) -> SaKey {
-    (id.destination, id.protocol, id.spi)
+fn sa_key(id: XfrmId, mark: Option<XfrmMark>) -> SaKey {
+    (id.destination, id.protocol, id.spi, mark)
 }
 
 fn sa_state_from_parameters(parameters: &crate::model::SaParameters) -> SaState {
@@ -281,6 +283,7 @@ fn sa_state_from_parameters(parameters: &crate::model::SaParameters) -> SaState 
             replay_window: parameters.replay_window,
             ..SaStatistics::default()
         },
+        egress_dscp: None,
     }
 }
 
@@ -333,6 +336,11 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn install_sa(&self, request: InstallSaRequest) -> Result<(), XfrmError> {
+        if request.parameters.egress_dscp.is_some() {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp",
+            });
+        }
         let mut state = self
             .state
             .lock()
@@ -393,7 +401,7 @@ impl XfrmBackend for MockXfrmBackend {
             replay_state_present: request.parameters.replay_state.is_some(),
         });
         state.sas.insert(
-            sa_key(request.parameters.id),
+            sa_key(request.parameters.id, request.parameters.mark),
             sa_state_from_parameters(&request.parameters),
         );
         Ok(())
@@ -412,12 +420,22 @@ impl XfrmBackend for MockXfrmBackend {
         });
         state
             .sas
-            .get(&(request.destination, request.protocol, request.spi))
+            .get(&(
+                request.destination,
+                request.protocol,
+                request.spi,
+                request.mark,
+            ))
             .cloned()
             .ok_or(XfrmError::NotFound)
     }
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
+        if request.parameters.egress_dscp.is_some() {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp",
+            });
+        }
         let mut state = self
             .state
             .lock()
@@ -478,7 +496,7 @@ impl XfrmBackend for MockXfrmBackend {
             replay_state_present: request.parameters.replay_state.is_some(),
         });
         state.sas.insert(
-            sa_key(request.parameters.id),
+            sa_key(request.parameters.id, request.parameters.mark),
             sa_state_from_parameters(&request.parameters),
         );
         Ok(())
@@ -497,7 +515,12 @@ impl XfrmBackend for MockXfrmBackend {
         });
         state
             .sas
-            .remove(&(request.destination, request.protocol, request.spi))
+            .remove(&(
+                request.destination,
+                request.protocol,
+                request.spi,
+                request.mark,
+            ))
             .ok_or(XfrmError::NotFound)?;
         Ok(())
     }
@@ -543,6 +566,7 @@ impl XfrmBackend for MockXfrmBackend {
         state.operations.push(MockOperation::RemovePolicy {
             selector: request.selector.clone(),
             direction: request.direction,
+            mark: request.mark,
         });
         Ok(())
     }
@@ -598,6 +622,7 @@ mod tests {
             encap: None,
             mark: None,
             if_id: None,
+            egress_dscp: None,
         }
     }
 
@@ -752,6 +777,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_rejects_fixed_outer_dscp_without_recording_or_mutating() {
+        let backend = MockXfrmBackend::new();
+        let mut params = sample_sa_parameters();
+        params.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: params.clone(),
+                })
+                .await
+                .unwrap_err(),
+            XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp"
+            }
+        ));
+        assert!(matches!(
+            backend
+                .rekey_sa(RekeySaRequest { parameters: params })
+                .await
+                .unwrap_err(),
+            XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp"
+            }
+        ));
+        assert!(backend.operations().is_empty());
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Missing
+        );
+    }
+
+    #[tokio::test]
     async fn mock_rekey_sa_records_operation() {
         let backend = MockXfrmBackend::new();
         let params = sample_sa_parameters();
@@ -780,6 +838,7 @@ mod tests {
             destination: ipv4(10, 0, 0, 2),
             protocol: 50,
             spi: 0x1234_5678,
+            mark: None,
         };
         backend.remove_sa(request).await.unwrap();
 
@@ -822,6 +881,7 @@ mod tests {
                 destination: params.id.destination,
                 protocol: params.id.protocol,
                 spi: params.id.spi,
+                mark: params.mark,
             })
             .await
             .unwrap();
@@ -839,6 +899,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_keeps_marked_and_unmarked_sa_identities_distinct() {
+        let backend = MockXfrmBackend::new();
+        let mut params = sample_sa_parameters();
+        let mark = XfrmMark {
+            value: 0x42,
+            mask: 0xff,
+        };
+        params.mark = Some(mark);
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+
+        let unmarked =
+            QuerySaRequest::new(params.id.destination, params.id.protocol, params.id.spi);
+        assert!(matches!(
+            backend.query_sa(unmarked).await,
+            Err(XfrmError::NotFound)
+        ));
+        backend.query_sa(unmarked.with_mark(mark)).await.unwrap();
+        assert!(matches!(
+            backend
+                .remove_sa(RemoveSaRequest::new(
+                    params.id.destination,
+                    params.id.protocol,
+                    params.id.spi,
+                ))
+                .await,
+            Err(XfrmError::NotFound)
+        ));
+        backend
+            .remove_sa(
+                RemoveSaRequest::new(params.id.destination, params.id.protocol, params.id.spi)
+                    .with_mark(mark),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn mock_query_sa_reports_not_found_after_remove() {
         let backend = MockXfrmBackend::new();
         let params = sample_sa_parameters();
@@ -853,6 +955,7 @@ mod tests {
                 destination: params.id.destination,
                 protocol: params.id.protocol,
                 spi: params.id.spi,
+                mark: params.mark,
             })
             .await
             .unwrap();
@@ -862,6 +965,7 @@ mod tests {
                 destination: params.id.destination,
                 protocol: params.id.protocol,
                 spi: params.id.spi,
+                mark: params.mark,
             })
             .await
             .unwrap_err();
@@ -927,6 +1031,10 @@ mod tests {
         let request = RemovePolicyRequest {
             selector: sample_selector(),
             direction: XfrmDirection::Out,
+            mark: Some(XfrmMark {
+                value: 0x42,
+                mask: 0xff,
+            }),
         };
         backend.remove_policy(request.clone()).await.unwrap();
 
@@ -937,6 +1045,7 @@ mod tests {
             MockOperation::RemovePolicy {
                 selector: request.selector,
                 direction: request.direction,
+                mark: request.mark,
             }
         );
     }
@@ -949,6 +1058,7 @@ mod tests {
             kernel_reachable: false,
             net_admin_capable: false,
             algorithms: XfrmCapability::Available,
+            egress_dscp_marking: XfrmCapability::Missing,
             details: Some("configured probe"),
         };
         let backend = MockXfrmBackend::with_probe(probe);
@@ -965,6 +1075,7 @@ mod tests {
             destination: ipv4(10, 0, 0, 2),
             protocol: 50,
             spi: 0x1234_5678,
+            mark: None,
         };
         let err = backend.remove_sa(request).await.unwrap_err();
         assert!(matches!(err, XfrmError::Unavailable));

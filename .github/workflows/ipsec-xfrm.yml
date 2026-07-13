@@ -1,0 +1,156 @@
+name: IPsec XFRM
+
+on:
+  pull_request:
+    paths:
+      - "crates/opc-ipsec-xfrm/**"
+      - "crates/opc-ipsec-xfrm-ebpf/**"
+      - "crates/opc-ipsec-xfrm-ebpf-common/**"
+      - "crates/opc-linux-xfrm-sys/**"
+      - "crates/opc-types/**"
+      - ".github/workflows/ipsec-xfrm.yml"
+      - "scripts/build-ipsec-xfrm-ebpf.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/opc-ipsec-xfrm/**"
+      - "crates/opc-ipsec-xfrm-ebpf/**"
+      - "crates/opc-ipsec-xfrm-ebpf-common/**"
+      - "crates/opc-linux-xfrm-sys/**"
+      - "crates/opc-types/**"
+      - ".github/workflows/ipsec-xfrm.yml"
+      - "scripts/build-ipsec-xfrm-ebpf.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  conformance:
+    name: Kernel-independent conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check diff whitespace
+        run: git diff --check
+
+      - name: Run clippy
+        run: cargo clippy --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --all-targets --all-features -- -D warnings
+
+      - name: Run conformance tests
+        run: cargo test --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --all-features --quiet -- --test-threads=4
+
+      - name: Build crate docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --no-deps --all-features
+
+  privileged:
+    name: Privileged Linux XFRM DSCP
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install kernel tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y iproute2
+          mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+          sudo unshare -n -- bash -c 'ip link set lo up; ip xfrm state list'
+
+      - name: Build privileged test
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          cargo test --locked -p opc-ipsec-xfrm --test xfrm_dscp_privileged --no-run
+
+      - name: Run real XFRM and tc datapath proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_XFRM_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-ipsec-xfrm --test xfrm_dscp_privileged -- --ignored --nocapture
+            '
+
+  ebpf-object:
+    name: XFRM tc object rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pinned nightly Rust toolchain
+        run: rustup toolchain install nightly-2026-06-22 --profile minimal --component rust-src
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/opc-ipsec-xfrm-ebpf
+
+      - name: Install pinned bpf-linker
+        run: cargo install bpf-linker --version 0.10.3 --locked
+
+      - name: Rebuild and compare program/map inventory
+        run: |
+          set -euo pipefail
+          committed="${RUNNER_TEMP}/committed-opc-ipsec-xfrm-dscp.bpf.o"
+          cp crates/opc-ipsec-xfrm/bpf/opc-ipsec-xfrm-dscp.bpf.o "${committed}"
+          ./scripts/build-ipsec-xfrm-ebpf.sh
+          rebuilt="crates/opc-ipsec-xfrm-ebpf/target/bpfel-unknown-none/release/opc-ipsec-xfrm-dscp"
+          inventory() {
+            readelf -sW "$1" | awk '
+              ($4 == "FUNC" || $4 == "OBJECT") {
+                if ($8 ~ /^_RNv/) next
+                print $4, $8
+              }
+            ' | sort
+          }
+          inventory "${committed}" > committed.inventory
+          inventory "${rebuilt}" > rebuilt.inventory
+          cat rebuilt.inventory
+          diff -u committed.inventory rebuilt.inventory
+          for symbol in opc_xfrm_dscp XFRM_DSCP_CFG; do
+            grep -q " ${symbol}$" committed.inventory
+          done

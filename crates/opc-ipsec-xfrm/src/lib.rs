@@ -12,6 +12,7 @@
 
 pub mod backend;
 pub mod composite;
+mod dscp;
 pub mod error;
 #[cfg(feature = "ikev2")]
 pub mod ikev2;
@@ -27,6 +28,9 @@ pub use composite::{
     XfrmBidirectionalInstallOutcome, XfrmCompositeInstallError, XfrmCompositeInstallRequest,
     XfrmCompositeOperation, XfrmCompositeOutcome, XFRM_COMPOSITE_INSTALL_ORDER,
     XFRM_COMPOSITE_INSTALL_ROLLBACK_ORDER, XFRM_COMPOSITE_REKEY_ORDER, XFRM_COMPOSITE_REMOVE_ORDER,
+};
+pub use dscp::{
+    LinuxXfrmDscpMarkingConfig, DEFAULT_XFRM_DSCP_BPFFS_PIN_ROOT, DEFAULT_XFRM_DSCP_TC_PRIORITY,
 };
 pub use error::XfrmError;
 #[cfg(feature = "ikev2")]
@@ -48,6 +52,7 @@ pub use model::{
     XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP, XFRM_AEAD_RFC4106_GCM_AES,
     XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES,
 };
+pub use opc_types::DscpCodepoint;
 pub use unsupported::UnsupportedXfrmBackend;
 
 #[cfg(test)]
@@ -92,6 +97,7 @@ mod integration_tests {
             encap: None,
             mark: None,
             if_id: None,
+            egress_dscp: None,
         }
     }
 
@@ -149,6 +155,7 @@ mod integration_tests {
                 destination: params.id.destination,
                 protocol: params.id.protocol,
                 spi: params.id.spi,
+                mark: params.mark,
             })
             .await
             .unwrap();
@@ -172,6 +179,7 @@ mod integration_tests {
             .remove_policy(RemovePolicyRequest {
                 selector: policy.selector.clone(),
                 direction: policy.direction,
+                mark: policy.mark,
             })
             .await
             .unwrap();

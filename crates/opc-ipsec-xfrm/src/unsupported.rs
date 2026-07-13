@@ -75,6 +75,7 @@ mod tests {
             destination: IpAddress::Ipv4([10, 0, 0, 2]),
             protocol: 50,
             spi: 0x1234_5678,
+            mark: None,
         };
         let err = backend.remove_sa(request).await.unwrap_err();
         assert!(matches!(err, XfrmError::UnsupportedPlatform));

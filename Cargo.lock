@@ -2492,6 +2492,7 @@ dependencies = [
  "nix",
  "opc-gtpu-ebpf-common",
  "opc-linux-gtpu-sys",
+ "opc-types",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -2551,13 +2552,22 @@ name = "opc-ipsec-xfrm"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "aya",
+ "nix",
+ "opc-ipsec-xfrm-ebpf-common",
+ "opc-linux-gtpu-sys",
  "opc-linux-xfrm-sys",
  "opc-proto-ikev2",
+ "opc-types",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
  "zeroize",
 ]
+
+[[package]]
+name = "opc-ipsec-xfrm-ebpf-common"
+version = "0.2.0"
 
 [[package]]
 name = "opc-key"

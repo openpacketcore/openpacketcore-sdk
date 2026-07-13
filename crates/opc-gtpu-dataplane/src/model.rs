@@ -4,6 +4,8 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
 
+use opc_types::DscpCodepoint;
+
 /// Default GTP-U UDP port.
 pub const GTPU_PORT: u16 = 2152;
 /// Default PDP context hash size used by libgtpnl examples.
@@ -155,6 +157,13 @@ pub struct GtpPdpContext {
     pub link_ifindex: u32,
     /// GTP version.
     pub gtp_version: GtpVersion,
+    /// Optional fixed DSCP stamped on the outer uplink IP header.
+    ///
+    /// The Linux eBPF backend supports this per PDP context. Backends whose
+    /// [`GtpuProbe::egress_dscp_marking`] is not [`GtpuCapability::Available`]
+    /// reject `Some` rather than silently ignoring it. `None` preserves the
+    /// backend's pre-DSCP packet and kernel-message behavior.
+    pub egress_dscp: Option<DscpCodepoint>,
 }
 
 impl fmt::Debug for GtpPdpContext {
@@ -166,6 +175,7 @@ impl fmt::Debug for GtpPdpContext {
             .field("peer_address", &"<redacted>")
             .field("link_ifindex", &self.link_ifindex)
             .field("gtp_version", &self.gtp_version)
+            .field("egress_dscp", &self.egress_dscp)
             .finish()
     }
 }
@@ -222,6 +232,21 @@ pub enum GtpuBackendKind {
     Mock,
 }
 
+/// Capability state reported by a GTP-U backend probe.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GtpuCapability {
+    /// Capability state has not been determined.
+    #[default]
+    Unknown,
+    /// The capability is available for production mutations.
+    Available,
+    /// The backend cannot provide the capability.
+    Missing,
+    /// The capability exists but current process privileges are insufficient.
+    PermissionDenied,
+}
+
 /// Capability and health probe for a GTP-U backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GtpuProbe {
@@ -244,6 +269,8 @@ pub struct GtpuProbe {
     /// Mutating operations appear ready: kernel reachable, module present,
     /// NET_ADMIN available, and the UDP GTP-U socket can be bound.
     pub mutation_ready: bool,
+    /// Ability to stamp a fixed per-PDP DSCP on uplink outer IP headers.
+    pub egress_dscp_marking: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,
 }
@@ -260,6 +287,7 @@ impl GtpuProbe {
             bpf_capable: false,
             btf_present: false,
             mutation_ready: false,
+            egress_dscp_marking: GtpuCapability::Missing,
             details: Some("dry-run/mock backend"),
         }
     }
@@ -275,6 +303,7 @@ impl GtpuProbe {
             bpf_capable: false,
             btf_present: false,
             mutation_ready: false,
+            egress_dscp_marking: GtpuCapability::Missing,
             details: Some("GTP-U dataplane operations are not supported on this platform"),
         }
     }
@@ -313,6 +342,7 @@ mod tests {
             peer_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             link_ifindex: 7,
             gtp_version: GtpVersion::V1,
+            egress_dscp: None,
         };
         let debug = format!("{ctx:?}");
         assert!(!debug.contains("12345678"));
@@ -330,6 +360,7 @@ mod tests {
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 9,
             gtp_version: GtpVersion::V1,
+            egress_dscp: None,
         };
         let remove = RemovePdpContextRequest::from_context(&ctx);
         assert_eq!(remove.local_teid, ctx.local_teid);

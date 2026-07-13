@@ -22,6 +22,12 @@ pub enum GtpuError {
     /// The platform does not support Linux GTP-U operations.
     #[error("GTP-U dataplane operations are not supported on this platform")]
     UnsupportedPlatform,
+    /// A requested feature is outside this backend's capability profile.
+    #[error("GTP-U dataplane feature is unsupported: {feature}")]
+    UnsupportedFeature {
+        /// Stable feature label.
+        feature: &'static str,
+    },
     /// Kernel or socket I/O failed.
     #[error("GTP-U {operation} failed{}", .raw_os_error.map(|code| format!(" (os error {code})")).unwrap_or_default())]
     Io {
@@ -45,6 +51,13 @@ pub enum GtpuError {
         field: &'static str,
         /// Static payload-free reason.
         reason: &'static str,
+    },
+    /// A mutation or cleanup may be partial, ACK-uncertain, or otherwise have
+    /// an unproven final state.
+    #[error("GTP-U {operation} outcome is indeterminate")]
+    StateIndeterminate {
+        /// Stable operation label.
+        operation: &'static str,
     },
 }
 

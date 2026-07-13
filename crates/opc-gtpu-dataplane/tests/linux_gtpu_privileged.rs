@@ -31,6 +31,7 @@ async fn create_install_remove_destroy_gtpu_device_in_current_netns(
         peer_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         link_ifindex: device.ifindex,
         gtp_version: GtpVersion::V1,
+        egress_dscp: None,
     };
 
     let result = async {

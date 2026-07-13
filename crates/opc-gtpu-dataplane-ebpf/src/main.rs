@@ -29,16 +29,20 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use opc_gtpu_ebpf_common::{
-    build_uplink_encap, classify_gtpu, DownlinkPdr, GtpuClass, UplinkFar, COUNTER_DL_DECAP,
-    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
-    COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
-    GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN, GTPU_UDP_PORT,
-    UPLINK_FAR_VALUE_LEN,
+    build_uplink_encap_with_dscp, classify_gtpu, DownlinkPdr, GtpuClass, UplinkFar,
+    COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
+    COUNTER_SLOTS, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
+    ETH_P_IPV4, GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN, GTPU_UDP_PORT,
+    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
 };
 
 /// Uplink FAR: UE PAA (IPv4, network order) -> encap state.
 #[map]
 static GTPU_UPLINK_FAR: HashMap<[u8; 4], [u8; UPLINK_FAR_VALUE_LEN]> = HashMap::pinned(65536, 0);
+
+/// Optional fixed outer DSCP: UE PAA -> one validated six-bit codepoint.
+#[map]
+static GTPU_UPLINK_DSCP: HashMap<[u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]> = HashMap::pinned(65536, 0);
 
 /// Downlink PDR: local S2b-U TEID (network order) -> UE PAA.
 #[map]
@@ -90,6 +94,11 @@ fn try_uplink(ctx: &mut TcContext) -> Result<i32, ()> {
     }
 
     let inner_src: [u8; 4] = ctx.load(ETH_HDR_LEN + 12).map_err(|_| ())?;
+    if inner_src == UPLINK_DSCP_SCHEMA_MARKER_KEY {
+        // Reserved durable-schema evidence is never subscriber forwarding
+        // state, even if a locally forged packet uses source 0.0.0.0.
+        return Ok(TC_ACT_OK as i32);
+    }
     let Some(far_ptr) = GTPU_UPLINK_FAR.get_ptr(&inner_src) else {
         count(COUNTER_UL_FAR_MISS);
         return Ok(TC_ACT_OK as i32);
@@ -106,7 +115,17 @@ fn try_uplink(ctx: &mut TcContext) -> Result<i32, ()> {
 
     let inner_len = (ctx.len() as usize).saturating_sub(ETH_HDR_LEN);
     let inner_len = u16::try_from(inner_len).map_err(|_| ())?;
-    let encap = build_uplink_encap(&far, inner_len).ok_or(())?;
+    let dscp = if let Some(dscp_ptr) = GTPU_UPLINK_DSCP.get_ptr(&inner_src) {
+        // SAFETY: the map value outlives this invocation and is read only.
+        let value = unsafe { (*dscp_ptr)[0] };
+        if value > 63 {
+            return Ok(TC_ACT_SHOT as i32);
+        }
+        Some(value)
+    } else {
+        None
+    };
+    let encap = build_uplink_encap_with_dscp(&far, inner_len, dscp).ok_or(())?;
 
     ctx.skb
         .adjust_room(

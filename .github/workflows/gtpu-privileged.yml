@@ -84,7 +84,8 @@ jobs:
       # tc-ingress decapsulation with stack forwarding to the UE netns,
       # unknown-TEID drops, echo passthrough, restore/adoption, and
       # ownership-safe teardown (no opc_gtpu filters or pins left behind,
-      # foreign filters never touched).
+      # already-visible foreign filters preserved under the documented
+      # exclusive-writer boundary).
       - name: Run privileged eBPF GTP-U datapath test in a fresh netns
         run: |
           set -euo pipefail
@@ -142,6 +143,6 @@ jobs:
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_gtpu_uplink opc_gtpu_downlink GTPU_UPLINK_FAR GTPU_DOWNLINK_PDR GTPU_COUNTERS GTPU_CONFIG; do
+          for symbol in opc_gtpu_uplink opc_gtpu_downlink GTPU_UPLINK_FAR GTPU_UPLINK_DSCP GTPU_DOWNLINK_PDR GTPU_COUNTERS GTPU_CONFIG; do
             grep -q " ${symbol}$" committed.inventory
           done

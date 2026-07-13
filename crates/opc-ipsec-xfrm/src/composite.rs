@@ -79,6 +79,7 @@ impl XfrmCompositeInstallRequest {
             destination: self.sa.parameters.id.destination,
             protocol: self.sa.parameters.id.protocol,
             spi: self.sa.parameters.id.spi,
+            mark: self.sa.parameters.mark,
         }
     }
 
@@ -87,6 +88,7 @@ impl XfrmCompositeInstallRequest {
         RemovePolicyRequest {
             selector: self.policy.parameters.selector.clone(),
             direction: self.policy.parameters.direction,
+            mark: self.policy.parameters.mark,
         }
     }
 }
@@ -125,6 +127,17 @@ impl XfrmCompositeOutcome {
             rolled_back: false,
             rollback_failed: false,
             partial_state_possible: false,
+            failed_operation: Some(failed_operation),
+        }
+    }
+
+    /// Failed with backend evidence that an acknowledged mutation may remain.
+    pub const fn indeterminate(failed_operation: XfrmCompositeOperation) -> Self {
+        Self {
+            applied: false,
+            rolled_back: false,
+            rollback_failed: false,
+            partial_state_possible: true,
             failed_operation: Some(failed_operation),
         }
     }
@@ -359,10 +372,12 @@ where
     B: XfrmBackend + ?Sized,
 {
     if let Err(source) = backend.install_sa(request.sa.clone()).await {
-        return Err(XfrmCompositeInstallError::InstallSaFailed {
-            source,
-            outcome: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
-        });
+        let outcome = if matches!(&source, XfrmError::StateIndeterminate { .. }) {
+            XfrmCompositeOutcome::indeterminate(XfrmCompositeOperation::InstallSa)
+        } else {
+            XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa)
+        };
+        return Err(XfrmCompositeInstallError::InstallSaFailed { source, outcome });
     }
 
     if let Err(source) = backend.install_policy(request.policy.clone()).await {
@@ -460,7 +475,11 @@ where
 ///
 /// # Errors
 ///
-/// Returns the backend error from the first failing operation.
+/// Returns the backend error from the first failing operation. A backend may
+/// return [`XfrmError::StateIndeterminate`] when an SA update was acknowledged
+/// but its mandatory post-update readback failed: the safe [`crate::SaState`]
+/// model deliberately contains no key material with which to restore the old
+/// SA.
 pub async fn rekey_sa_policy<B>(
     backend: &B,
     sa: RekeySaRequest,
@@ -529,6 +548,15 @@ mod tests {
         fn with_sa_failure() -> Self {
             Self {
                 install_sa_error: Some(XfrmError::Unavailable),
+                ..Self::default()
+            }
+        }
+
+        fn with_indeterminate_sa_failure() -> Self {
+            Self {
+                install_sa_error: Some(XfrmError::StateIndeterminate {
+                    operation: "install_sa_dscp_readback",
+                }),
                 ..Self::default()
             }
         }
@@ -659,6 +687,7 @@ mod tests {
             encap: None,
             mark: None,
             if_id: None,
+            egress_dscp: None,
         }
     }
 
@@ -770,6 +799,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composite_install_preserves_possible_residue_from_indeterminate_sa_failure() {
+        let backend = FailingCompositeBackend::with_indeterminate_sa_failure();
+
+        let error = install_sa_policy_with_rollback(&backend, install_request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.outcome(),
+            XfrmCompositeOutcome::indeterminate(XfrmCompositeOperation::InstallSa)
+        );
+        assert!(error.outcome().partial_state_possible);
+        assert_eq!(backend.operations(), vec!["install_sa"]);
+    }
+
+    #[tokio::test]
     async fn composite_rekey_and_remove_use_stable_order() {
         let backend = FailingCompositeBackend::default();
         let sa = sa_parameters();
@@ -795,11 +840,13 @@ mod tests {
             RemovePolicyRequest {
                 selector: policy.selector,
                 direction: policy.direction,
+                mark: policy.mark,
             },
             RemoveSaRequest {
                 destination: sa.id.destination,
                 protocol: sa.id.protocol,
                 spi: sa.id.spi,
+                mark: sa.mark,
             },
         )
         .await;

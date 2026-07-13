@@ -29,16 +29,20 @@
 
 use std::env;
 use std::fs;
+use std::io::IoSliceMut;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use aya::maps::MapInfo;
 use opc_gtpu_dataplane::{
-    CreateGtpDeviceRequest, EbpfGtpuDataplaneBackend, EbpfGtpuDataplaneBackendConfig,
-    GtpPdpContext, GtpVersion, GtpuDataplaneBackend, RemovePdpContextRequest, Teid,
+    CreateGtpDeviceRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
+    EbpfGtpuDataplaneBackendConfig, GtpPdpContext, GtpVersion, GtpuCapability,
+    GtpuDataplaneBackend, RemovePdpContextRequest, Teid,
 };
-use opc_gtpu_ebpf_common::ipv4_header_checksum;
+use opc_gtpu_ebpf_common::{ipv4_header_checksum, MAP_UPLINK_DSCP, MAP_UPLINK_FAR};
 
 const EPDG_S2BU_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const PGW_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -181,7 +185,14 @@ fn session_context(link_ifindex: u32) -> GtpPdpContext {
         peer_address: IpAddr::V4(PGW_IP),
         link_ifindex,
         gtp_version: GtpVersion::V1,
+        egress_dscp: None,
     }
+}
+
+fn marked_session_context(link_ifindex: u32) -> GtpPdpContext {
+    let mut context = session_context(link_ifindex);
+    context.egress_dscp = Some(DscpCodepoint::new(46).expect("valid EF codepoint"));
+    context
 }
 
 /// Build an inner IPv4/UDP packet as it would leave the PGW toward the UE.
@@ -255,6 +266,41 @@ fn send_until_received(
     None
 }
 
+/// Receive one UDP datagram together with the kernel-reported outer IPv4 ToS.
+fn send_until_received_with_tos(
+    send: impl Fn(),
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+) -> Option<(usize, SocketAddr, u8)> {
+    use nix::sys::socket::{
+        recvmsg, setsockopt, sockopt, ControlMessageOwned, MsgFlags, SockaddrIn,
+    };
+
+    setsockopt(socket, sockopt::IpRecvTos, &true).expect("enable IP_RECVTOS");
+    socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("set timeout");
+    for _ in 0..10 {
+        send();
+        let mut cmsg_space = nix::cmsg_space!(u8);
+        let mut iov = [IoSliceMut::new(buffer)];
+        if let Ok(message) = recvmsg::<SockaddrIn>(
+            socket.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsg_space),
+            MsgFlags::empty(),
+        ) {
+            let from = SocketAddr::from(message.address?);
+            let tos = message.cmsgs().ok()?.find_map(|control| match control {
+                ControlMessageOwned::Ipv4Tos(value) => Some(value),
+                _ => None,
+            })?;
+            return Some((message.bytes, from, tos));
+        }
+    }
+    None
+}
+
 fn expect_no_datagram(socket: &UdpSocket) {
     let mut buffer = [0_u8; 2048];
     socket
@@ -295,6 +341,11 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     let mut request = CreateGtpDeviceRequest::new("s2bu");
     request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
     let device = backend.create_device(request).await?;
+    assert_eq!(
+        backend.probe().await?.egress_dscp_marking,
+        GtpuCapability::Available,
+        "loaded datapath must expose a usable DSCP map"
+    );
     assert!(
         tc_filters("egress").contains("opc_gtpu_uplink"),
         "uplink program must be attached at tc egress"
@@ -303,10 +354,42 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         tc_filters("ingress").contains("opc_gtpu_downlink"),
         "downlink program must be attached at tc ingress"
     );
+
+    // A second live reconciler must not interleave map operations with the
+    // current owner. Kernel-owned abstract socket lifetime makes this work
+    // across independent backend instances and processes.
+    let competing = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    assert!(matches!(
+        competing.resolve_device("s2bu").await,
+        Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
+    ));
+    drop(competing);
+    let pin_alias = PathBuf::from(format!("/run/opc-gtpu-pin-alias-{}", std::process::id()));
+    std::os::unix::fs::symlink(&net.pin_root, &pin_alias)
+        .expect("create lexical alias for pin root");
+    let aliased = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: pin_alias.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    assert!(matches!(
+        aliased.resolve_device("s2bu").await,
+        Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
+    ));
+    drop(aliased);
+    fs::remove_file(&pin_alias).expect("remove pin-root alias");
+    assert!(
+        tc_filters("egress").contains("opc_gtpu_uplink")
+            && tc_filters("ingress").contains("opc_gtpu_downlink"),
+        "failed competing ownership and competitor drop must preserve both original filters"
+    );
+
     backend
         .install_pdp_context(session_context(device.ifindex))
         .await?;
-    // Re-install of identical state must be idempotent success.
+    // Re-install of identical absent-DSCP state must be idempotent success.
     backend
         .install_pdp_context(session_context(device.ifindex))
         .await?;
@@ -323,7 +406,28 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
 
     // --- Uplink: UE -> 8.8.8.8 must arrive at the PGW as a G-PDU. ---
     let mut buffer = [0_u8; 2048];
-    let (len, from) = send_until_received(
+    let (_, from, outer_tos) = send_until_received_with_tos(
+        || {
+            let _ = ue_socket.send_to(b"opc-uplink-unmarked", (REMOTE_HOST, 53));
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .expect("unmarked uplink G-PDU must reach the PGW");
+    assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(
+        outer_tos, 0,
+        "egress_dscp=None must preserve the legacy outer IPv4 ToS"
+    );
+
+    // Reconcile the exact FAR/PDR identity from absent to fixed EF marking.
+    backend
+        .install_pdp_context(marked_session_context(device.ifindex))
+        .await?;
+    backend
+        .install_pdp_context(marked_session_context(device.ifindex))
+        .await?;
+    let (len, from, outer_tos) = send_until_received_with_tos(
         || {
             let _ = ue_socket.send_to(b"opc-uplink", (REMOTE_HOST, 53));
         },
@@ -332,6 +436,8 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     )
     .expect("uplink G-PDU must reach the PGW");
     assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(outer_tos >> 2, 46, "outer IPv4 DSCP must be EF");
+    assert_eq!(outer_tos & 0x03, 0, "outer ECN bits must be preserved");
     let gpdu = &buffer[..len];
     assert_eq!(
         gpdu[0], 0x30,
@@ -408,6 +514,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     assert_eq!(from, SocketAddr::from((PGW_IP, GTPU_PORT)));
 
     // --- Restore: a fresh backend adopts the interface and state. ---
+    drop(backend);
     let restored = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
         bpffs_pin_root: net.pin_root.clone(),
         ..EbpfGtpuDataplaneBackendConfig::default()
@@ -415,7 +522,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     let adopted = restored.resolve_device("s2bu").await?;
     assert_eq!(adopted.ifindex, device.ifindex);
     restored
-        .install_pdp_context(session_context(adopted.ifindex))
+        .install_pdp_context(marked_session_context(adopted.ifindex))
         .await?;
     let (_, from) = send_until_received(
         || {
@@ -440,7 +547,6 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         .await?;
     restored.remove_device(&adopted).await?;
     drop(restored);
-    drop(backend);
 
     // Cleanup must be kernel-visible: no datapath filters on either hook and
     // no pinned map state left behind.
@@ -455,6 +561,120 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         !net.pin_root.join("s2bu").exists(),
         "pinned maps must be removed with the device"
     );
+
+    // --- Static pin-path replacement safety. ---
+    // Swap two exact named pin paths while this test is the only writer. The
+    // backend must fail closed before detaching either filter, preserve the
+    // replacement at each path, and succeed once the original paths return.
+    let pin_owner = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut pin_request = CreateGtpDeviceRequest::new("s2bu");
+    pin_request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let pin_device = pin_owner.create_device(pin_request).await?;
+    let pin_dir = net.pin_root.join("s2bu");
+    let far_pin = pin_dir.join(MAP_UPLINK_FAR);
+    let dscp_pin = pin_dir.join(MAP_UPLINK_DSCP);
+    let swap_pin = pin_dir.join("static-pin-swap");
+    let far_id = MapInfo::from_pin(&far_pin).expect("open FAR pin").id();
+    let dscp_id = MapInfo::from_pin(&dscp_pin).expect("open DSCP pin").id();
+    fs::rename(&far_pin, &swap_pin).expect("stage FAR pin swap");
+    fs::rename(&dscp_pin, &far_pin).expect("replace FAR pin path");
+    fs::rename(&swap_pin, &dscp_pin).expect("replace DSCP pin path");
+    assert!(matches!(
+        pin_owner.remove_device(&pin_device).await,
+        Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
+    ));
+    assert_eq!(
+        MapInfo::from_pin(&far_pin)
+            .expect("replacement FAR path must survive")
+            .id(),
+        dscp_id
+    );
+    assert_eq!(
+        MapInfo::from_pin(&dscp_pin)
+            .expect("replacement DSCP path must survive")
+            .id(),
+        far_id
+    );
+    for direction in ["egress", "ingress"] {
+        assert!(
+            tc_filters(direction).contains("opc_gtpu"),
+            "pin mismatch must preserve the {direction} filter"
+        );
+    }
+    fs::rename(&far_pin, &swap_pin).expect("stage pin-path restore");
+    fs::rename(&dscp_pin, &far_pin).expect("restore FAR pin path");
+    fs::rename(&swap_pin, &dscp_pin).expect("restore DSCP pin path");
+    pin_owner.remove_device(&pin_device).await?;
+    drop(pin_owner);
+
+    // --- External same-slot replacement safety. ---
+    // Aya's netlink tc links identify a filter by slot. If an external actor
+    // replaces both programs at that slot, neither remove_device nor dropping
+    // the old loader may delete those replacements through stale link drops.
+    let replacement_owner = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut replacement_request = CreateGtpDeviceRequest::new("s2bu");
+    replacement_request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let replacement_device = replacement_owner.create_device(replacement_request).await?;
+    for direction in ["egress", "ingress"] {
+        run(
+            "tc",
+            &[
+                "filter", "del", "dev", "s2bu", direction, "handle", "0x1", "pref", "50", "bpf",
+            ],
+        );
+        run(
+            "tc",
+            &[
+                "filter", "add", "dev", "s2bu", direction, "handle", "0x1", "pref", "50",
+                "protocol", "all", "matchall", "action", "pass",
+            ],
+        );
+    }
+    assert_eq!(
+        replacement_owner.probe().await?.egress_dscp_marking,
+        GtpuCapability::Missing
+    );
+    assert!(matches!(
+        replacement_owner
+            .install_pdp_context(marked_session_context(replacement_device.ifindex))
+            .await,
+        Err(opc_gtpu_dataplane::GtpuError::Io {
+            operation: "ebpf_dscp_datapath",
+            ..
+        })
+    ));
+    assert!(matches!(
+        replacement_owner.remove_device(&replacement_device).await,
+        Err(opc_gtpu_dataplane::GtpuError::AlreadyExists)
+    ));
+    for direction in ["egress", "ingress"] {
+        assert!(
+            tc_filters(direction).contains("matchall"),
+            "remove_device must preserve the external {direction} replacement"
+        );
+    }
+    drop(replacement_owner);
+    for direction in ["egress", "ingress"] {
+        assert!(
+            tc_filters(direction).contains("matchall"),
+            "old loader drop must preserve the external {direction} replacement"
+        );
+        run(
+            "tc",
+            &[
+                "filter", "del", "dev", "s2bu", direction, "handle", "0x1", "pref", "50",
+                "protocol", "all", "matchall",
+            ],
+        );
+    }
+    fs::remove_dir_all(net.pin_root.join("s2bu"))
+        .expect("remove pins after external replacement proof");
 
     // With the datapath removed, uplink packets are no longer encapsulated.
     ue_socket.send_to(b"opc-uplink-3", (REMOTE_HOST, 53))?;
@@ -503,6 +723,36 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             "filter", "del", "dev", "s2bu", "ingress", "handle", "0x1", "pref", "50", "protocol",
             "all", "matchall",
         ],
+    );
+
+    // Once a pin set carries durable schema evidence, loss of the additive
+    // map is corruption, not a one-time legacy migration. Adoption must fail
+    // before Aya can silently recreate an empty pinned-by-name map.
+    let owner = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut owner_request = CreateGtpDeviceRequest::new("s2bu");
+    owner_request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    owner.create_device(owner_request).await?;
+    let dscp_pin = net.pin_root.join("s2bu").join(MAP_UPLINK_DSCP);
+    assert!(dscp_pin.exists(), "DSCP map must be pinned after adoption");
+    drop(owner);
+    fs::remove_file(&dscp_pin).expect("remove DSCP pin to model durable state loss");
+    let after_loss = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    assert!(matches!(
+        after_loss.resolve_device("s2bu").await,
+        Err(opc_gtpu_dataplane::GtpuError::Io {
+            operation: "ebpf_dscp_schema",
+            ..
+        })
+    ));
+    assert!(
+        !dscp_pin.exists(),
+        "failed adoption must not recreate the missing DSCP pin"
     );
 
     drop(net);

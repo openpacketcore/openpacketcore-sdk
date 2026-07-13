@@ -2,29 +2,31 @@
 
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use opc_ipsec_xfrm_ebpf_common::{MarkProfile, IPPROTO_ESP};
 use opc_linux_xfrm_sys::{
     align_to_netlink, open_netlink_socket, receive_message, send_message, NLMSG_DONE, NLMSG_ERROR,
     NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD,
     XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_MARK,
-    XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_TMPL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY,
-    XFRM_MSG_DELSA, XFRM_MSG_GETSA, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY,
-    XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN,
-    XFRM_POLICY_OUT, XFRM_STATE_ESN,
+    XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL,
+    XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETSA, XFRM_MSG_NEWPOLICY,
+    XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK,
+    XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_STATE_ESN,
 };
 use zeroize::Zeroizing;
 
+use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
 use crate::{
-    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig,
-    LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
-    RemovePolicyRequest, RemoveSaRequest, SaParameters, SaReplayState, SaState, SaStatistics,
-    SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind, XfrmCapability,
-    XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId, XfrmSelector,
-    XfrmTemplate, XFRM_AEAD_RFC4106_GCM_AES,
+    AllocateSpiRequest, DscpCodepoint, InstallPolicyRequest, InstallSaRequest, IpAddress,
+    LifetimeConfig, LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest,
+    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SaReplayState, SaState,
+    SaStatistics, SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind,
+    XfrmCapability, XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId,
+    XfrmSelector, XfrmTemplate, XFRM_AEAD_RFC4106_GCM_AES,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -95,12 +97,16 @@ struct LinuxXfrmBackendInner {
     transport: Arc<dyn LinuxXfrmTransport>,
     next_sequence: AtomicU32,
     config: LinuxXfrmBackendConfig,
+    dscp_config: Option<LinuxXfrmDscpMarkingConfig>,
+    dscp_runtime: Arc<dyn XfrmDscpRuntime>,
+    dscp_xfrm_attributes_verified: AtomicBool,
 }
 
 impl fmt::Debug for LinuxXfrmBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LinuxXfrmBackend")
             .field("config", &self.inner.config)
+            .field("dscp_marking_configured", &self.inner.dscp_config.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -126,8 +132,40 @@ impl LinuxXfrmBackend {
                 transport: Arc::new(NetlinkXfrmTransport),
                 next_sequence: AtomicU32::new(1),
                 config,
+                dscp_config: None,
+                dscp_runtime: production_runtime(),
+                dscp_xfrm_attributes_verified: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Create a backend with the post-transform fixed-DSCP companion.
+    ///
+    /// Construction validates and eagerly attaches/adopts the tc programs on
+    /// every configured interface. No SA carrying a DSCP token can be
+    /// acknowledged until this succeeds.
+    pub fn with_dscp_marking(dscp_config: LinuxXfrmDscpMarkingConfig) -> Result<Self, XfrmError> {
+        Self::with_config_and_dscp_marking(LinuxXfrmBackendConfig::default(), dscp_config)
+    }
+
+    /// Create a backend with custom netlink and fixed-DSCP configuration.
+    pub fn with_config_and_dscp_marking(
+        config: LinuxXfrmBackendConfig,
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+    ) -> Result<Self, XfrmError> {
+        dscp_config.validate()?;
+        let runtime = production_runtime();
+        runtime.ensure_ready(&dscp_config)?;
+        Ok(Self {
+            inner: Arc::new(LinuxXfrmBackendInner {
+                transport: Arc::new(NetlinkXfrmTransport),
+                next_sequence: AtomicU32::new(1),
+                config,
+                dscp_config: Some(dscp_config),
+                dscp_runtime: runtime,
+                dscp_xfrm_attributes_verified: AtomicBool::new(false),
+            }),
+        })
     }
 
     #[cfg(test)]
@@ -144,8 +182,58 @@ impl LinuxXfrmBackend {
                     receive_buffer_len: 4096,
                     retry_delay: Duration::ZERO,
                 },
+                dscp_config: None,
+                dscp_runtime: production_runtime(),
+                dscp_xfrm_attributes_verified: AtomicBool::new(false),
             }),
         }
+    }
+
+    #[cfg(test)]
+    fn with_transport_and_dscp_runtime<T, R>(
+        transport: T,
+        dscp_config: LinuxXfrmDscpMarkingConfig,
+        dscp_runtime: R,
+    ) -> Result<Self, XfrmError>
+    where
+        T: LinuxXfrmTransport + 'static,
+        R: XfrmDscpRuntime + 'static,
+    {
+        dscp_config.validate()?;
+        dscp_runtime.ensure_ready(&dscp_config)?;
+        Ok(Self {
+            inner: Arc::new(LinuxXfrmBackendInner {
+                transport: Arc::new(transport),
+                next_sequence: AtomicU32::new(1),
+                config: LinuxXfrmBackendConfig {
+                    receive_attempts: 1,
+                    receive_buffer_len: 4096,
+                    retry_delay: Duration::ZERO,
+                },
+                dscp_config: Some(dscp_config),
+                dscp_runtime: Arc::new(dscp_runtime),
+                dscp_xfrm_attributes_verified: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    fn prepare_dscp(&self, parameters: &SaParameters) -> Result<Option<MarkProfile>, XfrmError> {
+        let Some(dscp) = parameters.egress_dscp else {
+            return Ok(None);
+        };
+        let config = self
+            .inner
+            .dscp_config
+            .as_ref()
+            .ok_or(XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp",
+            })?;
+        let profile = config.profile()?;
+        validate_fixed_outer_dscp(parameters, profile, dscp)?;
+        // Revalidate actual map/filter ownership for every marked mutation so
+        // runtime readiness loss is repaired or reported before XFRM ACK.
+        self.inner.dscp_runtime.ensure_ready(config)?;
+        Ok(Some(profile))
     }
 
     fn next_sequence(&self) -> u32 {
@@ -163,7 +251,7 @@ impl LinuxXfrmBackend {
         message_type: u16,
         flags: u16,
         body: SensitiveBuffer,
-    ) -> Result<Option<Vec<u8>>, XfrmError> {
+    ) -> Result<Option<SensitiveBuffer>, XfrmError> {
         let sequence = self.next_sequence();
         let request = encode_netlink_message(message_type, flags, sequence, &body)?;
         self.inner
@@ -177,7 +265,7 @@ impl LinuxXfrmBackend {
         message_type: u16,
         flags: u16,
         body: SensitiveBuffer,
-    ) -> Result<Option<Vec<u8>>, XfrmError> {
+    ) -> Result<Option<SensitiveBuffer>, XfrmError> {
         let backend = self.clone();
         tokio::task::spawn_blocking(move || backend.transact(operation, message_type, flags, body))
             .await
@@ -199,6 +287,43 @@ impl LinuxXfrmBackend {
         let _ = self
             .transact_blocking(operation, message_type, flags, body)
             .await?;
+        Ok(())
+    }
+
+    async fn verify_dscp_readback(
+        &self,
+        parameters: &SaParameters,
+        profile: MarkProfile,
+        operation: &'static str,
+    ) -> Result<(), XfrmError> {
+        let indeterminate = || XfrmError::StateIndeterminate { operation };
+        let body = encode_sa_id(
+            parameters.id.destination,
+            parameters.id.protocol,
+            parameters.id.spi,
+            parameters.mark,
+        )
+        .map_err(|_| indeterminate())?;
+        let response = self
+            .transact_blocking(operation, XFRM_MSG_GETSA, NLM_F_REQUEST | NLM_F_ACK, body)
+            .await
+            .map_err(|_| indeterminate())?
+            .ok_or_else(indeterminate)?;
+        let state = parse_sa_state(&response, Some(profile)).map_err(|_| indeterminate())?;
+        if state.id != parameters.id
+            || state.selector != parameters.selector
+            || state.source_address != parameters.source_address
+            || state.request_id != parameters.request_id
+            || state.mode != parameters.mode
+            || state.replay_window != parameters.replay_window
+            || state.lifetime_config != parameters.lifetime
+            || state.egress_dscp != parameters.egress_dscp
+        {
+            return Err(indeterminate());
+        }
+        self.inner
+            .dscp_xfrm_attributes_verified
+            .store(true, Ordering::Release);
         Ok(())
     }
 }
@@ -226,39 +351,83 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn install_sa(&self, request: InstallSaRequest) -> Result<(), XfrmError> {
-        let body = encode_sa_info(&request.parameters)?;
+        let profile = self.prepare_dscp(&request.parameters)?;
+        let body = encode_sa_info_with_dscp(&request.parameters, profile)?;
         self.run_ack(
             "install_sa",
             XFRM_MSG_NEWSA,
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
             body,
         )
-        .await
+        .await?;
+        if let Some(profile) = profile {
+            // The ACK linearizes acceptance of this NEWSA request, while the
+            // subsequent redacted GETSA proves only the current identity and
+            // output-mark attributes. It cannot establish cryptographic
+            // ownership, and an external UPDSA may race after the ACK. Never
+            // issue a compensating DELSA on readback failure: that could
+            // delete a newer same-identity SA installed by another writer.
+            self.verify_dscp_readback(&request.parameters, profile, "install_sa_dscp_readback")
+                .await?;
+        }
+        Ok(())
     }
 
     async fn query_sa(&self, request: QuerySaRequest) -> Result<SaState, XfrmError> {
         validate_sa_query(request)?;
-        let body = encode_sa_id(request.destination, request.protocol, request.spi)?;
+        let body = encode_sa_id(
+            request.destination,
+            request.protocol,
+            request.spi,
+            request.mark,
+        )?;
         let response = self
             .transact_blocking("query_sa", XFRM_MSG_GETSA, NLM_F_REQUEST | NLM_F_ACK, body)
             .await?
             .ok_or_else(|| XfrmError::io("query_sa", invalid_data("missing getsa response")))?;
-        parse_sa_state(&response)
+        let profile = self
+            .inner
+            .dscp_config
+            .as_ref()
+            .map(LinuxXfrmDscpMarkingConfig::profile)
+            .transpose()?;
+        let state = parse_sa_state(&response, profile)?;
+        if state.egress_dscp.is_some() {
+            self.inner
+                .dscp_xfrm_attributes_verified
+                .store(true, Ordering::Release);
+        }
+        Ok(state)
     }
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
-        let body = encode_sa_info(&request.parameters)?;
+        let profile = self.prepare_dscp(&request.parameters)?;
+        let body = encode_sa_info_with_dscp(&request.parameters, profile)?;
         self.run_ack(
             "rekey_sa",
             XFRM_MSG_UPDSA,
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE,
             body,
         )
-        .await
+        .await?;
+        if let Some(profile) = profile {
+            // An update replaces pre-existing state, and `SaState`
+            // intentionally excludes key material, so a safe automatic
+            // rollback cannot reconstruct the old SA. Any failed mandatory
+            // readback therefore remains explicitly indeterminate.
+            self.verify_dscp_readback(&request.parameters, profile, "rekey_sa_dscp_readback")
+                .await?;
+        }
+        Ok(())
     }
 
     async fn remove_sa(&self, request: RemoveSaRequest) -> Result<(), XfrmError> {
-        let body = encode_sa_id(request.destination, request.protocol, request.spi)?;
+        let body = encode_sa_id(
+            request.destination,
+            request.protocol,
+            request.spi,
+            request.mark,
+        )?;
         self.run_ack("remove_sa", XFRM_MSG_DELSA, NLM_F_REQUEST | NLM_F_ACK, body)
             .await
     }
@@ -286,7 +455,7 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn remove_policy(&self, request: RemovePolicyRequest) -> Result<(), XfrmError> {
-        let body = encode_policy_id(&request.selector, request.direction)?;
+        let body = encode_policy_id(&request.selector, request.direction, request.mark)?;
         self.run_ack(
             "remove_policy",
             XFRM_MSG_DELPOLICY,
@@ -297,7 +466,25 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 
     async fn probe(&self) -> Result<XfrmProbe, XfrmError> {
-        Ok(self.inner.transport.probe(self.inner.config))
+        let mut probe = self.inner.transport.probe(self.inner.config);
+        probe.egress_dscp_marking =
+            self.inner
+                .dscp_config
+                .as_ref()
+                .map_or(XfrmCapability::Missing, |config| {
+                    let companion = self.inner.dscp_runtime.capability(config);
+                    if companion == XfrmCapability::Available
+                        && !self
+                            .inner
+                            .dscp_xfrm_attributes_verified
+                            .load(Ordering::Acquire)
+                    {
+                        XfrmCapability::Unknown
+                    } else {
+                        companion
+                    }
+                });
+        Ok(probe)
     }
 }
 
@@ -308,7 +495,7 @@ trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
         request: &[u8],
         expected_sequence: u32,
         config: LinuxXfrmBackendConfig,
-    ) -> Result<Option<Vec<u8>>, XfrmError>;
+    ) -> Result<Option<SensitiveBuffer>, XfrmError>;
 
     fn probe(&self, config: LinuxXfrmBackendConfig) -> XfrmProbe;
 }
@@ -323,7 +510,7 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
         request: &[u8],
         expected_sequence: u32,
         config: LinuxXfrmBackendConfig,
-    ) -> Result<Option<Vec<u8>>, XfrmError> {
+    ) -> Result<Option<SensitiveBuffer>, XfrmError> {
         let socket = open_netlink_socket().map_err(|error| map_open_error(operation, error))?;
         let sent =
             send_message(&socket, request).map_err(|error| XfrmError::io("netlink_send", error))?;
@@ -334,7 +521,7 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
             ));
         }
 
-        let mut buffer = vec![0_u8; config.receive_buffer_len];
+        let mut buffer = Zeroizing::new(vec![0_u8; config.receive_buffer_len]);
         for _ in 0..config.receive_attempts {
             match receive_message(&socket, &mut buffer) {
                 Ok(0) => {}
@@ -368,6 +555,7 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
                     } else {
                         XfrmCapability::Available
                     },
+                    egress_dscp_marking: XfrmCapability::Missing,
                     details: match net_admin_capable {
                         Some(true) => {
                             Some("linux XFRM netlink socket reachable with CAP_NET_ADMIN")
@@ -385,6 +573,7 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
                 kernel_reachable: false,
                 net_admin_capable: false,
                 algorithms: XfrmCapability::Unknown,
+                egress_dscp_marking: XfrmCapability::Missing,
                 details: Some("linux XFRM netlink unsupported on this platform"),
             },
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => XfrmProbe {
@@ -393,6 +582,7 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
                 kernel_reachable: false,
                 net_admin_capable: false,
                 algorithms: XfrmCapability::PermissionDenied,
+                egress_dscp_marking: XfrmCapability::Missing,
                 details: Some("linux XFRM netlink permission denied"),
             },
             Err(_) => XfrmProbe {
@@ -401,6 +591,7 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
                 kernel_reachable: false,
                 net_admin_capable: false,
                 algorithms: XfrmCapability::Unknown,
+                egress_dscp_marking: XfrmCapability::Missing,
                 details: Some("linux XFRM netlink socket unavailable"),
             },
         }
@@ -458,7 +649,7 @@ fn encode_netlink_message(
 fn parse_netlink_response(
     response: &[u8],
     expected_sequence: u32,
-) -> Result<Option<Vec<u8>>, XfrmError> {
+) -> Result<Option<SensitiveBuffer>, XfrmError> {
     if response.len() < NETLINK_HEADER_LEN {
         return Err(XfrmError::io(
             "netlink_receive",
@@ -487,11 +678,11 @@ fn parse_netlink_response(
     match message_type {
         NLMSG_ERROR => parse_netlink_error(body),
         NLMSG_DONE => Ok(None),
-        _ => Ok(Some(body.to_vec())),
+        _ => Ok(Some(Zeroizing::new(body.to_vec()))),
     }
 }
 
-fn parse_netlink_error(body: &[u8]) -> Result<Option<Vec<u8>>, XfrmError> {
+fn parse_netlink_error(body: &[u8]) -> Result<Option<SensitiveBuffer>, XfrmError> {
     if body.len() < 4 {
         return Err(XfrmError::io(
             "netlink_receive",
@@ -543,9 +734,10 @@ fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<SensitiveBuff
         encap: None,
         mark: None,
         if_id: None,
+        egress_dscp: None,
     };
 
-    let mut out = encode_sa_info_inner(&sa, true)?;
+    let mut out = encode_sa_info_inner(&sa, true, None)?;
     debug_assert_eq!(out.len(), XFRM_USER_SA_INFO_LEN);
     push_u32_ne(&mut out, request.min_spi);
     push_u32_ne(&mut out, request.max_spi);
@@ -553,13 +745,27 @@ fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<SensitiveBuff
     Ok(out)
 }
 
+#[cfg(test)]
 fn encode_sa_info(parameters: &SaParameters) -> Result<SensitiveBuffer, XfrmError> {
-    encode_sa_info_inner(parameters, false)
+    if parameters.egress_dscp.is_some() {
+        return Err(XfrmError::UnsupportedFeature {
+            feature: "fixed_outer_dscp",
+        });
+    }
+    encode_sa_info_inner(parameters, false, None)
+}
+
+fn encode_sa_info_with_dscp(
+    parameters: &SaParameters,
+    profile: Option<MarkProfile>,
+) -> Result<SensitiveBuffer, XfrmError> {
+    encode_sa_info_inner(parameters, false, profile)
 }
 
 fn encode_sa_info_inner(
     parameters: &SaParameters,
     allow_zero_spi: bool,
+    dscp_profile: Option<MarkProfile>,
 ) -> Result<SensitiveBuffer, XfrmError> {
     validate_sa_parameters(parameters, allow_zero_spi)?;
     let family = address_family(parameters.id.destination);
@@ -624,6 +830,22 @@ fn encode_sa_info_inner(
     }
     append_replay_state_attr(&mut out, parameters)?;
     append_common_attrs(&mut out, parameters.mark, parameters.if_id)?;
+    match (parameters.egress_dscp, dscp_profile) {
+        (Some(dscp), Some(profile)) => {
+            validate_fixed_outer_dscp(parameters, profile, dscp)?;
+            let token = profile.encode_token(dscp.get()).ok_or_else(|| {
+                XfrmError::invalid_config("sa.egress_dscp", "DSCP must be between 0 and 63")
+            })?;
+            append_attr(&mut out, XFRMA_SET_MARK, &token.to_ne_bytes())?;
+            append_attr(&mut out, XFRMA_SET_MARK_MASK, &profile.mask.to_ne_bytes())?;
+        }
+        (Some(_), None) => {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp",
+            });
+        }
+        (None, _) => {}
+    }
     Ok(out)
 }
 
@@ -631,16 +853,22 @@ fn encode_sa_id(
     destination: IpAddress,
     protocol: u8,
     spi: u32,
+    mark: Option<XfrmMark>,
 ) -> Result<SensitiveBuffer, XfrmError> {
     if spi == 0 {
         return Err(XfrmError::invalid_config("spi", "spi must be nonzero"));
     }
-    let mut out = sensitive_buffer_with_capacity(XFRM_USER_SA_ID_LEN);
+    let mut out = sensitive_buffer_with_capacity(
+        XFRM_USER_SA_ID_LEN + mark.map_or(0, |_| ROUTE_ATTRIBUTE_HEADER_LEN + XFRM_MARK_LEN),
+    );
     encode_address(&mut out, destination);
     push_u32_be(&mut out, spi);
     push_u16_ne(&mut out, address_family(destination));
     push_u8(&mut out, protocol);
     out.resize(XFRM_USER_SA_ID_LEN, 0);
+    if let Some(mark) = mark {
+        append_attr(&mut out, XFRMA_MARK, &encode_mark(mark))?;
+    }
     Ok(out)
 }
 
@@ -678,6 +906,7 @@ fn encode_policy_info(parameters: &PolicyParameters) -> Result<SensitiveBuffer, 
 fn encode_policy_id(
     selector: &XfrmSelector,
     direction: XfrmDirection,
+    mark: Option<XfrmMark>,
 ) -> Result<SensitiveBuffer, XfrmError> {
     validate_selector_family(selector)?;
     let mut out = sensitive_buffer_with_capacity(XFRM_USER_POLICY_ID_LEN);
@@ -685,6 +914,7 @@ fn encode_policy_id(
     push_u32_ne(&mut out, 0);
     push_u8(&mut out, encode_direction(direction));
     out.resize(XFRM_USER_POLICY_ID_LEN, 0);
+    append_common_attrs(&mut out, mark, None)?;
     Ok(out)
 }
 
@@ -977,7 +1207,7 @@ fn parse_allocated_spi(payload: &[u8]) -> Result<u32, XfrmError> {
     Ok(spi)
 }
 
-fn parse_sa_state(payload: &[u8]) -> Result<SaState, XfrmError> {
+fn parse_sa_state(payload: &[u8], dscp_profile: Option<MarkProfile>) -> Result<SaState, XfrmError> {
     if payload.len() < XFRM_USER_SA_INFO_LEN {
         return Err(XfrmError::io(
             "query_sa",
@@ -1003,6 +1233,7 @@ fn parse_sa_state(payload: &[u8]) -> Result<SaState, XfrmError> {
         replay_window,
         flags & XFRM_STATE_ESN != 0,
     )?;
+    let egress_dscp = parse_fixed_outer_dscp_attrs(payload, dscp_profile)?;
     Ok(SaState {
         selector,
         id: XfrmId {
@@ -1018,7 +1249,57 @@ fn parse_sa_state(payload: &[u8]) -> Result<SaState, XfrmError> {
         lifetime_config,
         lifetime_current,
         statistics,
+        egress_dscp,
     })
+}
+
+fn parse_fixed_outer_dscp_attrs(
+    payload: &[u8],
+    profile: Option<MarkProfile>,
+) -> Result<Option<DscpCodepoint>, XfrmError> {
+    let value = find_attr_payload(payload, XFRM_USER_SA_INFO_LEN, XFRMA_SET_MARK)?;
+    let mask = find_attr_payload(payload, XFRM_USER_SA_INFO_LEN, XFRMA_SET_MARK_MASK)?;
+    let Some(profile) = profile else {
+        return if value.is_none() && mask.is_none() {
+            Ok(None)
+        } else {
+            Err(XfrmError::UnsupportedFeature {
+                feature: "unconfigured_output_mark_state",
+            })
+        };
+    };
+    let (Some(value), Some(mask)) = (value, mask) else {
+        if value.is_some() || mask.is_some() {
+            return Err(XfrmError::io(
+                "query_sa",
+                invalid_data("incomplete output-mark token attributes"),
+            ));
+        }
+        return Ok(None);
+    };
+    if value.len() != 4 || mask.len() != 4 {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("invalid output-mark token attribute length"),
+        ));
+    }
+    let value = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+    let mask = u32::from_ne_bytes([mask[0], mask[1], mask[2], mask[3]]);
+    if mask != profile.mask {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("output-mark mask does not match configured DSCP profile"),
+        ));
+    }
+    let opc_ipsec_xfrm_ebpf_common::MarkToken::Dscp(dscp) = profile.decode_token(value) else {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("malformed output-mark DSCP token"),
+        ));
+    };
+    DscpCodepoint::new(dscp)
+        .map(Some)
+        .map_err(|_| XfrmError::io("query_sa", invalid_data("invalid DSCP token")))
 }
 
 fn parse_replay_state_attrs(
@@ -1187,6 +1468,41 @@ fn validate_sa_parameters(
                 "aead algorithm must use the aead slot",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_fixed_outer_dscp(
+    parameters: &SaParameters,
+    profile: MarkProfile,
+    dscp: DscpCodepoint,
+) -> Result<(), XfrmError> {
+    if parameters.mode != XfrmMode::Tunnel {
+        return Err(XfrmError::invalid_config(
+            "sa.egress_dscp",
+            "fixed outer DSCP requires tunnel mode",
+        ));
+    }
+    if parameters.id.protocol != IPPROTO_ESP {
+        return Err(XfrmError::invalid_config(
+            "sa.egress_dscp",
+            "fixed outer DSCP supports ESP SAs only",
+        ));
+    }
+    if parameters
+        .mark
+        .is_some_and(|mark| mark.mask & profile.mask != 0)
+    {
+        return Err(XfrmError::invalid_config(
+            "sa.mark",
+            "SA lookup mark overlaps the reserved DSCP output-mark window",
+        ));
+    }
+    if profile.encode_token(dscp.get()).is_none() {
+        return Err(XfrmError::invalid_config(
+            "sa.egress_dscp",
+            "DSCP must be between 0 and 63",
+        ));
     }
     Ok(())
 }
@@ -1453,13 +1769,21 @@ fn decode_address(bytes: &[u8], offset: usize, family: u16) -> Result<IpAddress,
 
 fn decode_lifetime_config(bytes: &[u8], offset: usize) -> Result<LifetimeConfig, XfrmError> {
     Ok(LifetimeConfig {
-        soft_byte_limit: read_u64_ne(bytes, offset)?,
-        hard_byte_limit: read_u64_ne(bytes, offset + 8)?,
-        soft_packet_limit: read_u64_ne(bytes, offset + 16)?,
-        hard_packet_limit: read_u64_ne(bytes, offset + 24)?,
+        soft_byte_limit: decode_lifetime_limit(read_u64_ne(bytes, offset)?),
+        hard_byte_limit: decode_lifetime_limit(read_u64_ne(bytes, offset + 8)?),
+        soft_packet_limit: decode_lifetime_limit(read_u64_ne(bytes, offset + 16)?),
+        hard_packet_limit: decode_lifetime_limit(read_u64_ne(bytes, offset + 24)?),
         soft_add_expires_seconds: read_u64_ne(bytes, offset + 32)?,
         hard_add_expires_seconds: read_u64_ne(bytes, offset + 40)?,
     })
+}
+
+fn decode_lifetime_limit(value: u64) -> u64 {
+    if value == XFRM_INF {
+        0
+    } else {
+        value
+    }
 }
 
 fn decode_lifetime_current(bytes: &[u8], offset: usize) -> Result<LifetimeCurrent, XfrmError> {
@@ -1594,19 +1918,19 @@ mod tests {
 
     #[derive(Debug, Default, Clone)]
     struct CapturingTransport {
-        requests: Arc<Mutex<Vec<Vec<u8>>>>,
-        response: Option<Vec<u8>>,
+        requests: Arc<Mutex<Vec<SensitiveBuffer>>>,
+        response: Option<SensitiveBuffer>,
     }
 
     impl CapturingTransport {
         fn with_response(response: Vec<u8>) -> Self {
             Self {
-                response: Some(response),
+                response: Some(Zeroizing::new(response)),
                 ..Self::default()
             }
         }
 
-        fn requests(&self) -> Vec<Vec<u8>> {
+        fn requests(&self) -> Vec<SensitiveBuffer> {
             self.requests
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1621,11 +1945,11 @@ mod tests {
             request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
-        ) -> Result<Option<Vec<u8>>, XfrmError> {
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
             self.requests
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(request.to_vec());
+                .push(Zeroizing::new(request.to_vec()));
             Ok(self.response.clone())
         }
 
@@ -1636,8 +1960,73 @@ mod tests {
                 kernel_reachable: true,
                 net_admin_capable: true,
                 algorithms: XfrmCapability::Available,
+                egress_dscp_marking: XfrmCapability::Missing,
                 details: Some("test transport"),
             }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeDscpRuntime {
+        state: Arc<Mutex<FakeDscpRuntimeState>>,
+    }
+
+    #[derive(Debug)]
+    struct FakeDscpRuntimeState {
+        ensure_calls: usize,
+        ready: bool,
+        capability: XfrmCapability,
+    }
+
+    impl Default for FakeDscpRuntime {
+        fn default() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeDscpRuntimeState {
+                    ensure_calls: 0,
+                    ready: true,
+                    capability: XfrmCapability::Available,
+                })),
+            }
+        }
+    }
+
+    impl FakeDscpRuntime {
+        fn ensure_calls(&self) -> usize {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .ensure_calls
+        }
+
+        fn lose_readiness(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.ready = false;
+            state.capability = XfrmCapability::Missing;
+        }
+    }
+
+    impl XfrmDscpRuntime for FakeDscpRuntime {
+        fn ensure_ready(&self, _config: &LinuxXfrmDscpMarkingConfig) -> Result<(), XfrmError> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.ensure_calls += 1;
+            if state.ready {
+                Ok(())
+            } else {
+                Err(XfrmError::Unavailable)
+            }
+        }
+
+        fn capability(&self, _config: &LinuxXfrmDscpMarkingConfig) -> XfrmCapability {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capability
         }
     }
 
@@ -1653,7 +2042,7 @@ mod tests {
             _request: &[u8],
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
-        ) -> Result<Option<Vec<u8>>, XfrmError> {
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
             std::thread::sleep(self.delay);
             Ok(None)
         }
@@ -1665,6 +2054,7 @@ mod tests {
                 kernel_reachable: true,
                 net_admin_capable: true,
                 algorithms: XfrmCapability::Available,
+                egress_dscp_marking: XfrmCapability::Missing,
                 details: Some("slow test transport"),
             }
         }
@@ -1701,6 +2091,7 @@ mod tests {
             encap: None,
             mark: None,
             if_id: None,
+            egress_dscp: None,
         }
     }
 
@@ -1719,6 +2110,12 @@ mod tests {
             mark: None,
             if_id: None,
         }
+    }
+
+    fn dscp_config() -> LinuxXfrmDscpMarkingConfig {
+        let mut config = LinuxXfrmDscpMarkingConfig::new([String::from("eth0")], 25).unwrap();
+        config.bpffs_pin_root = "/sys/fs/bpf/opc-ipsec-xfrm-dscp-test".into();
+        config
     }
 
     fn ack(sequence: u32) -> Vec<u8> {
@@ -1759,6 +2156,173 @@ mod tests {
     }
 
     fn assert_sensitive_buffer(_buffer: &SensitiveBuffer) {}
+
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+    #[test]
+    fn netlink_response_and_transport_clones_remain_zeroizing_buffers() {
+        assert_zeroize_on_drop::<SensitiveBuffer>();
+        let body = Zeroizing::new(vec![0x5a; XFRM_USER_SA_INFO_LEN]);
+        let message = encode_netlink_message(XFRM_MSG_GETSA, 0, 7, &body).unwrap();
+        let parsed = parse_netlink_response(&message, 7)
+            .unwrap()
+            .expect("GETSA response body");
+        assert_sensitive_buffer(&parsed);
+
+        let transport = CapturingTransport::with_response(parsed.to_vec());
+        let cloned = transport.response.clone().expect("cloned test response");
+        assert_sensitive_buffer(&cloned);
+    }
+
+    #[test]
+    fn absent_dscp_preserves_exact_legacy_sa_bytes() {
+        let parameters = sa_parameters();
+        let legacy = encode_sa_info(&parameters).unwrap();
+        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+
+        let unconfigured = encode_sa_info_with_dscp(&parameters, None).unwrap();
+        let configured = encode_sa_info_with_dscp(&parameters, Some(profile)).unwrap();
+
+        assert_eq!(unconfigured.as_slice(), legacy.as_slice());
+        assert_eq!(configured.as_slice(), legacy.as_slice());
+        assert!(route_attr_payload(&configured, XFRMA_SET_MARK).is_none());
+        assert!(route_attr_payload(&configured, XFRMA_SET_MARK_MASK).is_none());
+    }
+
+    #[test]
+    fn fixed_outer_dscp_encodes_exact_output_mark_boundaries() {
+        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+        for dscp in [0, DscpCodepoint::MAX] {
+            let mut parameters = sa_parameters();
+            parameters.egress_dscp = Some(DscpCodepoint::new(dscp).unwrap());
+
+            let body = encode_sa_info_with_dscp(&parameters, Some(profile)).unwrap();
+            let value = route_attr_payload(&body, XFRMA_SET_MARK).unwrap();
+            let mask = route_attr_payload(&body, XFRMA_SET_MARK_MASK).unwrap();
+
+            assert_eq!(value, &profile.encode_token(dscp).unwrap().to_ne_bytes());
+            assert_eq!(mask, &profile.mask.to_ne_bytes());
+        }
+    }
+
+    #[test]
+    fn fixed_outer_dscp_rejects_unsupported_or_colliding_sa_contracts() {
+        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+
+        assert!(matches!(
+            encode_sa_info_with_dscp(&marked, None).unwrap_err(),
+            XfrmError::UnsupportedFeature {
+                feature: "fixed_outer_dscp"
+            }
+        ));
+
+        let mut transport = marked.clone();
+        transport.mode = XfrmMode::Transport;
+        assert!(matches!(
+            encode_sa_info_with_dscp(&transport, Some(profile)).unwrap_err(),
+            XfrmError::InvalidConfig {
+                field: "sa.egress_dscp",
+                ..
+            }
+        ));
+
+        let mut non_esp = marked.clone();
+        non_esp.id.protocol = 51;
+        assert!(matches!(
+            encode_sa_info_with_dscp(&non_esp, Some(profile)).unwrap_err(),
+            XfrmError::InvalidConfig {
+                field: "sa.egress_dscp",
+                ..
+            }
+        ));
+
+        marked.mark = Some(XfrmMark {
+            value: 0,
+            mask: profile.mask,
+        });
+        assert!(matches!(
+            encode_sa_info_with_dscp(&marked, Some(profile)).unwrap_err(),
+            XfrmError::InvalidConfig {
+                field: "sa.mark",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fixed_outer_dscp_query_round_trips_and_rejects_ambiguous_state() {
+        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+        let mut parameters = sa_parameters();
+        parameters.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        let body = encode_sa_info_with_dscp(&parameters, Some(profile)).unwrap();
+
+        assert_eq!(
+            parse_sa_state(&body, Some(profile)).unwrap().egress_dscp,
+            parameters.egress_dscp
+        );
+        assert!(matches!(
+            parse_sa_state(&body, None).unwrap_err(),
+            XfrmError::UnsupportedFeature {
+                feature: "unconfigured_output_mark_state"
+            }
+        ));
+
+        let mut incomplete = encode_sa_info(&sa_parameters()).unwrap();
+        append_attr(
+            &mut incomplete,
+            XFRMA_SET_MARK,
+            &profile.encode_token(46).unwrap().to_ne_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_sa_state(&incomplete, Some(profile))
+                .unwrap_err()
+                .io_kind(),
+            Some(io::ErrorKind::InvalidData)
+        );
+
+        let mut malformed = encode_sa_info(&sa_parameters()).unwrap();
+        append_attr(
+            &mut malformed,
+            XFRMA_SET_MARK,
+            &(1_u32 << profile.shift).to_ne_bytes(),
+        )
+        .unwrap();
+        append_attr(
+            &mut malformed,
+            XFRMA_SET_MARK_MASK,
+            &profile.mask.to_ne_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_sa_state(&malformed, Some(profile))
+                .unwrap_err()
+                .io_kind(),
+            Some(io::ErrorKind::InvalidData)
+        );
+
+        let mut wrong_mask = encode_sa_info(&sa_parameters()).unwrap();
+        append_attr(
+            &mut wrong_mask,
+            XFRMA_SET_MARK,
+            &profile.encode_token(46).unwrap().to_ne_bytes(),
+        )
+        .unwrap();
+        append_attr(
+            &mut wrong_mask,
+            XFRMA_SET_MARK_MASK,
+            &0x7f_u32.to_ne_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_sa_state(&wrong_mask, Some(profile))
+                .unwrap_err()
+                .io_kind(),
+            Some(io::ErrorKind::InvalidData)
+        );
+    }
 
     #[test]
     fn encodes_sa_install_with_auth_and_crypt_attrs() {
@@ -2075,7 +2639,7 @@ mod tests {
         });
         let body = encode_sa_info(&params).unwrap();
 
-        let state = parse_sa_state(&body).unwrap();
+        let state = parse_sa_state(&body, None).unwrap();
 
         assert_eq!(state.id, params.id);
         assert_eq!(state.selector, params.selector);
@@ -2091,7 +2655,7 @@ mod tests {
         let mut body = encode_sa_info(&sa_parameters()).unwrap();
         append_attr(&mut body, XFRMA_REPLAY_ESN_VAL, &[0, 0, 0]).unwrap();
 
-        let error = parse_sa_state(&body).unwrap_err();
+        let error = parse_sa_state(&body, None).unwrap_err();
 
         assert_eq!(error.io_kind(), Some(io::ErrorKind::InvalidData));
     }
@@ -2111,6 +2675,7 @@ mod tests {
             .remove_policy(RemovePolicyRequest {
                 selector: selector(),
                 direction: XfrmDirection::Out,
+                mark: None,
             })
             .await
             .unwrap();
@@ -2132,6 +2697,310 @@ mod tests {
         assert_eq!(
             requests[1].len(),
             NETLINK_HEADER_LEN + XFRM_USER_POLICY_ID_LEN
+        );
+    }
+
+    #[tokio::test]
+    async fn marked_policy_removal_encodes_exact_lookup_mark() {
+        let transport = CapturingTransport::default();
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+        let mark = XfrmMark {
+            value: 0x0000_0042,
+            mask: 0x0000_00ff,
+        };
+
+        backend
+            .remove_policy(RemovePolicyRequest {
+                selector: selector(),
+                direction: XfrmDirection::Out,
+                mark: Some(mark),
+            })
+            .await
+            .unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_DELPOLICY);
+        assert_eq!(
+            route_attr_payload_from(
+                netlink_body(&requests[0]),
+                XFRM_USER_POLICY_ID_LEN,
+                XFRMA_MARK,
+            ),
+            Some(encode_mark(mark).as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_backend_proves_dscp_capability_only_after_exact_readback() {
+        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        let response = encode_sa_info_with_dscp(&marked, Some(profile))
+            .unwrap()
+            .to_vec();
+        let transport = CapturingTransport::with_response(response);
+        let runtime = FakeDscpRuntime::default();
+        let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
+            transport.clone(),
+            dscp_config(),
+            runtime.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.ensure_calls(),
+            1,
+            "constructor eagerly validates tc"
+        );
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown,
+            "tc readiness alone cannot prove kernel output-mark support"
+        );
+
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: sa_parameters(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.ensure_calls(),
+            1,
+            "the legacy None path must not depend on the companion"
+        );
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown
+        );
+
+        backend
+            .install_sa(InstallSaRequest { parameters: marked })
+            .await
+            .unwrap();
+        assert_eq!(runtime.ensure_calls(), 2);
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Available
+        );
+
+        let requests = transport.requests();
+        let legacy_body = netlink_body(&requests[0]);
+        assert!(route_attr_payload(legacy_body, XFRMA_SET_MARK).is_none());
+        let marked_body = netlink_body(&requests[1]);
+        let expected_token = profile.encode_token(46).unwrap().to_ne_bytes();
+        assert_eq!(
+            route_attr_payload(marked_body, XFRMA_SET_MARK),
+            Some(expected_token.as_slice())
+        );
+        assert_eq!(netlink_message_type(&requests[2]), XFRM_MSG_GETSA);
+    }
+
+    #[tokio::test]
+    async fn marked_rekey_revalidates_runtime_before_kernel_mutation() {
+        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(63).unwrap());
+        let response = encode_sa_info_with_dscp(&marked, Some(profile))
+            .unwrap()
+            .to_vec();
+        let transport = CapturingTransport::with_response(response);
+        let runtime = FakeDscpRuntime::default();
+        let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
+            transport.clone(),
+            dscp_config(),
+            runtime.clone(),
+        )
+        .unwrap();
+        backend
+            .rekey_sa(RekeySaRequest { parameters: marked })
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.ensure_calls(), 2);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_UPDSA);
+        assert_eq!(
+            u16::from_ne_bytes([requests[0][6], requests[0][7]]),
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE
+        );
+        assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_GETSA);
+    }
+
+    #[tokio::test]
+    async fn marked_rekey_readback_failure_is_explicitly_indeterminate() {
+        let transport = CapturingTransport::default();
+        let runtime = FakeDscpRuntime::default();
+        let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
+            transport.clone(),
+            dscp_config(),
+            runtime,
+        )
+        .unwrap();
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        marked.mark = Some(XfrmMark {
+            value: 0x0000_0042,
+            mask: 0x0000_00ff,
+        });
+
+        assert!(matches!(
+            backend
+                .rekey_sa(RekeySaRequest { parameters: marked })
+                .await,
+            Err(XfrmError::StateIndeterminate {
+                operation: "rekey_sa_dscp_readback"
+            })
+        ));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_UPDSA);
+        assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_GETSA);
+        assert!(route_attr_payload_from(
+            netlink_body(&requests[1]),
+            XFRM_USER_SA_ID_LEN,
+            XFRMA_MARK,
+        )
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn marked_ack_without_exact_getsa_readback_is_indeterminate_without_delete() {
+        let transport = CapturingTransport::default();
+        let runtime = FakeDscpRuntime::default();
+        let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
+            transport.clone(),
+            dscp_config(),
+            runtime,
+        )
+        .unwrap();
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        marked.mark = Some(XfrmMark {
+            value: 0x0000_0042,
+            mask: 0x0000_00ff,
+        });
+        let marked_lookup = marked.mark.unwrap();
+
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest { parameters: marked })
+                .await
+                .unwrap_err(),
+            XfrmError::StateIndeterminate {
+                operation: "install_sa_dscp_readback"
+            }
+        ));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_NEWSA);
+        assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_GETSA);
+        let expected_mark = encode_mark(marked_lookup);
+        assert_eq!(
+            route_attr_payload_from(netlink_body(&requests[1]), XFRM_USER_SA_ID_LEN, XFRMA_MARK,),
+            Some(expected_mark.as_slice())
+        );
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_static_getsa_field_is_indeterminate_without_delete() {
+        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+        let mut requested = sa_parameters();
+        requested.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        requested.mark = Some(XfrmMark {
+            value: 0x42,
+            mask: 0xff,
+        });
+        let mut returned = requested.clone();
+        returned.source_address = ipv4(192, 0, 2, 99);
+        let response = encode_sa_info_with_dscp(&returned, Some(profile))
+            .unwrap()
+            .to_vec();
+        let transport = CapturingTransport::with_response(response);
+        let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
+            transport.clone(),
+            dscp_config(),
+            FakeDscpRuntime::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: requested,
+                })
+                .await,
+            Err(XfrmError::StateIndeterminate {
+                operation: "install_sa_dscp_readback"
+            })
+        ));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_NEWSA);
+        assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_GETSA);
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_loss_blocks_marked_sa_before_netlink() {
+        let transport = CapturingTransport::default();
+        let runtime = FakeDscpRuntime::default();
+        let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
+            transport.clone(),
+            dscp_config(),
+            runtime.clone(),
+        )
+        .unwrap();
+        runtime.lose_readiness();
+        let mut marked = sa_parameters();
+        marked.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest { parameters: marked })
+                .await
+                .unwrap_err(),
+            XfrmError::Unavailable
+        ));
+        assert!(transport.requests().is_empty());
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn marked_query_proves_kernel_output_mark_support() {
+        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+        let mut parameters = sa_parameters();
+        parameters.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        let response = encode_sa_info_with_dscp(&parameters, Some(profile))
+            .unwrap()
+            .to_vec();
+        let transport = CapturingTransport::with_response(response);
+        let runtime = FakeDscpRuntime::default();
+        let backend =
+            LinuxXfrmBackend::with_transport_and_dscp_runtime(transport, dscp_config(), runtime)
+                .unwrap();
+
+        let state = backend
+            .query_sa(QuerySaRequest {
+                destination: parameters.id.destination,
+                protocol: parameters.id.protocol,
+                spi: parameters.id.spi,
+                mark: parameters.mark,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state.egress_dscp, parameters.egress_dscp);
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Available
         );
     }
 
@@ -2210,6 +3079,7 @@ mod tests {
                 destination: params.id.destination,
                 protocol: params.id.protocol,
                 spi: params.id.spi,
+                mark: params.mark,
             })
             .await
             .unwrap();

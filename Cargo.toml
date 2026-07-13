@@ -9,6 +9,7 @@ members = [
 exclude = [
     "crates/opc-gtpu-dataplane-ebpf",
     "crates/opc-ipsec-lb-ebpf",
+    "crates/opc-ipsec-xfrm-ebpf",
 ]
 resolver = "2"
 

@@ -237,6 +237,11 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
+        if request.egress_dscp.is_some() {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "fixed_outer_dscp",
+            });
+        }
         if request.link_ifindex == 0 {
             return Err(GtpuError::invalid_config(
                 "pdp.link_ifindex",
@@ -296,6 +301,7 @@ mod tests {
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
             gtp_version: GtpVersion::V1,
+            egress_dscp: None,
         }
     }
 
@@ -382,6 +388,23 @@ mod tests {
                 MockOperation::InstallPdpContext { request: ctx },
                 MockOperation::RemovePdpContext { request: remove }
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_truthfully_rejects_fixed_outer_dscp() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let mut request = context();
+        request.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+        assert!(matches!(
+            backend.install_pdp_context(request).await.unwrap_err(),
+            GtpuError::UnsupportedFeature {
+                feature: "fixed_outer_dscp"
+            }
+        ));
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            crate::GtpuCapability::Missing
         );
     }
 
