@@ -17,11 +17,12 @@ implementation for the OpenPacketCore config and session persistence surfaces.
 #127 and #177 close the one-engine implementation transition, not production
 qualification. Config release evidence remains `GAP-001-006`; session
 current-format repair is hardened under #128 and #133 supplies bounded restore
-from Openraft-applied state. Legacy recovery (#129), production network
-qualification (#143), and the existing credential-rotation chain retain their
-own gates. Historical closure language below refers only to scoped algorithms
-and test harnesses; neither component is yet approved as a production deployment
-profile.
+from Openraft-applied state. #129 supplies bounded default-deny legacy recovery
+with a full-fleet quarantine and an Openraft-committed recovery epoch.
+Production network qualification (#143), the credential-rotation chain, and
+config release evidence retain their own gates. Historical closure language
+below refers only to scoped algorithms and test harnesses; neither component is
+yet approved as a production deployment profile.
 
 ---
 
@@ -115,7 +116,10 @@ and encryption-envelope admission.
 
 This is durable sequencing authority, but not yet a complete production
 deployment claim. Current-format follower recovery is Openraft-owned and
-hardened under #128; legacy-fork recovery remains #129. #133 provides bounded
+hardened under #128. #129 supplies an offline, audited whole-fleet legacy-fork
+campaign that quarantines every selected PVC and resumes from one immutable
+operator-selected checkpoint without becoming a second runtime authority; see
+the [recovery runbook](session-store-legacy-recovery.md). #133 provides bounded
 applied-state restore with snapshot-bound cursors. Watch and expiry hardening
 remain #145/#148, and network/resource/rotation qualification remains #143 and
 the #162 -> #161 -> #163 -> #158 -> #164 credential chain. Stable IDs,
@@ -235,9 +239,10 @@ installed image from being followed by a false purge-before-apply fatal error.
 Readiness reports typed local recovery posture and index counters without peer
 text or session identifiers.
 
-Recovery of an already forked legacy custom-coordinator database remains #129
-because the old format cannot prove which conflicting tail was committed.
-Readiness never guesses or performs an unaudited destructive rebuild.
+Recovery of an already forked legacy custom-coordinator database uses #129's
+[audited offline campaign](session-store-legacy-recovery.md) because the old
+format cannot prove which conflicting tail was committed. Readiness never
+guesses or performs an unaudited destructive rebuild.
 
 ### Bounded TTL inputs
 
@@ -504,8 +509,8 @@ backend/peer-controlled error text.
 
 Protocol v4 remains a compatibility transport and does not establish
 authority. #127 uses the separate Openraft transport; #133 scans only the
-barrier-confirmed local applied state with bounded work, while legacy-fork
-recovery remains #129.
+barrier-confirmed local applied state with bounded work, while #129 legacy-fork
+recovery remains an offline, operator-authorized campaign.
 
 ### Log & Replication Model
 - **Openraft Log Authority**: Openraft allocates and commits its zero-based log

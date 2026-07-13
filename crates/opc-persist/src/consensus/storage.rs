@@ -174,18 +174,18 @@ pub(crate) async fn open_with_recovery(
 ) -> Result<OpenedConfigStorage, ConfigConsensusStorageError> {
     let snapshot_directory = admit_snapshot_directory(backend, snapshot_dir.into())?;
     let already_completed = if let Some(approval) = recovery.as_ref() {
-        let conn = backend.conn();
         let approval = approval.clone();
-        tokio::time::timeout(
+        sqlite::run_backend_sqlite_with_timeout(
+            backend,
             std::time::Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
-                sqlite::completed_legacy_recovery_matches_sync(&conn, &approval)
-            }),
+            move |conn, cancellation| {
+                cancellation.check_io()?;
+                sqlite::completed_legacy_recovery_matches_sync(conn, &approval)
+                    .map_err(|_| sqlite::invalid_data("legacy recovery probe failed"))
+            },
         )
         .await
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)??
     } else {
         false
     };
@@ -571,6 +571,28 @@ fn range_to_half_open<R: RangeBounds<u64>>(range: &R) -> io::Result<(u64, Option
     Ok((start, end))
 }
 
+fn collect_bounded_entries<I>(entries: I) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>>
+where
+    I: IntoIterator<Item = Entry<ConfigRaftTypeConfig>>,
+{
+    let mut incoming = entries.into_iter();
+    let mut bounded = Vec::with_capacity(
+        incoming
+            .size_hint()
+            .0
+            .min(sqlite::CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES),
+    );
+    for entry in incoming.by_ref() {
+        if bounded.len() == sqlite::CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
+            return Err(sqlite::invalid_data(
+                "config consensus entry batch exceeds entry-count limit",
+            ));
+        }
+        bounded.push(entry);
+    }
+    Ok(bounded)
+}
+
 impl RaftLogReader<ConfigRaftTypeConfig> for SqliteConfigLogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + Send>(
         &mut self,
@@ -695,12 +717,28 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         I: IntoIterator<Item = Entry<ConfigRaftTypeConfig>> + Send,
         I::IntoIter: Send,
     {
-        let entries = entries.into_iter().collect::<Vec<_>>();
+        let entries = match collect_bounded_entries(entries) {
+            Ok(entries) => entries,
+            Err(error) => {
+                callback.log_io_completed(Err(io::Error::other(
+                    "config consensus log append exceeds entry-count limit",
+                )));
+                return Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
+            }
+        };
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         match self
             .core
-            .run_sqlite(move |conn| sqlite::append_logs_sync(conn, identity, &members, &entries))
+            .run_sqlite_cancellable(move |conn, cancellation| {
+                sqlite::append_logs_cancellable_sync(
+                    conn,
+                    identity,
+                    &members,
+                    &entries,
+                    cancellation,
+                )
+            })
             .await
         {
             Ok(()) => {
@@ -775,9 +813,18 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
     {
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
-        let entries = entries.into_iter().collect();
+        let entries = collect_bounded_entries(entries)
+            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
         self.core
-            .run_sqlite(move |conn| sqlite::apply_entries_sync(conn, identity, &members, entries))
+            .run_sqlite_cancellable(move |conn, cancellation| {
+                sqlite::apply_entries_cancellable_sync(
+                    conn,
+                    identity,
+                    &members,
+                    entries,
+                    cancellation,
+                )
+            })
             .await
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))
     }
@@ -809,7 +856,16 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         meta: &SnapshotMeta<ConsensusNodeId, opc_consensus::engine::EmptyNode>,
         mut snapshot: Box<ConfigSnapshotFile>,
     ) -> Result<(), StorageError<ConsensusNodeId>> {
-        let result = match tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, async {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(SNAPSHOT_OPERATION_TIMEOUT)
+            .ok_or_else(|| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    sqlite::invalid_data("config consensus snapshot install deadline overflow"),
+                )
+            })?;
+        let result = async {
             validate_snapshot_binding(&self.core).map_err(|error| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
@@ -817,54 +873,100 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     error,
                 )
             })?;
-            let _guard = self.core.snapshot_gate.lock().await;
-            snapshot.sync_all().await.map_err(|error| {
+            let _guard = tokio::time::timeout_at(deadline, self.core.snapshot_gate.lock())
+                .await
+                .map_err(|_| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        sqlite::invalid_data("config consensus snapshot install timed out"),
+                    )
+                })?;
+            tokio::time::timeout_at(deadline, snapshot.sync_all())
+                .await
+                .map_err(|_| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        sqlite::invalid_data("config consensus snapshot install timed out"),
+                    )
+                })?
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        error,
+                    )
+                })?;
+            let incoming = snapshot.path().to_path_buf();
+            snapshot.disarm_cleanup();
+            drop(snapshot);
+            let _incoming_cleanup = StagingArtifact::file(incoming.clone());
+            let (payload_length, checksum, total_length) =
+                tokio::time::timeout_at(deadline, verify_snapshot_envelope(&incoming))
+                    .await
+                    .map_err(|_| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            sqlite::invalid_data("config consensus snapshot install timed out"),
+                        )
+                    })?
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+            let raw = self
+                .core
+                .snapshot_dir
+                .join(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
+            let _raw_cleanup = tokio::time::timeout_at(
+                deadline,
+                extract_snapshot_database(&incoming, &raw, payload_length),
+            )
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    sqlite::invalid_data("config consensus snapshot install timed out"),
+                )
+            })?
+            .map_err(|error| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
                     ErrorVerb::Write,
                     error,
                 )
             })?;
-            let incoming = snapshot.path().to_path_buf();
-            snapshot.disarm_cleanup();
-            drop(snapshot);
-            let _incoming_cleanup = StagingArtifact::file(incoming.clone());
-            let (payload_length, checksum, total_length) =
-                verify_snapshot_envelope(&incoming).await.map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-            let raw = self
-                .core
-                .snapshot_dir
-                .join(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
-            let _raw_cleanup = extract_snapshot_database(&incoming, &raw, payload_length)
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Write,
-                        error,
-                    )
-                })?;
             let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
             let final_path = self.core.snapshot_dir.join(&file_name);
             let promoting = self
                 .core
                 .snapshot_dir
                 .join(format!("promote-{}.part", uuid::Uuid::new_v4()));
-            let mut final_cleanup = copy_and_promote(&incoming, &promoting, &final_path)
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Write,
-                        error,
-                    )
-                })?;
+            let mut final_cleanup = tokio::time::timeout_at(
+                deadline,
+                copy_and_promote(&incoming, &promoting, &final_path),
+            )
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    sqlite::invalid_data("config consensus snapshot install timed out"),
+                )
+            })?
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    error,
+                )
+            })?;
             let identity = self.core.identity;
             let members = self.core.expected_members.clone();
             let audit_key = self.core.audit_key.clone();
@@ -873,9 +975,9 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             let file_name_for_install = file_name.clone();
             let previous = self
                 .core
-                .run_sqlite(move |conn| {
+                .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
                     let previous = sqlite::read_current_snapshot_sync(conn, identity, &members)?;
-                    sqlite::install_snapshot_database_sync(
+                    sqlite::install_snapshot_database_cancellable_sync(
                         conn,
                         identity,
                         &members,
@@ -885,6 +987,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                         &file_name_for_install,
                         checksum,
                         total_length,
+                        cancellation,
                     )?;
                     Ok(previous)
                 })
@@ -897,18 +1000,14 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     )
                 })?;
             final_cleanup.disarm();
-            remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name).await;
+            let _ = tokio::time::timeout_at(
+                deadline,
+                remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name),
+            )
+            .await;
             Ok(())
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Write,
-                sqlite::invalid_data("config consensus snapshot install timed out"),
-            )),
-        };
+        }
+        .await;
         if result.is_err() {
             opc_redaction::metrics::METRICS
                 .persist_snapshot_install_failures
@@ -975,32 +1074,50 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
     async fn build_snapshot(
         &mut self,
     ) -> Result<Snapshot<ConfigRaftTypeConfig>, StorageError<ConsensusNodeId>> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(SNAPSHOT_OPERATION_TIMEOUT)
+            .ok_or_else(|| {
+                storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Write,
+                    sqlite::invalid_data("config consensus snapshot build deadline overflow"),
+                )
+            })?;
         validate_snapshot_binding(&self.core).map_err(|error| {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
-        let _guard = self.core.snapshot_gate.lock().await;
+        let _guard = tokio::time::timeout_at(deadline, self.core.snapshot_gate.lock())
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Write,
+                    sqlite::invalid_data("config consensus snapshot build timed out"),
+                )
+            })?;
         let raw = self
             .core
             .snapshot_dir
             .join(format!("build-{}.sqlite", uuid::Uuid::new_v4()));
+        let _raw_cleanup = StagingArtifact::sqlite(raw.clone());
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let audit_key = self.core.audit_key.clone();
         let raw_for_build = raw.clone();
         let (last_log_id, last_membership) = self
             .core
-            .run_sqlite(move |conn| {
-                sqlite::build_snapshot_database_sync(
+            .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                sqlite::build_snapshot_database_cancellable_sync(
                     conn,
                     identity,
                     &members,
                     &audit_key,
                     &raw_for_build,
+                    cancellation,
                 )
             })
             .await
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
-        let _raw_cleanup = StagingArtifact::sqlite(raw.clone());
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let file_name = format!("snapshot-{snapshot_id}.opc");
         let final_path = self.core.snapshot_dir.join(&file_name);
@@ -1008,41 +1125,66 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             .core
             .snapshot_dir
             .join(format!("snapshot-{snapshot_id}.part"));
-        let (checksum, length, mut final_cleanup) = tokio::time::timeout(
-            SNAPSHOT_OPERATION_TIMEOUT,
-            envelope_snapshot_database(&raw, &staging),
-        )
-        .await
-        .map_err(|_| {
-            storage_error(
-                ErrorSubject::Snapshot(None),
-                ErrorVerb::Write,
-                sqlite::invalid_data("config consensus snapshot build timed out"),
-            )
-        })?
-        .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?;
+        let (checksum, length, mut final_cleanup) =
+            tokio::time::timeout_at(deadline, envelope_snapshot_database(&raw, &staging))
+                .await
+                .map_err(|_| {
+                    storage_error(
+                        ErrorSubject::Snapshot(None),
+                        ErrorVerb::Write,
+                        sqlite::invalid_data("config consensus snapshot build timed out"),
+                    )
+                })?
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                })?;
         std::fs::rename(&staging, &final_path).map_err(|error| {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
         final_cleanup.replace_path(final_path.clone());
-        sync_directory(&self.core.snapshot_dir)
+        tokio::time::timeout_at(deadline, sync_directory(&self.core.snapshot_dir))
             .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Write,
+                    sqlite::invalid_data("config consensus snapshot build timed out"),
+                )
+            })?
             .map_err(|error| {
                 storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
             })?;
-        let _ = tokio::fs::remove_file(&raw).await;
+        let _ = tokio::time::timeout_at(deadline, tokio::fs::remove_file(&raw)).await;
         let meta = SnapshotMeta {
             last_log_id,
             last_membership,
             snapshot_id,
         };
+        let snapshot =
+            tokio::time::timeout_at(deadline, ConfigSnapshotFile::open(final_path.clone()))
+                .await
+                .map_err(|_| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        sqlite::invalid_data("config consensus snapshot build timed out"),
+                    )
+                })?
+                .map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let meta_for_save = meta.clone();
         let file_name_for_save = file_name.clone();
         let previous = self
             .core
-            .run_sqlite(move |conn| {
+            .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                cancellation.check_io()?;
                 let previous = sqlite::read_current_snapshot_sync(conn, identity, &members)?;
                 sqlite::save_current_snapshot_sync(
                     conn,
@@ -1064,16 +1206,11 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                 )
             })?;
         final_cleanup.disarm();
-        remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name).await;
-        let snapshot = ConfigSnapshotFile::open(final_path)
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
+        let _ = tokio::time::timeout_at(
+            deadline,
+            remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name),
+        )
+        .await;
         Ok(Snapshot {
             meta,
             snapshot: Box::new(snapshot),
@@ -1324,6 +1461,32 @@ mod tests {
         }
     }
 
+    struct HostileSizeHintOnce(Option<Entry<ConfigRaftTypeConfig>>);
+
+    impl Iterator for HostileSizeHintOnce {
+        type Item = Entry<ConfigRaftTypeConfig>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.take()
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (usize::MAX, Some(usize::MAX))
+        }
+    }
+
+    #[test]
+    fn entry_collection_caps_hostile_hints_and_rejects_oversized_batches() {
+        let bounded = collect_bounded_entries(HostileSizeHintOnce(Some(membership_entry())))
+            .expect("hostile hint is capped");
+        assert_eq!(1, bounded.len());
+        assert!(bounded.capacity() <= sqlite::CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES);
+
+        let oversized = std::iter::repeat_with(membership_entry)
+            .take(sqlite::CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES + 1);
+        assert!(collect_bounded_entries(oversized).is_err());
+    }
+
     fn mutation_entry() -> Entry<ConfigRaftTypeConfig> {
         Entry {
             log_id: log_id(1),
@@ -1485,6 +1648,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_deadline_winner_rejects_a_late_success_and_reuses_connection() {
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        let (log, _, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("storage");
+
+        let late_success = log
+            .core
+            .run_sqlite_with_test_timeout_controlled(
+                Duration::from_millis(25),
+                |_conn, cancellation| {
+                    while !cancellation.is_cancelled() {
+                        std::thread::yield_now();
+                    }
+                    Ok(7_i64)
+                },
+            )
+            .await;
+        let error = late_success.expect_err("deadline winner must reject late success");
+        assert_eq!(io::ErrorKind::TimedOut, error.kind());
+        assert_eq!(
+            "config consensus SQLite operation timed out",
+            error.to_string()
+        );
+
+        let follow_up = tokio::time::timeout(
+            Duration::from_secs(2),
+            log.core.run_sqlite(|conn| {
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                    .map_err(|_| sqlite::invalid_data("follow-up SQLite query failed"))
+            }),
+        )
+        .await
+        .expect("late-success worker releases admission")
+        .expect("follow-up query");
+        assert_eq!(1, follow_up);
+    }
+
+    #[tokio::test]
+    async fn pre_core_probe_timeout_never_queues_late_work_and_reuses_backend() {
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        let shared = backend.conn();
+        let held = shared.clone().lock_owned().await;
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_worker = ran.clone();
+        let error = sqlite::run_backend_sqlite_with_timeout(
+            &backend,
+            Duration::from_millis(25),
+            move |_conn, _cancellation| {
+                ran_in_worker.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("held connection must time out");
+        assert_eq!(io::ErrorKind::TimedOut, error.kind());
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!ran.load(Ordering::Acquire), "timed-out work ran late");
+
+        let value = sqlite::run_backend_sqlite_with_timeout(
+            &backend,
+            Duration::from_secs(1),
+            |conn, cancellation| {
+                cancellation.check_io()?;
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                    .map_err(|_| sqlite::invalid_data("reused backend query failed"))
+            },
+        )
+        .await
+        .expect("backend is reusable after timeout");
+        assert_eq!(1, value);
+    }
+
+    #[tokio::test]
     async fn initialization_timeout_cancels_before_authority_and_allows_retry() {
         let temp = tempfile::tempdir().expect("snapshot tempdir");
         let backend = SqliteBackend::open_with_audit_key(
@@ -1639,6 +1887,17 @@ mod tests {
         )
         .await
         .expect("destination storage");
+        let stale = temp.path().join("stale-incoming.sqlite");
+        drop(rusqlite::Connection::open(&stale).expect("stale attached database"));
+        {
+            let conn = destination_backend.conn();
+            let conn = conn.lock().await;
+            conn.execute(
+                "ATTACH DATABASE ?1 AS config_raft_incoming",
+                [stale.to_string_lossy().as_ref()],
+            )
+            .expect("inject stale incoming attachment");
+        }
         let mut receiving = destination_machine
             .begin_receiving_snapshot()
             .await
@@ -1676,9 +1935,17 @@ mod tests {
         let logs: i64 = conn
             .query_row("SELECT COUNT(*) FROM config_raft_log", [], |row| row.get(0))
             .expect("installed log count");
+        let stale_attachments: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'config_raft_incoming'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stale attachment count");
         assert_eq!(1, sequence);
         assert_eq!(1, outcomes);
         assert_eq!(0, logs, "snapshot must not import log-store authority");
+        assert_eq!(0, stale_attachments, "install must detach stale aliases");
     }
 
     #[tokio::test]

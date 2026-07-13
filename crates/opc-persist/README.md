@@ -165,7 +165,10 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   it bounds routing, quorum, commit, and apply. Forwarded writes and read
   barriers carry the remaining caller budget, and receivers use the lesser of
   that budget and their local cap rather than starting a new timeout.
-- Durable log appends are contiguous and capped at 16 MiB per encoded entry.
+- Durable log append/apply batches accept at most 1,024 entries, 16 MiB per
+  encoded entry, and 64 MiB encoded in aggregate. Serialization writes through
+  a bounded sink inside the cancellable SQLite worker, so hostile iterator
+  hints and oversized entries cannot trigger an unbounded preflight allocation.
   Committed, applied, and purged floors cannot be rewritten or truncated;
   startup and reads reject persisted holes while an uncommitted suffix remains
   replaceable through Openraft's explicit truncate/append sequence.
@@ -173,6 +176,9 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   admitted durable device as SQLite. The adapter holds its descriptor and
   rechecks the path/device/inode binding before build, install, read, and purge.
   Startup verifies the referenced snapshot before a bounded directory cleanup.
+  Build and install use one absolute 60-second deadline across file work,
+  stepped SQLite backup, validation, and the drained authority transaction;
+  timeout cannot leave a detached worker or report failure after commit.
   Interrupted receive/build/install/promote artifacts, SQLite sidecars,
   approved-recovery staging, and unreferenced snapshots are removed without
   following unsafe file types; drop guards clean canceled staging work.

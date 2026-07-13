@@ -378,6 +378,15 @@ impl ReplicaBackingIdentity {
         )?;
         Ok(Self(Sha256::digest(value.as_bytes()).into()))
     }
+
+    /// Return the fixed-width opaque fingerprint used by topology admission.
+    ///
+    /// The original caller-supplied identity is never retained. Recovery
+    /// tooling uses this fingerprint to prove that two logical votes do not
+    /// name the same admitted physical backing store.
+    pub const fn fingerprint(&self) -> [u8; 32] {
+        self.0
+    }
 }
 
 impl fmt::Debug for ReplicaBackingIdentity {

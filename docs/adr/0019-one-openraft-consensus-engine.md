@@ -113,9 +113,8 @@ qualification gates remain unchanged.
 
 An adapter must never reinterpret a nonempty legacy consensus log as Openraft
 metadata or use startup heuristics to choose a legacy tail. Pristine state may
-be claimed directly. Nonempty legacy config authority fails closed with
-`RecoveryRequired` unless the fleet is offline and an operator explicitly
-approves one applied SQLite snapshot.
+be claimed directly. Nonempty legacy authority fails closed unless the fleet is
+offline and an operator explicitly approves one coherent applied snapshot.
 
 Config recovery must bind the complete source file's exact SHA-256 checksum,
 the exact latest applied transaction ID and config version, and an explicit
@@ -125,7 +124,21 @@ envelopes, checksum, and chain head are verified before the target is replaced
 and the Openraft marker is created in one immediate SQLite transaction. Every
 unprovable target suffix is discarded; it is never merged or promoted.
 
-The transaction is atomic for one database, not for a fleet. Operators must
+For config authority, recovery binds the complete source file's exact SHA-256
+checksum, latest applied transaction ID and config version, and an explicit
+`DiscardUnknownAppendedSuffix` disposition. The source must be checkpointed
+with no nonempty WAL. Integrity, required tables, audit chains, config
+envelopes, checksum, and chain head are verified before the target is replaced
+and the Openraft marker is created in one immediate SQLite transaction. Every
+unprovable target suffix is discarded; it is never merged or promoted.
+
+For session authority, the operator-safe procedure is the offline, full-fleet
+campaign in the
+[legacy recovery runbook](../session-store-legacy-recovery.md). It may copy an
+operator-selected immutable checkpoint, but Openraft alone commits the recovery
+epoch and returns the fleet to service.
+
+A local conversion transaction is not a fleet transaction. Operators must
 drain every old authority, preserve one coherent authority decision, convert
 members under a coordinated rollout, and keep untouched pre-migration backups.
 

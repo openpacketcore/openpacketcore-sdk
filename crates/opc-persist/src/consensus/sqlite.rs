@@ -135,6 +135,10 @@ CREATE TABLE config_raft_legacy_recovery (
 
 /// Hard ceiling for one serialized config Openraft entry on disk.
 pub(crate) const CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Hard ceiling for entries accepted by one Openraft log append callback.
+pub(crate) const CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES: usize = 1_024;
+/// Hard ceiling for serialized bytes accepted by one Openraft log append.
+pub(crate) const CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES: usize = 64 * 1024 * 1024;
 const CONFIG_CONSENSUS_RETAINED_REQUEST_OUTCOMES: u64 = 4_096;
 const SQLITE_WORK_RUNNING: u8 = 0;
 const SQLITE_WORK_CANCELLED: u8 = 1;
@@ -142,17 +146,31 @@ const SQLITE_WORK_COMMITTING: u8 = 2;
 
 pub(crate) struct SqliteWorkCancellation {
     state: AtomicU8,
+    deadline: Option<std::time::Instant>,
 }
 
 impl SqliteWorkCancellation {
     fn new() -> Self {
         Self {
             state: AtomicU8::new(SQLITE_WORK_RUNNING),
+            deadline: None,
+        }
+    }
+
+    fn with_deadline(deadline: std::time::Instant) -> Self {
+        Self {
+            state: AtomicU8::new(SQLITE_WORK_RUNNING),
+            deadline: Some(deadline),
         }
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.state.load(Ordering::Acquire) == SQLITE_WORK_CANCELLED
+        let state = self.state.load(Ordering::Acquire);
+        state == SQLITE_WORK_CANCELLED
+            || state == SQLITE_WORK_RUNNING
+                && self
+                    .deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
     }
 
     fn cancel_before_commit(&self) -> bool {
@@ -167,6 +185,10 @@ impl SqliteWorkCancellation {
     }
 
     fn authorize_commit(&self) -> Result<(), ConfigConsensusStorageError> {
+        if self.is_cancelled() {
+            let _ = self.cancel_before_commit();
+            return Err(ConfigConsensusStorageError::BackendUnavailable);
+        }
         self.state
             .compare_exchange(
                 SQLITE_WORK_RUNNING,
@@ -181,6 +203,14 @@ impl SqliteWorkCancellation {
     fn check(&self) -> Result<(), ConfigConsensusStorageError> {
         if self.is_cancelled() {
             Err(ConfigConsensusStorageError::BackendUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn check_io(&self) -> io::Result<()> {
+        if self.is_cancelled() {
+            Err(timed_out("config consensus SQLite operation timed out"))
         } else {
             Ok(())
         }
@@ -301,6 +331,9 @@ impl ConfigConsensusCore {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
             .ok_or(ConfigConsensusStorageError::BackendUnavailable)?;
+        let std_deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(ConfigConsensusStorageError::BackendUnavailable)?;
         let worker_gate = backend.config_consensus_worker_gate();
         let permit = tokio::time::timeout_at(deadline, worker_gate.clone().acquire_owned())
             .await
@@ -312,7 +345,7 @@ impl ConfigConsensusCore {
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         let worker_members = expected_members.clone();
         let worker_audit_key = backend.audit_key().clone();
-        let cancellation = Arc::new(SqliteWorkCancellation::new());
+        let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
         let worker_cancellation = cancellation.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -377,6 +410,33 @@ impl ConfigConsensusCore {
         .await
     }
 
+    pub(crate) async fn run_sqlite_cancellable<T, F>(&self, operation: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
+    {
+        self.run_sqlite_with_timeout(Duration::from_secs(30), operation)
+            .await
+    }
+
+    pub(crate) async fn run_sqlite_cancellable_until<T, F>(
+        &self,
+        deadline: tokio::time::Instant,
+        operation: F,
+    ) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
+    {
+        run_sqlite_worker_until(
+            self.sqlite_worker_gate.clone(),
+            self.conn.clone(),
+            deadline,
+            operation,
+        )
+        .await
+    }
+
     #[cfg(test)]
     pub(crate) async fn run_sqlite_with_test_timeout_controlled<T, F>(
         &self,
@@ -385,7 +445,7 @@ impl ConfigConsensusCore {
     ) -> io::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection, &SqliteWorkCancellation) -> io::Result<T> + Send + 'static,
+        F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
     {
         self.run_sqlite_with_timeout(timeout, operation).await
     }
@@ -393,7 +453,7 @@ impl ConfigConsensusCore {
     async fn run_sqlite_with_timeout<T, F>(&self, timeout: Duration, operation: F) -> io::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection, &SqliteWorkCancellation) -> io::Result<T> + Send + 'static,
+        F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
     {
         if timeout.is_zero() {
             return Err(invalid_data(
@@ -403,59 +463,108 @@ impl ConfigConsensusCore {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| invalid_data("config consensus SQLite deadline overflow"))?;
-        let permit =
-            tokio::time::timeout_at(deadline, self.sqlite_worker_gate.clone().acquire_owned())
+        run_sqlite_worker_until(
+            self.sqlite_worker_gate.clone(),
+            self.conn.clone(),
+            deadline,
+            operation,
+        )
+        .await
+    }
+}
+
+pub(crate) async fn run_backend_sqlite_with_timeout<T, F>(
+    backend: &SqliteBackend,
+    timeout: Duration,
+    operation: F,
+) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
+{
+    if timeout.is_zero() {
+        return Err(invalid_data(
+            "config consensus SQLite timeout must be positive",
+        ));
+    }
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| invalid_data("config consensus SQLite deadline overflow"))?;
+    run_sqlite_worker_until(
+        backend.config_consensus_worker_gate(),
+        backend.conn(),
+        deadline,
+        operation,
+    )
+    .await
+}
+
+async fn run_sqlite_worker_until<T, F>(
+    worker_gate: Arc<tokio::sync::Semaphore>,
+    conn: Arc<tokio::sync::Mutex<Connection>>,
+    deadline: tokio::time::Instant,
+    operation: F,
+) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
+{
+    if deadline <= tokio::time::Instant::now() {
+        return Err(timed_out("config consensus SQLite deadline elapsed"));
+    }
+    let std_deadline = deadline.into_std();
+    let permit = tokio::time::timeout_at(deadline, worker_gate.acquire_owned())
+        .await
+        .map_err(|_| timed_out("config consensus SQLite admission timed out"))?
+        .map_err(|_| invalid_data("config consensus SQLite worker is closed"))?;
+    let conn = tokio::time::timeout_at(deadline, conn.lock_owned())
+        .await
+        .map_err(|_| timed_out("config consensus SQLite connection timed out"))?;
+    let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
+    let worker_cancellation = cancellation.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let commit_cancellation = worker_cancellation.clone();
+        conn.commit_hook(Some(move || {
+            commit_cancellation.authorize_commit().is_err()
+        }));
+        let progress_cancellation = worker_cancellation.clone();
+        conn.progress_handler(
+            1_000,
+            Some(move || {
+                progress_cancellation.is_cancelled() || std::time::Instant::now() >= std_deadline
+            }),
+        );
+        let result = operation(&conn, &worker_cancellation);
+        conn.commit_hook(None::<fn() -> bool>);
+        conn.progress_handler(0, None::<fn() -> bool>);
+        result
+    });
+    match tokio::time::timeout_at(deadline, &mut worker).await {
+        Ok(Ok(result)) => {
+            if cancellation.is_cancelled() && cancellation.cancel_before_commit() {
+                Err(timed_out("config consensus SQLite operation timed out"))
+            } else {
+                result
+            }
+        }
+        Ok(Err(_)) => Err(invalid_data("config consensus SQLite worker failed")),
+        Err(_) if cancellation.cancel_before_commit() => {
+            // Cancellation won before SQLite authorized any commit. Drain the
+            // worker so neither the transaction nor its connection can outlive
+            // this error. A late `Ok` is still a timeout because the caller
+            // lost authority to observe the result when cancellation won.
+            match worker.await {
+                Ok(_) => Err(timed_out("config consensus SQLite operation timed out")),
+                Err(_) => Err(invalid_data("config consensus SQLite worker failed")),
+            }
+        }
+        Err(_) => {
+            // SQLite authorized a commit before the timeout won. Drain it and
+            // report the actual durable result instead of an ambiguous timeout.
+            worker
                 .await
-                .map_err(|_| invalid_data("config consensus SQLite admission timed out"))?
-                .map_err(|_| invalid_data("config consensus SQLite worker is closed"))?;
-        let conn = tokio::time::timeout_at(deadline, self.conn.clone().lock_owned())
-            .await
-            .map_err(|_| invalid_data("config consensus SQLite connection timed out"))?;
-        let cancellation = Arc::new(SqliteWorkCancellation::new());
-        let worker_cancellation = cancellation.clone();
-        let std_deadline = std::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| invalid_data("config consensus SQLite deadline overflow"))?;
-        let mut worker = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let commit_cancellation = worker_cancellation.clone();
-            conn.commit_hook(Some(move || {
-                commit_cancellation.authorize_commit().is_err()
-            }));
-            let progress_cancellation = worker_cancellation.clone();
-            conn.progress_handler(
-                1_000,
-                Some(move || {
-                    progress_cancellation.is_cancelled()
-                        || std::time::Instant::now() >= std_deadline
-                }),
-            );
-            let result = operation(&conn, &worker_cancellation);
-            conn.commit_hook(None::<fn() -> bool>);
-            conn.progress_handler(0, None::<fn() -> bool>);
-            result
-        });
-        match tokio::time::timeout_at(deadline, &mut worker).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(invalid_data("config consensus SQLite worker failed")),
-            Err(_) if cancellation.cancel_before_commit() => {
-                // Cancellation won before SQLite authorized any commit. Drain
-                // the worker so neither the transaction nor its connection
-                // can outlive this error return.
-                match worker.await {
-                    Ok(Ok(result)) => Ok(result),
-                    Ok(Err(_)) => Err(invalid_data("config consensus SQLite operation timed out")),
-                    Err(_) => Err(invalid_data("config consensus SQLite worker failed")),
-                }
-            }
-            Err(_) => {
-                // SQLite authorized a commit before the timeout won. Drain it
-                // and report the actual durable result instead of returning an
-                // ambiguous timeout after authority may have changed.
-                worker
-                    .await
-                    .map_err(|_| invalid_data("config consensus SQLite worker failed"))?
-            }
+                .map_err(|_| invalid_data("config consensus SQLite worker failed"))?
         }
     }
 }
@@ -525,7 +634,7 @@ fn initialize_schema_transaction(
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         let epoch = checked_positive_i64(identity.configuration_epoch().get())
             .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?;
-        let schema_manifest_digest = config_schema_manifest_digest(&tx)
+        let schema_manifest_digest = config_schema_manifest_digest(&tx, cancellation)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         tx.execute(
             "INSERT INTO config_raft_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -563,10 +672,24 @@ fn initialize_schema_transaction(
         )
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     } else if let Some(recovery) = recovery {
-        validate_existing_schema(&tx, identity, expected_members, audit_key, false)?;
+        validate_existing_schema(
+            &tx,
+            identity,
+            expected_members,
+            audit_key,
+            false,
+            cancellation,
+        )?;
         validate_completed_legacy_recovery(&tx, &recovery.approval)?;
     } else {
-        validate_existing_schema(&tx, identity, expected_members, audit_key, false)?;
+        validate_existing_schema(
+            &tx,
+            identity,
+            expected_members,
+            audit_key,
+            false,
+            cancellation,
+        )?;
     }
     if let Some(before_commit) = before_commit {
         before_commit(cancellation);
@@ -861,15 +984,17 @@ fn validate_existing_schema(
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
     allow_detached_snapshot: bool,
+    cancellation: &SqliteWorkCancellation,
 ) -> Result<(), ConfigConsensusStorageError> {
     for table in RAFT_TABLES {
+        cancellation.check()?;
         if !table_exists(conn, table)
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
         {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
     }
-    let schema_manifest_digest = config_schema_manifest_digest(conn)
+    let schema_manifest_digest = config_schema_manifest_digest(conn, cancellation)
         .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
     let row = conn
         .query_row(
@@ -915,13 +1040,23 @@ fn validate_existing_schema(
     }
     read_vote_sync(conn, identity, expected_members)
         .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-    validate_durable_log_state_sync(conn, identity, expected_members, allow_detached_snapshot)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-    validate_sealed_state_sync(conn, audit_key)
+    cancellation.check()?;
+    validate_durable_log_state_sync(
+        conn,
+        identity,
+        expected_members,
+        allow_detached_snapshot,
+        cancellation,
+    )
+    .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    validate_sealed_state_sync(conn, audit_key, cancellation)
         .map_err(|_| ConfigConsensusStorageError::CorruptState)
 }
 
-fn config_schema_manifest(conn: &Connection) -> io::Result<Vec<(String, String, String, String)>> {
+fn config_schema_manifest(
+    conn: &Connection,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Vec<(String, String, String, String)>> {
     let mut statement = conn
         .prepare(
             "SELECT type, name, tbl_name, sql FROM sqlite_master \
@@ -943,18 +1078,23 @@ fn config_schema_manifest(conn: &Connection) -> io::Result<Vec<(String, String, 
         .map_err(db_error)?;
     let mut manifest = Vec::new();
     for row in rows {
+        cancellation.check_io()?;
         manifest.push(row.map_err(db_error)?);
     }
     Ok(manifest)
 }
 
-fn config_schema_manifest_digest(conn: &Connection) -> io::Result<[u8; 32]> {
+fn config_schema_manifest_digest(
+    conn: &Connection,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<[u8; 32]> {
+    cancellation.check_io()?;
     let expected = Connection::open_in_memory().map_err(db_error)?;
     expected
         .execute_batch(CONFIG_RAFT_SCHEMA)
         .map_err(db_error)?;
-    let expected_manifest = config_schema_manifest(&expected)?;
-    let live_manifest = config_schema_manifest(conn)?;
+    let expected_manifest = config_schema_manifest(&expected, cancellation)?;
+    let live_manifest = config_schema_manifest(conn, cancellation)?;
     if live_manifest != expected_manifest {
         return Err(invalid_data(
             "config consensus owned schema manifest does not match",
@@ -963,6 +1103,7 @@ fn config_schema_manifest_digest(conn: &Connection) -> io::Result<[u8; 32]> {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"openpacketcore/config-consensus/storage-manifest/v1\0");
     for (kind, name, table, sql) in live_manifest {
+        cancellation.check_io()?;
         for value in [kind, name, table, sql] {
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value.as_bytes());
@@ -998,12 +1139,71 @@ pub(crate) fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn timed_out(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, message)
+}
+
 fn db_error(_: rusqlite::Error) -> io::Error {
     io::Error::other("config consensus SQLite operation failed")
 }
 
 fn encode_json<T: Serialize + ?Sized>(value: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|_| invalid_data("config consensus encoding failed"))
+}
+
+struct BoundedJsonWriter<'a> {
+    bytes: Vec<u8>,
+    limit: usize,
+    limit_exceeded: bool,
+    cancellation: &'a SqliteWorkCancellation,
+}
+
+impl io::Write for BoundedJsonWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.cancellation.check_io()?;
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| invalid_data("config consensus encoding length overflow"))?;
+        if next > self.limit {
+            self.limit_exceeded = true;
+            return Err(invalid_data("config consensus encoding exceeds limit"));
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| io::Error::other("config consensus encoding allocation failed"))?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_json_bounded_cancellable<T: Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+    limit_message: &'static str,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Vec<u8>> {
+    let mut writer = BoundedJsonWriter {
+        bytes: Vec::new(),
+        limit,
+        limit_exceeded: false,
+        cancellation,
+    };
+    let encoded = serde_json::to_writer(&mut writer, value);
+    if cancellation.is_cancelled() {
+        return Err(timed_out("config consensus SQLite operation timed out"));
+    }
+    if writer.limit_exceeded {
+        return Err(invalid_data(limit_message));
+    }
+    encoded
+        .map_err(|_| invalid_data("config consensus encoding failed"))
+        .map(|()| writer.bytes)
 }
 
 fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
@@ -1387,7 +1587,9 @@ fn validate_durable_log_state_sync(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     allow_detached_snapshot: bool,
+    cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    cancellation.check_io()?;
     let (committed, applied, purged) = validate_durable_pointer_relationships_sync(conn, identity)?;
     let snapshot_log_id = read_current_snapshot_sync(conn, identity, expected_members)?
         .and_then(|(meta, _, _, _)| meta.last_log_id);
@@ -1471,6 +1673,7 @@ fn validate_durable_log_state_sync(
                         .ok_or_else(|| invalid_data("config consensus log range overflow"))?,
                 ),
                 None,
+                Some(cancellation),
             )?;
             if entries.len()
                 != usize::try_from(expected_count)
@@ -1516,6 +1719,7 @@ fn read_log_rows_unchecked_sync(
     start: u64,
     end: Option<u64>,
     limit: Option<usize>,
+    cancellation: Option<&SqliteWorkCancellation>,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
     let start = checked_i64(start)?;
     let end = end.map(checked_i64).transpose()?;
@@ -1542,6 +1746,9 @@ fn read_log_rows_unchecked_sync(
         .map_err(db_error)?;
     let mut entries = Vec::new();
     for row in rows {
+        if let Some(cancellation) = cancellation {
+            cancellation.check_io()?;
+        }
         let (epoch, term, index, encoded) = row.map_err(db_error)?;
         validate_epoch(epoch, identity)?;
         if encoded.len() > CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
@@ -1578,7 +1785,7 @@ pub(crate) fn read_log_range_sync(
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
     let (_, _, purged) = validate_durable_pointer_relationships_sync(conn, identity)?;
     let entries =
-        read_log_rows_unchecked_sync(conn, identity, expected_members, start, end, limit)?;
+        read_log_rows_unchecked_sync(conn, identity, expected_members, start, end, limit, None)?;
     if limit == Some(0) {
         return Ok(entries);
     }
@@ -1614,26 +1821,61 @@ pub(crate) fn read_log_range_sync(
     Ok(entries)
 }
 
+#[cfg(test)]
 pub(crate) fn append_logs_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     entries: &[Entry<ConfigRaftTypeConfig>],
 ) -> io::Result<()> {
+    append_logs_cancellable_sync(
+        conn,
+        identity,
+        expected_members,
+        entries,
+        &SqliteWorkCancellation::new(),
+    )
+}
+
+pub(crate) fn append_logs_cancellable_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    entries: &[Entry<ConfigRaftTypeConfig>],
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
+    if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
+        return Err(invalid_data(
+            "config consensus log append exceeds entry-count limit",
+        ));
+    }
     let mut encoded_entries = Vec::with_capacity(entries.len());
+    let mut encoded_bytes = 0_usize;
     for entry in entries {
+        cancellation.check_io()?;
         validate_entry(entry, identity, expected_members)?;
-        let encoded = encode_json(entry)?;
-        if encoded.len() > CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
-            return Err(invalid_data(
-                "config consensus log entry exceeds storage limit",
-            ));
-        }
+        let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
+            .checked_sub(encoded_bytes)
+            .ok_or_else(|| {
+                invalid_data("config consensus log append exceeds aggregate byte limit")
+            })?;
+        let entry_budget = CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES.min(remaining);
+        let limit_message = if remaining < CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+            "config consensus log append exceeds aggregate byte limit"
+        } else {
+            "config consensus log entry exceeds storage limit"
+        };
+        let encoded =
+            encode_json_bounded_cancellable(entry, entry_budget, limit_message, cancellation)?;
+        encoded_bytes = encoded_bytes
+            .checked_add(encoded.len())
+            .ok_or_else(|| invalid_data("config consensus log append byte count overflow"))?;
         encoded_entries.push(encoded);
     }
+    cancellation.check_io()?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
     let (committed, applied, purged) = validate_durable_pointer_relationships_sync(&tx, identity)?;
     let floor = [last_log_sync(&tx, identity)?, committed, applied, purged]
@@ -1655,6 +1897,7 @@ pub(crate) fn append_logs_sync(
         ));
     }
     for (offset, entry) in entries.iter().enumerate() {
+        cancellation.check_io()?;
         let offset = u64::try_from(offset)
             .map_err(|_| invalid_data("config consensus log batch exceeds integer range"))?;
         if entry.log_id.index
@@ -1666,6 +1909,7 @@ pub(crate) fn append_logs_sync(
         }
     }
     for (entry, encoded) in entries.iter().zip(encoded_entries) {
+        cancellation.check_io()?;
         tx.execute(
             "INSERT INTO config_raft_log (log_index, configuration_epoch, term, entry_json) VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -1677,6 +1921,7 @@ pub(crate) fn append_logs_sync(
         )
         .map_err(db_error)?;
     }
+    cancellation.check_io()?;
     tx.commit().map_err(db_error)
 }
 
@@ -1866,7 +2111,9 @@ fn deterministic_row_id(domain: &[u8], identity: &[u8]) -> i64 {
 fn append_prepared_commit_sync(
     conn: &Connection,
     commit: &super::PreparedConfigCommit,
+    cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
+    cancellation.check_io()?;
     if commit.validate().is_err() {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
     }
@@ -1931,6 +2178,7 @@ fn append_prepared_commit_sync(
     )
     .map_err(db_error)?;
     for entry in &commit.audit {
+        cancellation.check_io()?;
         let mut audit_identity = tx_id.to_vec();
         audit_identity.extend_from_slice(&entry.sequence.to_be_bytes());
         conn.execute(
@@ -2050,9 +2298,12 @@ fn execute_intent_sync(
     intent: &ConfigMutationIntent,
     logical_time: Timestamp,
     request_id: opc_consensus::ConsensusRequestId,
+    cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     match intent {
-        ConfigMutationIntent::AppendCommit(commit) => append_prepared_commit_sync(conn, commit),
+        ConfigMutationIntent::AppendCommit(commit) => {
+            append_prepared_commit_sync(conn, commit, cancellation)
+        }
         ConfigMutationIntent::MarkConfirmed { tx_id } => {
             mark_confirmed_sync(conn, *tx_id, logical_time, request_id)
         }
@@ -2062,20 +2313,59 @@ fn execute_intent_sync(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn apply_entries_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     entries: Vec<Entry<ConfigRaftTypeConfig>>,
 ) -> io::Result<Vec<ConfigConsensusResponse>> {
+    apply_entries_cancellable_sync(
+        conn,
+        identity,
+        expected_members,
+        entries,
+        &SqliteWorkCancellation::new(),
+    )
+}
+
+pub(crate) fn apply_entries_cancellable_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    entries: Vec<Entry<ConfigRaftTypeConfig>>,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Vec<ConfigConsensusResponse>> {
+    if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
+        return Err(invalid_data(
+            "config consensus apply exceeds entry-count limit",
+        ));
+    }
+    let mut encoded_bytes = 0_usize;
     for entry in &entries {
+        cancellation.check_io()?;
         validate_entry(entry, identity, expected_members)?;
+        let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
+            .checked_sub(encoded_bytes)
+            .ok_or_else(|| invalid_data("config consensus apply exceeds aggregate byte limit"))?;
+        let entry_budget = CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES.min(remaining);
+        let limit_message = if remaining < CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+            "config consensus apply exceeds aggregate byte limit"
+        } else {
+            "config consensus apply entry exceeds storage limit"
+        };
+        let encoded =
+            encode_json_bounded_cancellable(entry, entry_budget, limit_message, cancellation)?;
+        encoded_bytes = encoded_bytes
+            .checked_add(encoded.len())
+            .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
     }
     let tx = conn.unchecked_transaction().map_err(db_error)?;
     let mut last_applied = read_applied_sync(&tx, identity)?;
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());
     for entry in entries {
+        cancellation.check_io()?;
         let expected_index = last_applied
             .map(|log_id| {
                 log_id
@@ -2144,6 +2434,7 @@ pub(crate) fn apply_entries_sync(
                         &command.intent,
                         logical_time,
                         command.request_id,
+                        cancellation,
                     )?;
                     let response = ConfigConsensusResponse {
                         result,
@@ -2199,12 +2490,17 @@ pub(crate) fn apply_entries_sync(
     if !is_pristine_membership(&membership) {
         validate_fixed_membership(&membership, expected_members)?;
     }
+    cancellation.check_io()?;
     tx.commit().map_err(db_error)?;
     Ok(responses)
 }
 
-fn validate_sealed_state_sync(conn: &Connection, audit_key: &AuditKey) -> io::Result<()> {
-    validate_history_chain_sync(conn)?;
+fn validate_sealed_state_sync(
+    conn: &Connection,
+    audit_key: &AuditKey,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    validate_history_chain_cancellable_sync(conn, cancellation)?;
     let mut statement = conn
         .prepare(
             "SELECT tx_id, parent_tx_id, version, committed_at, principal, schema_digest, plaintext_digest, encrypted_blob, audit_count, audit_terminal_hash FROM config_history ORDER BY version ASC",
@@ -2227,6 +2523,7 @@ fn validate_sealed_state_sync(conn: &Connection, audit_key: &AuditKey) -> io::Re
         })
         .map_err(db_error)?;
     for row in rows {
+        cancellation.check_io()?;
         let (
             tx_id,
             parent_tx_id,
@@ -2324,6 +2621,7 @@ fn validate_sealed_state_sync(conn: &Connection, audit_key: &AuditKey) -> io::Re
         let mut previous = [0_u8; 32];
         let mut seen = 0_usize;
         for row in rows {
+            cancellation.check_io()?;
             let (sequence, yang_path, op_type, old, new, redacted, previous_hash, entry_hmac) =
                 row.map_err(db_error)?;
             let previous_hash: [u8; 32] = previous_hash
@@ -2394,6 +2692,7 @@ fn validate_sealed_state_sync(conn: &Connection, audit_key: &AuditKey) -> io::Re
         .map_err(db_error)?;
     let mut outcome_count = 0_u64;
     for row in rows {
+        cancellation.check_io()?;
         let (applied_sequence, encoded) = row.map_err(db_error)?;
         let response: ConfigConsensusResponse = decode_json(&encoded)?;
         if checked_positive_u64(applied_sequence)? != response.sequence {
@@ -2414,6 +2713,13 @@ fn validate_sealed_state_sync(conn: &Connection, audit_key: &AuditKey) -> io::Re
 }
 
 fn validate_history_chain_sync(conn: &Connection) -> io::Result<Option<(Vec<u8>, u64)>> {
+    validate_history_chain_cancellable_sync(conn, &SqliteWorkCancellation::new())
+}
+
+fn validate_history_chain_cancellable_sync(
+    conn: &Connection,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Option<(Vec<u8>, u64)>> {
     let mut statement = conn
         .prepare(
             "SELECT tx_id, parent_tx_id, version FROM config_history ORDER BY version ASC, tx_id ASC",
@@ -2430,6 +2736,7 @@ fn validate_history_chain_sync(conn: &Connection) -> io::Result<Option<(Vec<u8>,
         .map_err(db_error)?;
     let mut head: Option<(Vec<u8>, u64)> = None;
     for row in rows {
+        cancellation.check_io()?;
         let (tx_id, parent_tx_id, version) = row.map_err(db_error)?;
         if tx_id.len() != 16
             || parent_tx_id
@@ -2464,6 +2771,7 @@ pub(crate) type AppliedMembership = (
     StoredMembership<ConsensusNodeId, EmptyNode>,
 );
 
+#[cfg(test)]
 pub(crate) fn build_snapshot_database_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -2471,17 +2779,47 @@ pub(crate) fn build_snapshot_database_sync(
     audit_key: &AuditKey,
     path: &Path,
 ) -> io::Result<AppliedMembership> {
-    validate_sealed_state_sync(conn, audit_key)?;
+    build_snapshot_database_cancellable_sync(
+        conn,
+        identity,
+        expected_members,
+        audit_key,
+        path,
+        &Arc::new(SqliteWorkCancellation::new()),
+    )
+}
+
+pub(crate) fn build_snapshot_database_cancellable_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    path: &Path,
+    cancellation: &Arc<SqliteWorkCancellation>,
+) -> io::Result<AppliedMembership> {
+    cancellation.check_io()?;
+    validate_sealed_state_sync(conn, audit_key, cancellation)?;
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity, expected_members)?;
     validate_fixed_membership(&membership, expected_members)?;
     let mut destination = Connection::open(path).map_err(db_error)?;
+    let progress_cancellation = cancellation.clone();
+    destination.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
-        backup
-            .run_to_completion(128, std::time::Duration::ZERO, None)
-            .map_err(db_error)?;
+        loop {
+            cancellation.check_io()?;
+            match backup.step(128).map_err(db_error)? {
+                rusqlite::backup::StepResult::Done => break,
+                rusqlite::backup::StepResult::More => {}
+                rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                    std::thread::yield_now();
+                }
+                _ => return Err(invalid_data("config consensus snapshot backup failed")),
+            }
+        }
     }
+    cancellation.check_io()?;
     destination
         .execute_batch(
             r#"
@@ -2495,13 +2833,24 @@ pub(crate) fn build_snapshot_database_sync(
             "#,
         )
         .map_err(db_error)?;
-    validate_existing_schema(&destination, identity, expected_members, audit_key, true)
-        .map_err(|_| invalid_data("built config consensus snapshot failed validation"))?;
-    validate_snapshot_has_no_log_authority(&destination)?;
+    cancellation.check_io()?;
+    validate_existing_schema(
+        &destination,
+        identity,
+        expected_members,
+        audit_key,
+        true,
+        cancellation,
+    )
+    .map_err(|_| invalid_data("built config consensus snapshot failed validation"))?;
+    validate_snapshot_has_no_log_authority(&destination, cancellation)?;
     Ok((applied, membership))
 }
 
-fn validate_snapshot_has_no_log_authority(conn: &Connection) -> io::Result<()> {
+fn validate_snapshot_has_no_log_authority(
+    conn: &Connection,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
     for table in [
         "config_raft_vote",
         "config_raft_committed",
@@ -2509,6 +2858,7 @@ fn validate_snapshot_has_no_log_authority(conn: &Connection) -> io::Result<()> {
         "config_raft_log",
         "config_raft_snapshot",
     ] {
+        cancellation.check_io()?;
         let count: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                 row.get(0)
@@ -2527,13 +2877,17 @@ fn validate_snapshot_database_sync(
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
     meta: &SnapshotMeta<ConsensusNodeId, EmptyNode>,
+    cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<()> {
+    cancellation.check_io()?;
     validate_fixed_membership(&meta.last_membership, expected_members)?;
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(db_error)?;
+    let progress_cancellation = cancellation.clone();
+    conn.progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()));
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(db_error)?;
@@ -2542,10 +2896,18 @@ fn validate_snapshot_database_sync(
             "config consensus snapshot integrity check failed",
         ));
     }
-    validate_existing_schema(&conn, identity, expected_members, audit_key, true)
-        .map_err(|_| invalid_data("config consensus snapshot identity is invalid"))?;
-    validate_sealed_state_sync(&conn, audit_key)?;
-    validate_snapshot_has_no_log_authority(&conn)?;
+    cancellation.check_io()?;
+    validate_existing_schema(
+        &conn,
+        identity,
+        expected_members,
+        audit_key,
+        true,
+        cancellation,
+    )
+    .map_err(|_| invalid_data("config consensus snapshot identity is invalid"))?;
+    validate_sealed_state_sync(&conn, audit_key, cancellation)?;
+    validate_snapshot_has_no_log_authority(&conn, cancellation)?;
     if read_applied_sync(&conn, identity)? != meta.last_log_id
         || read_membership_sync(&conn, identity, expected_members)? != meta.last_membership
     {
@@ -2564,6 +2926,7 @@ fn valid_snapshot_file_name(file_name: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn install_snapshot_database_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -2575,12 +2938,40 @@ pub(crate) fn install_snapshot_database_sync(
     checksum: [u8; 32],
     byte_length: u64,
 ) -> io::Result<()> {
+    install_snapshot_database_cancellable_sync(
+        conn,
+        identity,
+        expected_members,
+        audit_key,
+        snapshot_db_path,
+        meta,
+        final_file_name,
+        checksum,
+        byte_length,
+        &Arc::new(SqliteWorkCancellation::new()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_snapshot_database_cancellable_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    snapshot_db_path: &Path,
+    meta: &SnapshotMeta<ConsensusNodeId, EmptyNode>,
+    final_file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+    cancellation: &Arc<SqliteWorkCancellation>,
+) -> io::Result<()> {
     validate_snapshot_database_sync(
         snapshot_db_path,
         identity,
         expected_members,
         audit_key,
         meta,
+        cancellation,
     )?;
     if !valid_snapshot_file_name(final_file_name) {
         return Err(invalid_data("invalid config consensus snapshot file name"));
@@ -2588,12 +2979,29 @@ pub(crate) fn install_snapshot_database_sync(
     let snapshot_path = snapshot_db_path
         .to_str()
         .ok_or_else(|| invalid_data("config consensus snapshot path is not UTF-8"))?;
+    cancellation.check_io()?;
+    let stale_incoming: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name = 'config_raft_incoming')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if stale_incoming {
+        // A previous post-commit cleanup failure is non-authoritative, but it
+        // must not poison every later install attempt on this shared handle.
+        // This pre-transaction detach is safe to fail: no new authority has
+        // been written yet.
+        conn.execute("DETACH DATABASE config_raft_incoming", [])
+            .map_err(db_error)?;
+    }
     conn.execute(
         "ATTACH DATABASE ?1 AS config_raft_incoming",
         [snapshot_path],
     )
     .map_err(db_error)?;
     let result = (|| {
+        cancellation.check_io()?;
         let tx = conn.unchecked_transaction().map_err(db_error)?;
         for table in [
             "config_lifecycle_audit",
@@ -2605,6 +3013,7 @@ pub(crate) fn install_snapshot_database_sync(
             "config_raft_membership",
             "config_raft_applied",
         ] {
+            cancellation.check_io()?;
             tx.execute(&format!("DELETE FROM {table}"), [])
                 .map_err(db_error)?;
         }
@@ -2639,6 +3048,7 @@ pub(crate) fn install_snapshot_database_sync(
                 "singleton, configuration_epoch, term, log_index, log_id_json",
             ),
         ] {
+            cancellation.check_io()?;
             tx.execute(
                 &format!("INSERT INTO {table} ({columns}) SELECT {columns} FROM config_raft_incoming.{table}"),
                 [],
@@ -2656,12 +3066,25 @@ pub(crate) fn install_snapshot_database_sync(
             ],
         )
         .map_err(db_error)?;
+        cancellation.check_io()?;
         tx.commit().map_err(db_error)
     })();
     let detach = conn
         .execute("DETACH DATABASE config_raft_incoming", [])
         .map_err(db_error);
-    result.and(detach.map(|_| ()))
+    match result {
+        Ok(()) => {
+            // The state-machine transaction is authority. A post-commit
+            // DETACH failure must not turn that durable success into an error
+            // that makes the caller delete the now-referenced envelope.
+            let _ = detach;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = detach;
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn save_current_snapshot_sync(

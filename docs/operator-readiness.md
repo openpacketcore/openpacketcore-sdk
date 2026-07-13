@@ -490,11 +490,12 @@ not an ownership lease.
 6. **Remaining Qualification**: #128 makes current-format repair exclusively
    Openraft-owned, rejects committed/applied truncation and stale snapshots,
    validates restart artifacts, and qualifies divergent-tail/snapshot recovery.
-   #129 must still provide operator-safe legacy-fork recovery and #143 must
-   supply distributed partition/restart/resource/soak and payload-key
-   qualification. #133 bounds restore scans over the barrier-confirmed local
-   applied state; method availability still is not readiness evidence. Until
-   the remaining gates land, this is implemented commit authority, not
+   #129 provides the default-deny offline whole-fleet procedure documented in
+   the [legacy recovery runbook](session-store-legacy-recovery.md). #133 bounds
+   restore scans over the barrier-confirmed local applied state; method
+   availability still is not readiness evidence. #143 must supply distributed
+   partition/restart/resource/soak and payload-key qualification. Until that
+   lands, this is implemented commit and recovery authority, not
    production HA qualification.
 
 ### Current-format follower recovery runbook
@@ -512,8 +513,9 @@ not an ownership lease.
    redacted readiness report. Do not edit or retry around a corrupt referenced
    snapshot; replace/recover the member only from an approved committed source.
 5. If storage predates Openraft or startup reports legacy recovery required,
-   stop. Use #129's audited workflow; current-format automatic recovery cannot
-   infer a committed branch from legacy rows.
+   stop. Use the [audited #129 workflow](session-store-legacy-recovery.md);
+   current-format automatic recovery cannot infer a committed branch from
+   legacy rows.
 
 The adapter removes bounded SDK-named interrupted staging files on restart but
 does not delete unknown operator files. A missing/corrupt referenced snapshot,
@@ -780,8 +782,9 @@ This is not production HA qualification. Do not infer readiness from bind
 success, static profiles, or cached capabilities; use the fresh bounded probe
 and continuous gate. #127 now provides Openraft commit authority and #133
 provides bounded snapshot-bound applied-state restore. Do not treat divergence
-repair outside #128's current-format rules or auto-resolve a legacy fork before
-#129. Protocol
+repair outside #128's current-format rules or apply those rules to a legacy
+fork. Use only #129's
+[explicit offline procedure](session-store-legacy-recovery.md). Protocol
 identity/fixed-width binding is not fork recovery. #135's invariant-safe model decoding
 and bounded offline identity audit and #134's fixed-width v4 DTOs are implemented.
 Checked TTL and sequence boundaries now fail closed under #137/#138, and
@@ -902,8 +905,8 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   Openraft engine for elections, voting, log matching, committed membership,
   snapshot coordination, and linearizable reads. Its SQLite state machine owns
   deterministic session semantics and exposes journal/watch changes only after
-  apply. #127, #128, and #133 are implemented; #129/#143 remain qualification
-  and legacy-recovery gates.
+  apply. #127, #128, #129, and #133 are implemented; #143 remains the
+  distributed-qualification gate.
 - **Session Topology, Identity, and Readiness**: HA construction requires one
   immutable descriptor set, explicit logical self, configuration digest, and
   positive epoch. Stable node IDs derive from cluster plus logical
@@ -917,9 +920,10 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   and rejoin, restart, delivered-but-lost response idempotency, replacement of
   repeated uncommitted tails above an immutable committed prefix, stale and
   cross-identity snapshot rejection, corrupt-snapshot restart, and interrupted
-  staging cleanup. These implement #128's storage/recovery boundary but are not
-  #143 distributed production qualification and do not implement #129 legacy
-  recovery.
+  staging cleanup. File-backed recovery tests additionally cover #129's
+  two-branch/three-branch legacy campaigns, full-fleet backup-before-mutation,
+  failpoint resume, pending-epoch fencing, and legacy cursor invalidation.
+  These are not #143 distributed production qualification.
 - **SQLite Writer Envelope**: Each node persists Openraft vote/log/membership,
   committed/applied positions, deterministic state, outcomes, and bounded
   snapshots in its own SQLite-backed store. Standalone `SqliteSessionBackend`
