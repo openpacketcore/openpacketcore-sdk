@@ -447,11 +447,7 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
     let manifest = manifest("config-openraft-mtls", 9, 1);
     let directory = tempfile::tempdir().expect("config cluster directory");
     let addresses = (0..3)
-        .map(|_| {
-            let listener =
-                std::net::TcpListener::bind("127.0.0.1:0").expect("reserve consensus address");
-            listener.local_addr().expect("reserved address")
-        })
+        .map(|_| Arc::new(StdRwLock::new(None)))
         .collect::<Vec<_>>();
     let node_ids = [1_u16, 2, 3].map(|replica| {
         manifest
@@ -481,7 +477,10 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
                 .expect("remote binding");
             let peer = RemoteSessionConsensusPeer::new_with_resolver(
                 binding,
-                resolver(addresses[target]),
+                deferred_resolver(
+                    Arc::clone(&addresses[target]),
+                    Arc::new(AtomicBool::new(true)),
+                ),
                 pki.client_config(source_replica),
                 Some(Duration::from_secs(3)),
             );
@@ -519,10 +518,10 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
             pki.server_config(replica),
             binding,
         )
-        .listen(addresses[index])
+        .listen("127.0.0.1:0".parse().expect("listen address"))
         .await
         .expect("config consensus listener");
-        assert_eq!(addresses[index], actual);
+        *addresses[index].write().expect("consensus address lock") = Some(actual);
         servers.push(handle);
     }
 
