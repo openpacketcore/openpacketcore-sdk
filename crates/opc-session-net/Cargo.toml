@@ -23,6 +23,7 @@ legacy-session-net-compat = []
 
 [dependencies]
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }

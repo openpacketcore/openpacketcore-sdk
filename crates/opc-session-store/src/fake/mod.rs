@@ -1056,6 +1056,7 @@ impl SessionBackend for FakeSessionBackend {
             }
         }
 
+        state.watchers.retain(|watcher| !watcher.is_closed());
         state.watchers.push(tx);
         use futures_util::StreamExt;
         let stream = WatchStream { rx };

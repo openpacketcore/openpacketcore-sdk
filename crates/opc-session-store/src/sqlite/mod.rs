@@ -10,11 +10,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, InterruptHandle, OptionalExtension, Transaction, TransactionBehavior,
+};
 
 use crate::{
     backend::{
@@ -43,6 +45,10 @@ pub(crate) mod watch;
 const SQLITE_SESSION_MAX_VALUE_BYTES: usize = 1_048_576;
 const CONSENSUS_AUTHORITY_REQUIRED: &str = "consensus_authority_required";
 const RESTORE_SCAN_BLOCKING_WORKERS: usize = 1;
+const SQLITE_OPERATION_BLOCKING_WORKERS: usize = 1;
+const SQLITE_OPERATION_MAX_WORK: Duration = Duration::from_secs(2);
+const SQLITE_BUSY_TIMEOUT_MILLIS: u64 = 100;
+const SQLITE_OPERATION_PROGRESS_INTERVAL: i32 = 1_000;
 
 /// Begin one standalone operation while holding SQLite's write reservation.
 ///
@@ -103,17 +109,101 @@ pub struct SqliteSessionBackend {
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
     restore_scan_workers: Arc<tokio::sync::Semaphore>,
+    operation_workers: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     watchers: Arc<
         tokio::sync::Mutex<Vec<tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>>>,
     >,
 }
 
-struct RestoreScanCancellation(Arc<AtomicBool>);
+struct RestoreScanCancellation {
+    cancellation: Arc<AtomicBool>,
+    abort: tokio::task::AbortHandle,
+    cancel_queued: Option<Box<dyn FnOnce() + Send>>,
+    armed: bool,
+}
+
+impl RestoreScanCancellation {
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.cancel_queued = None;
+    }
+}
 
 impl Drop for RestoreScanCancellation {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        if self.armed {
+            self.cancellation.store(true, Ordering::Release);
+            if let Some(cancel_queued) = self.cancel_queued.take() {
+                cancel_queued();
+            }
+            self.abort.abort();
+        }
     }
+}
+
+struct SqliteOperationCancellation {
+    cancellation: Arc<AtomicBool>,
+    interrupt: InterruptHandle,
+    abort: tokio::task::AbortHandle,
+    cancel_queued: Option<Box<dyn FnOnce() + Send>>,
+    armed: bool,
+}
+
+impl SqliteOperationCancellation {
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.cancel_queued = None;
+    }
+}
+
+impl Drop for SqliteOperationCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.store(true, Ordering::Release);
+            self.interrupt.interrupt();
+            if let Some(cancel_queued) = self.cancel_queued.take() {
+                cancel_queued();
+            }
+            // A running blocking job ignores abort and remains bounded by its
+            // SQLite interrupt/progress handler.
+            self.abort.abort();
+        }
+    }
+}
+
+struct SqliteOperationProgressGuard<'a>(&'a Connection);
+
+impl Drop for SqliteOperationProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SqliteStoreWorkKind {
+    Read,
+    CompareAndSet,
+    Mutation,
+}
+
+#[derive(Clone, Copy)]
+enum SqliteWorkerFailure {
+    Admission,
+    OutcomeUnavailable,
+}
+
+fn install_sqlite_operation_progress_handler(
+    conn: &Connection,
+    cancellation: Arc<AtomicBool>,
+    deadline: std::time::Instant,
+) -> SqliteOperationProgressGuard<'_> {
+    conn.progress_handler(
+        SQLITE_OPERATION_PROGRESS_INTERVAL,
+        Some(move || cancellation.load(Ordering::Acquire) || std::time::Instant::now() >= deadline),
+    );
+    SqliteOperationProgressGuard(conn)
 }
 
 impl SqliteSessionBackend {
@@ -294,6 +384,11 @@ impl SqliteSessionBackend {
             restore_scan_workers: Arc::new(tokio::sync::Semaphore::new(
                 RESTORE_SCAN_BLOCKING_WORKERS,
             )),
+            operation_workers: Arc::new(tokio::sync::Semaphore::new(
+                SQLITE_OPERATION_BLOCKING_WORKERS,
+            )),
+            #[cfg(test)]
+            consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         })
     }
@@ -325,6 +420,134 @@ impl SqliteSessionBackend {
         self
     }
 
+    async fn run_sqlite_task<T, E, F>(
+        &self,
+        operation: F,
+    ) -> Result<Result<T, E>, SqliteWorkerFailure>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(SQLITE_OPERATION_MAX_WORK)
+            .ok_or(SqliteWorkerFailure::Admission)?;
+        let worker_permit = tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.operation_workers).acquire_owned(),
+        )
+        .await
+        .map_err(|_| SqliteWorkerFailure::Admission)?
+        .map_err(|_| SqliteWorkerFailure::Admission)?;
+        // The async connection lock is acquired before `spawn_blocking`, so a
+        // blocked database cannot accumulate detached blocking jobs. Once the
+        // job starts, both the connection and worker permit stay in its
+        // closure even if the caller disconnects or its future is cancelled.
+        let conn = tokio::time::timeout_at(deadline, Arc::clone(&self.conn).lock_owned())
+            .await
+            .map_err(|_| SqliteWorkerFailure::Admission)?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let interrupt = conn.get_interrupt_handle();
+        let operation_deadline = deadline.into_std();
+        let task_cancellation = Arc::clone(&cancellation);
+        let queued_job = Arc::new(StdMutex::new(Some((conn, worker_permit, operation))));
+        let task_job = Arc::clone(&queued_job);
+        let task = tokio::task::spawn_blocking(move || {
+            let (conn, worker_permit, operation) = task_job
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()?;
+            let result = {
+                let _progress = install_sqlite_operation_progress_handler(
+                    &conn,
+                    Arc::clone(&task_cancellation),
+                    operation_deadline,
+                );
+                if task_cancellation.load(Ordering::Acquire) {
+                    Err(SqliteWorkerFailure::OutcomeUnavailable)
+                } else {
+                    Ok(operation(&conn))
+                }
+            };
+            // Return both guards with the result. The async wrapper disarms
+            // its interrupt before dropping them, so completion cannot issue
+            // a stale interrupt against a successor operation. If the wrapper
+            // was dropped, this output is discarded only after the worker
+            // exits, retaining bounded admission for the full lifetime.
+            Some((result, conn, worker_permit))
+        });
+        let cancel_job = Arc::clone(&queued_job);
+        let mut cancel_on_drop = SqliteOperationCancellation {
+            cancellation: Arc::clone(&cancellation),
+            interrupt,
+            abort: task.abort_handle(),
+            cancel_queued: Some(Box::new(move || {
+                drop(
+                    cancel_job
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take(),
+                );
+            })),
+            armed: true,
+        };
+        match tokio::time::timeout_at(deadline, task).await {
+            Err(_) => Err(SqliteWorkerFailure::OutcomeUnavailable),
+            Ok(Err(_)) => {
+                cancel_on_drop.disarm();
+                Err(SqliteWorkerFailure::OutcomeUnavailable)
+            }
+            Ok(Ok(Some((result, conn, worker_permit)))) => {
+                cancel_on_drop.disarm();
+                drop(conn);
+                drop(worker_permit);
+                result
+            }
+            Ok(Ok(None)) => {
+                cancel_on_drop.disarm();
+                Err(SqliteWorkerFailure::OutcomeUnavailable)
+            }
+        }
+    }
+
+    async fn run_store_sqlite_task<T, F>(
+        &self,
+        kind: SqliteStoreWorkKind,
+        operation: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+    {
+        match self.run_sqlite_task(operation).await {
+            Ok(Ok(value)) => Ok(value),
+            Err(SqliteWorkerFailure::OutcomeUnavailable) => {
+                Err(sqlite_store_outcome_unavailable(kind))
+            }
+            Ok(Err(error)) => Err(error),
+            Err(SqliteWorkerFailure::Admission) => Err(StoreError::BackendUnavailable(
+                "session SQLite worker admission deadline exceeded".into(),
+            )),
+        }
+    }
+
+    async fn run_lease_sqlite_task<T, F>(&self, operation: F) -> Result<T, LeaseError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, LeaseError> + Send + 'static,
+    {
+        match self.run_sqlite_task(operation).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(error),
+            Err(SqliteWorkerFailure::OutcomeUnavailable) => {
+                Err(LeaseError::OperationOutcomeUnavailable)
+            }
+            Err(SqliteWorkerFailure::Admission) => Err(LeaseError::Backend(
+                "session SQLite worker admission deadline exceeded".into(),
+            )),
+        }
+    }
+
     /// Capabilities consumed by the consensus adapter that owns this backend.
     pub(crate) const fn consensus_capabilities(&self) -> BackendCapabilities {
         self.caps
@@ -338,14 +561,17 @@ impl SqliteSessionBackend {
         key: &SessionKey,
         logical_time: opc_types::Timestamp,
     ) -> Result<Option<StoredSessionRecord>, StoreError> {
-        let conn = self.conn.lock().await;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-        let result = ops::get_sync(&tx, key, logical_time)?;
-        tx.commit()
-            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-        Ok(result)
+        let key = key.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let result = ops::get_sync(&tx, &key, logical_time)?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(result)
+        })
+        .await
     }
 
     /// Restore scan at one persisted consensus logical timestamp.
@@ -367,7 +593,6 @@ impl SqliteSessionBackend {
         standalone: bool,
     ) -> Result<RestoreScanPage, StoreError> {
         let cancellation = Arc::new(AtomicBool::new(false));
-        let _cancel_on_drop = RestoreScanCancellation(Arc::clone(&cancellation));
         // Admission happens before `spawn_blocking` and the owned permit stays
         // with the blocking closure. A timed-out caller therefore cannot
         // detach another worker behind the one SQLite connection; later calls
@@ -386,57 +611,104 @@ impl SqliteSessionBackend {
             .await
             .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?;
         let operation_deadline = deadline.into_std();
+        let task_cancellation = Arc::clone(&cancellation);
+        let queued_job = Arc::new(StdMutex::new(Some((conn, worker_permit, request))));
+        let task_job = Arc::clone(&queued_job);
         let task = tokio::task::spawn_blocking(move || {
+            let (conn, worker_permit, request) = task_job
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()?;
             let _worker_permit = worker_permit;
-            if cancellation.load(Ordering::Acquire) {
-                return Err(StoreError::RestoreScanWorkBudgetExceeded);
+            if task_cancellation.load(Ordering::Acquire) {
+                return Some(Err(StoreError::RestoreScanWorkBudgetExceeded));
             }
             let tx = if standalone {
-                standalone_transaction(&conn)?
+                match standalone_transaction(&conn) {
+                    Ok(tx) => tx,
+                    Err(error) => return Some(Err(error)),
+                }
             } else {
-                conn.unchecked_transaction().map_err(|_| {
-                    StoreError::BackendUnavailable("session store scan failed".into())
-                })?
+                match conn
+                    .unchecked_transaction()
+                    .map_err(|_| StoreError::BackendUnavailable("session store scan failed".into()))
+                {
+                    Ok(tx) => tx,
+                    Err(error) => return Some(Err(error)),
+                }
             };
-            let result = ops::scan_restore_records_sync(
+            let result = match ops::scan_restore_records_sync(
                 &tx,
                 request,
                 logical_time,
-                Arc::clone(&cancellation),
+                Arc::clone(&task_cancellation),
                 operation_deadline,
                 standalone,
-            )?;
-            if cancellation.load(Ordering::Acquire) {
-                return Err(StoreError::RestoreScanWorkBudgetExceeded);
+            ) {
+                Ok(result) => result,
+                Err(error) => return Some(Err(error)),
+            };
+            if task_cancellation.load(Ordering::Acquire) {
+                return Some(Err(StoreError::RestoreScanWorkBudgetExceeded));
             }
-            tx.commit()
-                .map_err(|_| StoreError::BackendUnavailable("session store scan failed".into()))?;
-            Ok(result)
+            if tx.commit().is_err() {
+                return Some(Err(StoreError::BackendUnavailable(
+                    "session store scan failed".into(),
+                )));
+            }
+            Some(Ok(result))
         });
-        tokio::time::timeout_at(deadline, task)
-            .await
-            .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?
-            .map_err(|_| {
-                StoreError::BackendUnavailable("session restore scan task failed".into())
-            })?
+        let cancel_job = Arc::clone(&queued_job);
+        let mut cancel_on_drop = RestoreScanCancellation {
+            cancellation: Arc::clone(&cancellation),
+            abort: task.abort_handle(),
+            cancel_queued: Some(Box::new(move || {
+                drop(
+                    cancel_job
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take(),
+                );
+            })),
+            armed: true,
+        };
+        match tokio::time::timeout_at(deadline, task).await {
+            Err(_) => Err(StoreError::RestoreScanWorkBudgetExceeded),
+            Ok(Err(_)) => {
+                cancel_on_drop.disarm();
+                Err(StoreError::BackendUnavailable(
+                    "session restore scan task failed".into(),
+                ))
+            }
+            Ok(Ok(Some(result))) => {
+                cancel_on_drop.disarm();
+                result
+            }
+            Ok(Ok(None)) => {
+                cancel_on_drop.disarm();
+                Err(StoreError::RestoreScanWorkBudgetExceeded)
+            }
+        }
     }
 
     /// Read the committed application-journal head after the caller has
     /// completed its Openraft linearizable barrier and local apply wait.
     pub(crate) async fn consensus_max_replication_sequence(&self) -> Result<u64, StoreError> {
-        let conn = self.conn.lock().await;
-        let seq: i64 = conn
-            .query_row(
-                "SELECT MAX(machine.watch_sequence, recovery.watch_cursor_invalidation_floor)
-                 FROM consensus_machine AS machine
-                 JOIN consensus_operator_recovery AS recovery ON recovery.singleton = machine.singleton
-                 WHERE machine.singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-        consensus::checked_u64(seq)
-            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let seq: i64 = conn
+                .query_row(
+                    "SELECT MAX(machine.watch_sequence, recovery.watch_cursor_invalidation_floor)
+                     FROM consensus_machine AS machine
+                     JOIN consensus_operator_recovery AS recovery ON recovery.singleton = machine.singleton
+                     WHERE machine.singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            consensus::checked_u64(seq)
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))
+        })
+        .await
     }
 
     /// Whether an offline operator reset is awaiting its Openraft-committed
@@ -446,43 +718,45 @@ impl SqliteSessionBackend {
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
     ) -> Result<bool, StoreError> {
-        let conn = self.conn.lock().await;
-        let database_latch = self
-            .database_path
-            .as_deref()
-            .map(|path| consensus::read_operator_recovery_latch_sync(path))
-            .transpose()
-            .map_err(|_| {
-                StoreError::BackendUnavailable(
-                    "session operator recovery latch is unavailable".into(),
-                )
-            })?
-            .flatten();
-        if let Some(latch) = database_latch {
-            if latch.identity != identity {
-                return Err(StoreError::BackendUnavailable(
-                    "session operator recovery latch identity does not match".into(),
-                ));
-            }
-            opc_redaction::metrics::METRICS
-                .session_operator_recovery_required
-                .store(1, std::sync::atomic::Ordering::Relaxed);
-            opc_redaction::metrics::METRICS
-                .session_operator_recovery_epoch
-                .fetch_max(latch.recovery_epoch, std::sync::atomic::Ordering::Relaxed);
-            if latch.audit_pending {
+        let database_path = self.database_path.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let database_latch = database_path
+                .as_deref()
+                .map(|path| consensus::read_operator_recovery_latch_sync(path))
+                .transpose()
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery latch is unavailable".into(),
+                    )
+                })?
+                .flatten();
+            if let Some(latch) = database_latch {
+                if latch.identity != identity {
+                    return Err(StoreError::BackendUnavailable(
+                        "session operator recovery latch identity does not match".into(),
+                    ));
+                }
                 opc_redaction::metrics::METRICS
-                    .session_operator_recovery_audit_pending
+                    .session_operator_recovery_required
                     .store(1, std::sync::atomic::Ordering::Relaxed);
+                opc_redaction::metrics::METRICS
+                    .session_operator_recovery_epoch
+                    .fetch_max(latch.recovery_epoch, std::sync::atomic::Ordering::Relaxed);
+                if latch.audit_pending {
+                    opc_redaction::metrics::METRICS
+                        .session_operator_recovery_audit_pending
+                        .store(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
-        }
-        consensus::read_operator_recovery_sync(&conn, identity)
-            .map(|state| state.pending_epoch.is_some() || database_latch.is_some())
-            .map_err(|_| {
-                StoreError::BackendUnavailable(
-                    "session operator recovery state is unavailable".into(),
-                )
-            })
+            consensus::read_operator_recovery_sync(conn, identity)
+                .map(|state| state.pending_epoch.is_some() || database_latch.is_some())
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery state is unavailable".into(),
+                    )
+                })
+        })
+        .await
     }
 
     pub(crate) async fn consensus_operator_recovery_committed(
@@ -491,18 +765,20 @@ impl SqliteSessionBackend {
         recovery_epoch: u64,
         plan_digest: [u8; 32],
     ) -> Result<bool, StoreError> {
-        let conn = self.conn.lock().await;
-        consensus::read_operator_recovery_sync(&conn, identity)
-            .map(|state| {
-                state.pending_epoch.is_none()
-                    && state.recovery_epoch == recovery_epoch
-                    && state.last_plan_digest == plan_digest
-            })
-            .map_err(|_| {
-                StoreError::BackendUnavailable(
-                    "session operator recovery state is unavailable".into(),
-                )
-            })
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::read_operator_recovery_sync(conn, identity)
+                .map(|state| {
+                    state.pending_epoch.is_none()
+                        && state.recovery_epoch == recovery_epoch
+                        && state.last_plan_digest == plan_digest
+                })
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery state is unavailable".into(),
+                    )
+                })
+        })
+        .await
     }
 
     /// Read committed application-journal entries after the caller's Openraft
@@ -521,13 +797,13 @@ impl SqliteSessionBackend {
         };
         let sqlite_limit =
             i64::try_from(range.limit()).map_err(|_| StoreError::InvalidReplicationLogRange)?;
-        let conn = self.conn.lock().await;
-        let invalidation_floor = consensus::read_watch_cursor_invalidation_floor_sync(&conn)
-            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-        range.ensure_not_compacted(invalidation_floor)?;
-        let mut stmt = conn
-            .prepare(
-                r#"
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let invalidation_floor = consensus::read_watch_cursor_invalidation_floor_sync(conn)
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            range.ensure_not_compacted(invalidation_floor)?;
+            let mut stmt = conn
+                .prepare(
+                    r#"
                 SELECT sequence,
                        CASE
                            WHEN typeof(tx_id) = 'text'
@@ -540,36 +816,39 @@ impl SqliteSessionBackend {
                 ORDER BY sequence ASC
                 LIMIT ?2
                 "#,
-            )
-            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-        let entries = stmt
-            .query_map(
-                params![
-                    sqlite_start,
-                    sqlite_limit,
-                    REPLICATION_TX_ID_MIN_BYTES,
-                    REPLICATION_TX_ID_MAX_BYTES
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-        let mut result = Vec::new();
-        for item in entries {
-            let (stored_sequence, stored_tx_id, json) = item
+                )
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
-            result.push(replication::hydrate_replication_entry(
-                stored_sequence,
-                stored_tx_id,
-                &json,
-            )?);
-        }
-        validate_replication_log_page_owned(start, limit, result)
+            let entries = stmt
+                .query_map(
+                    params![
+                        sqlite_start,
+                        sqlite_limit,
+                        REPLICATION_TX_ID_MIN_BYTES,
+                        REPLICATION_TX_ID_MAX_BYTES
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let mut result = Vec::new();
+            for item in entries {
+                let (stored_sequence, stored_tx_id, json) = item.map_err(|_| {
+                    StoreError::BackendUnavailable("session store read failed".into())
+                })?;
+                result.push(replication::hydrate_replication_entry(
+                    stored_sequence,
+                    stored_tx_id,
+                    &json,
+                )?);
+            }
+            validate_replication_log_page_owned(start, limit, result)
+        })
+        .await
     }
 
     /// Subscribe to the committed application journal. The caller must first
@@ -591,7 +870,9 @@ impl SqliteSessionBackend {
                 break;
             }
         }
-        self.watchers.lock().await.push(tx);
+        let mut watchers = self.watchers.lock().await;
+        watchers.retain(|watcher| !watcher.is_closed());
+        watchers.push(tx);
         use futures_util::StreamExt;
         Ok(watch::SqliteWatchStream { rx }.boxed())
     }
@@ -611,6 +892,30 @@ fn sqlite_capabilities() -> BackendCapabilities {
     }
 }
 
+fn sqlite_store_outcome_unavailable(kind: SqliteStoreWorkKind) -> StoreError {
+    match kind {
+        SqliteStoreWorkKind::Read => {
+            StoreError::BackendUnavailable("session SQLite operation did not complete".into())
+        }
+        SqliteStoreWorkKind::CompareAndSet => StoreError::CasIdempotencyOutcomeUnavailable,
+        SqliteStoreWorkKind::Mutation => StoreError::BackendOperationOutcomeUnavailable,
+    }
+}
+
+fn session_op_result_has_backend_unavailable(result: &SessionOpResult) -> bool {
+    let error = match result {
+        SessionOpResult::Get(Err(error))
+        | SessionOpResult::CompareAndSet(Err(error))
+        | SessionOpResult::DeleteFenced(Err(error))
+        | SessionOpResult::RefreshTtl(Err(error)) => Some(error),
+        SessionOpResult::Get(Ok(_))
+        | SessionOpResult::CompareAndSet(Ok(_))
+        | SessionOpResult::DeleteFenced(Ok(()))
+        | SessionOpResult::RefreshTtl(Ok(())) => None,
+    };
+    matches!(error, Some(StoreError::BackendUnavailable(_)))
+}
+
 fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreError> {
     if in_memory {
         conn.execute_batch(
@@ -618,7 +923,6 @@ fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreE
             PRAGMA synchronous = EXTRA;
             PRAGMA foreign_keys = ON;
             PRAGMA locking_mode = NORMAL;
-            PRAGMA busy_timeout = 5000;
             PRAGMA temp_store = MEMORY;
             "#,
         )
@@ -629,12 +933,13 @@ fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreE
             PRAGMA synchronous = EXTRA;
             PRAGMA foreign_keys = ON;
             PRAGMA locking_mode = NORMAL;
-            PRAGMA busy_timeout = 5000;
             PRAGMA temp_store = MEMORY;
             "#,
         )
     }
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MILLIS))
+        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
     let foreign_keys: i32 = conn
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
@@ -674,60 +979,80 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     async fn capabilities(&self) -> BackendCapabilities {
-        let conn = self.conn.lock().await;
-        match (
-            consensus_identity_exists(&conn),
-            operator_recovery_latch_exists(&conn),
-        ) {
-            (Ok(false), Ok(false)) => self.caps,
-            _ => BackendCapabilities::minimal(),
-        }
+        let caps = self.caps;
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            Ok(
+                match (
+                    consensus_identity_exists(conn),
+                    operator_recovery_latch_exists(conn),
+                ) {
+                    (Ok(false), Ok(false)) => caps,
+                    _ => BackendCapabilities::minimal(),
+                },
+            )
+        })
+        .await
+        .unwrap_or_else(|_| BackendCapabilities::minimal())
     }
 
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
-        let conn = self.conn.lock().await;
+        let key = key.clone();
         let now = self.clock.now_utc();
-        let tx = standalone_transaction(&conn)?;
-        let result = ops::get_sync(&tx, key, now)?;
-        // Standalone SQLite owns its local monotonic clock and may physically
-        // prune on reads. Consensus reads use `consensus_get_at` instead and
-        // never mutate outside an Openraft-applied command.
-        ops::prune_sync(&tx, now)?;
-        tx.commit()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Ok(result)
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = standalone_transaction(conn)?;
+            let result = ops::get_sync(&tx, &key, now)?;
+            // Standalone SQLite owns its local monotonic clock and may
+            // physically prune on reads. Consensus reads never mutate outside
+            // an Openraft-applied command.
+            ops::prune_sync(&tx, now)?;
+            tx.commit()
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            Ok(result)
+        })
+        .await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
-        let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        let tx = standalone_transaction(&conn)?;
-        let res = ops::compare_and_set_sync(&tx, op, &self.caps, now)?;
-        tx.commit()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Ok(res)
+        let caps = self.caps;
+        self.run_store_sqlite_task(SqliteStoreWorkKind::CompareAndSet, move |conn| {
+            let tx = standalone_transaction(conn)?;
+            let result = ops::compare_and_set_sync(&tx, op, &caps, now)?;
+            tx.commit()
+                .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
+            Ok(result)
+        })
+        .await
     }
 
     async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
-        let conn = self.conn.lock().await;
+        let lease = lease.clone();
         let now = self.clock.now_utc();
-        let tx = standalone_transaction(&conn)?;
-        ops::delete_fenced_sync(&tx, lease, &self.caps, now)?;
-        tx.commit()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Ok(())
+        let caps = self.caps;
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Mutation, move |conn| {
+            let tx = standalone_transaction(conn)?;
+            ops::delete_fenced_sync(&tx, &lease, &caps, now)?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
         validate_session_ttl(ttl)?;
         let now = self.clock.now_utc();
         checked_session_deadline(now, ttl)?;
-        let conn = self.conn.lock().await;
-        let tx = standalone_transaction(&conn)?;
-        ops::refresh_ttl_sync(&tx, lease, ttl, &self.caps, now)?;
-        tx.commit()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        Ok(())
+        let lease = lease.clone();
+        let caps = self.caps;
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Mutation, move |conn| {
+            let tx = standalone_transaction(conn)?;
+            ops::refresh_ttl_sync(&tx, &lease, ttl, &caps, now)?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
@@ -741,55 +1066,81 @@ impl SessionBackend for SqliteSessionBackend {
         if !self.caps.batch_write {
             return Err(StoreError::CapabilityNotSupported("batch_write".into()));
         }
-
-        let conn = self.conn.lock().await;
-        let mut results = Vec::with_capacity(ops.len());
-        for op in ops {
-            let res = match op {
-                SessionOp::Get { key } => {
-                    let run_get = || {
-                        let tx = standalone_transaction(&conn)?;
-                        let result = ops::get_sync(&tx, &key, now)?;
-                        tx.commit()
-                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-                        Ok(result)
-                    };
-                    SessionOpResult::Get(run_get())
+        let contains_mutation = ops.iter().any(|op| !matches!(op, SessionOp::Get { .. }));
+        let kind = if contains_mutation {
+            SqliteStoreWorkKind::Mutation
+        } else {
+            SqliteStoreWorkKind::Read
+        };
+        let caps = self.caps;
+        self.run_store_sqlite_task(kind, move |conn| {
+            let mut results = Vec::with_capacity(ops.len());
+            let mut effect_may_have_committed = false;
+            for op in ops {
+                let mutation_slot = !matches!(&op, SessionOp::Get { .. });
+                let result = match op {
+                    SessionOp::Get { key } => {
+                        let run_get = || {
+                            let tx = standalone_transaction(conn)?;
+                            let result = ops::get_sync(&tx, &key, now)?;
+                            tx.commit()
+                                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                            Ok(result)
+                        };
+                        SessionOpResult::Get(run_get())
+                    }
+                    SessionOp::CompareAndSet(cas) => {
+                        let run_cas = || {
+                            let tx = standalone_transaction(conn)?;
+                            let result = ops::compare_and_set_sync(&tx, cas, &caps, now)?;
+                            tx.commit()
+                                .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
+                            Ok(result)
+                        };
+                        SessionOpResult::CompareAndSet(run_cas())
+                    }
+                    SessionOp::DeleteFenced { lease } => {
+                        let run_delete = || {
+                            let tx = standalone_transaction(conn)?;
+                            ops::delete_fenced_sync(&tx, &lease, &caps, now)?;
+                            tx.commit()
+                                .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
+                            Ok(())
+                        };
+                        SessionOpResult::DeleteFenced(run_delete())
+                    }
+                    SessionOp::RefreshTtl { lease, ttl } => {
+                        let run_refresh = || {
+                            let tx = standalone_transaction(conn)?;
+                            ops::refresh_ttl_sync(&tx, &lease, ttl, &caps, now)?;
+                            tx.commit()
+                                .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
+                            Ok(())
+                        };
+                        SessionOpResult::RefreshTtl(run_refresh())
+                    }
+                };
+                if session_op_result_has_backend_unavailable(&result) {
+                    return Err(if effect_may_have_committed {
+                        StoreError::BackendOperationOutcomeUnavailable
+                    } else {
+                        StoreError::BackendUnavailable(
+                            "session SQLite batch outcome is unavailable".into(),
+                        )
+                    });
                 }
-                SessionOp::CompareAndSet(cas) => {
-                    let run_cas = || {
-                        let tx = standalone_transaction(&conn)?;
-                        let res = ops::compare_and_set_sync(&tx, cas, &self.caps, now)?;
-                        tx.commit()
-                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-                        Ok(res)
-                    };
-                    SessionOpResult::CompareAndSet(run_cas())
+                if mutation_slot {
+                    // A non-generic result proves the slot crossed its SQLite
+                    // admission/transaction setup. From this point onward a
+                    // later generic backend error cannot prove that no prior
+                    // batch effect committed.
+                    effect_may_have_committed = true;
                 }
-                SessionOp::DeleteFenced { lease } => {
-                    let run_del = || {
-                        let tx = standalone_transaction(&conn)?;
-                        ops::delete_fenced_sync(&tx, &lease, &self.caps, now)?;
-                        tx.commit()
-                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-                        Ok(())
-                    };
-                    SessionOpResult::DeleteFenced(run_del())
-                }
-                SessionOp::RefreshTtl { lease, ttl } => {
-                    let run_ref = || {
-                        let tx = standalone_transaction(&conn)?;
-                        ops::refresh_ttl_sync(&tx, &lease, ttl, &self.caps, now)?;
-                        tx.commit()
-                            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-                        Ok(())
-                    };
-                    SessionOpResult::RefreshTtl(run_ref())
-                }
-            };
-            results.push(res);
-        }
-        Ok(results)
+                results.push(result);
+            }
+            Ok(results)
+        })
+        .await
     }
 
     async fn scan_restore_records(
@@ -806,24 +1157,27 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
-        let conn = self.conn.lock().await;
-        let tx = standalone_transaction(&conn)?;
-        let seq: Option<Option<i64>> = tx
-            .query_row(
-                "SELECT MAX(sequence) FROM session_replication_log",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-        let sequence = seq
-            .flatten()
-            .map(replication::stored_replication_sequence)
-            .transpose()
-            .map(|sequence| sequence.unwrap_or(0))?;
-        tx.commit()
-            .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;
-        Ok(sequence)
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = standalone_transaction(conn)?;
+            let seq: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT MAX(sequence) FROM session_replication_log",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+            let sequence = seq
+                .flatten()
+                .map(replication::stored_replication_sequence)
+                .transpose()
+                .map(|sequence| sequence.unwrap_or(0))?;
+            tx.commit().map_err(|_| {
+                StoreError::BackendUnavailable("session store operation failed".into())
+            })?;
+            Ok(sequence)
+        })
+        .await
     }
 
     async fn get_replication_log(
@@ -840,12 +1194,12 @@ impl SessionBackend for SqliteSessionBackend {
         };
         let sqlite_limit =
             i64::try_from(range.limit()).map_err(|_| StoreError::InvalidReplicationLogRange)?;
-        let conn = self.conn.lock().await;
-        let tx = standalone_transaction(&conn)?;
-        let res = {
-            let mut stmt = tx
-                .prepare(
-                    r#"
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = standalone_transaction(conn)?;
+            let result = {
+                let mut stmt = tx
+                    .prepare(
+                        r#"
                 SELECT sequence,
                        CASE
                            WHEN typeof(tx_id) = 'text'
@@ -858,50 +1212,56 @@ impl SessionBackend for SqliteSessionBackend {
                 ORDER BY sequence ASC
                 LIMIT ?2
                 "#,
-                )
-                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-            let entries = stmt
-                .query_map(
-                    params![
-                        sqlite_start,
-                        sqlite_limit,
-                        REPLICATION_TX_ID_MIN_BYTES,
-                        REPLICATION_TX_ID_MAX_BYTES
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )
-                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                    )
+                    .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                let entries = stmt
+                    .query_map(
+                        params![
+                            sqlite_start,
+                            sqlite_limit,
+                            REPLICATION_TX_ID_MIN_BYTES,
+                            REPLICATION_TX_ID_MAX_BYTES
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-            let mut res = Vec::new();
-            for item in entries {
-                let (stored_sequence, stored_tx_id, json) =
-                    item.map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-                res.push(replication::hydrate_replication_entry(
-                    stored_sequence,
-                    stored_tx_id,
-                    &json,
-                )?);
-            }
-            validate_replication_log_page_owned(start, limit, res)?
-        };
-        tx.commit()
-            .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;
-        Ok(res)
+                let mut result = Vec::new();
+                for item in entries {
+                    let (stored_sequence, stored_tx_id, json) =
+                        item.map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                    result.push(replication::hydrate_replication_entry(
+                        stored_sequence,
+                        stored_tx_id,
+                        &json,
+                    )?);
+                }
+                validate_replication_log_page_owned(start, limit, result)?
+            };
+            tx.commit().map_err(|_| {
+                StoreError::BackendUnavailable("session store operation failed".into())
+            })?;
+            Ok(result)
+        })
+        .await
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         let entry = entry.into_validated()?;
-        let should_notify = {
-            let conn = self.conn.lock().await;
-            let now = self.clock.now_utc();
-            replication::replicate_entry_sync(&conn, &entry, &self.caps, now)?
-        };
+        let worker_entry = entry.clone();
+        let now = self.clock.now_utc();
+        let caps = self.caps;
+        let should_notify = self
+            .run_store_sqlite_task(SqliteStoreWorkKind::Mutation, move |conn| {
+                replication::replicate_entry_sync(conn, &worker_entry, &caps, now)
+            })
+            .await?;
 
         if should_notify {
             let mut watchers = self.watchers.lock().await;
@@ -916,8 +1276,11 @@ impl SessionBackend for SqliteSessionBackend {
         entries: Vec<ReplicationEntry>,
     ) -> Result<(), StoreError> {
         let entries = validate_replication_prefix_owned(entries)?;
-        let conn = self.conn.lock().await;
-        replication::rebuild_replication_state_sync(&conn, &entries, &self.caps)
+        let caps = self.caps;
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Mutation, move |conn| {
+            replication::rebuild_replication_state_sync(conn, &entries, &caps)
+        })
+        .await
     }
 
     async fn watch(
@@ -938,6 +1301,7 @@ impl SessionBackend for SqliteSessionBackend {
         }
 
         let mut watchers = self.watchers.lock().await;
+        watchers.retain(|watcher| !watcher.is_closed());
         watchers.push(tx);
 
         use futures_util::StreamExt;
@@ -946,27 +1310,30 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
-        let conn = self.conn.lock().await;
-        let tx = standalone_transaction(&conn)?;
-        let (next_fence, next_credential_id) = {
-            let mut global_stmt = tx
-                .prepare("SELECT val FROM lease_globals WHERE key = ?1")
-                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-            let next_fence: i64 = global_stmt
-                .query_row(["next_fence"], |row| row.get(0))
-                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-            let next_credential_id: i64 = global_stmt
-                .query_row(["next_credential_id"], |row| row.get(0))
-                .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
-            (next_fence, next_credential_id)
-        };
-        let result = (
-            ops::persisted_u64(next_fence)?,
-            ops::persisted_u64(next_credential_id)?,
-        );
-        tx.commit()
-            .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))?;
-        Ok(result)
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = standalone_transaction(conn)?;
+            let (next_fence, next_credential_id) = {
+                let mut global_stmt = tx
+                    .prepare("SELECT val FROM lease_globals WHERE key = ?1")
+                    .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                let next_fence: i64 = global_stmt
+                    .query_row(["next_fence"], |row| row.get(0))
+                    .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                let next_credential_id: i64 = global_stmt
+                    .query_row(["next_credential_id"], |row| row.get(0))
+                    .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+                (next_fence, next_credential_id)
+            };
+            let result = (
+                ops::persisted_u64(next_fence)?,
+                ops::persisted_u64(next_credential_id)?,
+            );
+            tx.commit().map_err(|_| {
+                StoreError::BackendUnavailable("session store operation failed".into())
+            })?;
+            Ok(result)
+        })
+        .await
     }
 }
 
@@ -985,34 +1352,365 @@ impl SessionLeaseManager for SqliteSessionBackend {
         validate_session_ttl(ttl).map_err(LeaseError::from)?;
         let now = self.clock.now_utc();
         checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
-        let conn = self.conn.lock().await;
-        let tx = standalone_transaction(&conn).map_err(LeaseError::from)?;
-        let res = lease::acquire_sync(&tx, key, owner, ttl, now)?;
-        tx.commit()
-            .map_err(|e| LeaseError::Backend(e.to_string()))?;
-        Ok(res)
+        let key = key.clone();
+        self.run_lease_sqlite_task(move |conn| {
+            let tx = standalone_transaction(conn).map_err(LeaseError::from)?;
+            let result = lease::acquire_sync(&tx, &key, owner, ttl, now)?;
+            tx.commit()
+                .map_err(|_| LeaseError::OperationOutcomeUnavailable)?;
+            Ok(result)
+        })
+        .await
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
         validate_session_ttl(ttl).map_err(LeaseError::from)?;
         let now = self.clock.now_utc();
         checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
-        let conn = self.conn.lock().await;
-        let tx = standalone_transaction(&conn).map_err(LeaseError::from)?;
-        let res = lease::renew_sync(&tx, lease, ttl, now)?;
-        tx.commit()
-            .map_err(|e| LeaseError::Backend(e.to_string()))?;
-        Ok(res)
+        let lease = lease.clone();
+        self.run_lease_sqlite_task(move |conn| {
+            let tx = standalone_transaction(conn).map_err(LeaseError::from)?;
+            let result = lease::renew_sync(&tx, &lease, ttl, now)?;
+            tx.commit()
+                .map_err(|_| LeaseError::OperationOutcomeUnavailable)?;
+            Ok(result)
+        })
+        .await
     }
 
     async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
-        let conn = self.conn.lock().await;
         let now = self.clock.now_utc();
-        let tx = standalone_transaction(&conn).map_err(LeaseError::from)?;
-        lease::release_sync(&tx, lease, now)?;
-        tx.commit()
-            .map_err(|e| LeaseError::Backend(e.to_string()))?;
-        Ok(())
+        self.run_lease_sqlite_task(move |conn| {
+            let tx = standalone_transaction(conn).map_err(LeaseError::from)?;
+            lease::release_sync(&tx, lease, now)?;
+            tx.commit()
+                .map_err(|_| LeaseError::OperationOutcomeUnavailable)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod operation_lifetime_tests {
+    use super::*;
+    use crate::{
+        backend::ReplicationOp,
+        model::{FenceToken, Generation, SessionKeyType, StateClass, StateType},
+        record::EncryptedSessionPayload,
+    };
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+
+    fn key(stable_id: &'static [u8]) -> SessionKey {
+        SessionKey {
+            tenant: TenantId::new("sqlite-lifetime").expect("tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(stable_id).try_into().expect("stable ID"),
+        }
+    }
+
+    fn record(key: SessionKey, lease: &LeaseGuard) -> StoredSessionRecord {
+        StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner: lease.owner().clone(),
+            fence: FenceToken::new(lease.fence().get()),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("sqlite-lifetime").expect("state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(vec![0x5a]),
+        }
+    }
+
+    fn replication_entry(key: SessionKey, lease: &LeaseGuard) -> ReplicationEntry {
+        let timestamp = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let expires_at = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60),
+        );
+        ReplicationEntry {
+            sequence: 1,
+            tx_id: "sqlite-lifetime-replication"
+                .try_into()
+                .expect("transaction ID"),
+            op: ReplicationOp::RefreshTtl {
+                key,
+                owner: lease.owner().clone(),
+                fence: FenceToken::new(lease.fence().get()),
+                ttl: Duration::from_secs(60),
+                expires_at,
+            },
+            timestamp,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_sqlite_lock_contention_is_bounded_and_known_preeffect_failures_remain_retryable()
+    {
+        let directory = tempfile::tempdir().expect("SQLite lifetime directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let key = key(b"blocked-operation");
+        let lease = backend
+            .acquire(
+                &key,
+                OwnerId::new("sqlite-lifetime-owner").expect("owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("prepare lease");
+        let compare_and_set = CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: record(key.clone(), &lease),
+        };
+        let entry = replication_entry(key.clone(), &lease);
+
+        let blocker = Connection::open(&path).expect("blocking SQLite connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold SQLite write reservation");
+
+        assert!(matches!(
+            backend.get(&key).await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert!(matches!(
+            backend.compare_and_set(compare_and_set).await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert!(matches!(
+            backend.delete_fenced(&lease).await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert!(matches!(
+            backend.replicate_entry(entry.clone()).await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert!(matches!(
+            backend.rebuild_replication_state(vec![entry]).await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert!(matches!(
+            backend.renew(&lease, Duration::from_secs(60)).await,
+            Err(LeaseError::Backend(_))
+        ));
+        assert_eq!(
+            backend.operation_workers.available_permits(),
+            SQLITE_OPERATION_BLOCKING_WORKERS
+        );
+
+        blocker.execute_batch("ROLLBACK").expect("release blocker");
+        assert_eq!(backend.get(&key).await.expect("read after unblock"), None);
+    }
+
+    #[tokio::test]
+    async fn batch_backend_failure_after_an_earlier_commit_is_typed_ambiguous() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let key = key(b"partially-committed-batch");
+        let lease = backend
+            .acquire(
+                &key,
+                OwnerId::new("partial-batch-owner").expect("owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("prepare batch lease");
+        backend
+            .conn
+            .lock()
+            .await
+            .execute_batch(
+                "CREATE TRIGGER fail_test_refresh
+                 BEFORE UPDATE OF expires_at ON session_records
+                 BEGIN SELECT RAISE(ABORT, 'forced refresh failure'); END;",
+            )
+            .expect("install deterministic second-slot failure");
+
+        let error = backend
+            .batch(vec![
+                SessionOp::CompareAndSet(CompareAndSet {
+                    key: key.clone(),
+                    lease: lease.clone(),
+                    expected_generation: None,
+                    new_record: record(key.clone(), &lease),
+                }),
+                SessionOp::RefreshTtl {
+                    lease,
+                    ttl: Duration::from_secs(30),
+                },
+            ])
+            .await
+            .expect_err("later backend failure makes the whole batch outcome unknown");
+        assert_eq!(error, StoreError::BackendOperationOutcomeUnavailable);
+        assert!(
+            backend
+                .get(&key)
+                .await
+                .expect("read committed first slot")
+                .is_some(),
+            "the first slot committed before the second slot failed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_sqlite_mutation_retains_its_worker_until_blocking_work_stops() {
+        let directory = tempfile::tempdir().expect("SQLite cancellation directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let key = key(b"cancelled-operation");
+        let lease = backend
+            .acquire(
+                &key,
+                OwnerId::new("sqlite-cancel-owner").expect("owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("prepare lease");
+        let operation = CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: record(key.clone(), &lease),
+        };
+        let blocker = Connection::open(&path).expect("blocking SQLite connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold SQLite write reservation");
+
+        let worker_backend = backend.clone();
+        let task = tokio::spawn(async move { worker_backend.compare_and_set(operation).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.operation_workers.available_permits() == SQLITE_OPERATION_BLOCKING_WORKERS
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking worker starts");
+        assert_eq!(
+            backend.operation_workers.available_permits(),
+            0,
+            "the live blocking job retains its admission permit"
+        );
+        task.abort();
+        assert!(task.await.expect_err("cancel task").is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.operation_workers.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("interrupted blocking worker exits within the SQLite busy bound");
+
+        blocker.execute_batch("ROLLBACK").expect("release blocker");
+        assert_eq!(backend.get(&key).await.expect("read after unblock"), None);
+    }
+
+    #[test]
+    fn cancelling_queued_blocking_tasks_releases_captured_sqlite_admission() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("single blocking-thread runtime");
+
+        let (
+            ordinary_released,
+            ordinary_connection_released,
+            restore_released,
+            restore_connection_released,
+        ) = runtime.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let saturator = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            started_rx.await.expect("blocking pool saturator starts");
+
+            let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+            let ordinary_backend = backend.clone();
+            let ordinary = tokio::spawn(async move {
+                ordinary_backend
+                    .run_sqlite_task(|_| Ok::<(), StoreError>(()))
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while backend.operation_workers.available_permits()
+                    == SQLITE_OPERATION_BLOCKING_WORKERS
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ordinary SQLite job queues behind saturated pool");
+            ordinary.abort();
+            let _ = ordinary.await;
+            let ordinary_released = tokio::time::timeout(Duration::from_secs(1), async {
+                while backend.operation_workers.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            let ordinary_connection_released = backend.conn.try_lock().is_ok();
+
+            let restore_backend = backend.clone();
+            let restore = tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                restore_backend
+                    .run_restore_scan(
+                        RestoreScanRequest::all(1),
+                        restore_backend.clock.now_utc(),
+                        deadline,
+                        true,
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while backend.restore_scan_workers.available_permits()
+                    == RESTORE_SCAN_BLOCKING_WORKERS
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("restore SQLite job queues behind saturated pool");
+            restore.abort();
+            let _ = restore.await;
+            let restore_released = tokio::time::timeout(Duration::from_secs(1), async {
+                while backend.restore_scan_workers.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            let restore_connection_released = backend.conn.try_lock().is_ok();
+
+            let _ = release_tx.send(());
+            saturator.await.expect("blocking pool saturator exits");
+            (
+                ordinary_released,
+                ordinary_connection_released,
+                restore_released,
+                restore_connection_released,
+            )
+        });
+
+        assert!(ordinary_released, "queued ordinary job retained its permit");
+        assert!(
+            ordinary_connection_released,
+            "queued ordinary job retained its connection guard"
+        );
+        assert!(restore_released, "queued restore job retained its permit");
+        assert!(
+            restore_connection_released,
+            "queued restore job retained its connection guard"
+        );
     }
 }
 
@@ -1136,5 +1834,27 @@ mod restore_cancellation_tests {
         .expect("cancelled blocking task releases the connection promptly")
         .expect("fresh restore scan succeeds");
         assert!(page.complete);
+    }
+}
+
+#[cfg(test)]
+mod watcher_lifetime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn repeated_idle_watch_disconnects_are_pruned_before_registration() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        for _ in 0..128 {
+            let stream = backend.watch(1).await.expect("register idle watch");
+            drop(stream);
+        }
+
+        let live = backend.watch(1).await.expect("register live watch");
+        assert_eq!(
+            backend.watchers.lock().await.len(),
+            1,
+            "closed idle watchers cannot accumulate without a later mutation"
+        );
+        drop(live);
     }
 }

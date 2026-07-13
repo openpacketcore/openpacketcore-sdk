@@ -511,6 +511,11 @@ pub struct SdkMetrics {
     pub session_operator_recovery_audit_pending: AtomicI64,
     pub session_operator_recovery_epoch: AtomicU64,
     pub session_operator_recovery_rejoins: AtomicU64,
+    pub session_net_backend_queue_timeouts: AtomicU64,
+    pub session_net_backend_execution_timeouts: AtomicU64,
+    pub session_net_backend_cancellations: AtomicU64,
+    pub session_net_backend_peer_disconnects: AtomicU64,
+    pub session_net_backend_ambiguous_outcomes: AtomicU64,
 
     // === NACM / Authz ===
     pub nacm_eval_allow: AtomicU64,
@@ -652,6 +657,11 @@ impl SdkMetrics {
             session_operator_recovery_audit_pending: AtomicI64::new(0),
             session_operator_recovery_epoch: AtomicU64::new(0),
             session_operator_recovery_rejoins: AtomicU64::new(0),
+            session_net_backend_queue_timeouts: AtomicU64::new(0),
+            session_net_backend_execution_timeouts: AtomicU64::new(0),
+            session_net_backend_cancellations: AtomicU64::new(0),
+            session_net_backend_peer_disconnects: AtomicU64::new(0),
+            session_net_backend_ambiguous_outcomes: AtomicU64::new(0),
 
             nacm_eval_allow: AtomicU64::new(0),
             nacm_eval_deny: AtomicU64::new(0),
@@ -820,6 +830,16 @@ impl SdkMetrics {
         self.session_operator_recovery_epoch
             .store(0, Ordering::Relaxed);
         self.session_operator_recovery_rejoins
+            .store(0, Ordering::Relaxed);
+        self.session_net_backend_queue_timeouts
+            .store(0, Ordering::Relaxed);
+        self.session_net_backend_execution_timeouts
+            .store(0, Ordering::Relaxed);
+        self.session_net_backend_cancellations
+            .store(0, Ordering::Relaxed);
+        self.session_net_backend_peer_disconnects
+            .store(0, Ordering::Relaxed);
+        self.session_net_backend_ambiguous_outcomes
             .store(0, Ordering::Relaxed);
 
         self.nacm_eval_allow.store(0, Ordering::Relaxed);
@@ -1654,6 +1674,41 @@ pub fn export_prometheus_text() -> String {
         operator_recovery_rejoins as f64,
     );
 
+    let backend_queue_timeouts = METRICS
+        .session_net_backend_queue_timeouts
+        .load(Ordering::Relaxed);
+    let backend_execution_timeouts = METRICS
+        .session_net_backend_execution_timeouts
+        .load(Ordering::Relaxed);
+    let backend_cancellations = METRICS
+        .session_net_backend_cancellations
+        .load(Ordering::Relaxed);
+    let backend_peer_disconnects = METRICS
+        .session_net_backend_peer_disconnects
+        .load(Ordering::Relaxed);
+    let backend_ambiguous_outcomes = METRICS
+        .session_net_backend_ambiguous_outcomes
+        .load(Ordering::Relaxed);
+    out.push_str(
+        "# HELP opc_session_net_backend_lifetime_events_total Bounded session backend lifetime events by fixed outcome\n",
+    );
+    out.push_str("# TYPE opc_session_net_backend_lifetime_events_total counter\n");
+    out.push_str(&format!(
+        "opc_session_net_backend_lifetime_events_total{{event=\"queue_timeout\"}} {backend_queue_timeouts}\n"
+    ));
+    out.push_str(&format!(
+        "opc_session_net_backend_lifetime_events_total{{event=\"execution_timeout\"}} {backend_execution_timeouts}\n"
+    ));
+    out.push_str(&format!(
+        "opc_session_net_backend_lifetime_events_total{{event=\"cancellation\"}} {backend_cancellations}\n"
+    ));
+    out.push_str(&format!(
+        "opc_session_net_backend_lifetime_events_total{{event=\"peer_disconnect\"}} {backend_peer_disconnects}\n"
+    ));
+    out.push_str(&format!(
+        "opc_session_net_backend_lifetime_events_total{{event=\"ambiguous_outcome\"}} {backend_ambiguous_outcomes}\n"
+    ));
+
     // --- NACM / Authz ---
     let nacm_allow = METRICS.nacm_eval_allow.load(Ordering::Relaxed);
     out.push_str("# HELP opc_nacm_eval_total Total count of NACM policy evaluations\n");
@@ -2305,6 +2360,21 @@ mod tests {
         METRICS
             .session_durable_readiness_recovery_required_failures
             .store(17, Ordering::Relaxed);
+        METRICS
+            .session_net_backend_queue_timeouts
+            .store(18, Ordering::Relaxed);
+        METRICS
+            .session_net_backend_execution_timeouts
+            .store(19, Ordering::Relaxed);
+        METRICS
+            .session_net_backend_cancellations
+            .store(20, Ordering::Relaxed);
+        METRICS
+            .session_net_backend_peer_disconnects
+            .store(21, Ordering::Relaxed);
+        METRICS
+            .session_net_backend_ambiguous_outcomes
+            .store(22, Ordering::Relaxed);
 
         if let Ok(mut lag) = METRICS.persist_peer_replication_lag.lock() {
             lag.insert(1, 42);
@@ -2388,6 +2458,21 @@ mod tests {
         assert!(exported.contains(
             "opc_session_store_durable_readiness_failures_total{reason=\"recovery_required\"} 17\n"
         ));
+        assert!(exported.contains(
+            "opc_session_net_backend_lifetime_events_total{event=\"queue_timeout\"} 18\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_net_backend_lifetime_events_total{event=\"execution_timeout\"} 19\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_net_backend_lifetime_events_total{event=\"cancellation\"} 20\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_net_backend_lifetime_events_total{event=\"peer_disconnect\"} 21\n"
+        ));
+        assert!(exported.contains(
+            "opc_session_net_backend_lifetime_events_total{event=\"ambiguous_outcome\"} 22\n"
+        ));
         assert!(exported.contains("opc_admin_requests_total{route=\"readyz\",status=\"200\"} 1\n"));
         assert!(exported
             .contains("opc_admin_requests_total{route=\"redacted\",status=\"invalid\"} 1\n"));
@@ -2450,6 +2535,9 @@ mod tests {
         ));
         assert!(after.contains(
             "opc_session_store_durable_readiness_failures_total{reason=\"recovery_required\"} 0\n"
+        ));
+        assert!(after.contains(
+            "opc_session_net_backend_lifetime_events_total{event=\"ambiguous_outcome\"} 0\n"
         ));
     }
 

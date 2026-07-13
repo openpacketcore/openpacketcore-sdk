@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,7 @@ use opc_session_store::{
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionPayloadEncoding,
     SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, SystemClock,
-    ValidatedQuorumTopology,
+    ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use rusqlite::OptionalExtension;
@@ -54,6 +54,8 @@ struct LoopbackPeer {
     enabled: Arc<AtomicBool>,
     forward_responses_to_drop: Arc<AtomicUsize>,
     dropped_forward_responses: Arc<AtomicUsize>,
+    forward_response_delay_millis: Arc<AtomicU64>,
+    delayed_forward_responses: Arc<AtomicUsize>,
     captured_payloads: Arc<StdMutex<Vec<Bytes>>>,
 }
 
@@ -65,6 +67,8 @@ impl LoopbackPeer {
             enabled: Arc::new(AtomicBool::new(true)),
             forward_responses_to_drop: Arc::new(AtomicUsize::new(0)),
             dropped_forward_responses: Arc::new(AtomicUsize::new(0)),
+            forward_response_delay_millis: Arc::new(AtomicU64::new(0)),
+            delayed_forward_responses: Arc::new(AtomicUsize::new(0)),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
         }
     }
@@ -88,6 +92,22 @@ impl LoopbackPeer {
 
     fn dropped_forward_responses(&self) -> usize {
         self.dropped_forward_responses.load(Ordering::SeqCst)
+    }
+
+    fn delay_forward_responses(&self, delay: Duration) {
+        self.forward_response_delay_millis.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    fn stop_delaying_forward_responses(&self) {
+        self.forward_response_delay_millis
+            .store(0, Ordering::SeqCst);
+    }
+
+    fn delayed_forward_responses(&self) -> usize {
+        self.delayed_forward_responses.load(Ordering::SeqCst)
     }
 
     fn clear_captured_payloads(&self) {
@@ -155,6 +175,15 @@ impl SessionConsensusPeer for LoopbackPeer {
         let family = request.family;
         let response = handler.handle(sender, request).await;
 
+        if family == SessionConsensusRpcFamily::ForwardMutation {
+            let delay = self.forward_response_delay_millis.load(Ordering::SeqCst);
+            if delay != 0 {
+                self.delayed_forward_responses
+                    .fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+        }
+
         if family == SessionConsensusRpcFamily::ForwardMutation
             && self
                 .forward_responses_to_drop
@@ -181,6 +210,10 @@ struct TestCluster {
 
 impl TestCluster {
     async fn start() -> Self {
+        Self::start_with_operation_timeout(OPERATION_TIMEOUT).await
+    }
+
+    async fn start_with_operation_timeout(operation_timeout: Duration) -> Self {
         let directory = tempfile::tempdir().expect("create fleet directory");
         let backends = (0..MEMBER_COUNT)
             .map(|index| {
@@ -234,7 +267,7 @@ impl TestCluster {
                 directory.path().join(format!("snapshots-{index}")),
                 peers,
                 Arc::new(SystemClock),
-                OPERATION_TIMEOUT,
+                operation_timeout,
             )
             .await
             .expect("open consensus node");
@@ -338,6 +371,42 @@ impl TestCluster {
                     .stop_dropping_forward_responses();
             }
         }
+    }
+
+    fn arm_forward_response_delay(&self, source: usize, delay: Duration) -> usize {
+        let before = self.delayed_forward_responses(source);
+        for target in 0..MEMBER_COUNT {
+            if source != target {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .delay_forward_responses(delay);
+            }
+        }
+        before
+    }
+
+    fn stop_forward_response_delay(&self, source: usize) {
+        for target in 0..MEMBER_COUNT {
+            if source != target {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .stop_delaying_forward_responses();
+            }
+        }
+    }
+
+    fn delayed_forward_responses(&self, source: usize) -> usize {
+        (0..MEMBER_COUNT)
+            .filter(|target| *target != source)
+            .map(|target| {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .delayed_forward_responses()
+            })
+            .sum()
     }
 
     fn dropped_forward_responses(&self, source: usize) -> usize {
@@ -1156,7 +1225,13 @@ async fn cold_start_concurrent_mutations_share_one_gap_free_committed_sequence()
 
 #[tokio::test]
 async fn restore_pages_use_only_linearizable_applied_state_and_fail_closed_when_stale() {
-    let cluster = TestCluster::start().await;
+    // This test proves healthy linearizable paging and cursor invalidation
+    // across isolate/heal. Use the production operation budget so concurrent
+    // snapshot and SQLite qualification work cannot turn the stale-cursor
+    // assertion into a scheduler-induced, correctly typed work-budget error.
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
 
     for label in [b"restore-a".as_slice(), b"restore-b", b"restore-c"] {
         let key = session_key(label);
@@ -1220,7 +1295,7 @@ async fn restore_pages_use_only_linearizable_applied_state_and_fail_closed_when_
 
     cluster.isolate(0);
     let isolated = tokio::time::timeout(
-        Duration::from_secs(2),
+        DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT + RECOVERY_TIMEOUT,
         cluster.stores[0].scan_restore_records(RestoreScanRequest::all(1)),
     )
     .await
@@ -1439,7 +1514,13 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
 
 #[tokio::test]
 async fn repeated_lost_forward_responses_retry_one_request_without_duplicate_event() {
-    let cluster = TestCluster::start().await;
+    // This test deliberately consumes more retry backoffs than the member
+    // count. Use the production operation budget so concurrent snapshot and
+    // SQLite qualification work cannot turn the success-path assertion into
+    // a scheduler-induced, correctly typed deadline ambiguity.
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
 
     for source in 0..MEMBER_COUNT {
         let key = session_key(format!("lost-response-{source}").as_bytes());
@@ -1504,4 +1585,75 @@ async fn repeated_lost_forward_responses_retry_one_request_without_duplicate_eve
     }
 
     panic!("no follower path was exercised while response loss was armed");
+}
+
+#[tokio::test]
+async fn committed_write_with_a_late_forward_result_is_typed_ambiguous_and_applied_once() {
+    let cluster = TestCluster::start().await;
+
+    for source in 0..MEMBER_COUNT {
+        let key = session_key(format!("late-result-{source}").as_bytes());
+        let lease = cluster.stores[source]
+            .acquire(
+                &key,
+                owner(format!("late-result-owner-{source}")),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("prepare lease before late result");
+        let before = cluster.stores[source]
+            .max_replication_sequence()
+            .await
+            .expect("replication head before late result");
+        let delayed_before = cluster
+            .arm_forward_response_delay(source, OPERATION_TIMEOUT + Duration::from_millis(250));
+        let expected = sealed_record(key.clone(), 1, &lease, b"sealed-late-result");
+
+        let result = cluster.stores[source]
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: expected.clone(),
+            })
+            .await;
+        cluster.stop_forward_response_delay(source);
+        let response_was_delayed = cluster.delayed_forward_responses(source) > delayed_before;
+
+        if response_was_delayed {
+            assert_eq!(result, Err(StoreError::CasIdempotencyOutcomeUnavailable));
+            let committed = cluster.stores[source]
+                .get(&key)
+                .await
+                .expect("linearizable read after late result");
+            assert_eq!(committed, Some(expected));
+            let after = cluster.stores[source]
+                .max_replication_sequence()
+                .await
+                .expect("replication head after late result");
+            assert_eq!(after, before + 1);
+
+            let logs = replication_logs(&cluster).await;
+            assert!(logs.windows(2).all(|pair| pair[0] == pair[1]));
+            let matching_events = logs[0]
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.op,
+                        ReplicationOp::CompareAndSet { key: event_key, .. }
+                            if event_key == &key
+                    )
+                })
+                .count();
+            assert_eq!(matching_events, 1);
+            return;
+        }
+
+        assert_eq!(
+            result.expect("local leader CAS"),
+            CompareAndSetResult::Success
+        );
+    }
+
+    panic!("no follower path was exercised while forward results were delayed");
 }

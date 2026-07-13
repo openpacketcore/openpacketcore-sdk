@@ -177,7 +177,7 @@ backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile pins wire-schema revision 4, error-set revision 4, a 4 MiB restore
+profile pins wire-schema revision 4, error-set revision 5, a 4 MiB restore
 payload bound, 8 MiB retained-page and examined key/filter-metadata bounds,
 `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
@@ -189,7 +189,8 @@ Transported stable IDs contain 1 through 64 bytes, transaction IDs contain 1
 through 128 UTF-8 bytes, and CAS request IDs, when present, are canonical
 lowercase hyphenated UUIDs with the exact 36-byte encoding. Error-set revision
 4 additionally carries checked replication-log range overflow, page-limit, and
-compacted-cursor outcomes; revision-3 peers are incompatible. Public
+compacted-cursor outcomes; revision 5 adds non-CAS backend and lease ambiguity
+outcomes. Revision-4 or older peers are incompatible. Public
 `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
 `contract_profile`; exhaustive construction and matching must account for the
 new field. The public `ContractProfile::max_frame_size` field is also a Rust
@@ -212,8 +213,10 @@ independent request-frame size. Each is a checked `u32` between
 `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes) and
 `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes), and
 `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that same minimum.
-This makes unequal client/server limits explicit. Revision-1, revision-2, and
-current revision-3 v4 profiles are mutually incompatible even though all use
+This makes unequal client/server limits explicit. The directional fields were
+introduced by wire-schema revision 2 and are retained by the current
+wire-schema revision 4/error-set revision 5 profile. Older exact profiles,
+including error-set revision 4 or older, are incompatible even though all use
 the `opc-session-net/4` ALPN.
 
 Every response and watch item is fully bounded-encoded before any frame prefix
@@ -228,6 +231,17 @@ The synchronous storage/sizing sinks check deadline and server-abort
 cancellation cooperatively between serializer writes/chunks; one bounded
 serializer callback is not asynchronously preemptible. A slow reader is
 disconnected and its slot is recovered.
+
+Legacy direct-backend dispatch also has three bounded phases: one inbound
+idle-timeout to decode a complete frame, independent read/mutation/lease/watch
+admission plus one backend queue/work deadline, and one reserved response
+interval. The latter two form the checked post-decode lifetime. Peer EOF and
+shutdown cancel pending reads and idle watches.
+CAS keeps its operation-bound replay outcome; other mutations and leases are
+sent once and return typed non-retryable ambiguity after transmission when an
+exact result cannot be confirmed. Pre-transmission failure remains known not
+applied. Backend adapters own cancellation: blocking/spawned work must be
+bounded and supervised rather than detached on async-wrapper drop.
 Records and positional batch results are never truncated. Restore and log reads
 may return only complete cursor/contiguous-sequence prefixes. Watch never skips
 an oversized entry; a fixed SDK-owned redaction-safe error is emitted when it
@@ -270,7 +284,8 @@ integer operations rather than floating point or panicking timestamp
 
 The new public error variants require exhaustive callers. Protocol v4
 introduced their private fixed-width DTOs in error revision 1; current error
-revision 2 retains those encodings and rejects a v3 peer during negotiation.
+revision 5 retains those encodings and rejects an error-revision-4 or older v4
+peer during negotiation.
 Operators must first audit persisted legacy
 replication logs: a TTL-bearing entry above 365 days now fails closed during
 replay/rebuild and is neither clamped nor rewritten automatically. Replicated

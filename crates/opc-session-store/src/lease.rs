@@ -99,6 +99,17 @@ impl LeaseGuard {
 ///
 /// Every successful acquisition MUST produce a monotonic fencing token for the
 /// session key. Writes with a lower token MUST be rejected by the backend.
+/// Lease futures follow the same cancellation contract as session mutations:
+/// dropping one after polling makes its result unknown, so the caller must
+/// abandon the guard and stop authoritative writes. It must not blindly replay
+/// the operation; product recovery needs an authoritative observation or a
+/// completed uncertainty window before a fresh guard is acquired.
+/// Implementations retain bounded admission and supervision until underlying
+/// work exits; that work may finish without making its exact result available
+/// to the dropped caller. A future that remains alive but cannot confirm the
+/// outcome returns
+/// [`LeaseError::OperationOutcomeUnavailable`]; callers must not retry the same
+/// operation.
 #[async_trait]
 pub trait SessionLeaseManager: Send + Sync {
     /// Acquire a lease for `key` on behalf of `owner` with the given `ttl`.

@@ -46,6 +46,14 @@ const RETAINED_LOGS: u64 = 1_024;
 const MAX_FORWARDED_BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_ID_DOMAIN: &[u8] = b"openpacketcore/config-consensus/request-id/v1\0";
 
+fn map_watch_snapshot<T, R: 'static>(
+    receiver: &tokio::sync::watch::Receiver<T>,
+    map: impl FnOnce(&T) -> R,
+) -> R {
+    let current = receiver.borrow();
+    map(&current)
+}
+
 /// Fail-closed construction or cluster-formation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -418,18 +426,37 @@ impl ConsensusConfigStore {
     pub fn status(&self) -> ConfigConsensusStatus {
         self.publish_global_metrics();
         let metrics = self.inner.raft.metrics();
-        let metrics = metrics.borrow();
+        // Snapshot every value derived from the watch payload while holding
+        // one read guard. Re-borrowing the watch lock before the first guard
+        // is dropped can deadlock when its underlying lock gives a queued
+        // Openraft metrics writer priority: the writer waits for the first
+        // guard, while the nested read waits for the writer.
+        let (term, leader_id, applied_index, live_membership_is_exact) =
+            map_watch_snapshot(&metrics, |metrics| {
+                (
+                    metrics.current_term,
+                    metrics.current_leader,
+                    metrics.last_applied.as_ref().map(|log_id| log_id.index),
+                    metrics.running_state.is_ok()
+                        && exact_uniform_voter_membership(
+                            metrics.membership_config.as_ref(),
+                            &self.inner.members,
+                        ),
+                )
+            });
+        let admitted = self.apply_live_membership_admission(live_membership_is_exact);
+
         ConfigConsensusStatus {
             node_id: self.inner.local_node_id,
-            term: metrics.current_term,
-            leader_id: metrics.current_leader,
-            applied_index: metrics.last_applied.as_ref().map(|log_id| log_id.index),
+            term,
+            leader_id,
+            applied_index,
             // Openraft metrics expose applied but not committed. The storage
             // adapter publishes the separately persisted committed pointer.
             committed_index: self.inner.durable_progress.committed_index(),
             audit_key_epoch: self.inner.backend.audit_key().epoch(),
             audit_key_fingerprint: self.inner.backend.audit_key().fingerprint(),
-            admitted: self.exact_membership_is_admitted(),
+            admitted,
         }
     }
 
@@ -552,19 +579,27 @@ impl ConsensusConfigStore {
 
     fn live_membership_is_exact(&self) -> bool {
         let metrics = self.inner.raft.metrics();
-        let current = metrics.borrow();
-        current.running_state.is_ok()
-            && exact_uniform_voter_membership(
-                current.membership_config.as_ref(),
-                &self.inner.members,
-            )
+        map_watch_snapshot(&metrics, |current| {
+            current.running_state.is_ok()
+                && exact_uniform_voter_membership(
+                    current.membership_config.as_ref(),
+                    &self.inner.members,
+                )
+        })
     }
 
     fn exact_membership_is_admitted(&self) -> bool {
         if !self.inner.admitted.load(Ordering::Acquire) {
             return false;
         }
-        if self.live_membership_is_exact() {
+        self.apply_live_membership_admission(self.live_membership_is_exact())
+    }
+
+    fn apply_live_membership_admission(&self, live_membership_is_exact: bool) -> bool {
+        if !self.inner.admitted.load(Ordering::Acquire) {
+            return false;
+        }
+        if live_membership_is_exact {
             true
         } else {
             self.inner.admitted.store(false, Ordering::Release);
@@ -1406,5 +1441,63 @@ mod tests {
         .await;
         assert_eq!(Err(ConsensusPeerError::ScopeMismatch), response.result);
         store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn precomputed_membership_snapshot_latches_admission() {
+        let (store, _snapshots) = singleton_store().await;
+
+        assert!(store.status().admitted);
+        assert!(store.apply_live_membership_admission(true));
+        assert!(store.inner.admitted.load(Ordering::Acquire));
+
+        assert!(!store.apply_live_membership_admission(false));
+        assert!(!store.inner.admitted.load(Ordering::Acquire));
+        assert!(!store.apply_live_membership_admission(true));
+
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[test]
+    fn owned_watch_snapshot_releases_read_guard_before_downstream_work() {
+        let (sender, receiver) = tokio::sync::watch::channel(7_u64);
+        let _receiver_keepalive = receiver.clone();
+        let (guard_held_tx, guard_held_rx) = std::sync::mpsc::channel();
+        let (release_guard_tx, release_guard_rx) = std::sync::mpsc::channel();
+        let snapshot_thread = std::thread::spawn(move || {
+            map_watch_snapshot(&receiver, |value| {
+                guard_held_tx.send(()).expect("signal held read guard");
+                release_guard_rx.recv().expect("release held read guard");
+                *value
+            })
+        });
+        guard_held_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot mapper acquires watch read guard");
+
+        let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+        let writer_thread = std::thread::spawn(move || {
+            writer_started_tx
+                .send(())
+                .expect("signal watch writer start");
+            sender.send(8).expect("publish replacement watch value");
+            writer_done_tx.send(()).expect("signal completed writer");
+        });
+        writer_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("watch writer starts");
+        assert_eq!(
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            writer_done_rx.recv_timeout(Duration::from_millis(50)),
+            "watch writer must wait while the snapshot mapper holds its read guard"
+        );
+
+        release_guard_tx.send(()).expect("release snapshot mapper");
+        assert_eq!(7, snapshot_thread.join().expect("join snapshot mapper"));
+        writer_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer proceeds after owned snapshot returns");
+        writer_thread.join().expect("join watch writer");
     }
 }

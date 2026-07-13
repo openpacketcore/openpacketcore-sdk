@@ -1856,3 +1856,16 @@ async fn test_ttl_expiration_fake_backend() {
         "refreshing TTL of expired record must return NotFound"
     );
 }
+
+#[tokio::test]
+async fn repeated_idle_watch_disconnects_do_not_accumulate_in_fake_backend() {
+    let backend = FakeSessionBackend::new();
+    for _ in 0..128 {
+        let stream = backend.watch(1).await.expect("register idle watch");
+        drop(stream);
+    }
+
+    let live = backend.watch(1).await.expect("register live watch");
+    assert_eq!(backend.inner.lock().await.watchers.len(), 1);
+    drop(live);
+}

@@ -137,6 +137,12 @@ enum ForwardMutationReply {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsensusPeerCallFailure {
+    BeforeTransmission,
+    AfterTransmission,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct ReadBarrierRequest;
 
@@ -161,7 +167,7 @@ struct ConsensusSessionStoreInner {
     clock: Arc<dyn Clock>,
     operation_timeout: Duration,
     admitted: AtomicBool,
-    proposal_gate: tokio::sync::Mutex<()>,
+    proposal_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// SQLite session state coordinated by the SDK's single Openraft engine.
@@ -304,7 +310,7 @@ impl ConsensusSessionStore {
                 clock,
                 operation_timeout,
                 admitted: AtomicBool::new(false),
-                proposal_gate: tokio::sync::Mutex::new(()),
+                proposal_gate: Arc::new(tokio::sync::Mutex::new(())),
             }),
         })
     }
@@ -465,13 +471,20 @@ impl ConsensusSessionStore {
                 metrics.purged.as_ref().map(|log_id| log_id.index),
             )
         };
-        if self
-            .inner
-            .backend
-            .consensus_operator_recovery_pending(self.inner.identity)
-            .await
-            .unwrap_or(true)
-        {
+        let recovery_deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let recovery_pending = tokio::time::timeout_at(
+            recovery_deadline,
+            self.inner
+                .backend
+                .consensus_operator_recovery_pending(self.inner.identity),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(true);
+        if recovery_pending {
             let metrics = self.inner.raft.metrics();
             let metrics = metrics.borrow();
             let recovery_progress = DurableRecoveryProgress::new(
@@ -586,11 +599,18 @@ impl ConsensusSessionStore {
         validate_consensus_intent(&intent)?;
         let request = ForwardMutationRequest { request_id, intent };
         let mut preferred = None;
+        let mut outcome_may_be_unavailable = false;
 
         loop {
             let leader = match preferred.take() {
                 Some(leader) => leader,
-                None => self.wait_for_known_leader(deadline).await?,
+                None => match self.wait_for_known_leader(deadline).await {
+                    Ok(leader) => leader,
+                    Err(_) if outcome_may_be_unavailable => {
+                        return Err(consensus_outcome_unavailable(&request.intent));
+                    }
+                    Err(error) => return Err(error),
+                },
             };
             let reply = if leader == self.inner.local_node_id {
                 self.apply_on_local_leader(request.clone(), deadline).await
@@ -605,16 +625,43 @@ impl ConsensusSessionStore {
                     .await
                 {
                     Ok(reply) => reply,
-                    Err(_) => {
-                        self.wait_for_route_refresh(leader, deadline).await?;
+                    Err(ConsensusPeerCallFailure::AfterTransmission) => {
+                        // The peer abstraction cannot prove that a failed call
+                        // stopped before delivery. Retrying this same durable
+                        // request ID is safe; returning a generic unavailable
+                        // error after this point is not.
+                        outcome_may_be_unavailable = true;
+                        if self.wait_for_route_refresh(leader, deadline).await.is_err() {
+                            return Err(consensus_outcome_unavailable(&request.intent));
+                        }
+                        continue;
+                    }
+                    Err(ConsensusPeerCallFailure::BeforeTransmission) => {
+                        if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
+                            return if outcome_may_be_unavailable {
+                                Err(consensus_outcome_unavailable(&request.intent))
+                            } else {
+                                Err(error)
+                            };
+                        }
                         continue;
                     }
                 }
             };
             match reply {
                 ForwardMutationReply::Applied(response) => {
-                    self.require_exact_membership_admission()?;
-                    return Ok(*response);
+                    if committed_response_matches_intent(&request.intent, &response) {
+                        return Ok(*response);
+                    }
+                    if !outcome_may_be_unavailable
+                        && rejected_response_matches_intent(&request.intent, &response)
+                    {
+                        return match response.result {
+                            Err(error) => Err(error),
+                            Ok(_) => Err(consensus_outcome_unavailable(&request.intent)),
+                        };
+                    }
+                    return Err(consensus_outcome_unavailable(&request.intent));
                 }
                 ForwardMutationReply::NotLeader {
                     leader: next_leader,
@@ -623,11 +670,23 @@ impl ConsensusSessionStore {
                         *candidate != leader && self.inner.members.contains(candidate)
                     });
                     if preferred.is_none() {
-                        self.wait_for_route_refresh(leader, deadline).await?;
+                        if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
+                            return if outcome_may_be_unavailable {
+                                Err(consensus_outcome_unavailable(&request.intent))
+                            } else {
+                                Err(error)
+                            };
+                        }
                     }
                 }
                 ForwardMutationReply::Unavailable => {
-                    self.wait_for_route_refresh(leader, deadline).await?;
+                    if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
+                        return if outcome_may_be_unavailable {
+                            Err(consensus_outcome_unavailable(&request.intent))
+                        } else {
+                            Err(error)
+                        };
+                    }
                 }
             }
         }
@@ -651,15 +710,21 @@ impl ConsensusSessionStore {
         if self.require_exact_membership_admission().is_err() {
             return ForwardMutationReply::Unavailable;
         }
-        if !allow_operator_recovery
-            && self
-                .inner
-                .backend
-                .consensus_operator_recovery_pending(self.inner.identity)
-                .await
-                .unwrap_or(true)
-        {
-            return ForwardMutationReply::Unavailable;
+        if !allow_operator_recovery {
+            let recovery_pending = match tokio::time::timeout_at(
+                deadline,
+                self.inner
+                    .backend
+                    .consensus_operator_recovery_pending(self.inner.identity),
+            )
+            .await
+            {
+                Ok(Ok(pending)) => pending,
+                Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
+            };
+            if recovery_pending {
+                return ForwardMutationReply::Unavailable;
+            }
         }
         if let Err(error) =
             validate_consensus_intent_with_recovery(&request.intent, allow_operator_recovery)
@@ -668,11 +733,15 @@ impl ConsensusSessionStore {
                 error,
             )));
         }
-        let _proposal_guard =
-            match tokio::time::timeout_at(deadline, self.inner.proposal_gate.lock()).await {
-                Ok(guard) => guard,
-                Err(_) => return ForwardMutationReply::Unavailable,
-            };
+        let proposal_guard = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.inner.proposal_gate).lock_owned(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => return ForwardMutationReply::Unavailable,
+        };
 
         match tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await {
             Err(_) => return ForwardMutationReply::Unavailable,
@@ -690,6 +759,7 @@ impl ConsensusSessionStore {
             }
         }
 
+        let outcome_unavailable = consensus_outcome_unavailable(&request.intent);
         let command = super::SessionConsensusCommand {
             schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
             identity: self.inner.identity,
@@ -698,7 +768,7 @@ impl ConsensusSessionStore {
             intent: request.intent,
         };
         if encode_bounded(&command).is_err() {
-            let max = self.inner.backend.capabilities().await.max_value_bytes;
+            let max = self.inner.backend.consensus_capabilities().max_value_bytes;
             return ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
                 StoreError::PayloadTooLarge {
                     actual: max.saturating_add(1),
@@ -707,22 +777,50 @@ impl ConsensusSessionStore {
             )));
         }
 
-        match tokio::time::timeout_at(
-            deadline,
-            self.inner
-                .raft
-                .client_write::<tokio::sync::oneshot::error::RecvError>(command),
-        )
-        .await
-        {
-            Err(_) => ForwardMutationReply::Unavailable,
-            Ok(Ok(response)) if self.exact_membership_is_admitted() => {
-                ForwardMutationReply::Applied(Box::new(response.data))
-            }
-            Ok(Ok(_)) => ForwardMutationReply::Unavailable,
-            Ok(Err(error)) => ForwardMutationReply::NotLeader {
-                leader: client_write_leader(&error),
-            },
+        // Split Openraft's enqueue and result phases explicitly. Once
+        // `client_write_ff` returns a receiver, the proposal was accepted by
+        // the local Raft core. Losing the receiver or crossing the deadline
+        // after that point is an unknown committed outcome, never a safe
+        // retryable availability failure.
+        let response =
+            match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
+            {
+                Err(_) => return ForwardMutationReply::Unavailable,
+                Ok(Err(_)) => return ForwardMutationReply::Unavailable,
+                Ok(Ok(response)) => response,
+            };
+        // Once Openraft returns the receiver, the proposal is accepted by its
+        // core. A detached supervisor owns the proposal permit until Openraft
+        // resolves the receiver, so caller cancellation, peer EOF, or a
+        // response deadline cannot admit an unbounded queue of detached
+        // mutations behind the still-running command.
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let timeout_outcome_unavailable = outcome_unavailable.clone();
+        tokio::spawn(async move {
+            let reply = match response.await {
+                Err(_) => ForwardMutationReply::Applied(Box::new(
+                    SessionConsensusResponse::rejected(outcome_unavailable.clone()),
+                )),
+                Ok(Ok(response)) => ForwardMutationReply::Applied(Box::new(response.data)),
+                Ok(Err(ClientWriteError::ForwardToLeader(forward))) => {
+                    ForwardMutationReply::NotLeader {
+                        leader: forward.leader_id,
+                    }
+                }
+                Ok(Err(ClientWriteError::ChangeMembershipError(_))) => {
+                    ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
+                        outcome_unavailable,
+                    )))
+                }
+            };
+            let _ = completion_tx.send(reply);
+            drop(proposal_guard);
+        });
+        match tokio::time::timeout_at(deadline, completion_rx).await {
+            Err(_) | Ok(Err(_)) => ForwardMutationReply::Applied(Box::new(
+                SessionConsensusResponse::rejected(timeout_outcome_unavailable),
+            )),
+            Ok(Ok(reply)) => reply,
         }
     }
 
@@ -797,16 +895,18 @@ impl ConsensusSessionStore {
             return false;
         }
         self.exact_membership_is_admitted()
-            && self
-                .inner
-                .backend
-                .consensus_operator_recovery_committed(
+            && tokio::time::timeout_at(
+                deadline,
+                self.inner.backend.consensus_operator_recovery_committed(
                     self.inner.identity,
                     recovery_epoch,
                     plan_digest,
-                )
-                .await
-                .unwrap_or(false)
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
     }
 
     async fn wait_for_known_leader(
@@ -857,7 +957,7 @@ impl ConsensusSessionStore {
         family: SessionConsensusRpcFamily,
         request: &Req,
         deadline: tokio::time::Instant,
-    ) -> Result<Resp, StoreError>
+    ) -> Result<Resp, ConsensusPeerCallFailure>
     where
         Req: Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
@@ -867,35 +967,44 @@ impl ConsensusSessionStore {
             .peers
             .get(&target)
             .filter(|peer| peer.node_id() == target)
-            .ok_or_else(consensus_unavailable)?;
-        let payload = encode_bounded(request).map_err(|_| consensus_unavailable())?;
+            .ok_or(ConsensusPeerCallFailure::BeforeTransmission)?;
+        let payload =
+            encode_bounded(request).map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
         let wire = SessionConsensusWireRequest::try_new(
             self.inner.identity,
             self.inner.local_node_id,
             family,
             payload,
         )
-        .map_err(|_| consensus_unavailable())?;
+        .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
         let response = tokio::time::timeout_at(deadline, peer.call(wire))
             .await
-            .map_err(|_| consensus_unavailable())?
-            .map_err(|_| consensus_unavailable())?;
-        response.validate().map_err(|_| consensus_unavailable())?;
-        let payload = response.result.map_err(|_| consensus_unavailable())?;
-        decode_bounded(&payload).map_err(|_| consensus_unavailable())
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+        response
+            .validate()
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+        let payload = response
+            .result
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+        decode_bounded(&payload).map_err(|_| ConsensusPeerCallFailure::AfterTransmission)
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
         if self.require_exact_membership_admission().is_err() {
             return ReadBarrierReply::Unavailable;
         }
-        if self
-            .inner
-            .backend
-            .consensus_operator_recovery_pending(self.inner.identity)
-            .await
-            .unwrap_or(true)
-        {
+        let recovery_pending = tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .backend
+                .consensus_operator_recovery_pending(self.inner.identity),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(true);
+        if recovery_pending {
             return ReadBarrierReply::Unavailable;
         }
         match tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await {
@@ -1001,7 +1110,14 @@ impl ConsensusSessionStore {
                 SessionMutationIntent::AdvanceLogicalTime,
                 deadline,
             )
-            .await?;
+            .await
+            .map_err(|error| match error {
+                // Advancing logical time is an idempotent implementation
+                // detail of a read barrier. A lost result may have advanced
+                // time, but repeating it cannot duplicate a user mutation.
+                StoreError::BackendOperationOutcomeUnavailable => consensus_unavailable(),
+                error => error,
+            })?;
         response.result?;
         if response.raft_log_index == 0 {
             return Err(consensus_unavailable());
@@ -1037,16 +1153,153 @@ fn session_raft_config() -> Result<Config, ConsensusSessionStoreOpenError> {
     .map_err(|_| ConsensusSessionStoreOpenError::InvalidRuntimeConfiguration)
 }
 
-fn client_write_leader(
-    error: &RaftError<SessionConsensusNodeId, ClientWriteError<SessionConsensusNodeId, EmptyNode>>,
-) -> Option<SessionConsensusNodeId> {
-    error
-        .forward_to_leader()
-        .and_then(|forward| forward.leader_id)
-}
-
 fn consensus_unavailable() -> StoreError {
     StoreError::BackendUnavailable("session consensus quorum is unavailable".into())
+}
+
+fn consensus_outcome_unavailable(intent: &SessionMutationIntent) -> StoreError {
+    if matches!(intent, SessionMutationIntent::CompareAndSet(_)) {
+        StoreError::CasIdempotencyOutcomeUnavailable
+    } else {
+        StoreError::BackendOperationOutcomeUnavailable
+    }
+}
+
+fn committed_response_matches_intent(
+    intent: &SessionMutationIntent,
+    response: &SessionConsensusResponse,
+) -> bool {
+    if response.sequence == 0
+        || response.digest.is_none()
+        || response.logical_time.is_none()
+        || response.raft_log_index == 0
+    {
+        return false;
+    }
+    let Some(logical_time) = response.logical_time else {
+        return false;
+    };
+    match (&response.result, intent) {
+        (Err(error), intent) => committed_error_matches_intent(intent, error),
+        (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::AdvanceLogicalTime)
+        | (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::DeleteFenced(_))
+        | (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::RefreshTtl { .. })
+        | (Ok(SessionMutationOutcome::Unit), SessionMutationIntent::ReleaseLease(_))
+        | (
+            Ok(SessionMutationOutcome::Unit),
+            SessionMutationIntent::FinalizeOperatorRecovery { .. },
+        ) => true,
+        (
+            Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Success)),
+            SessionMutationIntent::CompareAndSet(_),
+        )
+        | (
+            Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict {
+                current: None,
+            })),
+            SessionMutationIntent::CompareAndSet(_),
+        ) => true,
+        (
+            Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict {
+                current: Some(current),
+            })),
+            SessionMutationIntent::CompareAndSet(operation),
+        ) => current.key == operation.key,
+        (
+            Ok(SessionMutationOutcome::Lease(guard)),
+            SessionMutationIntent::AcquireLease {
+                key, owner, ttl, ..
+            },
+        ) => {
+            guard.key() == key
+                && guard.owner() == owner
+                && guard.fence().get() != 0
+                && guard.credential_id() != 0
+                && guard.acquired_at() == logical_time
+                && checked_session_deadline(logical_time, *ttl)
+                    .is_ok_and(|expires_at| guard.expires_at() == expires_at)
+        }
+        (
+            Ok(SessionMutationOutcome::Lease(renewed)),
+            SessionMutationIntent::RenewLease { lease, ttl },
+        ) => {
+            renewed.key() == lease.key()
+                && renewed.owner() == lease.owner()
+                && renewed.fence() == lease.fence()
+                && renewed.credential_id() == lease.credential_id()
+                && renewed.acquired_at() == lease.acquired_at()
+                && checked_session_deadline(logical_time, *ttl)
+                    .is_ok_and(|expires_at| renewed.expires_at() == expires_at)
+        }
+        _ => false,
+    }
+}
+
+fn rejected_response_matches_intent(
+    intent: &SessionMutationIntent,
+    response: &SessionConsensusResponse,
+) -> bool {
+    // The original private forwarding wire shape does not echo the request ID.
+    // Keep the existing private wire discriminants stable, but accept a rejection as
+    // preproposal only when it carries the sentinel non-committed metadata and
+    // the error is one this exact intent can encounter before submission.
+    response.sequence == 0
+        && response.digest.is_none()
+        && response.logical_time.is_none()
+        && response.raft_log_index == 0
+        && matches!(
+            &response.result,
+            Err(error) if rejected_error_matches_intent(intent, error)
+        )
+}
+
+fn rejected_error_matches_intent(_: &SessionMutationIntent, error: &StoreError) -> bool {
+    // Normal callers validate intent before routing. The only remaining
+    // preproposal rejection is the fixed bounded-command encoding limit.
+    matches!(error, StoreError::PayloadTooLarge { .. })
+}
+
+fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreError) -> bool {
+    match intent {
+        SessionMutationIntent::AdvanceLogicalTime => false,
+        SessionMutationIntent::CompareAndSet(_) => matches!(
+            error,
+            StoreError::NotFound
+                | StoreError::StaleFence
+                | StoreError::InvalidKey(_)
+                | StoreError::LeaseExpired
+                | StoreError::PayloadTooLarge { .. }
+        ),
+        SessionMutationIntent::DeleteFenced(_) => matches!(
+            error,
+            StoreError::NotFound | StoreError::StaleFence | StoreError::LeaseExpired
+        ),
+        SessionMutationIntent::RefreshTtl { .. } => matches!(
+            error,
+            StoreError::NotFound
+                | StoreError::StaleFence
+                | StoreError::InvalidSessionTtl
+                | StoreError::LeaseExpired
+        ),
+        SessionMutationIntent::AcquireLease { .. } => {
+            matches!(error, StoreError::InvalidSessionTtl | StoreError::LeaseHeld)
+        }
+        SessionMutationIntent::RenewLease { .. } => matches!(
+            error,
+            StoreError::NotFound
+                | StoreError::StaleFence
+                | StoreError::InvalidSessionTtl
+                | StoreError::LeaseHeld
+                | StoreError::LeaseExpired
+        ),
+        SessionMutationIntent::ReleaseLease(_) => matches!(
+            error,
+            StoreError::NotFound | StoreError::StaleFence | StoreError::LeaseHeld
+        ),
+        SessionMutationIntent::FinalizeOperatorRecovery { .. } => {
+            matches!(error, StoreError::InvalidKey(reason) if reason == "operator_recovery_epoch_rejected")
+        }
+    }
 }
 
 fn exact_uniform_voter_membership(
@@ -1216,7 +1469,7 @@ impl SessionBackend for ConsensusSessionStore {
             .await?;
         match response.result? {
             SessionMutationOutcome::CompareAndSet(result) => Ok(result),
-            _ => Err(consensus_unavailable()),
+            _ => Err(StoreError::CasIdempotencyOutcomeUnavailable),
         }
     }
 
@@ -1226,7 +1479,7 @@ impl SessionBackend for ConsensusSessionStore {
             .await?;
         match response.result? {
             SessionMutationOutcome::Unit => Ok(()),
-            _ => Err(consensus_unavailable()),
+            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
         }
     }
 
@@ -1241,7 +1494,7 @@ impl SessionBackend for ConsensusSessionStore {
             .await?;
         match response.result? {
             SessionMutationOutcome::Unit => Ok(()),
-            _ => Err(consensus_unavailable()),
+            _ => Err(StoreError::BackendOperationOutcomeUnavailable),
         }
     }
 
@@ -1372,9 +1625,7 @@ impl SessionLeaseManager for ConsensusSessionStore {
             .map_err(LeaseError::from)?;
         match response.result.map_err(LeaseError::from)? {
             SessionMutationOutcome::Lease(guard) => Ok(guard),
-            _ => Err(LeaseError::Backend(
-                "session consensus outcome mismatch".into(),
-            )),
+            _ => Err(LeaseError::OperationOutcomeUnavailable),
         }
     }
 
@@ -1390,9 +1641,7 @@ impl SessionLeaseManager for ConsensusSessionStore {
             .map_err(LeaseError::from)?;
         match response.result.map_err(LeaseError::from)? {
             SessionMutationOutcome::Lease(guard) => Ok(guard),
-            _ => Err(LeaseError::Backend(
-                "session consensus outcome mismatch".into(),
-            )),
+            _ => Err(LeaseError::OperationOutcomeUnavailable),
         }
     }
 
@@ -1403,25 +1652,27 @@ impl SessionLeaseManager for ConsensusSessionStore {
             .map_err(LeaseError::from)?;
         match response.result.map_err(LeaseError::from)? {
             SessionMutationOutcome::Unit => Ok(()),
-            _ => Err(LeaseError::Backend(
-                "session consensus outcome mismatch".into(),
-            )),
+            _ => Err(LeaseError::OperationOutcomeUnavailable),
         }
     }
 }
 
 #[cfg(test)]
 mod membership_tests {
+    use bytes::Bytes;
     use opc_consensus::engine::{CommittedLeaderId, Membership};
     use opc_consensus::{
         derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
     };
 
     use super::*;
+    use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
+    use crate::record::EncryptedSessionPayload;
     use crate::topology::{
         QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
         ReplicaId, ReplicaTlsIdentity,
     };
+    use opc_types::{NetworkFunctionKind, TenantId};
 
     fn node(value: u64) -> SessionConsensusNodeId {
         SessionConsensusNodeId::new(value).expect("valid test consensus node ID")
@@ -1508,6 +1759,145 @@ mod membership_tests {
         );
     }
 
+    #[test]
+    fn forwarded_mutation_responses_are_bound_to_the_exact_intent() {
+        let key = |stable_id: &'static [u8]| SessionKey {
+            tenant: TenantId::new("forward-response-binding").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(stable_id).try_into().expect("stable ID"),
+        };
+        let key_a = key(b"key-a");
+        let key_b = key(b"key-b");
+        let owner_a = OwnerId::new("owner-a").expect("owner");
+        let owner_b = OwnerId::new("owner-b").expect("owner");
+        let logical_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let ttl = Duration::from_secs(60);
+        let expires_at = checked_session_deadline(logical_time, ttl).expect("lease deadline");
+        let lease_a = LeaseGuard::new(
+            key_a.clone(),
+            owner_a.clone(),
+            FenceToken::new(7),
+            logical_time,
+            expires_at,
+            9,
+        );
+        let record = |key: SessionKey| StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner: owner_a.clone(),
+            fence: lease_a.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("forward-response-binding").expect("state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(Bytes::from_static(b"payload")),
+        };
+        let cas = CompareAndSet {
+            key: key_a.clone(),
+            lease: lease_a.clone(),
+            expected_generation: None,
+            new_record: record(key_a.clone()),
+        };
+        let committed = |result| SessionConsensusResponse {
+            result,
+            sequence: 1,
+            digest: Some(crate::consensus::SessionConsensusEntryDigest::from_bytes(
+                [0x5a; 32],
+            )),
+            logical_time: Some(logical_time),
+            raft_log_index: 1,
+        };
+
+        let rejected =
+            SessionConsensusResponse::rejected(StoreError::PayloadTooLarge { actual: 2, max: 1 });
+        assert!(rejected_response_matches_intent(
+            &SessionMutationIntent::AdvanceLogicalTime,
+            &rejected
+        ));
+        assert!(!committed_response_matches_intent(
+            &SessionMutationIntent::AdvanceLogicalTime,
+            &rejected
+        ));
+        assert!(!rejected_response_matches_intent(
+            &SessionMutationIntent::AdvanceLogicalTime,
+            &SessionConsensusResponse::rejected(StoreError::BackendOperationOutcomeUnavailable)
+        ));
+
+        let cas_intent = SessionMutationIntent::CompareAndSet(Box::new(cas));
+        assert!(!committed_response_matches_intent(
+            &cas_intent,
+            &committed(Ok(SessionMutationOutcome::Unit))
+        ));
+        assert!(!committed_response_matches_intent(
+            &cas_intent,
+            &committed(Err(StoreError::CasConflict))
+        ));
+        assert!(!committed_response_matches_intent(
+            &cas_intent,
+            &committed(Ok(SessionMutationOutcome::CompareAndSet(
+                CompareAndSetResult::Conflict {
+                    current: Some(record(key_b)),
+                },
+            )))
+        ));
+        assert!(committed_response_matches_intent(
+            &cas_intent,
+            &committed(Ok(SessionMutationOutcome::CompareAndSet(
+                CompareAndSetResult::Conflict {
+                    current: Some(record(key_a.clone())),
+                },
+            )))
+        ));
+
+        assert!(!committed_response_matches_intent(
+            &SessionMutationIntent::ReleaseLease(lease_a.clone()),
+            &committed(Err(StoreError::LeaseExpired))
+        ));
+
+        let acquire = SessionMutationIntent::AcquireLease {
+            key: key_a.clone(),
+            owner: owner_a.clone(),
+            ttl,
+        };
+        assert!(committed_response_matches_intent(
+            &acquire,
+            &committed(Ok(SessionMutationOutcome::Lease(lease_a.clone())))
+        ));
+        let forged_acquire = LeaseGuard::new(
+            key_a.clone(),
+            owner_b,
+            lease_a.fence(),
+            logical_time,
+            expires_at,
+            lease_a.credential_id(),
+        );
+        assert!(!committed_response_matches_intent(
+            &acquire,
+            &committed(Ok(SessionMutationOutcome::Lease(forged_acquire)))
+        ));
+
+        let renew = SessionMutationIntent::RenewLease {
+            lease: lease_a.clone(),
+            ttl,
+        };
+        assert!(committed_response_matches_intent(
+            &renew,
+            &committed(Ok(SessionMutationOutcome::Lease(lease_a.clone())))
+        ));
+        let forged_renew = LeaseGuard::new(
+            key_a,
+            owner_a,
+            lease_a.fence(),
+            lease_a.acquired_at(),
+            expires_at,
+            lease_a.credential_id() + 1,
+        );
+        assert!(!committed_response_matches_intent(
+            &renew,
+            &committed(Ok(SessionMutationOutcome::Lease(forged_renew)))
+        ));
+    }
+
     #[tokio::test]
     async fn store_and_forwarded_services_fail_closed_before_exact_admission() {
         let directory = tempfile::tempdir().expect("membership admission directory");
@@ -1562,6 +1952,176 @@ mod membership_tests {
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_local_proposals_remain_supervised_after_timeout_and_cancellation() {
+        let directory = tempfile::tempdir().expect("proposal supervision directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("proposal supervision SQLite backend");
+        let apply_gate = Arc::clone(&backend.consensus_apply_gate);
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("open proposal supervision store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize proposal supervision store");
+
+        let wait_for_submission = |store: ConsensusSessionStore, before: u64| async move {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if store.inner.raft.metrics().borrow().last_log_index > Some(before) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("proposal reaches the real Openraft log");
+        };
+        let wait_for_supervisor = |store: ConsensusSessionStore| async move {
+            let guard = tokio::time::timeout(
+                Duration::from_secs(1),
+                Arc::clone(&store.inner.proposal_gate).lock_owned(),
+            )
+            .await
+            .expect("proposal supervisor releases admission after apply");
+            drop(guard);
+        };
+
+        // Dropping the original caller after Openraft accepted its proposal
+        // must not release admission or permit a disconnect flood to enqueue
+        // more detached commands.
+        let held_apply = Arc::clone(&apply_gate)
+            .acquire_owned()
+            .await
+            .expect("hold state-machine apply");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let cancelled_store = store.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_store
+                .submit_intent(SessionMutationIntent::AdvanceLogicalTime)
+                .await
+        });
+        wait_for_submission(store.clone(), before).await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert!(
+            Arc::clone(&store.inner.proposal_gate)
+                .try_lock_owned()
+                .is_err(),
+            "accepted proposal admission must outlive its cancelled caller"
+        );
+        let flood = (0..16)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .submit_intent(SessionMutationIntent::AdvanceLogicalTime)
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        for attempt in flood {
+            assert!(matches!(
+                attempt.await.expect("queued flood task"),
+                Err(StoreError::BackendUnavailable(_))
+            ));
+        }
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "cancelled callers cannot build an unbounded Openraft queue"
+        );
+        drop(held_apply);
+        wait_for_supervisor(store.clone()).await;
+
+        // A live non-CAS caller that crosses the same post-submit boundary
+        // receives typed ambiguity while the supervisor continues to own
+        // admission until the delayed state-machine result arrives.
+        let held_apply = Arc::clone(&apply_gate)
+            .acquire_owned()
+            .await
+            .expect("hold state-machine apply for non-CAS");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let mutation_store = store.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_store
+                .submit_intent(SessionMutationIntent::AdvanceLogicalTime)
+                .await
+        });
+        wait_for_submission(store.clone(), before).await;
+        assert_eq!(
+            mutation.await.expect("non-CAS task"),
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        );
+        assert!(Arc::clone(&store.inner.proposal_gate)
+            .try_lock_owned()
+            .is_err());
+        drop(held_apply);
+        wait_for_supervisor(store.clone()).await;
+
+        // Lease APIs must translate that same committed-unknown boundary to
+        // their lease-specific non-retryable outcome.
+        let held_apply = Arc::clone(&apply_gate)
+            .acquire_owned()
+            .await
+            .expect("hold state-machine apply for lease");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let key = SessionKey {
+            tenant: TenantId::new("proposal-supervision").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"lease-timeout")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let lease_store = store.clone();
+        let lease = tokio::spawn(async move {
+            lease_store
+                .acquire(
+                    &key,
+                    OwnerId::new("proposal-supervision-owner").expect("owner"),
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        wait_for_submission(store.clone(), before).await;
+        assert_eq!(
+            lease.await.expect("lease task"),
+            Err(LeaseError::OperationOutcomeUnavailable)
+        );
+        assert!(Arc::clone(&store.inner.proposal_gate)
+            .try_lock_owned()
+            .is_err());
+        drop(held_apply);
+        wait_for_supervisor(store).await;
     }
 }
 

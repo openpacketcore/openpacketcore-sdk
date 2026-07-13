@@ -263,6 +263,41 @@ impl CapturingReplicationBackend {
     }
 }
 
+#[derive(Default)]
+struct TruncatedBatchBackend {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionBackend for TruncatedBatchBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        let mut capabilities = BackendCapabilities::minimal();
+        capabilities.batch_write = true;
+        capabilities
+    }
+
+    async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        Ok(None)
+    }
+
+    async fn compare_and_set(&self, _op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        Ok(CompareAndSetResult::Success)
+    }
+
+    async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+}
+
 #[async_trait]
 impl SessionBackend for CapturingReplicationBackend {
     async fn capabilities(&self) -> BackendCapabilities {
@@ -1151,6 +1186,62 @@ impl KeyProvider for BarrierKeyProvider {
     async fn rotate_key(&self, purpose: KeyPurpose, tenant: &TenantId) -> Result<KeyId, KeyError> {
         self.inner.rotate_key(purpose, tenant).await
     }
+}
+
+async fn detached_test_lease() -> LeaseGuard {
+    let backend = FakeSessionBackend::new();
+    backend
+        .acquire(
+            &test_key(),
+            OwnerId::new("batch-cardinality-owner").expect("owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("test lease")
+}
+
+#[tokio::test]
+async fn encrypting_batch_cardinality_failure_after_mutation_is_typed_ambiguous() {
+    let inner = Arc::new(TruncatedBatchBackend::default());
+    let backend = EncryptingSessionBackend::new(
+        Arc::clone(&inner),
+        test_provider(),
+        "batch-cardinality-local",
+    );
+    let lease = detached_test_lease().await;
+    assert_eq!(
+        backend.batch(vec![SessionOp::DeleteFenced { lease }]).await,
+        Err(StoreError::BackendOperationOutcomeUnavailable)
+    );
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+
+    assert!(matches!(
+        backend
+            .batch(vec![SessionOp::Get { key: test_key() }])
+            .await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn remote_sealing_batch_cardinality_failure_after_mutation_is_typed_ambiguous() {
+    let inner = Arc::new(TruncatedBatchBackend::default());
+    let backend = RemoteSealingSessionBackend::new(
+        Arc::clone(&inner),
+        test_remote_seal_provider(),
+        "batch-cardinality-remote",
+    );
+    let lease = detached_test_lease().await;
+    assert_eq!(
+        backend
+            .batch(vec![SessionOp::RefreshTtl {
+                lease,
+                ttl: Duration::from_secs(60),
+            }])
+            .await,
+        Err(StoreError::BackendOperationOutcomeUnavailable)
+    );
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
