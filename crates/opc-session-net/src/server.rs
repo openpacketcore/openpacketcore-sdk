@@ -30,6 +30,10 @@ use tracing;
 
 use crate::error::ProtocolError;
 use crate::identity::{LocalReplicaBinding, SessionClusterId};
+use crate::lifecycle::{
+    directed_connection_key, wall_expiry_deadline, ConnectionLifecycle, ConnectionLifecyclePolicy,
+    SessionReauthenticationControl,
+};
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
     compare_and_set_result_matches_key, conservative_payload_budget,
@@ -364,18 +368,45 @@ fn record_response_write_failure(error: &ProtocolError, family: ResponseFamily) 
     );
 }
 
+async fn write_frame_until_server_cancellation<W, T>(
+    writer: &mut W,
+    frame: &T,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &ServerCancellation,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ProtocolError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "response write cancelled",
+        ))),
+        result = write_frame_bounded_until_cancellable(
+            writer,
+            frame,
+            max_frame_size,
+            deadline,
+            cancellation.flag(),
+        ) => result,
+    }
+}
+
 async fn write_post_auth_response_until<W>(
     writer: &mut W,
     response: &Response,
     max_frame_size: usize,
     deadline: tokio::time::Instant,
     family: ResponseFamily,
-    cancellation: &AtomicBool,
+    cancellation: &ServerCancellation,
 ) -> Result<(), ProtocolError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let result = write_frame_bounded_until_cancellable(
+    let result = write_frame_until_server_cancellation(
         writer,
         response,
         max_frame_size,
@@ -395,7 +426,7 @@ async fn write_post_auth_response<W>(
     max_frame_size: usize,
     timeout: std::time::Duration,
     family: ResponseFamily,
-    cancellation: &AtomicBool,
+    cancellation: &ServerCancellation,
 ) -> Result<(), ProtocolError>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -420,7 +451,7 @@ async fn write_post_auth_response_with_fallback<W>(
     max_frame_size: usize,
     timeout: std::time::Duration,
     family: ResponseFamily,
-    cancellation: &AtomicBool,
+    cancellation: &ServerCancellation,
 ) -> Result<(), ProtocolError>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -445,12 +476,12 @@ async fn write_post_auth_response_with_fallback_until<W>(
     max_frame_size: usize,
     deadline: tokio::time::Instant,
     family: ResponseFamily,
-    cancellation: &AtomicBool,
+    cancellation: &ServerCancellation,
 ) -> Result<(), ProtocolError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    match write_frame_bounded_until_cancellable(
+    match write_frame_until_server_cancellation(
         writer,
         &response,
         max_frame_size,
@@ -520,7 +551,7 @@ async fn write_watch_response<W>(
     response: Response,
     max_frame_size: usize,
     timeout: std::time::Duration,
-    cancellation: &AtomicBool,
+    cancellation: &ServerCancellation,
 ) -> Result<bool, ProtocolError>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -534,12 +565,12 @@ async fn write_watch_response_until<W>(
     response: Response,
     max_frame_size: usize,
     deadline: tokio::time::Instant,
-    cancellation: &AtomicBool,
+    cancellation: &ServerCancellation,
 ) -> Result<bool, ProtocolError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    match write_frame_bounded_until_cancellable(
+    match write_frame_until_server_cancellation(
         writer,
         &response,
         max_frame_size,
@@ -627,6 +658,8 @@ struct DispatchConfig {
     restore_scan_timeout: std::time::Duration,
     restore_scan_slots: Arc<Semaphore>,
     cancellation: Arc<ServerCancellation>,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
 }
 
 #[derive(Clone)]
@@ -1632,7 +1665,7 @@ async fn wait_for_cas_outcome(mut outcome: watch::Receiver<Option<CasOutcome>>) 
 /// Networked session replication server.
 pub struct SessionReplicationServer {
     backend: Arc<dyn SessionStoreBackend>,
-    tls_config: Option<Arc<opc_tls::ServerConfig>>,
+    tls_config: Option<opc_tls::AuthenticatedServerConfig>,
     binding: LocalReplicaBinding,
     max_connections: usize,
     max_frame_size: usize,
@@ -1641,6 +1674,8 @@ pub struct SessionReplicationServer {
     backend_operation_concurrency: usize,
     restore_scan_timeout: std::time::Duration,
     cas_idempotency_cache: Arc<StdMutex<CasIdempotencyCache>>,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
 }
 
 impl fmt::Debug for SessionReplicationServer {
@@ -1680,7 +1715,7 @@ impl SessionReplicationServer {
     ) -> Self {
         Self {
             backend,
-            tls_config: Some(session_server_tls_config(&tls_config)),
+            tls_config: Some(tls_config),
             binding,
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -1689,6 +1724,8 @@ impl SessionReplicationServer {
             backend_operation_concurrency: DEFAULT_BACKEND_OPERATION_CONCURRENCY,
             restore_scan_timeout: DEFAULT_RESTORE_SCAN_TIMEOUT,
             cas_idempotency_cache: Arc::new(StdMutex::new(CasIdempotencyCache::default())),
+            lifecycle_policy: ConnectionLifecyclePolicy::default(),
+            reauthentication: SessionReauthenticationControl::new(),
         }
     }
 
@@ -1706,6 +1743,8 @@ impl SessionReplicationServer {
             backend_operation_concurrency: DEFAULT_BACKEND_OPERATION_CONCURRENCY,
             restore_scan_timeout: DEFAULT_RESTORE_SCAN_TIMEOUT,
             cas_idempotency_cache: Arc::new(StdMutex::new(CasIdempotencyCache::default())),
+            lifecycle_policy: ConnectionLifecyclePolicy::default(),
+            reauthentication: SessionReauthenticationControl::new(),
         }
     }
 
@@ -1761,6 +1800,29 @@ impl SessionReplicationServer {
         self
     }
 
+    /// Set the finite authentication, drain, and reconnect policy.
+    #[must_use]
+    pub fn with_connection_lifecycle(mut self, policy: ConnectionLifecyclePolicy) -> Self {
+        self.lifecycle_policy = policy;
+        self
+    }
+
+    /// Share an orchestration control that gracefully retires authenticated
+    /// connections through the bounded drain path.
+    #[must_use]
+    pub fn with_reauthentication_control(
+        mut self,
+        control: SessionReauthenticationControl,
+    ) -> Self {
+        self.reauthentication = control;
+        self
+    }
+
+    /// Control used by this listener for explicit graceful reauthentication.
+    pub fn reauthentication_control(&self) -> SessionReauthenticationControl {
+        self.reauthentication.clone()
+    }
+
     /// Bind and start accepting connections.
     pub async fn listen(
         self,
@@ -1789,6 +1851,12 @@ impl SessionReplicationServer {
             ));
         }
         let now = tokio::time::Instant::now();
+        if self.lifecycle_policy.validate_at(now).is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session connection lifecycle policy is not representable",
+            ));
+        }
         if now.checked_add(self.idle_timeout).is_none()
             || now
                 .checked_add(self.backend_operation_timeout)
@@ -1818,6 +1886,8 @@ impl SessionReplicationServer {
             restore_scan_timeout: self.restore_scan_timeout,
             restore_scan_slots: Arc::new(Semaphore::new(RESTORE_SCAN_CONCURRENCY)),
             cancellation: cancellation.clone(),
+            lifecycle_policy: self.lifecycle_policy,
+            reauthentication: self.reauthentication.clone(),
         };
         let connection_tasks = Arc::new(std::sync::Mutex::new(ConnectionTaskRegistry {
             stopping: false,
@@ -1837,12 +1907,11 @@ impl SessionReplicationServer {
                     _ = shutdown_rx.recv() => break,
                     accept_res = listener.accept() => {
                         match accept_res {
-                            Ok((stream, peer)) => {
+                            Ok((stream, _peer)) => {
                                 let backend = backend.clone();
                                 let tls_config = tls_config.clone();
                                 let cas_idempotency_cache = cas_idempotency_cache.clone();
                                 let dispatch_config = dispatch_config.clone();
-                                tracing::debug!(%peer, "accepted connection");
                                 let mut registry = connection_tasks_clone
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1862,7 +1931,6 @@ impl SessionReplicationServer {
                                     .await
                                     {
                                         tracing::debug!(
-                                            %peer,
                                             reason = connection_failure_reason(&error),
                                             "connection handler exited"
                                         );
@@ -1891,10 +1959,8 @@ impl SessionReplicationServer {
     }
 }
 
-fn session_server_tls_config(
-    config: &opc_tls::AuthenticatedServerConfig,
-) -> Arc<opc_tls::ServerConfig> {
-    let mut config = config.rustls_config().as_ref().clone();
+fn session_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tls::ServerConfig> {
+    let mut config = config.as_ref().clone();
     config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
     // A resumed session may authenticate from cached state rather than the
     // certificate currently selected by the reloadable SVID resolver. Disable
@@ -1934,16 +2000,159 @@ enum ConnectionPeerIdentity {
     InsecureTest,
 }
 
+struct PendingServerLifecycle {
+    handshake: Option<opc_tls::TlsServerHandshake>,
+    tls_config: Option<opc_tls::AuthenticatedServerConfig>,
+    peer_leaf_expiry: Option<opc_types::Timestamp>,
+    established_at: tokio::time::Instant,
+    generation: u64,
+}
+
+impl PendingServerLifecycle {
+    fn insecure(generation: u64) -> Self {
+        Self {
+            handshake: None,
+            tls_config: None,
+            peer_leaf_expiry: None,
+            established_at: tokio::time::Instant::now(),
+            generation,
+        }
+    }
+
+    fn admit(
+        self,
+        policy: ConnectionLifecyclePolicy,
+        admitted_generation: u64,
+    ) -> Result<
+        (
+            ConnectionLifecycle,
+            Option<opc_tls::AuthenticatedServerConfig>,
+        ),
+        ProtocolError,
+    > {
+        if admitted_generation != self.generation {
+            return Err(ProtocolError::Authentication);
+        }
+        let (local_expiry, epoch) = match self.handshake {
+            Some(handshake) => {
+                let admission = handshake
+                    .admit()
+                    .map_err(|_| ProtocolError::Authentication)?;
+                (
+                    Some(wall_expiry_deadline(
+                        admission.leaf_expires_at(),
+                        self.established_at,
+                    )),
+                    Some(admission.epoch()),
+                )
+            }
+            None => (None, None),
+        };
+        let lifecycle = ConnectionLifecycle::new(
+            policy,
+            self.established_at,
+            local_expiry,
+            self.peer_leaf_expiry
+                .map(|expiry| wall_expiry_deadline(expiry, self.established_at)),
+            self.generation,
+            epoch,
+        )
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
+        Ok((lifecycle, self.tls_config))
+    }
+}
+
+struct LifecycleTask(tokio::task::JoinHandle<()>);
+
+impl Drop for LifecycleTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn wait_server_material_change(receiver: &mut Option<opc_tls::TlsMaterialStatusReceiver>) {
+    let closed = match receiver.as_mut() {
+        Some(receiver) => receiver.changed().await.is_err(),
+        None => {
+            std::future::pending::<()>().await;
+            false
+        }
+    };
+    if closed {
+        *receiver = None;
+    }
+}
+
+fn spawn_connection_lifecycle(
+    mut lifecycle: ConnectionLifecycle,
+    peer_key: Vec<u8>,
+    tls_config: Option<opc_tls::AuthenticatedServerConfig>,
+    reauthentication: SessionReauthenticationControl,
+    server_cancellation: Arc<ServerCancellation>,
+    cancellation: Arc<ServerCancellation>,
+) -> (LifecycleTask, watch::Receiver<bool>) {
+    let (retirement_tx, retirement_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut reauthentication_rx = reauthentication.subscribe();
+        let mut material_rx = tls_config
+            .as_ref()
+            .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
+        loop {
+            let now = tokio::time::Instant::now();
+            lifecycle.observe_rotation(
+                now,
+                reauthentication.generation(),
+                tls_config
+                    .as_ref()
+                    .map(|config| config.material_status().epoch()),
+                &peer_key,
+            );
+            if lifecycle.retirement(now).is_some() {
+                retirement_tx.send_replace(true);
+                let hard_deadline = match lifecycle.hard_deadline() {
+                    Ok(deadline) => deadline,
+                    Err(_) => {
+                        cancellation.cancel();
+                        return;
+                    }
+                };
+                tokio::select! {
+                    _ = server_cancellation.cancelled() => cancellation.cancel(),
+                    _ = tokio::time::sleep_until(hard_deadline) => cancellation.cancel(),
+                }
+                return;
+            }
+            let retire_at = lifecycle.retire_at();
+            tokio::select! {
+                biased;
+                _ = server_cancellation.cancelled() => {
+                    cancellation.cancel();
+                    return;
+                }
+                _ = reauthentication_rx.changed() => {}
+                _ = wait_server_material_change(&mut material_rx) => {}
+                _ = tokio::time::sleep_until(retire_at) => {}
+            }
+        }
+    });
+    (LifecycleTask(task), retirement_rx)
+}
+
 async fn handle_connection(
     backend: Arc<dyn SessionStoreBackend>,
     stream: TcpStream,
-    tls_config: Option<Arc<opc_tls::ServerConfig>>,
+    tls_config: Option<opc_tls::AuthenticatedServerConfig>,
     cas_idempotency_cache: Arc<StdMutex<CasIdempotencyCache>>,
     dispatch_config: DispatchConfig,
 ) -> Result<(), ProtocolError> {
     let idle_timeout = dispatch_config.idle_timeout;
     if let Some(tls_config) = tls_config {
-        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+        let generation = dispatch_config.reauthentication.generation();
+        let handshake = tls_config
+            .begin_handshake()
+            .map_err(|_| ProtocolError::Authentication)?;
+        let acceptor =
+            tokio_rustls::TlsAcceptor::from(session_server_tls_config(handshake.rustls_config()));
         let tls_stream = tokio::time::timeout(idle_timeout, acceptor.accept(stream))
             .await
             .map_err(|_| {
@@ -1953,10 +2162,11 @@ async fn handle_connection(
                 ))
             })?
             .map_err(ProtocolError::Io)?;
+        let established_at = tokio::time::Instant::now();
         if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
             return Err(ProtocolError::Authentication);
         }
-        let peer_spiffe = opc_tls::peer_spiffe_id_from_server_connection(tls_stream.get_ref().1)
+        let peer = opc_tls::peer_tls_identity_from_server_connection(tls_stream.get_ref().1)
             .map_err(|_| ProtocolError::Authentication)?;
         let (mut r, mut w) = tokio::io::split(tls_stream);
         dispatch(
@@ -1964,7 +2174,14 @@ async fn handle_connection(
             cas_idempotency_cache,
             &mut r,
             &mut w,
-            ConnectionPeerIdentity::Authenticated(peer_spiffe),
+            ConnectionPeerIdentity::Authenticated(peer.spiffe_id().clone()),
+            PendingServerLifecycle {
+                handshake: Some(handshake),
+                tls_config: Some(tls_config),
+                peer_leaf_expiry: Some(peer.leaf_expires_at()),
+                established_at,
+                generation,
+            },
             dispatch_config,
         )
         .await
@@ -1976,6 +2193,7 @@ async fn handle_connection(
             &mut r,
             &mut w,
             ConnectionPeerIdentity::InsecureTest,
+            PendingServerLifecycle::insecure(dispatch_config.reauthentication.generation()),
             dispatch_config,
         )
         .await
@@ -1988,6 +2206,7 @@ async fn dispatch<R, W>(
     reader: &mut R,
     writer: &mut W,
     peer_identity: ConnectionPeerIdentity,
+    pending_lifecycle: PendingServerLifecycle,
     dispatch_config: DispatchConfig,
 ) -> Result<(), ProtocolError>
 where
@@ -2003,6 +2222,8 @@ where
         restore_scan_timeout,
         restore_scan_slots,
         cancellation,
+        lifecycle_policy,
+        reauthentication,
     } = dispatch_config;
 
     // Hello handshake — bounded so a peer that connects and stalls is reaped.
@@ -2212,12 +2433,57 @@ where
     )
     .await?;
 
+    // Application identity, manifest, nonce, version and exact profile have
+    // now completed. Admit the same immutable TLS material epoch only after
+    // that complete negotiation, then start the cooperative retirement clock.
+    let (mut lifecycle, lifecycle_tls_config) =
+        pending_lifecycle.admit(lifecycle_policy, reauthentication.generation())?;
+    let peer_key = directed_connection_key(
+        b"direct",
+        client_replica_id.as_str(),
+        binding.local_replica_id().as_str(),
+    )
+    .to_vec();
+    let now = tokio::time::Instant::now();
+    lifecycle.observe_rotation(
+        now,
+        reauthentication.generation(),
+        lifecycle_tls_config
+            .as_ref()
+            .map(|config| config.material_status().epoch()),
+        &peer_key,
+    );
+    if lifecycle.retirement(now).is_some() {
+        return Ok(());
+    }
+    let server_cancellation = cancellation;
+    let cancellation = Arc::new(ServerCancellation::default());
+    let (_lifecycle_task, mut retirement_rx) = spawn_connection_lifecycle(
+        lifecycle,
+        peer_key,
+        lifecycle_tls_config,
+        reauthentication,
+        server_cancellation,
+        cancellation.clone(),
+    );
+
     let transport_payload_limit = conservative_payload_budget(max_frame_size)
         .min(conservative_payload_budget(effective_response_frame_size));
 
     // Dispatch loop
     loop {
-        let inbound = match read_request_frame_within(reader, max_frame_size, idle_timeout).await {
+        if *retirement_rx.borrow() {
+            return Ok(());
+        }
+        let inbound_result = tokio::select! {
+            biased;
+            changed = retirement_rx.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            inbound = read_request_frame_within(reader, max_frame_size, idle_timeout) => inbound,
+        };
+        let inbound = match inbound_result {
             Ok(request) => request,
             Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
@@ -2704,7 +2970,7 @@ where
                             )?
                         } else {
                             let response = Response::ScanRestoreRecords(Ok(page));
-                            match write_frame_bounded_until_cancellable(
+                            match write_frame_until_server_cancellation(
                                 writer,
                                 &response,
                                 effective_max,
@@ -2819,7 +3085,7 @@ where
                 match res {
                     Ok(entries) => {
                         let response = Response::GetReplicationLog(Ok(entries));
-                        match write_frame_bounded_until_cancellable(
+                        match write_frame_until_server_cancellation(
                             writer,
                             &response,
                             effective_response_frame_size,
@@ -3192,13 +3458,13 @@ async fn write_bootstrap_ack<W>(
     accepted_response_frame_size: Option<u32>,
     server_request_frame_size: Option<u32>,
     timeout: std::time::Duration,
-    cancellation: &AtomicBool,
+    cancellation: &ServerCancellation,
 ) -> Result<(), ProtocolError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let deadline = response_write_deadline(timeout)?;
-    write_frame_bounded_until_cancellable(
+    write_frame_until_server_cancellation(
         writer,
         &BootstrapResponse::HelloAck(Box::new(BootstrapHelloAck {
             contract_version: CONTRACT_VERSION,
@@ -3224,13 +3490,13 @@ async fn reject_hello<W>(
     writer: &mut W,
     reason: HelloRejectReason,
     timeout: std::time::Duration,
-    cancellation: &AtomicBool,
+    cancellation: &ServerCancellation,
 ) -> Result<(), ProtocolError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let deadline = response_write_deadline(timeout)?;
-    write_frame_bounded_until_cancellable(
+    write_frame_until_server_cancellation(
         writer,
         &BootstrapResponse::HelloRejected { reason },
         MAX_HANDSHAKE_FRAME_SIZE,
@@ -3253,6 +3519,8 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId};
 
     static TEST_NOT_CANCELLED: AtomicBool = AtomicBool::new(false);
+    static TEST_SERVER_NOT_CANCELLED: std::sync::LazyLock<ServerCancellation> =
+        std::sync::LazyLock::new(ServerCancellation::default);
 
     struct DropSignal(Arc<AtomicBool>);
 
@@ -4084,7 +4352,7 @@ mod tests {
             budget,
             std::time::Duration::from_secs(1),
             ResponseFamily::Batch,
-            &TEST_NOT_CANCELLED,
+            &TEST_SERVER_NOT_CANCELLED,
         )
         .await
         .expect("write bounded batch fallback");
@@ -4109,7 +4377,7 @@ mod tests {
             budget,
             std::time::Duration::from_secs(1),
             ResponseFamily::Batch,
-            &TEST_NOT_CANCELLED,
+            &TEST_SERVER_NOT_CANCELLED,
         )
         .await
         .expect("write ambiguous mutation fallback");
@@ -4133,7 +4401,7 @@ mod tests {
             Response::WatchEntry(Ok(replication_log_entry(1, 8192))),
             budget,
             std::time::Duration::from_secs(1),
-            &TEST_NOT_CANCELLED,
+            &TEST_SERVER_NOT_CANCELLED,
         )
         .await
         .expect("write bounded watch fallback");
@@ -4170,7 +4438,7 @@ mod tests {
             response,
             MIN_NEGOTIATED_FRAME_SIZE,
             response_write_deadline(std::time::Duration::from_secs(1)).expect("deadline"),
-            &TEST_NOT_CANCELLED,
+            &TEST_SERVER_NOT_CANCELLED,
         )
         .await
         .expect_err("an over-depth backend watch item must fail closed");
@@ -4266,7 +4534,7 @@ mod tests {
                 exact,
                 std::time::Duration::from_secs(1),
                 family,
-                &TEST_NOT_CANCELLED,
+                &TEST_SERVER_NOT_CANCELLED,
             )
             .await
             .expect("exact response must fit");
@@ -4287,7 +4555,7 @@ mod tests {
                 one_over_budget,
                 std::time::Duration::from_secs(1),
                 family,
-                &TEST_NOT_CANCELLED,
+                &TEST_SERVER_NOT_CANCELLED,
             )
             .await
             .expect("one-over response must use the same-family fallback");
@@ -4333,7 +4601,7 @@ mod tests {
                 MIN_NEGOTIATED_FRAME_SIZE,
                 std::time::Duration::from_millis(25),
                 ResponseFamily::ReplicationLog,
-                &TEST_NOT_CANCELLED,
+                &TEST_SERVER_NOT_CANCELLED,
             )
             .await
             .expect_err("a non-reading peer must time out the fallback write");

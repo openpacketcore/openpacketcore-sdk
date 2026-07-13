@@ -20,6 +20,7 @@ pub mod client;
 pub mod consensus;
 pub mod error;
 pub mod identity;
+mod lifecycle;
 #[cfg(not(feature = "legacy-session-net-compat"))]
 mod protocol;
 #[cfg(feature = "legacy-session-net-compat")]
@@ -38,6 +39,11 @@ pub use identity::{
     LocalReplicaBinding, RemoteReplicaBinding, SessionClusterId, SessionConfigurationEpoch,
     SessionConfigurationGeneration, SessionConfigurationId, SessionManifestError,
     SessionReplicationManifest,
+};
+pub use lifecycle::{
+    ConnectionLifecycleError, ConnectionLifecyclePolicy, SessionReauthenticationControl,
+    DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
+    DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
 };
 pub use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId, ConsensusIdentity,

@@ -238,6 +238,37 @@ pub struct TlsMaterialController {
     inner: Arc<ControllerInner>,
 }
 
+/// Opaque event-driven subscription to coherent material publications.
+///
+/// The receiver exposes only the redaction-safe status. Source identity,
+/// certificate and key material never cross this boundary.
+pub struct TlsMaterialStatusReceiver {
+    controller: TlsMaterialController,
+    source_rx: watch::Receiver<Option<IdentityState>>,
+}
+
+impl TlsMaterialStatusReceiver {
+    /// Wait for a source publication, reconcile it, and return safe status.
+    pub async fn changed(&mut self) -> Result<TlsMaterialStatus, watch::error::RecvError> {
+        if let Err(closed) = self.source_rx.changed().await {
+            let _ = self.controller.status();
+            return Err(closed);
+        }
+        Ok(self.controller.status())
+    }
+
+    /// Current reconciled redaction-safe status.
+    pub fn status(&self) -> TlsMaterialStatus {
+        self.controller.status()
+    }
+}
+
+impl fmt::Debug for TlsMaterialStatusReceiver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TlsMaterialStatusReceiver([redacted])")
+    }
+}
+
 impl TlsMaterialController {
     /// Create a controller that pins the first accepted local SPIFFE identity.
     pub fn new(source_rx: watch::Receiver<Option<IdentityState>>) -> Self {
@@ -283,6 +314,14 @@ impl TlsMaterialController {
     pub fn subscribe_status(&self) -> watch::Receiver<TlsMaterialStatus> {
         self.refresh();
         self.inner.status_tx.subscribe()
+    }
+
+    /// Subscribe to source-driven changes while exposing safe status only.
+    pub fn subscribe_material_changes(&self) -> TlsMaterialStatusReceiver {
+        TlsMaterialStatusReceiver {
+            controller: self.clone(),
+            source_rx: self.source_receiver(),
+        }
     }
 
     pub(crate) fn source_receiver(&self) -> watch::Receiver<Option<IdentityState>> {

@@ -8,22 +8,23 @@ use opc_identity::{
     extract_spiffe_id_from_cert_der, IdentityState, SpiffeSanError, TrustBundle, TrustDomain,
     WorkloadIdentity,
 };
-use opc_types::{InstanceId, NfKind, SpiffeId, TenantId};
+use opc_types::{InstanceId, NfKind, SpiffeId, TenantId, Timestamp};
 use rustls::DistinguishedName;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::watch;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 mod material;
 pub use material::{
     TlsAdmittedConnection, TlsClientHandshake, TlsHandshakeOutcome, TlsHandshakeRunError,
     TlsMaterialAvailability, TlsMaterialController, TlsMaterialEpoch, TlsMaterialError,
-    TlsMaterialReloadReason, TlsMaterialStatus, TlsServerHandshake, MAX_TLS_CONCURRENT_HANDSHAKES,
-    MAX_TLS_HANDSHAKE_EPOCH_RETRIES, MAX_TLS_MATERIAL_CHAIN_CERTIFICATES,
-    MAX_TLS_MATERIAL_PRIVATE_KEY_BYTES, MAX_TLS_MATERIAL_TOTAL_BYTES,
-    MAX_TLS_MATERIAL_TRUST_ANCHORS, MAX_TLS_MATERIAL_TRUST_BUNDLES,
+    TlsMaterialReloadReason, TlsMaterialStatus, TlsMaterialStatusReceiver, TlsServerHandshake,
+    MAX_TLS_CONCURRENT_HANDSHAKES, MAX_TLS_HANDSHAKE_EPOCH_RETRIES,
+    MAX_TLS_MATERIAL_CHAIN_CERTIFICATES, MAX_TLS_MATERIAL_PRIVATE_KEY_BYTES,
+    MAX_TLS_MATERIAL_TOTAL_BYTES, MAX_TLS_MATERIAL_TRUST_ANCHORS, MAX_TLS_MATERIAL_TRUST_BUNDLES,
 };
 
 const TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
@@ -402,6 +403,11 @@ impl AuthenticatedClientConfig {
         self.controller.status()
     }
 
+    /// Drive source changes and expose only reconciled redaction-safe status.
+    pub fn subscribe_material_changes(&self) -> TlsMaterialStatusReceiver {
+        self.controller.subscribe_material_changes()
+    }
+
     /// Freeze one coherent client certificate/key/trust snapshot.
     ///
     /// Use the returned fixed config for TLS and call
@@ -510,6 +516,11 @@ impl AuthenticatedServerConfig {
         self.controller.status()
     }
 
+    /// Drive source changes and expose only reconciled redaction-safe status.
+    pub fn subscribe_material_changes(&self) -> TlsMaterialStatusReceiver {
+        self.controller.subscribe_material_changes()
+    }
+
     /// Freeze one coherent server certificate/key/trust snapshot.
     ///
     /// Use the returned fixed config for TLS and call
@@ -611,6 +622,32 @@ pub enum PeerSpiffeIdentityError {
     MalformedSpiffeId,
 }
 
+/// Redaction-safe identity and leaf-expiry evidence from one completed peer
+/// handshake.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerTlsIdentity {
+    spiffe_id: SpiffeId,
+    leaf_expires_at: Timestamp,
+}
+
+impl fmt::Debug for PeerTlsIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PeerTlsIdentity([redacted])")
+    }
+}
+
+impl PeerTlsIdentity {
+    /// Canonical SPIFFE identity authenticated on this connection.
+    pub const fn spiffe_id(&self) -> &SpiffeId {
+        &self.spiffe_id
+    }
+
+    /// Peer leaf-certificate expiry authenticated on this connection.
+    pub const fn leaf_expires_at(&self) -> Timestamp {
+        self.leaf_expires_at
+    }
+}
+
 impl From<SpiffeSanError> for PeerSpiffeIdentityError {
     fn from(error: SpiffeSanError) -> Self {
         match error {
@@ -637,6 +674,30 @@ fn peer_spiffe_id(
     extract_spiffe_id_from_cert_der(leaf.as_ref()).map_err(Into::into)
 }
 
+fn peer_tls_identity(
+    is_handshaking: bool,
+    peer_certificates: Option<&[CertificateDer<'static>]>,
+) -> Result<PeerTlsIdentity, PeerSpiffeIdentityError> {
+    if is_handshaking {
+        return Err(PeerSpiffeIdentityError::HandshakeIncomplete);
+    }
+    let leaf = peer_certificates
+        .and_then(|chain| chain.first())
+        .ok_or(PeerSpiffeIdentityError::PeerCertificateUnavailable)?;
+    let (remaining, certificate) = X509Certificate::from_der(leaf.as_ref())
+        .map_err(|_| PeerSpiffeIdentityError::MalformedCertificate)?;
+    if !remaining.is_empty() {
+        return Err(PeerSpiffeIdentityError::MalformedCertificate);
+    }
+    let not_after =
+        time::OffsetDateTime::from_unix_timestamp(certificate.validity().not_after.timestamp())
+            .map_err(|_| PeerSpiffeIdentityError::MalformedCertificate)?;
+    Ok(PeerTlsIdentity {
+        spiffe_id: extract_spiffe_id_from_cert_der(leaf.as_ref())?,
+        leaf_expires_at: Timestamp::from_offset_datetime(not_after),
+    })
+}
+
 /// Extract the server SPIFFE ID presented on a completed rustls client
 /// connection.
 ///
@@ -648,6 +709,14 @@ pub fn peer_spiffe_id_from_client_connection(
     peer_spiffe_id(connection.is_handshaking(), connection.peer_certificates())
 }
 
+/// Extract canonical identity and leaf expiry from a completed server
+/// certificate authenticated by a client connection.
+pub fn peer_tls_identity_from_client_connection(
+    connection: &rustls::ClientConnection,
+) -> Result<PeerTlsIdentity, PeerSpiffeIdentityError> {
+    peer_tls_identity(connection.is_handshaking(), connection.peer_certificates())
+}
+
 /// Extract the client SPIFFE ID presented on a completed rustls server
 /// connection.
 ///
@@ -657,6 +726,14 @@ pub fn peer_spiffe_id_from_server_connection(
     connection: &rustls::ServerConnection,
 ) -> Result<SpiffeId, PeerSpiffeIdentityError> {
     peer_spiffe_id(connection.is_handshaking(), connection.peer_certificates())
+}
+
+/// Extract canonical identity and leaf expiry from a completed client
+/// certificate authenticated by a server connection.
+pub fn peer_tls_identity_from_server_connection(
+    connection: &rustls::ServerConnection,
+) -> Result<PeerTlsIdentity, PeerSpiffeIdentityError> {
+    peer_tls_identity(connection.is_handshaking(), connection.peer_certificates())
 }
 
 pub struct TlsConfigBuilder {
@@ -1217,7 +1294,15 @@ mod policy_tests {
             Err(PeerSpiffeIdentityError::HandshakeIncomplete)
         );
         assert_eq!(
+            peer_tls_identity_from_client_connection(&client),
+            Err(PeerSpiffeIdentityError::HandshakeIncomplete)
+        );
+        assert_eq!(
             peer_spiffe_id_from_server_connection(&server),
+            Err(PeerSpiffeIdentityError::HandshakeIncomplete)
+        );
+        assert_eq!(
+            peer_tls_identity_from_server_connection(&server),
             Err(PeerSpiffeIdentityError::HandshakeIncomplete)
         );
 
@@ -1271,6 +1356,16 @@ mod policy_tests {
                 .as_str(),
             CLIENT_ID
         );
+        let server_evidence = peer_tls_identity_from_client_connection(&client).unwrap();
+        assert_eq!(server_evidence.spiffe_id().as_str(), SERVER_ID);
+        assert!(server_evidence.leaf_expires_at() > Timestamp::now_utc());
+        assert_eq!(
+            format!("{server_evidence:?}"),
+            "PeerTlsIdentity([redacted])"
+        );
+        let client_evidence = peer_tls_identity_from_server_connection(&server).unwrap();
+        assert_eq!(client_evidence.spiffe_id().as_str(), CLIENT_ID);
+        assert!(client_evidence.leaf_expires_at() > Timestamp::now_utc());
     }
 
     #[test]

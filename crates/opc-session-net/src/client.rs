@@ -35,6 +35,10 @@ use tokio::sync::Mutex;
 pub use crate::consensus::RemoteAddrResolver;
 use crate::error::ProtocolError;
 use crate::identity::RemoteReplicaBinding;
+use crate::lifecycle::{
+    directed_connection_key, wall_expiry_deadline, ConnectionLifecycle, ConnectionLifecyclePolicy,
+    SessionReauthenticationControl,
+};
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
     compare_and_set_result_matches_key, conservative_payload_budget, get_result_matches_key,
@@ -57,6 +61,7 @@ struct Connection {
     contract_profile: ContractProfile,
     frame_limits: NegotiatedFrameLimits,
     cas_idempotency_epoch: uuid::Uuid,
+    lifecycle: ConnectionLifecycle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,10 +317,8 @@ impl std::fmt::Display for RemoteTarget {
     }
 }
 
-fn session_client_tls_config(
-    config: &opc_tls::AuthenticatedClientConfig,
-) -> Arc<opc_tls::ClientConfig> {
-    let mut config = config.rustls_config().as_ref().clone();
+fn session_client_tls_config(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls::ClientConfig> {
+    let mut config = config.as_ref().clone();
     config.alpn_protocols = vec![SESSION_NET_ALPN.to_vec()];
     // Session identity is defined by the certificate presented on this exact
     // connection. A resumed TLS session can carry cached peer certificates and
@@ -328,43 +331,110 @@ fn session_client_tls_config(
 
 async fn open_connection(
     target: RemoteTarget,
-    tls_config: Option<Arc<opc_tls::ClientConfig>>,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     binding: RemoteReplicaBinding,
     requested_response_frame_size: usize,
     operation_deadline: tokio::time::Instant,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
 ) -> Result<Connection, ProtocolError> {
     // Reject unrepresentable or unusably small local budgets before DNS or a
     // socket allocation. The handshake repeats this conversion when building
     // the fixed-width field, keeping direct callers fail closed as well.
     checked_wire_frame_size(requested_response_frame_size)?;
-    let addr = target.resolve().await.map_err(ProtocolError::Io)?;
-    let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
-
     if let Some(tls_config) = tls_config {
-        let connector = tokio_rustls::TlsConnector::from(tls_config);
-        let server_name = target.tls_server_name(addr)?;
-        let tls_stream = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(classify_tls_connect_error)?;
-        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
-            return Err(ProtocolError::UnexpectedResponse);
-        }
-        let peer_spiffe = opc_tls::peer_spiffe_id_from_client_connection(tls_stream.get_ref().1)
-            .map_err(|_| ProtocolError::Authentication)?;
-        if peer_spiffe.as_str() != binding.remote_spiffe_id().as_str() {
-            return Err(ProtocolError::Authentication);
-        }
+        let (outcome, admitted_generation) = loop {
+            if tokio::time::Instant::now() >= operation_deadline {
+                return Err(ProtocolError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "session authentication deadline expired",
+                )));
+            }
+            let generation = reauthentication.generation();
+            let outcome = tls_config
+                .run_handshake(|attempt| {
+                    let target = target.clone();
+                    let binding = binding.clone();
+                    async move {
+                        let addr = target.resolve().await.map_err(ProtocolError::Io)?;
+                        let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
+                        let connector = tokio_rustls::TlsConnector::from(
+                            session_client_tls_config(attempt.rustls_config()),
+                        );
+                        let server_name = target.tls_server_name(addr)?;
+                        let tls_stream = connector
+                            .connect(server_name, tcp)
+                            .await
+                            .map_err(classify_tls_connect_error)?;
+                        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
+                            return Err(ProtocolError::UnexpectedResponse);
+                        }
+                        let peer = opc_tls::peer_tls_identity_from_client_connection(
+                            tls_stream.get_ref().1,
+                        )
+                        .map_err(|_| ProtocolError::Authentication)?;
+                        if peer.spiffe_id().as_str() != binding.remote_spiffe_id().as_str() {
+                            return Err(ProtocolError::Authentication);
+                        }
+                        let tls_completed_at = tokio::time::Instant::now();
 
-        let (mut reader, mut writer) = tokio::io::split(tls_stream);
-        let (contract_profile, frame_limits, cas_idempotency_epoch) = perform_client_handshake(
-            &mut reader,
-            &mut writer,
-            &binding,
-            requested_response_frame_size,
-            operation_deadline,
+                        let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                        let (contract_profile, frame_limits, cas_idempotency_epoch) =
+                            perform_client_handshake(
+                                &mut reader,
+                                &mut writer,
+                                &binding,
+                                requested_response_frame_size,
+                                operation_deadline,
+                            )
+                            .await?;
+                        Ok::<_, ProtocolError>((
+                            reader,
+                            writer,
+                            tls_completed_at,
+                            peer.leaf_expires_at(),
+                            contract_profile,
+                            frame_limits,
+                            cas_idempotency_epoch,
+                        ))
+                    }
+                })
+                .await
+                .map_err(|error| match error {
+                    opc_tls::TlsHandshakeRunError::Material(_) => ProtocolError::Authentication,
+                    opc_tls::TlsHandshakeRunError::Operation(error) => error,
+                })?;
+            if reauthentication.generation() == generation {
+                break (outcome, generation);
+            }
+            tracing::debug!(
+                reason = "explicit",
+                "session handshake retired before admission"
+            );
+        };
+        let admission = outcome.admission();
+        let (parts, _) = outcome.into_parts();
+        let (
+            reader,
+            writer,
+            established_at,
+            peer_expiry,
+            contract_profile,
+            frame_limits,
+            cas_idempotency_epoch,
+        ) = parts;
+        let lifecycle = ConnectionLifecycle::new(
+            lifecycle_policy,
+            established_at,
+            Some(wall_expiry_deadline(
+                admission.leaf_expires_at(),
+                established_at,
+            )),
+            Some(wall_expiry_deadline(peer_expiry, established_at)),
+            admitted_generation,
+            Some(admission.epoch()),
         )
-        .await?;
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
         Ok(Connection {
             reader: Box::new(reader),
             writer: Box::new(writer),
@@ -372,8 +442,11 @@ async fn open_connection(
             contract_profile,
             frame_limits,
             cas_idempotency_epoch,
+            lifecycle,
         })
     } else {
+        let addr = target.resolve().await.map_err(ProtocolError::Io)?;
+        let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
         let (mut reader, mut writer) = tokio::io::split(tcp);
         let (contract_profile, frame_limits, cas_idempotency_epoch) = perform_client_handshake(
             &mut reader,
@@ -383,6 +456,16 @@ async fn open_connection(
             operation_deadline,
         )
         .await?;
+        let established_at = tokio::time::Instant::now();
+        let lifecycle = ConnectionLifecycle::new(
+            lifecycle_policy,
+            established_at,
+            None,
+            None,
+            reauthentication.generation(),
+            None,
+        )
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
         Ok(Connection {
             reader: Box::new(reader),
             writer: Box::new(writer),
@@ -390,6 +473,7 @@ async fn open_connection(
             contract_profile,
             frame_limits,
             cas_idempotency_epoch,
+            lifecycle,
         })
     }
 }
@@ -673,10 +757,12 @@ fn discard_replication_entry_iteratively(entry: ReplicationEntry) {
 #[derive(Clone)]
 pub struct RemoteSessionBackend {
     target: RemoteTarget,
-    tls_config: Option<Arc<opc_tls::ClientConfig>>,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     binding: RemoteReplicaBinding,
     deadline: Duration,
     max_frame_size: usize,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
     conn: Arc<Mutex<Option<Connection>>>,
     negotiated_frame_limits: Arc<RwLock<Option<NegotiatedFrameLimits>>>,
     cached_capabilities:
@@ -716,12 +802,7 @@ impl RemoteSessionBackend {
         deadline: Option<Duration>,
     ) -> Self {
         let target = RemoteTarget::configured(&binding);
-        Self::from_transport(
-            target,
-            Some(session_client_tls_config(&tls_config)),
-            binding,
-            deadline,
-        )
+        Self::from_transport(target, Some(tls_config), binding, deadline)
     }
 
     /// Create a new mTLS remote backend client that re-resolves before each
@@ -741,7 +822,7 @@ impl RemoteSessionBackend {
         let server_name = binding.remote_endpoint().host().to_string();
         Self::from_transport(
             RemoteTarget::resolved(Some(server_name), resolve),
-            Some(session_client_tls_config(&tls_config)),
+            Some(tls_config),
             binding,
             deadline,
         )
@@ -776,7 +857,7 @@ impl RemoteSessionBackend {
 
     fn from_transport(
         target: RemoteTarget,
-        tls_config: Option<Arc<opc_tls::ClientConfig>>,
+        tls_config: Option<opc_tls::AuthenticatedClientConfig>,
         binding: RemoteReplicaBinding,
         deadline: Option<Duration>,
     ) -> Self {
@@ -786,6 +867,8 @@ impl RemoteSessionBackend {
             binding,
             deadline: deadline.unwrap_or(Duration::from_secs(2)),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            lifecycle_policy: ConnectionLifecyclePolicy::default(),
+            reauthentication: SessionReauthenticationControl::new(),
             conn: Arc::new(Mutex::new(None)),
             negotiated_frame_limits: Arc::new(RwLock::new(None)),
             cached_capabilities: Arc::new(RwLock::new(None)),
@@ -809,6 +892,31 @@ impl RemoteSessionBackend {
         self
     }
 
+    /// Set the finite authentication, drain, and reconnect policy.
+    #[must_use]
+    pub fn with_connection_lifecycle(mut self, policy: ConnectionLifecyclePolicy) -> Self {
+        self.lifecycle_policy = policy;
+        self.conn = Arc::new(Mutex::new(None));
+        self
+    }
+
+    /// Share an orchestration control that gracefully retires live requests
+    /// and reconnects watches without enabling plaintext or aborting tasks.
+    #[must_use]
+    pub fn with_reauthentication_control(
+        mut self,
+        control: SessionReauthenticationControl,
+    ) -> Self {
+        self.reauthentication = control;
+        self.conn = Arc::new(Mutex::new(None));
+        self
+    }
+
+    /// Control used by this client for explicit graceful reauthentication.
+    pub fn reauthentication_control(&self) -> SessionReauthenticationControl {
+        self.reauthentication.clone()
+    }
+
     async fn send_request_classified(
         &self,
         req: Request,
@@ -822,7 +930,7 @@ impl RemoteSessionBackend {
         let mut last_failure = None;
         let mut request_in_flight = true;
         let attempts = async {
-            let mut backoff_ms = 100u64;
+            let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
             loop {
                 request_in_flight = true;
                 match self.do_request(&req, operation_deadline, None).await {
@@ -834,8 +942,8 @@ impl RemoteSessionBackend {
                         }
                         last_failure = Some(failure);
                         request_in_flight = false;
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(1000);
+                        tokio::time::sleep(backoff).await;
+                        backoff = self.lifecycle_policy.next_backoff(backoff);
                     }
                 }
             }
@@ -1020,6 +1128,7 @@ impl RemoteSessionBackend {
         // response of the cancelled request to the next caller; taking it
         // means cancellation drops the connection and the next request
         // reconnects cleanly. Errors drop it for the same reason.
+        let now = tokio::time::Instant::now();
         let mut conn = match guard.take() {
             Some(conn) => conn,
             None => self
@@ -1027,7 +1136,25 @@ impl RemoteSessionBackend {
                 .await
                 .map_err(|error| RemoteRequestAttemptFailure::before_transmission(&error))?,
         };
-
+        conn.lifecycle.observe_rotation(
+            now,
+            self.reauthentication.generation(),
+            self.tls_config
+                .as_ref()
+                .map(|config| config.material_status().epoch()),
+            &directed_connection_key(
+                b"direct",
+                self.binding.local_replica_id().as_str(),
+                self.binding.remote_replica_id().as_str(),
+            ),
+        );
+        if let Some(reason) = conn.lifecycle.retirement(now) {
+            tracing::debug!(reason = reason.as_str(), "session connection retired");
+            conn = self
+                .connect(operation_deadline)
+                .await
+                .map_err(|error| RemoteRequestAttemptFailure::before_transmission(&error))?;
+        }
         let request = match req {
             Request::CompareAndSet { op, request_id, .. } => Request::CompareAndSet {
                 op: op.clone(),
@@ -1045,15 +1172,61 @@ impl RemoteSessionBackend {
             return Err(RemoteRequestAttemptFailure::from_store_preflight(error));
         }
 
-        match self
-            .exchange(
+        let mut lifecycle = conn.lifecycle;
+        let mut reauthentication_rx = self.reauthentication.subscribe();
+        let mut material_rx = self
+            .tls_config
+            .as_ref()
+            .map(opc_tls::AuthenticatedClientConfig::subscribe_material_changes);
+        let exchange_result = {
+            let exchange = self.exchange(
                 &request,
                 &mut conn,
                 operation_deadline,
                 transmission_started,
-            )
-            .await
-        {
+            );
+            tokio::pin!(exchange);
+            loop {
+                let now = tokio::time::Instant::now();
+                lifecycle.observe_rotation(
+                    now,
+                    self.reauthentication.generation(),
+                    self.tls_config
+                        .as_ref()
+                        .map(|config| config.material_status().epoch()),
+                    &directed_connection_key(
+                        b"direct",
+                        self.binding.local_replica_id().as_str(),
+                        self.binding.remote_replica_id().as_str(),
+                    ),
+                );
+                let hard_deadline = lifecycle
+                    .hard_deadline()
+                    .map_err(|_| {
+                        RemoteRequestAttemptFailure::before_transmission(
+                            &ProtocolError::InvalidWireValue,
+                        )
+                    })?
+                    .min(operation_deadline);
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(hard_deadline) => {
+                        break Err(RemoteRequestAttemptFailure {
+                            failure: RemoteRequestFailure::Timeout,
+                            request_may_have_reached_server: transmission_started
+                                .is_none_or(|started| started.load(Ordering::Acquire)),
+                            invalidates_contract: false,
+                        });
+                    }
+                    result = &mut exchange => break result,
+                    _ = reauthentication_rx.changed() => {}
+                    _ = wait_for_material_change(&mut material_rx) => {}
+                }
+            }
+        };
+        conn.lifecycle = lifecycle;
+
+        match exchange_result {
             Ok(resp) => {
                 if let Some(failure) = response_contract_failure(&request, &resp) {
                     discard_replication_payloads_from_response(resp);
@@ -1068,7 +1241,20 @@ impl RemoteSessionBackend {
                     contract_profile: conn.contract_profile,
                     frame_limits: conn.frame_limits,
                 };
-                if !requires_fresh_connection {
+                let now = tokio::time::Instant::now();
+                conn.lifecycle.observe_rotation(
+                    now,
+                    self.reauthentication.generation(),
+                    self.tls_config
+                        .as_ref()
+                        .map(|config| config.material_status().epoch()),
+                    &directed_connection_key(
+                        b"direct",
+                        self.binding.local_replica_id().as_str(),
+                        self.binding.remote_replica_id().as_str(),
+                    ),
+                );
+                if !requires_fresh_connection && conn.lifecycle.retirement(now).is_none() {
                     *guard = Some(conn);
                 }
                 Ok(response)
@@ -1092,6 +1278,8 @@ impl RemoteSessionBackend {
             self.binding.clone(),
             self.max_frame_size,
             operation_deadline,
+            self.lifecycle_policy,
+            self.reauthentication.clone(),
         )
         .await;
         if let Ok(connection) = &result {
@@ -1648,12 +1836,37 @@ impl SessionBackend for RemoteSessionBackend {
             self.binding.clone(),
             cursor,
             operation_deadline,
+            self.lifecycle_policy,
+            self.reauthentication.clone(),
         )
-        .await?;
+        .await
+        .map_err(watch_open_store_error)?;
 
         let (tx, rx) = tokio::sync::mpsc::channel(WATCH_CHANNEL_CAPACITY);
+        let terminal = Arc::new(std::sync::Mutex::new(None));
+        let task_terminal = terminal.clone();
+        let target = self.target.clone();
+        let tls_config = self.tls_config.clone();
+        let binding = self.binding.clone();
+        let lifecycle_policy = self.lifecycle_policy;
+        let reauthentication = self.reauthentication.clone();
+        let deadline = self.deadline;
+        let max_frame_size = self.max_frame_size;
         tokio::spawn(async move {
-            let result = read_watch_stream(connection, cursor, tx).await;
+            let result = read_watch_stream(
+                connection,
+                cursor,
+                tx,
+                target,
+                tls_config,
+                binding,
+                max_frame_size,
+                deadline,
+                lifecycle_policy,
+                reauthentication,
+                task_terminal,
+            )
+            .await;
             if let Err(e) = result {
                 tracing::debug!(
                     failure = RemoteRequestFailure::from_protocol_error(&e).reason_code(),
@@ -1662,7 +1875,11 @@ impl SessionBackend for RemoteSessionBackend {
             }
         });
 
-        Ok(Box::pin(WatchStream { rx }))
+        Ok(Box::pin(WatchStream {
+            rx,
+            terminal,
+            terminal_delivered: false,
+        }))
     }
 
     async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
@@ -1742,12 +1959,14 @@ impl SessionLeaseManager for RemoteSessionBackend {
 
 async fn open_watch_connection(
     target: RemoteTarget,
-    tls_config: Option<Arc<opc_tls::ClientConfig>>,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     max_frame_size: usize,
     binding: RemoteReplicaBinding,
     cursor: ReplicationWatchCursor,
     operation_deadline: tokio::time::Instant,
-) -> Result<Connection, StoreError> {
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
+) -> Result<Connection, WatchOpenFailure> {
     // Complete the dedicated watch handshake before returning a stream so a
     // typed backend rejection cannot be confused with a later disconnect.
     let open = async {
@@ -1757,6 +1976,8 @@ async fn open_watch_connection(
             binding,
             max_frame_size,
             operation_deadline,
+            lifecycle_policy,
+            reauthentication,
         )
         .await?;
         let watch = Request::Watch {
@@ -1792,58 +2013,195 @@ async fn open_watch_connection(
     };
     match tokio::time::timeout_at(operation_deadline, open).await {
         Ok(Ok(Ok(connection))) => Ok(connection),
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(error)) => {
-            let reason = RemoteRequestFailure::from_protocol_error(&error).reason_code();
-            Err(StoreError::BackendUnavailable(format!(
-                "remote session watch handshake failed: {reason}"
-            )))
-        }
-        Err(_) => Err(StoreError::BackendUnavailable(
-            "remote session watch handshake timed out".to_string(),
+        Ok(Ok(Err(error))) => Err(WatchOpenFailure::Backend(error)),
+        Ok(Err(error)) => Err(WatchOpenFailure::Remote(
+            RemoteRequestFailure::from_protocol_error(&error),
+        )),
+        Err(_) => Err(WatchOpenFailure::Remote(RemoteRequestFailure::Timeout)),
+    }
+}
+
+#[derive(Debug)]
+enum WatchOpenFailure {
+    Backend(StoreError),
+    Remote(RemoteRequestFailure),
+}
+
+fn watch_open_store_error(failure: WatchOpenFailure) -> StoreError {
+    match failure {
+        WatchOpenFailure::Backend(error) => error,
+        WatchOpenFailure::Remote(failure) => StoreError::BackendUnavailable(format!(
+            "remote session watch handshake failed: {}",
+            failure.reason_code()
         )),
     }
 }
 
+async fn wait_for_material_change(receiver: &mut Option<opc_tls::TlsMaterialStatusReceiver>) {
+    let closed = match receiver.as_mut() {
+        Some(receiver) => receiver.changed().await.is_err(),
+        None => {
+            std::future::pending::<()>().await;
+            false
+        }
+    };
+    if closed {
+        *receiver = None;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconnect_watch(
+    target: &RemoteTarget,
+    tls_config: &Option<opc_tls::AuthenticatedClientConfig>,
+    binding: &RemoteReplicaBinding,
+    max_frame_size: usize,
+    deadline: Duration,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: &SessionReauthenticationControl,
+    cursor: ReplicationWatchCursor,
+    tx: &tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
+) -> Result<Option<Connection>, StoreError> {
+    let mut backoff = lifecycle_policy.reconnect_backoff_min();
+    loop {
+        let Some(operation_deadline) = tokio::time::Instant::now().checked_add(deadline) else {
+            return Err(StoreError::BackendUnavailable(
+                "remote session watch deadline is not representable".to_string(),
+            ));
+        };
+        match open_watch_connection(
+            target.clone(),
+            tls_config.clone(),
+            max_frame_size,
+            binding.clone(),
+            cursor,
+            operation_deadline,
+            lifecycle_policy,
+            reauthentication.clone(),
+        )
+        .await
+        {
+            Ok(connection) => return Ok(Some(connection)),
+            Err(WatchOpenFailure::Remote(failure)) if failure.is_retryable() => {
+                tokio::select! {
+                    _ = tx.closed() => return Ok(None),
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = lifecycle_policy.next_backoff(backoff);
+            }
+            Err(failure) => return Err(watch_open_store_error(failure)),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn read_watch_stream(
     mut connection: Connection,
     cursor: ReplicationWatchCursor,
     tx: tokio::sync::mpsc::Sender<Result<ReplicationEntry, StoreError>>,
+    target: RemoteTarget,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
+    binding: RemoteReplicaBinding,
+    max_frame_size: usize,
+    deadline: Duration,
+    lifecycle_policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
+    terminal_error: Arc<std::sync::Mutex<Option<StoreError>>>,
 ) -> Result<(), ProtocolError> {
     let mut expected_sequence = cursor.first_sequence();
+    let mut reauthentication_rx = reauthentication.subscribe();
+    let mut material_rx = tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedClientConfig::subscribe_material_changes);
 
     loop {
-        match read_response_frame(
-            &mut connection.reader,
-            connection.frame_limits.response_frame_size,
-        )
-        .await
-        {
+        let now = tokio::time::Instant::now();
+        connection.lifecycle.observe_rotation(
+            now,
+            reauthentication.generation(),
+            tls_config
+                .as_ref()
+                .map(|config| config.material_status().epoch()),
+            &directed_connection_key(
+                b"direct",
+                binding.local_replica_id().as_str(),
+                binding.remote_replica_id().as_str(),
+            ),
+        );
+        let retired = connection.lifecycle.retirement(now);
+        let frame = if retired.is_some() {
+            Err(ProtocolError::Io(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "watch connection retired",
+            )))
+        } else {
+            let retire_at = connection.lifecycle.retire_at();
+            tokio::select! {
+                biased;
+                _ = tx.closed() => return Ok(()),
+                _ = reauthentication_rx.changed() => continue,
+                _ = wait_for_material_change(&mut material_rx) => continue,
+                _ = tokio::time::sleep_until(retire_at) => continue,
+                frame = read_response_frame(
+                    &mut connection.reader,
+                    connection.frame_limits.response_frame_size,
+                ) => frame,
+            }
+        };
+        match frame {
             Ok(Response::WatchEntry(Ok(entry))) => {
                 let entry = match entry.into_validated() {
                     Ok(entry) if entry.sequence == expected_sequence => entry,
                     Ok(entry) => {
                         discard_replication_payloads_from_response(Response::WatchEntry(Ok(entry)));
-                        let _ = tx.try_send(Err(StoreError::BackendUnavailable(
-                            "remote session watch failed: protocol".to_string(),
-                        )));
+                        set_watch_terminal(
+                            &terminal_error,
+                            StoreError::BackendUnavailable(
+                                "remote session watch failed: protocol".to_string(),
+                            ),
+                        );
                         break;
                     }
                     Err(_) => {
-                        let _ = tx.try_send(Err(StoreError::BackendUnavailable(
-                            "remote session watch failed: protocol".to_string(),
-                        )));
+                        set_watch_terminal(
+                            &terminal_error,
+                            StoreError::BackendUnavailable(
+                                "remote session watch failed: protocol".to_string(),
+                            ),
+                        );
                         break;
                     }
                 };
-                let terminal = expected_sequence == u64::MAX;
-                if !terminal {
-                    expected_sequence = next_replication_sequence(expected_sequence)
-                        .map_err(|_| ProtocolError::InvalidWireValue)?;
+                let terminal_sequence = expected_sequence == u64::MAX;
+                match tx.try_send(Ok(entry)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(item)) => {
+                        if let Ok(entry) = item {
+                            discard_replication_entry_iteratively(entry);
+                        }
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+                        if let Ok(entry) = item {
+                            discard_replication_entry_iteratively(entry);
+                        }
+                        set_watch_terminal(
+                            &terminal_error,
+                            StoreError::BackendUnavailable(
+                                "remote session watch consumer is too slow".to_string(),
+                            ),
+                        );
+                        break;
+                    }
                 }
-                if tx.try_send(Ok(entry)).is_err() || terminal {
+                if terminal_sequence {
                     break;
                 }
+                // Resume only after the item crossed the caller-visible
+                // delivery boundary. A disconnect before this point replays
+                // the item; one after it resumes at the checked successor.
+                expected_sequence = next_replication_sequence(expected_sequence)
+                    .map_err(|_| ProtocolError::InvalidWireValue)?;
             }
             Ok(Response::WatchEntry(Err(error))) => {
                 let error = if store_error_matches_class(&error, StoreResponseClass::Read) {
@@ -1853,24 +2211,56 @@ async fn read_watch_stream(
                         "remote session watch failed: protocol".to_string(),
                     )
                 };
-                let _ = tx.try_send(Err(error));
+                set_watch_terminal(&terminal_error, error);
                 break;
             }
             Ok(response) => {
                 discard_replication_payloads_from_response(response);
-                let _ = tx.try_send(Err(StoreError::BackendUnavailable(
-                    "unexpected watch frame".into(),
-                )));
+                set_watch_terminal(
+                    &terminal_error,
+                    StoreError::BackendUnavailable("unexpected watch frame".into()),
+                );
                 break;
             }
-            Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break;
+            Err(ProtocolError::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                let cursor = ReplicationWatchCursor::new(expected_sequence);
+                match reconnect_watch(
+                    &target,
+                    &tls_config,
+                    &binding,
+                    max_frame_size,
+                    deadline,
+                    lifecycle_policy,
+                    &reauthentication,
+                    cursor,
+                    &tx,
+                )
+                .await
+                {
+                    Ok(Some(reconnected)) => connection = reconnected,
+                    Ok(None) => break,
+                    Err(error) => {
+                        set_watch_terminal(&terminal_error, error);
+                        break;
+                    }
+                }
             }
             Err(e) => {
                 let reason = RemoteRequestFailure::from_protocol_error(&e).reason_code();
-                let _ = tx.try_send(Err(StoreError::BackendUnavailable(format!(
-                    "remote session watch failed: {reason}"
-                ))));
+                set_watch_terminal(
+                    &terminal_error,
+                    StoreError::BackendUnavailable(format!(
+                        "remote session watch failed: {reason}"
+                    )),
+                );
                 break;
             }
         }
@@ -1915,13 +2305,35 @@ fn store_error_kind(err: &StoreError) -> &'static str {
 
 struct WatchStream {
     rx: tokio::sync::mpsc::Receiver<Result<ReplicationEntry, StoreError>>,
+    terminal: Arc<std::sync::Mutex<Option<StoreError>>>,
+    terminal_delivered: bool,
 }
 
 impl Stream for WatchStream {
     type Item = Result<ReplicationEntry, StoreError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(None) if !self.terminal_delivered => {
+                let terminal = self
+                    .terminal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                self.terminal_delivered = terminal.is_some();
+                terminal.map_or(Poll::Ready(None), |error| Poll::Ready(Some(Err(error))))
+            }
+            result => result,
+        }
+    }
+}
+
+fn set_watch_terminal(terminal: &Arc<std::sync::Mutex<Option<StoreError>>>, error: StoreError) {
+    let mut slot = terminal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_none() {
+        *slot = Some(error);
     }
 }
 
@@ -2437,6 +2849,8 @@ mod tests {
                 crate::identity::insecure_test_client_binding(),
                 configured_frame_size,
                 deadline,
+                ConnectionLifecyclePolicy::default(),
+                SessionReauthenticationControl::new(),
             )
             .await
             {
