@@ -21,6 +21,10 @@ evidence.
 - `ReplicationEntry::validate_sequence`, `validate_replication_prefix`,
   `validate_replication_page`, and `next_replication_sequence` define the
   checked 1-based log-position contract shared by adapters and consumers.
+- `ReplicationLogRange`, `validate_replication_log_page`, and
+  `MAX_REPLICATION_LOG_PAGE_ENTRIES` (65,536) define the exact checked cursor
+  interval and returned-prefix contract shared by Fake/SQLite, wrappers,
+  Openraft, cache, and network boundaries.
 - `ReplicationTxId` makes the 1-through-128-byte durable idempotency/fork
   identity structural. New committed coordinator writes mint the fixed
   32-byte lowercase hexadecimal consensus request ID; valid legacy strings
@@ -130,7 +134,7 @@ evidence.
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 4, error-set revision 3,
+  Its profile pins wire-schema revision 4, error-set revision 4,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -143,8 +147,9 @@ evidence.
   Revision 2 added exact directional frame negotiation. Revision 3 replaces
   revision 2's inspectable cursor fields with the confidential authenticated
   token, adds the page cursor profile, and pins the 4 MiB payload plus 4,096
-  examined-candidate bounds; error-set revision 3 carries typed stale-cursor,
-  work-budget, and direct-CAS idempotency outcomes.
+  examined-candidate bounds. Error-set revision 3 carries typed restore
+  stale-cursor, work-budget, and direct-CAS idempotency outcomes; revision 4
+  adds the replication-log range, page-limit, and compacted-cursor outcomes.
   Hello requests the
   client's response limit, while HelloAck reports the accepted response limit
   and server request limit;
@@ -529,6 +534,44 @@ consensus frames, and snapshots, and that restart plus active-key rotation
 with retained historical local keys preserves decryptability. Seamless
 remote-seal historical-key selection is tracked by #179 and remains required
 before remote-seal rotation can be claimed.
+
+### Replication-log range cursor contract
+
+`get_replication_log(start, limit)` describes one inclusive checked interval.
+For both `start = 0` and `start = 1`, the first sequence is one. `limit = 0`
+returns an empty page before a backend lock, provider call, Openraft barrier,
+resolver lookup, or network operation. Otherwise the last admissible sequence
+is `max(start, 1) + limit - 1`; arithmetic overflow returns
+`InvalidReplicationLogRange`, and a limit above 65,536 returns
+`ReplicationLogPageTooLarge`. `start = u64::MAX, limit = 1` is valid;
+increasing that limit overflows. Empty logs, the terminal cursor immediately
+after the head, and any future cursor return an empty page.
+
+A non-empty result must start at the exact normalized cursor, remain
+contiguous, and end inside that interval. It may be shorter only because the
+current head or an outer encoded-frame budget was reached. The next request
+starts at the first unsent sequence; no adapter may move past it. A contiguous
+page before or after the requested range is a contract violation. Local
+wrappers and the server reject it before caller exposure; the compatibility
+client additionally drops the connection and cached capabilities before
+another request can re-handshake.
+
+When a requested sequence is no longer available, the adapter returns
+`ReplicationLogCursorCompacted { resume_from }`, where `resume_from` is the
+first sequence after the compacted floor. The resume point is not permission
+to discard history: install a coherent snapshot/rebuild through the existing
+Openraft or operator authority first, then resume incremental reads. A
+zero-limit request does not consult the floor. `ConsensusSessionStore`
+executes one linearizable Openraft barrier and reads only its local applied
+SQLite state; it never unions pages or compaction floors from replicas.
+Differing floors therefore produce typed local outcomes, not a synthetic page
+that skips committed history.
+
+These rules constrain range selection only. They do not create sequencing,
+commit, snapshot, restore, or watch authority and do not change payload
+envelopes, AAD, provider/HKMS placement, or encryption-at-rest composition.
+The quarantined session-net v4 error-set revision is now 4; drain and upgrade
+all compatibility participants together before restoring traffic.
 
 ### TTL input contract
 

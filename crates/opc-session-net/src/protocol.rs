@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, marker::PhantomData, time::Duration};
 
 use opc_session_store::backend::{
-    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp, ReplicationTxId,
-    SessionOp, SessionOpResult, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
-    MAX_REPLICATION_OPERATION_DEPTH,
+    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange, ReplicationOp,
+    ReplicationTxId, SessionOp, SessionOpResult, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -58,7 +58,7 @@ pub const MIN_SESSION_CONSENSUS_FRAME_SIZE: usize = 9 * 1024 * 1024;
 /// value limit while keeping per-connection response storage finite.
 pub const MAX_NEGOTIATED_FRAME_SIZE: usize = 16 * 1024 * 1024;
 pub const MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE: usize = MIN_NEGOTIATED_FRAME_SIZE;
-pub const MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES: usize = 65_536;
+pub const MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES: usize = MAX_REPLICATION_LOG_PAGE_ENTRIES;
 pub const MAX_SESSION_NET_BATCH_OPERATIONS: usize = 256;
 pub const MAX_SESSION_NET_REBUILD_ENTRIES: usize = 65_536;
 /// Maximum transport width for a digest-oriented session stable identifier.
@@ -117,7 +117,7 @@ pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractPr
     };
 
 const WIRE_SCHEMA_REVISION: u16 = 4;
-const ERROR_SET_REVISION: u16 = 3;
+const ERROR_SET_REVISION: u16 = 4;
 
 /// Exact semantic and resource-bound contract required by protocol v4.
 ///
@@ -985,7 +985,10 @@ pub(crate) fn validate_request_profile(request: &Request) -> Result<(), WireConv
             })?;
             Ok(())
         }
-        Request::GetReplicationLog { limit, .. } => {
+        Request::GetReplicationLog { start, limit } => {
+            ReplicationLogRange::try_new(*start, *limit).map_err(|_| {
+                WireConversionError("replication log range violates the v4 contract")
+            })?;
             wire_u32_from_usize(
                 *limit,
                 MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
@@ -1332,6 +1335,9 @@ enum WireStoreError {
     BackendUnavailable(String),
     InvalidKey(String),
     InvalidReplicationSequence,
+    InvalidReplicationLogRange,
+    ReplicationLogPageTooLarge { requested: u64, max: u64 },
+    ReplicationLogCursorCompacted { resume_from: u64 },
     ReplicationOperationLimitExceeded,
     InvalidSessionTtl,
     LeaseHeld,
@@ -1360,6 +1366,9 @@ enum WireStoreErrorRef<'a> {
     BackendUnavailable(&'a str),
     InvalidKey(&'a str),
     InvalidReplicationSequence,
+    InvalidReplicationLogRange,
+    ReplicationLogPageTooLarge { requested: u64, max: u64 },
+    ReplicationLogCursorCompacted { resume_from: u64 },
     ReplicationOperationLimitExceeded,
     InvalidSessionTtl,
     LeaseHeld,
@@ -1405,6 +1414,24 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             StoreError::BackendUnavailable(_) => Self::BackendUnavailable("backend unavailable"),
             StoreError::InvalidKey(_) => Self::InvalidKey("invalid key"),
             StoreError::InvalidReplicationSequence => Self::InvalidReplicationSequence,
+            StoreError::InvalidReplicationLogRange => Self::InvalidReplicationLogRange,
+            StoreError::ReplicationLogPageTooLarge { requested, max } => {
+                Self::ReplicationLogPageTooLarge {
+                    requested: wire_u64_from_usize(
+                        *requested,
+                        "replication page size exceeds the v4 wire range",
+                    )?,
+                    max: wire_u64_from_usize(
+                        *max,
+                        "replication page limit exceeds the v4 wire range",
+                    )?,
+                }
+            }
+            StoreError::ReplicationLogCursorCompacted { resume_from } => {
+                Self::ReplicationLogCursorCompacted {
+                    resume_from: *resume_from,
+                }
+            }
             StoreError::ReplicationOperationLimitExceeded => {
                 Self::ReplicationOperationLimitExceeded
             }
@@ -1466,6 +1493,22 @@ impl TryFrom<WireStoreError> for StoreError {
             }
             WireStoreError::InvalidKey(_) => Self::InvalidKey("invalid key".to_string()),
             WireStoreError::InvalidReplicationSequence => Self::InvalidReplicationSequence,
+            WireStoreError::InvalidReplicationLogRange => Self::InvalidReplicationLogRange,
+            WireStoreError::ReplicationLogPageTooLarge { requested, max } => {
+                Self::ReplicationLogPageTooLarge {
+                    requested: usize_from_wire_u64(
+                        requested,
+                        "replication page size is not representable on this peer",
+                    )?,
+                    max: usize_from_wire_u64(
+                        max,
+                        "replication page limit is not representable on this peer",
+                    )?,
+                }
+            }
+            WireStoreError::ReplicationLogCursorCompacted { resume_from } => {
+                Self::ReplicationLogCursorCompacted { resume_from }
+            }
             WireStoreError::ReplicationOperationLimitExceeded => {
                 Self::ReplicationOperationLimitExceeded
             }
@@ -2372,14 +2415,17 @@ impl TryFrom<WireRequest> for InboundRequest {
                 max_response_frame_size,
             },
             WireRequest::MaxReplicationSequence => Request::MaxReplicationSequence,
-            WireRequest::GetReplicationLog { start, limit } => Request::GetReplicationLog {
-                start,
-                limit: usize_from_wire_u32(
+            WireRequest::GetReplicationLog { start, limit } => {
+                let limit = usize_from_wire_u32(
                     limit,
                     MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
                     "replication log page exceeds the v4 operation limit",
-                )?,
-            },
+                )?;
+                ReplicationLogRange::try_new(start, limit).map_err(|_| {
+                    WireConversionError("replication log range violates the v4 contract")
+                })?;
+                Request::GetReplicationLog { start, limit }
+            }
             WireRequest::ReplicateEntry { entry } => match ReplicationEntry::try_from(entry) {
                 Ok(entry) => {
                     if let Err(error) = validate_replication_retained_profile(&entry) {
@@ -3848,7 +3894,7 @@ mod tests {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/4");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
         assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 4);
-        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 3);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 4);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
 
@@ -3857,7 +3903,7 @@ mod tests {
             profile,
             serde_json::json!({
                 "wire_schema_revision": 4,
-                "error_set_revision": 3,
+                "error_set_revision": 4,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 4194304,
                 "max_restore_scan_page_retained_bytes": 8388608,
@@ -3943,12 +3989,17 @@ mod tests {
     fn fixed_width_limits_and_size_errors_have_golden_v4_shapes() {
         let request = Request::GetReplicationLog {
             start: u64::MAX,
-            limit: MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
+            limit: 1,
         };
         assert_eq!(
             serde_json::to_string(&request).expect("request JSON"),
-            r#"{"GetReplicationLog":{"start":18446744073709551615,"limit":65536}}"#
+            r#"{"GetReplicationLog":{"start":18446744073709551615,"limit":1}}"#
         );
+        assert!(serde_json::to_vec(&Request::GetReplicationLog {
+            start: u64::MAX,
+            limit: 2,
+        })
+        .is_err());
         assert!(serde_json::to_vec(&Request::GetReplicationLog {
             start: 1,
             limit: MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES + 1,
@@ -4004,6 +4055,12 @@ mod tests {
             StoreError::BackendUnavailable("backend".to_string()),
             StoreError::InvalidKey("invalid".to_string()),
             StoreError::InvalidReplicationSequence,
+            StoreError::InvalidReplicationLogRange,
+            StoreError::ReplicationLogPageTooLarge {
+                requested: 2,
+                max: 1,
+            },
+            StoreError::ReplicationLogCursorCompacted { resume_from: 7 },
             StoreError::ReplicationOperationLimitExceeded,
             StoreError::InvalidSessionTtl,
             StoreError::LeaseHeld,

@@ -537,6 +537,38 @@ purge waits at most ten seconds for asynchronous snapshot apply to advance the
 durable floor; timeout stops the Openraft node rather than deleting unapplied
 history.
 
+### Replication-log range cursor operations
+
+Replication-log positions are inclusive and 1-based. `start = 0` is only the
+empty-head read sentinel and aliases sequence one; `limit = 0` returns before
+I/O. Every non-empty page must start at the exact normalized cursor, remain
+contiguous, and stay within the checked request interval of at most 65,536
+entries. Empty, terminal, and future cursors return an empty page. A request
+whose interval overflows, exceeds the page maximum, or names compacted history
+returns a distinct typed outcome. Frame-budget shortening leaves the first
+unsent entry as the next request; do not add one twice or infer progress from
+the requested limit.
+
+On `ReplicationLogCursorCompacted { resume_from }`, stop incremental replay.
+The resume point identifies the first position after the compacted floor; it is
+not evidence that the missing history was applied and is not authorization to
+skip it. Install a coherent Openraft snapshot or complete the approved
+operator recovery/rebuild path, verify fresh durable readiness, and only then
+resume at that point. Never splice pages from different replicas or select the
+largest resume point. The production store performs a linearizable barrier and
+reads one local applied state; replicas with temporarily different compaction
+floors return their own typed outcomes and cannot be unioned into a synthetic
+page.
+
+For the quarantined legacy session-net path, a page before or after the exact
+request is a peer contract violation. The client closes that connection and
+clears cached capabilities before re-handshake. Error-set revision 4 is an
+exact-profile transition: drain and stop every v4 compatibility client/server,
+upgrade them together, verify exact and shortened-page pagination plus typed
+compaction recovery, then restore traffic. This change does not alter
+Openraft commit authority, restore/watch cursors, payload envelopes, AAD,
+HKMS/KMS placement, or encrypted-at-rest composition.
+
 ### Session payload protection boundary
 
 The required production composition places protection above consensus:
@@ -749,7 +781,7 @@ live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
 configured frame bound remains
 separate. #159 now enforces that negotiated bound and one
 absolute write deadline across every ordinary response/watch item. The profile
-pins wire-schema revision 4, error-set revision 3,
+pins wire-schema revision 4, error-set revision 4,
 `max_restore_scan_examined_rows = 4096`,
 `min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
 owner/custom-key/state-type bounds,
@@ -758,7 +790,7 @@ owner/custom-key/state-type bounds,
 depth-16/256-node trees. Stable IDs contain 1 through 64 bytes, replication
 transaction IDs contain 1 through 128 UTF-8 bytes, and CAS request IDs, when
 present, are canonical lowercase hyphenated UUIDs with the exact 36-byte encoding. A
-revision-2 or older v4 participant is incompatible despite
+revision-3 or older v4 participant is incompatible despite
 sharing the same ALPN, so that profile transition also requires the coordinated
 stop/upgrade/start above. `ContractProfile::max_frame_size` is a public Rust
 source break for external struct literals/destructuring and must be updated in

@@ -9,7 +9,8 @@ use opc_session_store::{
     checked_session_deadline, Clock, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
     FakeSessionBackend, FenceToken, Generation, LeaseError, LeaseGuard, OwnerId, ReplicationEntry,
     ReplicationOp, SessionKey, SessionKeyType, SessionOp, SessionStoreBackend,
-    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, MAX_SESSION_TTL,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
+    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_SESSION_TTL,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -125,7 +126,7 @@ fn backend(kind: BackendKind, clock: Arc<FixedClock>) -> Arc<dyn SessionStoreBac
 
 async fn replication_log(backend: &dyn SessionStoreBackend) -> Vec<ReplicationEntry> {
     backend
-        .get_replication_log(1, usize::MAX)
+        .get_replication_log(1, MAX_REPLICATION_LOG_PAGE_ENTRIES)
         .await
         .expect("replication log")
 }

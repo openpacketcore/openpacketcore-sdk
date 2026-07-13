@@ -9,9 +9,10 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
 use opc_session_store::backend::{
-    validate_replication_page_owned, validate_replication_prefix_owned, BackendInstanceIdentity,
-    BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationOp,
-    SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+    validate_replication_log_page_owned, validate_replication_page_owned,
+    validate_replication_prefix_owned, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
+    CompareAndSetResult, ReplicationEntry, ReplicationLogRange, ReplicationOp, SessionBackend,
+    SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -38,8 +39,7 @@ use crate::protocol::{
     BootstrapHello, BootstrapRequest, BootstrapResponse, ContractProfile, Request, Response,
     RestoreScanWireRequest, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
     MAX_HANDSHAKE_FRAME_SIZE, MAX_SESSION_NET_BATCH_OPERATIONS, MAX_SESSION_NET_REBUILD_ENTRIES,
-    MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES, MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE,
-    SESSION_NET_ALPN,
+    MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE, SESSION_NET_ALPN,
 };
 
 /// Persistent transport connection to a remote session backend.
@@ -1151,8 +1151,9 @@ impl SessionBackend for RemoteSessionBackend {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        if limit > MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES {
-            return Err(StoreError::ReplicationOperationLimitExceeded);
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
         }
         match self
             .send_request_with_retry(Request::GetReplicationLog { start, limit })
@@ -1168,7 +1169,7 @@ impl SessionBackend for RemoteSessionBackend {
                         "remote replication page violated the protocol contract".to_string(),
                     ));
                 }
-                match validate_replication_page_owned(entries) {
+                match validate_replication_log_page_owned(start, limit, entries) {
                     Ok(entries) => Ok(entries),
                     Err(error) => {
                         self.discard_connection().await;
@@ -1441,6 +1442,9 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
         StoreError::InvalidReplicationSequence => "invalid_replication_sequence",
+        StoreError::InvalidReplicationLogRange => "invalid_replication_log_range",
+        StoreError::ReplicationLogPageTooLarge { .. } => "replication_log_page_too_large",
+        StoreError::ReplicationLogCursorCompacted { .. } => "replication_log_cursor_compacted",
         StoreError::ReplicationOperationLimitExceeded => "replication_operation_limit_exceeded",
         StoreError::InvalidSessionTtl => "invalid_session_ttl",
         StoreError::LeaseHeld => "lease_held",
@@ -2158,7 +2162,7 @@ mod tests {
             backend
                 .send_request_classified(Request::GetReplicationLog {
                     start: 1,
-                    limit: MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES + 1,
+                    limit: crate::MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES + 1,
                 })
                 .await,
             Err(RemoteRequestFailure::Protocol)
@@ -2973,6 +2977,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_replication_range_discards_connection_cache_and_rehandshakes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let server_handshakes = Arc::clone(&handshakes);
+        let server = tokio::spawn(async move {
+            for attempt in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("read hello");
+                server_handshakes.fetch_add(1, Ordering::SeqCst);
+                write_frame(&mut stream, &successful_hello_ack(&hello))
+                    .await
+                    .expect("write hello ack");
+
+                if attempt == 0 {
+                    let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                        .await
+                        .expect("read capabilities request");
+                    assert!(matches!(request, Request::Capabilities));
+                    write_frame(
+                        &mut stream,
+                        &Response::Capabilities(BackendCapabilities::all_enabled()),
+                    )
+                    .await
+                    .expect("write capabilities response");
+                }
+
+                let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("read replication-log request");
+                assert!(matches!(
+                    request,
+                    Request::GetReplicationLog { start: 2, limit: 1 }
+                ));
+                let mut entry = valid_deadline_entry();
+                entry.sequence = match attempt {
+                    0 => 100,
+                    1 => 1,
+                    _ => 2,
+                };
+                write_frame(&mut stream, &Response::GetReplicationLog(Ok(vec![entry])))
+                    .await
+                    .expect("write replication-log response");
+            }
+        });
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+
+        assert!(backend.capabilities().await.ordered_replication_log);
+        assert!(backend.cached_capabilities().is_some());
+        assert_eq!(
+            backend
+                .get_replication_log(2, 1)
+                .await
+                .expect_err("contiguous page after the requested range"),
+            StoreError::InvalidReplicationSequence
+        );
+        assert!(backend.conn.lock().await.is_none());
+        assert!(backend.cached_capabilities().is_none());
+
+        assert_eq!(
+            backend
+                .get_replication_log(2, 1)
+                .await
+                .expect_err("contiguous page before the requested range"),
+            StoreError::InvalidReplicationSequence
+        );
+        assert!(backend.conn.lock().await.is_none());
+
+        let page = backend
+            .get_replication_log(2, 1)
+            .await
+            .expect("next call reconnects with an exact page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].sequence, 2);
+        assert_eq!(handshakes.load(Ordering::SeqCst), 3);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn forged_watch_deadline_is_rejected() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3216,10 +3303,28 @@ mod tests {
         assert_eq!(batch_error, StoreError::ReplicationOperationLimitExceeded);
 
         let log_error = backend
-            .get_replication_log(1, MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES + 1)
+            .get_replication_log(1, crate::MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES + 1)
             .await
             .expect_err("oversized log page must fail locally");
-        assert_eq!(log_error, StoreError::ReplicationOperationLimitExceeded);
+        assert_eq!(
+            log_error,
+            StoreError::ReplicationLogPageTooLarge {
+                requested: crate::MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES + 1,
+                max: crate::MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES,
+            }
+        );
+        assert_eq!(
+            backend
+                .get_replication_log(u64::MAX, 2)
+                .await
+                .expect_err("overflowing log range must fail locally"),
+            StoreError::InvalidReplicationLogRange
+        );
+        assert!(backend
+            .get_replication_log(0, 0)
+            .await
+            .expect("zero-limit range must not resolve")
+            .is_empty());
 
         let lightweight_entry = ReplicationEntry {
             sequence: 1,

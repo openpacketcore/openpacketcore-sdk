@@ -675,6 +675,47 @@ async fn replication_logs(cluster: &TestCluster) -> Vec<Vec<opc_session_store::R
     .collect()
 }
 
+async fn assert_differing_replica_compaction_floors_never_union(cluster: &TestCluster) {
+    let logs = replication_logs(cluster).await;
+    assert!(logs.iter().all(|log| log == &logs[0]));
+    assert!(logs[0].len() >= MEMBER_COUNT);
+
+    // Test-only post-commit fault injection: no authoritative mutation follows
+    // these deliberately different local floors. The read contract must expose
+    // each typed outcome rather than constructing a cross-replica union page.
+    for (index, floor) in (1_i64..=3).enumerate() {
+        let connection = rusqlite::Connection::open(
+            cluster
+                ._directory
+                .path()
+                .join(format!("node-{index}.sqlite")),
+        )
+        .expect("open replica for deliberate compaction disagreement");
+        connection
+            .execute(
+                "UPDATE consensus_operator_recovery SET watch_cursor_invalidation_floor = ?1 WHERE singleton = 1",
+                [floor],
+            )
+            .expect("install deliberate local compaction floor");
+    }
+
+    let outcomes = futures_util::future::join_all(
+        cluster
+            .stores
+            .iter()
+            .map(|store| store.get_replication_log(1, MEMBER_COUNT)),
+    )
+    .await;
+    for (index, outcome) in outcomes.into_iter().enumerate() {
+        assert_eq!(
+            outcome.expect_err("a stale cursor must not be filled from another replica"),
+            StoreError::ReplicationLogCursorCompacted {
+                resume_from: u64::try_from(index + 2).expect("small resume point"),
+            }
+        );
+    }
+}
+
 fn assert_raw_consensus_guard<T>(result: Result<T, StoreError>) {
     assert!(matches!(
         result,
@@ -1052,6 +1093,7 @@ async fn writes_leases_and_cas_converge_with_linearizable_reads() {
         Err(StoreError::CapabilityNotSupported(capability))
             if capability == "direct_rebuild_authority"
     ));
+    assert_differing_replica_compaction_floors_never_union(&cluster).await;
 }
 
 #[tokio::test]

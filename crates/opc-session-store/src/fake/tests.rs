@@ -769,7 +769,9 @@ async fn fake_backend_bounds_tracked_keys_and_replication_log() {
     let compacted = backend.get_replication_log(1, 16).await.unwrap_err();
     assert_eq!(
         compacted,
-        StoreError::BackendUnavailable("replication log compacted before requested start".into())
+        StoreError::ReplicationLogCursorCompacted {
+            resume_from: max_sequence - 2,
+        }
     );
 
     let state = backend.inner.lock().await;

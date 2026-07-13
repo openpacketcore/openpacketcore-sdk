@@ -1,6 +1,6 @@
 use opc_session_store::{
     FakeSessionBackend, ReplicationEntry, ReplicationOp, SessionBackend, SqliteSessionBackend,
-    StoreError,
+    StoreError, MAX_REPLICATION_LOG_PAGE_ENTRIES,
 };
 use opc_types::Timestamp;
 use tempfile::NamedTempFile;
@@ -202,10 +202,20 @@ async fn sqlite_checks_signed_query_and_entry_boundaries() {
         StoreError::InvalidReplicationSequence
     );
     assert!(backend
-        .get_replication_log(u64::MAX, usize::MAX)
+        .get_replication_log(u64::MAX, 1)
         .await
         .expect("an out-of-range start must be an empty bounded query")
         .is_empty());
+    assert_eq!(
+        backend
+            .get_replication_log(1, MAX_REPLICATION_LOG_PAGE_ENTRIES + 1)
+            .await
+            .expect_err("an oversized page request must be rejected"),
+        StoreError::ReplicationLogPageTooLarge {
+            requested: MAX_REPLICATION_LOG_PAGE_ENTRIES + 1,
+            max: MAX_REPLICATION_LOG_PAGE_ENTRIES,
+        }
+    );
 }
 
 #[tokio::test]

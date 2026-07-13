@@ -723,6 +723,46 @@ progress. Any edit or mismatch MUST return `RestoreScanCursorStale` before the
 record query rather than skip, merge, or guess. Restore method availability
 alone is not readiness evidence.
 
+#### 11.2.3 Replication-Log Range Cursors
+
+`get_replication_log(start, limit)` MUST define one checked inclusive range.
+Sequence zero is a read-side empty-log sentinel and MUST normalize to inclusive
+sequence one; it remains invalid as an entry. A zero limit MUST return an empty
+page before backend I/O, provider work, an Openraft barrier, resolution, or
+network dispatch. A non-zero range begins at `max(start, 1)` and ends at that
+value plus `limit - 1`. The SDK-wide page limit MUST be 65,536 entries. A
+larger limit MUST return `ReplicationLogPageTooLarge`; interval overflow MUST
+return `InvalidReplicationLogRange`. `start = u64::MAX, limit = 1` is valid,
+while any larger non-zero interval from that start MUST fail overflow. An empty
+log, the terminal cursor immediately after the head, or a future cursor MUST
+return an empty page.
+
+A non-empty page MUST begin at the normalized first sequence, remain internally
+contiguous, and end no later than the checked last sequence. It MAY be shorter
+only at the current head or an outer response-frame boundary. Frame shaping
+MUST emit only the largest complete exact prefix and MUST leave the first
+unsent sequence as the next cursor. A backend or peer page wholly before or
+after the requested interval MUST fail with `InvalidReplicationSequence`
+before caller exposure. An authenticated compatibility client observing such
+a wire violation MUST discard both the connection and its cached capabilities
+before a later request re-handshakes.
+
+If compaction has removed the requested first sequence, the backend MUST return
+`ReplicationLogCursorCompacted { resume_from }`, where `resume_from` is the
+first sequence after the compacted floor. It MUST NOT silently substitute the
+first retained entry. The caller MUST install a coherent snapshot or rebuild
+through its existing authority before using that resume point; the error is not
+permission to discard missing history. A zero-limit request MUST NOT consult
+the compaction floor.
+
+After its linearizable barrier, `ConsensusSessionStore` MUST read one local
+applied state. It MUST NOT collect or union replication-log pages or compaction
+floors across replicas. Differing replica floors therefore yield typed local
+outcomes and cannot synthesize a page that skips committed history. This range
+contract does not create sequencing, commit, snapshot, restore, or watch
+authority and does not change payload envelopes, AAD, HKMS/provider placement,
+or encryption-at-rest boundaries.
+
 Replicas MUST apply events only if `generation` and `fence` are newer according
 to the state class rules.
 
@@ -785,7 +825,7 @@ Serde boundary MUST delegate to private fixed-width v4 DTOs. `Hello` and
 server's optional `cas_idempotency_epoch`, and direct CAS carries an optional
 `idempotency_epoch`. Exhaustive Rust construction and matching MUST account for
 the new fields. The profile pins wire-schema revision 4 and error-set revision
-3; owner, custom-key, and state-type
+4; owner, custom-key, and state-type
 bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `max_frame_size = 16777216`;
 `stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
@@ -813,7 +853,8 @@ The fixed-width mapping is:
 - restore/log request limits and the client restore-response budget: `u32`;
 - restore request/response cursors and restore excluded count: `u64`;
 - backend `max_value_bytes`: `u64`; and
-- `PayloadTooLarge.actual/max`, `RestoreScanPageTooLarge.requested/max`, and
+- `PayloadTooLarge.actual/max`, `RestoreScanPageTooLarge.requested/max`,
+  `ReplicationLogPageTooLarge.requested/max`, and
   `RestoreScanResponseTooLarge.max_bytes`: `u64`, including errors nested in
   batch results.
 
@@ -823,7 +864,9 @@ domain `usize` MUST be checked, and a non-representable value MUST fail before
 backend dispatch or caller exposure. Collection work MUST be bounded
 independently from encoded frame size: at most 256 batch operations, 1,024
 restore records, 65,536 replication-log entries, and 65,536 rebuild entries.
-The configured frame limit remains a separate encoded-byte bound.
+The configured frame limit remains a separate encoded-byte bound. Log requests
+and returned pages MUST also satisfy the exact range contract in §11.2.3 before
+dispatch or caller exposure.
 
 Wire-schema revision 2 MUST negotiate directional frame budgets during the
 frozen bootstrap. The client's requested response size, the server's accepted
@@ -966,8 +1009,9 @@ or traffic admission. A cache MUST be keyed by the exact profile and negotiated
 directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
-The v3-to-v4 transition, and same-v4 wire-schema transitions through revision 3,
-are coordinated stop/upgrade/start boundaries, not rolling
+The v3-to-v4 transition, and same-v4 exact-profile transitions through
+wire-schema revision 4 and error-set revision 4, are coordinated
+stop/upgrade/start boundaries, not rolling
 deployments. Operators MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore
 source, and replay source for the stable-ID and transaction-ID bounds; and

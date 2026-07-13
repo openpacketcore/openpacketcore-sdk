@@ -33,8 +33,9 @@ use super::{
     SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::backend::{
-    validate_replication_prefix_owned, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-    ReplicationEntry, SessionBackend, SessionOp, SessionOpResult,
+    validate_replication_log_page_owned, validate_replication_prefix_owned,
+    BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
+    ReplicationLogRange, SessionBackend, SessionOp, SessionOpResult,
 };
 use crate::capability::{BackendCapabilities, SessionStorePlatformProfile};
 use crate::clock::{Clock, SystemClock};
@@ -1297,11 +1298,19 @@ impl SessionBackend for ConsensusSessionStore {
         start: u64,
         limit: usize,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        let range = ReplicationLogRange::try_new(start, limit)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
         self.logical_read_time().await?;
-        self.inner
-            .backend
-            .consensus_get_replication_log(start, limit)
-            .await
+        validate_replication_log_page_owned(
+            start,
+            limit,
+            self.inner
+                .backend
+                .consensus_get_replication_log(start, limit)
+                .await?,
+        )
     }
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {

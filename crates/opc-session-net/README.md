@@ -187,14 +187,13 @@ confidential authenticated snapshot-bound
 restore cursor, explicit durable-page profile, fixed 4 MiB restore payload and
 8 MiB retained-page, 8 MiB examined-metadata, and 4,096 examined-candidate
 budgets, and adds exact configuration/process epoch binding for direct CAS.
-The error-set revision is 3. Directional budgets are
-part
-of the exact handshake. `requested_response_frame_size`,
+The error-set revision is 4. Directional budgets are part of the exact
+handshake. `requested_response_frame_size`,
 `accepted_response_frame_size`, and `server_request_frame_size` are public
 `Option<u32>` bootstrap fields so an older decoder can classify an otherwise
 decodable legacy minimal bootstrap. This is not bidirectional mismatch
 negotiation: an older decoder may reject unknown fields by simply closing.
-Exact revision-3 v4 admission requires each to be `Some`, at least
+Exact revision-4 v4 admission requires each to be `Some`, at least
 `MIN_NEGOTIATED_FRAME_SIZE` (8 KiB, or 8,192 bytes), and at most
 `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes). The profile pins
 both as `min_frame_size = 8192` and `max_frame_size = 16777216`.
@@ -203,8 +202,21 @@ second independently configurable limit. The accepted response size is the
 smaller of the client's receive limit and the server's configured frame limit;
 the server request size independently bounds frames sent by that client. This
 supports unequal client/server settings without assuming either configured
-limit applies in both directions. A revision-2 or older v4 peer is incompatible even
-though the ALPN remains `opc-session-net/4`.
+limit applies in both directions. A revision-3 or older v4 peer is incompatible
+even though the ALPN remains `opc-session-net/4`.
+
+Error-set revision 4 adds typed replication-log range overflow, page-limit,
+and compacted-cursor outcomes. A log request normalizes `start = 0` to one;
+`limit = 0` returns before resolution or network work; a non-empty result must
+start at the exact normalized cursor, remain contiguous, and stay within the
+checked inclusive interval of at most 65,536 entries. Empty/terminal/future
+cursors return an empty page. An otherwise contiguous peer page before or
+after the requested interval is a protocol violation: the client discards the
+connection and capability cache, then requires a fresh handshake. A response
+that exceeds the negotiated frame may expose only the largest complete exact
+prefix; the caller resumes at its first unsent sequence with no skip or
+duplicate. A typed compacted resume point may be used only after the product
+installs a coherent snapshot/rebuild through its existing authority path.
 
 Direct CAS uses a canonical request UUID plus the server's
 `cas_idempotency_epoch` from the authenticated `HelloAck`. The server binds
@@ -395,7 +407,7 @@ campaigns.
   adds public `ContractProfile::max_frame_size`, so external profile struct
   literals and exhaustive destructuring must be updated in the same
   coordinated change.
-- The v4 profile pins wire-schema revision 4 and error-set revision 3;
+- The v4 profile pins wire-schema revision 4 and error-set revision 4;
   `max_restore_scan_page_payload_bytes = 4194304`;
   `max_restore_scan_examined_rows = 4096`;
   `min_frame_size = 8192`; `max_frame_size = 16777216`; the 128-byte
@@ -418,7 +430,8 @@ campaigns.
   pre-v4 peer built before #135 can still send an empty or oversized value
   that a new peer rejects before dispatch, so unchanged valid JSON shape is not
   a rolling-compatibility claim.
-- Treat the v4 migration, including revision 2 to revision 3, as a
+- Treat every v4 exact-profile migration through wire-schema revision 4 and
+  error-set revision 4 as a
   coordinated stop/upgrade/start boundary. Drain
   traffic and writers, audit every persisted SQLite replica with the count-only
   `opc-session-store-audit identity-invariants` command, and separately

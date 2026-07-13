@@ -1505,8 +1505,8 @@ async fn remote_sealing_replication_log_seals_and_unseals_nested_batch_cas_recor
 async fn encrypting_wrapper_rejects_invalid_replication_metadata_before_crypto_or_delegation() {
     let key_provider = test_provider();
     let mut invalid_returned = vec![
-        test_replication_entry(1, "returned-one"),
-        test_replication_entry(3, "returned-gap"),
+        test_replication_entry(100, "returned-after-one"),
+        test_replication_entry(101, "returned-after-two"),
     ];
     for entry in &mut invalid_returned {
         let ReplicationOp::CompareAndSet { new_record, .. } = &mut entry.op else {
@@ -1584,10 +1584,25 @@ async fn encrypting_wrapper_rejects_invalid_replication_metadata_before_crypto_o
         "invalid TTL prefix reached wrapped backend"
     );
 
+    assert!(backend
+        .get_replication_log(0, 0)
+        .await
+        .expect("zero-limit range")
+        .is_empty());
+    assert_eq!(
+        backend
+            .get_replication_log(u64::MAX, 2)
+            .await
+            .expect_err("overflowing range must be rejected before delegation"),
+        StoreError::InvalidReplicationLogRange
+    );
+    assert_eq!(inner.log_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.calls(), 0);
+
     let returned_error = backend
         .get_replication_log(1, 2)
         .await
-        .expect_err("a gapped returned page must be rejected");
+        .expect_err("a contiguous page after the requested range must be rejected");
     assert_eq!(returned_error, StoreError::InvalidReplicationSequence);
     assert_eq!(inner.log_reads.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -1602,8 +1617,8 @@ async fn remote_sealing_wrapper_rejects_invalid_replication_metadata_before_prov
 {
     let seal_provider = test_remote_seal_provider();
     let mut invalid_returned = vec![
-        test_replication_entry(1, "returned-one"),
-        test_replication_entry(3, "returned-gap"),
+        test_replication_entry(1, "returned-before-one"),
+        test_replication_entry(2, "returned-before-two"),
     ];
     for entry in &mut invalid_returned {
         let ReplicationOp::CompareAndSet { new_record, .. } = &mut entry.op else {
@@ -1684,10 +1699,25 @@ async fn remote_sealing_wrapper_rejects_invalid_replication_metadata_before_prov
         "invalid TTL prefix reached wrapped backend"
     );
 
-    let returned_error = backend
-        .get_replication_log(1, 2)
+    assert!(backend
+        .get_replication_log(0, 0)
         .await
-        .expect_err("a gapped returned page must be rejected");
+        .expect("zero-limit range")
+        .is_empty());
+    assert_eq!(
+        backend
+            .get_replication_log(u64::MAX, 2)
+            .await
+            .expect_err("overflowing range must be rejected before delegation"),
+        StoreError::InvalidReplicationLogRange
+    );
+    assert_eq!(inner.log_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.calls(), 0);
+
+    let returned_error = backend
+        .get_replication_log(2, 2)
+        .await
+        .expect_err("a contiguous page before the requested range must be rejected");
     assert_eq!(returned_error, StoreError::InvalidReplicationSequence);
     assert_eq!(inner.log_reads.load(Ordering::SeqCst), 1);
     assert_eq!(
