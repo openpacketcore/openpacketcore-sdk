@@ -31,8 +31,9 @@ evidence.
   each `Batch`, counts toward the per-entry total.
 - `MAX_SESSION_TTL` (365 days), `validate_session_ttl`, and
   `checked_session_deadline` define the common checked TTL/deadline contract.
-- `SessionKey`, `SessionKeyType`, `StateClass`, `StateType`, `Generation`,
-  `OwnerId`, and `FenceToken` describe session identity and ownership.
+- `SessionKey`, bounded `StableId`, `SessionKeyType`, `StateClass`, `StateType`,
+  `Generation`, `OwnerId`, and `FenceToken` describe session identity and
+  ownership.
 - `CustomSessionKeyType` makes deployment-specific key-type invariants
   structural, and `sqlite::audit::audit_sqlite_identity_invariants` plus the
   `opc-session-store-audit` binary provide a bounded, read-only legacy-store
@@ -108,8 +109,8 @@ evidence.
   Cursors are backend-incarnation/node-bound: a same-PVC restart retains them,
   while mutation, scope reuse, token editing, another node, or an installed
   snapshot returns `RestoreScanCursorStale` and requires a first-page restart.
-  At the 2 MiB local consensus-key ceiling the hex cursor is roughly 4 MiB: it
-  remains bounded but does not fit the legacy adapter's 1 MiB default frame.
+  The seek identifier is model-bounded to 64 bytes, so the complete hex cursor
+  remains below 2 KiB and fits the legacy adapter's minimum frame.
   Exact response sizing returns typed `RestoreScanResponseTooLarge` without a
   partial frame unless peers negotiated a sufficient frame (up to 16 MiB).
 - `opc-session-net` protocol v4 can transport only the durable opaque restore
@@ -202,6 +203,25 @@ async fn open() -> Result<(), opc_session_store::StoreError> {
 
 ### Identity invariants and legacy SQLite admission
 
+`StableId` contains exactly 1 through 64 opaque bytes. Its private storage and
+fallible constructors make that invariant structural for direct Rust callers,
+Serde, Fake/SQLite/cache/Openraft stores, restore pages and cursors,
+replication/rebuild/watch values, and session-net facades. The JSON byte-array,
+wire, and SQLite BLOB representation of every compliant legacy value is
+unchanged. New SQLite tables also enforce BLOB type and width. Existing tables
+are not rewritten on open; their complete drained state must pass the offline
+audit described below.
+
+Raw SUPI/GPSI bytes are forbidden. Use
+`StableId::derive_hmac_sha256(tenant_privacy_key, tenant, canonical_subject)`
+with a tenant-specific KMS/HSM privacy key and a product-defined canonical
+subject representation. Privacy keys contain 16 through 64 bytes and canonical
+subjects contain 1 through 256 bytes, bounding every derivation. The SDK
+commits to one domain-separated, full-width 32-byte HMAC-SHA256 profile. It length-prefixes tenant and canonical subject
+with unsigned 64-bit big-endian lengths and does not support digest truncation.
+`SessionKey::digest_with_key` remains the separate digest of an already-built
+composite key; it is not a substitute for deriving a privacy-safe `stable_id`.
+
 `OwnerId` and a deployment-specific `SessionKeyType` name each contain exactly
 1 through 128 UTF-8 encoded bytes. The limit is bytes, not Unicode scalar
 values: for example, 64 two-byte `é` characters are accepted and 65 are not.
@@ -217,9 +237,11 @@ display, SQLite identity, key-digest input, and `Ord` all use the canonical
 string. Ordering therefore follows string order across known and custom values,
 not enum declaration order.
 
-Custom deserializers enforce the same bounds for Serde values. SQLite point
-reads validate persisted record owners; restore scans validate persisted key
-types and owners; lease acquire, renew, release, and fenced mutations validate
+Custom deserializers enforce the same bounds for Serde values and stop a stable
+ID sequence after the first byte beyond the fixed maximum. SQLite point reads
+validate persisted record owners; restore scans validate persisted stable IDs,
+key types and owners before retaining row-owned identity bytes; lease acquire,
+renew, release, and fenced mutations validate
 the stored active owner before using it; and replication-log hydration validates
 the complete nested entry. Session-net request and response decoding reuses
 those deserializers before backend dispatch or caller exposure. Errors are
@@ -252,10 +274,12 @@ consistent snapshot in fixed 256-row pages, and applies `--max-rows` across
 that order. The two JSON budgets bound individual and cumulative replication
 entries before strict `ReplicationEntry` decoding and domain validation.
 
-Report schema version 1 contains only the requested limits, per-table scanned
+Report schema version 2 contains only the requested limits, per-table scanned
 counts, violation counts (`invalid_owner_fields`,
-`invalid_session_key_type_fields`, and `invalid_replication_entries`), and an
-optional bounded `incomplete_reason`. It never emits the database path, row
+`invalid_session_key_type_fields`, `invalid_stable_id_fields`, and
+`invalid_replication_entries`), and an optional bounded `incomplete_reason`.
+Relational stable-ID validation reads only SQLite type and length. It never
+emits the database path, row
 identity, tenant, owner, key type, stable ID, payload, transaction, or raw JSON.
 The command contract is:
 
@@ -275,6 +299,13 @@ semantics, then audit the resulting snapshot again. The SDK and audit never
 truncate, rename, normalize, delete, or rewrite invalid identities or log
 entries automatically. Store replacement is the safer recovery when those
 semantics cannot be established.
+
+Run the same audit against every retained SQLite snapshot that could be
+installed or used as a restore/rebuild source. A non-compliant snapshot must be
+quarantined; after upgrade, take a fresh compliant snapshot before reopening
+rollback/recovery coverage. The complete operator procedure, including
+application-owned deterministic rekey requirements and rollback, is in
+[`session-store-stable-id-migration.md`](../../docs/session-store-stable-id-migration.md).
 
 The identity audit deliberately does not read, decrypt, or classify payload
 bytes in live records or nested `ReplicationOp::CompareAndSet` log entries;
@@ -309,10 +340,11 @@ and payload semantics. Oversized/newly invalid phases or classifications that
 cannot be proven need an equally reviewed semantic migration or store
 replacement.
 
-Accepted protocol-v4 identities keep the same JSON string shape, but the Rust
-API is source-breaking (`Other(String)` becomes
-`Other(CustomSessionKeyType)`, and `other` is fallible) and wire admission is
-semantically stricter. Handover decoding is also source-breaking:
+Accepted protocol-v4 identities keep the same JSON byte-array shape, but the
+Rust API is source-breaking (`SessionKey::stable_id` becomes `StableId`,
+`Other(String)` becomes `Other(CustomSessionKeyType)`, and both constructors
+are fallible) and wire admission is semantically stricter. Handover decoding is
+also source-breaking:
 `unpack_raw` now returns `Result`, `unpack_json` returns
 `HandoverEnvelopeDecodeError`, and `HandoverError` gains `InvalidEnvelope`.
 `pack_raw`/`pack_json` now write the versioned `OPCH` envelope; a compatible
@@ -693,12 +725,13 @@ transaction IDs, peer identities, or backend/peer-controlled error text.
   empty/over-64-byte stable IDs and empty/over-128-byte UTF-8 transaction IDs in
   retained records/logs. Before startup, use a decoder-first, product-aware
   migration or coherent store replacement: quiesce writers, ensure the migration
-  reader can decode the legacy representation, migrate under #167/#168 without
+  reader can decode the legacy representation, follow the #167 stable-ID runbook
+  and #168 without
   truncating or renaming durable identities, then verify with the strict decoder
   before enabling revision-3 writers. Rollback likewise installs a decoder for
   the retained target representation before old writers restart, or restores a
-  coherent checkpoint/reverse migration. #167 owns the production stable-ID
-  model/persistence/privacy/audit contract; #168 owns the durable canonical
+  coherent checkpoint/reverse migration. #167 now supplies the production
+  stable-ID model/persistence/privacy/audit contract; #168 owns the durable canonical
   transaction-ID type and migration coordinated with #127/#128/#143. This
   supplies no durable authority or distributed/payload-key qualification
   (#143). Shared real-mTLS tests now qualify a renewed SVID on a subsequent new

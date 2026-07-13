@@ -167,7 +167,9 @@ impl SqliteSessionBackend {
                 tenant TEXT NOT NULL,
                 nf_kind TEXT NOT NULL,
                 key_type TEXT NOT NULL,
-                stable_id BLOB NOT NULL,
+                stable_id BLOB NOT NULL CHECK (
+                    typeof(stable_id) = 'blob' AND length(stable_id) BETWEEN 1 AND 64
+                ),
                 generation INTEGER NOT NULL,
                 owner TEXT NOT NULL,
                 fence INTEGER NOT NULL,
@@ -208,7 +210,9 @@ impl SqliteSessionBackend {
                 tenant TEXT NOT NULL,
                 nf_kind TEXT NOT NULL,
                 key_type TEXT NOT NULL,
-                stable_id BLOB NOT NULL,
+                stable_id BLOB NOT NULL CHECK (
+                    typeof(stable_id) = 'blob' AND length(stable_id) BETWEEN 1 AND 64
+                ),
                 active INTEGER NOT NULL,
                 credential_id INTEGER NOT NULL,
                 owner TEXT NOT NULL,
@@ -229,7 +233,9 @@ impl SqliteSessionBackend {
                 tenant TEXT NOT NULL,
                 nf_kind TEXT NOT NULL,
                 key_type TEXT NOT NULL,
-                stable_id BLOB NOT NULL,
+                stable_id BLOB NOT NULL CHECK (
+                    typeof(stable_id) = 'blob' AND length(stable_id) BETWEEN 1 AND 64
+                ),
                 fence INTEGER NOT NULL,
                 PRIMARY KEY (tenant, nf_kind, key_type, stable_id)
             );

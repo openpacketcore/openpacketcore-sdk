@@ -448,7 +448,9 @@ fn session_key(label: impl AsRef<[u8]>) -> SessionKey {
         tenant: TenantId::new("consensus-test-tenant").expect("tenant"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::copy_from_slice(label.as_ref()),
+        stable_id: Bytes::copy_from_slice(label.as_ref())
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 

@@ -14,10 +14,11 @@ use thiserror::Error;
 
 use crate::{
     OwnerId, ReplicationEntry, SessionKeyType, OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES,
+    STABLE_ID_MAX_BYTES, STABLE_ID_MIN_BYTES,
 };
 
 /// Version of the count-only SQLite identity-audit report.
-pub const SQLITE_IDENTITY_AUDIT_REPORT_VERSION: u32 = 1;
+pub const SQLITE_IDENTITY_AUDIT_REPORT_VERSION: u32 = 2;
 
 /// Fixed number of SQLite rows requested by each bounded audit page.
 pub const SQLITE_IDENTITY_AUDIT_PAGE_ROWS: u32 = 256;
@@ -142,6 +143,7 @@ impl SqliteIdentityAuditScannedCounts {
 pub struct SqliteIdentityAuditViolationCounts {
     invalid_owner_fields: u64,
     invalid_session_key_type_fields: u64,
+    invalid_stable_id_fields: u64,
     invalid_replication_entries: u64,
 }
 
@@ -156,6 +158,11 @@ impl SqliteIdentityAuditViolationCounts {
         self.invalid_session_key_type_fields
     }
 
+    /// Empty, oversized, or non-BLOB stable identifiers in relational rows.
+    pub const fn invalid_stable_id_fields(self) -> u64 {
+        self.invalid_stable_id_fields
+    }
+
     /// Replication entries rejected by strict decode or domain validation.
     pub const fn invalid_replication_entries(self) -> u64 {
         self.invalid_replication_entries
@@ -164,6 +171,7 @@ impl SqliteIdentityAuditViolationCounts {
     const fn any(self) -> bool {
         self.invalid_owner_fields != 0
             || self.invalid_session_key_type_fields != 0
+            || self.invalid_stable_id_fields != 0
             || self.invalid_replication_entries != 0
     }
 }
@@ -346,6 +354,21 @@ impl AuditState {
         true
     }
 
+    fn increment_invalid_stable_id(&mut self) -> bool {
+        let Some(next) = self
+            .report
+            .violations
+            .invalid_stable_id_fields
+            .checked_add(1)
+        else {
+            self.report
+                .mark_incomplete(SqliteIdentityAuditIncompleteReason::CounterOverflow);
+            return false;
+        };
+        self.report.violations.invalid_stable_id_fields = next;
+        true
+    }
+
     fn increment_invalid_replication_entry(&mut self) -> bool {
         let Some(next) = self
             .report
@@ -433,9 +456,9 @@ pub fn audit_sqlite_identity_invariants(
 
 fn schema_is_supported(conn: &Connection) -> Result<bool, ()> {
     for (table, columns) in [
-        ("session_records", &["owner", "key_type"][..]),
-        ("leases", &["owner", "key_type"][..]),
-        ("key_fences", &["key_type"][..]),
+        ("session_records", &["owner", "key_type", "stable_id"][..]),
+        ("leases", &["owner", "key_type", "stable_id"][..]),
+        ("key_fences", &["key_type", "stable_id"][..]),
         ("session_replication_log", &["sequence", "entry_json"][..]),
     ] {
         for column in columns {
@@ -498,7 +521,8 @@ const SESSION_RECORDS_FIRST_PAGE: &str = r#"
                   AND length(CAST(owner AS BLOB)) <= ?1 THEN owner END,
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
-                  AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END
+                  AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
+           typeof(stable_id), length(stable_id)
     FROM session_records
     ORDER BY rowid
     LIMIT ?3
@@ -511,7 +535,8 @@ const SESSION_RECORDS_NEXT_PAGE: &str = r#"
                   AND length(CAST(owner AS BLOB)) <= ?1 THEN owner END,
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
-                  AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END
+                  AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
+           typeof(stable_id), length(stable_id)
     FROM session_records
     WHERE rowid > ?3
     ORDER BY rowid
@@ -525,7 +550,8 @@ const LEASES_FIRST_PAGE: &str = r#"
                   AND length(CAST(owner AS BLOB)) <= ?1 THEN owner END,
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
-                  AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END
+                  AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
+           typeof(stable_id), length(stable_id)
     FROM leases
     ORDER BY rowid
     LIMIT ?3
@@ -538,7 +564,8 @@ const LEASES_NEXT_PAGE: &str = r#"
                   AND length(CAST(owner AS BLOB)) <= ?1 THEN owner END,
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
-                  AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END
+                  AND length(CAST(key_type AS BLOB)) <= ?2 THEN key_type END,
+           typeof(stable_id), length(stable_id)
     FROM leases
     WHERE rowid > ?3
     ORDER BY rowid
@@ -627,6 +654,9 @@ fn scan_owner_and_key_type_table(
             if !key_type_field_is_valid(row, 4, 5, 6)? && !state.increment_invalid_key_type() {
                 return Ok(ScanControl::Stop);
             }
+            if !stable_id_field_is_valid(row, 7, 8)? && !state.increment_invalid_stable_id() {
+                return Ok(ScanControl::Stop);
+            }
             cursor = Some(rowid);
             rows_in_page = rows_in_page.checked_add(1).ok_or(())?;
         }
@@ -686,11 +716,25 @@ fn bounded_text_value(
     row.get(value_index).map_err(|_| ())
 }
 
+fn stable_id_field_is_valid(
+    row: &Row<'_>,
+    type_index: usize,
+    length_index: usize,
+) -> Result<bool, ()> {
+    let value_type: String = row.get(type_index).map_err(|_| ())?;
+    let byte_length: Option<i64> = row.get(length_index).map_err(|_| ())?;
+    let Some(byte_length) = byte_length.and_then(|value| usize::try_from(value).ok()) else {
+        return Ok(false);
+    };
+    Ok(value_type == "blob" && (STABLE_ID_MIN_BYTES..=STABLE_ID_MAX_BYTES).contains(&byte_length))
+}
+
 const KEY_FENCES_FIRST_PAGE: &str = r#"
     SELECT rowid,
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
-                  AND length(CAST(key_type AS BLOB)) <= ?1 THEN key_type END
+                  AND length(CAST(key_type AS BLOB)) <= ?1 THEN key_type END,
+           typeof(stable_id), length(stable_id)
     FROM key_fences
     ORDER BY rowid
     LIMIT ?2
@@ -700,7 +744,8 @@ const KEY_FENCES_NEXT_PAGE: &str = r#"
     SELECT rowid,
            typeof(key_type), length(CAST(key_type AS BLOB)),
            CASE WHEN typeof(key_type) = 'text'
-                  AND length(CAST(key_type AS BLOB)) <= ?1 THEN key_type END
+                  AND length(CAST(key_type AS BLOB)) <= ?1 THEN key_type END,
+           typeof(stable_id), length(stable_id)
     FROM key_fences
     WHERE rowid > ?2
     ORDER BY rowid
@@ -754,6 +799,9 @@ fn scan_key_fences(conn: &Connection, state: &mut AuditState) -> Result<ScanCont
                 return Ok(ScanControl::Stop);
             }
             if !key_type_field_is_valid(row, 1, 2, 3)? && !state.increment_invalid_key_type() {
+                return Ok(ScanControl::Stop);
+            }
+            if !stable_id_field_is_valid(row, 4, 5)? && !state.increment_invalid_stable_id() {
                 return Ok(ScanControl::Stop);
             }
             cursor = Some(rowid);

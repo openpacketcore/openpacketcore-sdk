@@ -60,7 +60,9 @@ fn test_key() -> SessionKey {
         tenant: tenant(),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(b"same-id"),
+        stable_id: Bytes::from_static(b"same-id")
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 

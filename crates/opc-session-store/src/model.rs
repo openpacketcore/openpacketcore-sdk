@@ -15,6 +15,7 @@ use hmac::{Hmac, Mac};
 use opc_types::{NetworkFunctionKind, TenantId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 /// Maximum UTF-8 encoded length accepted for a [`StateType`].
 pub const STATE_TYPE_MAX_BYTES: usize = 128;
@@ -25,6 +26,246 @@ pub const SESSION_KEY_TYPE_MAX_BYTES: usize = 128;
 
 /// Maximum UTF-8 encoded length accepted for an [`OwnerId`].
 pub const OWNER_ID_MAX_BYTES: usize = 128;
+
+/// Minimum encoded width of a production [`StableId`].
+pub const STABLE_ID_MIN_BYTES: usize = 1;
+
+/// Maximum encoded width of a production [`StableId`].
+///
+/// This model-wide limit is shared by local, durable, cache, quorum, restore,
+/// replication, watch, and session-network boundaries. It deliberately
+/// matches the session-network v4 contract so a locally admitted key is
+/// always representable by a production peer.
+pub const STABLE_ID_MAX_BYTES: usize = 64;
+
+/// Width of the canonical tenant-scoped HMAC-SHA256 stable identifier.
+pub const STABLE_ID_HMAC_SHA256_BYTES: usize = 32;
+
+/// Minimum accepted tenant privacy-key width for stable-ID derivation.
+pub const STABLE_ID_PRIVACY_KEY_MIN_BYTES: usize = 16;
+
+/// Maximum accepted tenant privacy-key width for stable-ID derivation.
+pub const STABLE_ID_PRIVACY_KEY_MAX_BYTES: usize = 64;
+
+/// Maximum canonical subject bytes hashed by one stable-ID derivation.
+pub const STABLE_ID_CANONICAL_SUBJECT_MAX_BYTES: usize = 256;
+
+const STABLE_ID_HMAC_SHA256_DOMAIN: &[u8] = b"openpacketcore/session-stable-id/hmac-sha256/v1";
+
+/// Redaction-safe reason that stable-identifier construction failed.
+///
+/// The error never contains the rejected bytes, a subscriber identifier, or
+/// the supplied privacy key, so it is safe to cross SDK and operator-facing
+/// boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum StableIdError {
+    /// The identifier was empty or exceeded the production width.
+    #[error("stable session identifier must contain 1 to 64 bytes")]
+    InvalidWidth,
+    /// Keyed derivation used a privacy key outside the supported width.
+    #[error("stable session identifier privacy key must contain 16 to 64 bytes")]
+    InvalidPrivacyKeyWidth,
+    /// Keyed derivation was requested with an empty canonical subject.
+    #[error("stable session identifier canonical subject must not be empty")]
+    EmptyCanonicalSubject,
+    /// Keyed derivation used an oversized canonical subject.
+    #[error("stable session identifier canonical subject exceeds 256 bytes")]
+    CanonicalSubjectTooLong,
+}
+
+/// Bounded opaque identifier within a session key's tenant/NF/type scope.
+///
+/// Values contain exactly `1..=64` bytes. The private representation makes
+/// that production invariant structural across direct Rust construction,
+/// Serde, persistence hydration, caches, quorum commands, restore pages,
+/// replication entries, watches, and network facades.
+///
+/// Raw SUPI/GPSI values are forbidden. Subscriber-derived identifiers should
+/// be created with [`StableId::derive_hmac_sha256`], using a tenant-specific
+/// privacy key and one canonical input representation. The supported keyed
+/// digest profile is HMAC-SHA256 at its full 32-byte width; truncation is not
+/// supported because it weakens collision resistance and creates divergent
+/// identities across callers.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StableId(Bytes);
+
+impl StableId {
+    /// Minimum accepted encoded width.
+    pub const MIN_BYTES: usize = STABLE_ID_MIN_BYTES;
+
+    /// Maximum accepted encoded width.
+    pub const MAX_BYTES: usize = STABLE_ID_MAX_BYTES;
+
+    /// Validate and construct an opaque stable identifier.
+    pub fn new(value: impl Into<Bytes>) -> Result<Self, StableIdError> {
+        let value = value.into();
+        if !(STABLE_ID_MIN_BYTES..=STABLE_ID_MAX_BYTES).contains(&value.len()) {
+            return Err(StableIdError::InvalidWidth);
+        }
+        Ok(Self(value))
+    }
+
+    /// Derive the canonical privacy-preserving stable identifier.
+    ///
+    /// The HMAC input is domain-separated and length-prefixes both the tenant
+    /// and the caller's canonical subject bytes. Deployments MUST use a
+    /// tenant-specific secret from their KMS/HSM and MUST normalize each
+    /// identifier type to one canonical byte representation before calling
+    /// this method. Neither input is retained.
+    pub fn derive_hmac_sha256(
+        tenant_privacy_key: &[u8],
+        tenant: &TenantId,
+        canonical_subject: &[u8],
+    ) -> Result<Self, StableIdError> {
+        if !(STABLE_ID_PRIVACY_KEY_MIN_BYTES..=STABLE_ID_PRIVACY_KEY_MAX_BYTES)
+            .contains(&tenant_privacy_key.len())
+        {
+            return Err(StableIdError::InvalidPrivacyKeyWidth);
+        }
+        if canonical_subject.is_empty() {
+            return Err(StableIdError::EmptyCanonicalSubject);
+        }
+        if canonical_subject.len() > STABLE_ID_CANONICAL_SUBJECT_MAX_BYTES {
+            return Err(StableIdError::CanonicalSubjectTooLong);
+        }
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(tenant_privacy_key)
+            .map_err(|_| StableIdError::InvalidPrivacyKeyWidth)?;
+        mac.update(STABLE_ID_HMAC_SHA256_DOMAIN);
+        update_len_prefixed_mac(&mut mac, tenant.as_str().as_bytes());
+        update_len_prefixed_mac(&mut mac, canonical_subject);
+        Ok(Self(Bytes::copy_from_slice(&mac.finalize().into_bytes())))
+    }
+
+    /// Borrow the validated opaque bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+
+    /// Encoded identifier width.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always false for a constructed value; provided for collection-like
+    /// compatibility at read-only call sites.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for StableId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StableId([redacted])")
+    }
+}
+
+impl AsRef<[u8]> for StableId {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl std::ops::Deref for StableId {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_bytes()
+    }
+}
+
+impl TryFrom<Bytes> for StableId {
+    type Error = StableIdError;
+
+    fn try_from(value: Bytes) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<Vec<u8>> for StableId {
+    type Error = StableIdError;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&[u8]> for StableId {
+    type Error = StableIdError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Self::new(Bytes::copy_from_slice(value))
+    }
+}
+
+impl From<[u8; STABLE_ID_HMAC_SHA256_BYTES]> for StableId {
+    fn from(value: [u8; STABLE_ID_HMAC_SHA256_BYTES]) -> Self {
+        Self(Bytes::copy_from_slice(&value))
+    }
+}
+
+impl Serialize for StableId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(self.as_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for StableId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StableIdVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for StableIdVisitor {
+            type Value = StableId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a stable session identifier containing 1 to 64 bytes")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                StableId::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                StableId::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let capacity = sequence.size_hint().unwrap_or(0).min(STABLE_ID_MAX_BYTES);
+                let mut bytes = Vec::with_capacity(capacity);
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    if bytes.len() == STABLE_ID_MAX_BYTES {
+                        return Err(serde::de::Error::custom(StableIdError::InvalidWidth));
+                    }
+                    bytes.push(byte);
+                }
+                StableId::try_from(bytes).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_bytes(StableIdVisitor)
+    }
+}
+
+fn update_len_prefixed_mac(mac: &mut Hmac<Sha256>, value: &[u8]) {
+    mac.update(&(value.len() as u64).to_be_bytes());
+    mac.update(value);
+}
 
 /// Classification of session state by consistency requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -373,7 +614,9 @@ impl<'de> Deserialize<'de> for SessionKeyType {
 ///
 /// Raw subscriber identifiers MUST NOT be used directly as `stable_id` in
 /// production; derive tenant-scoped keyed digests with
-/// [`SessionKey::digest_with_key`] for backend keys and correlation IDs.
+/// [`StableId::derive_hmac_sha256`]. [`SessionKey::digest_with_key`] is only a
+/// separate digest of an already-built composite key for correlation and does
+/// not construct `stable_id`.
 /// [`SessionKey::digest`] is provided only for non-privacy-sensitive,
 /// deterministic hashing.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -389,31 +632,12 @@ pub struct SessionKey {
     /// records of different shapes that share the same `stable_id`.
     pub key_type: SessionKeyType,
     /// Stable identifying bytes within the tenant/NF/type scope. MUST NOT be
-    /// a raw SUPI/GPSI in production; use a derived identifier and rely on
-    /// `SessionKey::digest_with_key` for backend keys. The `Debug` impl
-    /// redacts these bytes to keep subscriber identifiers out of logs.
-    #[serde(with = "bytes_serde")]
-    pub stable_id: Bytes,
-}
-
-mod bytes_serde {
-    use bytes::Bytes;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &Bytes, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(bytes.as_ref())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Bytes, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let v = Vec::<u8>::deserialize(deserializer)?;
-        Ok(Bytes::from(v))
-    }
+    /// a raw SUPI/GPSI in production; use [`StableId::derive_hmac_sha256`].
+    /// [`SessionKey::digest_with_key`] is only the separate digest of the
+    /// already-built composite key for correlation and does not construct this
+    /// field. The `Debug` impl redacts these bytes to keep subscriber
+    /// identifiers out of logs.
+    pub stable_id: StableId,
 }
 
 impl SessionKey {
@@ -698,7 +922,9 @@ mod tests {
             tenant: TenantId::new("tenant-a").unwrap(),
             nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"same-id"),
+            stable_id: Bytes::from_static(b"same-id")
+                .try_into()
+                .expect("valid stable ID"),
         }
     }
 
@@ -715,6 +941,95 @@ mod tests {
         assert_eq!(
             to_hex(digest),
             "4918bc64727d00bab80c09d4885fc7c61bed0e61ae6fa84e7f875bd8c6591813"
+        );
+    }
+
+    #[test]
+    fn stable_id_constructor_boundaries_are_exact() {
+        for (length, accepted) in [
+            (0, false),
+            (STABLE_ID_MIN_BYTES, true),
+            (STABLE_ID_MAX_BYTES, true),
+            (STABLE_ID_MAX_BYTES + 1, false),
+        ] {
+            let result = StableId::new(Bytes::from(vec![0xa5; length]));
+            assert_eq!(result.is_ok(), accepted, "stable ID length {length}");
+        }
+    }
+
+    #[test]
+    fn stable_id_json_reuses_bounds_and_redacts_failures() {
+        for (length, accepted) in [
+            (0, false),
+            (STABLE_ID_MIN_BYTES, true),
+            (STABLE_ID_MAX_BYTES, true),
+            (STABLE_ID_MAX_BYTES + 1, false),
+        ] {
+            let raw = vec![0xa5_u8; length];
+            let encoded = serde_json::to_string(&raw).unwrap();
+            let decoded = serde_json::from_str::<StableId>(&encoded);
+            assert_eq!(decoded.is_ok(), accepted, "stable ID length {length}");
+            if let Err(error) = decoded {
+                let rendered = error.to_string();
+                assert!(!rendered.contains("165"));
+                assert!(!rendered.contains(&encoded));
+            }
+        }
+
+        let stable_id = StableId::new(Bytes::from_static(b"subscriber-secret")).unwrap();
+        assert_eq!(format!("{stable_id:?}"), "StableId([redacted])");
+        assert!(!format!("{stable_id:?}").contains("subscriber-secret"));
+    }
+
+    #[test]
+    fn stable_id_keyed_derivation_is_tenant_scoped_and_full_width() {
+        let tenant_a = TenantId::from_static("tenant-a");
+        let tenant_b = TenantId::from_static("tenant-b");
+        let first = StableId::derive_hmac_sha256(
+            b"tenant-a-privacy-key",
+            &tenant_a,
+            b"canonical-supi-001010000000001",
+        )
+        .unwrap();
+        let repeated = StableId::derive_hmac_sha256(
+            b"tenant-a-privacy-key",
+            &tenant_a,
+            b"canonical-supi-001010000000001",
+        )
+        .unwrap();
+        let other_tenant = StableId::derive_hmac_sha256(
+            b"tenant-a-privacy-key",
+            &tenant_b,
+            b"canonical-supi-001010000000001",
+        )
+        .unwrap();
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_tenant);
+        assert_eq!(first.len(), STABLE_ID_HMAC_SHA256_BYTES);
+        assert_eq!(
+            first
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "c16a015f5237260ac501cd987c8c45e43b8bfb642a94c10bc245d2b2e9ab7676"
+        );
+        assert_eq!(
+            StableId::derive_hmac_sha256(b"", &tenant_a, b"canonical-supi-001010000000001"),
+            Err(StableIdError::InvalidPrivacyKeyWidth)
+        );
+        assert_eq!(
+            StableId::derive_hmac_sha256(b"tenant-a-privacy-key", &tenant_a, b""),
+            Err(StableIdError::EmptyCanonicalSubject)
+        );
+        assert_eq!(
+            StableId::derive_hmac_sha256(
+                b"tenant-a-privacy-key",
+                &tenant_a,
+                &vec![0xa5; STABLE_ID_CANONICAL_SUBJECT_MAX_BYTES + 1],
+            ),
+            Err(StableIdError::CanonicalSubjectTooLong)
         );
     }
 
@@ -923,7 +1238,9 @@ mod tests {
             tenant: TenantId::new("tenant-a").unwrap(),
             nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::copy_from_slice(raw_stable_id.as_bytes()),
+            stable_id: Bytes::copy_from_slice(raw_stable_id.as_bytes())
+                .try_into()
+                .expect("valid stable ID"),
         };
 
         let rendered = format!("{key:?}");
@@ -940,7 +1257,9 @@ mod tests {
             tenant: TenantId::new("tenant-a").unwrap(),
             nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::copy_from_slice(raw_stable_id.as_bytes()),
+            stable_id: Bytes::copy_from_slice(raw_stable_id.as_bytes())
+                .try_into()
+                .expect("valid stable ID"),
         };
         let owner = OwnerId::new("owner-a").unwrap();
         let lease = LeaseGuard::new(

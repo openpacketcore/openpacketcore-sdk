@@ -115,7 +115,7 @@ pub struct SessionKey {
     pub tenant: TenantId,
     pub nf_kind: NetworkFunctionKind,
     pub key_type: SessionKeyType,
-    pub stable_id: bytes::Bytes,
+    pub stable_id: StableId,
 }
 ```
 
@@ -127,8 +127,22 @@ Examples:
 - PFCP session SEID key.
 - Handover transaction key.
 
-Raw SUPI/GPSI MUST NOT be used directly as a backend key in production. The SDK
-SHOULD derive stable keys with a tenant-specific keyed hash.
+`StableId` has a structural `1..=64`-byte invariant shared by every local,
+SQLite, cache, quorum, restore, replication, watch, and session-net boundary.
+Valid pre-existing bytes retain their exact wire and SQLite representation.
+Empty or wider legacy values are not silently truncated or hashed; they fail
+the mandatory pre-upgrade audit and hydration.
+
+Raw SUPI/GPSI MUST NOT be used directly as a backend key in production.
+Subscriber-derived keys MUST use `StableId::derive_hmac_sha256` with a
+16-through-64-byte tenant-specific KMS/HSM privacy key and one product-defined
+1-through-256-byte canonical subject representation. The canonical profile is
+full-width 32-byte HMAC-SHA256 over
+the SDK domain followed by unsigned 64-bit big-endian length-prefixed tenant
+and subject bytes. Truncated keyed digests are not supported.
+
+See `docs/session-store-stable-id-migration.md` for the required count-only
+audit, coordinated remediation, snapshot handling, and rollback procedure.
 
 ### 5.1 Owner and Session-Key Type Invariants
 
@@ -161,8 +175,9 @@ and response decode. Invalid persisted or remote data MUST fail closed before
 mutation or caller exposure. Diagnostics MUST be fieldless or fixed and MUST
 NOT expose the owner, key type, stable ID, row, transaction, or raw entry.
 
-Valid protocol-v4 values retain their JSON string shape. This does not make the
-change rolling-compatible: replacing `Other(String)` with
+Valid protocol-v4 values retain their JSON byte-array shape. This does not make
+the change rolling-compatible: replacing `SessionKey::stable_id: Bytes` with
+`StableId` and replacing `Other(String)` with
 `Other(CustomSessionKeyType)` and making `SessionKeyType::other` fallible is a
 Rust source break. Both `HandoverEnvelope::unpack_raw` and
 `HandoverSessionRecord::unpack_raw` now return a typed `Result`; both public
@@ -197,12 +212,13 @@ pages, applies the row budget across `session_records`, `leases`,
 `key_fences`, and `session_replication_log`, and bounds individual and
 cumulative replication JSON before strict typed decode and domain validation.
 
-Report schema version 1 is count-only. It contains the supplied limits,
+Report schema version 2 is count-only. It contains the supplied limits,
 per-table scanned counts, counts for invalid owner fields, invalid session-key
-type fields, and invalid replication entries, and at most one bounded
-incomplete reason. It MUST NOT contain the database path, row identity, tenant,
-owner, key type, stable ID, payload, transaction, or raw JSON. The stable
-command outcomes are:
+type fields, invalid stable-ID fields, and invalid replication entries, and at
+most one bounded incomplete reason. Relational stable-ID checks read only
+SQLite type and length. It MUST NOT contain the database path, row identity,
+tenant, owner, key type, stable ID, payload, transaction, or raw JSON. The
+stable command outcomes are:
 
 - `compliant` on stdout with exit 0;
 - `violations_found` on stdout with exit 1;
@@ -219,6 +235,9 @@ and audit MUST NOT truncate, rename, normalize, delete, repair, or rewrite
 invalid identity or replication state automatically. A violation requires a
 separately reviewed product migration that preserves authoritative identity and
 history, or audited store replacement, followed by another complete audit.
+Every retained SQLite snapshot or restore/rebuild image that can become
+authoritative MUST pass the same audit. The normative operator procedure is
+`docs/session-store-stable-id-migration.md`.
 
 The identity audit MUST NOT be treated as a handover-payload preflight. It does
 not classify live payloads or payload bytes inside nested CAS log operations,

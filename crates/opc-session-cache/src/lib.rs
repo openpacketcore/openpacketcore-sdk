@@ -860,7 +860,9 @@ mod tests {
             tenant: TenantId::new("tenant-a").expect("tenant"),
             nf_kind: NetworkFunctionKind::from_static("amf"),
             key_type: SessionKeyType::SubscriberContext,
-            stable_id: Bytes::copy_from_slice(b"cache-key"),
+            stable_id: Bytes::copy_from_slice(b"cache-key")
+                .try_into()
+                .expect("valid stable ID"),
         }
     }
 

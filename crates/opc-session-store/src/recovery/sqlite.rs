@@ -1068,6 +1068,15 @@ fn validate_sealed_records(
         .map_err(|error| inspection_sql_error(error, budget))?
     {
         budget.consume_row()?;
+        match row
+            .get_ref(3)
+            .map_err(|error| inspection_sql_error(error, budget))?
+        {
+            ValueRef::Blob(value)
+                if (crate::STABLE_ID_MIN_BYTES..=crate::STABLE_ID_MAX_BYTES)
+                    .contains(&value.len()) => {}
+            _ => return Err(RecoveryError::CorruptReplica),
+        }
         for column in [0_usize, 1, 2, 3, 5, 7, 8, 9, 10] {
             match row
                 .get_ref(column)

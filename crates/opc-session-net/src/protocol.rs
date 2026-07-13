@@ -61,7 +61,7 @@ pub const MAX_SESSION_NET_REPLICATION_LOG_PAGE_ENTRIES: usize = 65_536;
 pub const MAX_SESSION_NET_BATCH_OPERATIONS: usize = 256;
 pub const MAX_SESSION_NET_REBUILD_ENTRIES: usize = 65_536;
 /// Maximum transport width for a digest-oriented session stable identifier.
-pub const MAX_SESSION_NET_STABLE_ID_BYTES: usize = 64;
+pub const MAX_SESSION_NET_STABLE_ID_BYTES: usize = opc_session_store::STABLE_ID_MAX_BYTES;
 /// Maximum UTF-8 width retained for a durable replication transaction ID.
 pub const MAX_SESSION_NET_REPLICATION_TX_ID_BYTES: usize = 128;
 /// Canonical hyphenated UUID width used by CAS idempotency request IDs.
@@ -3612,14 +3612,18 @@ mod tests {
             tenant: TenantId::new("tenant-a").expect("test tenant"),
             nf_kind: NetworkFunctionKind::new("smf").expect("test NF kind"),
             key_type: SessionKeyType::other(KEY_TYPE_SENTINEL).expect("test key type"),
-            stable_id: Bytes::from_static(b"protocol-invariant-boundary"),
+            stable_id: Bytes::from_static(b"protocol-invariant-boundary")
+                .try_into()
+                .expect("valid stable ID"),
         }
     }
 
-    fn test_session_key_with_stable_id_len(len: usize) -> SessionKey {
+    fn test_session_key_with_stable_id_len(
+        len: usize,
+    ) -> Result<SessionKey, opc_session_store::StableIdError> {
         let mut key = test_session_key();
-        key.stable_id = Bytes::from(vec![u8::MAX; len]);
-        key
+        key.stable_id = Bytes::from(vec![u8::MAX; len]).try_into()?;
+        Ok(key)
     }
 
     fn test_record(key: SessionKey, owner: OwnerId, fence: FenceToken) -> StoredSessionRecord {
@@ -4480,18 +4484,16 @@ mod tests {
             (MAX_SESSION_NET_STABLE_ID_BYTES, true),
             (MAX_SESSION_NET_STABLE_ID_BYTES + 1, false),
         ] {
-            let request = Request::Get {
-                key: test_session_key_with_stable_id_len(len),
-            };
-            assert_eq!(
-                serde_json::to_vec(&request).is_ok(),
-                accepted,
-                "outbound stable_id length {len}"
-            );
+            let key = test_session_key_with_stable_id_len(len);
+            assert_eq!(key.is_ok(), accepted, "direct stable_id length {len}");
+            if let Ok(key) = key {
+                assert!(serde_json::to_vec(&Request::Get { key }).is_ok());
+            }
         }
 
         let valid = serde_json::to_value(Request::Get {
-            key: test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES),
+            key: test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES)
+                .expect("maximum stable ID"),
         })
         .expect("maximum stable ID request");
         for (len, accepted) in [
@@ -4514,17 +4516,13 @@ mod tests {
             );
         }
 
-        let nested = Request::Batch {
-            ops: vec![SessionOp::Get {
-                key: test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES + 1),
-            }],
-        };
-        assert!(serde_json::to_vec(&nested).is_err());
+        assert!(test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES + 1).is_err());
     }
 
     #[test]
     fn replication_transaction_id_boundaries_are_exact_and_nested() {
-        let key = test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES);
+        let key = test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES)
+            .expect("maximum stable ID");
         let owner = OwnerId::new("replica-a").expect("owner");
         let base = replication_entry(replication_leaf(&key, &owner));
 
@@ -4596,27 +4594,19 @@ mod tests {
 
     #[tokio::test]
     async fn retained_identifier_profiles_cover_nested_requests_and_response_carriers() {
-        let valid_key = test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES);
-        let invalid_key = test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES + 1);
+        let valid_key = test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES)
+            .expect("maximum stable ID");
+        assert!(test_session_key_with_stable_id_len(MAX_SESSION_NET_STABLE_ID_BYTES + 1).is_err());
         let owner = OwnerId::new("replica-a").expect("owner");
         let backend = FakeSessionBackend::new();
         let valid_lease = backend
             .acquire(&valid_key, owner.clone(), Duration::from_secs(60))
             .await
             .expect("valid lease");
-        let invalid_lease = backend
-            .acquire(&invalid_key, owner.clone(), Duration::from_secs(60))
-            .await
-            .expect("model permits transport-oversized stable IDs");
         let valid_record = test_record(valid_key.clone(), owner.clone(), valid_lease.fence());
-        let invalid_record = test_record(invalid_key.clone(), owner.clone(), invalid_lease.fence());
 
         let valid_nested_entry = replication_entry(operation_at_depth(
             replication_leaf(&valid_key, &owner),
-            MAX_REPLICATION_OPERATION_DEPTH,
-        ));
-        let invalid_nested_entry = replication_entry(operation_at_depth(
-            replication_leaf(&invalid_key, &owner),
             MAX_REPLICATION_OPERATION_DEPTH,
         ));
 
@@ -4652,30 +4642,6 @@ mod tests {
             );
         }
 
-        let invalid_responses = vec![
-            Response::Get(Ok(Some(invalid_record.clone()))),
-            Response::Batch(Ok(vec![SessionOpResult::CompareAndSet(Ok(
-                CompareAndSetResult::Conflict {
-                    current: Some(invalid_record.clone()),
-                },
-            ))])),
-            Response::ScanRestoreRecords(Ok(RestoreScanPage::new(vec![invalid_record], 0, None))),
-            Response::AcquireLease(Ok(invalid_lease.clone())),
-            Response::RenewLease(Ok(invalid_lease)),
-            Response::GetReplicationLog(Ok(vec![invalid_nested_entry.clone()])),
-            Response::WatchEntry(Ok(invalid_nested_entry.clone())),
-        ];
-        for response in invalid_responses {
-            assert!(
-                serde_json::to_vec(&response).is_err(),
-                "transport-oversized stable ID must not be emitted"
-            );
-        }
-
-        assert!(serde_json::to_vec(&Request::RebuildReplicationState {
-            entries: vec![invalid_nested_entry]
-        })
-        .is_err());
         let mut valid_rebuild = serde_json::to_value(Request::RebuildReplicationState {
             entries: vec![valid_nested_entry],
         })
@@ -4692,7 +4658,7 @@ mod tests {
 
     #[tokio::test]
     async fn cas_request_ids_are_canonical_uuid_values_before_dispatch() {
-        let key = test_session_key_with_stable_id_len(1);
+        let key = test_session_key_with_stable_id_len(1).expect("minimum stable ID");
         let owner = OwnerId::new("replica-a").expect("owner");
         let backend = FakeSessionBackend::new();
         let lease = backend
@@ -4942,7 +4908,9 @@ mod tests {
                 tenant: TenantId::new("t").expect("minimum tenant"),
                 nf_kind: NetworkFunctionKind::new("x").expect("minimum NF kind"),
                 key_type: SessionKeyType::PduSession,
-                stable_id: Bytes::from_static(&[0]),
+                stable_id: Bytes::from_static(&[0])
+                    .try_into()
+                    .expect("valid stable ID"),
             },
             generation: Generation::new(1),
             owner: OwnerId::new("r").expect("minimum owner"),
@@ -4962,7 +4930,9 @@ mod tests {
                 .expect("maximum escaped key type"),
             // Use the complete digest-oriented transport allowance and
             // worst-case JSON byte values.
-            stable_id: Bytes::from(vec![u8::MAX; MAX_SESSION_NET_STABLE_ID_BYTES]),
+            stable_id: Bytes::from(vec![u8::MAX; MAX_SESSION_NET_STABLE_ID_BYTES])
+                .try_into()
+                .expect("maximum stable ID"),
         };
         let max_owner =
             OwnerId::new("\u{1}".repeat(OWNER_ID_MAX_BYTES)).expect("maximum escaped owner");

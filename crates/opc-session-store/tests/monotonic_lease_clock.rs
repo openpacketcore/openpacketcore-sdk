@@ -38,7 +38,9 @@ fn test_key() -> SessionKey {
         tenant: TenantId::new("tenant-a").expect("tenant"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::copy_from_slice(b"monotonic-lease"),
+        stable_id: Bytes::copy_from_slice(b"monotonic-lease")
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 

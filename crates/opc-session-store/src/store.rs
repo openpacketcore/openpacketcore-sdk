@@ -46,7 +46,7 @@ use crate::ttl::validate_session_ttl;
 ///     tenant: TenantId::new("ref-smf")?,
 ///     nf_kind: NetworkFunctionKind::new("smf")?,
 ///     key_type: SessionKeyType::PduSession,
-///     stable_id: bytes::Bytes::from_static(b"seid-1"),
+///     stable_id: bytes::Bytes::from_static(b"seid-1").try_into()?,
 /// };
 /// let lease = store.acquire(&key, owner, Duration::from_secs(60)).await?;
 /// # let _ = lease;
@@ -229,7 +229,9 @@ mod tests {
             tenant: TenantId::from_static("ref-smf"),
             nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"seid-1"),
+            stable_id: Bytes::from_static(b"seid-1")
+                .try_into()
+                .expect("valid stable ID"),
         };
         let lease = store
             .acquire(&key, owner.clone(), Duration::from_secs(60))

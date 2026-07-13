@@ -76,7 +76,9 @@ fn session_key(stable_id: &'static [u8]) -> SessionKey {
         tenant: tenant(),
         nf_kind: NetworkFunctionKind::new("amf").expect("nf kind"),
         key_type: SessionKeyType::SubscriberContext,
-        stable_id: Bytes::from_static(stable_id),
+        stable_id: Bytes::from_static(stable_id)
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 

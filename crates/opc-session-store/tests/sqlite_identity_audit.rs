@@ -5,7 +5,7 @@ use opc_session_store::sqlite::audit::{
 };
 use opc_session_store::{
     FenceToken, OwnerId, ReplicationEntry, ReplicationOp, SessionKey, SessionKeyType,
-    SqliteSessionBackend, OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES,
+    SqliteSessionBackend, OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_MAX_BYTES,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::{params, Connection};
@@ -76,7 +76,9 @@ fn replication_entry(sequence: u64, owner: &str) -> ReplicationEntry {
         tenant: TenantId::new("tenant-a").expect("tenant"),
         nf_kind: NetworkFunctionKind::new("smf").expect("nf kind"),
         key_type: SessionKeyType::other("audit-custom-key").expect("custom key"),
-        stable_id: Bytes::from(format!("session-{sequence}")),
+        stable_id: Bytes::from(format!("session-{sequence}"))
+            .try_into()
+            .expect("valid stable ID"),
     };
     ReplicationEntry {
         sequence,
@@ -158,6 +160,64 @@ fn relational_identity_violations_are_counted_without_values() {
     for sensitive in ["owner-sensitive", "key-sensitive", "tenant-a", "stable-"] {
         assert!(!rendered.contains(sensitive), "leaked {sensitive}");
     }
+}
+
+#[test]
+fn stable_id_audit_covers_exact_bounds_and_sqlite_types_without_values() {
+    let (_dir, path) = database();
+    let conn = Connection::open(&path).expect("open fixture");
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+        .expect("allow legacy-invalid audit fixtures");
+    for (rowid, stable_id) in [
+        (1_i64, vec![0x11_u8; 1]),
+        (2_i64, vec![0x22_u8; STABLE_ID_MAX_BYTES]),
+        (3_i64, Vec::new()),
+    ] {
+        conn.execute(
+            r#"
+            INSERT INTO session_records (
+                rowid, tenant, nf_kind, key_type, stable_id, generation, owner,
+                fence, state_class, state_type, expires_at, payload, encoding
+            ) VALUES (?1, 'tenant-a', 'smf', 'pdu-session', ?2, 1, 'owner-a', 1,
+                      'authoritative-session', 'test-state', NULL, X'', 0)
+            "#,
+            params![rowid, stable_id],
+        )
+        .expect("insert stable ID fixture");
+    }
+    conn.execute(
+        r#"
+        INSERT INTO leases (
+            rowid, tenant, nf_kind, key_type, stable_id, active,
+            credential_id, owner, fence, expires_at_unix_ms, guard_expires_at
+        ) VALUES (4, 'tenant-a', 'smf', 'pdu-session', ?1, 1, 1,
+                  'owner-a', 1, 1, '2030-01-01T00:00:00Z')
+        "#,
+        params![vec![0x33_u8; STABLE_ID_MAX_BYTES + 1]],
+    )
+    .expect("insert oversized lease stable ID");
+    let sensitive = "raw-subscriber-id-must-not-leak";
+    conn.execute(
+        r#"
+        INSERT INTO key_fences (
+            rowid, tenant, nf_kind, key_type, stable_id, fence
+        ) VALUES (5, 'tenant-a', 'smf', 'pdu-session', ?1, 1)
+        "#,
+        params![sensitive],
+    )
+    .expect("insert wrong-type fence stable ID");
+    drop(conn);
+
+    let report =
+        audit_sqlite_identity_invariants(&path, limits(10, 1024, 1024)).expect("audit succeeds");
+    assert_eq!(report.status(), SqliteIdentityAuditStatus::ViolationsFound);
+    assert_eq!(report.violations().invalid_stable_id_fields(), 3);
+    assert_eq!(report.scanned().session_records(), 3);
+    assert_eq!(report.scanned().leases(), 1);
+    assert_eq!(report.scanned().key_fences(), 1);
+    assert!(!serde_json::to_string(&report)
+        .expect("report JSON")
+        .contains(sensitive));
 }
 
 #[test]

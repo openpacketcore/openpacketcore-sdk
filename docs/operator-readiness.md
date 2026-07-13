@@ -265,7 +265,7 @@ For every existing SQLite replica, the operator sequence is:
    length range. Size `--max-rows` for the
    combined row count across `session_records`, `leases`, `key_fences`, and
    `session_replication_log`, not per table.
-4. Accept only report schema version 1 with `status = compliant` and process
+4. Accept only report schema version 2 with `status = compliant` and process
    exit 0. This means the complete drained snapshot fit the budgets and had no
    observed invariant violations; it says nothing about quorum, commit
    authority, or a different snapshot.
@@ -283,14 +283,17 @@ For every existing SQLite replica, the operator sequence is:
    authenticated v4 handshakes, restore/log reads, and fresh quorum gate, then
    restore traffic.
 
-The command opens only an existing database in read-only/query-only mode and
-scans one consistent snapshot in fixed 256-row pages. `--max-rows` bounds all
+Run this command against the live SQLite file and every retained SQLite
+snapshot that could become a restore/rebuild source. The command opens only an
+existing database in read-only/query-only mode and scans one consistent
+snapshot in fixed 256-row pages. `--max-rows` bounds all
 audited rows; `--max-entry-json-bytes` and `--max-total-json-bytes` bound strict
-decode of the individual and cumulative replication JSON. Version-1 output is
+decode of the individual and cumulative replication JSON. Version-2 output is
 count-only: supplied limits, per-table scanned counts, invalid-owner,
-invalid-key-type, and invalid-replication-entry counts, plus an optional bounded
-incomplete reason. It does not print the database path, row IDs, tenant, owner,
-key type, stable ID, transaction, payload, or raw JSON.
+invalid-key-type, invalid-stable-ID, and invalid-replication-entry counts, plus
+an optional bounded incomplete reason. Relational stable IDs are inspected by
+SQLite type and length only. It does not print the database path, row IDs,
+tenant, owner, key type, stable ID, transaction, payload, or raw JSON.
 
 An incomplete reason is one of `row_budget_exceeded`,
 `entry_json_budget_exceeded`, `total_json_budget_exceeded`,
@@ -756,12 +759,10 @@ retains the cursor key and epoch and can resume a page. Another node or an
 installed snapshot has a different cursor incarnation and returns typed
 `RestoreScanCursorStale`; the operator/CNF must discard partial pagination and
 restart from the first page. Do not merge pages across nodes or snapshots.
-The maximum local consensus-key cursor is roughly 4 MiB after hex encoding, so
-it does not fit session-net's 1 MiB default frame. The compatibility server
-returns typed `RestoreScanResponseTooLarge` without writing a partial frame;
-only a sufficiently large negotiated frame (bounded at 16 MiB) can carry it.
-The session-net record profile remains independently limited to 64-byte stable
-IDs.
+The model-wide 64-byte stable-ID bound keeps the complete hex cursor below
+2 KiB, so it fits session-net's minimum frame. The compatibility server still
+returns typed `RestoreScanResponseTooLarge` without writing a partial frame for
+an otherwise oversized page.
 
 A mutation may commit before response encoding or delivery fails. A disconnect,
 oversize fallback, or write timeout is an ambiguous result, not rollback proof.
@@ -819,10 +820,12 @@ Checked TTL and sequence boundaries now fail closed under #137/#138, and
 bounded nested protected-payload traversal is implemented under #147. Watch
 handoff and absolute-record-expiry admission remain
 #145/#148. Outbound slow-reader and response-frame enforcement is implemented
-under #159, but its stable-ID and transaction-ID limits are wire containment
-only. The production stable-ID model/persistence/privacy/audit/migration remains
-#167; the canonical durable `ReplicationEntry` transaction-ID type and migration
-remain #168 and must be coordinated with #127/#128/#143. The shared
+under #159. #167 now makes the 1..=64-byte stable-ID invariant structural across
+the complete model/store/network stack and supplies the privacy derivation plus
+version-2 count-only migration audit; use
+[`session-store-stable-id-migration.md`](session-store-stable-id-migration.md)
+before rollout. The canonical durable `ReplicationEntry` transaction-ID type
+and migration remain #168 and must be coordinated with #127/#128/#143. The shared
 session-net call deadline and `ConsensusConfigStore`'s complete
 routing/quorum/commit/apply operation deadline remain separate bounded layers;
 the removed private config TCP timeout is not a production setting. A renewed
@@ -832,13 +835,13 @@ trust-bundle/revocation/authentication-age fleet lifecycle remains
 #161 -> #162 -> #163 -> #164 under umbrella #158. The remaining distributed/payload-key
 production evidence stays open in #143.
 
-#159 does not rewrite persisted session-store bytes. In-profile stores need no
-format conversion, but a retained empty/over-64-byte stable ID or
+#167 does not rewrite persisted session-store bytes. In-profile stable IDs need
+no format conversion, but a retained empty/over-64-byte/non-BLOB stable ID or
 empty/over-128-byte UTF-8 transaction ID cannot cross strict revision-2
 transport. Before startup, quiesce writers and inventory all records, logs,
 snapshots, restore sources, and replay sources. Any violation needs a
-decoder-first, product-aware migration or coherent store replacement under
-#167/#168: the migration reader must decode the legacy representation before
+decoder-first, product-aware migration or coherent store replacement under the
+#167 runbook and #168: the migration reader must decode the legacy representation before
 rewrite, must not truncate/hash/rename durable identities, and the strict
 decoder must verify the result before writers restart. Rollback must first
 install a decoder capable of reading the retained target representation, or use

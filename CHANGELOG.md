@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   floating-VIP delivery from testkit mocks. The ready mutation contract is an
   intentional no-op and claims no XDP, NIC offload, key custody, or datapath
   programming; defaults remain fail-closed as `Unsupported`.
+- **BREAKING — `opc-session-store` and consumers:** `SessionKey::stable_id` is
+  now the validated `StableId` newtype instead of arbitrary `Bytes`. The
+  production invariant is exactly 1 through 64 bytes across construction,
+  bounded Serde, Fake/SQLite/cache/Openraft stores, restore, replication,
+  watches, and session-net; valid JSON/wire/SQLite bytes are unchanged.
+  `StableId::derive_hmac_sha256` defines the full-width 32-byte,
+  tenant-scoped, domain-separated keyed-digest profile for subscriber-derived
+  identities. New SQLite stores add matching BLOB/width checks, while existing
+  stores and snapshots require the version-2 count-only identity audit before
+  upgrade. Empty, oversized, or non-BLOB legacy identifiers are never echoed,
+  truncated, or silently rehashed; follow the documented drain,
+  application-owned remediation, re-audit, and rollback procedure.
 - `opc-identity`: a production `ProjectedSvidSource` for Kubernetes projected
   Secrets. It resolves one immutable `..data` target, detects and boundedly
   retries every mid-read generation switch, enforces exact file/total/
@@ -373,10 +385,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `write_timeout`, `transport`, and `encoding` reasons, and exclude keys,
   payloads, owners, transaction IDs, peer identities, and backend/peer-controlled
   error text.
-  #159 does not rewrite the persisted store format, but its stable-ID and
-  replication-transaction-ID limits are wire containment only. #167 owns the
-  production stable-ID model/persistence/privacy/audit/migration contract;
-  #168 owns a canonical durable transaction-ID type and migration coordinated
+  #159 does not rewrite the persisted store format. #167 now promotes its
+  stable-ID rule into the structural model/persistence/privacy/audit/migration
+  contract without changing compliant bytes. #168 owns a canonical durable
+  transaction-ID type and migration coordinated
   with #127/#128/#143. Before revision 2, quiesce writers and use a reviewed
   decoder-first migration for any out-of-profile retained record, log,
   snapshot, restore source, or replay source; never truncate or rename an

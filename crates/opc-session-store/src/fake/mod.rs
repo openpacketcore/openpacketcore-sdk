@@ -15,7 +15,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use opc_types::Timestamp;
 use tokio::sync::{mpsc, Mutex};
 
@@ -30,7 +29,7 @@ use crate::{
     clock::{Clock, TokioVirtualClock},
     error::{LeaseError, StoreError},
     lease::{LeaseGuard, SessionLeaseManager},
-    model::{FenceToken, OwnerId, SessionKey, SessionKeyType},
+    model::{FenceToken, OwnerId, SessionKey, SessionKeyType, StableId},
     record::StoredSessionRecord,
     restore::{
         compare_restore_records, restore_record_retained_bytes, RestoreScanCursor, RestoreScanPage,
@@ -72,7 +71,7 @@ struct FakeMapKey {
     tenant: String,
     nf_kind: String,
     key_type: SessionKeyType,
-    stable_id: Bytes,
+    stable_id: StableId,
 }
 
 impl FakeBackendState {
