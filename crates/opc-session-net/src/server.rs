@@ -2,12 +2,13 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use opc_session_store::backend::{
-    validate_replication_page_owned, validate_replication_prefix_owned, CompareAndSetResult,
-    ReplicationEntry, ReplicationOp,
+    validate_replication_page_owned, validate_replication_prefix_owned, CompareAndSet,
+    CompareAndSetResult, ReplicationEntry, ReplicationOp,
 };
 use opc_session_store::error::{LeaseError, StoreError};
 use opc_session_store::quorum::SessionStoreBackend;
@@ -17,8 +18,9 @@ use opc_session_store::{
     validate_session_ttl, ReplicaId, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
 };
 use opc_types::SpiffeId;
+use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{watch, Semaphore};
 use tracing;
 
 use crate::error::ProtocolError;
@@ -118,7 +120,15 @@ impl ServerHandle {
 const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const DEFAULT_RESTORE_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const RESTORE_SCAN_CONCURRENCY: usize = 1;
-const CAS_IDEMPOTENCY_CACHE_CAPACITY: usize = 4096;
+const CAS_IDEMPOTENCY_CACHE_CAPACITY: usize = 4_096;
+const CAS_IDEMPOTENCY_CACHE_PER_PEER_CAPACITY: usize = 512;
+const CAS_IDEMPOTENCY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const CAS_IDEMPOTENCY_CACHE_PER_PEER_MAX_BYTES: usize = 8 * 1024 * 1024;
+const CAS_IDEMPOTENCY_RESULT_RETENTION: Duration = Duration::from_secs(5 * 60);
+const CAS_IDEMPOTENCY_TOMBSTONE_RETENTION: Duration = Duration::from_secs(10 * 60);
+const CAS_IDEMPOTENCY_CLEANUP_WORK: usize = 64;
+const CAS_IDEMPOTENCY_ENTRY_OVERHEAD: usize = 128;
+const CAS_OPERATION_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-net/cas-idempotency/v1\0";
 const RESPONSE_LIMIT_MESSAGE: &str = "session response exceeds negotiated frame limit";
 const WATCH_RESPONSE_LIMIT_MESSAGE: &str = "watch item exceeds negotiated frame limit";
 const BACKEND_CONTRACT_MESSAGE: &str = "session backend returned an inconsistent response";
@@ -718,31 +728,358 @@ fn bounded_replication_log_response(
     Ok(Response::GetReplicationLog(Ok(entries)))
 }
 
-#[derive(Debug, Default)]
+type CasOutcome = Result<CompareAndSetResult, StoreError>;
+
+#[derive(Debug)]
+enum CasIdempotencyState {
+    InFlight {
+        outcome: watch::Sender<Option<CasOutcome>>,
+    },
+    Complete {
+        outcome: CasOutcome,
+        completed_at: Instant,
+    },
+    Ambiguous {
+        since: Instant,
+    },
+}
+
+#[derive(Debug)]
+struct CasIdempotencyEntry {
+    peer: ReplicaId,
+    operation_digest: [u8; 32],
+    retained_bytes: usize,
+    state: CasIdempotencyState,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CasPeerUsage {
+    entries: usize,
+    bytes: usize,
+}
+
+#[derive(Debug)]
 struct CasIdempotencyCache {
-    entries: HashMap<uuid::Uuid, CompareAndSetResult>,
+    epoch: uuid::Uuid,
+    entries: HashMap<uuid::Uuid, CasIdempotencyEntry>,
     order: VecDeque<uuid::Uuid>,
+    peer_usage: HashMap<ReplicaId, CasPeerUsage>,
+    retained_bytes: usize,
+}
+
+impl Default for CasIdempotencyCache {
+    fn default() -> Self {
+        Self {
+            epoch: uuid::Uuid::new_v4(),
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            peer_usage: HashMap::new(),
+            retained_bytes: 0,
+        }
+    }
 }
 
 impl CasIdempotencyCache {
-    fn get(&self, request_id: &uuid::Uuid) -> Option<CompareAndSetResult> {
-        self.entries.get(request_id).cloned()
+    fn epoch(&self) -> uuid::Uuid {
+        self.epoch
     }
 
-    fn insert_success(&mut self, request_id: uuid::Uuid, result: CompareAndSetResult) {
-        if self.entries.contains_key(&request_id) {
-            return;
+    fn begin(
+        cache: &Arc<StdMutex<Self>>,
+        peer: &ReplicaId,
+        request_id: uuid::Uuid,
+        epoch: uuid::Uuid,
+        operation_digest: [u8; 32],
+        now: Instant,
+    ) -> CasIdempotencyAdmission {
+        let mut cache_guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache_guard.cleanup(now);
+
+        if epoch != cache_guard.epoch {
+            return CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable);
         }
 
-        while self.entries.len() >= CAS_IDEMPOTENCY_CACHE_CAPACITY {
-            let Some(oldest) = self.order.pop_front() else {
+        if let Some(entry) = cache_guard.entries.get(&request_id) {
+            if entry.peer != *peer || entry.operation_digest != operation_digest {
+                return CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyConflict);
+            }
+            return match &entry.state {
+                CasIdempotencyState::InFlight { outcome } => {
+                    CasIdempotencyAdmission::Wait(outcome.subscribe())
+                }
+                CasIdempotencyState::Complete { outcome, .. } => {
+                    CasIdempotencyAdmission::Replay(outcome.clone())
+                }
+                CasIdempotencyState::Ambiguous { .. } => {
+                    CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+                }
+            };
+        }
+
+        let retained_bytes = CAS_IDEMPOTENCY_ENTRY_OVERHEAD
+            .checked_add(peer.as_str().len())
+            .unwrap_or(usize::MAX);
+        let usage = cache_guard
+            .peer_usage
+            .get(peer)
+            .copied()
+            .unwrap_or_default();
+        if cache_guard.entries.len() >= CAS_IDEMPOTENCY_CACHE_CAPACITY
+            || usage.entries >= CAS_IDEMPOTENCY_CACHE_PER_PEER_CAPACITY
+            || cache_guard
+                .retained_bytes
+                .checked_add(retained_bytes)
+                .is_none_or(|bytes| bytes > CAS_IDEMPOTENCY_CACHE_MAX_BYTES)
+            || usage
+                .bytes
+                .checked_add(retained_bytes)
+                .is_none_or(|bytes| bytes > CAS_IDEMPOTENCY_CACHE_PER_PEER_MAX_BYTES)
+        {
+            return CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable);
+        }
+
+        let (outcome, _) = watch::channel(None);
+        cache_guard.order.push_back(request_id);
+        cache_guard.retained_bytes += retained_bytes;
+        let usage = cache_guard.peer_usage.entry(peer.clone()).or_default();
+        usage.entries += 1;
+        usage.bytes += retained_bytes;
+        cache_guard.entries.insert(
+            request_id,
+            CasIdempotencyEntry {
+                peer: peer.clone(),
+                operation_digest,
+                retained_bytes,
+                state: CasIdempotencyState::InFlight { outcome },
+            },
+        );
+        drop(cache_guard);
+
+        CasIdempotencyAdmission::Execute(CasExecutionPermit {
+            cache: Arc::clone(cache),
+            request_id,
+            operation_digest,
+            completed: false,
+        })
+    }
+
+    fn cleanup(&mut self, now: Instant) {
+        let work = self.order.len().min(CAS_IDEMPOTENCY_CLEANUP_WORK);
+        let mut rotate_epoch = false;
+        for _ in 0..work {
+            let Some(request_id) = self.order.pop_front() else {
                 break;
             };
-            self.entries.remove(&oldest);
+            let disposition = self
+                .entries
+                .get(&request_id)
+                .map(|entry| match entry.state {
+                    CasIdempotencyState::InFlight { .. } => CasCleanupDisposition::Keep,
+                    CasIdempotencyState::Complete { completed_at, .. }
+                        if now.saturating_duration_since(completed_at)
+                            >= CAS_IDEMPOTENCY_RESULT_RETENTION =>
+                    {
+                        CasCleanupDisposition::Tombstone
+                    }
+                    CasIdempotencyState::Ambiguous { since }
+                        if now.saturating_duration_since(since)
+                            >= CAS_IDEMPOTENCY_TOMBSTONE_RETENTION =>
+                    {
+                        CasCleanupDisposition::Remove
+                    }
+                    CasIdempotencyState::Complete { .. }
+                    | CasIdempotencyState::Ambiguous { .. } => CasCleanupDisposition::Keep,
+                });
+            match disposition {
+                Some(CasCleanupDisposition::Tombstone) => {
+                    self.mark_ambiguous(request_id, now);
+                    self.order.push_back(request_id);
+                }
+                Some(CasCleanupDisposition::Remove) => {
+                    rotate_epoch = true;
+                    self.order.push_back(request_id);
+                }
+                Some(CasCleanupDisposition::Keep) => self.order.push_back(request_id),
+                None => {}
+            }
         }
+        if rotate_epoch
+            && !self
+                .entries
+                .values()
+                .any(|entry| matches!(entry.state, CasIdempotencyState::InFlight { .. }))
+        {
+            self.epoch = uuid::Uuid::new_v4();
+            self.entries.clear();
+            self.order.clear();
+            self.peer_usage.clear();
+            self.retained_bytes = 0;
+        }
+    }
 
-        self.order.push_back(request_id);
-        self.entries.insert(request_id, result);
+    fn resize_entry(&mut self, peer: &ReplicaId, old_bytes: usize, new_bytes: usize) -> bool {
+        let additional = new_bytes.saturating_sub(old_bytes);
+        let usage = self.peer_usage.get(peer).copied().unwrap_or_default();
+        if self
+            .retained_bytes
+            .checked_add(additional)
+            .is_none_or(|bytes| bytes > CAS_IDEMPOTENCY_CACHE_MAX_BYTES)
+            || usage
+                .bytes
+                .checked_add(additional)
+                .is_none_or(|bytes| bytes > CAS_IDEMPOTENCY_CACHE_PER_PEER_MAX_BYTES)
+        {
+            return false;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_sub(old_bytes) + new_bytes;
+        if let Some(usage) = self.peer_usage.get_mut(peer) {
+            usage.bytes = usage.bytes.saturating_sub(old_bytes) + new_bytes;
+        }
+        true
+    }
+
+    fn mark_ambiguous(&mut self, request_id: uuid::Uuid, now: Instant) {
+        let Some(entry) = self.entries.get(&request_id) else {
+            return;
+        };
+        let peer = entry.peer.clone();
+        let old_bytes = entry.retained_bytes;
+        let notify = match &entry.state {
+            CasIdempotencyState::InFlight { outcome } => Some(outcome.clone()),
+            CasIdempotencyState::Complete { .. } | CasIdempotencyState::Ambiguous { .. } => None,
+        };
+        let new_bytes = CAS_IDEMPOTENCY_ENTRY_OVERHEAD + peer.as_str().len();
+        let _ = self.resize_entry(&peer, old_bytes, new_bytes);
+        if let Some(entry) = self.entries.get_mut(&request_id) {
+            entry.retained_bytes = new_bytes;
+            entry.state = CasIdempotencyState::Ambiguous { since: now };
+        }
+        if let Some(notify) = notify {
+            let _ = notify.send(Some(Err(StoreError::CasIdempotencyOutcomeUnavailable)));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CasCleanupDisposition {
+    Keep,
+    Tombstone,
+    Remove,
+}
+
+enum CasIdempotencyAdmission {
+    Execute(CasExecutionPermit),
+    Wait(watch::Receiver<Option<CasOutcome>>),
+    Replay(CasOutcome),
+    Reject(StoreError),
+}
+
+struct CasExecutionPermit {
+    cache: Arc<StdMutex<CasIdempotencyCache>>,
+    request_id: uuid::Uuid,
+    operation_digest: [u8; 32],
+    completed: bool,
+}
+
+impl CasExecutionPermit {
+    fn complete(mut self, outcome: CasOutcome) {
+        let now = Instant::now();
+        let encoded_bytes =
+            serde_json::to_vec(&outcome).map_or(usize::MAX, |encoded| encoded.len());
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = cache.entries.get(&self.request_id) else {
+            self.completed = true;
+            return;
+        };
+        if entry.operation_digest != self.operation_digest {
+            cache.mark_ambiguous(self.request_id, now);
+            self.completed = true;
+            return;
+        }
+        let peer = entry.peer.clone();
+        let old_bytes = entry.retained_bytes;
+        let notify = match &entry.state {
+            CasIdempotencyState::InFlight { outcome } => Some(outcome.clone()),
+            CasIdempotencyState::Complete { .. } | CasIdempotencyState::Ambiguous { .. } => None,
+        };
+        let new_bytes = old_bytes.checked_add(encoded_bytes).unwrap_or(usize::MAX);
+        if !cache.resize_entry(&peer, old_bytes, new_bytes) {
+            cache.mark_ambiguous(self.request_id, now);
+            self.completed = true;
+            return;
+        }
+        if let Some(entry) = cache.entries.get_mut(&self.request_id) {
+            entry.retained_bytes = new_bytes;
+            entry.state = CasIdempotencyState::Complete {
+                outcome: outcome.clone(),
+                completed_at: now,
+            };
+        }
+        if let Some(notify) = notify {
+            let _ = notify.send(Some(outcome));
+        }
+        self.completed = true;
+    }
+}
+
+impl Drop for CasExecutionPermit {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.mark_ambiguous(self.request_id, Instant::now());
+    }
+}
+
+fn hash_cas_field(hasher: &mut Sha256, field: &[u8]) -> Result<(), StoreError> {
+    let length = u64::try_from(field.len())
+        .map_err(|_| StoreError::Serialization("CAS idempotency input is too large".into()))?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(field);
+    Ok(())
+}
+
+fn cas_operation_digest(
+    binding: &LocalReplicaBinding,
+    peer: &ReplicaId,
+    request_id: uuid::Uuid,
+    idempotency_epoch: uuid::Uuid,
+    operation: &CompareAndSet,
+) -> Result<[u8; 32], StoreError> {
+    let operation = serde_json::to_vec(operation)
+        .map_err(|_| StoreError::Serialization("CAS idempotency encoding failed".into()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(CAS_OPERATION_DIGEST_DOMAIN);
+    hash_cas_field(&mut hasher, binding.cluster_id().as_str().as_bytes())?;
+    hash_cas_field(&mut hasher, binding.configuration_id().as_bytes())?;
+    hash_cas_field(
+        &mut hasher,
+        &binding.configuration_epoch().get().to_be_bytes(),
+    )?;
+    hash_cas_field(&mut hasher, peer.as_str().as_bytes())?;
+    hash_cas_field(&mut hasher, request_id.as_bytes())?;
+    hash_cas_field(&mut hasher, idempotency_epoch.as_bytes())?;
+    hash_cas_field(&mut hasher, &operation)?;
+    Ok(hasher.finalize().into())
+}
+
+async fn wait_for_cas_outcome(mut outcome: watch::Receiver<Option<CasOutcome>>) -> CasOutcome {
+    loop {
+        if let Some(outcome) = outcome.borrow().clone() {
+            return outcome;
+        }
+        if outcome.changed().await.is_err() {
+            return Err(StoreError::CasIdempotencyOutcomeUnavailable);
+        }
     }
 }
 
@@ -755,7 +1092,7 @@ pub struct SessionReplicationServer {
     max_frame_size: usize,
     idle_timeout: std::time::Duration,
     restore_scan_timeout: std::time::Duration,
-    cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
+    cas_idempotency_cache: Arc<StdMutex<CasIdempotencyCache>>,
 }
 
 impl fmt::Debug for SessionReplicationServer {
@@ -796,7 +1133,7 @@ impl SessionReplicationServer {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             restore_scan_timeout: DEFAULT_RESTORE_SCAN_TIMEOUT,
-            cas_idempotency_cache: Arc::new(Mutex::new(CasIdempotencyCache::default())),
+            cas_idempotency_cache: Arc::new(StdMutex::new(CasIdempotencyCache::default())),
         }
     }
 
@@ -811,7 +1148,7 @@ impl SessionReplicationServer {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             restore_scan_timeout: DEFAULT_RESTORE_SCAN_TIMEOUT,
-            cas_idempotency_cache: Arc::new(Mutex::new(CasIdempotencyCache::default())),
+            cas_idempotency_cache: Arc::new(StdMutex::new(CasIdempotencyCache::default())),
         }
     }
 
@@ -1010,7 +1347,7 @@ async fn handle_connection(
     backend: Arc<dyn SessionStoreBackend>,
     stream: TcpStream,
     tls_config: Option<Arc<opc_tls::ServerConfig>>,
-    cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
+    cas_idempotency_cache: Arc<StdMutex<CasIdempotencyCache>>,
     dispatch_config: DispatchConfig,
 ) -> Result<(), ProtocolError> {
     let idle_timeout = dispatch_config.idle_timeout;
@@ -1056,7 +1393,7 @@ async fn handle_connection(
 
 async fn dispatch<R, W>(
     backend: Arc<dyn SessionStoreBackend>,
-    cas_idempotency_cache: Arc<Mutex<CasIdempotencyCache>>,
+    cas_idempotency_cache: Arc<StdMutex<CasIdempotencyCache>>,
     reader: &mut R,
     writer: &mut W,
     peer_identity: ConnectionPeerIdentity,
@@ -1103,6 +1440,7 @@ where
             None,
             None,
             None,
+            None,
             idle_timeout,
             &cancellation,
         )
@@ -1115,6 +1453,7 @@ where
     if contract_profile != Some(CURRENT_CONTRACT_PROFILE) {
         write_bootstrap_ack(
             writer,
+            None,
             None,
             None,
             None,
@@ -1247,6 +1586,10 @@ where
         .await;
     }
 
+    let cas_idempotency_epoch = cas_idempotency_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .epoch();
     write_bootstrap_ack(
         writer,
         Some(binding.local_replica_id().as_str().to_string()),
@@ -1254,6 +1597,7 @@ where
         Some(binding.cluster_id().as_str().to_string()),
         Some(binding.configuration_id().to_hex()),
         Some(handshake_nonce),
+        Some(cas_idempotency_epoch),
         Some(accepted_response_frame_size),
         Some(server_request_frame_size),
         idle_timeout,
@@ -1342,7 +1686,11 @@ where
                 )
                 .await?;
             }
-            Request::CompareAndSet { op, request_id } => {
+            Request::CompareAndSet {
+                op,
+                request_id,
+                idempotency_epoch,
+            } => {
                 if let Some(error) = request_payload_error.take() {
                     write_post_auth_response_with_fallback(
                         writer,
@@ -1357,54 +1705,50 @@ where
                     continue;
                 }
                 let expected_key = op.key.clone();
-                if let Some(request_id) = request_id {
+                let res = if let (Some(request_id), Some(idempotency_epoch)) =
+                    (request_id, idempotency_epoch)
+                {
                     let request_id = uuid::Uuid::parse_str(&request_id)
                         .map_err(|_| ProtocolError::InvalidWireValue)?;
-                    let cached = { cas_idempotency_cache.lock().await.get(&request_id) };
-                    if let Some(cached) = cached {
-                        write_post_auth_response_with_fallback(
-                            writer,
-                            Response::CompareAndSet(Ok(cached)),
-                            Response::CompareAndSet(Err(store_response_limit_error())),
-                            effective_response_frame_size,
-                            idle_timeout,
-                            ResponseFamily::CompareAndSet,
-                            &cancellation,
-                        )
-                        .await?;
-                        continue;
+                    let idempotency_epoch = uuid::Uuid::parse_str(&idempotency_epoch)
+                        .map_err(|_| ProtocolError::InvalidWireValue)?;
+                    let operation_digest = cas_operation_digest(
+                        &binding,
+                        &client_replica_id,
+                        request_id,
+                        idempotency_epoch,
+                        &op,
+                    );
+                    match operation_digest {
+                        Ok(operation_digest) => match CasIdempotencyCache::begin(
+                            &cas_idempotency_cache,
+                            &client_replica_id,
+                            request_id,
+                            idempotency_epoch,
+                            operation_digest,
+                            Instant::now(),
+                        ) {
+                            CasIdempotencyAdmission::Execute(permit) => {
+                                let result = backend.compare_and_set(op).await;
+                                let result =
+                                    if compare_and_set_result_matches_key(&expected_key, &result) {
+                                        result
+                                    } else {
+                                        Err(backend_contract_error())
+                                    };
+                                permit.complete(result.clone());
+                                result
+                            }
+                            CasIdempotencyAdmission::Wait(outcome) => {
+                                wait_for_cas_outcome(outcome).await
+                            }
+                            CasIdempotencyAdmission::Replay(outcome) => outcome,
+                            CasIdempotencyAdmission::Reject(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
                     }
-
-                    let res = backend.compare_and_set(op).await;
-                    let res = if compare_and_set_result_matches_key(&expected_key, &res) {
-                        res
-                    } else {
-                        Err(backend_contract_error())
-                    };
-                    if matches!(res, Ok(CompareAndSetResult::Success)) {
-                        cas_idempotency_cache
-                            .lock()
-                            .await
-                            .insert_success(request_id, CompareAndSetResult::Success);
-                    }
-                    write_post_auth_response_with_fallback(
-                        writer,
-                        Response::CompareAndSet(res),
-                        Response::CompareAndSet(Err(store_response_limit_error())),
-                        effective_response_frame_size,
-                        idle_timeout,
-                        ResponseFamily::CompareAndSet,
-                        &cancellation,
-                    )
-                    .await?;
-                    continue;
-                }
-
-                let res = backend.compare_and_set(op).await;
-                let res = if compare_and_set_result_matches_key(&expected_key, &res) {
-                    res
                 } else {
-                    Err(backend_contract_error())
+                    Err(StoreError::CasIdempotencyOutcomeUnavailable)
                 };
                 write_post_auth_response_with_fallback(
                     writer,
@@ -1917,6 +2261,7 @@ async fn write_bootstrap_ack<W>(
     cluster_id: Option<String>,
     configuration_id: Option<String>,
     handshake_nonce: Option<uuid::Uuid>,
+    cas_idempotency_epoch: Option<uuid::Uuid>,
     accepted_response_frame_size: Option<u32>,
     server_request_frame_size: Option<u32>,
     timeout: std::time::Duration,
@@ -1935,6 +2280,7 @@ where
             cluster_id,
             configuration_id,
             handshake_nonce,
+            cas_idempotency_epoch,
             contract_profile: Some(CURRENT_CONTRACT_PROFILE),
             accepted_response_frame_size,
             server_request_frame_size,
@@ -2118,26 +2464,28 @@ mod tests {
     }
 
     #[test]
-    fn cas_idempotency_cache_retains_successes_with_bound() {
-        let mut cache = CasIdempotencyCache::default();
+    fn cas_idempotency_cache_replays_exact_outcome_and_rejects_reuse() {
+        let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let peer = ReplicaId::new("replica-a").expect("peer");
         let first = uuid::Uuid::from_u128(u128::MAX);
+        let epoch = cache.lock().expect("cache").epoch();
+        let digest = [7; 32];
 
-        cache.insert_success(first, CompareAndSetResult::Success);
-        assert_eq!(cache.get(&first), Some(CompareAndSetResult::Success));
+        let CasIdempotencyAdmission::Execute(permit) =
+            CasIdempotencyCache::begin(&cache, &peer, first, epoch, digest, Instant::now())
+        else {
+            panic!("first request must execute");
+        };
+        permit.complete(Ok(CompareAndSetResult::Success));
 
-        for idx in 0..CAS_IDEMPOTENCY_CACHE_CAPACITY {
-            cache.insert_success(
-                uuid::Uuid::from_u128((idx + 1) as u128),
-                CompareAndSetResult::Success,
-            );
-        }
-
-        assert_eq!(cache.entries.len(), CAS_IDEMPOTENCY_CACHE_CAPACITY);
-        assert_eq!(cache.get(&first), None);
-        assert_eq!(
-            cache.get(&uuid::Uuid::from_u128(1)),
-            Some(CompareAndSetResult::Success)
-        );
+        assert!(matches!(
+            CasIdempotencyCache::begin(&cache, &peer, first, epoch, digest, Instant::now()),
+            CasIdempotencyAdmission::Replay(Ok(CompareAndSetResult::Success))
+        ));
+        assert!(matches!(
+            CasIdempotencyCache::begin(&cache, &peer, first, epoch, [8; 32], Instant::now()),
+            CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyConflict)
+        ));
     }
 
     #[test]

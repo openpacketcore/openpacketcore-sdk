@@ -184,6 +184,7 @@ fn successful_hello_ack(hello: &Request) -> Response {
         cluster_id: cluster_id.clone(),
         configuration_id: configuration_id.clone(),
         handshake_nonce: *handshake_nonce,
+        cas_idempotency_epoch: Some(uuid::Uuid::from_u128(1)),
         accepted_response_frame_size: *requested_response_frame_size,
         server_request_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
     }

@@ -813,6 +813,21 @@ async fn authenticated_raw_stream(
     addr: SocketAddr,
     response_frame_size: usize,
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    authenticated_raw_stream_with_epoch(mtls, local_index, remote_index, addr, response_frame_size)
+        .await
+        .0
+}
+
+async fn authenticated_raw_stream_with_epoch(
+    mtls: &TestMtls,
+    local_index: usize,
+    remote_index: usize,
+    addr: SocketAddr,
+    response_frame_size: usize,
+) -> (
+    tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    uuid::Uuid,
+) {
     use opc_session_net::protocol::{
         read_frame, write_frame, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, SESSION_NET_ALPN,
     };
@@ -856,16 +871,17 @@ async fn authenticated_raw_stream(
     let hello: Response = read_frame(&mut stream, response_frame_size)
         .await
         .expect("read authenticated raw hello acknowledgement");
-    assert!(matches!(
-        hello,
+    let epoch = match hello {
         Response::HelloAck {
             contract_version: CONTRACT_VERSION,
             handshake_nonce: Some(echoed),
             accepted_response_frame_size: Some(accepted),
+            cas_idempotency_epoch: Some(epoch),
             ..
-        } if echoed == nonce && accepted == requested_response_frame_size
-    ));
-    stream
+        } if echoed == nonce && accepted == requested_response_frame_size => epoch,
+        other => panic!("unexpected authenticated hello acknowledgement: {other:?}"),
+    };
+    (stream, epoch)
 }
 
 #[cfg(feature = "insecure-test")]
@@ -894,6 +910,7 @@ fn hello_ack_for(
         cluster_id: cluster_id.clone(),
         configuration_id: configuration_id.clone(),
         handshake_nonce: *handshake_nonce,
+        cas_idempotency_epoch: Some(uuid::Uuid::from_u128(1)),
         accepted_response_frame_size: (contract_version
             == opc_session_net::protocol::CONTRACT_VERSION)
             .then_some(
@@ -2089,9 +2106,10 @@ async fn hostile_cas_request_id_is_rejected_before_backend_or_idempotency_cache(
     let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
 
     let request_id = uuid::Uuid::new_v4().hyphenated().to_string();
-    let valid_request = Request::CompareAndSet {
+    let mut valid_request = Request::CompareAndSet {
         op: operation,
         request_id: Some(request_id),
+        idempotency_epoch: None,
     };
     let mut hostile_wire =
         serde_json::to_value(&valid_request).expect("encode valid canonical CAS request");
@@ -2110,7 +2128,15 @@ async fn hostile_cas_request_id_is_rejected_before_backend_or_idempotency_cache(
     assert!(rejected.is_err());
     assert_eq!(backend.compare_and_set_calls.load(Ordering::SeqCst), 0);
 
-    let mut valid = authenticated_raw_stream(&mtls, 1, 2, addr, DEFAULT_MAX_FRAME_SIZE).await;
+    let (mut valid, epoch) =
+        authenticated_raw_stream_with_epoch(&mtls, 1, 2, addr, DEFAULT_MAX_FRAME_SIZE).await;
+    let Request::CompareAndSet {
+        idempotency_epoch, ..
+    } = &mut valid_request
+    else {
+        unreachable!("constructed CAS request changed family")
+    };
+    *idempotency_epoch = Some(epoch.to_string());
     for expected_backend_calls in [1, 1] {
         write_frame(&mut valid, &valid_request)
             .await
@@ -2317,7 +2343,8 @@ async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
         .listen("127.0.0.1:0".parse().unwrap())
         .await
         .expect("listen for payload preflight");
-    let mut stream = authenticated_raw_stream(&mtls, 1, 2, addr, frame_budget).await;
+    let (mut stream, idempotency_epoch) =
+        authenticated_raw_stream_with_epoch(&mtls, 1, 2, addr, frame_budget).await;
     let request_id = uuid::Uuid::new_v4().hyphenated().to_string();
 
     write_frame(
@@ -2325,6 +2352,7 @@ async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
         &Request::CompareAndSet {
             op: operation.clone(),
             request_id: Some(request_id.clone()),
+            idempotency_epoch: Some(idempotency_epoch.to_string()),
         },
     )
     .await
@@ -2404,6 +2432,7 @@ async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
         &Request::CompareAndSet {
             op: exact,
             request_id: Some(request_id),
+            idempotency_epoch: Some(idempotency_epoch.to_string()),
         },
     )
     .await
@@ -3081,7 +3110,7 @@ async fn direct_cas_retry_after_dropped_response_reports_success() {
                                     .await
                                     .unwrap();
                             }
-                            Request::CompareAndSet { op, request_id } => {
+                            Request::CompareAndSet { op, request_id, .. } => {
                                 let request_id =
                                     request_id.expect("direct CAS must carry an idempotency key");
                                 let mut ids = cas_request_ids.lock().await;
