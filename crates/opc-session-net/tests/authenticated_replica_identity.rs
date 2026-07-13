@@ -985,6 +985,9 @@ fn rotation_record(key: SessionKey, lease: &LeaseGuard, generation: u64) -> Stor
     }
 }
 
+const ROTATION_OPERATION_DEADLINE: Duration = Duration::from_secs(3);
+const ROTATION_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
+
 #[derive(Default)]
 struct RotationTrafficOutcome {
     get: AtomicUsize,
@@ -1026,7 +1029,7 @@ impl RotationTrafficOutcome {
 }
 
 async fn wait_for_rotation_traffic_after(outcome: &RotationTrafficOutcome, baseline: [usize; 5]) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(ROTATION_OPERATION_DEADLINE, async {
         loop {
             outcome.assert_no_failures();
             let current = outcome.snapshot();
@@ -1119,7 +1122,7 @@ async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_remove
         // The four concurrent direct families serialize through one bounded
         // pool. Keep their complete call SLO below the four-second lifecycle
         // drain while leaving enough budget for full mTLS + profile renewal.
-        Some(Duration::from_secs(3)),
+        Some(ROTATION_OPERATION_DEADLINE),
     )
     .with_connection_lifecycle(lifecycle_policy())
     .with_reauthentication_control(reauthentication.clone());
@@ -1328,10 +1331,13 @@ async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_remove
         .await;
 
     stop.store(true, Ordering::Release);
+    // Cleanup gets scheduling margin beyond the three-second operation SLO.
+    // This bound supervises task teardown only; it does not relax operation or
+    // post-rotation progress deadlines.
     for task in [get_task, cas_task, lease_task, batch_task] {
-        tokio::time::timeout(Duration::from_secs(3), task)
+        tokio::time::timeout(ROTATION_CLEANUP_DEADLINE, task)
             .await
-            .expect("traffic task must stop within its operation deadline")
+            .expect("traffic task must stop within the cleanup scheduling margin")
             .expect("traffic task join");
     }
     outcome.assert_no_failures();
@@ -1341,9 +1347,9 @@ async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_remove
         .await
         .expect("final replication head");
     watch_target_tx.send_replace(Some(final_sequence));
-    let sequences = tokio::time::timeout(Duration::from_secs(3), watch_task)
+    let sequences = tokio::time::timeout(ROTATION_CLEANUP_DEADLINE, watch_task)
         .await
-        .expect("watch must reach the exact final committed successor")
+        .expect("watch must reach the final successor within its cleanup-only margin")
         .expect("watch task join");
     outcome.assert_no_failures();
     assert_eq!(

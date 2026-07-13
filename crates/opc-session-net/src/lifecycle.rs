@@ -11,7 +11,8 @@ use tokio::sync::watch;
 
 /// Default maximum age of one authenticated session transport connection.
 pub const DEFAULT_MAX_AUTHENTICATION_AGE: Duration = Duration::from_secs(15 * 60);
-/// Default time allowed for an operation already in flight when retirement starts.
+/// Default transport wait and connection/task-slot ownership after retirement
+/// starts; this does not prove backend completion or rollback.
 pub const DEFAULT_ROTATION_DRAIN_WINDOW: Duration = Duration::from_secs(30);
 /// Default first delay between reconnect attempts.
 pub const DEFAULT_RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(50);
@@ -36,10 +37,14 @@ pub enum ConnectionLifecycleError {
 /// One validated, finite lifecycle policy shared by clients and servers.
 ///
 /// `maximum_authentication_age` bounds how long a completed authentication can
-/// serve new operations. `rotation_drain_window` bounds an operation that was
-/// already in flight at retirement. Reconnect attempts use exponential backoff
-/// between the inclusive minimum and maximum. Material rotation is spread by
-/// a stable per-peer jitter in `[0, rotation_jitter]`.
+/// serve new operations. `rotation_drain_window` bounds how long the transport
+/// waits for already-admitted work and retains its connection/task slot after
+/// retirement. It does not prove backend completion or rollback: dropping a
+/// backend future requests cancellation, but bounded supervised mutation work
+/// may finish later. That outcome remains typed ambiguous and must never be
+/// replayed automatically. Reconnect attempts use exponential backoff between
+/// the inclusive minimum and maximum. Material rotation is spread by a stable
+/// per-peer jitter in `[0, rotation_jitter]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionLifecyclePolicy {
     maximum_authentication_age: Duration,
@@ -94,7 +99,12 @@ impl ConnectionLifecyclePolicy {
         self.maximum_authentication_age
     }
 
-    /// Maximum drain allowed after retirement begins.
+    /// Maximum transport wait and connection/task-slot ownership after
+    /// retirement begins.
+    ///
+    /// This does not bound completion of already-admitted bounded supervised
+    /// backend work; such late completion retains typed ambiguity and no-replay
+    /// semantics.
     pub const fn rotation_drain_window(self) -> Duration {
         self.rotation_drain_window
     }
