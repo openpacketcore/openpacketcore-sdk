@@ -512,7 +512,13 @@ impl SessionBackend for OversizedOutputBackend {
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
-        self.inner.compare_and_set(op).await
+        self.inner
+            .compare_and_set_calls
+            .fetch_add(1, Ordering::SeqCst);
+        assert_eq!(op.key, self.record.key);
+        Ok(CompareAndSetResult::Conflict {
+            current: Some(self.record.clone()),
+        })
     }
 
     async fn delete_fenced(&self, lease: &opc_session_store::LeaseGuard) -> Result<(), StoreError> {
@@ -2085,6 +2091,65 @@ async fn negotiated_response_limit_contains_malicious_backend_outputs_by_family(
             .expect("watch closes after the typed limit error")
             .is_none(),
         "the server must terminate an oversized watch stream"
+    );
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn oversized_cas_outcome_is_typed_and_exact_retry_is_not_redispatched() {
+    use opc_session_net::protocol::{read_frame, write_frame, MIN_NEGOTIATED_FRAME_SIZE};
+    use opc_session_net::{Request, Response};
+
+    let mtls = mtls_configs();
+    let frame_budget = 2 * MIN_NEGOTIATED_FRAME_SIZE;
+    let key = test_key_with_stable_id(b"oversized-cas-outcome");
+    let owner = OwnerId::new("oversized-cas-owner").expect("oversized CAS owner");
+    let mut current = test_record(&key, &owner, FenceToken::new(1), Generation::new(1));
+    current.payload = EncryptedSessionPayload::new(vec![255; 4096]);
+    let backend = OversizedOutputBackend::new(current, Vec::new(), payload_replication_entry(1, 1));
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("seed oversized CAS lease");
+    backend
+        .inner
+        .compare_and_set_calls
+        .store(0, Ordering::SeqCst);
+    let operation = CompareAndSet {
+        key: key.clone(),
+        lease: lease.clone(),
+        expected_generation: None,
+        new_record: test_record(&key, &owner, lease.fence(), Generation::new(2)),
+    };
+    let (addr, backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
+    let (mut stream, idempotency_epoch) =
+        authenticated_raw_stream_with_epoch(&mtls, 1, 2, addr, frame_budget).await;
+    let request = Request::CompareAndSet {
+        op: operation,
+        request_id: Some(uuid::Uuid::new_v4().hyphenated().to_string()),
+        idempotency_epoch: Some(idempotency_epoch.hyphenated().to_string()),
+    };
+
+    for _ in 0..2 {
+        write_frame(&mut stream, &request)
+            .await
+            .expect("write exact CAS attempt");
+        let response: Response = read_frame(&mut stream, frame_budget)
+            .await
+            .expect("read bounded CAS response");
+        assert!(
+            matches!(
+                &response,
+                Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable))
+            ),
+            "unexpected bounded CAS response: {response:?}"
+        );
+    }
+    assert_eq!(
+        backend.inner.compare_and_set_calls.load(Ordering::SeqCst),
+        1,
+        "the exact retry must replay the cached oversized outcome without backend redispatch"
     );
 
     handle.abort_and_wait().await;

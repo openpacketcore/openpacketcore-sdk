@@ -1723,7 +1723,7 @@ where
                     write_post_auth_response_with_fallback(
                         writer,
                         Response::CompareAndSet(Err(error)),
-                        Response::CompareAndSet(Err(store_response_limit_error())),
+                        Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
                         effective_response_frame_size,
                         idle_timeout,
                         ResponseFamily::CompareAndSet,
@@ -1781,7 +1781,7 @@ where
                 write_post_auth_response_with_fallback(
                     writer,
                     Response::CompareAndSet(res),
-                    Response::CompareAndSet(Err(store_response_limit_error())),
+                    Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
                     effective_response_frame_size,
                     idle_timeout,
                     ResponseFamily::CompareAndSet,
@@ -2805,7 +2805,7 @@ mod tests {
         let responses = vec![
             Response::Capabilities(opc_session_store::BackendCapabilities::all_enabled()),
             Response::Get(Err(store_response_limit_error())),
-            Response::CompareAndSet(Err(store_response_limit_error())),
+            Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
             Response::DeleteFenced(Err(store_response_limit_error())),
             Response::RefreshTtl(Err(store_response_limit_error())),
             Response::Batch(Err(store_response_limit_error())),
@@ -3022,7 +3022,7 @@ mod tests {
             ),
             (
                 Response::CompareAndSet(Err(store_error())),
-                Response::CompareAndSet(Err(store_response_limit_error())),
+                Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
                 ResponseFamily::CompareAndSet,
             ),
             (
