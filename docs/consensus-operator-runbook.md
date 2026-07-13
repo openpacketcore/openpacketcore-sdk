@@ -308,6 +308,30 @@ metrics. Preserve the encryption/HKMS composition above consensus; rotation
 must not move plaintext, a provider handle, or raw key material into Openraft or
 session-net.
 
+For each authenticated connection, the hard deadline uses the earliest expiry
+across each side's configured/presented SVID certificate chain. Every presented
+certificate contributes, including a redundantly presented root. Production
+SVID chains should omit the trust anchor, so the bound normally covers the leaf
+and every presented intermediate. Certificates that appear only in configured
+trust bundles are not independently scanned, and the time an anchor is
+administratively removed is not a certificate-expiry deadline input. A
+coherently published trust-bundle change creates new material; use the normal
+reauthentication path to retire connections admitted under the previous
+material.
+
+The bounded same-issuer credential-compromise/revocation mechanism is
+short-lived SVID expiry, not rotation or reauthentication. Set the SVID validity
+bound to the maximum acceptable exposure window. Publishing a replacement
+certificate/key and forcing fresh handshakes moves cooperative members to it,
+but does not revoke the old certificate/key: its holder can reconnect until the
+earliest expiry in its presented chain while its issuer remains trusted.
+Session-net does not implement immediate generic CRL, OCSP,
+certificate/identity denylist, or other selective same-issuer revocation. Root
+removal is the trust-anchor cutover: later full handshakes reject every chain
+that depends on that root, rather than selectively revoking one credential.
+Treat any requirement for immediate generic per-credential revocation as
+unsupported, not as evidence provided by a rotation campaign.
+
 ### 7.1 Forward rotation
 
 1. Confirm all members are durably ready, all directed peer routes are healthy,
@@ -337,8 +361,11 @@ session-net.
    readiness path and representative traffic on every member.
 7. Keep old trust through the maximum authentication age, configured jitter and
    drain bound, observation window, and approved rollback window. Then remove
-   old trust atomically, trigger reauthentication again, and prove the old
-   issuer is rejected while all directed current-material paths remain ready.
+   old trust atomically. This is a trust-anchor cutover for later handshakes,
+   not a certificate-expiry deadline or selective same-issuer revocation.
+   Trigger reauthentication again, and prove every chain depending on the
+   removed old trust anchor is rejected while all directed current-material
+   paths remain ready.
 
 ### 7.2 Rollback
 
@@ -351,14 +378,19 @@ as rollback proof.
 After old-trust removal, first republish the overlapping bundle and prove it
 Ready everywhere. Only then republish the previous leaf/key, trigger a new
 reauthentication generation, and repeat every directed-path and durable-ready
-check. If the previous leaf is expired or revoked, it is not a valid rollback;
-issue a new correctly scoped leaf from a trusted authority instead. If overlap
-cannot be restored coherently, stop traffic and use the coordinated release
-rollback procedure rather than enabling plaintext or weakening identity checks.
+check. If the previous SVID leaf or a presented intermediate is expired, or its
+trust anchor remains intentionally removed, it is not a valid rollback; issue a
+new correctly scoped SVID from a trusted authority instead. Generic CRL, OCSP,
+and certificate/identity denylist revocation are not available as an alternate
+rollback state. If overlap cannot be restored coherently, stop traffic and use
+the coordinated release rollback procedure rather than enabling plaintext or
+weakening identity checks.
 
 #163 provides the in-process bounded-retirement and request/watch continuity
 mechanism. #164/#143 still gate production claims on multi-process trust
-overlap/removal, revocation, reconnect-storm, resource, and soak evidence.
+overlap/removal, short-lived-SVID expiry, root-cutover, reconnect-storm,
+resource, and soak evidence. These semantics do not provide fleet qualification
+or close either issue.
 
 ## 8. Snapshots, backups, and rollback
 

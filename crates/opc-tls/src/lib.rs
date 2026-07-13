@@ -41,6 +41,44 @@ fn protocol_versions(compat_mode: bool) -> &'static [&'static rustls::SupportedP
     }
 }
 
+#[derive(Clone, Copy)]
+struct CertificateValidity {
+    not_before: Timestamp,
+    not_after: Timestamp,
+}
+
+fn certificate_validity(certificate: &CertificateDer<'_>) -> Result<CertificateValidity, ()> {
+    let (remaining, certificate) =
+        X509Certificate::from_der(certificate.as_ref()).map_err(|_| ())?;
+    if !remaining.is_empty() {
+        return Err(());
+    }
+    let not_before =
+        time::OffsetDateTime::from_unix_timestamp(certificate.validity().not_before.timestamp())
+            .map_err(|_| ())?;
+    let not_after =
+        time::OffsetDateTime::from_unix_timestamp(certificate.validity().not_after.timestamp())
+            .map_err(|_| ())?;
+    Ok(CertificateValidity {
+        not_before: Timestamp::from_offset_datetime(not_before),
+        not_after: Timestamp::from_offset_datetime(not_after),
+    })
+}
+
+fn certificate_not_after(certificate: &CertificateDer<'_>) -> Result<Timestamp, ()> {
+    certificate_validity(certificate).map(|validity| validity.not_after)
+}
+
+fn presented_certificate_chain_expires_at(
+    certificates: &[CertificateDer<'_>],
+) -> Result<Timestamp, ()> {
+    let mut certificates = certificates.iter();
+    let first = certificates.next().ok_or(())?;
+    certificates.try_fold(certificate_not_after(first)?, |earliest, certificate| {
+        certificate_not_after(certificate).map(|expires_at| earliest.min(expires_at))
+    })
+}
+
 fn root_store_from_bundle(bundle: &TrustBundle) -> Result<rustls::RootCertStore, rustls::Error> {
     let mut root_store = rustls::RootCertStore::empty();
     for root in &bundle.certificates {
@@ -622,12 +660,13 @@ pub enum PeerSpiffeIdentityError {
     MalformedSpiffeId,
 }
 
-/// Redaction-safe identity and leaf-expiry evidence from one completed peer
-/// handshake.
+/// Redaction-safe identity and certificate-expiry evidence from one completed
+/// peer handshake.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PeerTlsIdentity {
     spiffe_id: SpiffeId,
     leaf_expires_at: Timestamp,
+    certificate_chain_expires_at: Timestamp,
 }
 
 impl fmt::Debug for PeerTlsIdentity {
@@ -645,6 +684,11 @@ impl PeerTlsIdentity {
     /// Peer leaf-certificate expiry authenticated on this connection.
     pub const fn leaf_expires_at(&self) -> Timestamp {
         self.leaf_expires_at
+    }
+
+    /// Earliest expiry across every certificate presented by the peer.
+    pub const fn certificate_chain_expires_at(&self) -> Timestamp {
+        self.certificate_chain_expires_at
     }
 }
 
@@ -681,20 +725,19 @@ fn peer_tls_identity(
     if is_handshaking {
         return Err(PeerSpiffeIdentityError::HandshakeIncomplete);
     }
+    let peer_certificates =
+        peer_certificates.ok_or(PeerSpiffeIdentityError::PeerCertificateUnavailable)?;
     let leaf = peer_certificates
-        .and_then(|chain| chain.first())
+        .first()
         .ok_or(PeerSpiffeIdentityError::PeerCertificateUnavailable)?;
-    let (remaining, certificate) = X509Certificate::from_der(leaf.as_ref())
-        .map_err(|_| PeerSpiffeIdentityError::MalformedCertificate)?;
-    if !remaining.is_empty() {
-        return Err(PeerSpiffeIdentityError::MalformedCertificate);
-    }
-    let not_after =
-        time::OffsetDateTime::from_unix_timestamp(certificate.validity().not_after.timestamp())
-            .map_err(|_| PeerSpiffeIdentityError::MalformedCertificate)?;
+    let leaf_expires_at =
+        certificate_not_after(leaf).map_err(|()| PeerSpiffeIdentityError::MalformedCertificate)?;
+    let certificate_chain_expires_at = presented_certificate_chain_expires_at(peer_certificates)
+        .map_err(|()| PeerSpiffeIdentityError::MalformedCertificate)?;
     Ok(PeerTlsIdentity {
         spiffe_id: extract_spiffe_id_from_cert_der(leaf.as_ref())?,
-        leaf_expires_at: Timestamp::from_offset_datetime(not_after),
+        leaf_expires_at,
+        certificate_chain_expires_at,
     })
 }
 
@@ -709,7 +752,7 @@ pub fn peer_spiffe_id_from_client_connection(
     peer_spiffe_id(connection.is_handshaking(), connection.peer_certificates())
 }
 
-/// Extract canonical identity and leaf expiry from a completed server
+/// Extract canonical identity and certificate expiries from a completed server
 /// certificate authenticated by a client connection.
 pub fn peer_tls_identity_from_client_connection(
     connection: &rustls::ClientConnection,
@@ -728,7 +771,7 @@ pub fn peer_spiffe_id_from_server_connection(
     peer_spiffe_id(connection.is_handshaking(), connection.peer_certificates())
 }
 
-/// Extract canonical identity and leaf expiry from a completed client
+/// Extract canonical identity and certificate expiries from a completed client
 /// certificate authenticated by a server connection.
 pub fn peer_tls_identity_from_server_connection(
     connection: &rustls::ServerConnection,
@@ -1023,7 +1066,7 @@ mod policy_tests {
     use super::*;
     use opc_identity::{build_identity_state, Namespace, ServiceAccount, TrustBundleSet};
     use opc_types::{SpiffeId, Timestamp};
-    use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::io::Cursor;
 
     fn workload(td: &str, tenant: &str, nf: &str, inst: &str) -> WorkloadIdentity {
@@ -1314,6 +1357,20 @@ mod policy_tests {
         assert_eq!(
             peer_spiffe_id_from_client_connection(&client),
             Err(PeerSpiffeIdentityError::HandshakeIncomplete)
+        );
+    }
+
+    #[test]
+    fn peer_identity_evidence_rejects_a_malformed_non_leaf_certificate() {
+        const CLIENT_ID: &str =
+            "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/client-0";
+        let (ca, ca_key) = test_ca();
+        let mut certificates = identity_state(CLIENT_ID, &ca, &ca_key).svid.cert_chain;
+        certificates.insert(1, CertificateDer::from(vec![0xde, 0xad]));
+
+        assert_eq!(
+            peer_tls_identity(false, Some(&certificates)),
+            Err(PeerSpiffeIdentityError::MalformedCertificate)
         );
     }
 

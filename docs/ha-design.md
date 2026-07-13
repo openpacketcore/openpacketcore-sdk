@@ -112,12 +112,14 @@ followers/snapshots/restart, and scans durable artifacts for plaintext,
 raw-key, and provider-endpoint canaries. Shared transport tests observe a
 renewed SVID on a subsequent new call/full handshake and reject rotated
 identities outside the bound peer scope. These qualify the three-node HKMS
-boundary and scoped new-call SVID transport mechanism, not seamless connection
-retirement or remote HKMS. The same suite forms a real three-node config
-Openraft cluster and commits/linearizably reads over loopback mTLS. It does not
+boundary and scoped new-call SVID transport mechanism, not fleet-scale seamless
+connection retirement or remote HKMS. The same suite forms a real three-node
+config Openraft cluster and commits/linearizably reads over loopback mTLS. It does not
 provide out-of-process/deployed-network integration, resource/soak, complete
-trust-bundle/revocation/authentication-age fleet lifecycle, or candidate
-release evidence. Those production claims remain `GAP-001-006`.
+trust-overlap/removal, short-lived-SVID expiry/root-cutover,
+authentication-age fleet lifecycle, or candidate release evidence. Immediate
+generic CRL/OCSP/certificate-or-identity-denylist revocation is not implemented.
+Those production claims remain `GAP-001-006`.
 
 
 ---
@@ -545,21 +547,39 @@ independent coherent-checkpoint or reverse-migration requirement.
 
 Session caches, tickets, resumption, early data, and 0-RTT are disabled, so a
 reconnect performs a full mutual-TLS certificate exchange. #163 gives every
-connection a finite maximum authentication age and exact local/peer leaf-expiry
-bound, retires retained connections on coherent material-epoch or explicit
-reauthentication changes, ends transport waits and releases connection slots by
-the hard deadline, and reconnects watches from the exact delivered cursor. A
-bounded supervised mutation may still finish later; its outcome remains typed
-ambiguous and must not be automatically retried. Fleet trust overlap/removal,
-revocation, reconnect-storm, multi-process rotation, seamless continuity, and
-soak remain production evidence under #164/#143.
+connection a finite maximum authentication age and exact local/peer effective
+presented-chain-expiry bound. Every certificate configured in the local SVID
+chain and every certificate actually presented by the peer contributes; a
+redundantly presented root bounds the deadline, while a root present only in a
+trust bundle is not independently scanned. Production SVID chains should omit
+the trust anchor. #163 retires retained connections on coherent material-epoch
+or explicit reauthentication changes, ends transport waits and releases
+connection slots by the hard deadline, and reconnects watches from the exact
+delivered cursor. Root removal is a trust-anchor cutover and material change,
+not an expiry deadline. A bounded supervised mutation may still finish later;
+its outcome remains typed ambiguous and must not be automatically retried.
+
+Short-lived SVID expiry is the bounded same-issuer
+credential-compromise/revocation response. Rotation and reauthentication do
+not revoke the old certificate/key; its holder can reconnect until the earliest
+expiry across its presented chain while its issuer remains trusted. Immediate
+generic CRL, OCSP, certificate/identity-denylist, and other selective
+same-issuer revocation are unsupported. Fleet trust overlap/removal,
+short-lived-SVID expiry/root-cutover, reconnect-storm, multi-process rotation,
+fleet-scale seamless continuity, and soak remain production evidence under
+#164/#143.
 
 For Kubernetes mounts, `ProjectedSvidSource` now publishes only a bounded,
 validated candidate read from one immutable `..data` target and retains a
-failed candidate's predecessor only until expiry. #162 implements coherent
-handshake epochs and #163 consumes those epochs for connection continuity;
-#164 fleet evidence remains under umbrella #158. Distributed qualification
-remains #143. Session
+failed candidate's predecessor only until the source-monitored leaf expiry; it
+uses that leaf expiry for its ongoing clearing schedule and is not the authority
+for an earlier intermediate expiry. `TlsMaterialController` separately scans
+every configured SVID-chain certificate and marks the material unavailable at
+the earliest effective chain expiry. Consumers must gate TLS readiness on the
+controller status; source `Ready` alone is insufficient. #162 implements
+coherent handshake epochs and #163 consumes those epochs for connection
+continuity; #164 fleet evidence remains under umbrella #158. Distributed
+qualification remains #143. Session
 TTL is application-state lifetime; the 365-day bound is not a
 certificate-expiry, trust-validity, or authentication-age policy.
 
@@ -655,18 +675,23 @@ second consensus algorithm.
   canaries. Followers, apply, snapshots, and recovery make no provider calls.
 - **Shared mTLS lifecycle**: `opc-session-net` transport tests cover local and
   peer leaf-expiry retirement, overlapping trust, full replacement admission,
-  and removed/wrong-scope identity rejection. The suite also forms
-  a real three-node config Openraft cluster and commits/linearizably reads
-  through the existing mTLS peer/server types.
+  and removed/wrong-scope identity rejection. TLS material tests separately
+  prove effective configured/presented-chain expiry through a real mutual-TLS
+  handshake, and lifecycle unit tests prove its local/peer retirement deadlines
+  and fixed metric reasons. The suite also forms a real three-node config
+  Openraft cluster and commits/linearizably reads through the existing mTLS
+  peer/server types.
 
 This evidence establishes the single-engine and migration behavior, qualifies
 the three-node HKMS boundary, and qualifies scoped new-call/full-handshake SVID
 reload plus three-node in-process real-mTLS config composition on the shared
-transport. It does not yet provide seamless connection
-retirement, remote HKMS, out-of-process/deployed-network integration,
+transport. It does not yet provide seamless connection retirement at fleet
+scale, remote HKMS, out-of-process/deployed-network integration,
 restart/rejoin, resource/soak, complete
-trust-bundle/revocation/authentication-age fleet lifecycle, or candidate
-release evidence; those remain `GAP-001-006`.
+trust-overlap/removal, short-lived-SVID expiry/root-cutover,
+authentication-age fleet lifecycle, or candidate release evidence; generic
+CRL/OCSP/certificate-or-identity-denylist revocation remains unsupported and
+those production gaps remain `GAP-001-006`.
 
 ### Session Store HA Failure Tests (Openraft)
 

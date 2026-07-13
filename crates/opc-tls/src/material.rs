@@ -3,6 +3,7 @@
 use opc_identity::{build_identity_state, IdentityReloadError, IdentityState};
 use opc_types::{SpiffeId, Timestamp};
 use rustls::{ClientConfig, ServerConfig};
+use rustls_pki_types::CertificateDer;
 use serde::Serialize;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -87,7 +88,8 @@ pub enum TlsMaterialReloadReason {
     InvalidWorkloadIdentity,
     /// The candidate changed the controller's pinned local SPIFFE identity.
     LocalIdentityChanged,
-    /// The last accepted snapshot reached its leaf expiry boundary.
+    /// The last accepted snapshot reached its effective certificate-chain
+    /// expiry boundary.
     LastGoodExpired,
     /// The process-local epoch counter could not advance.
     EpochExhausted,
@@ -120,12 +122,18 @@ impl fmt::Display for TlsMaterialReloadReason {
 }
 
 /// Redaction-safe status published by [`TlsMaterialController`].
+///
+/// This is the authoritative TLS-handshake availability status: the
+/// controller validates every certificate it will present. An upstream
+/// identity-source status describes source acquisition and is not a substitute
+/// for this admission status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TlsMaterialStatus {
     epoch: TlsMaterialEpoch,
     availability: TlsMaterialAvailability,
     reason: Option<TlsMaterialReloadReason>,
     leaf_expires_at: Option<Timestamp>,
+    certificate_chain_expires_at: Option<Timestamp>,
 }
 
 impl TlsMaterialStatus {
@@ -135,6 +143,7 @@ impl TlsMaterialStatus {
             availability: TlsMaterialAvailability::Initializing,
             reason: Some(TlsMaterialReloadReason::AwaitingInitialMaterial),
             leaf_expires_at: None,
+            certificate_chain_expires_at: None,
         }
     }
 
@@ -156,6 +165,11 @@ impl TlsMaterialStatus {
     /// Leaf expiry for the retained snapshot, when one is available.
     pub const fn leaf_expires_at(self) -> Option<Timestamp> {
         self.leaf_expires_at
+    }
+
+    /// Earliest expiry across the retained presented certificate chain.
+    pub const fn certificate_chain_expires_at(self) -> Option<Timestamp> {
+        self.certificate_chain_expires_at
     }
 }
 
@@ -192,6 +206,7 @@ impl TlsMaterialError {
 pub(crate) struct TlsMaterialSnapshot {
     epoch: TlsMaterialEpoch,
     leaf_expires_at: Timestamp,
+    certificate_chain_expires_at: Timestamp,
     pub(crate) state: Arc<IdentityState>,
 }
 
@@ -203,6 +218,10 @@ impl TlsMaterialSnapshot {
     pub(crate) fn leaf_expires_at(&self) -> Timestamp {
         self.leaf_expires_at
     }
+
+    pub(crate) fn certificate_chain_expires_at(&self) -> Timestamp {
+        self.certificate_chain_expires_at
+    }
 }
 
 impl fmt::Debug for TlsMaterialSnapshot {
@@ -211,6 +230,10 @@ impl fmt::Debug for TlsMaterialSnapshot {
             .debug_struct("TlsMaterialSnapshot")
             .field("epoch", &self.epoch)
             .field("leaf_expires_at", &self.leaf_expires_at)
+            .field(
+                "certificate_chain_expires_at",
+                &self.certificate_chain_expires_at,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -352,6 +375,7 @@ impl TlsMaterialController {
         Ok(TlsAdmittedConnection {
             epoch: snapshot.epoch,
             leaf_expires_at: snapshot.leaf_expires_at,
+            certificate_chain_expires_at: snapshot.certificate_chain_expires_at,
         })
     }
 
@@ -394,7 +418,7 @@ impl TlsMaterialController {
             );
             return;
         };
-        let validated = match validate_candidate(candidate) {
+        let (validated, certificate_chain_expires_at) = match validate_candidate(candidate) {
             Ok(validated) => validated,
             Err(reason) => {
                 publish_rejection(&controller, &self.inner.status_tx, reason);
@@ -429,6 +453,7 @@ impl TlsMaterialController {
         controller.snapshot = Some(TlsMaterialSnapshot {
             epoch: next_epoch,
             leaf_expires_at,
+            certificate_chain_expires_at,
             state: Arc::new(validated),
         });
         self.inner.status_tx.send_replace(TlsMaterialStatus {
@@ -436,6 +461,7 @@ impl TlsMaterialController {
             availability: TlsMaterialAvailability::Ready,
             reason: None,
             leaf_expires_at: Some(leaf_expires_at),
+            certificate_chain_expires_at: Some(certificate_chain_expires_at),
         });
     }
 
@@ -475,7 +501,7 @@ fn expire_locked(controller: &mut ControllerState, status_tx: &watch::Sender<Tls
     let expired = controller
         .snapshot
         .as_ref()
-        .is_some_and(|snapshot| snapshot.state.is_expired());
+        .is_some_and(|snapshot| snapshot.certificate_chain_expires_at <= Timestamp::now_utc());
     if !expired {
         return;
     }
@@ -486,6 +512,7 @@ fn expire_locked(controller: &mut ControllerState, status_tx: &watch::Sender<Tls
         availability: TlsMaterialAvailability::Unavailable,
         reason: Some(TlsMaterialReloadReason::LastGoodExpired),
         leaf_expires_at: None,
+        certificate_chain_expires_at: None,
     });
 }
 
@@ -511,10 +538,43 @@ fn publish_rejection(
         },
         reason: Some(effective_reason),
         leaf_expires_at: retained.map(TlsMaterialSnapshot::leaf_expires_at),
+        certificate_chain_expires_at: retained
+            .map(TlsMaterialSnapshot::certificate_chain_expires_at),
     });
 }
 
-fn validate_candidate(candidate: &IdentityState) -> Result<IdentityState, TlsMaterialReloadReason> {
+fn validate_candidate_chain_temporal_validity(
+    certificates: &[CertificateDer<'_>],
+    now: Timestamp,
+) -> Result<Timestamp, TlsMaterialReloadReason> {
+    let mut earliest_expiry = None;
+    let mut has_expired_certificate = false;
+    let mut has_not_yet_valid_certificate = false;
+    for certificate in certificates {
+        let validity = crate::certificate_validity(certificate)
+            .map_err(|()| TlsMaterialReloadReason::InvalidCertificateChain)?;
+        earliest_expiry = Some(
+            earliest_expiry.map_or(validity.not_after, |earliest: Timestamp| {
+                earliest.min(validity.not_after)
+            }),
+        );
+        has_expired_certificate |= validity.not_after <= now;
+        has_not_yet_valid_certificate |= validity.not_before > now;
+    }
+    let earliest_expiry =
+        earliest_expiry.ok_or(TlsMaterialReloadReason::InvalidCertificateChain)?;
+    if has_expired_certificate {
+        return Err(TlsMaterialReloadReason::ExpiredMaterial);
+    }
+    if has_not_yet_valid_certificate {
+        return Err(TlsMaterialReloadReason::NotYetValidMaterial);
+    }
+    Ok(earliest_expiry)
+}
+
+fn validate_candidate(
+    candidate: &IdentityState,
+) -> Result<(IdentityState, Timestamp), TlsMaterialReloadReason> {
     if candidate.svid.cert_chain.is_empty()
         || candidate.svid.cert_chain.len() > MAX_TLS_MATERIAL_CHAIN_CERTIFICATES
         || candidate.trust_bundles.bundles.len() > MAX_TLS_MATERIAL_TRUST_BUNDLES
@@ -568,6 +628,10 @@ fn validate_candidate(candidate: &IdentityState) -> Result<IdentityState, TlsMat
         candidate.svid.private_key.secret_der().len(),
         material_bytes,
     )?;
+    let certificate_chain_expires_at = validate_candidate_chain_temporal_validity(
+        &candidate.svid.cert_chain,
+        Timestamp::now_utc(),
+    )?;
 
     let validated = build_identity_state(
         candidate.svid.cert_chain.clone(),
@@ -581,7 +645,7 @@ fn validate_candidate(candidate: &IdentityState) -> Result<IdentityState, TlsMat
     {
         return Err(TlsMaterialReloadReason::InvalidWorkloadIdentity);
     }
-    Ok(validated)
+    Ok((validated, certificate_chain_expires_at))
 }
 
 fn validate_material_shape(
@@ -621,6 +685,7 @@ fn map_identity_error(error: IdentityReloadError) -> TlsMaterialReloadReason {
 pub struct TlsAdmittedConnection {
     epoch: TlsMaterialEpoch,
     leaf_expires_at: Timestamp,
+    certificate_chain_expires_at: Timestamp,
 }
 
 impl TlsAdmittedConnection {
@@ -632,6 +697,11 @@ impl TlsAdmittedConnection {
     /// Local leaf expiry used by the admitted TLS connection.
     pub const fn leaf_expires_at(self) -> Timestamp {
         self.leaf_expires_at
+    }
+
+    /// Earliest expiry across the local certificate chain used by the connection.
+    pub const fn certificate_chain_expires_at(self) -> Timestamp {
+        self.certificate_chain_expires_at
     }
 }
 
@@ -671,6 +741,11 @@ impl TlsClientHandshake {
         self.snapshot.leaf_expires_at()
     }
 
+    /// Earliest expiry across the fixed local certificate chain.
+    pub fn certificate_chain_expires_at(&self) -> Timestamp {
+        self.snapshot.certificate_chain_expires_at()
+    }
+
     /// Verify the snapshot is still current after TLS and application negotiation.
     pub fn admit(&self) -> Result<TlsAdmittedConnection, TlsMaterialError> {
         self.controller.admit(&self.snapshot)
@@ -683,6 +758,10 @@ impl fmt::Debug for TlsClientHandshake {
             .debug_struct("TlsClientHandshake")
             .field("epoch", &self.snapshot.epoch)
             .field("leaf_expires_at", &self.snapshot.leaf_expires_at)
+            .field(
+                "certificate_chain_expires_at",
+                &self.snapshot.certificate_chain_expires_at,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -723,6 +802,11 @@ impl TlsServerHandshake {
         self.snapshot.leaf_expires_at()
     }
 
+    /// Earliest expiry across the fixed local certificate chain.
+    pub fn certificate_chain_expires_at(&self) -> Timestamp {
+        self.snapshot.certificate_chain_expires_at()
+    }
+
     /// Verify the snapshot is still current after TLS and application negotiation.
     pub fn admit(&self) -> Result<TlsAdmittedConnection, TlsMaterialError> {
         self.controller.admit(&self.snapshot)
@@ -735,6 +819,10 @@ impl fmt::Debug for TlsServerHandshake {
             .debug_struct("TlsServerHandshake")
             .field("epoch", &self.snapshot.epoch)
             .field("leaf_expires_at", &self.snapshot.leaf_expires_at)
+            .field(
+                "certificate_chain_expires_at",
+                &self.snapshot.certificate_chain_expires_at,
+            )
             .finish_non_exhaustive()
     }
 }

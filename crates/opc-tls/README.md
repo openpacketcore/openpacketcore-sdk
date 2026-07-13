@@ -35,11 +35,15 @@ and instance metadata.
   exchange, and `admit()` must run only after application negotiation.
 - `run_handshake()` enforces 128 concurrent operations and retries at most two
   epoch changes after the initial attempt. Its successful
-  `TlsAdmittedConnection` records the exact epoch and local leaf expiry.
+  `TlsAdmittedConnection` records the exact epoch, local leaf expiry, and the
+  earliest expiry across every certificate in the configured SVID chain.
 - `peer_spiffe_id_from_client_connection` and
   `peer_spiffe_id_from_server_connection` extract the one canonical SPIFFE URI
   from an established TLS connection. Missing, malformed, or ambiguous URI
   SANs fail closed.
+- `peer_tls_identity_from_client_connection` and
+  `peer_tls_identity_from_server_connection` additionally retain the peer leaf
+  expiry and earliest expiry across every certificate presented by the peer.
 - `ServerConfig` and `ClientConfig` are re-exported Rustls config aliases.
 
 ```rust,no_run
@@ -108,14 +112,23 @@ async fn coherent_handshake(
 - Certificate/key rotation is driven by identity state updates; this crate does
   not fetch SVIDs itself.
 - Controller status contains only an epoch, closed availability/reason enums,
-  and local leaf expiry. It never contains paths, PEM, key bytes, SPIFFE IDs,
-  parser text, or user operation errors. Status/snapshot access reconciles the
-  latest watch value and enforces expiry.
+  local leaf expiry, and effective configured-chain expiry. It never contains
+  paths, PEM, key bytes, SPIFFE IDs, parser text, or user operation errors.
+  Status/snapshot access reconciles the latest watch value and enforces the
+  earliest configured-chain expiry. This controller status is authoritative
+  for TLS admission; an upstream source `Ready` status alone is not.
+- Readiness code must call `material_status()` or
+  `TlsMaterialController::status()` for each evaluation. A previously borrowed
+  status/watch value is not a wall-clock expiry timer; source activity or an
+  explicit controller access drives reconciliation.
 - A candidate is revalidated under limits of 16 chain certificates, 16 trust
   bundles, 128 trust anchors, 64 KiB private-key bytes, and 4 MiB total material.
-  Same-SPIFFE leaf/key and overlapping-trust updates publish a new epoch;
-  changed identity, wrong key/chain/trust, malformed/oversized, future, or
-  expired candidates preserve the prior snapshot only until its leaf expires.
+  Every configured chain certificate is temporally checked before chain
+  rebuild. Same-SPIFFE leaf/key and overlapping-trust updates publish a new
+  epoch; changed identity, wrong key/chain/trust, malformed/oversized, future,
+  or expired candidates preserve the prior snapshot only until the earliest
+  configured-chain expiry. A redundantly configured root therefore bounds the
+  snapshot; a root present only in a trust bundle does not.
 
 ## Compatibility
 
@@ -128,21 +141,28 @@ transport integrations should use `run_handshake()` by default. Direct
 independently enforce equivalent concurrency, deadline, epoch-retry, and
 post-application `admit()` bounds.
 
+`TlsMaterialStatus`, `TlsAdmittedConnection`, and `PeerTlsIdentity` add
+effective-chain-expiry accessors; the first two also serialize that additional
+redaction-safe timestamp. Strict external JSON consumers must accept the added
+field when adopting this version.
+
 This contract makes each new handshake coherent and records its exact material
-epoch. It does not drain already authenticated connections or enforce maximum
-authentication age; that lifecycle remains #163, followed by #164 fleet
-qualification under umbrella #158.
+epoch and certificate deadlines. It does not itself drain already authenticated
+connections or enforce maximum authentication age; `opc-session-net` consumes
+the evidence through the #163 lifecycle. Fleet qualification remains #164
+under umbrella #158.
 
 ## Roadmap
 
-- Wire bounded epoch admission into long-lived transport connection lifecycle
-  under #163 without reintroducing per-callback dynamic material reads.
+- Qualify projected-material rotation, expiry, rollback, and bounded reconnect
+  behavior in three- and five-member fleets under #164.
 - Add policy dimensions only when encoded in workload identity metadata.
 - Keep compatibility mode explicit so TLS 1.2 is never enabled accidentally.
 
 ## Verification
 
-- Source checked: `Cargo.toml`, `src/lib.rs`, and TLS/identity tests.
+- Source checked: `Cargo.toml`, `src/lib.rs`, `src/material.rs`, and
+  TLS/identity tests, including `tests/material_epochs.rs`.
 - Run with: `cargo test -p opc-tls`.
 
 ## License

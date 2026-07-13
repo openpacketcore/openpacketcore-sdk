@@ -184,8 +184,9 @@ existing `opc-session-net`/CNF responsibility. Preserve trust overlap, force
 fresh authentication, drain old connections, and gate on fresh readiness.
 Shared real-mTLS tests qualify a renewed SVID on a subsequent new call/full
 handshake and wrong-scope rejection. They do not prove seamless old-connection
-retirement. The suite also forms a real three-node `ConsensusConfigStore` and
-commits/linearizably reads through the existing mTLS adapter. This migration
+retirement across a fleet. The suite also forms a real three-node
+`ConsensusConfigStore` and commits/linearizably reads through the existing mTLS
+adapter. This migration
 does not by itself supply out-of-process/deployed-network, multi-process/soak,
 or the complete fleet trust lifecycle.
 
@@ -484,10 +485,12 @@ clamp/split entries ad hoc or use the raw inner backend as protection.
 This closes the #147 traversal/confidentiality gap only. It does not qualify
 networked session HA. #143 and the remaining dependencies still block the
 experimental profile. A renewed SVID on a subsequent new call/full handshake
-and wrong-scope rejection have scoped real-mTLS qualification; seamless
-connection retirement, payload-protection key rotation, and the complete
-trust-bundle, revocation, authentication-age, multi-process, and soak lifecycle
-remain separate mandatory production gates.
+and wrong-scope rejection have scoped real-mTLS qualification; fleet-scale
+seamless connection retirement, payload-protection key rotation, and the
+complete trust-overlap/removal, short-lived-SVID expiry/root-cutover,
+authentication-age, multi-process, and soak lifecycle remain separate mandatory
+production gates. Immediate generic CRL/OCSP/certificate-or-identity-denylist
+revocation is not implemented.
 
 ### Session durable readiness
 
@@ -750,26 +753,46 @@ commands or make consensus decisions.
 
 #161 atomic identity/trust reload, #162 bounded material epochs, and #163 finite
 peer reauthentication are implemented. Clients and listeners retain exact
-handshake epoch and local/peer leaf-expiry evidence, stop new admission at the
-soft retirement boundary, bound transport waits and connection slots by the
-hard deadline, and repeat the complete mutual-TLS/application handshake on
-replacements. A supervised backend mutation may finish after its caller future
-is dropped; retirement therefore preserves typed ambiguity, forbids automatic
-replay, and requires authoritative readback or the existing operation-bound
-idempotency/fencing contract.
+handshake epoch and local/peer effective presented-chain-expiry evidence, stop
+new admission at the soft retirement boundary, bound transport waits and
+connection slots by the hard deadline, and repeat the complete
+mutual-TLS/application handshake on replacements. Every certificate configured
+in the local SVID chain and every certificate actually presented by the peer
+contributes to the deadline; a redundantly presented root therefore bounds it.
+A root present only in a configured trust bundle is not independently scanned,
+and anchor removal time is not an expiry deadline. Production SVID chains
+should omit the trust anchor. A supervised backend mutation may finish after
+its caller future is dropped; retirement therefore preserves typed ambiguity,
+forbids automatic replay, and requires authoritative readback or the existing
+operation-bound idempotency/fencing contract.
+
+Use short-lived SVID expiry as the bounded same-issuer
+credential-compromise/revocation response. Rotation and reauthentication move
+cooperative participants but do not revoke an old certificate/key: its holder
+can reconnect until the earliest expiry in that presented chain while its
+issuer remains trusted. Immediate generic CRL, OCSP,
+certificate/identity-denylist, and other selective same-issuer revocation are
+unsupported. Root removal is instead a trust-anchor cutover for every chain
+that depends on it; it is not an expiry deadline.
+
 Legacy watches resume from the exact caller-delivered sequence. #164 still
 owns fleet rotation qualification under umbrella #158; a production CNF must
-qualify old/new trust overlap and removal, revocation, reconnect storms, and
-multi-process/soak continuity. #143 owns the wider distributed qualification.
+qualify old/new trust overlap and removal, short-lived-SVID expiry and root
+cutover, reconnect storms, and multi-process/soak continuity. The unsupported
+generic-revocation limitation remains part of that acceptance decision. #143
+owns the wider distributed qualification.
 
 When TLS material is mounted as a Kubernetes projected Secret, construct
 `ProjectedSvidSource` with the mount root and relative Secret-key paths. Do not
 point the independent-file source at the user-facing `tls.crt`, `tls.key`, and
 bundle symlinks: those links can cross generations during `..data` replacement.
-Gate startup on a `Ready` typed status and non-empty identity state. A
-`RetainingLastGood` status permits existing unexpired material to remain active
-while the candidate is repaired; `Unavailable` must gate new traffic. Never
-retain last-good material past its leaf expiry.
+Treat source `Ready` and a non-empty identity state only as source-publication
+prerequisites. A `RetainingLastGood` status permits existing unexpired material
+to remain active while the candidate is repaired; source `Unavailable` must
+gate new traffic. Never retain source-level last-good material past its leaf
+expiry. This projected source's ongoing expiry monitor schedules clearing from
+the leaf expiry; it is not the authority for an earlier intermediate expiry.
+Source `Ready` alone is therefore not TLS readiness.
 
 Alert on the fixed projected reload reason codes, not the legacy free-form
 event field. Generation numbers are process-local evidence: rollback advances
@@ -781,19 +804,30 @@ until a validated replacement is published.
 Construct one shared `TlsMaterialController` from the identity source and pass
 clones through `TlsConfigBuilder::from_material_controller`. Pin the expected
 local SPIFFE ID explicitly when configuration already knows it; otherwise the
-first valid state becomes the process-lifetime pin. Use `run_handshake` for the
-complete TLS plus application bootstrap and retain its admitted epoch/leaf
-expiry with the connection. A raw `rustls_config()` call is compatibility-only
-and does not supply epoch-current application admission.
+first valid state becomes the process-lifetime pin. Gate startup and new TLS
+traffic on controller `Ready`, not source status alone. The controller pre-scans
+every configured SVID-chain certificate, marks material unavailable at the
+earliest expiry, and exposes both leaf and effective chain expiry. Use
+`run_handshake` for the complete TLS plus application bootstrap and retain its
+admitted epoch, leaf expiry, and effective configured/presented-chain expiry
+with the connection. A raw `rustls_config()` call is compatibility-only and does
+not supply epoch-current application admission.
+
+Every readiness evaluation must call `material_status()` or
+`TlsMaterialController::status()` so wall-clock expiry is reconciled at that
+evaluation. Do not cache a previously borrowed watch value as current
+readiness: status subscriptions wake on reconciled/source activity and are not
+an independent wall-clock timer for an earlier intermediate expiry.
 
 Alert on `local_identity_changed`, `last_good_expired`,
 `material_limit_exceeded`, and `epoch_retry_limit` without attaching identity
-or parser text. An invalid candidate leaves an unexpired prior epoch usable;
-an expired prior epoch gates new connections. Epochs reset with the process and
-must never be used as cluster membership/configuration epochs. Configure the
-same finite `ConnectionLifecyclePolicy` on peers and listeners and share a
-`SessionReauthenticationControl` for CNF orchestration. Defaults are a
-15-minute maximum authentication age, 30-second drain, 50 ms through 1 second
+or parser text. An invalid candidate leaves a prior epoch usable only while its
+effective configured/presented chain remains unexpired; expiry of any
+configured chain certificate gates new connections. Epochs reset with the
+process and must never be used as cluster membership/configuration epochs.
+Configure the same finite `ConnectionLifecyclePolicy` on peers and listeners
+and share a `SessionReauthenticationControl` for CNF orchestration. Defaults are
+a 15-minute maximum authentication age, 30-second drain, 50 ms through 1 second
 reconnect backoff, and at most 30 seconds of directed stable jitter. Use the
 forward and reverse trust/leaf procedure in
 [`consensus-operator-runbook.md`](consensus-operator-runbook.md#7-shared-mtls-certificate-rotation).
@@ -1063,10 +1097,11 @@ routing/quorum/commit/apply operation deadline remain separate bounded layers;
 the removed private config TCP timeout is not a production setting. A renewed
 SVID rotation has scoped real-mTLS qualification. #161 atomic reload, #162
 coherent material epochs, and #163 finite connection retirement are
-implemented; complete fleet trust removal, revocation, reconnect-storm, and
-multi-process continuity evidence remains #164 under umbrella #158. The
-remaining distributed/payload-key production evidence
-stays open in #143.
+implemented; complete fleet trust removal, short-lived-SVID expiry/root-cutover,
+reconnect-storm, and multi-process continuity evidence remains #164 under
+umbrella #158. Immediate generic CRL/OCSP/certificate-or-identity-denylist
+revocation remains unsupported. The remaining distributed/payload-key
+production evidence stays open in #143.
 
 #167 does not rewrite persisted session-store bytes. In-profile stable IDs need
 no format conversion, but a retained empty/over-64-byte/non-BLOB stable ID or

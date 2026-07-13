@@ -24,11 +24,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::error::ProtocolError;
+use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::identity::{LocalReplicaBinding, RemoteReplicaBinding};
 use crate::lifecycle::{
-    directed_connection_key, material_status_matches_admission, ConnectionLifecycle,
-    ConnectionLifecyclePolicy, LeafExpiryEvidence, SessionReauthenticationControl,
+    directed_connection_key, material_status_matches_admission, CertificateExpiryEvidence,
+    ConnectionLifecycle, ConnectionLifecyclePolicy, SessionReauthenticationControl,
 };
 use crate::protocol::{
     checked_frame_size, checked_wire_frame_size, negotiate_response_frame_size, read_frame,
@@ -205,14 +205,10 @@ fn record_consensus_server_connection_failure(error: &ProtocolError) {
 }
 
 fn map_tls_connect_error(error: io::Error) -> SessionConsensusPeerError {
-    if error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<tokio_rustls::rustls::Error>())
-        .is_some()
-    {
-        SessionConsensusPeerError::Authentication
-    } else {
-        SessionConsensusPeerError::Unavailable
+    match classify_tls_io_error(error) {
+        ProtocolError::Authentication => SessionConsensusPeerError::Authentication,
+        ProtocolError::Io(_) => SessionConsensusPeerError::Unavailable,
+        _ => SessionConsensusPeerError::Protocol,
     }
 }
 
@@ -393,7 +389,7 @@ impl RemoteSessionConsensusPeer {
                                 if tls_stream.get_ref().1.alpn_protocol()
                                     != Some(SESSION_CONSENSUS_ALPN)
                                 {
-                                    return Err(SessionConsensusPeerError::Authentication);
+                                    return Err(SessionConsensusPeerError::Protocol);
                                 }
                                 let peer = opc_tls::peer_tls_identity_from_client_connection(
                                     tls_stream.get_ref().1,
@@ -404,12 +400,14 @@ impl RemoteSessionConsensusPeer {
                                     return Err(SessionConsensusPeerError::Authentication);
                                 }
                                 let tls_completed_at = tokio::time::Instant::now();
-                                let local_expiry = LeafExpiryEvidence::capture(
+                                let local_expiry = CertificateExpiryEvidence::capture(
                                     attempt.leaf_expires_at(),
+                                    attempt.certificate_chain_expires_at(),
                                     tls_completed_at,
                                 );
-                                let peer_expiry = LeafExpiryEvidence::capture(
+                                let peer_expiry = CertificateExpiryEvidence::capture(
                                     peer.leaf_expires_at(),
+                                    peer.certificate_chain_expires_at(),
                                     tls_completed_at,
                                 );
                                 let (mut reader, mut writer) = tokio::io::split(tls_stream);
@@ -1037,8 +1035,8 @@ enum ConnectionPeerIdentity {
 struct PendingConsensusLifecycle {
     handshake: Option<opc_tls::TlsServerHandshake>,
     tls_config: Option<opc_tls::AuthenticatedServerConfig>,
-    local_leaf_expiry: Option<LeafExpiryEvidence>,
-    peer_leaf_expiry: Option<LeafExpiryEvidence>,
+    local_certificate_expiry: Option<CertificateExpiryEvidence>,
+    peer_certificate_expiry: Option<CertificateExpiryEvidence>,
     established_at: tokio::time::Instant,
     generation: u64,
 }
@@ -1048,8 +1046,8 @@ impl PendingConsensusLifecycle {
         Self {
             handshake: None,
             tls_config: None,
-            local_leaf_expiry: None,
-            peer_leaf_expiry: None,
+            local_certificate_expiry: None,
+            peer_certificate_expiry: None,
             established_at: tokio::time::Instant::now(),
             generation,
         }
@@ -1081,8 +1079,8 @@ impl PendingConsensusLifecycle {
         let lifecycle = ConnectionLifecycle::new(
             policy,
             self.established_at,
-            self.local_leaf_expiry,
-            self.peer_leaf_expiry,
+            self.local_certificate_expiry,
+            self.peer_certificate_expiry,
             self.generation,
             epoch,
         )
@@ -1097,8 +1095,8 @@ impl PendingConsensusLifecycle {
         ConnectionLifecycle::new(
             policy,
             self.established_at,
-            self.local_leaf_expiry,
-            self.peer_leaf_expiry,
+            self.local_certificate_expiry,
+            self.peer_certificate_expiry,
             self.generation,
             self.handshake
                 .as_ref()
@@ -1209,16 +1207,23 @@ async fn handle_consensus_connection(
                     "consensus TLS handshake timed out",
                 ))
             })?
-            .map_err(ProtocolError::Io)?;
+            .map_err(classify_tls_io_error)?;
         let established_at = tokio::time::Instant::now();
         if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
-            return Err(ProtocolError::Authentication);
+            return Err(ProtocolError::UnexpectedResponse);
         }
         let peer = opc_tls::peer_tls_identity_from_server_connection(tls_stream.get_ref().1)
             .map_err(|_| ProtocolError::Authentication)?;
-        let local_leaf_expiry =
-            LeafExpiryEvidence::capture(handshake.leaf_expires_at(), established_at);
-        let peer_leaf_expiry = LeafExpiryEvidence::capture(peer.leaf_expires_at(), established_at);
+        let local_certificate_expiry = CertificateExpiryEvidence::capture(
+            handshake.leaf_expires_at(),
+            handshake.certificate_chain_expires_at(),
+            established_at,
+        );
+        let peer_certificate_expiry = CertificateExpiryEvidence::capture(
+            peer.leaf_expires_at(),
+            peer.certificate_chain_expires_at(),
+            established_at,
+        );
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
         dispatch_consensus(
             &mut reader,
@@ -1227,8 +1232,8 @@ async fn handle_consensus_connection(
             PendingConsensusLifecycle {
                 handshake: Some(handshake),
                 tls_config: Some(tls_config),
-                local_leaf_expiry: Some(local_leaf_expiry),
-                peer_leaf_expiry: Some(peer_leaf_expiry),
+                local_certificate_expiry: Some(local_certificate_expiry),
+                peer_certificate_expiry: Some(peer_certificate_expiry),
                 established_at,
                 generation,
             },

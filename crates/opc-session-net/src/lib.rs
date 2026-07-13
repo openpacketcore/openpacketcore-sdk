@@ -15,7 +15,8 @@
 //!
 //! Every authenticated direct and consensus connection also has one finite
 //! [`ConnectionLifecyclePolicy`]. The transport records the completed
-//! handshake's material epoch and local/peer leaf-expiry evidence, stops
+//! handshake's material epoch and local/peer leaf plus presented-chain expiry
+//! evidence, stops
 //! admitting new work at the earliest retirement boundary, and bounds the
 //! transport wait plus connection-slot lifetime by the hard deadline. A
 //! supervised backend mutation may still finish after its caller future is

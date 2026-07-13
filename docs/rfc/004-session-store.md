@@ -28,8 +28,9 @@ current-format recovery and #129 supplies the audited offline legacy-fork
 campaign, while #133 supplies bounded restore from the Openraft-applied state
 without becoming readiness evidence by itself. Connection reauthentication and
 retained-connection continuity are implemented under #163. Distributed fleet
-qualification of trust overlap/removal, revocation, reconnect storms,
-resources, and soak (#164/#143) remains a gate.
+qualification of trust overlap/removal, short-lived-SVID expiry and root
+cutover, reconnect storms, resources, and soak (#164/#143) remains a gate;
+generic CRL/OCSP/denylist revocation is not implemented.
 
 ## 2. Scope
 
@@ -1232,8 +1233,13 @@ It does not close #167 or #168 and does not provide #143's
 payload-key/distributed production qualification. #163 real-mTLS transport
 tests cover local/peer leaf-expiry retirement, overlapping trust, complete
 replacement negotiation, old-trust rejection, and request/watch continuity.
+TLS material tests separately prove effective configured/presented-chain expiry
+through a real mutual-TLS handshake, while lifecycle unit tests prove the
+corresponding local/peer retirement deadlines and fixed metric reasons.
 That scoped evidence is not #164/#143's multi-process rotation/soak,
-reconnect-storm, revocation, or fleet trust-removal qualification. #177 removes
+reconnect-storm, short-lived-SVID expiry/root-cutover, or fleet trust-removal
+qualification. Generic CRL/OCSP/certificate-or-identity-denylist revocation is
+not implemented. #177 removes
 `opc-persist`'s separate config TCP
 path and reuses the shared consensus peer/handler boundary instead of defining
 another timeout or credential lifecycle. An in-process real-mTLS integration
@@ -1290,12 +1296,16 @@ MUST fail before Openraft dispatch with redaction-safe diagnostics.
 
 Every authenticated client, peer, and listener MUST apply one finite
 `ConnectionLifecyclePolicy`. Its hard deadline MUST be the earliest of the
-configured maximum authentication age, authenticated local leaf expiry, and
-authenticated peer leaf expiry. Soft retirement MUST begin early enough to
-leave at most one configured drain window before that hard deadline. A coherent
-TLS material-epoch change or an explicit process-local reauthentication
-generation MUST also schedule retirement, using deterministic directed-peer
-jitter no greater than the configured bound.
+configured maximum authentication age, the expiry of every certificate in the
+local configured/presented SVID chain, and the expiry of every certificate
+actually presented by the peer. A redundantly presented root contributes to
+that bound. A certificate appearing only in a configured trust bundle is not
+independently scanned for the deadline, and the time an anchor is removed is not
+an expiry deadline. Production SVID chains SHOULD omit the trust anchor. Soft
+retirement MUST begin early enough to leave at most one configured drain window
+before the hard deadline. A coherent TLS material-epoch change or an explicit
+process-local reauthentication generation MUST also schedule retirement, using
+deterministic directed-peer jitter no greater than the configured bound.
 
 After soft retirement the client MUST NOT assign a new operation to the
 connection and the server MUST NOT read or dispatch another request. An
@@ -1331,8 +1341,10 @@ partition/restart/resource/soak and payload-key gate. #161 atomic reload, #162
 material epochs, and #163 bounded reauthentication are implemented, including
 scoped retained-connection, request, and watch continuity evidence. Production
 rotation MUST additionally qualify old/new trust overlap and removal,
-revocation, reconnect-storm bounds, and multi-process/soak behavior under
-#164/#143. #158 remains the umbrella until that fleet evidence passes.
+short-lived-SVID expiry and root cutover, reconnect-storm bounds, and
+multi-process/soak behavior under #164/#143. The lack of immediate generic CRL,
+OCSP, or certificate/identity-denylist revocation MUST remain explicit. #158
+remains the umbrella until that fleet evidence passes.
 
 ## 13. Local Cache
 
@@ -1450,26 +1462,44 @@ stable keyed digests for correlation when needed.
 Session TTL is application-state lifetime and MUST NOT be used as a certificate
 lifetime, trust-bundle lifetime, or maximum-authentication-age policy. A
 production networked session-store profile MUST rotate workload certificates
-and trust bundles without interrupting service, while still enforcing
-revocation and a documented maximum authentication age on long-lived
-connections. #161 atomic reload, #162 coherent material epochs, and #163 finite
-connection retirement/reauthentication are implemented. On epoch change or an
-explicit orchestration request, both sides MUST stop new admission, end the
-transport wait and release connection slots within the finite hard deadline,
-and repeat the full mutual-TLS and application handshake on replacements.
+and trust bundles without interrupting service, use short-lived SVID expiry as
+the bounded same-issuer credential-compromise/revocation response, and document
+a maximum authentication age on long-lived connections. #161 atomic reload,
+#162 coherent material epochs, and #163 finite connection
+retirement/reauthentication are implemented. On epoch change or an explicit
+orchestration request, both sides MUST stop new admission, end the transport
+wait and release connection slots within the finite hard deadline, and repeat
+the full mutual-TLS and application handshake on replacements.
 Already-admitted supervised mutations retain the ambiguity/readback contract
 above if their bounded backend work finishes later.
+
+Rotation and reauthentication move cooperative participants but do not revoke
+the old certificate/key. Its holder can establish a fresh connection until the
+earliest expiry across every certificate in that presented chain while its
+issuer remains trusted. Immediate generic CRL, OCSP,
+certificate/identity-denylist, and other selective same-issuer revocation are
+not implemented. Root removal is a trust-anchor cutover for all chains that
+depend on it, not an expiry deadline or selective revocation.
+
+The projected source's ongoing expiry monitor clears retained source material
+at leaf expiry. It is not the authority for an earlier intermediate expiry.
+`TlsMaterialController` MUST pre-scan every configured SVID-chain certificate,
+mark material unavailable at the earliest effective chain expiry, and provide
+the TLS readiness status. Source `Ready` alone MUST NOT satisfy this section.
 
 An operator MUST publish overlapping old/new trust before new leaves, preserve
 the exact stable SPIFFE and consensus scope, trigger reauthentication, and
 verify that every directed peer path has authenticated on current material
-before removing old trust. Rollback before old-trust removal restores the prior
-leaf/material publication and triggers another monotonic reauthentication
-generation; rollback after removal MUST first restore overlapping trust and
-prove it Ready, then restore the old leaf and trigger reauthentication. A
-rollback MUST NOT reuse an old authenticated connection as evidence.
-Reconnect-storm, revocation, multi-process trust-removal, soak, and wider
-distributed production evidence remain #164/#143 under umbrella #158.
+before removing old trust. Removing that anchor cuts over later handshakes;
+trigger reauthentication and prove that every chain depending on it is
+rejected. Rollback before old-trust removal restores the prior leaf/material
+publication and triggers another monotonic reauthentication generation;
+rollback after removal MUST first restore overlapping trust and prove the
+controller status is `Ready`, then restore the old leaf and trigger
+reauthentication. A rollback MUST NOT reuse an old authenticated connection as
+evidence. Reconnect-storm,
+short-lived-SVID expiry, root-cutover, multi-process trust-removal, soak, and
+wider distributed production evidence remain #164/#143 under umbrella #158.
 
 ## 15. Observability
 

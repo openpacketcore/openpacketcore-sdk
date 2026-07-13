@@ -102,14 +102,19 @@ TLS session caches, tickets, resumption, early data, and 0-RTT are disabled;
 every reconnect performs a full mutual-TLS certificate exchange so rotated
 SVIDs cannot inherit cached replica authority.
 
-#163 now applies a finite maximum authentication age and exact local/peer leaf
-expiry to every connection, retires retained connections on coherent material
-epoch or explicit reauthentication changes, ends transport waits and releases
-connection slots by the hard deadline, and repeats the full handshake.
+#163 now applies a finite maximum authentication age and exact local/peer
+certificate deadlines to every connection. Material admission and lifecycle
+evidence use the earliest expiry across each configured/presented chain while
+preserving distinct leaf and earlier-chain telemetry. Retained connections
+retire on coherent material-epoch or explicit reauthentication changes,
+transport waits and connection slots end by the hard deadline, and replacements
+repeat the full handshake.
 Already-admitted supervised mutations may finish later; they remain typed
 ambiguous and are never automatically replayed. The qualified CNF/operator
-profile must still prove fleet trust overlap/removal, revocation,
-reconnect-storm behavior, and multi-process continuity under #164/#143.
+profile must still prove fleet trust overlap/removal, short-lived-SVID expiry
+and root cutover, rollback, reconnect-storm behavior, and multi-process
+continuity under #164/#143. Immediate generic CRL/OCSP/certificate-or-identity
+denylist revocation is unsupported.
 Session/lease TTL is an application-state lifetime and does not set certificate
 expiry, trust-bundle validity, or authentication age.
 
@@ -430,8 +435,10 @@ three-node config Openraft cluster and commits/linearizably reads through those
 existing peer/server types. #163 tests qualify bounded retained-connection
 retirement, full reauthentication, and request/watch continuity on this shared
 transport. Multi-process rotation/soak and complete trust-bundle removal,
-revocation, reconnect-storm, and seamless-continuity evidence retain their
-#164/#143 production gates. Remote-seal historical selection now uses the exact validated
+short-lived-SVID expiry/root cutover, rollback, reconnect-storm, and
+seamless-continuity evidence retain their #164/#143 production gates.
+Immediate generic CRL/OCSP/certificate-or-identity-denylist revocation is
+unsupported. Remote-seal historical selection now uses the exact validated
 envelope key ID with KMS/HKMS-owned retention. The SDK has no local historical
 cache, retirement API, or enforcement gate. Distributed payload-protection and
 failure/soak/resource qualification remains #143.
