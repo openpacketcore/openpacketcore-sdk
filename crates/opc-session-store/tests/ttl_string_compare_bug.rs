@@ -36,7 +36,9 @@ async fn test_sqlite_string_comparison_subsecond_bug() {
         tenant: TenantId::new("tenant-a").unwrap(),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from(vec![1, 2, 3]),
+        stable_id: Bytes::from(vec![1, 2, 3])
+            .try_into()
+            .expect("valid stable ID"),
     };
 
     // Acquire lease
@@ -101,7 +103,9 @@ async fn test_sqlite_string_comparison_subsecond_bug_not_pruning_expired() {
         tenant: TenantId::new("tenant-a").unwrap(),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from(vec![4, 5, 6]),
+        stable_id: Bytes::from(vec![4, 5, 6])
+            .try_into()
+            .expect("valid stable ID"),
     };
 
     // Acquire lease
@@ -173,7 +177,9 @@ async fn test_sqlite_lease_premature_millisecond_prune() {
         tenant: TenantId::new("tenant-a").unwrap(),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from(vec![7, 8, 9]),
+        stable_id: Bytes::from(vec![7, 8, 9])
+            .try_into()
+            .expect("valid stable ID"),
     };
 
     // Acquire lease at base_time (100 microseconds) with a TTL of 800 microseconds.

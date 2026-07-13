@@ -229,7 +229,9 @@ mod tests {
             tenant: TenantId::from_static("ref-smf"),
             nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"seid-1"),
+            stable_id: Bytes::from_static(b"seid-1")
+                .try_into()
+                .expect("valid stable ID"),
         };
         let lease = store
             .acquire(&key, owner.clone(), Duration::from_secs(60))

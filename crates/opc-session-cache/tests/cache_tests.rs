@@ -22,7 +22,9 @@ fn test_session_key() -> SessionKey {
         tenant: opc_types::TenantId::new("test-tenant").unwrap(),
         nf_kind: opc_types::NetworkFunctionKind::new("amf").unwrap(),
         key_type: opc_session_store::SessionKeyType::SubscriberContext,
-        stable_id: bytes::Bytes::copy_from_slice(&[0xAA; 16]),
+        stable_id: bytes::Bytes::copy_from_slice(&[0xAA; 16])
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 

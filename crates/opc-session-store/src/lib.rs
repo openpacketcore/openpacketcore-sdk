@@ -81,8 +81,9 @@ pub use handover::{
 pub use lease::{LeaseGuard, SessionLeaseManager};
 pub use model::{
     CustomSessionKeyType, FenceToken, Generation, HandoverPhase, HandoverTxId, OwnerId, SessionKey,
-    SessionKeyType, StateClass, StateType, OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES,
-    STATE_TYPE_MAX_BYTES,
+    SessionKeyType, StableId, StableIdError, StateClass, StateType, OWNER_ID_MAX_BYTES,
+    SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_HMAC_SHA256_BYTES, STABLE_ID_MAX_BYTES,
+    STABLE_ID_MIN_BYTES, STATE_TYPE_MAX_BYTES,
 };
 pub use owned_session::{OwnedSession, OwnedSessionMutationContext, OwnedSessionMutationError};
 pub use payload_codec::{

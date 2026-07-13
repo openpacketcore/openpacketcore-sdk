@@ -2009,7 +2009,9 @@ mod tests {
                 tenant: TenantId::from_static("tenant-a"),
                 nf_kind: NetworkFunctionKind::from_static("smf"),
                 key_type: SessionKeyType::PduSession,
-                stable_id: Bytes::from_static(stable_id),
+                stable_id: Bytes::from_static(stable_id)
+                    .try_into()
+                    .expect("valid stable ID"),
             },
             generation: Generation::new(1),
             owner: OwnerId::new("owner-a").expect("owner"),

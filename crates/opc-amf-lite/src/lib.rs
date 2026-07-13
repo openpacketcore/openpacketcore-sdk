@@ -88,7 +88,9 @@ fn session_key_from_pseudonym(pseudonym: &str) -> Result<SessionKey, BoxError> {
         tenant: TenantId::new(SYSTEM_TENANT)?,
         nf_kind: amf_nf_kind()?,
         key_type: SessionKeyType::SubscriberContext,
-        stable_id: bytes::Bytes::copy_from_slice(pseudonym.as_bytes()),
+        stable_id: opc_session_store::StableId::new(bytes::Bytes::copy_from_slice(
+            pseudonym.as_bytes(),
+        ))?,
     })
 }
 

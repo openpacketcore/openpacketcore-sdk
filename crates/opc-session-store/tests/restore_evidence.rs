@@ -8,7 +8,7 @@ use opc_session_store::{
     SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, StateClass, StateType,
     StoreError, StoredSessionRecord, RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE,
     RESTORE_SCAN_MAX_PAGE_PAYLOAD_BYTES, RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
-    RESTORE_SCAN_MAX_PAGE_SIZE, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    RESTORE_SCAN_MAX_PAGE_SIZE,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use std::sync::Arc;
@@ -35,7 +35,9 @@ fn record(
             tenant: TenantId::from_static("tenant-a"),
             nf_kind: NetworkFunctionKind::upf(),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(stable_id),
+            stable_id: Bytes::from_static(stable_id)
+                .try_into()
+                .expect("valid stable ID"),
         },
         generation: Generation::new(generation),
         owner: OwnerId::new(owner).unwrap(),
@@ -52,7 +54,9 @@ fn key(tenant: &'static str, nf_kind: &'static str, stable_id: &'static [u8]) ->
         tenant: TenantId::from_static(tenant),
         nf_kind: NetworkFunctionKind::from_static(nf_kind),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(stable_id),
+        stable_id: Bytes::from_static(stable_id)
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 
@@ -410,7 +414,9 @@ fn restore_page_retained_byte_ceiling_accepts_exact_and_rejects_one_over() {
                 1,
                 1,
             );
-            record.key.stable_id = Bytes::from(vec![prefix; 1024 * 1024]);
+            record.key.stable_id = vec![prefix; opc_session_store::STABLE_ID_MAX_BYTES]
+                .try_into()
+                .expect("maximum stable ID");
             record.payload = EncryptedSessionPayload::new(Vec::<u8>::new());
             record
         })
@@ -511,7 +517,7 @@ fn dynamic_key(stable_id: impl Into<Bytes>) -> SessionKey {
         tenant: TenantId::from_static("tenant-a"),
         nf_kind: NetworkFunctionKind::upf(),
         key_type: SessionKeyType::PduSession,
-        stable_id: stable_id.into(),
+        stable_id: stable_id.into().try_into().expect("valid stable ID"),
     }
 }
 
@@ -686,26 +692,32 @@ async fn sqlite_restore_cursor_is_node_bound_and_restart_from_first_page_is_type
 }
 
 #[tokio::test]
-async fn sqlite_restore_cursor_represents_stable_ids_beyond_legacy_wire_width() {
-    let backend = opc_session_store::SqliteSessionBackend::in_memory().expect("sqlite");
-    let stable_id_65 = Bytes::from(vec![0x61; 65]);
-    write_dynamic_sqlite_record(&backend, Bytes::from_static(b"a"), Bytes::from_static(b"a")).await;
-    write_dynamic_sqlite_record(&backend, stable_id_65.clone(), Bytes::from_static(b"wide")).await;
+async fn sqlite_restore_rejects_legacy_stable_id_above_production_width() {
+    let directory = tempfile::tempdir().expect("legacy stable ID directory");
+    let path = directory.path().join("session.sqlite");
+    let backend = opc_session_store::SqliteSessionBackend::open(&path).expect("sqlite");
+    let raw = rusqlite::Connection::open(&path).expect("raw sqlite");
+    raw.execute(
+        r#"
+        INSERT INTO session_records (
+            tenant, nf_kind, key_type, stable_id, generation, owner, fence,
+            state_class, state_type, expires_at, payload, encoding
+        ) VALUES ('tenant-a', 'upf', 'pdu-session', ?1, 1, 'restore-owner', 1,
+                  'authoritative-session', 'pdu-session', NULL, X'', 0)
+        "#,
+        rusqlite::params![vec![0x61_u8; opc_session_store::STABLE_ID_MAX_BYTES + 1]],
+    )
+    .expect("insert legacy oversized identifier");
+    drop(raw);
 
-    let request = RestoreScanRequest::all(1);
-    let first = backend
-        .scan_restore_records(request.clone())
+    let error = backend
+        .scan_restore_records(RestoreScanRequest::all(1))
         .await
-        .expect("first page");
-    let second = backend
-        .scan_restore_records(RestoreScanRequest {
-            cursor: first.next_cursor,
-            ..request
-        })
-        .await
-        .expect("cursor carries a 65-byte seek key");
-    assert_eq!(second.records[0].key.stable_id, stable_id_65);
-    assert!(second.complete);
+        .expect_err("legacy oversized identifier must fail hydration");
+    assert_eq!(
+        error,
+        StoreError::Serialization("persisted stable session identifier is invalid".into())
+    );
 }
 
 #[tokio::test]
@@ -887,19 +899,22 @@ async fn sqlite_restore_key_preflight_accepts_exact_and_rejects_one_over() {
             .await
     }
 
-    let exact = scan_key_of_size(SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES)
+    let exact = scan_key_of_size(opc_session_store::STABLE_ID_MAX_BYTES)
         .await
-        .expect("the existing consensus key ceiling is accepted");
+        .expect("the production stable ID ceiling is accepted");
     assert_eq!(
         exact.records[0].key.stable_id.len(),
-        SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES
+        opc_session_store::STABLE_ID_MAX_BYTES
     );
     assert!(exact.complete);
 
-    let one_over = scan_key_of_size(SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES + 1)
+    let one_over = scan_key_of_size(opc_session_store::STABLE_ID_MAX_BYTES + 1)
         .await
         .expect_err("one-over key is rejected before row-owned allocation");
-    assert_eq!(one_over, StoreError::RestoreScanWorkBudgetExceeded);
+    assert_eq!(
+        one_over,
+        StoreError::Serialization("persisted stable session identifier is invalid".into())
+    );
 }
 
 #[tokio::test]

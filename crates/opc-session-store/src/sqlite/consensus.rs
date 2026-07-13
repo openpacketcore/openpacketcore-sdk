@@ -2650,7 +2650,9 @@ mod tests {
             tenant: TenantId::from_static("state-machine-fault-tenant"),
             nf_kind: NetworkFunctionKind::from_static("smf"),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"state-machine-fault-session"),
+            stable_id: Bytes::from_static(b"state-machine-fault-session")
+                .try_into()
+                .expect("valid stable ID"),
         }
     }
 

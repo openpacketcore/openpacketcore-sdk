@@ -90,7 +90,9 @@ fn key(key_type: SessionKeyType, stable_id: &'static [u8]) -> SessionKey {
         tenant: TenantId::new(TENANT).expect("valid tenant"),
         nf_kind: NetworkFunctionKind::from_static(NF_KIND),
         key_type,
-        stable_id: Bytes::from_static(stable_id),
+        stable_id: Bytes::from_static(stable_id)
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 

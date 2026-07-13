@@ -41,7 +41,9 @@ fn key(stable_id: &[u8]) -> SessionKey {
         tenant: TenantId::new("structure-bounds").expect("tenant"),
         nf_kind: NetworkFunctionKind::from_static("smf"),
         key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::copy_from_slice(stable_id),
+        stable_id: Bytes::copy_from_slice(stable_id)
+            .try_into()
+            .expect("valid stable ID"),
     }
 }
 
