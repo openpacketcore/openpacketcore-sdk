@@ -38,6 +38,13 @@ pub enum StoreError {
     /// it must re-read authoritative state and re-derive any next mutation.
     #[error("compare-and-set idempotency outcome is unavailable")]
     CasIdempotencyOutcomeUnavailable,
+    /// A non-CAS mutation may have crossed its externally visible effect
+    /// boundary, but the adapter could not return a confirmed outcome before
+    /// cancellation, disconnect, or its operation deadline. The caller MUST
+    /// NOT resubmit the same mutation. Re-read authoritative state and derive
+    /// any next mutation from that observation.
+    #[error("backend mutation outcome is unavailable")]
+    BackendOperationOutcomeUnavailable,
     /// The operation requires a capability (named in the payload) that this
     /// backend did not declare in its `BackendCapabilities`. Retrying cannot
     /// succeed; choose a backend that satisfies the required profile.
@@ -184,6 +191,13 @@ pub enum LeaseError {
     /// deadline could not be represented. No lease state was changed.
     #[error("invalid session TTL")]
     InvalidSessionTtl,
+    /// A lease mutation may have crossed its externally visible effect
+    /// boundary, but its exact outcome was not confirmed. The caller MUST
+    /// treat the current lease as lost, MUST NOT resubmit the same operation,
+    /// and MUST stop writes until product recovery obtains an authoritative
+    /// observation or its uncertainty window permits acquiring a fresh guard.
+    #[error("lease mutation outcome is unavailable")]
+    OperationOutcomeUnavailable,
     /// The underlying store failed (see the wrapped message). Treat as
     /// transient like `StoreError::BackendUnavailable`, but consider the lease
     /// state unknown — and therefore lost — until a renew succeeds.
@@ -199,6 +213,9 @@ impl From<StoreError> for LeaseError {
             StoreError::StaleFence => LeaseError::StaleFence,
             StoreError::NotFound => LeaseError::NotFound,
             StoreError::InvalidSessionTtl => LeaseError::InvalidSessionTtl,
+            StoreError::BackendOperationOutcomeUnavailable => {
+                LeaseError::OperationOutcomeUnavailable
+            }
             other => LeaseError::Backend(other.to_string()),
         }
     }

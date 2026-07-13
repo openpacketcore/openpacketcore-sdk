@@ -351,8 +351,8 @@ fail closed even if an outer layer omitted validation.
 
 The new errors are public enum variants, so external exhaustive matches MUST be
 updated. Protocol v4 introduced their private fixed-width DTOs in error
-revision 1; current error revision 2 retains those encodings. An older v3
-decoder is rejected during the exact handshake;
+revision 1; current error revision 5 retains those encodings. An
+error-revision-4 or older v4 decoder is rejected during the exact handshake;
 deployments MUST use the coordinated v4 rollout in §12.3.
 
 ## 8. Record Format
@@ -825,7 +825,7 @@ Serde boundary MUST delegate to private fixed-width v4 DTOs. `Hello` and
 server's optional `cas_idempotency_epoch`, and direct CAS carries an optional
 `idempotency_epoch`. Exhaustive Rust construction and matching MUST account for
 the new fields. The profile pins wire-schema revision 4 and error-set revision
-4; owner, custom-key, and state-type
+5; owner, custom-key, and state-type
 bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `max_frame_size = 16777216`;
 `stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
@@ -994,12 +994,62 @@ unavailable outcome MUST perform an authoritative re-read and derive a new
 mutation; it MUST NOT infer rollback or replay the historical operation under
 either the old or a fresh UUID.
 
+Every authenticated request MUST have three bounded phases: one inbound
+idle-timeout to receive and decode a complete frame, one backend admission/work
+deadline started after decode, and one reserved bounded response interval. The
+checked sum of the latter two is the post-decode dispatch/response lifetime;
+full connection-slot occupancy includes the inbound phase as well.
+Reads, mutations, lease mutations, and watch setup MUST have independent
+fixed-size admission pools; restore MAY retain a stricter dedicated pool.
+Queue expiry before backend polling is known not applied. Read execution MUST
+be cancellable and release resources. Once a non-CAS or lease mutation has
+been polled, deadline, disconnect, cancellation, or response loss MUST either
+recover a durable operation-bound outcome or return the non-retryable
+`BackendOperationOutcomeUnavailable` /
+`LeaseError::OperationOutcomeUnavailable` class. The public legacy client MUST
+NOT reconnect and resubmit such a mutation. A transport failure proven to have
+occurred before the first request write remains known not applied and MAY be
+retried. CAS continues to use its stronger operation-bound idempotency outcome.
+Code that itself drops a polled mutation future receives no result and MUST
+treat that cancellation as the same unknown-outcome class.
+
+The production Openraft adapter MUST create one durable request identity before
+leader selection and retain it across internal forwarding retries. A local
+failure before proposal submission MAY remain retryable. Once Openraft accepts
+the proposal into its client-write channel, loss of the result receiver,
+deadline expiry, or an unvalidated forwarded result MUST return
+`CasIdempotencyOutcomeUnavailable` for direct CAS and
+`BackendOperationOutcomeUnavailable` for every other mutation (mapped to
+`LeaseError::OperationOutcomeUnavailable` at the lease API). It MUST NOT return
+a generic retryable availability error. Durable state-machine request outcomes
+MUST make retry of the same internal identity idempotent.
+
+After a legacy request is transmitted, a malformed or wrong-family response,
+or a same-family response that violates request-bound key, owner, fence,
+credential, ordering, or cardinality semantics, MUST use the same typed
+ambiguous-outcome classification. Direct-CAS retry caches MUST NOT retain a
+backend availability result as a completed retryable outcome; they MUST retain
+an ambiguous tombstone instead.
+
+Server cancellation and peer EOF MUST race pending backend work and idle watch
+streams. Backend adapters MUST treat future drop as a cancellation signal and
+retain bounded admission/supervision until underlying work exits. Read
+resources are released after bounded cancellation completes. A mutation may
+finish after its caller drops, but that caller MUST treat the outcome as
+unknown and re-read authoritative state. Durable operation-bound replay is
+Openraft/direct-CAS-specific, not a generic adapter promise. No timeout or
+shutdown path may create unbounded detached work. Static capabilities MUST fail
+closed when backend admission cannot be obtained and MUST NOT substitute for
+fresh readiness.
+
 Outbound diagnostics SHOULD expose only bounded `response_family` categories
 and fixed reasons such as `frame_too_large`, `page_shortened`, `write_timeout`,
 `transport`, and `encoding`. They MUST NOT label or log session keys, payloads,
 transaction IDs, owners, SPIFFE IDs, backend/peer-controlled error text, or
-other high-cardinality identifiers. This requirement does not establish a new
-public metrics API.
+other high-cardinality identifiers. The fixed metric family
+`opc_session_net_backend_lifetime_events_total` MAY expose only
+`queue_timeout`, `execution_timeout`, `cancellation`, `peer_disconnect`, and
+`ambiguous_outcome`; it MUST NOT contain dynamic labels.
 
 A fresh version/profile/authentication or malformed-handshake failure MUST clear
 the cached capabilities and report all capability booleans false with
@@ -1010,7 +1060,7 @@ directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
 The v3-to-v4 transition, and same-v4 exact-profile transitions through
-wire-schema revision 4 and error-set revision 4, are coordinated
+wire-schema revision 4 and error-set revision 5, are coordinated
 stop/upgrade/start boundaries, not rolling
 deployments. Operators MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore
@@ -1086,6 +1136,13 @@ server MUST own only a `SessionConsensusRpcHandler`; it MUST NOT accept a
 replication append, or rebuild request. The consensus ALPN and legacy
 `opc-session-net/4` ALPN MUST NOT be multiplexed as equivalent authority on one
 production listener.
+
+The exact consensus contract profile MUST use wire-schema revision 1 and
+error-set revision 2. Error-set revision 1 MUST fail before engine dispatch
+because a forwarded applied response can carry the non-CAS ambiguity outcome.
+Operators MUST drain traffic and writers, stop every consensus member, upgrade
+the full membership together, verify exact-profile handshakes, and only then
+restore traffic. Mixed-profile rolling operation is unsupported.
 
 Each connection MUST perform mutual TLS and bind all of the following before
 engine dispatch:
@@ -1380,6 +1437,12 @@ fencing.
 - Ambiguous mutation outcomes under response rejection/write timeout, proving
   callers recover through idempotency, fencing, and authoritative re-read rather
   than assuming rollback or blindly replaying the operation.
+- A real Openraft proposal that commits before its forwarded result is delayed
+  beyond the caller deadline returns typed ambiguity and produces exactly one
+  durable application-journal event.
+- Real SQLite external write-lock contention and async-future cancellation are
+  bounded, retain at most one supervised worker, release it after interruption,
+  and never classify a started mutation as safely retryable.
 - Concurrent pristine three-node formation and mutation submission with one
   gap-free committed application journal on every replica.
 - A one-node partition produces bounded readiness/write failure, then heals and

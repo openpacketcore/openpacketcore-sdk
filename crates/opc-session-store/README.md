@@ -134,7 +134,7 @@ evidence.
   `max_value_bytes`, and
   size-bearing store errors; checked conversion at both domain boundaries; and
   independent 256-batch, 1,024-restore, 65,536-log, and 65,536-rebuild limits.
-  Its profile pins wire-schema revision 4, error-set revision 4,
+  Its profile pins wire-schema revision 4, error-set revision 5,
   `max_restore_scan_examined_rows = 4096`,
   `max_restore_scan_page_retained_bytes = 8388608`,
   `max_restore_scan_examined_metadata_bytes = 8388608`, `min_frame_size = 8192`,
@@ -149,7 +149,8 @@ evidence.
   token, adds the page cursor profile, and pins the 4 MiB payload plus 4,096
   examined-candidate bounds. Error-set revision 3 carries typed restore
   stale-cursor, work-budget, and direct-CAS idempotency outcomes; revision 4
-  adds the replication-log range, page-limit, and compacted-cursor outcomes.
+  adds the replication-log range, page-limit, and compacted-cursor outcomes;
+  revision 5 adds the non-CAS backend and lease ambiguity outcomes.
   Hello requests the
   client's response limit, while HelloAck reports the accepted response limit
   and server request limit;
@@ -170,6 +171,33 @@ evidence.
   re-read authoritative state and derive a new mutation. This compatibility
   cache is not a second durable authority and does not replace Openraft's
   atomically persisted production command outcomes.
+- Every `SessionBackend`/`SessionLeaseManager` future is a cancellation
+  boundary. Dropping a future signals cancellation; bounded admission and
+  supervision remain owned until underlying work exits. Read resources are
+  released after bounded cancellation completes, not necessarily immediately
+  on `Drop`. A caller that drops a polled mutation future treats its result as
+  unknown and re-reads authoritative state even if supervised work later
+  finishes. Durable operation-bound replay is specific to Openraft and direct
+  CAS contracts, not every adapter. An internal deadline or transport failure reports
+  `BackendOperationOutcomeUnavailable` (lease:
+  `OperationOutcomeUnavailable`) so callers do not retry an unknown effect.
+  Spawned/blocking adapters must bound admission and retain a worker permit
+  until the worker exits; dropping the async wrapper must not create detached
+  unbounded work. The encrypted wrapper and HKMS/provider boundary are
+  unchanged: cancellation does not bypass envelope encryption or expose
+  protected bytes.
+- `SqliteSessionBackend` admits one ordinary blocking worker per backend and
+  acquires its async connection before spawning. The worker owns both permits
+  until SQLite exits, uses a progress handler plus interrupt handle for future
+  drop, caps external database-busy waits at 100 ms, and caps complete ordinary
+  work at a two-second outward deadline. Failure before
+  worker/connection/transaction admission remains retryable; once a CAS,
+  non-CAS, or lease effect may have committed, or the async wrapper loses a
+  started worker's outcome, the result is
+  `CasIdempotencyOutcomeUnavailable`,
+  `BackendOperationOutcomeUnavailable`, or
+  `LeaseError::OperationOutcomeUnavailable`, respectively. Reads remain
+  retryable. Consensus-gated SQLite reads use the same supervised worker path.
 - The exact `opc-session-net/4` ALPN, version, and contract profile have no v3
   fallback or downgrade negotiation. Public session-net `Request`/`Response`
   remain, but `Hello`/`HelloAck` gain an optional `contract_profile`, so
@@ -420,6 +448,11 @@ cluster, configuration digest, epoch, peer role, and fresh challenge must all
 agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
 only the dial address; a bare self ID such as `epdg-app-0` can correctly name
 the member whose route is an FQDN because the SDK never compares those strings.
+The exact consensus contract uses wire-schema revision 1 and error-set revision
+2. Error-set revision 1 fails before dispatch because forwarded applied
+responses can now carry the non-CAS ambiguity outcome. Drain traffic and
+writers, then stop and upgrade every consensus member together; mixed-profile
+rolling operation is unsupported.
 
 Topology admission validates the complete descriptor set, its exact local
 logical member, configuration digest, and stable derived node IDs without
@@ -464,6 +497,18 @@ idempotent request outcomes, bounded snapshots, and watch cursors. Raw
 `replicate_entry`, whole-state rebuild, and caller-selected lease sequencing
 are rejected by the production consensus adapter; those are not alternate
 ways to establish authority.
+
+Each production mutation creates one hidden `SessionConsensusRequestId` and
+keeps it across leader-forwarding retries. Failure before local proposal
+submission remains `BackendUnavailable`. Once `client_write_ff` accepts the
+command, deadline, receiver loss, fatal result loss, or an unvalidated forwarded
+response is an unknown committed outcome: direct CAS returns
+`CasIdempotencyOutcomeUnavailable`; non-CAS operations return
+`BackendOperationOutcomeUnavailable`, which lease methods convert to
+`LeaseError::OperationOutcomeUnavailable`. Openraft/state-machine durable
+request outcomes prevent an internal retry of that same identity from applying
+twice. A caller never receives a generic retryable availability error after
+this boundary and must authoritatively re-read before deriving a new mutation.
 
 ### Openraft follower recovery
 
@@ -572,8 +617,10 @@ that skips committed history.
 These rules constrain range selection only. They do not create sequencing,
 commit, snapshot, restore, or watch authority and do not change payload
 envelopes, AAD, provider/HKMS placement, or encryption-at-rest composition.
-The quarantined session-net v4 error-set revision is now 4; drain and upgrade
-all compatibility participants together before restoring traffic.
+The replication-log range outcomes were introduced in quarantined session-net
+v4 error-set revision 4. The current revision 5 additionally carries non-CAS
+backend and lease ambiguity outcomes; drain and upgrade all compatibility
+participants together before restoring traffic.
 
 ### TTL input contract
 
@@ -607,8 +654,8 @@ fail closed.
 
 This is a compatibility boundary. The two public error enums gain new variants,
 so external exhaustive matches must add arms. Protocol v4 introduced their
-private fixed-width DTOs in error revision 1; current error revision 2 retains
-those encodings and a v3 peer is not admitted. Before upgrading a store created by an older SDK, audit
+private fixed-width DTOs in error revision 1; current error revision 5 retains
+those encodings and an error-revision-4 or older v4 peer is not admitted. Before upgrading a store created by an older SDK, audit
 its persisted replication log for TTL-bearing
 operations above 365 days. Such legacy entries now fail closed during replay or
 rebuild; the SDK does not silently clamp or rewrite them. Replicated

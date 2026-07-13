@@ -6,8 +6,8 @@ use tempfile::NamedTempFile;
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, Generation, HandoverEnvelope,
     HandoverEnvelopeDecodeError, HandoverEnvelopeFormat, HandoverError, HandoverManager,
-    HandoverPhase, HandoverTxId, LeaseGuard, OwnerId, SessionBackend, SessionKey, SessionKeyType,
-    SessionLeaseManager, SqliteSessionBackend, StateClass, StateType, StoreError,
+    HandoverPhase, HandoverTxId, LeaseError, LeaseGuard, OwnerId, SessionBackend, SessionKey,
+    SessionKeyType, SessionLeaseManager, SqliteSessionBackend, StateClass, StateType, StoreError,
     StoredSessionRecord, SystemClock, TokioVirtualClock, HANDOVER_ENVELOPE_MAGIC,
     HANDOVER_ENVELOPE_VERSION, HANDOVER_PHASE_HEADER_MAX_BYTES,
 };
@@ -1250,7 +1250,14 @@ async fn test_concurrent_handover_stress() {
                 .prepare_handover(&lease_s, gen, tx, owner_t.clone())
                 .await;
 
-            backend_clone.release(lease_s).await.unwrap();
+            // Same-owner concurrent acquire is allowed to rotate the active
+            // lease credential. An older task's guard is then stale by
+            // design, so its cleanup must not turn expected contention into a
+            // panic.
+            assert!(matches!(
+                backend_clone.release(lease_s).await,
+                Ok(()) | Err(LeaseError::StaleFence)
+            ));
 
             match res {
                 Ok(_) => {
@@ -1259,6 +1266,7 @@ async fn test_concurrent_handover_stress() {
                     Ok(true)
                 }
                 Err(HandoverError::Store(StoreError::CasConflict))
+                | Err(HandoverError::Store(StoreError::StaleFence))
                 | Err(HandoverError::TransactionConflict { .. }) => {
                     // Expected failures due to concurrent prepare
                     Ok(false)

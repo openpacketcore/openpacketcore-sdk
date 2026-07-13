@@ -1,15 +1,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use opc_redaction::metrics::METRICS;
 use opc_session_store::backend::{
     validate_replication_log_page_owned, validate_replication_page_owned,
     validate_replication_prefix_owned, CompareAndSet, CompareAndSetResult, ReplicationEntry,
-    ReplicationLogRange, ReplicationOp,
+    ReplicationLogRange, ReplicationOp, SessionOpResult,
 };
 use opc_session_store::error::{LeaseError, StoreError};
 use opc_session_store::quorum::SessionStoreBackend;
@@ -21,7 +23,7 @@ use opc_session_store::{
 use opc_types::SpiffeId;
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing;
 
 use crate::error::ProtocolError;
@@ -32,7 +34,7 @@ use crate::protocol::{
     ensure_frame_fits_until as ensure_frame_fits_until_controlled,
     ensure_replication_log_success_frame_fits_until as ensure_replication_log_success_frame_fits_until_controlled,
     ensure_restore_scan_success_frame_fits_until as ensure_restore_scan_success_frame_fits_until_controlled,
-    get_result_matches_key, negotiate_response_frame_size, read_frame_within,
+    get_result_matches_key, negotiate_response_frame_size, read_frame_within, read_request_frame,
     read_request_frame_within, session_op_results_match_expectations,
     validate_request_payload_limit, write_frame_bounded_until_cancellable, BootstrapHello,
     BootstrapHelloAck, BootstrapRequest, BootstrapResponse, HelloRejectReason, InboundRequest,
@@ -47,7 +49,45 @@ pub struct ServerHandle {
     accept_handle: tokio::task::JoinHandle<()>,
     _shutdown_tx: tokio::sync::mpsc::Sender<()>,
     connection_tasks: Arc<std::sync::Mutex<ConnectionTaskRegistry>>,
-    cancellation: Arc<AtomicBool>,
+    cancellation: Arc<ServerCancellation>,
+}
+
+#[derive(Debug, Default)]
+struct ServerCancellation {
+    stopped: AtomicBool,
+    notify: Notify,
+}
+
+impl ServerCancellation {
+    fn cancel(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn flag(&self) -> &AtomicBool {
+        &self.stopped
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.stopped.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl std::ops::Deref for ServerCancellation {
+    type Target = AtomicBool;
+
+    fn deref(&self) -> &Self::Target {
+        self.flag()
+    }
 }
 
 #[derive(Debug)]
@@ -66,7 +106,7 @@ impl ServerHandle {
         // Tokio task abortion is observed only at an await. Publish a
         // cooperative stop before aborting so synchronous response encoders
         // can stop between serializer writes and retained chunks.
-        self.cancellation.store(true, Ordering::Release);
+        self.cancellation.cancel();
         self.accept_handle.abort();
         let mut registry = self
             .connection_tasks
@@ -118,6 +158,8 @@ impl ServerHandle {
 
 /// Default per-frame read deadline for accepted connections.
 const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_BACKEND_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_BACKEND_OPERATION_CONCURRENCY: usize = 16;
 const DEFAULT_RESTORE_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const RESTORE_SCAN_CONCURRENCY: usize = 1;
 const CAS_IDEMPOTENCY_CACHE_CAPACITY: usize = 4_096;
@@ -227,6 +269,13 @@ fn response_write_deadline(
                 "response write timeout is not representable",
             ))
         })
+}
+
+fn bounded_response_deadline(
+    request_deadline: tokio::time::Instant,
+    timeout: std::time::Duration,
+) -> Result<tokio::time::Instant, ProtocolError> {
+    Ok(response_write_deadline(timeout)?.min(request_deadline))
 }
 
 fn response_write_timeout_error() -> ProtocolError {
@@ -359,6 +408,7 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn write_post_auth_response_with_fallback<W>(
     writer: &mut W,
     response: Response,
@@ -407,7 +457,13 @@ where
     {
         Ok(()) => Ok(()),
         Err(ProtocolError::FrameTooLarge(_)) => {
+            let ambiguity_fallback_count = ambiguity_fallback_count(&response, &fallback);
             discard_response_iteratively(response);
+            if ambiguity_fallback_count != 0 {
+                METRICS
+                    .session_net_backend_ambiguous_outcomes
+                    .fetch_add(ambiguity_fallback_count, Ordering::Relaxed);
+            }
             tracing::warn!(
                 response_family = family.code(),
                 reason = "frame_too_large",
@@ -429,6 +485,28 @@ where
             Err(other)
         }
     }
+}
+
+fn response_is_ambiguous_outcome(response: &Response) -> bool {
+    match response {
+        Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)) => true,
+        Response::DeleteFenced(Err(StoreError::BackendOperationOutcomeUnavailable))
+        | Response::RefreshTtl(Err(StoreError::BackendOperationOutcomeUnavailable))
+        | Response::Batch(Err(StoreError::BackendOperationOutcomeUnavailable))
+        | Response::ReplicateEntry(Err(StoreError::BackendOperationOutcomeUnavailable))
+        | Response::RebuildReplicationState(Err(StoreError::BackendOperationOutcomeUnavailable)) => {
+            true
+        }
+        Response::AcquireLease(Err(LeaseError::OperationOutcomeUnavailable))
+        | Response::RenewLease(Err(LeaseError::OperationOutcomeUnavailable))
+        | Response::ReleaseLease(Err(LeaseError::OperationOutcomeUnavailable)) => true,
+        Response::Batch(Ok(results)) => batch_results_have_ambiguous_outcome(results),
+        _ => false,
+    }
+}
+
+fn ambiguity_fallback_count(primary: &Response, fallback: &Response) -> u64 {
+    u64::from(!response_is_ambiguous_outcome(primary) && response_is_ambiguous_outcome(fallback))
 }
 
 #[cfg(test)]
@@ -517,12 +595,17 @@ fn store_response_limit_error() -> StoreError {
     StoreError::BackendUnavailable(RESPONSE_LIMIT_MESSAGE.to_string())
 }
 
-fn lease_response_limit_error() -> LeaseError {
-    LeaseError::Backend(RESPONSE_LIMIT_MESSAGE.to_string())
-}
-
 fn backend_contract_error() -> StoreError {
     StoreError::BackendUnavailable(BACKEND_CONTRACT_MESSAGE.to_string())
+}
+
+fn cas_outcome_is_definitive(result: &Result<CompareAndSetResult, StoreError>) -> bool {
+    !matches!(
+        result,
+        Err(StoreError::BackendUnavailable(_)
+            | StoreError::BackendOperationOutcomeUnavailable
+            | StoreError::CasIdempotencyOutcomeUnavailable)
+    )
 }
 
 fn backend_lease_contract_error() -> LeaseError {
@@ -534,9 +617,439 @@ struct DispatchConfig {
     binding: LocalReplicaBinding,
     max_frame_size: usize,
     idle_timeout: std::time::Duration,
+    backend_operation_timeout: std::time::Duration,
+    backend_slots: BackendOperationSlots,
     restore_scan_timeout: std::time::Duration,
     restore_scan_slots: Arc<Semaphore>,
-    cancellation: Arc<AtomicBool>,
+    cancellation: Arc<ServerCancellation>,
+}
+
+#[derive(Clone)]
+struct BackendOperationSlots {
+    read: Arc<Semaphore>,
+    mutation: Arc<Semaphore>,
+    lease: Arc<Semaphore>,
+    watch_setup: Arc<Semaphore>,
+}
+
+impl BackendOperationSlots {
+    fn new(per_family: usize) -> Self {
+        Self {
+            read: Arc::new(Semaphore::new(per_family)),
+            mutation: Arc::new(Semaphore::new(per_family)),
+            lease: Arc::new(Semaphore::new(per_family)),
+            watch_setup: Arc::new(Semaphore::new(per_family)),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BackendDeadlineOutcome {
+    Read,
+    Mutation,
+    CompareAndSet,
+    RestoreScan,
+}
+
+#[derive(Clone, Copy)]
+enum BackendOperationPhase {
+    Queue,
+    Execute,
+}
+
+impl BackendOperationPhase {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Execute => "execute",
+        }
+    }
+}
+
+fn record_backend_operation_failure(
+    family: ResponseFamily,
+    phase: BackendOperationPhase,
+    reason: &'static str,
+) {
+    match (phase, reason) {
+        (BackendOperationPhase::Queue, "timeout") => {
+            METRICS
+                .session_net_backend_queue_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        (BackendOperationPhase::Execute, "timeout") => {
+            METRICS
+                .session_net_backend_execution_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        (_, "cancelled") => {
+            METRICS
+                .session_net_backend_cancellations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        (_, "peer_disconnect") => {
+            METRICS
+                .session_net_backend_peer_disconnects
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    tracing::warn!(
+        response_family = family.code(),
+        operation_phase = phase.code(),
+        reason,
+        "session backend operation did not complete"
+    );
+}
+
+fn backend_control_error(kind: std::io::ErrorKind, message: &'static str) -> ProtocolError {
+    ProtocolError::Io(std::io::Error::new(kind, message))
+}
+
+async fn await_backend_stage<R, F, T>(
+    reader: &mut R,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &ServerCancellation,
+    family: ResponseFamily,
+    phase: BackendOperationPhase,
+    future: F,
+) -> Result<Option<T>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            record_backend_operation_failure(family, phase, "cancelled");
+            Err(backend_control_error(
+                std::io::ErrorKind::Interrupted,
+                "backend operation cancelled",
+            ))
+        }
+        output = &mut future => Ok(Some(output)),
+        peer = read_request_frame(reader, max_frame_size) => {
+            match peer {
+                Err(ProtocolError::Io(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    record_backend_operation_failure(family, phase, "peer_disconnect");
+                    Err(ProtocolError::Io(error))
+                }
+                Err(error) => Err(error),
+                Ok(_pipelined_request) => {
+                    record_backend_operation_failure(family, phase, "pipelined_request");
+                    Err(ProtocolError::UnexpectedResponse)
+                }
+            }
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            record_backend_operation_failure(family, phase, "timeout");
+            Ok(None)
+        }
+    }
+}
+
+fn store_deadline_error(
+    outcome: BackendDeadlineOutcome,
+    phase: BackendOperationPhase,
+) -> StoreError {
+    match (outcome, phase) {
+        (BackendDeadlineOutcome::Mutation, BackendOperationPhase::Execute) => {
+            StoreError::BackendOperationOutcomeUnavailable
+        }
+        (BackendDeadlineOutcome::CompareAndSet, BackendOperationPhase::Execute) => {
+            StoreError::CasIdempotencyOutcomeUnavailable
+        }
+        (BackendDeadlineOutcome::RestoreScan, _) => StoreError::RestoreScanWorkBudgetExceeded,
+        _ => StoreError::BackendUnavailable("backend operation deadline exceeded".to_string()),
+    }
+}
+
+fn record_store_ambiguous_outcome<T>(result: &Result<T, StoreError>) {
+    if matches!(
+        result,
+        Err(StoreError::CasIdempotencyOutcomeUnavailable
+            | StoreError::BackendOperationOutcomeUnavailable)
+    ) {
+        METRICS
+            .session_net_backend_ambiguous_outcomes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn batch_results_have_ambiguous_outcome(results: &[SessionOpResult]) -> bool {
+    results.iter().any(|result| {
+        matches!(
+            result,
+            SessionOpResult::Get(Err(StoreError::CasIdempotencyOutcomeUnavailable
+                | StoreError::BackendOperationOutcomeUnavailable))
+                | SessionOpResult::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable
+                    | StoreError::BackendOperationOutcomeUnavailable))
+                | SessionOpResult::DeleteFenced(Err(StoreError::CasIdempotencyOutcomeUnavailable
+                    | StoreError::BackendOperationOutcomeUnavailable))
+                | SessionOpResult::RefreshTtl(Err(StoreError::CasIdempotencyOutcomeUnavailable
+                    | StoreError::BackendOperationOutcomeUnavailable))
+        )
+    })
+}
+
+fn batch_ambiguous_outcome_count(result: &Result<Vec<SessionOpResult>, StoreError>) -> u64 {
+    u64::from(
+        result
+            .as_ref()
+            .is_ok_and(|results| batch_results_have_ambiguous_outcome(results)),
+    )
+}
+
+fn record_batch_ambiguous_outcome(result: &Result<Vec<SessionOpResult>, StoreError>) {
+    let count = batch_ambiguous_outcome_count(result);
+    if count != 0 {
+        // One request-level signal is emitted even when several batch slots
+        // report ambiguity; the metric counts ambiguous operations, not slots.
+        METRICS
+            .session_net_backend_ambiguous_outcomes
+            .fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+fn record_lease_ambiguous_outcome<T>(result: &Result<T, LeaseError>) {
+    if matches!(result, Err(LeaseError::OperationOutcomeUnavailable)) {
+        METRICS
+            .session_net_backend_ambiguous_outcomes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn normalize_store_backend_outcome<T>(
+    result: Result<T, StoreError>,
+    outcome: BackendDeadlineOutcome,
+) -> Result<T, StoreError> {
+    match (outcome, result) {
+        (
+            BackendDeadlineOutcome::CompareAndSet,
+            Err(
+                StoreError::BackendUnavailable(_)
+                | StoreError::BackendOperationOutcomeUnavailable
+                | StoreError::CasIdempotencyOutcomeUnavailable,
+            ),
+        ) => Err(StoreError::CasIdempotencyOutcomeUnavailable),
+        (
+            BackendDeadlineOutcome::Mutation,
+            Err(
+                StoreError::BackendUnavailable(_)
+                | StoreError::BackendOperationOutcomeUnavailable
+                | StoreError::CasIdempotencyOutcomeUnavailable,
+            ),
+        ) => Err(StoreError::BackendOperationOutcomeUnavailable),
+        (_, result) => result,
+    }
+}
+
+fn normalize_lease_backend_outcome<T>(result: Result<T, LeaseError>) -> Result<T, LeaseError> {
+    match result {
+        Err(LeaseError::Backend(_) | LeaseError::OperationOutcomeUnavailable) => {
+            Err(LeaseError::OperationOutcomeUnavailable)
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_store_backend_operation<R, F, T>(
+    reader: &mut R,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &ServerCancellation,
+    family: ResponseFamily,
+    slots: Arc<Semaphore>,
+    deadline_outcome: BackendDeadlineOutcome,
+    operation: F,
+) -> Result<Result<T, StoreError>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: Future<Output = Result<T, StoreError>>,
+{
+    let permit: OwnedSemaphorePermit = match await_backend_stage(
+        reader,
+        max_frame_size,
+        deadline,
+        cancellation,
+        family,
+        BackendOperationPhase::Queue,
+        slots.acquire_owned(),
+    )
+    .await?
+    {
+        Some(Ok(permit)) => permit,
+        Some(Err(_closed)) => {
+            return Ok(Err(StoreError::BackendUnavailable(
+                "backend operation capacity unavailable".to_string(),
+            )))
+        }
+        None => {
+            return Ok(Err(store_deadline_error(
+                deadline_outcome,
+                BackendOperationPhase::Queue,
+            )))
+        }
+    };
+    let result = await_backend_stage(
+        reader,
+        max_frame_size,
+        deadline,
+        cancellation,
+        family,
+        BackendOperationPhase::Execute,
+        operation,
+    )
+    .await?;
+    drop(permit);
+    let result = result.unwrap_or_else(|| {
+        Err(store_deadline_error(
+            deadline_outcome,
+            BackendOperationPhase::Execute,
+        ))
+    });
+    let result = normalize_store_backend_outcome(result, deadline_outcome);
+    record_store_ambiguous_outcome(&result);
+    Ok(result)
+}
+
+async fn run_store_backend_operation_if_capacity<R, F, T>(
+    reader: &mut R,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &ServerCancellation,
+    family: ResponseFamily,
+    slots: Arc<Semaphore>,
+    operation: F,
+) -> Result<Result<T, StoreError>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: Future<Output = Result<T, StoreError>>,
+{
+    let permit = match slots.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            record_backend_operation_failure(
+                family,
+                BackendOperationPhase::Queue,
+                "capacity_exhausted",
+            );
+            return Ok(Err(StoreError::BackendUnavailable(
+                "backend operation capacity exhausted".to_string(),
+            )));
+        }
+    };
+    let result = await_backend_stage(
+        reader,
+        max_frame_size,
+        deadline,
+        cancellation,
+        family,
+        BackendOperationPhase::Execute,
+        operation,
+    )
+    .await?;
+    drop(permit);
+    Ok(result.unwrap_or_else(|| {
+        Err(store_deadline_error(
+            BackendDeadlineOutcome::Read,
+            BackendOperationPhase::Execute,
+        ))
+    }))
+}
+
+async fn run_lease_backend_operation<R, F, T>(
+    reader: &mut R,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+    cancellation: &ServerCancellation,
+    family: ResponseFamily,
+    slots: Arc<Semaphore>,
+    operation: F,
+) -> Result<Result<T, LeaseError>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: Future<Output = Result<T, LeaseError>>,
+{
+    let permit: OwnedSemaphorePermit = match await_backend_stage(
+        reader,
+        max_frame_size,
+        deadline,
+        cancellation,
+        family,
+        BackendOperationPhase::Queue,
+        slots.acquire_owned(),
+    )
+    .await?
+    {
+        Some(Ok(permit)) => permit,
+        Some(Err(_closed)) => {
+            return Ok(Err(LeaseError::Backend(
+                "backend operation capacity unavailable".to_string(),
+            )))
+        }
+        None => {
+            return Ok(Err(LeaseError::Backend(
+                "backend operation deadline exceeded".to_string(),
+            )))
+        }
+    };
+    let result = await_backend_stage(
+        reader,
+        max_frame_size,
+        deadline,
+        cancellation,
+        family,
+        BackendOperationPhase::Execute,
+        operation,
+    )
+    .await?;
+    drop(permit);
+    let result = normalize_lease_backend_outcome(
+        result.unwrap_or(Err(LeaseError::OperationOutcomeUnavailable)),
+    );
+    record_lease_ambiguous_outcome(&result);
+    Ok(result)
+}
+
+async fn next_watch_item_or_disconnect<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+    cancellation: &ServerCancellation,
+    stream: &mut futures_util::stream::BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+) -> Result<Option<Result<ReplicationEntry, StoreError>>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(backend_control_error(
+            std::io::ErrorKind::Interrupted,
+            "watch stream cancelled",
+        )),
+        item = stream.next() => Ok(item),
+        peer = read_request_frame(reader, max_frame_size) => {
+            match peer {
+                Err(ProtocolError::Io(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    record_backend_operation_failure(
+                        ResponseFamily::Watch,
+                        BackendOperationPhase::Execute,
+                        "peer_disconnect",
+                    );
+                    Err(ProtocolError::Io(error))
+                }
+                Err(error) => Err(error),
+                Ok(_pipelined_request) => Err(ProtocolError::UnexpectedResponse),
+            }
+        }
+    }
 }
 
 fn bounded_restore_scan_response(
@@ -1105,6 +1618,8 @@ pub struct SessionReplicationServer {
     max_connections: usize,
     max_frame_size: usize,
     idle_timeout: std::time::Duration,
+    backend_operation_timeout: std::time::Duration,
+    backend_operation_concurrency: usize,
     restore_scan_timeout: std::time::Duration,
     cas_idempotency_cache: Arc<StdMutex<CasIdempotencyCache>>,
 }
@@ -1116,6 +1631,11 @@ impl fmt::Debug for SessionReplicationServer {
             .field("binding", &self.binding)
             .field("max_connections", &self.max_connections)
             .field("max_frame_size", &self.max_frame_size)
+            .field("backend_operation_timeout", &self.backend_operation_timeout)
+            .field(
+                "backend_operation_concurrency",
+                &self.backend_operation_concurrency,
+            )
             .field("restore_scan_timeout", &self.restore_scan_timeout)
             .finish()
     }
@@ -1146,6 +1666,8 @@ impl SessionReplicationServer {
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            backend_operation_timeout: DEFAULT_BACKEND_OPERATION_TIMEOUT,
+            backend_operation_concurrency: DEFAULT_BACKEND_OPERATION_CONCURRENCY,
             restore_scan_timeout: DEFAULT_RESTORE_SCAN_TIMEOUT,
             cas_idempotency_cache: Arc::new(StdMutex::new(CasIdempotencyCache::default())),
         }
@@ -1161,6 +1683,8 @@ impl SessionReplicationServer {
             max_connections: 128,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            backend_operation_timeout: DEFAULT_BACKEND_OPERATION_TIMEOUT,
+            backend_operation_concurrency: DEFAULT_BACKEND_OPERATION_CONCURRENCY,
             restore_scan_timeout: DEFAULT_RESTORE_SCAN_TIMEOUT,
             cas_idempotency_cache: Arc::new(StdMutex::new(CasIdempotencyCache::default())),
         }
@@ -1171,6 +1695,26 @@ impl SessionReplicationServer {
     /// freeing its connection slot.
     pub fn with_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.idle_timeout = timeout;
+        self
+    }
+
+    /// Set the post-decode lifetime of backend-slot queueing plus backend work
+    /// for one authenticated request. The server first allows one
+    /// `idle_timeout` to receive a complete frame, then starts this deadline,
+    /// and finally reserves another `idle_timeout` for bounded response
+    /// validation, encoding, and socket write. A connection slot therefore has
+    /// three bounded phases; backend timeout plus the final idle timeout is the
+    /// checked post-decode lifetime.
+    pub fn with_backend_operation_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.backend_operation_timeout = timeout;
+        self
+    }
+
+    /// Set the independent concurrency bound applied to each backend family:
+    /// reads, mutations, lease mutations, and watch setup. Restore scan keeps
+    /// its stricter dedicated single-worker bound.
+    pub fn with_backend_operation_concurrency(mut self, per_family: usize) -> Self {
+        self.backend_operation_concurrency = per_family;
         self
     }
 
@@ -1209,6 +1753,14 @@ impl SessionReplicationServer {
                 "session connection limit is outside the supported range",
             ));
         }
+        if self.backend_operation_concurrency == 0
+            || self.backend_operation_concurrency > Semaphore::MAX_PERMITS
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session backend operation limit is outside the supported range",
+            ));
+        }
         if self.max_frame_size < MIN_NEGOTIATED_FRAME_SIZE
             || checked_wire_frame_size(self.max_frame_size).is_err()
         {
@@ -1219,6 +1771,10 @@ impl SessionReplicationServer {
         }
         let now = tokio::time::Instant::now();
         if now.checked_add(self.idle_timeout).is_none()
+            || now
+                .checked_add(self.backend_operation_timeout)
+                .and_then(|deadline| deadline.checked_add(self.idle_timeout))
+                .is_none()
             || now.checked_add(self.restore_scan_timeout).is_none()
         {
             return Err(std::io::Error::new(
@@ -1233,11 +1789,13 @@ impl SessionReplicationServer {
         let tls_config = self.tls_config.clone();
         let backend = self.backend.clone();
         let cas_idempotency_cache = self.cas_idempotency_cache.clone();
-        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::new(ServerCancellation::default());
         let dispatch_config = DispatchConfig {
             binding: self.binding.clone(),
             max_frame_size: self.max_frame_size,
             idle_timeout: self.idle_timeout,
+            backend_operation_timeout: self.backend_operation_timeout,
+            backend_slots: BackendOperationSlots::new(self.backend_operation_concurrency),
             restore_scan_timeout: self.restore_scan_timeout,
             restore_scan_slots: Arc::new(Semaphore::new(RESTORE_SCAN_CONCURRENCY)),
             cancellation: cancellation.clone(),
@@ -1421,6 +1979,8 @@ where
         binding,
         max_frame_size,
         idle_timeout,
+        backend_operation_timeout,
+        backend_slots,
         restore_scan_timeout,
         restore_scan_slots,
         cancellation,
@@ -1674,11 +2234,44 @@ where
         };
         let mut request_payload_error =
             validate_request_payload_limit(&req, transport_payload_limit).err();
+        let operation_deadline = tokio::time::Instant::now()
+            .checked_add(backend_operation_timeout)
+            .ok_or_else(|| {
+                backend_control_error(
+                    std::io::ErrorKind::InvalidInput,
+                    "backend operation timeout is not representable",
+                )
+            })?;
+        // Reserve a separate, bounded response-preparation/write interval.
+        // Reusing the backend deadline would make a timeout impossible to
+        // report: it would already be expired before the typed result was
+        // encoded. The checked sum is the post-decode dispatch/response
+        // lifetime; the preceding frame read has its own idle-timeout bound.
+        let request_deadline = operation_deadline
+            .checked_add(idle_timeout)
+            .ok_or_else(|| {
+                backend_control_error(
+                    std::io::ErrorKind::InvalidInput,
+                    "request timeout is not representable",
+                )
+            })?;
 
         match req {
             Request::Capabilities => {
+                let backend_capabilities = run_store_backend_operation_if_capacity(
+                    reader,
+                    max_frame_size,
+                    operation_deadline,
+                    &cancellation,
+                    ResponseFamily::Capabilities,
+                    backend_slots.read.clone(),
+                    async { Ok(backend.capabilities().await) },
+                )
+                .await?
+                .unwrap_or_else(|_| opc_session_store::BackendCapabilities::minimal());
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
                 let backend_capabilities = capabilities_for_restore_profile(
-                    backend.capabilities().await,
+                    backend_capabilities,
                     backend.restore_scan_cursor_profile(),
                 );
                 let caps = capabilities_for_transport(
@@ -1686,29 +2279,40 @@ where
                     max_frame_size,
                     effective_response_frame_size,
                 );
-                write_post_auth_response(
+                write_post_auth_response_until(
                     writer,
                     &Response::Capabilities(caps),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::Capabilities,
                     &cancellation,
                 )
                 .await?;
             }
             Request::Get { key } => {
-                let result = backend.get(&key).await;
+                let result = run_store_backend_operation(
+                    reader,
+                    max_frame_size,
+                    operation_deadline,
+                    &cancellation,
+                    ResponseFamily::Get,
+                    backend_slots.read.clone(),
+                    BackendDeadlineOutcome::Read,
+                    backend.get(&key),
+                )
+                .await?;
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
                 let result = if get_result_matches_key(&key, &result) {
                     result
                 } else {
                     Err(backend_contract_error())
                 };
-                write_post_auth_response_with_fallback(
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::Get(result),
                     Response::Get(Err(store_response_limit_error())),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::Get,
                     &cancellation,
                 )
@@ -1720,12 +2324,14 @@ where
                 idempotency_epoch,
             } => {
                 if let Some(error) = request_payload_error.take() {
-                    write_post_auth_response_with_fallback(
+                    let response_deadline =
+                        bounded_response_deadline(request_deadline, idle_timeout)?;
+                    write_post_auth_response_with_fallback_until(
                         writer,
                         Response::CompareAndSet(Err(error)),
                         Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
                         effective_response_frame_size,
-                        idle_timeout,
+                        response_deadline,
                         ResponseFamily::CompareAndSet,
                         &cancellation,
                     )
@@ -1733,70 +2339,107 @@ where
                     continue;
                 }
                 let expected_key = op.key.clone();
-                let res = if let (Some(request_id), Some(idempotency_epoch)) =
-                    (request_id, idempotency_epoch)
-                {
-                    let request_id = uuid::Uuid::parse_str(&request_id)
-                        .map_err(|_| ProtocolError::InvalidWireValue)?;
-                    let idempotency_epoch = uuid::Uuid::parse_str(&idempotency_epoch)
-                        .map_err(|_| ProtocolError::InvalidWireValue)?;
-                    let operation_digest = cas_operation_digest(
-                        &binding,
-                        &client_replica_id,
-                        request_id,
-                        idempotency_epoch,
-                        &op,
-                    );
-                    match operation_digest {
-                        Ok(operation_digest) => match CasIdempotencyCache::begin(
-                            &cas_idempotency_cache,
-                            &client_replica_id,
-                            request_id,
-                            idempotency_epoch,
-                            operation_digest,
-                            Instant::now(),
-                        ) {
-                            CasIdempotencyAdmission::Execute(permit) => {
-                                let result = backend.compare_and_set(op).await;
-                                let result =
-                                    if compare_and_set_result_matches_key(&expected_key, &result) {
-                                        result
-                                    } else {
-                                        Err(backend_contract_error())
-                                    };
-                                permit.complete(result.clone());
-                                result
+                let res = run_store_backend_operation(
+                    reader,
+                    max_frame_size,
+                    operation_deadline,
+                    &cancellation,
+                    ResponseFamily::CompareAndSet,
+                    backend_slots.mutation.clone(),
+                    BackendDeadlineOutcome::CompareAndSet,
+                    async {
+                        if let (Some(request_id), Some(idempotency_epoch)) =
+                            (request_id, idempotency_epoch)
+                        {
+                            let request_id = uuid::Uuid::parse_str(&request_id)
+                                .map_err(|_| StoreError::CasIdempotencyConflict)?;
+                            let idempotency_epoch = uuid::Uuid::parse_str(&idempotency_epoch)
+                                .map_err(|_| StoreError::CasIdempotencyConflict)?;
+                            let operation_digest = cas_operation_digest(
+                                &binding,
+                                &client_replica_id,
+                                request_id,
+                                idempotency_epoch,
+                                &op,
+                            );
+                            match operation_digest {
+                                Ok(operation_digest) => match CasIdempotencyCache::begin(
+                                    &cas_idempotency_cache,
+                                    &client_replica_id,
+                                    request_id,
+                                    idempotency_epoch,
+                                    operation_digest,
+                                    Instant::now(),
+                                ) {
+                                    CasIdempotencyAdmission::Execute(permit) => {
+                                        let result = backend.compare_and_set(op).await;
+                                        let result = if compare_and_set_result_matches_key(
+                                            &expected_key,
+                                            &result,
+                                        ) {
+                                            result
+                                        } else {
+                                            Err(backend_contract_error())
+                                        };
+                                        if cas_outcome_is_definitive(&result) {
+                                            permit.complete(result.clone());
+                                            result
+                                        } else {
+                                            // A backend availability error can
+                                            // arrive after its commit boundary.
+                                            // Dropping the permit leaves a
+                                            // tombstone so this request ID can
+                                            // never replay a falsely definitive
+                                            // retryable outcome.
+                                            drop(permit);
+                                            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+                                        }
+                                    }
+                                    CasIdempotencyAdmission::Wait(outcome) => {
+                                        wait_for_cas_outcome(outcome).await
+                                    }
+                                    CasIdempotencyAdmission::Replay(outcome) => outcome,
+                                    CasIdempotencyAdmission::Reject(error) => Err(error),
+                                },
+                                Err(error) => Err(error),
                             }
-                            CasIdempotencyAdmission::Wait(outcome) => {
-                                wait_for_cas_outcome(outcome).await
-                            }
-                            CasIdempotencyAdmission::Replay(outcome) => outcome,
-                            CasIdempotencyAdmission::Reject(error) => Err(error),
-                        },
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    Err(StoreError::CasIdempotencyOutcomeUnavailable)
-                };
-                write_post_auth_response_with_fallback(
+                        } else {
+                            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+                        }
+                    },
+                )
+                .await?;
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::CompareAndSet(res),
                     Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::CompareAndSet,
                     &cancellation,
                 )
                 .await?;
             }
             Request::DeleteFenced { lease } => {
-                let res = backend.delete_fenced(&lease).await;
-                write_post_auth_response_with_fallback(
+                let res = run_store_backend_operation(
+                    reader,
+                    max_frame_size,
+                    operation_deadline,
+                    &cancellation,
+                    ResponseFamily::DeleteFenced,
+                    backend_slots.mutation.clone(),
+                    BackendDeadlineOutcome::Mutation,
+                    backend.delete_fenced(&lease),
+                )
+                .await?;
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::DeleteFenced(res),
-                    Response::DeleteFenced(Err(store_response_limit_error())),
+                    Response::DeleteFenced(Err(StoreError::BackendOperationOutcomeUnavailable)),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::DeleteFenced,
                     &cancellation,
                 )
@@ -1804,15 +2447,28 @@ where
             }
             Request::RefreshTtl { lease, ttl } => {
                 let res = match validate_session_ttl(ttl) {
-                    Ok(()) => backend.refresh_ttl(&lease, ttl).await,
+                    Ok(()) => {
+                        run_store_backend_operation(
+                            reader,
+                            max_frame_size,
+                            operation_deadline,
+                            &cancellation,
+                            ResponseFamily::RefreshTtl,
+                            backend_slots.mutation.clone(),
+                            BackendDeadlineOutcome::Mutation,
+                            backend.refresh_ttl(&lease, ttl),
+                        )
+                        .await?
+                    }
                     Err(error) => Err(error),
                 };
-                write_post_auth_response_with_fallback(
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::RefreshTtl(res),
-                    Response::RefreshTtl(Err(store_response_limit_error())),
+                    Response::RefreshTtl(Err(StoreError::BackendOperationOutcomeUnavailable)),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::RefreshTtl,
                     &cancellation,
                 )
@@ -1821,35 +2477,70 @@ where
             Request::Batch { ops } => {
                 let expected_results = ops.len();
                 let expected = bounded_session_op_expectations(&ops);
+                let deadline_outcome = if ops
+                    .iter()
+                    .any(|op| !matches!(op, opc_session_store::SessionOp::Get { .. }))
+                {
+                    BackendDeadlineOutcome::Mutation
+                } else {
+                    BackendDeadlineOutcome::Read
+                };
+                let slots = match deadline_outcome {
+                    BackendDeadlineOutcome::Mutation => backend_slots.mutation.clone(),
+                    _ => backend_slots.read.clone(),
+                };
                 let res = if let Some(error) = request_payload_error.take() {
                     Err(error)
                 } else if expected_results > MAX_SESSION_NET_BATCH_OPERATIONS {
                     Err(StoreError::ReplicationOperationLimitExceeded)
                 } else {
                     match ops.iter().try_for_each(|op| op.validate_ttls()) {
-                        Ok(()) => match backend.batch(ops).await {
-                            Ok(results)
-                                if expected.as_ref().is_ok_and(|expected| {
-                                    session_op_results_match_expectations(expected, &results)
-                                }) =>
-                            {
-                                Ok(results)
-                            }
-                            Ok(results) => {
-                                drop(results);
-                                Err(backend_contract_error())
-                            }
-                            Err(error) => Err(error),
-                        },
+                        Ok(()) => {
+                            run_store_backend_operation(
+                                reader,
+                                max_frame_size,
+                                operation_deadline,
+                                &cancellation,
+                                ResponseFamily::Batch,
+                                slots,
+                                deadline_outcome,
+                                async {
+                                    match backend.batch(ops).await {
+                                        Ok(results)
+                                            if expected.as_ref().is_ok_and(|expected| {
+                                                session_op_results_match_expectations(
+                                                    expected, &results,
+                                                )
+                                            }) =>
+                                        {
+                                            Ok(results)
+                                        }
+                                        Ok(results) => {
+                                            drop(results);
+                                            Err(backend_contract_error())
+                                        }
+                                        Err(error) => Err(error),
+                                    }
+                                },
+                            )
+                            .await?
+                        }
                         Err(error) => Err(error),
                     }
                 };
-                write_post_auth_response_with_fallback(
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                record_batch_ambiguous_outcome(&res);
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::Batch(res),
-                    Response::Batch(Err(store_response_limit_error())),
+                    Response::Batch(Err(match deadline_outcome {
+                        BackendDeadlineOutcome::Mutation => {
+                            StoreError::BackendOperationOutcomeUnavailable
+                        }
+                        _ => store_response_limit_error(),
+                    })),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::Batch,
                     &cancellation,
                 )
@@ -1870,43 +2561,19 @@ where
                 let request = match RestoreScanRequest::try_from(wire_request) {
                     Ok(request) => request,
                     Err(error) => {
-                        let deadline = response_write_deadline(idle_timeout)?;
+                        let response_deadline =
+                            bounded_response_deadline(request_deadline, idle_timeout)?;
                         let response = bounded_restore_scan_error_response(
                             error,
                             effective_max,
-                            deadline,
+                            response_deadline,
                             &cancellation,
                         )?;
                         write_post_auth_response_until(
                             writer,
                             &response,
                             effective_max,
-                            deadline,
-                            ResponseFamily::RestoreScan,
-                            &cancellation,
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-
-                let permit = match restore_scan_slots.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        let deadline = response_write_deadline(idle_timeout)?;
-                        let response = bounded_restore_scan_error_response(
-                            StoreError::BackendUnavailable(
-                                "restore scan capacity exhausted".to_string(),
-                            ),
-                            effective_max,
-                            deadline,
-                            &cancellation,
-                        )?;
-                        write_post_auth_response_until(
-                            writer,
-                            &response,
-                            effective_max,
-                            deadline,
+                            response_deadline,
                             ResponseFamily::RestoreScan,
                             &cancellation,
                         )
@@ -1918,28 +2585,37 @@ where
                 let frame_limited_records =
                     (effective_max / MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE).max(1);
                 backend_request.limit = backend_request.limit.min(frame_limited_records);
-                let result = match tokio::time::timeout(
-                    restore_scan_timeout,
+                let restore_deadline = tokio::time::Instant::now()
+                    .checked_add(restore_scan_timeout)
+                    .ok_or_else(|| {
+                        backend_control_error(
+                            std::io::ErrorKind::InvalidInput,
+                            "restore scan timeout is not representable",
+                        )
+                    })?
+                    .min(operation_deadline);
+                let result = run_store_backend_operation(
+                    reader,
+                    max_frame_size,
+                    restore_deadline,
+                    &cancellation,
+                    ResponseFamily::RestoreScan,
+                    restore_scan_slots.clone(),
+                    BackendDeadlineOutcome::RestoreScan,
                     backend.scan_restore_records(backend_request.clone()),
                 )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_elapsed) => Err(StoreError::BackendUnavailable(
-                        "restore scan exceeded the server deadline".to_string(),
-                    )),
-                };
-                let deadline = response_write_deadline(idle_timeout)?;
+                .await?;
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
                 let response = match result {
                     Ok(page) => {
-                        check_response_write_control(deadline, &cancellation)?;
+                        check_response_write_control(response_deadline, &cancellation)?;
                         let validation = validate_dispatched_restore_page(&page, &backend_request);
-                        check_response_write_control(deadline, &cancellation)?;
+                        check_response_write_control(response_deadline, &cancellation)?;
                         if let Err(error) = validation {
                             bounded_restore_scan_error_response(
                                 error,
                                 effective_max,
-                                deadline,
+                                response_deadline,
                                 &cancellation,
                             )?
                         } else {
@@ -1948,13 +2624,12 @@ where
                                 writer,
                                 &response,
                                 effective_max,
-                                deadline,
+                                response_deadline,
                                 &cancellation,
                             )
                             .await
                             {
                                 Ok(()) => {
-                                    drop(permit);
                                     continue;
                                 }
                                 Err(ProtocolError::FrameTooLarge(_)) => {
@@ -1970,12 +2645,11 @@ where
                                         Ok(page),
                                         &backend_request,
                                         effective_max,
-                                        deadline,
+                                        response_deadline,
                                         &cancellation,
                                     )?
                                 }
                                 Err(other) => {
-                                    drop(permit);
                                     record_response_write_failure(
                                         &other,
                                         ResponseFamily::RestoreScan,
@@ -1988,29 +2662,38 @@ where
                     Err(error) => bounded_restore_scan_error_response(
                         error,
                         effective_max,
-                        deadline,
+                        response_deadline,
                         &cancellation,
                     )?,
                 };
-                drop(permit);
                 write_post_auth_response_until(
                     writer,
                     &response,
                     effective_max,
-                    deadline,
+                    response_deadline,
                     ResponseFamily::RestoreScan,
                     &cancellation,
                 )
                 .await?;
             }
             Request::MaxReplicationSequence => {
-                let res = backend.max_replication_sequence().await;
-                write_post_auth_response_with_fallback(
+                let res = run_store_backend_operation_if_capacity(
+                    reader,
+                    max_frame_size,
+                    operation_deadline,
+                    &cancellation,
+                    ResponseFamily::MaxReplicationSequence,
+                    backend_slots.read.clone(),
+                    backend.max_replication_sequence(),
+                )
+                .await?;
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::MaxReplicationSequence(res),
                     Response::MaxReplicationSequence(Err(store_response_limit_error())),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::MaxReplicationSequence,
                     &cancellation,
                 )
@@ -2020,10 +2703,22 @@ where
                 let backend_result = match ReplicationLogRange::try_new(start, limit) {
                     Err(error) => Err(error),
                     Ok(range) if range.is_empty() => Ok(Vec::new()),
-                    Ok(_) => backend.get_replication_log(start, limit).await,
+                    Ok(_) => {
+                        run_store_backend_operation(
+                            reader,
+                            max_frame_size,
+                            operation_deadline,
+                            &cancellation,
+                            ResponseFamily::ReplicationLog,
+                            backend_slots.read.clone(),
+                            BackendDeadlineOutcome::Read,
+                            backend.get_replication_log(start, limit),
+                        )
+                        .await?
+                    }
                 };
-                let deadline = response_write_deadline(idle_timeout)?;
-                check_response_write_control(deadline, &cancellation)?;
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                check_response_write_control(response_deadline, &cancellation)?;
                 let res = match backend_result {
                     Ok(entries) if entries.len() <= limit => {
                         validate_replication_log_page_owned(start, limit, entries)
@@ -2036,7 +2731,7 @@ where
                     }
                     Err(error) => Err(error),
                 };
-                check_response_write_control(deadline, &cancellation)?;
+                check_response_write_control(response_deadline, &cancellation)?;
                 match res {
                     Ok(entries) => {
                         let response = Response::GetReplicationLog(Ok(entries));
@@ -2044,7 +2739,7 @@ where
                             writer,
                             &response,
                             effective_response_frame_size,
-                            deadline,
+                            response_deadline,
                             &cancellation,
                         )
                         .await
@@ -2057,7 +2752,7 @@ where
                                 let response = bounded_replication_log_response(
                                     Ok(entries),
                                     effective_response_frame_size,
-                                    deadline,
+                                    response_deadline,
                                     &cancellation,
                                 )?;
                                 write_post_auth_response_with_fallback_until(
@@ -2065,7 +2760,7 @@ where
                                     response,
                                     Response::GetReplicationLog(Err(store_response_limit_error())),
                                     effective_response_frame_size,
-                                    deadline,
+                                    response_deadline,
                                     ResponseFamily::ReplicationLog,
                                     &cancellation,
                                 )
@@ -2090,7 +2785,7 @@ where
                             Response::GetReplicationLog(Err(error)),
                             Response::GetReplicationLog(Err(store_response_limit_error())),
                             effective_response_frame_size,
-                            deadline,
+                            response_deadline,
                             ResponseFamily::ReplicationLog,
                             &cancellation,
                         )
@@ -2102,16 +2797,29 @@ where
                 let res = match request_payload_error.take() {
                     Some(error) => Err(error),
                     None => match entry.into_validated() {
-                        Ok(entry) => backend.replicate_entry(entry).await,
+                        Ok(entry) => {
+                            run_store_backend_operation(
+                                reader,
+                                max_frame_size,
+                                operation_deadline,
+                                &cancellation,
+                                ResponseFamily::ReplicateEntry,
+                                backend_slots.mutation.clone(),
+                                BackendDeadlineOutcome::Mutation,
+                                backend.replicate_entry(entry),
+                            )
+                            .await?
+                        }
                         Err(error) => Err(error),
                     },
                 };
-                write_post_auth_response_with_fallback(
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::ReplicateEntry(res),
-                    Response::ReplicateEntry(Err(store_response_limit_error())),
+                    Response::ReplicateEntry(Err(StoreError::BackendOperationOutcomeUnavailable)),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::ReplicateEntry,
                     &cancellation,
                 )
@@ -2124,33 +2832,68 @@ where
                     Err(StoreError::ReplicationOperationLimitExceeded)
                 } else {
                     match validate_replication_prefix_owned(entries) {
-                        Ok(entries) => backend.rebuild_replication_state(entries).await,
+                        Ok(entries) => {
+                            run_store_backend_operation(
+                                reader,
+                                max_frame_size,
+                                operation_deadline,
+                                &cancellation,
+                                ResponseFamily::RebuildReplicationState,
+                                backend_slots.mutation.clone(),
+                                BackendDeadlineOutcome::Mutation,
+                                backend.rebuild_replication_state(entries),
+                            )
+                            .await?
+                        }
                         Err(error) => Err(error),
                     }
                 };
-                write_post_auth_response_with_fallback(
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::RebuildReplicationState(res),
-                    Response::RebuildReplicationState(Err(store_response_limit_error())),
+                    Response::RebuildReplicationState(Err(
+                        StoreError::BackendOperationOutcomeUnavailable,
+                    )),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::RebuildReplicationState,
                     &cancellation,
                 )
                 .await?;
             }
-            Request::Watch { start_sequence } => match backend.watch(start_sequence).await {
+            Request::Watch { start_sequence } => match run_store_backend_operation(
+                reader,
+                max_frame_size,
+                operation_deadline,
+                &cancellation,
+                ResponseFamily::Watch,
+                backend_slots.watch_setup.clone(),
+                BackendDeadlineOutcome::Read,
+                backend.watch(start_sequence),
+            )
+            .await?
+            {
                 Ok(mut stream) => {
-                    write_post_auth_response(
+                    let response_deadline =
+                        bounded_response_deadline(request_deadline, idle_timeout)?;
+                    write_post_auth_response_until(
                         writer,
                         &Response::WatchStream,
                         effective_response_frame_size,
-                        idle_timeout,
+                        response_deadline,
                         ResponseFamily::Watch,
                         &cancellation,
                     )
                     .await?;
-                    while let Some(item) = stream.next().await {
+                    while let Some(item) = next_watch_item_or_disconnect(
+                        reader,
+                        max_frame_size,
+                        &cancellation,
+                        &mut stream,
+                    )
+                    .await?
+                    {
                         let deadline = response_write_deadline(idle_timeout)?;
                         check_response_write_control(deadline, &cancellation)?;
                         let item =
@@ -2185,13 +2928,24 @@ where
                 }
             },
             Request::NextLeaseInfo => {
-                let res = backend.next_lease_info().await;
-                write_post_auth_response_with_fallback(
+                let res = run_store_backend_operation(
+                    reader,
+                    max_frame_size,
+                    operation_deadline,
+                    &cancellation,
+                    ResponseFamily::NextLeaseInfo,
+                    backend_slots.read.clone(),
+                    BackendDeadlineOutcome::Read,
+                    backend.next_lease_info(),
+                )
+                .await?;
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::NextLeaseInfo(res),
                     Response::NextLeaseInfo(Err(store_response_limit_error())),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::NextLeaseInfo,
                     &cancellation,
                 )
@@ -2200,22 +2954,38 @@ where
             Request::AcquireLease { key, owner, ttl } => {
                 let expected_owner = owner.clone();
                 let res = match validate_session_ttl(ttl) {
-                    Ok(()) => backend.acquire(&key, owner, ttl).await,
+                    Ok(()) => {
+                        run_lease_backend_operation(
+                            reader,
+                            max_frame_size,
+                            operation_deadline,
+                            &cancellation,
+                            ResponseFamily::AcquireLease,
+                            backend_slots.lease.clone(),
+                            async {
+                                match backend.acquire(&key, owner, ttl).await {
+                                    Ok(lease)
+                                        if lease.key() == &key
+                                            && lease.owner() == &expected_owner =>
+                                    {
+                                        Ok(lease)
+                                    }
+                                    Ok(_) => Err(backend_lease_contract_error()),
+                                    Err(error) => Err(error),
+                                }
+                            },
+                        )
+                        .await?
+                    }
                     Err(error) => Err(LeaseError::from(error)),
                 };
-                let res = match res {
-                    Ok(lease) if lease.key() == &key && lease.owner() == &expected_owner => {
-                        Ok(lease)
-                    }
-                    Ok(_) => Err(backend_lease_contract_error()),
-                    Err(error) => Err(error),
-                };
-                write_post_auth_response_with_fallback(
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::AcquireLease(res),
-                    Response::AcquireLease(Err(lease_response_limit_error())),
+                    Response::AcquireLease(Err(LeaseError::OperationOutcomeUnavailable)),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::AcquireLease,
                     &cancellation,
                 )
@@ -2223,40 +2993,63 @@ where
             }
             Request::RenewLease { lease, ttl } => {
                 let res = match validate_session_ttl(ttl) {
-                    Ok(()) => backend.renew(&lease, ttl).await,
+                    Ok(()) => {
+                        run_lease_backend_operation(
+                            reader,
+                            max_frame_size,
+                            operation_deadline,
+                            &cancellation,
+                            ResponseFamily::RenewLease,
+                            backend_slots.lease.clone(),
+                            async {
+                                match backend.renew(&lease, ttl).await {
+                                    Ok(renewed)
+                                        if renewed.key() == lease.key()
+                                            && renewed.owner() == lease.owner()
+                                            && renewed.fence() == lease.fence()
+                                            && renewed.credential_id() == lease.credential_id() =>
+                                    {
+                                        Ok(renewed)
+                                    }
+                                    Ok(_) => Err(backend_lease_contract_error()),
+                                    Err(error) => Err(error),
+                                }
+                            },
+                        )
+                        .await?
+                    }
                     Err(error) => Err(LeaseError::from(error)),
                 };
-                let res = match res {
-                    Ok(renewed)
-                        if renewed.key() == lease.key()
-                            && renewed.owner() == lease.owner()
-                            && renewed.fence() == lease.fence()
-                            && renewed.credential_id() == lease.credential_id() =>
-                    {
-                        Ok(renewed)
-                    }
-                    Ok(_) => Err(backend_lease_contract_error()),
-                    Err(error) => Err(error),
-                };
-                write_post_auth_response_with_fallback(
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::RenewLease(res),
-                    Response::RenewLease(Err(lease_response_limit_error())),
+                    Response::RenewLease(Err(LeaseError::OperationOutcomeUnavailable)),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::RenewLease,
                     &cancellation,
                 )
                 .await?;
             }
             Request::ReleaseLease { lease } => {
-                let res = backend.release(lease).await;
-                write_post_auth_response_with_fallback(
+                let res = run_lease_backend_operation(
+                    reader,
+                    max_frame_size,
+                    operation_deadline,
+                    &cancellation,
+                    ResponseFamily::ReleaseLease,
+                    backend_slots.lease.clone(),
+                    backend.release(lease),
+                )
+                .await?;
+                let response_deadline = bounded_response_deadline(request_deadline, idle_timeout)?;
+                write_post_auth_response_with_fallback_until(
                     writer,
                     Response::ReleaseLease(res),
-                    Response::ReleaseLease(Err(lease_response_limit_error())),
+                    Response::ReleaseLease(Err(LeaseError::OperationOutcomeUnavailable)),
                     effective_response_frame_size,
-                    idle_timeout,
+                    response_deadline,
                     ResponseFamily::ReleaseLease,
                     &cancellation,
                 )
@@ -2356,6 +3149,76 @@ mod tests {
 
     static TEST_NOT_CANCELLED: AtomicBool = AtomicBool::new(false);
 
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_queue_timeout_never_polls_work_and_execution_timeout_is_ambiguous() {
+        let slots = Arc::new(Semaphore::new(1));
+        let held = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold the only slot");
+        let (peer, mut reader) = tokio::io::duplex(64);
+        let cancellation = ServerCancellation::default();
+        let polled = Arc::new(AtomicBool::new(false));
+        let operation_polled = Arc::clone(&polled);
+        let queued = run_store_backend_operation(
+            &mut reader,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            &cancellation,
+            ResponseFamily::DeleteFenced,
+            Arc::clone(&slots),
+            BackendDeadlineOutcome::Mutation,
+            async move {
+                operation_polled.store(true, Ordering::Release);
+                Ok::<(), StoreError>(())
+            },
+        )
+        .await
+        .expect("queue timeout is a typed backend response");
+        assert!(matches!(queued, Err(StoreError::BackendUnavailable(_))));
+        assert!(!polled.load(Ordering::Acquire));
+        assert_eq!(slots.available_permits(), 0);
+        drop(held);
+        assert_eq!(slots.available_permits(), 1);
+        drop(peer);
+
+        let (peer, mut reader) = tokio::io::duplex(64);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let drop_signal = Arc::clone(&dropped);
+        let executed = run_store_backend_operation(
+            &mut reader,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            &cancellation,
+            ResponseFamily::DeleteFenced,
+            Arc::clone(&slots),
+            BackendDeadlineOutcome::Mutation,
+            async move {
+                let _drop_signal = DropSignal(drop_signal);
+                std::future::pending::<()>().await;
+                Ok::<(), StoreError>(())
+            },
+        )
+        .await
+        .expect("execution timeout is a typed backend response");
+        assert_eq!(
+            executed,
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        );
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(slots.available_permits(), 1);
+        drop(peer);
+    }
+
     struct SlowCooperativeFrame {
         started: Arc<AtomicBool>,
     }
@@ -2440,7 +3303,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_and_wait_cooperatively_interrupts_synchronous_frame_encoding() {
-        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::new(ServerCancellation::default());
         let started = Arc::new(AtomicBool::new(false));
         let observed_interruption = Arc::new(AtomicBool::new(false));
         let task_cancellation = cancellation.clone();
@@ -2529,6 +3392,105 @@ mod tests {
             CasIdempotencyCache::begin(&cache, &other_peer, first, epoch, digest, Instant::now()),
             CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyConflict)
         ));
+    }
+
+    #[test]
+    fn cas_idempotency_cache_tombstones_backend_ambiguous_outcomes() {
+        let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let peer = ReplicaId::new("replica-a").expect("peer");
+        let request_id = uuid::Uuid::from_u128(73);
+        let epoch = cache.lock().expect("cache").epoch();
+        let digest = [3; 32];
+        let CasIdempotencyAdmission::Execute(permit) =
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now())
+        else {
+            panic!("first request must execute");
+        };
+
+        let unavailable = Err(StoreError::BackendUnavailable(
+            "backend lost its commit response".into(),
+        ));
+        assert!(!cas_outcome_is_definitive(&unavailable));
+        drop(permit);
+
+        assert!(matches!(
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now()),
+            CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn backend_reported_ambiguity_is_counted_for_store_and_lease_families() {
+        let before = METRICS
+            .session_net_backend_ambiguous_outcomes
+            .load(Ordering::Relaxed);
+        let slots = Arc::new(Semaphore::new(1));
+        let cancellation = ServerCancellation::default();
+
+        let (peer, mut reader) = tokio::io::duplex(64);
+        let result = run_store_backend_operation(
+            &mut reader,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &cancellation,
+            ResponseFamily::DeleteFenced,
+            Arc::clone(&slots),
+            BackendDeadlineOutcome::Mutation,
+            async { Err::<(), _>(StoreError::BackendUnavailable("lost commit result".into())) },
+        )
+        .await
+        .expect("store result");
+        assert_eq!(result, Err(StoreError::BackendOperationOutcomeUnavailable));
+        drop(peer);
+
+        let (peer, mut reader) = tokio::io::duplex(64);
+        let result = run_lease_backend_operation(
+            &mut reader,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &cancellation,
+            ResponseFamily::ReleaseLease,
+            slots,
+            async { Err::<(), _>(LeaseError::Backend("lost lease result".into())) },
+        )
+        .await
+        .expect("lease result");
+        assert_eq!(result, Err(LeaseError::OperationOutcomeUnavailable));
+        drop(peer);
+
+        assert!(
+            METRICS
+                .session_net_backend_ambiguous_outcomes
+                .load(Ordering::Relaxed)
+                >= before + 2
+        );
+    }
+
+    #[test]
+    fn batch_slot_ambiguity_counts_once_per_request() {
+        let ambiguous = Ok(vec![
+            SessionOpResult::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
+            SessionOpResult::DeleteFenced(Err(StoreError::BackendOperationOutcomeUnavailable)),
+        ]);
+        assert_eq!(batch_ambiguous_outcome_count(&ambiguous), 1);
+        assert_eq!(
+            batch_ambiguous_outcome_count(&Ok(vec![SessionOpResult::Get(Ok(None))])),
+            0
+        );
+        assert_eq!(
+            batch_ambiguous_outcome_count(&Err(StoreError::BackendOperationOutcomeUnavailable)),
+            0,
+            "outer ambiguity is counted by the generic operation wrapper"
+        );
+
+        let primary = Response::Batch(ambiguous);
+        let fallback = Response::Batch(Err(StoreError::BackendOperationOutcomeUnavailable));
+        assert_eq!(
+            u64::from(response_is_ambiguous_outcome(&primary))
+                + ambiguity_fallback_count(&primary, &fallback),
+            1,
+            "an oversized nested ambiguity must not be counted again by its fallback"
+        );
     }
 
     #[tokio::test]
@@ -2804,22 +3766,22 @@ mod tests {
             Response::Capabilities(opc_session_store::BackendCapabilities::all_enabled()),
             Response::Get(Err(store_response_limit_error())),
             Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
-            Response::DeleteFenced(Err(store_response_limit_error())),
-            Response::RefreshTtl(Err(store_response_limit_error())),
-            Response::Batch(Err(store_response_limit_error())),
+            Response::DeleteFenced(Err(StoreError::BackendOperationOutcomeUnavailable)),
+            Response::RefreshTtl(Err(StoreError::BackendOperationOutcomeUnavailable)),
+            Response::Batch(Err(StoreError::BackendOperationOutcomeUnavailable)),
             Response::ScanRestoreRecords(Err(store_response_limit_error())),
             Response::MaxReplicationSequence(Err(store_response_limit_error())),
             Response::GetReplicationLog(Err(store_response_limit_error())),
-            Response::ReplicateEntry(Err(store_response_limit_error())),
-            Response::RebuildReplicationState(Err(store_response_limit_error())),
+            Response::ReplicateEntry(Err(StoreError::BackendOperationOutcomeUnavailable)),
+            Response::RebuildReplicationState(Err(StoreError::BackendOperationOutcomeUnavailable)),
             Response::WatchEntry(Err(StoreError::BackendUnavailable(
                 WATCH_RESPONSE_LIMIT_MESSAGE.to_string(),
             ))),
             Response::WatchStream,
             Response::NextLeaseInfo(Err(store_response_limit_error())),
-            Response::AcquireLease(Err(lease_response_limit_error())),
-            Response::RenewLease(Err(lease_response_limit_error())),
-            Response::ReleaseLease(Err(lease_response_limit_error())),
+            Response::AcquireLease(Err(LeaseError::OperationOutcomeUnavailable)),
+            Response::RenewLease(Err(LeaseError::OperationOutcomeUnavailable)),
+            Response::ReleaseLease(Err(LeaseError::OperationOutcomeUnavailable)),
         ];
 
         for response in responses {
@@ -2959,6 +3921,37 @@ mod tests {
                 if message == "backend unavailable"
         ));
 
+        let ambiguity_before = METRICS
+            .session_net_backend_ambiguous_outcomes
+            .load(Ordering::Relaxed);
+        write_post_auth_response_with_fallback(
+            &mut writer,
+            Response::Batch(Ok(vec![opc_session_store::SessionOpResult::Get(Ok(Some(
+                restore_record(b"large-mutation", 8192),
+            )))])),
+            Response::Batch(Err(StoreError::BackendOperationOutcomeUnavailable)),
+            budget,
+            std::time::Duration::from_secs(1),
+            ResponseFamily::Batch,
+            &TEST_NOT_CANCELLED,
+        )
+        .await
+        .expect("write ambiguous mutation fallback");
+        let response: Response = read_frame(&mut reader, budget)
+            .await
+            .expect("read ambiguous mutation fallback");
+        assert!(matches!(
+            response,
+            Response::Batch(Err(StoreError::BackendOperationOutcomeUnavailable))
+        ));
+        assert!(
+            METRICS
+                .session_net_backend_ambiguous_outcomes
+                .load(Ordering::Relaxed)
+                > ambiguity_before,
+            "selecting a typed ambiguity fallback must be observable"
+        );
+
         let terminate = write_watch_response(
             &mut writer,
             Response::WatchEntry(Ok(replication_log_entry(1, 8192))),
@@ -3027,17 +4020,17 @@ mod tests {
             ),
             (
                 Response::DeleteFenced(Err(store_error())),
-                Response::DeleteFenced(Err(store_response_limit_error())),
+                Response::DeleteFenced(Err(StoreError::BackendOperationOutcomeUnavailable)),
                 ResponseFamily::DeleteFenced,
             ),
             (
                 Response::RefreshTtl(Err(store_error())),
-                Response::RefreshTtl(Err(store_response_limit_error())),
+                Response::RefreshTtl(Err(StoreError::BackendOperationOutcomeUnavailable)),
                 ResponseFamily::RefreshTtl,
             ),
             (
                 Response::Batch(Err(store_error())),
-                Response::Batch(Err(store_response_limit_error())),
+                Response::Batch(Err(StoreError::BackendOperationOutcomeUnavailable)),
                 ResponseFamily::Batch,
             ),
             (
@@ -3047,12 +4040,14 @@ mod tests {
             ),
             (
                 Response::ReplicateEntry(Err(store_error())),
-                Response::ReplicateEntry(Err(store_response_limit_error())),
+                Response::ReplicateEntry(Err(StoreError::BackendOperationOutcomeUnavailable)),
                 ResponseFamily::ReplicateEntry,
             ),
             (
                 Response::RebuildReplicationState(Err(store_error())),
-                Response::RebuildReplicationState(Err(store_response_limit_error())),
+                Response::RebuildReplicationState(Err(
+                    StoreError::BackendOperationOutcomeUnavailable,
+                )),
                 ResponseFamily::RebuildReplicationState,
             ),
             (
@@ -3062,17 +4057,17 @@ mod tests {
             ),
             (
                 Response::AcquireLease(Err(lease_error())),
-                Response::AcquireLease(Err(lease_response_limit_error())),
+                Response::AcquireLease(Err(LeaseError::OperationOutcomeUnavailable)),
                 ResponseFamily::AcquireLease,
             ),
             (
                 Response::RenewLease(Err(lease_error())),
-                Response::RenewLease(Err(lease_response_limit_error())),
+                Response::RenewLease(Err(LeaseError::OperationOutcomeUnavailable)),
                 ResponseFamily::RenewLease,
             ),
             (
                 Response::ReleaseLease(Err(lease_error())),
-                Response::ReleaseLease(Err(lease_response_limit_error())),
+                Response::ReleaseLease(Err(LeaseError::OperationOutcomeUnavailable)),
                 ResponseFamily::ReleaseLease,
             ),
         ];

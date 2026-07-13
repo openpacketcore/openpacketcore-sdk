@@ -189,6 +189,10 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   following unsafe file types; drop guards clean canceled staging work.
 - `probe_durable_readiness` uses Openraft's linearizable path; listener bind or
   a local SQLite read is not readiness evidence.
+- `ConsensusConfigStore::status` snapshots engine progress and live exact
+  membership under one Openraft metrics guard, releases that guard, and only
+  then updates admission state. Status remains a synchronous observation and
+  cannot self-deadlock behind a queued metrics publication during an election.
 - Normal trait mutations derive request IDs from durable operation identity;
   explicit caller-retained IDs remain available. Outcomes retain the most
   recent 4,096 applications, so steady-state snapshot size is bounded. Reusing

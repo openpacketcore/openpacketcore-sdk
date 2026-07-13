@@ -1,6 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -8,11 +9,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use futures_util::Stream;
+use opc_redaction::metrics::METRICS;
 use opc_session_store::backend::{
-    validate_replication_log_page_owned, validate_replication_page_owned,
-    validate_replication_prefix_owned, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
-    CompareAndSetResult, ReplicationEntry, ReplicationLogRange, ReplicationOp, SessionBackend,
-    SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
+    validate_replication_log_page, validate_replication_log_page_owned,
+    validate_replication_page_owned, validate_replication_prefix_owned, BackendInstanceIdentity,
+    BackendPeerBinding, CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange,
+    ReplicationOp, SessionBackend, SessionOp, SessionOpResult, WATCH_CHANNEL_CAPACITY,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -74,8 +76,54 @@ enum RemoteRequestFailure {
     Authentication,
     Timeout,
     Protocol,
+    ResponseContract,
+    ReplicationLogResponseContract,
     Backend,
     PayloadTooLarge { actual: usize, max: usize },
+}
+
+#[derive(Debug)]
+struct RemoteRequestAttemptFailure {
+    failure: RemoteRequestFailure,
+    request_may_have_reached_server: bool,
+    invalidates_contract: bool,
+}
+
+impl RemoteRequestAttemptFailure {
+    fn before_transmission(error: &ProtocolError) -> Self {
+        Self {
+            failure: RemoteRequestFailure::from_protocol_error(error),
+            request_may_have_reached_server: false,
+            invalidates_contract: invalidates_negotiated_contract(error),
+        }
+    }
+
+    fn after_transmission_started(error: &ProtocolError) -> Self {
+        Self {
+            failure: RemoteRequestFailure::from_protocol_error(error),
+            // A failed `write_all` cannot prove that the peer did not receive
+            // the complete frame. Once the first write is attempted, a
+            // mutation transport failure is conservatively ambiguous.
+            request_may_have_reached_server: true,
+            invalidates_contract: invalidates_negotiated_contract(error),
+        }
+    }
+
+    fn from_store_preflight(error: StoreError) -> Self {
+        Self {
+            failure: RemoteRequestFailure::from_store_preflight(error),
+            request_may_have_reached_server: false,
+            invalidates_contract: false,
+        }
+    }
+
+    fn response_contract_violation(failure: RemoteRequestFailure) -> Self {
+        Self {
+            failure,
+            request_may_have_reached_server: true,
+            invalidates_contract: true,
+        }
+    }
 }
 
 impl RemoteRequestFailure {
@@ -104,6 +152,7 @@ impl RemoteRequestFailure {
             Self::Authentication => "authentication",
             Self::Timeout => "timeout",
             Self::Protocol => "protocol",
+            Self::ResponseContract | Self::ReplicationLogResponseContract => "protocol",
             Self::Backend => "backend",
             Self::PayloadTooLarge { .. } => "payload_too_large",
         }
@@ -170,6 +219,8 @@ impl From<RemoteRequestFailure> for ReplicaReadinessFailure {
             RemoteRequestFailure::Authentication => Self::Authentication,
             RemoteRequestFailure::Timeout => Self::Timeout,
             RemoteRequestFailure::Protocol => Self::Protocol,
+            RemoteRequestFailure::ResponseContract
+            | RemoteRequestFailure::ReplicationLogResponseContract => Self::Protocol,
             RemoteRequestFailure::Backend => Self::Backend,
             RemoteRequestFailure::PayloadTooLarge { .. } => Self::Protocol,
         }
@@ -440,6 +491,161 @@ fn discard_replication_payloads_from_response(response: Response) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StoreResponseClass {
+    Read,
+    CompareAndSet,
+    Mutation,
+}
+
+fn store_error_matches_class(error: &StoreError, class: StoreResponseClass) -> bool {
+    match error {
+        StoreError::CasIdempotencyOutcomeUnavailable => {
+            matches!(class, StoreResponseClass::CompareAndSet)
+        }
+        StoreError::BackendOperationOutcomeUnavailable => {
+            matches!(class, StoreResponseClass::Mutation)
+        }
+        _ => true,
+    }
+}
+
+fn store_result_matches_class<T>(
+    result: &Result<T, StoreError>,
+    class: StoreResponseClass,
+) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_none_or(|error| store_error_matches_class(error, class))
+}
+
+fn batch_response_matches_request(ops: &[SessionOp], results: &[SessionOpResult]) -> bool {
+    if !bounded_session_op_expectations(ops)
+        .as_ref()
+        .is_ok_and(|expected| session_op_results_match_expectations(expected, results))
+    {
+        return false;
+    }
+    ops.iter()
+        .zip(results)
+        .all(|(operation, result)| match (operation, result) {
+            (SessionOp::Get { .. }, SessionOpResult::Get(result)) => {
+                store_result_matches_class(result, StoreResponseClass::Read)
+            }
+            (SessionOp::CompareAndSet(_), SessionOpResult::CompareAndSet(result)) => {
+                store_result_matches_class(result, StoreResponseClass::CompareAndSet)
+            }
+            (SessionOp::DeleteFenced { .. }, SessionOpResult::DeleteFenced(result))
+            | (SessionOp::RefreshTtl { .. }, SessionOpResult::RefreshTtl(result)) => {
+                store_result_matches_class(result, StoreResponseClass::Mutation)
+            }
+            _ => false,
+        })
+}
+
+fn response_matches_request(request: &Request, response: &Response) -> bool {
+    match (request, response) {
+        (Request::Capabilities, Response::Capabilities(_)) => true,
+        (Request::Get { key }, Response::Get(result)) => {
+            get_result_matches_key(key, result)
+                && store_result_matches_class(result, StoreResponseClass::Read)
+        }
+        (Request::CompareAndSet { op, .. }, Response::CompareAndSet(result)) => {
+            compare_and_set_result_matches_key(&op.key, result)
+                && store_result_matches_class(result, StoreResponseClass::CompareAndSet)
+        }
+        (Request::DeleteFenced { .. }, Response::DeleteFenced(result))
+        | (Request::RefreshTtl { .. }, Response::RefreshTtl(result)) => {
+            store_result_matches_class(result, StoreResponseClass::Mutation)
+        }
+        (Request::Batch { ops }, Response::Batch(Ok(results))) => {
+            batch_response_matches_request(ops, results)
+        }
+        (Request::Batch { ops }, Response::Batch(Err(error))) => {
+            let class = if ops.iter().any(|op| !matches!(op, SessionOp::Get { .. })) {
+                StoreResponseClass::Mutation
+            } else {
+                StoreResponseClass::Read
+            };
+            store_error_matches_class(error, class)
+        }
+        (
+            Request::ScanRestoreRecords {
+                request: wire_request,
+                ..
+            },
+            Response::ScanRestoreRecords(Ok(page)),
+        ) => RestoreScanRequest::try_from(wire_request.clone()).is_ok_and(|request| {
+            page.cursor_profile == RestoreScanCursorProfile::DurableOpaqueV1
+                && page.validate_for_request(&request).is_ok()
+        }),
+        (Request::ScanRestoreRecords { .. }, Response::ScanRestoreRecords(Err(error))) => {
+            store_error_matches_class(error, StoreResponseClass::Read)
+        }
+        (Request::MaxReplicationSequence, Response::MaxReplicationSequence(result)) => {
+            store_result_matches_class(result, StoreResponseClass::Read)
+        }
+        (Request::GetReplicationLog { start, limit }, Response::GetReplicationLog(Ok(entries))) => {
+            validate_replication_log_page(*start, *limit, entries).is_ok()
+        }
+        (Request::GetReplicationLog { .. }, Response::GetReplicationLog(Err(error))) => {
+            store_error_matches_class(error, StoreResponseClass::Read)
+        }
+        (Request::ReplicateEntry { .. }, Response::ReplicateEntry(result))
+        | (Request::RebuildReplicationState { .. }, Response::RebuildReplicationState(result)) => {
+            store_result_matches_class(result, StoreResponseClass::Mutation)
+        }
+        (Request::Watch { .. }, Response::WatchStream) => true,
+        (Request::NextLeaseInfo, Response::NextLeaseInfo(result)) => {
+            store_result_matches_class(result, StoreResponseClass::Read)
+        }
+        (Request::AcquireLease { key, owner, .. }, Response::AcquireLease(Ok(lease))) => {
+            lease.key() == key && lease.owner() == owner
+        }
+        (Request::AcquireLease { .. }, Response::AcquireLease(Err(_))) => true,
+        (Request::RenewLease { lease, .. }, Response::RenewLease(Ok(renewed))) => {
+            renewed.key() == lease.key()
+                && renewed.owner() == lease.owner()
+                && renewed.fence() == lease.fence()
+                && renewed.credential_id() == lease.credential_id()
+        }
+        (Request::RenewLease { .. }, Response::RenewLease(Err(_)))
+        | (Request::ReleaseLease { .. }, Response::ReleaseLease(_)) => true,
+        (Request::Hello { .. }, _) => false,
+        _ => false,
+    }
+}
+
+fn response_contract_failure(
+    request: &Request,
+    response: &Response,
+) -> Option<RemoteRequestFailure> {
+    if response_matches_request(request, response) {
+        return None;
+    }
+    if let (Request::GetReplicationLog { start, limit }, Response::GetReplicationLog(Ok(entries))) =
+        (request, response)
+    {
+        if entries.len() <= *limit
+            && matches!(
+                validate_replication_log_page(*start, *limit, entries),
+                Err(StoreError::InvalidReplicationSequence)
+            )
+        {
+            return Some(RemoteRequestFailure::ReplicationLogResponseContract);
+        }
+    }
+    Some(RemoteRequestFailure::ResponseContract)
+}
+
+fn response_requires_fresh_connection(response: &Response) -> bool {
+    matches!(
+        response,
+        Response::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable))
+    )
+}
+
 fn discard_replication_entry_iteratively(entry: ReplicationEntry) {
     let ReplicationEntry { op, .. } = entry;
     let mut pending = vec![vec![op].into_iter()];
@@ -490,10 +696,11 @@ impl RemoteSessionBackend {
     /// Session resumption and early data are disabled so a reconnect must
     /// present and verify the peer's current certificate.
     ///
-    /// `deadline` bounds every backend method end-to-end, including connection
-    /// retries with backoff (default 2s when `None`). On expiry the method
-    /// returns the store's unavailable error so a quorum layer treats this
-    /// replica as offline instead of stalling.
+    /// `deadline` bounds every backend method end-to-end (default 2s when
+    /// `None`). Reads and failures proven before transmission may reconnect with
+    /// bounded backoff and return availability failure on expiry. A transmitted
+    /// CAS, non-CAS mutation, or lease mutation is never automatically replayed;
+    /// expiry after that boundary returns its typed non-retryable ambiguity.
     pub fn new(
         binding: RemoteReplicaBinding,
         tls_config: opc_tls::AuthenticatedClientConfig,
@@ -609,9 +816,10 @@ impl RemoteSessionBackend {
             let mut backoff_ms = 100u64;
             loop {
                 request_in_flight = true;
-                match self.do_request(&req, operation_deadline).await {
+                match self.do_request(&req, operation_deadline, None).await {
                     Ok(resp) => return Ok(resp),
-                    Err(failure) => {
+                    Err(attempt) => {
+                        let failure = attempt.failure;
                         if !failure.is_retryable() {
                             return Err(failure);
                         }
@@ -644,20 +852,125 @@ impl RemoteSessionBackend {
     /// after restart or pressure). The caller receives a typed unavailable
     /// result and must re-read authoritative state before deriving a new CAS.
     async fn send_mutation_once(&self, req: Request) -> Result<Response, StoreError> {
-        validate_request_profile(&req).map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
+        validate_request_profile(&req).map_err(|_| {
+            StoreError::BackendUnavailable(
+                "session mutation violates the transport profile".to_string(),
+            )
+        })?;
         validate_request_payload_limit(&req, conservative_payload_budget(self.max_frame_size))?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.deadline)
-            .ok_or(StoreError::CasIdempotencyOutcomeUnavailable)?;
-        self.do_request(&req, deadline)
+            .ok_or_else(|| {
+                StoreError::BackendUnavailable(
+                    "remote session mutation deadline is not representable".to_string(),
+                )
+            })?;
+        self.do_request_once_until(&req, deadline)
             .await
             .map(|response| response.response)
-            .map_err(|failure| match failure {
+            .map_err(|attempt| match attempt.failure {
                 RemoteRequestFailure::PayloadTooLarge { actual, max } => {
                     StoreError::PayloadTooLarge { actual, max }
                 }
-                _ => StoreError::CasIdempotencyOutcomeUnavailable,
+                _ if !attempt.request_may_have_reached_server => StoreError::BackendUnavailable(
+                    "remote session mutation failed before transmission".to_string(),
+                ),
+                _ => {
+                    METRICS
+                        .session_net_backend_ambiguous_outcomes
+                        .fetch_add(1, Ordering::Relaxed);
+                    StoreError::CasIdempotencyOutcomeUnavailable
+                }
             })
+    }
+
+    /// Dispatch one non-CAS mutation exactly once. A transport or deadline
+    /// failure after request transmission is an ambiguous outcome, never an
+    /// invitation to reconnect and repeat the effect.
+    async fn send_backend_mutation_once(&self, req: Request) -> Result<Response, StoreError> {
+        validate_request_profile(&req).map_err(|_| {
+            StoreError::BackendUnavailable(
+                "session mutation violates the transport profile".to_string(),
+            )
+        })?;
+        validate_request_payload_limit(&req, conservative_payload_budget(self.max_frame_size))?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.deadline)
+            .ok_or_else(|| {
+                StoreError::BackendUnavailable(
+                    "remote session mutation deadline is not representable".to_string(),
+                )
+            })?;
+        self.do_request_once_until(&req, deadline)
+            .await
+            .map(|response| response.response)
+            .map_err(|attempt| match attempt.failure {
+                RemoteRequestFailure::PayloadTooLarge { actual, max } => {
+                    StoreError::PayloadTooLarge { actual, max }
+                }
+                _ if !attempt.request_may_have_reached_server => StoreError::BackendUnavailable(
+                    "remote session mutation failed before transmission".to_string(),
+                ),
+                _ => {
+                    METRICS
+                        .session_net_backend_ambiguous_outcomes
+                        .fetch_add(1, Ordering::Relaxed);
+                    StoreError::BackendOperationOutcomeUnavailable
+                }
+            })
+    }
+
+    /// Dispatch one lease mutation exactly once. Unknown transport outcomes
+    /// invalidate the caller's lease authority and cannot be retried safely.
+    async fn send_lease_mutation_once(&self, req: Request) -> Result<Response, LeaseError> {
+        validate_request_profile(&req).map_err(|_| {
+            LeaseError::Backend("lease mutation violates the transport profile".to_string())
+        })?;
+        validate_request_payload_limit(&req, conservative_payload_budget(self.max_frame_size))
+            .map_err(LeaseError::from)?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.deadline)
+            .ok_or_else(|| {
+                LeaseError::Backend(
+                    "remote lease mutation deadline is not representable".to_string(),
+                )
+            })?;
+        self.do_request_once_until(&req, deadline)
+            .await
+            .map(|response| response.response)
+            .map_err(|attempt| {
+                if attempt.request_may_have_reached_server {
+                    METRICS
+                        .session_net_backend_ambiguous_outcomes
+                        .fetch_add(1, Ordering::Relaxed);
+                    LeaseError::OperationOutcomeUnavailable
+                } else {
+                    LeaseError::Backend(
+                        "remote lease mutation failed before transmission".to_string(),
+                    )
+                }
+            })
+    }
+
+    async fn do_request_once_until(
+        &self,
+        req: &Request,
+        deadline: tokio::time::Instant,
+    ) -> Result<NegotiatedResponse, RemoteRequestAttemptFailure> {
+        let transmission_started = AtomicBool::new(false);
+        match tokio::time::timeout_at(
+            deadline,
+            self.do_request(req, deadline, Some(&transmission_started)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RemoteRequestAttemptFailure {
+                failure: RemoteRequestFailure::Timeout,
+                request_may_have_reached_server: transmission_started.load(Ordering::Acquire),
+                invalidates_contract: false,
+            }),
+        }
     }
 
     async fn send_request_with_retry_negotiated(
@@ -670,6 +983,12 @@ impl RemoteSessionBackend {
                 RemoteRequestFailure::PayloadTooLarge { actual, max } => {
                     StoreError::PayloadTooLarge { actual, max }
                 }
+                RemoteRequestFailure::ResponseContract => {
+                    StoreError::BackendUnavailable(REMOTE_PROTOCOL_VIOLATION.to_string())
+                }
+                RemoteRequestFailure::ReplicationLogResponseContract => {
+                    StoreError::InvalidReplicationSequence
+                }
                 _ => StoreError::BackendUnavailable(format!(
                     "remote session backend request failed: {}",
                     failure.reason_code()
@@ -677,17 +996,12 @@ impl RemoteSessionBackend {
             })
     }
 
-    async fn send_lease_request_with_retry(&self, req: Request) -> Result<Response, LeaseError> {
-        self.send_request_with_retry(req)
-            .await
-            .map_err(|e| LeaseError::Backend(e.to_string()))
-    }
-
     async fn do_request(
         &self,
         req: &Request,
         operation_deadline: tokio::time::Instant,
-    ) -> Result<NegotiatedResponse, RemoteRequestFailure> {
+        transmission_started: Option<&AtomicBool>,
+    ) -> Result<NegotiatedResponse, RemoteRequestAttemptFailure> {
         let mut guard = self.conn.lock().await;
 
         // Take the connection out of the slot for the duration of the
@@ -702,7 +1016,7 @@ impl RemoteSessionBackend {
             None => self
                 .connect(operation_deadline)
                 .await
-                .map_err(|error| RemoteRequestFailure::from_protocol_error(&error))?,
+                .map_err(|error| RemoteRequestAttemptFailure::before_transmission(&error))?,
         };
 
         let request = match req {
@@ -719,24 +1033,42 @@ impl RemoteSessionBackend {
             ));
         if let Err(error) = validate_request_payload_limit(&request, transport_limit) {
             *guard = Some(conn);
-            return Err(RemoteRequestFailure::from_store_preflight(error));
+            return Err(RemoteRequestAttemptFailure::from_store_preflight(error));
         }
 
-        match self.exchange(&request, &mut conn, operation_deadline).await {
+        match self
+            .exchange(
+                &request,
+                &mut conn,
+                operation_deadline,
+                transmission_started,
+            )
+            .await
+        {
             Ok(resp) => {
+                if let Some(failure) = response_contract_failure(&request, &resp) {
+                    discard_replication_payloads_from_response(resp);
+                    self.clear_cached_capabilities();
+                    return Err(RemoteRequestAttemptFailure::response_contract_violation(
+                        failure,
+                    ));
+                }
+                let requires_fresh_connection = response_requires_fresh_connection(&resp);
                 let response = NegotiatedResponse {
                     response: resp,
                     contract_profile: conn.contract_profile,
                     frame_limits: conn.frame_limits,
                 };
-                *guard = Some(conn);
+                if !requires_fresh_connection {
+                    *guard = Some(conn);
+                }
                 Ok(response)
             }
-            Err(error) => {
-                if invalidates_negotiated_contract(&error) {
+            Err(attempt) => {
+                if attempt.invalidates_contract {
                     self.clear_cached_capabilities();
                 }
-                Err(RemoteRequestFailure::from_protocol_error(&error))
+                Err(attempt)
             }
         }
     }
@@ -775,14 +1107,22 @@ impl RemoteSessionBackend {
         req: &Request,
         conn: &mut Connection,
         operation_deadline: tokio::time::Instant,
-    ) -> Result<Response, ProtocolError> {
+        transmission_started: Option<&AtomicBool>,
+    ) -> Result<Response, RemoteRequestAttemptFailure> {
         if self.tls_config.is_some()
             && conn.authenticated_peer.as_ref() != Some(self.binding.remote_replica_id())
         {
-            return Err(ProtocolError::Authentication);
+            return Err(RemoteRequestAttemptFailure::before_transmission(
+                &ProtocolError::Authentication,
+            ));
         }
         if conn.contract_profile != CURRENT_CONTRACT_PROFILE {
-            return Err(ProtocolError::ContractMismatch);
+            return Err(RemoteRequestAttemptFailure::before_transmission(
+                &ProtocolError::ContractMismatch,
+            ));
+        }
+        if let Some(transmission_started) = transmission_started {
+            transmission_started.store(true, Ordering::Release);
         }
         write_frame_bounded_until(
             &mut conn.writer,
@@ -790,8 +1130,11 @@ impl RemoteSessionBackend {
             conn.frame_limits.request_frame_size,
             operation_deadline,
         )
-        .await?;
-        read_response_frame(&mut conn.reader, conn.frame_limits.response_frame_size).await
+        .await
+        .map_err(|error| RemoteRequestAttemptFailure::after_transmission_started(&error))?;
+        read_response_frame(&mut conn.reader, conn.frame_limits.response_frame_size)
+            .await
+            .map_err(|error| RemoteRequestAttemptFailure::after_transmission_started(&error))
     }
 
     fn remember_capabilities(
@@ -883,11 +1226,34 @@ impl RemoteSessionBackend {
         StoreError::BackendUnavailable(REMOTE_PROTOCOL_VIOLATION.to_string())
     }
 
-    async fn lease_protocol_violation(&self, response: Response) -> LeaseError {
+    async fn cas_mutation_protocol_violation(&self, response: Response) -> StoreError {
         discard_replication_payloads_from_response(response);
         self.discard_connection().await;
         self.clear_cached_capabilities();
-        LeaseError::Backend(REMOTE_PROTOCOL_VIOLATION.to_string())
+        METRICS
+            .session_net_backend_ambiguous_outcomes
+            .fetch_add(1, Ordering::Relaxed);
+        StoreError::CasIdempotencyOutcomeUnavailable
+    }
+
+    async fn backend_mutation_protocol_violation(&self, response: Response) -> StoreError {
+        discard_replication_payloads_from_response(response);
+        self.discard_connection().await;
+        self.clear_cached_capabilities();
+        METRICS
+            .session_net_backend_ambiguous_outcomes
+            .fetch_add(1, Ordering::Relaxed);
+        StoreError::BackendOperationOutcomeUnavailable
+    }
+
+    async fn lease_mutation_protocol_violation(&self, response: Response) -> LeaseError {
+        discard_replication_payloads_from_response(response);
+        self.discard_connection().await;
+        self.clear_cached_capabilities();
+        METRICS
+            .session_net_backend_ambiguous_outcomes
+            .fetch_add(1, Ordering::Relaxed);
+        LeaseError::OperationOutcomeUnavailable
     }
 
     async fn readiness_protocol_violation(&self, response: Response) -> ReplicaReadinessFailure {
@@ -983,35 +1349,35 @@ impl SessionBackend for RemoteSessionBackend {
                 res
             }
             Response::CompareAndSet(res) => Err(self
-                .store_protocol_violation(Response::CompareAndSet(res))
+                .cas_mutation_protocol_violation(Response::CompareAndSet(res))
                 .await),
-            response => Err(self.store_protocol_violation(response).await),
+            response => Err(self.cas_mutation_protocol_violation(response).await),
         }
     }
 
     async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
         match self
-            .send_request_with_retry(Request::DeleteFenced {
+            .send_backend_mutation_once(Request::DeleteFenced {
                 lease: lease.clone(),
             })
             .await?
         {
             Response::DeleteFenced(res) => res,
-            response => Err(self.store_protocol_violation(response).await),
+            response => Err(self.backend_mutation_protocol_violation(response).await),
         }
     }
 
     async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
         validate_session_ttl(ttl)?;
         match self
-            .send_request_with_retry(Request::RefreshTtl {
+            .send_backend_mutation_once(Request::RefreshTtl {
                 lease: lease.clone(),
                 ttl,
             })
             .await?
         {
             Response::RefreshTtl(res) => res,
-            response => Err(self.store_protocol_violation(response).await),
+            response => Err(self.backend_mutation_protocol_violation(response).await),
         }
     }
 
@@ -1023,7 +1389,14 @@ impl SessionBackend for RemoteSessionBackend {
             op.validate_ttls()?;
         }
         let expected = bounded_session_op_expectations(&ops)?;
-        match self.send_request_with_retry(Request::Batch { ops }).await? {
+        let contains_mutation = ops.iter().any(|op| !matches!(op, SessionOp::Get { .. }));
+        let response = if contains_mutation {
+            self.send_backend_mutation_once(Request::Batch { ops })
+                .await?
+        } else {
+            self.send_request_with_retry(Request::Batch { ops }).await?
+        };
+        match response {
             Response::Batch(Ok(results))
                 if session_op_results_match_expectations(&expected, &results) =>
             {
@@ -1033,11 +1406,21 @@ impl SessionBackend for RemoteSessionBackend {
                 drop(results);
                 self.discard_connection().await;
                 self.clear_cached_capabilities();
-                Err(StoreError::BackendUnavailable(
-                    "remote batch response violated the protocol contract".to_string(),
-                ))
+                if contains_mutation {
+                    METRICS
+                        .session_net_backend_ambiguous_outcomes
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(StoreError::BackendOperationOutcomeUnavailable)
+                } else {
+                    Err(StoreError::BackendUnavailable(
+                        "remote batch response violated the protocol contract".to_string(),
+                    ))
+                }
             }
             Response::Batch(Err(error)) => Err(error),
+            response if contains_mutation => {
+                Err(self.backend_mutation_protocol_violation(response).await)
+            }
             response => Err(self.store_protocol_violation(response).await),
         }
     }
@@ -1185,11 +1568,11 @@ impl SessionBackend for RemoteSessionBackend {
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         let entry = entry.into_validated()?;
         match self
-            .send_request_with_retry(Request::ReplicateEntry { entry })
+            .send_backend_mutation_once(Request::ReplicateEntry { entry })
             .await?
         {
             Response::ReplicateEntry(res) => res,
-            response => Err(self.store_protocol_violation(response).await),
+            response => Err(self.backend_mutation_protocol_violation(response).await),
         }
     }
 
@@ -1202,11 +1585,11 @@ impl SessionBackend for RemoteSessionBackend {
         }
         let entries = validate_replication_prefix_owned(entries)?;
         match self
-            .send_request_with_retry(Request::RebuildReplicationState { entries })
+            .send_backend_mutation_once(Request::RebuildReplicationState { entries })
             .await?
         {
             Response::RebuildReplicationState(res) => res,
-            response => Err(self.store_protocol_violation(response).await),
+            response => Err(self.backend_mutation_protocol_violation(response).await),
         }
     }
 
@@ -1275,7 +1658,7 @@ impl SessionLeaseManager for RemoteSessionBackend {
         validate_session_ttl(ttl).map_err(LeaseError::from)?;
         let expected_owner = owner.clone();
         match self
-            .send_lease_request_with_retry(Request::AcquireLease {
+            .send_lease_mutation_once(Request::AcquireLease {
                 key: key.clone(),
                 owner,
                 ttl,
@@ -1289,16 +1672,16 @@ impl SessionLeaseManager for RemoteSessionBackend {
             }
             Response::AcquireLease(Err(error)) => Err(error),
             Response::AcquireLease(Ok(lease)) => Err(self
-                .lease_protocol_violation(Response::AcquireLease(Ok(lease)))
+                .lease_mutation_protocol_violation(Response::AcquireLease(Ok(lease)))
                 .await),
-            response => Err(self.lease_protocol_violation(response).await),
+            response => Err(self.lease_mutation_protocol_violation(response).await),
         }
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
         validate_session_ttl(ttl).map_err(LeaseError::from)?;
         match self
-            .send_lease_request_with_retry(Request::RenewLease {
+            .send_lease_mutation_once(Request::RenewLease {
                 lease: lease.clone(),
                 ttl,
             })
@@ -1314,19 +1697,19 @@ impl SessionLeaseManager for RemoteSessionBackend {
             }
             Response::RenewLease(Err(error)) => Err(error),
             Response::RenewLease(Ok(renewed)) => Err(self
-                .lease_protocol_violation(Response::RenewLease(Ok(renewed)))
+                .lease_mutation_protocol_violation(Response::RenewLease(Ok(renewed)))
                 .await),
-            response => Err(self.lease_protocol_violation(response).await),
+            response => Err(self.lease_mutation_protocol_violation(response).await),
         }
     }
 
     async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
         match self
-            .send_lease_request_with_retry(Request::ReleaseLease { lease })
+            .send_lease_mutation_once(Request::ReleaseLease { lease })
             .await?
         {
             Response::ReleaseLease(res) => res,
-            response => Err(self.lease_protocol_violation(response).await),
+            response => Err(self.lease_mutation_protocol_violation(response).await),
         }
     }
 }
@@ -1438,6 +1821,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::CasConflict => "cas_conflict",
         StoreError::CasIdempotencyConflict => "cas_idempotency_conflict",
         StoreError::CasIdempotencyOutcomeUnavailable => "cas_idempotency_outcome_unavailable",
+        StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
         StoreError::BackendUnavailable(_) => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
@@ -1684,6 +2068,81 @@ mod tests {
                 .expect("write capabilities");
         });
         (addr, handle)
+    }
+
+    async fn response_loss_server() -> (SocketAddr, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind response-loss listener");
+        let addr = listener.local_addr().expect("response-loss address");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept mutation client");
+            let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read response-loss hello");
+            write_frame(&mut stream, &successful_hello_ack(&hello))
+                .await
+                .expect("write response-loss hello ack");
+            let _request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read one mutation");
+            drop(stream);
+
+            match tokio::time::timeout(Duration::from_millis(150), listener.accept()).await {
+                Ok(Ok((_retry, _))) => 2,
+                _ => 1,
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn mutations_are_not_retried_after_response_loss_and_preconnect_failure_is_known_safe() {
+        let fixture = FakeSessionBackend::new();
+        let key = match valid_deadline_entry().op {
+            ReplicationOp::RefreshTtl { key, .. } => key,
+            _ => unreachable!("fixture operation is fixed"),
+        };
+        let owner = OwnerId::new("response-loss-owner").expect("owner");
+        let lease = fixture
+            .acquire(&key, owner, Duration::from_secs(60))
+            .await
+            .expect("fixture lease");
+
+        let (addr, server) = response_loss_server().await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        let error = backend
+            .send_backend_mutation_once(Request::DeleteFenced {
+                lease: lease.clone(),
+            })
+            .await
+            .expect_err("lost mutation response is ambiguous");
+        assert_eq!(error, StoreError::BackendOperationOutcomeUnavailable);
+        assert_eq!(server.await.expect("response-loss server"), 1);
+
+        let (addr, server) = response_loss_server().await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        let error = backend
+            .send_lease_mutation_once(Request::ReleaseLease {
+                lease: lease.clone(),
+            })
+            .await
+            .expect_err("lost lease response is ambiguous");
+        assert_eq!(error, LeaseError::OperationOutcomeUnavailable);
+        assert_eq!(server.await.expect("lease response-loss server"), 1);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unreachable address");
+        let unreachable = listener.local_addr().expect("unreachable address");
+        drop(listener);
+        let backend =
+            RemoteSessionBackend::new_insecure(unreachable, Some(Duration::from_millis(250)));
+        let error = backend
+            .send_backend_mutation_once(Request::DeleteFenced { lease })
+            .await
+            .expect_err("connect failure is known not applied");
+        assert!(matches!(error, StoreError::BackendUnavailable(_)));
     }
 
     async fn warmed_malicious_response_server(
@@ -2537,9 +2996,7 @@ mod tests {
             .expect_err("wrong response cardinality must fail closed");
         assert_eq!(
             error,
-            StoreError::BackendUnavailable(
-                "remote batch response violated the protocol contract".to_string()
-            )
+            StoreError::BackendUnavailable(REMOTE_PROTOCOL_VIOLATION.to_string())
         );
         assert!(
             backend.conn.lock().await.is_none(),
@@ -2685,10 +3142,7 @@ mod tests {
             .compare_and_set(operation)
             .await
             .expect_err("a CAS conflict for another key must fail closed");
-        assert_eq!(
-            error,
-            StoreError::BackendUnavailable(REMOTE_PROTOCOL_VIOLATION.to_string())
-        );
+        assert_eq!(error, StoreError::CasIdempotencyOutcomeUnavailable);
         assert!(backend.conn.lock().await.is_none());
         assert!(backend
             .cached_capabilities
@@ -2702,6 +3156,7 @@ mod tests {
         ops: Vec<SessionOp>,
         results: Vec<SessionOpResult>,
     ) {
+        let contains_mutation = ops.iter().any(|op| !matches!(op, SessionOp::Get { .. }));
         let (addr, server) = warmed_malicious_response_server(Response::Batch(Ok(results))).await;
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
         assert!(backend.capabilities().await.restore_scan);
@@ -2710,12 +3165,14 @@ mod tests {
             .batch(ops)
             .await
             .expect_err("a batch response that does not match its request must fail closed");
-        assert_eq!(
-            error,
-            StoreError::BackendUnavailable(
-                "remote batch response violated the protocol contract".to_string()
-            )
-        );
+        if contains_mutation {
+            assert_eq!(error, StoreError::BackendOperationOutcomeUnavailable);
+        } else {
+            assert_eq!(
+                error,
+                StoreError::BackendUnavailable(REMOTE_PROTOCOL_VIOLATION.to_string())
+            );
+        }
         assert!(backend.conn.lock().await.is_none());
         assert!(backend
             .cached_capabilities
@@ -2768,6 +3225,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_ambiguity_must_match_the_exact_response_family() {
+        let operation = valid_compare_and_set(0).await;
+        let lease = operation.lease.clone();
+
+        let (addr, server) = warmed_malicious_response_server(Response::Get(Err(
+            StoreError::CasIdempotencyOutcomeUnavailable,
+        )))
+        .await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.restore_scan);
+        assert_eq!(
+            backend.get(&operation.key).await,
+            Err(StoreError::BackendUnavailable(
+                REMOTE_PROTOCOL_VIOLATION.to_string()
+            ))
+        );
+        server.await.expect("malicious get ambiguity peer");
+
+        let (addr, server) = warmed_malicious_response_server(Response::CompareAndSet(Err(
+            StoreError::BackendOperationOutcomeUnavailable,
+        )))
+        .await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.restore_scan);
+        assert_eq!(
+            backend.compare_and_set(operation.clone()).await,
+            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+        );
+        server.await.expect("malicious CAS ambiguity peer");
+
+        for (request, response, family) in [
+            (
+                Request::DeleteFenced {
+                    lease: lease.clone(),
+                },
+                Response::DeleteFenced(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
+                "delete",
+            ),
+            (
+                Request::RefreshTtl {
+                    lease: lease.clone(),
+                    ttl: Duration::from_secs(60),
+                },
+                Response::RefreshTtl(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
+                "refresh",
+            ),
+        ] {
+            let (addr, server) = warmed_malicious_response_server(response).await;
+            let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+            assert!(backend.capabilities().await.restore_scan);
+            assert!(
+                matches!(
+                    backend.send_backend_mutation_once(request).await,
+                    Err(StoreError::BackendOperationOutcomeUnavailable)
+                ),
+                "{family} accepted the CAS-only ambiguity family",
+            );
+            server.await.expect("malicious non-CAS ambiguity peer");
+        }
+
+        assert_malicious_batch_response_is_rejected(
+            vec![SessionOp::Get {
+                key: operation.key.clone(),
+            }],
+            vec![SessionOpResult::Get(Err(
+                StoreError::CasIdempotencyOutcomeUnavailable,
+            ))],
+        )
+        .await;
+        assert_malicious_batch_response_is_rejected(
+            vec![SessionOp::CompareAndSet(operation)],
+            vec![SessionOpResult::CompareAndSet(Err(
+                StoreError::BackendOperationOutcomeUnavailable,
+            ))],
+        )
+        .await;
+        assert_malicious_batch_response_is_rejected(
+            vec![SessionOp::DeleteFenced { lease }],
+            vec![SessionOpResult::DeleteFenced(Err(
+                StoreError::CasIdempotencyOutcomeUnavailable,
+            ))],
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn peer_acquire_lease_must_match_the_requested_key_and_owner() {
         let requested_key = match valid_deadline_entry().op {
             ReplicationOp::RefreshTtl { key, .. } => key,
@@ -2795,10 +3338,7 @@ mod tests {
             .acquire(&requested_key, requested_owner, Duration::from_secs(60))
             .await
             .expect_err("an acquire response for another key and owner must fail closed");
-        assert_eq!(
-            error,
-            LeaseError::Backend(REMOTE_PROTOCOL_VIOLATION.to_string())
-        );
+        assert_eq!(error, LeaseError::OperationOutcomeUnavailable);
         assert!(backend.conn.lock().await.is_none());
         assert!(backend
             .cached_capabilities
@@ -2836,10 +3376,7 @@ mod tests {
             .renew(&lease, Duration::from_secs(60))
             .await
             .expect_err("a renewal that changes its credential must fail closed");
-        assert_eq!(
-            error,
-            LeaseError::Backend(REMOTE_PROTOCOL_VIOLATION.to_string())
-        );
+        assert_eq!(error, LeaseError::OperationOutcomeUnavailable);
         assert!(backend.conn.lock().await.is_none());
         assert!(backend
             .cached_capabilities
@@ -2847,6 +3384,328 @@ mod tests {
             .expect("cache lock")
             .is_none());
         server.await.expect("malicious peer");
+    }
+
+    #[tokio::test]
+    async fn wrong_response_family_is_ambiguous_for_every_remaining_mutation_family() {
+        let operation = valid_compare_and_set(0).await;
+        let lease = operation.lease.clone();
+
+        let (addr, server) = warmed_malicious_response_server(Response::Get(Ok(None))).await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.restore_scan);
+        assert_eq!(
+            backend
+                .compare_and_set(operation)
+                .await
+                .expect_err("wrong CAS response family"),
+            StoreError::CasIdempotencyOutcomeUnavailable
+        );
+        server.await.expect("malicious CAS peer");
+
+        let (addr, server) = warmed_malicious_response_server(Response::Get(Ok(None))).await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.restore_scan);
+        assert_eq!(
+            backend
+                .delete_fenced(&lease)
+                .await
+                .expect_err("wrong delete response family"),
+            StoreError::BackendOperationOutcomeUnavailable
+        );
+        server.await.expect("malicious delete peer");
+
+        let (addr, server) = warmed_malicious_response_server(Response::Get(Ok(None))).await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.restore_scan);
+        assert_eq!(
+            backend
+                .refresh_ttl(&lease, Duration::from_secs(60))
+                .await
+                .expect_err("wrong refresh response family"),
+            StoreError::BackendOperationOutcomeUnavailable
+        );
+        server.await.expect("malicious refresh peer");
+
+        let (addr, server) = warmed_malicious_response_server(Response::Get(Ok(None))).await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.restore_scan);
+        assert_eq!(
+            backend
+                .batch(vec![SessionOp::DeleteFenced {
+                    lease: lease.clone(),
+                }])
+                .await
+                .expect_err("wrong mutating batch response family"),
+            StoreError::BackendOperationOutcomeUnavailable
+        );
+        server.await.expect("malicious batch peer");
+
+        let entry = valid_deadline_entry();
+        let (addr, server) = warmed_malicious_response_server(Response::Get(Ok(None))).await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.restore_scan);
+        assert_eq!(
+            backend
+                .replicate_entry(entry.clone())
+                .await
+                .expect_err("wrong replication response family"),
+            StoreError::BackendOperationOutcomeUnavailable
+        );
+        server.await.expect("malicious replication peer");
+
+        let (addr, server) = warmed_malicious_response_server(Response::Get(Ok(None))).await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.restore_scan);
+        assert_eq!(
+            backend
+                .rebuild_replication_state(vec![entry])
+                .await
+                .expect_err("wrong rebuild response family"),
+            StoreError::BackendOperationOutcomeUnavailable
+        );
+        server.await.expect("malicious rebuild peer");
+
+        let (addr, server) = warmed_malicious_response_server(Response::Get(Ok(None))).await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
+        assert!(backend.capabilities().await.restore_scan);
+        assert_eq!(
+            backend
+                .release(lease)
+                .await
+                .expect_err("wrong release response family"),
+            LeaseError::OperationOutcomeUnavailable
+        );
+        server.await.expect("malicious release peer");
+    }
+
+    #[tokio::test]
+    async fn violating_response_connection_cannot_dispatch_a_queued_mutation() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind violating connection-race server");
+        let addr = listener.local_addr().expect("server address");
+        let same_connection_dispatches = Arc::new(AtomicUsize::new(0));
+        let replacement_dispatches = Arc::new(AtomicUsize::new(0));
+        let server_same_connection_dispatches = Arc::clone(&same_connection_dispatches);
+        let server_replacement_dispatches = Arc::clone(&replacement_dispatches);
+        let (first_request_tx, first_request_rx) = tokio::sync::oneshot::channel();
+        let (release_response_tx, release_response_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("accept first connection");
+            let hello: Request = read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read first hello");
+            write_frame(&mut first, &successful_hello_ack(&hello))
+                .await
+                .expect("write first hello acknowledgement");
+            let capabilities: Request = read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read capabilities");
+            assert!(matches!(capabilities, Request::Capabilities));
+            write_frame(
+                &mut first,
+                &Response::Capabilities(BackendCapabilities::all_enabled()),
+            )
+            .await
+            .expect("write capabilities");
+
+            let first_mutation: Request = read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read first mutation");
+            assert!(matches!(first_mutation, Request::ReplicateEntry { .. }));
+            let _ = first_request_tx.send(());
+            let _ = release_response_rx.await;
+            write_frame(&mut first, &Response::Get(Ok(None)))
+                .await
+                .expect("write wrong-family mutation response");
+
+            match tokio::time::timeout(
+                Duration::from_millis(250),
+                read_frame::<_, Request>(&mut first, DEFAULT_MAX_FRAME_SIZE),
+            )
+            .await
+            {
+                Ok(Ok(Request::ReplicateEntry { .. })) => {
+                    server_same_connection_dispatches.fetch_add(1, Ordering::SeqCst);
+                    write_frame(&mut first, &Response::ReplicateEntry(Ok(())))
+                        .await
+                        .expect("finish incorrectly reused connection");
+                }
+                _ => {
+                    let (mut replacement, _) =
+                        tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                            .await
+                            .expect("client reconnects after contract violation")
+                            .expect("accept replacement connection");
+                    let hello: Request = read_frame(&mut replacement, DEFAULT_MAX_FRAME_SIZE)
+                        .await
+                        .expect("read replacement hello");
+                    write_frame(&mut replacement, &successful_hello_ack(&hello))
+                        .await
+                        .expect("write replacement hello acknowledgement");
+                    let mutation: Request = read_frame(&mut replacement, DEFAULT_MAX_FRAME_SIZE)
+                        .await
+                        .expect("read replacement mutation");
+                    assert!(matches!(mutation, Request::ReplicateEntry { .. }));
+                    server_replacement_dispatches.fetch_add(1, Ordering::SeqCst);
+                    write_frame(&mut replacement, &Response::ReplicateEntry(Ok(())))
+                        .await
+                        .expect("finish replacement mutation");
+                }
+            }
+        });
+
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(2)));
+        assert!(backend.capabilities().await.restore_scan);
+        let first_backend = backend.clone();
+        let first =
+            tokio::spawn(
+                async move { first_backend.replicate_entry(valid_deadline_entry()).await },
+            );
+        first_request_rx
+            .await
+            .expect("first request reaches server");
+        let second_backend = backend.clone();
+        let second =
+            tokio::spawn(
+                async move { second_backend.replicate_entry(valid_deadline_entry()).await },
+            );
+        // Tokio's mutex is FIFO. Let the second caller queue before the first
+        // response is released so it would win the old reinsert-then-discard
+        // race deterministically.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let _ = release_response_tx.send(());
+
+        let first = first.await.expect("first mutation task");
+        let second = second.await.expect("second mutation task");
+        assert!(matches!(
+            (&first, &second),
+            (Err(StoreError::BackendOperationOutcomeUnavailable), Ok(()))
+                | (Ok(()), Err(StoreError::BackendOperationOutcomeUnavailable))
+        ));
+        server.await.expect("race server");
+        assert_eq!(
+            same_connection_dispatches.load(Ordering::SeqCst),
+            0,
+            "a protocol-invalid connection must never return to the pool"
+        );
+        assert_eq!(replacement_dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_replication_range_connection_cannot_dispatch_a_queued_read() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind replication connection-race server");
+        let addr = listener.local_addr().expect("server address");
+        let same_connection_dispatches = Arc::new(AtomicUsize::new(0));
+        let replacement_dispatches = Arc::new(AtomicUsize::new(0));
+        let server_same_connection_dispatches = Arc::clone(&same_connection_dispatches);
+        let server_replacement_dispatches = Arc::clone(&replacement_dispatches);
+        let (first_request_tx, first_request_rx) = tokio::sync::oneshot::channel();
+        let (release_response_tx, release_response_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("accept first connection");
+            let hello: Request = read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read first hello");
+            write_frame(&mut first, &successful_hello_ack(&hello))
+                .await
+                .expect("write first hello acknowledgement");
+            let first_read: Request = read_frame(&mut first, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read first replication request");
+            assert!(matches!(
+                first_read,
+                Request::GetReplicationLog { start: 2, limit: 1 }
+            ));
+            let _ = first_request_tx.send(());
+            let _ = release_response_rx.await;
+            let mut wrong_entry = valid_deadline_entry();
+            wrong_entry.sequence = 1;
+            write_frame(
+                &mut first,
+                &Response::GetReplicationLog(Ok(vec![wrong_entry])),
+            )
+            .await
+            .expect("write wrong-range response");
+
+            let mut exact_entry = valid_deadline_entry();
+            exact_entry.sequence = 2;
+            match tokio::time::timeout(
+                Duration::from_millis(250),
+                read_frame::<_, Request>(&mut first, DEFAULT_MAX_FRAME_SIZE),
+            )
+            .await
+            {
+                Ok(Ok(Request::GetReplicationLog { start: 2, limit: 1 })) => {
+                    server_same_connection_dispatches.fetch_add(1, Ordering::SeqCst);
+                    write_frame(
+                        &mut first,
+                        &Response::GetReplicationLog(Ok(vec![exact_entry])),
+                    )
+                    .await
+                    .expect("finish incorrectly reused connection");
+                }
+                _ => {
+                    let (mut replacement, _) =
+                        tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                            .await
+                            .expect("client reconnects after range violation")
+                            .expect("accept replacement connection");
+                    let hello: Request = read_frame(&mut replacement, DEFAULT_MAX_FRAME_SIZE)
+                        .await
+                        .expect("read replacement hello");
+                    write_frame(&mut replacement, &successful_hello_ack(&hello))
+                        .await
+                        .expect("write replacement hello acknowledgement");
+                    let read: Request = read_frame(&mut replacement, DEFAULT_MAX_FRAME_SIZE)
+                        .await
+                        .expect("read replacement replication request");
+                    assert!(matches!(
+                        read,
+                        Request::GetReplicationLog { start: 2, limit: 1 }
+                    ));
+                    server_replacement_dispatches.fetch_add(1, Ordering::SeqCst);
+                    write_frame(
+                        &mut replacement,
+                        &Response::GetReplicationLog(Ok(vec![exact_entry])),
+                    )
+                    .await
+                    .expect("finish replacement read");
+                }
+            }
+        });
+
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(2)));
+        let first_backend = backend.clone();
+        let first = tokio::spawn(async move { first_backend.get_replication_log(2, 1).await });
+        first_request_rx
+            .await
+            .expect("first request reaches server");
+        let second_backend = backend.clone();
+        let second = tokio::spawn(async move { second_backend.get_replication_log(2, 1).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let _ = release_response_tx.send(());
+
+        assert_eq!(
+            first.await.expect("first read task"),
+            Err(StoreError::InvalidReplicationSequence)
+        );
+        let second = second
+            .await
+            .expect("second read task")
+            .expect("second read reconnects");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].sequence, 2);
+        server.await.expect("range-race server");
+        assert_eq!(
+            same_connection_dispatches.load(Ordering::SeqCst),
+            0,
+            "a wrong-range connection must never return to the pool"
+        );
+        assert_eq!(replacement_dispatches.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

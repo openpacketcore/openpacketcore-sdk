@@ -422,6 +422,8 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
     pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<ConsensusWatcher>>>,
+    #[cfg(test)]
+    pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl SqliteConsensusCore {
@@ -457,6 +459,8 @@ impl SqliteConsensusCore {
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
             applied_progress,
             watchers: Arc::clone(&backend.watchers),
+            #[cfg(test)]
+            apply_gate: Arc::clone(&backend.consensus_apply_gate),
         })
     }
 }
@@ -1607,6 +1611,7 @@ fn lease_error_to_store(error: LeaseError) -> StoreError {
         LeaseError::StaleFence => StoreError::StaleFence,
         LeaseError::NotFound => StoreError::NotFound,
         LeaseError::InvalidSessionTtl => StoreError::InvalidSessionTtl,
+        LeaseError::OperationOutcomeUnavailable => StoreError::BackendOperationOutcomeUnavailable,
         LeaseError::Backend(_) => {
             StoreError::BackendUnavailable("session consensus lease application failed".into())
         }
@@ -1634,6 +1639,7 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         StoreError::CapabilityNotSupported(_)
         | StoreError::CasIdempotencyConflict
         | StoreError::CasIdempotencyOutcomeUnavailable
+        | StoreError::BackendOperationOutcomeUnavailable
         | StoreError::BackendUnavailable(_)
         | StoreError::InvalidReplicationSequence
         | StoreError::InvalidReplicationLogRange

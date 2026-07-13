@@ -3164,6 +3164,7 @@ dependencies = [
  "opc-identity",
  "opc-key",
  "opc-persist",
+ "opc-redaction",
  "opc-session-store",
  "opc-tls",
  "opc-types",

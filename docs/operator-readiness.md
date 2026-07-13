@@ -762,8 +762,14 @@ values are checked `u32` values of at least
 `MAX_NEGOTIATED_FRAME_SIZE` (16 MiB, or 16,777,216 bytes).
 `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that minimum. Configure each side
 for its real receive capacity; unequal limits are supported and must not be
-silently treated as symmetric. The server's configured idle timeout is one
-absolute deadline for response preparation and delivery.
+silently treated as symmetric. The server first allows one configured idle
+timeout to receive and decode a complete frame. Backend admission and work then
+use `with_backend_operation_timeout`; the server reserves a second idle-timeout
+interval for response preparation and delivery. Checked addition of the latter
+two forms the post-decode lifetime, while full connection-slot occupancy has
+all three bounded phases. Configure `with_backend_operation_concurrency` from measured
+backend capacity. Reads, mutations, leases, and watch setup have independent
+pools, so pressure in one family cannot consume another family's admission.
 Server startup rejects invalid resource configuration before bind/spawn:
 frame limits outside 8 KiB..=16 MiB, zero/unsupported connection-slot
 counts, and unrepresentable idle/restore timeouts return `InvalidInput`. Zero
@@ -833,7 +839,7 @@ live candidates per page, 65,536 log entries, and 65,536 rebuild entries; the
 configured frame bound remains
 separate. #159 now enforces that negotiated bound and one
 absolute write deadline across every ordinary response/watch item. The profile
-pins wire-schema revision 4, error-set revision 4,
+pins wire-schema revision 4, error-set revision 5,
 `max_restore_scan_examined_rows = 4096`,
 `min_frame_size = 8192`, `max_frame_size = 16777216`, 128-byte
 owner/custom-key/state-type bounds,
@@ -842,7 +848,7 @@ owner/custom-key/state-type bounds,
 depth-16/256-node trees. Stable IDs contain 1 through 64 bytes, replication
 transaction IDs contain 1 through 128 UTF-8 bytes, and CAS request IDs, when
 present, are canonical lowercase hyphenated UUIDs with the exact 36-byte encoding. A
-revision-3 or older v4 participant is incompatible despite
+revision-4 or older v4 participant is incompatible despite
 sharing the same ALPN, so that profile transition also requires the coordinated
 stop/upgrade/start above. `ContractProfile::max_frame_size` is a public Rust
 source break for external struct literals/destructuring and must be updated in
@@ -868,6 +874,13 @@ an otherwise oversized page.
 
 A mutation may commit before response encoding or delivery fails. A disconnect,
 oversize fallback, or write timeout is an ambiguous result, not rollback proof.
+The same rule applies to backend execution timeout or client cancellation after
+request transmission. `BackendOperationOutcomeUnavailable` and lease
+`OperationOutcomeUnavailable` are non-retryable: re-read authoritative state,
+treat lease authority as lost, and derive a new action. A pre-transmission
+connect/handshake failure remains known not applied. Never configure an outer
+client retry layer to replay delete, refresh, mutating batch,
+replication/rebuild, acquire, renew, or release.
 For direct CAS on the quarantined compatibility transport, the server binds the
 canonical UUID to the authenticated logical peer, complete operation,
 cluster/configuration identity and monotonic epoch, and the process-scoped
@@ -899,6 +912,11 @@ text. Qualification must demonstrate repeated
 oversize and authenticated slow-reader campaigns keep memory, tasks, file
 descriptors, CPU, and connection slots bounded and that shutdown barriers still
 complete.
+Also alert on
+`opc_session_net_backend_lifetime_events_total{event="execution_timeout"}` and
+`{event="ambiguous_outcome"}`. Queue timeout, cancellation, and peer-disconnect
+events are fixed labels in that same family; no key, owner, peer, request ID, or
+backend text is permitted.
 
 Restore runbook evidence must record low-cardinality counters/histograms for
 page outcome, `cursor_profile`, `complete`, loaded records, excluded/examined
@@ -970,7 +988,7 @@ rewrite, must not truncate/hash/rename durable identities, and the strict
 decoder must verify the result before writers restart. Rollback must first
 install a decoder capable of reading the retained target representation, or use
 a coherent checkpoint/reviewed reverse migration. Every session-net participant
-still returns together to one exact revision-1 profile; mixed revisions fail
+still returns together to one exact current profile; mixed revisions fail
 closed. Rollback across `OPCH`/#135 retains its independent checkpoint/reverse-
 migration requirement.
 
@@ -1069,7 +1087,9 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   `opc-session-consensus/1` mTLS profile binds SPIFFE, logical/stable IDs,
   cluster/configuration/epoch, peer role, and nonce. `probe_durable_readiness`
   uses an Openraft linearizable barrier and local-apply wait, not bind or cached
-  capability evidence.
+  capability evidence. Its exact profile uses wire-schema revision 1 and
+  error-set revision 2; revision-1 error-set peers fail before dispatch and all
+  consensus members must be upgraded together while traffic is drained.
 - **Fault Coverage**: Tests cover concurrent pristine formation, cross-node
   lease/CAS visibility, follower linearizable reads, partition-bounded failure
   and rejoin, restart, delivered-but-lost response idempotency, replacement of

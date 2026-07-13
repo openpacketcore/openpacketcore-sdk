@@ -401,6 +401,9 @@ impl OwnedSessionMutationError {
             StoreError::CasIdempotencyOutcomeUnavailable => Self::StoreRejected {
                 code: "cas-idempotency-outcome-unavailable",
             },
+            StoreError::BackendOperationOutcomeUnavailable => Self::StoreRejected {
+                code: "backend-operation-outcome-unavailable",
+            },
             StoreError::CapabilityNotSupported(_) => Self::StoreRejected {
                 code: "capability-not-supported",
             },

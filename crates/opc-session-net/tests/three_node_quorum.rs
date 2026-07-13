@@ -386,6 +386,139 @@ impl SessionLeaseManager for ReplicationDispatchSpy {
 }
 
 #[derive(Clone)]
+struct CancellableStallBackend {
+    inner: FakeSessionBackend,
+    active: Arc<AtomicUsize>,
+    get_calls: Arc<AtomicUsize>,
+    delete_calls: Arc<AtomicUsize>,
+    delete_effects: Arc<AtomicUsize>,
+}
+
+impl CancellableStallBackend {
+    fn new() -> Self {
+        Self {
+            inner: FakeSessionBackend::new(),
+            active: Arc::new(AtomicUsize::new(0)),
+            get_calls: Arc::new(AtomicUsize::new(0)),
+            delete_calls: Arc::new(AtomicUsize::new(0)),
+            delete_effects: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    async fn stall(&self) {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let _active = ActiveOperation(Arc::clone(&self.active));
+        std::future::pending::<()>().await;
+    }
+}
+
+struct ActiveOperation(Arc<AtomicUsize>);
+
+impl Drop for ActiveOperation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionBackend for CancellableStallBackend {
+    async fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities().await
+    }
+
+    async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.stall().await;
+        unreachable!("stall completes only when its future is cancelled")
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.inner.compare_and_set(op).await
+    }
+
+    async fn delete_fenced(
+        &self,
+        _lease: &opc_session_store::LeaseGuard,
+    ) -> Result<(), StoreError> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
+        // Model an adapter that crossed its effect boundary but has not yet
+        // made the exact outcome observable to the RPC handler.
+        self.delete_effects.fetch_add(1, Ordering::SeqCst);
+        self.stall().await;
+        unreachable!("stall completes only when its future is cancelled")
+    }
+
+    async fn refresh_ttl(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        self.inner.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(
+        &self,
+        ops: Vec<opc_session_store::SessionOp>,
+    ) -> Result<Vec<opc_session_store::SessionOpResult>, StoreError> {
+        self.inner.batch(ops).await
+    }
+
+    async fn max_replication_sequence(&self) -> Result<u64, StoreError> {
+        self.inner.max_replication_sequence().await
+    }
+
+    async fn get_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        self.inner.get_replication_log(start, limit).await
+    }
+
+    async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+        self.inner.replicate_entry(entry).await
+    }
+
+    async fn rebuild_replication_state(
+        &self,
+        entries: Vec<ReplicationEntry>,
+    ) -> Result<(), StoreError> {
+        self.inner.rebuild_replication_state(entries).await
+    }
+
+    async fn next_lease_info(&self) -> Result<(u64, u64), StoreError> {
+        self.inner.next_lease_info().await
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionLeaseManager for CancellableStallBackend {
+    async fn acquire(
+        &self,
+        key: &SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.acquire(key, owner, ttl).await
+    }
+
+    async fn renew(
+        &self,
+        lease: &opc_session_store::LeaseGuard,
+        ttl: Duration,
+    ) -> Result<opc_session_store::LeaseGuard, opc_session_store::LeaseError> {
+        self.inner.renew(lease, ttl).await
+    }
+
+    async fn release(
+        &self,
+        lease: opc_session_store::LeaseGuard,
+    ) -> Result<(), opc_session_store::LeaseError> {
+        self.inner.release(lease).await
+    }
+}
+
+#[derive(Clone)]
 struct MalformedReplicationOutputBackend {
     inner: ReplicationDispatchSpy,
     log_calls: Arc<AtomicUsize>,
@@ -1096,6 +1229,133 @@ where
     );
     let (handle, addr) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
     (addr, backend, handle)
+}
+
+#[tokio::test]
+async fn mtls_backend_deadlines_disconnects_and_shutdown_release_stalled_work() {
+    use opc_session_net::protocol::write_frame;
+    use opc_session_net::Request;
+
+    let mtls = mtls_configs();
+    let backend = CancellableStallBackend::new();
+    let key = test_key_with_stable_id(b"backend-lifetime");
+    let owner = OwnerId::new("backend-lifetime-owner").expect("owner");
+    let lease = backend
+        .acquire(&key, owner, Duration::from_secs(60))
+        .await
+        .expect("seed lease before server starts");
+    let server = SessionReplicationServer::new(
+        Arc::new(backend.clone()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_backend_operation_timeout(Duration::from_millis(75))
+    .with_backend_operation_concurrency(1)
+    .with_idle_timeout(Duration::from_millis(250));
+    let (handle, addr) = server
+        .listen("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect("start bounded server");
+    let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(1)));
+
+    let read_error = remote
+        .get(&key)
+        .await
+        .expect_err("stalled read must reach its backend deadline");
+    assert!(matches!(read_error, StoreError::BackendUnavailable(_)));
+    assert_eq!(backend.get_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+
+    let mutation_error = remote
+        .delete_fenced(&lease)
+        .await
+        .expect_err("post-effect stall must have an ambiguous outcome");
+    assert_eq!(
+        mutation_error,
+        StoreError::BackendOperationOutcomeUnavailable
+    );
+    assert_eq!(backend.delete_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.delete_effects.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    handle.abort_and_wait().await;
+
+    let disconnect_server = SessionReplicationServer::new(
+        Arc::new(backend.clone()),
+        mtls.server_config(2),
+        mtls.local_binding(2),
+    )
+    .with_backend_operation_timeout(Duration::from_secs(5))
+    .with_backend_operation_concurrency(1)
+    .with_idle_timeout(Duration::from_millis(250));
+    let (disconnect_handle, disconnect_addr) = disconnect_server
+        .listen("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect("start disconnect server");
+
+    let mut disconnected = authenticated_raw_stream(
+        &mtls,
+        1,
+        2,
+        disconnect_addr,
+        opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await;
+    write_frame(&mut disconnected, &Request::Get { key: key.clone() })
+        .await
+        .expect("write stalled read");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while backend.active.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("backend read starts");
+    let readiness = remote_backend(
+        &mtls,
+        1,
+        2,
+        disconnect_addr,
+        Some(Duration::from_millis(500)),
+    )
+    .probe_replication_head()
+    .await;
+    assert_eq!(
+        readiness,
+        Err(ReplicaReadinessFailure::Backend),
+        "fresh readiness must fail closed while the read family is exhausted"
+    );
+    drop(disconnected);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while backend.active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer disconnect cancels and releases backend work");
+
+    let mut shutdown = authenticated_raw_stream(
+        &mtls,
+        1,
+        2,
+        disconnect_addr,
+        opc_session_net::protocol::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await;
+    write_frame(&mut shutdown, &Request::Get { key })
+        .await
+        .expect("write shutdown-stalled read");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while backend.active.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown backend read starts");
+    tokio::time::timeout(Duration::from_secs(1), disconnect_handle.abort_and_wait())
+        .await
+        .expect("shutdown barrier cancels stalled backend work");
+    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    drop(shutdown);
 }
 
 #[tokio::test]
@@ -2828,8 +3088,6 @@ async fn server_rejects_backend_outputs_bound_to_a_different_request() {
     let (addr, _backend, handle) = start_server_with_backend(&mtls, 2, backend).await;
     let remote = remote_backend(&mtls, 1, 2, addr, Some(Duration::from_secs(2)));
     let expected_store = StoreError::BackendUnavailable("backend unavailable".to_string());
-    let expected_lease =
-        opc_session_store::LeaseError::Backend("lease backend unavailable".to_string());
 
     assert_eq!(
         remote.get(&requested_key).await,
@@ -2850,7 +3108,7 @@ async fn server_rejects_backend_outputs_bound_to_a_different_request() {
                 new_record: record,
             })
             .await,
-        Err(expected_store.clone())
+        Err(StoreError::CasIdempotencyOutcomeUnavailable)
     );
     let batch_record = test_record(
         &requested_key,
@@ -2869,7 +3127,7 @@ async fn server_rejects_backend_outputs_bound_to_a_different_request() {
                 },
             )])
             .await,
-        Err(expected_store.clone())
+        Err(StoreError::BackendOperationOutcomeUnavailable)
     );
     assert_eq!(
         remote
@@ -2887,11 +3145,11 @@ async fn server_rejects_backend_outputs_bound_to_a_different_request() {
                 Duration::from_secs(60),
             )
             .await,
-        Err(expected_lease.clone())
+        Err(opc_session_store::LeaseError::OperationOutcomeUnavailable)
     );
     assert_eq!(
         remote.renew(&valid_lease, Duration::from_secs(60)).await,
-        Err(expected_lease)
+        Err(opc_session_store::LeaseError::OperationOutcomeUnavailable)
     );
 
     handle.abort_and_wait().await;

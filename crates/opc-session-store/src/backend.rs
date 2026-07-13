@@ -933,6 +933,19 @@ where
 /// instance root and an authenticated legacy peer binding. Production
 /// consensus topology is descriptor-only and never derives votes, membership,
 /// or peer identity from these adapter tokens.
+///
+/// Backend futures are cancellation boundaries. Dropping one signals
+/// cancellation; implementations MUST retain bounded admission and supervision
+/// until underlying work exits. Read resources are released after bounded
+/// cancellation completes, which need not be synchronous with `Drop`. A caller
+/// that drops a mutation future after polling it MUST treat the result as
+/// unknown and re-read authoritative state even if supervised work later
+/// finishes. Durable operation-bound replay is an additional contract provided
+/// by implementations such as Openraft and direct CAS, not by every adapter. An
+/// operation that remains alive long enough to report an otherwise unknown
+/// result returns [`StoreError::BackendOperationOutcomeUnavailable`]. No async
+/// wrapper may detach unbounded blocking work; a blocking adapter must use a
+/// bounded queue/worker set and retain ownership until the worker exits.
 #[async_trait]
 pub trait SessionBackend: Send + Sync {
     /// Process-local instance root declared by this backend adapter.
@@ -1394,6 +1407,16 @@ enum EncryptedBatchSlot {
     SyntheticResult(Box<SessionOpResult>),
 }
 
+fn batch_result_shape_error(contains_dispatched_mutation: bool) -> StoreError {
+    if contains_dispatched_mutation {
+        StoreError::BackendOperationOutcomeUnavailable
+    } else {
+        StoreError::BackendUnavailable(
+            "session batch result cardinality violated the backend contract".into(),
+        )
+    }
+}
+
 #[async_trait]
 impl<B, P> SessionBackend for EncryptingSessionBackend<B, P>
 where
@@ -1452,6 +1475,7 @@ where
 
         let mut encrypted_ops = Vec::with_capacity(ops.len());
         let mut slots = Vec::with_capacity(ops.len());
+        let mut contains_dispatched_mutation = false;
         for op in ops {
             match op {
                 SessionOp::Get { key } => {
@@ -1460,6 +1484,7 @@ where
                 }
                 SessionOp::CompareAndSet(cas) => match self.encrypt_record(cas.new_record).await {
                     Ok(new_record) => {
+                        contains_dispatched_mutation = true;
                         encrypted_ops.push(SessionOp::CompareAndSet(CompareAndSet {
                             key: cas.key,
                             lease: cas.lease,
@@ -1475,10 +1500,12 @@ where
                     }
                 },
                 SessionOp::DeleteFenced { lease } => {
+                    contains_dispatched_mutation = true;
                     encrypted_ops.push(SessionOp::DeleteFenced { lease });
                     slots.push(EncryptedBatchSlot::BackendResult);
                 }
                 SessionOp::RefreshTtl { lease, ttl } => {
+                    contains_dispatched_mutation = true;
                     encrypted_ops.push(SessionOp::RefreshTtl { lease, ttl });
                     slots.push(EncryptedBatchSlot::BackendResult);
                 }
@@ -1498,9 +1525,7 @@ where
             match slot {
                 EncryptedBatchSlot::BackendResult => {
                     let Some(result) = backend_results.next() else {
-                        return Err(StoreError::BackendUnavailable(
-                            "session batch returned fewer results than requested".into(),
-                        ));
+                        return Err(batch_result_shape_error(contains_dispatched_mutation));
                     };
                     pending.push(async move { (index, self.decrypt_batch_result(result).await) });
                 }
@@ -1509,9 +1534,7 @@ where
         }
 
         if backend_results.next().is_some() {
-            return Err(StoreError::BackendUnavailable(
-                "session batch returned more results than requested".into(),
-            ));
+            return Err(batch_result_shape_error(contains_dispatched_mutation));
         }
 
         for (index, result) in join_all(pending).await {
@@ -1521,11 +1544,7 @@ where
         decrypted
             .into_iter()
             .map(|result| {
-                result.ok_or_else(|| {
-                    StoreError::BackendUnavailable(
-                        "session batch returned fewer results than requested".into(),
-                    )
-                })
+                result.ok_or_else(|| batch_result_shape_error(contains_dispatched_mutation))
             })
             .collect()
     }
@@ -1872,6 +1891,7 @@ where
 
         let mut sealed_ops = Vec::with_capacity(ops.len());
         let mut slots = Vec::with_capacity(ops.len());
+        let mut contains_dispatched_mutation = false;
         for op in ops {
             match op {
                 SessionOp::Get { key } => {
@@ -1880,6 +1900,7 @@ where
                 }
                 SessionOp::CompareAndSet(cas) => match self.seal_record(cas.new_record).await {
                     Ok(new_record) => {
+                        contains_dispatched_mutation = true;
                         sealed_ops.push(SessionOp::CompareAndSet(CompareAndSet {
                             key: cas.key,
                             lease: cas.lease,
@@ -1895,10 +1916,12 @@ where
                     }
                 },
                 SessionOp::DeleteFenced { lease } => {
+                    contains_dispatched_mutation = true;
                     sealed_ops.push(SessionOp::DeleteFenced { lease });
                     slots.push(EncryptedBatchSlot::BackendResult);
                 }
                 SessionOp::RefreshTtl { lease, ttl } => {
+                    contains_dispatched_mutation = true;
                     sealed_ops.push(SessionOp::RefreshTtl { lease, ttl });
                     slots.push(EncryptedBatchSlot::BackendResult);
                 }
@@ -1918,9 +1941,7 @@ where
             match slot {
                 EncryptedBatchSlot::BackendResult => {
                     let Some(result) = backend_results.next() else {
-                        return Err(StoreError::BackendUnavailable(
-                            "session batch returned fewer results than requested".into(),
-                        ));
+                        return Err(batch_result_shape_error(contains_dispatched_mutation));
                     };
                     pending.push(async move { (index, self.unseal_batch_result(result).await) });
                 }
@@ -1929,9 +1950,7 @@ where
         }
 
         if backend_results.next().is_some() {
-            return Err(StoreError::BackendUnavailable(
-                "session batch returned more results than requested".into(),
-            ));
+            return Err(batch_result_shape_error(contains_dispatched_mutation));
         }
 
         for (index, result) in join_all(pending).await {
@@ -1941,11 +1960,7 @@ where
         unsealed
             .into_iter()
             .map(|result| {
-                result.ok_or_else(|| {
-                    StoreError::BackendUnavailable(
-                        "session batch returned fewer results than requested".into(),
-                    )
-                })
+                result.ok_or_else(|| batch_result_shape_error(contains_dispatched_mutation))
             })
             .collect()
     }

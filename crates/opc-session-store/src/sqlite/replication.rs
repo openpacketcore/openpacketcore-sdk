@@ -456,7 +456,7 @@ pub(crate) fn replicate_entry_sync(
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
     tx.commit()
-        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
 
     Ok(true)
 }
@@ -511,6 +511,6 @@ pub(crate) fn rebuild_replication_state_sync(
     }
 
     tx.commit()
-        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
     Ok(())
 }

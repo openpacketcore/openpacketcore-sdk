@@ -264,8 +264,9 @@ application/backend mutation or provider work: clients reject before
 resolution/dialing, while servers reject after request receipt but before
 backend dispatch and may return the typed response. The new public error
 variants require external exhaustive matches. Protocol v4 introduced their
-private fixed-width DTOs in error revision 1; current error revision 2 retains
-those encodings and rejects v3 peers during the exact handshake. Operators must audit legacy
+private fixed-width DTOs in error revision 1; current error revision 5 retains
+those encodings and rejects error-revision-4 or older v4 peers during the exact
+handshake. Operators must audit legacy
 persisted logs before upgrade because a TTL-bearing entry
 above the bound now fails closed during replay/rebuild rather than being
 clamped or rewritten. Replicated deadline validation permits at most one
@@ -394,8 +395,9 @@ client/server settings are therefore explicit. Revision 3 carries the
 confidential cursor and explicit durable-page profile and pins the payload and
 8 MiB retained-page, 8 MiB examined key/filter-metadata, and
 examined-candidate budgets; error-set revision 3 carries stale-cursor,
-direct-CAS idempotency, and
-work-budget failures. Different exact v4
+direct-CAS idempotency, and work-budget failures. Error-set revision 4 adds
+checked replication-log range outcomes; revision 5 adds non-CAS backend and
+lease ambiguity outcomes. Different exact v4
 profiles do not interoperate even though their ALPN text is the same.
 
 Cursor ciphertext is variable-length up to the consensus RPC/key ceiling and
@@ -415,7 +417,7 @@ response budget, a confidential authenticated strictly bounded restore cursor, a
 `complete` are omitted and recomputed after decode. Independent work limits
 admit 256 batch operations, 1,024 restore records, 65,536 log entries, and
 65,536 rebuild entries; the configured frame bound remains separate. The exact
-profile pins wire-schema revision 4, error-set revision 4, a 4 MiB restore
+profile pins wire-schema revision 4, error-set revision 5, a 4 MiB restore
 payload bound, `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, the
 31,536,000-second TTL maximum, and
@@ -427,7 +429,8 @@ Transported stable IDs contain 1 through 64 bytes, transaction IDs contain 1
 through 128 UTF-8 bytes, and CAS request IDs, when present, use the canonical
 lowercase hyphenated 36-byte UUID encoding.
 Error-set revision 4 adds checked replication-log range overflow, page-limit,
-and compacted-cursor outcomes; a revision-3 peer is therefore incompatible.
+and compacted-cursor outcomes; revision 5 adds non-CAS backend and lease
+ambiguity outcomes. A revision-4 or older peer is therefore incompatible.
 
 Every server response and watch item is fully bounded-encoded before a length
 prefix is emitted. Common non-pageable and complete-page successes use one

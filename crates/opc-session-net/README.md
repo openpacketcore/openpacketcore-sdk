@@ -44,6 +44,11 @@ handshake nonce before decoding one operation. Each call also carries a fresh
 correlation ID. The client applies one absolute logical deadline to gate
 acquisition, DNS, TCP, TLS, bootstrap, bounded encoding, write, and response
 read; cancellation drops the connection, so a late response cannot be reused.
+The exact consensus contract remains at wire-schema revision 1 and advances to
+error-set revision 2 because forwarded applied responses can now carry the
+non-CAS ambiguity outcome. Error-set revision 1 peers fail before dispatch;
+upgrade every consensus member together while traffic and writers are drained.
+This is not a rolling mixed-profile transition.
 
 The consensus profile accepts encoded frame budgets from 9 MiB through 16 MiB.
 The 9 MiB minimum is proven to hold the worst JSON expansion of the shared
@@ -90,10 +95,15 @@ mutation or rebuild authority beside Openraft.
   member.
 - `SessionReplicationServer::new_insecure` exists only behind the
   `insecure-test` feature.
-- `with_idle_timeout`, `with_max_connections`, and `with_max_frame_size`
-  configure the server; the idle timeout is also the one absolute deadline for
-  each response's final bounded encode, prefix, payload, and flush, and
-  `with_restore_scan_timeout` bounds cancellable backend scan work.
+- `with_idle_timeout`, `with_backend_operation_timeout`,
+  `with_backend_operation_concurrency`, `with_max_connections`, and
+  `with_max_frame_size` configure the server. Backend queueing plus work has
+  one absolute deadline after a complete request frame is decoded; one
+  `idle_timeout` interval is then reserved for response validation, bounded
+  encoding, prefix, payload, and flush. Their checked sum is the post-decode
+  lifetime. Full connection-slot occupancy has three bounded phases: one
+  inbound `idle_timeout`, backend queue/work, and one outbound `idle_timeout`.
+  `with_restore_scan_timeout` may further shorten cancellable restore work.
 - `RemoteSessionBackend::scan_restore_records` validates requests and peer
   pages against the exact request limit actually dispatched after frame
   narrowing. Only `DurableOpaqueV1` pages are transportable: compatibility
@@ -187,7 +197,7 @@ confidential authenticated snapshot-bound
 restore cursor, explicit durable-page profile, fixed 4 MiB restore payload and
 8 MiB retained-page, 8 MiB examined-metadata, and 4,096 examined-candidate
 budgets, and adds exact configuration/process epoch binding for direct CAS.
-The error-set revision is 4. Directional budgets are part of the exact
+The error-set revision is 5. Directional budgets are part of the exact
 handshake. `requested_response_frame_size`,
 `accepted_response_frame_size`, and `server_request_frame_size` are public
 `Option<u32>` bootstrap fields so an older decoder can classify an otherwise
@@ -202,7 +212,7 @@ second independently configurable limit. The accepted response size is the
 smaller of the client's receive limit and the server's configured frame limit;
 the server request size independently bounds frames sent by that client. This
 supports unequal client/server settings without assuming either configured
-limit applies in both directions. A revision-3 or older v4 peer is incompatible
+limit applies in both directions. A revision-4 or older v4 peer is incompatible
 even though the ALPN remains `opc-session-net/4`.
 
 Error-set revision 4 adds typed replication-log range overflow, page-limit,
@@ -217,6 +227,10 @@ that exceeds the negotiated frame may expose only the largest complete exact
 prefix; the caller resumes at its first unsent sequence with no skip or
 duplicate. A typed compacted resume point may be used only after the product
 installs a coherent snapshot/rebuild through its existing authority path.
+
+Error-set revision 5 adds non-CAS backend and lease ambiguity outcomes. It is
+another exact-profile transition and does not add a downgrade or rolling
+mixed-revision mode.
 
 Direct CAS uses a canonical request UUID plus the server's
 `cas_idempotency_epoch` from the authenticated `HelloAck`. The server binds
@@ -239,10 +253,45 @@ therefore rejected before mutation. The public `RemoteSessionBackend` injects
 the live epoch internally and sends a direct CAS only once: transport loss
 after any write/read boundary returns the typed unavailable outcome. The CNF
 must authoritatively re-read and derive a new CAS; it must not resubmit the
-historical operation under either the old or a fresh UUID.
+historical operation under either the old or a fresh UUID. A backend-returned
+`BackendUnavailable` after CAS dispatch is also converted to that typed outcome
+and leaves an ambiguous tombstone; it is never cached as a completed result
+that invites replay.
 Diagnostics use only the fixed reasons `stale_epoch`, `identity_reuse`,
 `ambiguous`, and `capacity`; they never include a peer, UUID, digest, key,
 owner, lease, record, or payload.
+
+All other legacy backend RPCs use independent fixed-size admission pools for
+reads, mutations, lease mutations, and watch setup; restore retains its
+single-worker pool. Queue timeout occurs before backend polling and is known
+not to have applied an effect. A read execution timeout drops the read future
+and is retryable. A non-CAS mutation or lease call that times out after backend
+polling returns `BackendOperationOutcomeUnavailable` or
+`LeaseError::OperationOutcomeUnavailable`: the caller must not replay it and
+must stop writes until product recovery obtains authoritative state or a safe
+uncertainty window permits a fresh guard. Transport failure
+before the first request write remains retryable; once a write begins, response
+loss is conservatively ambiguous. The public client automatically retries only
+read-only operations (including an all-Get batch). It sends CAS, any mutating
+batch, delete, refresh, replication/rebuild, and lease mutations once.
+After transmission, a malformed response, wrong response family, or a
+same-family success whose key/owner/fence/credential/result cardinality does
+not match the request is equally ambiguous. The client discards retained
+payloads, clears the negotiated connection/cache, increments the fixed
+ambiguity metric, and returns the CAS, backend-mutation, or lease typed outcome
+instead of a retryable protocol availability error.
+
+Backend trait implementations are cancellation boundaries. Dropping a read
+future signals cancellation; queue and database resources are released after
+bounded cancellation completes, not necessarily synchronously with `Drop`.
+Dropping a mutation leaves its caller with an unknown outcome that requires an
+authoritative re-read even if supervised work later finishes. Durable
+operation-bound replay is Openraft/direct-CAS-specific, not a generic adapter
+promise. An internally detected deadline or transport failure surfaces the
+typed ambiguity contract above. Blocking or spawned adapters must own a bounded
+queue and retain their worker permit until the worker exits; they may not create
+detached unbounded work. Session-net watches also monitor peer EOF and server
+cancellation while the backend stream is idle.
 
 The cursor's seek key and snapshot metadata remain confidential. Its one clear
 cumulative examined-row position is bound into cursor authentication and lets
@@ -407,7 +456,7 @@ campaigns.
   adds public `ContractProfile::max_frame_size`, so external profile struct
   literals and exhaustive destructuring must be updated in the same
   coordinated change.
-- The v4 profile pins wire-schema revision 4 and error-set revision 4;
+- The v4 profile pins wire-schema revision 4 and error-set revision 5;
   `max_restore_scan_page_payload_bytes = 4194304`;
   `max_restore_scan_examined_rows = 4096`;
   `min_frame_size = 8192`; `max_frame_size = 16777216`; the 128-byte
@@ -431,7 +480,7 @@ campaigns.
   that a new peer rejects before dispatch, so unchanged valid JSON shape is not
   a rolling-compatibility claim.
 - Treat every v4 exact-profile migration through wire-schema revision 4 and
-  error-set revision 4 as a
+  error-set revision 5 as a
   coordinated stop/upgrade/start boundary. Drain
   traffic and writers, audit every persisted SQLite replica with the count-only
   `opc-session-store-audit identity-invariants` command, and separately
@@ -507,7 +556,7 @@ campaigns.
   unchanged for entries within the operation-tree contract. The new serialized
   error variants require external exhaustive matches. Their wire representation
   was introduced by v4 error revision 1 and is retained by current error
-  revision 2; a v3 peer is rejected during negotiation.
+  revision 5; an error-revision-4 or older v4 peer fails exact negotiation.
   Legacy persisted replication logs must be
   audited before upgrade because an entry carrying a larger TTL now fails
   closed during replay or rebuild rather than being clamped. Cross-field

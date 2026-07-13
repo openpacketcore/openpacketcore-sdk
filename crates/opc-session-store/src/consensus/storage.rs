@@ -396,6 +396,14 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         I: IntoIterator<Item = Entry<SessionRaftTypeConfig>> + Send,
         I::IntoIter: Send,
     {
+        #[cfg(test)]
+        let _apply_permit = self.core.apply_gate.acquire().await.map_err(|_| {
+            storage_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                io::Error::other("session consensus test apply gate closed"),
+            )
+        })?;
         let entries: Vec<_> = entries.into_iter().collect();
         let last_applied = entries.last().map(|entry| entry.log_id);
         let applied = {

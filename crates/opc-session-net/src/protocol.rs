@@ -83,7 +83,7 @@ pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 1;
 pub struct SessionConsensusContractProfile {
     /// Revision of the dedicated consensus wire DTOs.
     pub wire_schema_revision: u16,
-    /// Revision of the fixed [`SessionConsensusPeerError`] set.
+    /// Revision of the fixed transport and nested forwarded-operation errors.
     pub error_set_revision: u16,
     /// Largest decoded private consensus payload accepted in either direction.
     pub max_rpc_payload_bytes: u32,
@@ -110,14 +110,14 @@ impl SessionConsensusContractProfile {
 pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractProfile =
     SessionConsensusContractProfile {
         wire_schema_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
-        error_set_revision: 1,
+        error_set_revision: 2,
         max_rpc_payload_bytes: SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES as u32,
         min_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE as u32,
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
 
 const WIRE_SCHEMA_REVISION: u16 = 4;
-const ERROR_SET_REVISION: u16 = 4;
+const ERROR_SET_REVISION: u16 = 5;
 
 /// Exact semantic and resource-bound contract required by protocol v4.
 ///
@@ -668,13 +668,23 @@ pub(crate) fn session_op_results_match_expectations(
             .all(|(expected, result)| match (expected, result) {
                 (SessionOpExpectation::Get(key), SessionOpResult::Get(result)) => {
                     get_result_matches_key(key, result)
+                        && !matches!(
+                            result,
+                            Err(StoreError::CasIdempotencyOutcomeUnavailable
+                                | StoreError::BackendOperationOutcomeUnavailable)
+                        )
                 }
                 (
                     SessionOpExpectation::CompareAndSet(key),
                     SessionOpResult::CompareAndSet(result),
-                ) => compare_and_set_result_matches_key(key, result),
-                (SessionOpExpectation::DeleteFenced, SessionOpResult::DeleteFenced(_))
-                | (SessionOpExpectation::RefreshTtl, SessionOpResult::RefreshTtl(_)) => true,
+                ) => {
+                    compare_and_set_result_matches_key(key, result)
+                        && !matches!(result, Err(StoreError::BackendOperationOutcomeUnavailable))
+                }
+                (SessionOpExpectation::DeleteFenced, SessionOpResult::DeleteFenced(result))
+                | (SessionOpExpectation::RefreshTtl, SessionOpResult::RefreshTtl(result)) => {
+                    !matches!(result, Err(StoreError::CasIdempotencyOutcomeUnavailable))
+                }
                 _ => false,
             })
 }
@@ -766,7 +776,23 @@ pub(crate) fn validate_request_payload_limit(
 }
 
 fn validate_lease_profile(lease: &LeaseGuard) -> Result<(), WireConversionError> {
-    validate_session_key_profile(lease.key())
+    validate_session_key_profile(lease.key())?;
+    if lease.fence().get() == 0 {
+        return Err(WireConversionError(
+            "lease fence violates the v4 transport profile",
+        ));
+    }
+    if lease.credential_id() == 0 {
+        return Err(WireConversionError(
+            "lease credential violates the v4 transport profile",
+        ));
+    }
+    if lease.expires_at() < lease.acquired_at() {
+        return Err(WireConversionError(
+            "lease lifetime violates the v4 transport profile",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_compare_and_set_profile(op: &CompareAndSet) -> Result<(), WireConversionError> {
@@ -1331,6 +1357,7 @@ enum WireStoreError {
     CasConflict,
     CasIdempotencyConflict,
     CasIdempotencyOutcomeUnavailable,
+    BackendOperationOutcomeUnavailable,
     CapabilityNotSupported(String),
     BackendUnavailable(String),
     InvalidKey(String),
@@ -1362,6 +1389,7 @@ enum WireStoreErrorRef<'a> {
     CasConflict,
     CasIdempotencyConflict,
     CasIdempotencyOutcomeUnavailable,
+    BackendOperationOutcomeUnavailable,
     CapabilityNotSupported(&'a str),
     BackendUnavailable(&'a str),
     InvalidKey(&'a str),
@@ -1408,6 +1436,9 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             StoreError::CasConflict => Self::CasConflict,
             StoreError::CasIdempotencyConflict => Self::CasIdempotencyConflict,
             StoreError::CasIdempotencyOutcomeUnavailable => Self::CasIdempotencyOutcomeUnavailable,
+            StoreError::BackendOperationOutcomeUnavailable => {
+                Self::BackendOperationOutcomeUnavailable
+            }
             StoreError::CapabilityNotSupported(message) => {
                 Self::CapabilityNotSupported(safe_capability_name(message))
             }
@@ -1484,6 +1515,9 @@ impl TryFrom<WireStoreError> for StoreError {
             WireStoreError::CasIdempotencyConflict => Self::CasIdempotencyConflict,
             WireStoreError::CasIdempotencyOutcomeUnavailable => {
                 Self::CasIdempotencyOutcomeUnavailable
+            }
+            WireStoreError::BackendOperationOutcomeUnavailable => {
+                Self::BackendOperationOutcomeUnavailable
             }
             WireStoreError::CapabilityNotSupported(message) => {
                 Self::CapabilityNotSupported(safe_capability_name(&message).to_string())
@@ -1565,6 +1599,7 @@ enum WireLeaseErrorRef<'a> {
     StaleFence,
     NotFound,
     InvalidSessionTtl,
+    OperationOutcomeUnavailable,
     Backend(&'a str),
 }
 
@@ -1576,6 +1611,7 @@ enum WireLeaseError {
     StaleFence,
     NotFound,
     InvalidSessionTtl,
+    OperationOutcomeUnavailable,
     Backend(String),
 }
 
@@ -1587,6 +1623,7 @@ impl<'a> From<&'a LeaseError> for WireLeaseErrorRef<'a> {
             LeaseError::StaleFence => Self::StaleFence,
             LeaseError::NotFound => Self::NotFound,
             LeaseError::InvalidSessionTtl => Self::InvalidSessionTtl,
+            LeaseError::OperationOutcomeUnavailable => Self::OperationOutcomeUnavailable,
             LeaseError::Backend(_) => Self::Backend("lease backend unavailable"),
         }
     }
@@ -1600,6 +1637,7 @@ impl From<WireLeaseError> for LeaseError {
             WireLeaseError::StaleFence => Self::StaleFence,
             WireLeaseError::NotFound => Self::NotFound,
             WireLeaseError::InvalidSessionTtl => Self::InvalidSessionTtl,
+            WireLeaseError::OperationOutcomeUnavailable => Self::OperationOutcomeUnavailable,
             WireLeaseError::Backend(message) => {
                 drop(message);
                 Self::Backend("lease backend unavailable".to_string())
@@ -3855,6 +3893,13 @@ mod tests {
             .expect("consensus minimum must fit the worst byte response");
         assert!(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.is_current());
         assert_eq!(
+            CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision,
+            2
+        );
+        let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
+        previous_error_set.error_set_revision = 1;
+        assert!(!previous_error_set.is_current());
+        assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.min_frame_size,
             MIN_SESSION_CONSENSUS_FRAME_SIZE as u32
         );
@@ -3894,7 +3939,7 @@ mod tests {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/4");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
         assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 4);
-        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 4);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 5);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
 
@@ -3903,7 +3948,7 @@ mod tests {
             profile,
             serde_json::json!({
                 "wire_schema_revision": 4,
-                "error_set_revision": 4,
+                "error_set_revision": 5,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 4194304,
                 "max_restore_scan_page_retained_bytes": 8388608,
@@ -4051,6 +4096,7 @@ mod tests {
             StoreError::CasConflict,
             StoreError::CasIdempotencyConflict,
             StoreError::CasIdempotencyOutcomeUnavailable,
+            StoreError::BackendOperationOutcomeUnavailable,
             StoreError::CapabilityNotSupported("capability".to_string()),
             StoreError::BackendUnavailable("backend".to_string()),
             StoreError::InvalidKey("invalid".to_string()),
@@ -4239,6 +4285,35 @@ mod tests {
             key: key.clone(),
             owner: owner.clone(),
             fence: FenceToken::new(1),
+        }
+    }
+
+    #[test]
+    fn every_lease_error_has_a_frozen_v4_round_trip() {
+        let errors = [
+            LeaseError::AlreadyHeld,
+            LeaseError::Expired,
+            LeaseError::StaleFence,
+            LeaseError::NotFound,
+            LeaseError::InvalidSessionTtl,
+            LeaseError::OperationOutcomeUnavailable,
+            LeaseError::Backend("backend".to_string()),
+        ];
+
+        for expected in errors {
+            let encoded = serde_json::to_vec(&Response::AcquireLease(Err(expected.clone())))
+                .expect("encode LeaseError");
+            let decoded: Response = serde_json::from_slice(&encoded).expect("decode LeaseError");
+            let expected = match expected {
+                LeaseError::Backend(_) => {
+                    LeaseError::Backend("lease backend unavailable".to_string())
+                }
+                expected => expected,
+            };
+            let Response::AcquireLease(Err(decoded)) = decoded else {
+                panic!("lease error changed response family");
+            };
+            assert_eq!(decoded, expected);
         }
     }
 
@@ -4776,6 +4851,68 @@ mod tests {
             ) > 0
         );
         assert!(serde_json::from_value::<Request>(valid_rebuild).is_err());
+    }
+
+    #[tokio::test]
+    async fn lease_wire_profile_rejects_structurally_invalid_guards() {
+        let key = test_session_key();
+        let owner = OwnerId::new("replica-a").expect("owner");
+        let backend = FakeSessionBackend::new();
+        let lease = backend
+            .acquire(&key, owner, Duration::from_secs(60))
+            .await
+            .expect("valid lease");
+        let request = serde_json::to_value(Request::RenewLease {
+            lease: lease.clone(),
+            ttl: Duration::from_secs(60),
+        })
+        .expect("valid renew request");
+        let response = serde_json::to_value(Response::AcquireLease(Ok(lease.clone())))
+            .expect("valid acquire response");
+        let expired_before_acquisition = serde_json::to_value(Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH,
+        ))
+        .expect("timestamp wire value");
+
+        for (field, invalid) in [
+            ("fence", serde_json::json!(0)),
+            ("credential_id", serde_json::json!(0)),
+            ("expires_at", expired_before_acquisition),
+        ] {
+            let mut invalid_request = request.clone();
+            assert_eq!(replace_json_field(&mut invalid_request, field, &invalid), 1);
+            assert!(
+                serde_json::from_value::<Request>(invalid_request).is_err(),
+                "invalid lease {field} reached request dispatch"
+            );
+
+            let mut invalid_response = response.clone();
+            assert_eq!(
+                replace_json_field(&mut invalid_response, field, &invalid),
+                1
+            );
+            assert!(
+                serde_json::from_value::<Response>(invalid_response).is_err(),
+                "invalid lease {field} reached a client"
+            );
+        }
+
+        let acquired_at = serde_json::to_value(lease.acquired_at()).expect("acquisition time");
+        let mut zero_ttl_request = request;
+        assert_eq!(
+            replace_json_field(&mut zero_ttl_request, "expires_at", &acquired_at),
+            1
+        );
+        assert!(
+            serde_json::from_value::<Request>(zero_ttl_request).is_ok(),
+            "an exact zero lease lifetime remains valid"
+        );
+        let mut zero_ttl_response = response;
+        assert_eq!(
+            replace_json_field(&mut zero_ttl_response, "expires_at", &acquired_at),
+            1
+        );
+        assert!(serde_json::from_value::<Response>(zero_ttl_response).is_ok());
     }
 
     #[tokio::test]

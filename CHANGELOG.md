@@ -77,6 +77,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   floating-VIP delivery from testkit mocks. The ready mutation contract is an
   intentional no-op and claims no XDP, NIC offload, key custody, or datapath
   programming; defaults remain fail-closed as `Unsupported`.
+- **BREAKING — `opc-session-net`/`opc-session-store`:** legacy direct-backend
+  RPC dispatch now uses independent bounded read, mutation, lease, and watch
+  setup admission; after one bounded inbound frame-read phase, one backend
+  queue/work deadline plus one reserved response interval form the checked
+  post-decode lifetime. Pending work observes peer
+  disconnect and server cancellation. Read cancellation is retryable;
+  non-CAS and lease mutations that may have crossed their effect boundary
+  return `BackendOperationOutcomeUnavailable` or
+  `LeaseError::OperationOutcomeUnavailable` and are never automatically
+  resubmitted. Malformed, wrong-family, or semantically mismatched responses
+  received after transmission use the same non-retryable classification. CAS
+  retains its operation-bound idempotency outcome; a backend availability
+  result after dispatch becomes an ambiguous tombstone rather than a cached
+  retryable result. Production Openraft writes distinguish pre-submission
+  failure from a lost result after `client_write_ff` accepts the proposal and
+  persist one request identity across internal forwarding retries. SQLite
+  ordinary operations and consensus-gated query paths now use one bounded
+  blocking-worker admission, asynchronous connection admission, progress/interrupt
+  cancellation, and a 100 ms database-busy bound; a cancelled caller cannot
+  release the worker permit while SQLite is still running. Fixed timeout,
+  cancellation, disconnect, and ambiguity metrics include backend-returned
+  typed ambiguity and contain no session identifiers or backend text. The v4
+  error-set revision advances from 4 to 5 and requires a coordinated
+  compatibility-fleet upgrade. The consensus-only exact profile error set
+  advances from 1 to 2 because forwarded applied responses carry the same
+  nested error; consensus members also require a coordinated stop/upgrade/start.
+  Config-consensus status now snapshots Openraft metrics and exact-membership
+  state under one watch guard, then updates admission after releasing it, so a
+  queued metrics publisher cannot deadlock a nested status read during leader
+  failover.
 - **BREAKING — `opc-session-store` and consumers:** `SessionKey::stable_id` is
   now the validated `StableId` newtype instead of arbitrary `Bytes`. The
   production invariant is exactly 1 through 64 bytes across construction,
@@ -164,7 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RestoreScanPage` adds `cursor_profile`; exhaustive construction and matching
   must be updated.
 - **BREAKING — `opc-session-net`:** the quarantined v4 compatibility profile
-  advances to wire-schema revision 4; error-set revision 3 includes the
+  advances to wire-schema revision 4; error-set revision 4 includes the
   confidential restore token, explicit durable-page profile, examined/payload
   contracts, typed stale-cursor/work-budget errors, and typed direct-CAS
   idempotency outcomes. Local fake offset

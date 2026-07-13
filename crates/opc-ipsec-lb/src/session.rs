@@ -645,6 +645,13 @@ fn map_lease_error(error: LeaseError) -> IpsecLbError {
             "session_store.ttl",
             "session-store TTL is outside the supported range",
         ),
+        LeaseError::OperationOutcomeUnavailable => IpsecLbError::io(
+            "session_store_ownership_lease",
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "session-store lease mutation outcome is unavailable",
+            ),
+        ),
         LeaseError::NotFound | LeaseError::Backend(_) => IpsecLbError::io(
             "session_store_ownership_lease",
             io::Error::new(
@@ -673,6 +680,13 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         ),
         StoreError::CasIdempotencyOutcomeUnavailable => IpsecLbError::io(
             "session_store_compare_and_set",
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "session-store mutation outcome is unavailable",
+            ),
+        ),
+        StoreError::BackendOperationOutcomeUnavailable => IpsecLbError::io(
+            "session_store_mutation",
             io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "session-store mutation outcome is unavailable",
