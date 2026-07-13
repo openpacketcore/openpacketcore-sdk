@@ -1,6 +1,7 @@
 [package]
 name = "opc-sbi"
 version.workspace = true
+publish = false # issue #143 source-build release closure
 authors.workspace = true
 edition.workspace = true
 license.workspace = true

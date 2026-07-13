@@ -119,6 +119,16 @@ persistence behind the workspace's single exact-pinned Openraft engine.
 removed. Each domain retains its own state machine and production evidence
 gates.
 
+The current exact pin is the immutable `openpacketcore/openraft` revision
+`f607e636406b16bd0ad7925dbb631da1b7a4cd96`, not registry 0.9.24. Both domains
+consume one fixed runtime profile from `opc-consensus`, including fresh
+per-campaign 1,000–2,000 ms election-timeout sampling. This temporary git
+source makes the mechanically derived 26-crate normal reverse-dependency
+closure source-build-only and `publish = false`. Keep that boundary until an
+official stable Openraft release contains the fix, an exact registry
+pin/checksum replaces it, and #143 is requalified. This restriction does not
+move payload sealing, AAD, HKMS/KMS operations, or key custody into consensus.
+
 ### Config Openraft, migration, and shared transport contract
 
 For `opc-persist`, the authority path is:
@@ -555,7 +565,16 @@ steering selection remains fail-closed as `Unsupported`.
    log, committed/applied/purged positions, membership, request outcomes, and
    the application chain; bounded checksummed snapshots carry only one coherent
    sealed state-machine image.
-6. **Remaining Qualification**: #128 makes current-format repair exclusively
+6. **Observed-Leader Foundation Evidence**: The 3- and 5-process harness
+   coherently observes the actual leader, stops that process, requires a
+   different survivor at a strictly higher term, performs a generation read
+   while the old leader is down, restarts the same durable node, and waits for
+   convergence. The retained original 15-operation history is independently
+   checked; the added outage read is separately identified as transition
+   evidence. Separate domain-level tests commit session lease/CAS work and a
+   configuration transaction after isolating the old leader. This is loopback
+   plaintext test transport, not deployed-network or mTLS qualification.
+7. **Remaining Qualification**: #128 makes current-format repair exclusively
    Openraft-owned, rejects committed/applied truncation and stale snapshots,
    validates restart artifacts, and qualifies divergent-tail/snapshot recovery.
    #129 provides the default-deny offline whole-fleet procedure documented in

@@ -15,8 +15,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
-use opc_consensus::engine::{Config, EmptyNode, LogId, SnapshotPolicy, StoredMembership};
-use opc_consensus::{decode_bounded, encode_bounded};
+use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
+use opc_consensus::{
+    decode_bounded, durable_openraft_config, encode_bounded, DurableOpenraftDomain,
+};
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -62,13 +64,7 @@ use crate::ttl::{
 /// forwarding, quorum confirmation, commit, and local apply.
 pub const DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-const SESSION_CONSENSUS_HEARTBEAT_MILLIS: u64 = 250;
-const SESSION_CONSENSUS_ELECTION_MIN_MILLIS: u64 = 1_000;
-const SESSION_CONSENSUS_ELECTION_MAX_MILLIS: u64 = 2_000;
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const SESSION_CONSENSUS_SNAPSHOT_CHUNK_BYTES: u64 = 1024 * 1024;
-const SESSION_CONSENSUS_LOGS_PER_SNAPSHOT: u64 = 4_096;
-const SESSION_CONSENSUS_RETAINED_LOGS: u64 = 1_024;
 
 /// Fail-closed construction or cluster-formation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -1489,22 +1485,9 @@ impl ConsensusSessionStore {
     }
 }
 
-fn session_raft_config() -> Result<Config, ConsensusSessionStoreOpenError> {
-    Config {
-        cluster_name: "opc-session-store".into(),
-        heartbeat_interval: SESSION_CONSENSUS_HEARTBEAT_MILLIS,
-        election_timeout_min: SESSION_CONSENSUS_ELECTION_MIN_MILLIS,
-        election_timeout_max: SESSION_CONSENSUS_ELECTION_MAX_MILLIS,
-        install_snapshot_timeout: 10_000,
-        max_payload_entries: 1,
-        replication_lag_threshold: SESSION_CONSENSUS_LOGS_PER_SNAPSHOT,
-        snapshot_policy: SnapshotPolicy::LogsSinceLast(SESSION_CONSENSUS_LOGS_PER_SNAPSHOT),
-        snapshot_max_chunk_size: SESSION_CONSENSUS_SNAPSHOT_CHUNK_BYTES,
-        max_in_snapshot_log_to_keep: SESSION_CONSENSUS_RETAINED_LOGS,
-        ..Config::default()
-    }
-    .validate()
-    .map_err(|_| ConsensusSessionStoreOpenError::InvalidRuntimeConfiguration)
+fn session_raft_config() -> Result<opc_consensus::engine::Config, ConsensusSessionStoreOpenError> {
+    durable_openraft_config(DurableOpenraftDomain::SessionState)
+        .map_err(|_| ConsensusSessionStoreOpenError::InvalidRuntimeConfiguration)
 }
 
 fn consensus_unavailable() -> StoreError {

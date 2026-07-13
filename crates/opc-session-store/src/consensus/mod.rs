@@ -38,6 +38,7 @@ opc_consensus::engine::declare_raft_types!(
         NodeId = SessionConsensusNodeId,
         Node = opc_consensus::engine::EmptyNode,
         SnapshotData = snapshot::SessionSnapshotFile,
+        AsyncRuntime = opc_consensus::DurableOpenraftRuntime,
 );
 
 pub(crate) type SessionRaft = opc_consensus::engine::Raft<SessionRaftTypeConfig>;

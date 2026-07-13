@@ -50,6 +50,45 @@ persistence authority.
   standalone consensus-node binary are removed rather than retained as a
   compatibility engine.
 
+The shared engine also has one runtime profile. `opc-consensus` owns the
+heartbeat, election range, snapshot-install timeout, replication payload,
+snapshot trigger/chunk, retained-log, and Tokio runtime choices. Session and
+configuration adapters select only their non-secret cluster label; they cannot
+silently drift to separate timing or runtime behavior.
+
+### Interim engine-source and release gate
+
+The accepted one-engine rule applies to source selection as well as APIs. Until
+an official stable Openraft release contains per-campaign election-timeout
+resampling, the workspace exact-pins
+`https://github.com/openpacketcore/openraft` revision
+`f607e636406b16bd0ad7925dbb631da1b7a4cd96` (signed tag
+`opc-v0.9.24-election-resampling-1`). The dependency is a full immutable `rev`,
+not a mutable branch or tag, and locked metadata must resolve only
+`openraft`/`openraft-macros` 0.9.24 from that revision.
+
+Registry 0.9.24 SDK one-shot leader-loss runs happened to pass. They do not
+invalidate the deterministic scripted engine regression or the historical
+observed-leader split-vote in the multi-process qualification harness: the
+registry implementation reused one sampled timeout across campaigns. The
+forked engine resamples every campaign without adding SDK election, vote,
+leader-lease, or quorum logic.
+
+A published crates.io manifest cannot preserve this git revision. Therefore
+the exact 26-crate transitive normal reverse-dependency closure rooted at
+`opc-consensus`, `opc-session-store`, and `opc-persist` is source-build-only and
+`publish = false`. Metadata/profile tests and `scripts/publish-order.py` derive
+and check the closure; the other 51 workspace crates keep their existing
+publication status. Remove the gate only when all three conditions hold:
+
+1. an official stable Openraft release contains the fix;
+2. the workspace uses an exact registry version and checksum; and
+3. the complete #143 profile is requalified against that revision.
+
+This gate does not graduate the HA profile. Its machine-readable maturity stays
+`experimental`, `qualification_complete` stays false, and #143 remains an
+unresolved dependency.
+
 Kubernetes controller leader election, gNMI master arbitration, local
 single-node SQLite transactions, session fencing leases, caches, and test
 fakes do not become Openraft concerns unless they start deciding distributed
@@ -154,6 +193,11 @@ algorithms. Config and session tests focus on deterministic state-machine and
 adapter behavior; shared engine and transport qualification can exercise one
 set of election, replication, membership, read, and snapshot semantics.
 
+The interim git source also makes the affected release closure intentionally
+source-build-only. This is a bounded distribution cost, not permission to mix
+registry and forked Openraft consumers or to reintroduce SDK-owned consensus
+logic.
+
 #127 and #177 close the single-engine implementation transition. They do not
 by themselves declare either domain carrier-production ready. Recovery,
 restore, credential lifecycle, real-network compatibility, restart/rejoin,
@@ -170,6 +214,9 @@ gates.
 - `crates/opc-amf-lite/tests/config_consensus_encryption.rs`
 - `crates/opc-session-net/src/consensus.rs`
 - `crates/opc-session-net/tests/consensus_transport.rs`
+- `crates/opc-session-testkit/tests/qualification_multiprocess.rs`
+- `crates/opc-session-testkit/qualification/v1/session-ha-profile.json`
+- `scripts/publish-order.py`
 - `docs/adr/0002-config-store-consensus-ha.md`
 - `docs/adr/0003-session-store-quorum-replication.md`
 - `docs/consensus-operator-runbook.md`

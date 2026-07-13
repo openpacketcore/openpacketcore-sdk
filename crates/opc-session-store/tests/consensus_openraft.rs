@@ -319,6 +319,30 @@ impl TestCluster {
         .map_err(|_| ())
     }
 
+    fn observed_leader(&self) -> (usize, SessionConsensusNodeId, u64) {
+        let statuses = self
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::status)
+            .collect::<Vec<_>>();
+        let leader_id = statuses
+            .first()
+            .and_then(|status| status.leader_id)
+            .expect("known leader");
+        let term = statuses.first().expect("cluster status").term;
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.leader_id == Some(leader_id) && status.term == term),
+            "all ready members must agree on the observed leader and term"
+        );
+        let leader_index = statuses
+            .iter()
+            .position(|status| status.node_id == leader_id)
+            .expect("leader is a configured member");
+        (leader_index, leader_id, term)
+    }
+
     fn isolate(&self, node: usize) {
         for peer in 0..MEMBER_COUNT {
             if peer != node {
@@ -1415,6 +1439,80 @@ async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
         .acquire(&key, owner("healed-owner"), Duration::from_secs(30))
         .await
         .expect("mutation succeeds after healing");
+}
+
+#[tokio::test]
+async fn observed_leader_loss_elects_a_different_higher_term_leader_and_recovers() {
+    let cluster = TestCluster::start().await;
+    let (old_leader_index, old_leader_id, old_term) = cluster.observed_leader();
+    cluster.isolate(old_leader_index);
+    let survivors = (0..MEMBER_COUNT)
+        .filter(|index| *index != old_leader_index)
+        .collect::<Vec<_>>();
+
+    let (new_leader_id, new_term) = tokio::time::timeout(RECOVERY_TIMEOUT, async {
+        loop {
+            let reports = futures_util::future::join_all(
+                survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
+            )
+            .await;
+            let statuses = survivors
+                .iter()
+                .map(|index| cluster.stores[*index].status())
+                .collect::<Vec<_>>();
+            if reports.iter().all(DurableReadinessReport::is_ready) {
+                if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
+                    let new_term = statuses.first().expect("survivor status").term;
+                    if new_leader_id != old_leader_id
+                        && new_term > old_term
+                        && statuses.iter().all(|status| {
+                            status.leader_id == Some(new_leader_id) && status.term == new_term
+                        })
+                    {
+                        break (new_leader_id, new_term);
+                    }
+                }
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("surviving majority elects a different higher-term leader");
+    assert_ne!(new_leader_id, old_leader_id);
+    assert!(new_term > old_term);
+
+    let key = session_key(b"observed-leader-loss");
+    let lease = cluster.stores[survivors[0]]
+        .acquire(&key, owner("post-failover-owner"), Duration::from_secs(30))
+        .await
+        .expect("survivor quorum accepts a lease after leader loss");
+    let committed = sealed_record(key.clone(), 1, &lease, b"sealed-post-failover");
+    assert_eq!(
+        CompareAndSetResult::Success,
+        cluster.stores[survivors[1]]
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease,
+                expected_generation: None,
+                new_record: committed.clone(),
+            })
+            .await
+            .expect("survivor quorum commits after leader loss")
+    );
+
+    cluster.heal(old_leader_index);
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("old leader catches up after rejoining");
+    for store in &cluster.stores {
+        assert_eq!(
+            Some(committed.clone()),
+            store.get(&key).await.expect("rejoined fleet converges")
+        );
+    }
 }
 
 #[tokio::test]

@@ -16,6 +16,7 @@
     "topology",
     "payload_protection",
     "faults",
+    "leader_transition",
     "history",
     "checker",
     "logs",
@@ -169,12 +170,36 @@
         "properties": {
           "kind": { "enum": ["process_stop", "process_restart"] },
           "target_process": { "type": "string", "pattern": "^node-[0-4]$" },
-          "target_role": { "const": "follower" },
+          "target_role": { "enum": ["follower", "leader"] },
           "observed_node_id": { "type": "integer", "minimum": 1 },
           "observed_leader_id": { "type": "integer", "minimum": 1 },
           "observed_term": { "type": "integer", "minimum": 1 },
           "bounded": { "const": true }
         }
+      }
+    },
+    "leader_transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "old_leader_process",
+        "old_leader_node_id",
+        "old_term",
+        "new_leader_process",
+        "new_leader_node_id",
+        "new_term",
+        "failover_millis",
+        "old_leader_restart_catchup_millis"
+      ],
+      "properties": {
+        "old_leader_process": { "type": "string", "pattern": "^node-[0-4]$" },
+        "old_leader_node_id": { "type": "integer", "minimum": 1 },
+        "old_term": { "type": "integer", "minimum": 1 },
+        "new_leader_process": { "type": "string", "pattern": "^node-[0-4]$" },
+        "new_leader_node_id": { "type": "integer", "minimum": 1 },
+        "new_term": { "type": "integer", "minimum": 2 },
+        "failover_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
+        "old_leader_restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 }
       }
     },
     "history": {
@@ -264,6 +289,9 @@
         "startup_millis",
         "single_member_stop_service_continuity_millis",
         "restart_catchup_millis",
+        "leader_failover_millis",
+        "leader_restart_catchup_millis",
+        "leader_outage_store_read_succeeded",
         "acknowledged_write_loss",
         "stale_owner_mutation_successes",
         "history_checker_violations"
@@ -272,6 +300,9 @@
         "startup_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
         "single_member_stop_service_continuity_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
         "restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 },
+        "leader_failover_millis": { "type": "integer", "minimum": 0, "maximum": 30000 },
+        "leader_restart_catchup_millis": { "type": "integer", "minimum": 0, "maximum": 120000 },
+        "leader_outage_store_read_succeeded": { "const": true },
         "acknowledged_write_loss": { "const": 0 },
         "stale_owner_mutation_successes": { "const": 0 },
         "history_checker_violations": { "const": 0 }
@@ -295,6 +326,7 @@
           "real_tcp",
           "persistent_sqlite",
           "process_stop_restart",
+          "observed_leader_failover",
           "three_node",
           "five_node"
         ]

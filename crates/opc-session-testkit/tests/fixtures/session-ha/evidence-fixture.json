@@ -66,8 +66,36 @@
       "observed_leader_id": 1,
       "observed_term": 1,
       "bounded": true
+    },
+    {
+      "kind": "process_stop",
+      "target_process": "node-0",
+      "target_role": "leader",
+      "observed_node_id": 1,
+      "observed_leader_id": 1,
+      "observed_term": 1,
+      "bounded": true
+    },
+    {
+      "kind": "process_restart",
+      "target_process": "node-0",
+      "target_role": "leader",
+      "observed_node_id": 1,
+      "observed_leader_id": 1,
+      "observed_term": 1,
+      "bounded": true
     }
   ],
+  "leader_transition": {
+    "old_leader_process": "node-0",
+    "old_leader_node_id": 1,
+    "old_term": 1,
+    "new_leader_process": "node-1",
+    "new_leader_node_id": 2,
+    "new_term": 2,
+    "failover_millis": 1000,
+    "old_leader_restart_catchup_millis": 1000
+  },
   "history": {
     "schema_version": "opc-session-ha-history/v1",
     "schedule_schema_version": "opc-session-ha-schedule/v1",
@@ -94,6 +122,9 @@
     "startup_millis": 1000,
     "single_member_stop_service_continuity_millis": 1000,
     "restart_catchup_millis": 1000,
+    "leader_failover_millis": 1000,
+    "leader_restart_catchup_millis": 1000,
+    "leader_outage_store_read_succeeded": true,
     "acknowledged_write_loss": 0,
     "stale_owner_mutation_successes": 0,
     "history_checker_violations": 0

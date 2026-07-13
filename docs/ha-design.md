@@ -24,6 +24,25 @@ config release evidence retain their own gates. Historical closure language
 below refers only to scoped algorithms and test harnesses; neither component is
 yet approved as a production deployment profile.
 
+### Interim Openraft source and shared runtime profile
+
+Both domains use `opc_consensus::durable_openraft_config` and the same Tokio
+runtime. The fixed profile uses a 250 ms heartbeat, a fresh 1,000–2,000 ms
+election timeout for every campaign, a 10 second snapshot-install timeout,
+one-entry replication payloads, a 4,096-log snapshot trigger, 1 MiB snapshot
+chunks, and 1,024 retained applied logs. Domain adapters select only their
+cluster label. These are code-path constants, not operator tuning knobs and not
+proof that the experimental profile meets #143 under deployed load.
+
+The workspace temporarily exact-pins `openpacketcore/openraft` revision
+`f607e636406b16bd0ad7925dbb631da1b7a4cd96`. Registry 0.9.24 reuses a sampled
+election timeout across campaigns; the fork resamples each campaign. It does
+not add an SDK leader lease or any second election/vote path. Until an official
+stable release contains that fix, an exact registry checksum replaces the git
+pin, and #143 is requalified, the mechanically checked 26-crate normal reverse
+dependency closure is source-build-only with `publish = false`. The other 51
+workspace crates are outside that release gate.
+
 ---
 
 ## 1. Openraft Config Store: `ConsensusConfigStore`
@@ -622,9 +641,10 @@ second consensus algorithm.
   nonempty source WAL, and invalid audit state fail without claiming or
   modifying the target authority.
 - **Three-node authority**: Tests form an Openraft fleet, commit through the
-  quorum, isolate the old leader, elect and write through the surviving
-  majority, heal/converge, and replay a delivered-but-lost response without a
-  duplicate application outcome.
+  quorum, observe and stop the actual old leader, require a different leader at
+  a strictly higher term, write through the surviving majority, heal/converge,
+  and replay a delivered-but-lost response without a duplicate application
+  outcome.
 - **Membership**: the configured voter set is exact and immutable within an
   epoch; subset/superset requests fail before Openraft work and topology change
   requires a coordinated new configuration epoch.
@@ -660,6 +680,15 @@ implement a second quorum algorithm.
   linearizable barrier, and only Openraft-backed stores claim quorum.
 - **Partition and healing**: A node isolation causes bounded readiness/write
   failure where quorum is unavailable; healed paths catch up and rejoin.
+- **Observed-leader process failover**: The 3- and 5-process foundation harness
+  requires two coherent leader observations before stopping that process,
+  records a different survivor leader at a strictly higher term, proves a
+  generation read while the old leader is down, then restarts the same durable
+  node and bounds full catch-up. The independent checker still validates the
+  original 15-operation history; the added outage read is explicit transition
+  evidence, not falsely attributed to that checker. Separate domain-level
+  tests commit session lease/CAS work and a configuration transaction through
+  the surviving majority before convergence.
 - **Ambiguous response retry**: A delivered-but-lost forwarded response can be
   retried with the same durable request identity and produces exactly one
   committed application event.
@@ -692,3 +721,9 @@ implement a second quorum algorithm.
   the structural retained-identity and migration contracts. #177 reuses this shared
   transport boundary for config consensus instead of maintaining a separate
   config TCP deadline or credential path.
+
+The observed-leader evidence closes only that foundation gap. The profile
+remains `experimental` and `qualification_complete = false`; Kubernetes/mTLS
+and rotation, crash-point/partition matrices, batch/watch/restore histories,
+resource limits, soak, production payload-key operation, and signed
+candidate-release evidence remain under #143 and related gates.

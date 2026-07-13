@@ -39,6 +39,7 @@ opc_consensus::engine::declare_raft_types!(
         NodeId = ConfigConsensusNodeId,
         Node = opc_consensus::engine::EmptyNode,
         SnapshotData = snapshot_file::ConfigSnapshotFile,
+        AsyncRuntime = opc_consensus::DurableOpenraftRuntime,
 );
 
 pub(crate) type ConfigRaft = opc_consensus::engine::Raft<ConfigRaftTypeConfig>;

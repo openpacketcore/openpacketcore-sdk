@@ -9,6 +9,7 @@
     "maturity",
     "qualification_complete",
     "workspace",
+    "source_build_gate",
     "artifacts",
     "platforms",
     "topology",
@@ -32,10 +33,67 @@
         "source_revision": { "const": "required-in-evidence" }
       }
     },
+    "source_build_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tracking_issue",
+        "openraft_git",
+        "openraft_rev",
+        "affected_workspace_crates",
+        "crates_io_check_date",
+        "crates_io_exact_matches",
+        "removal_condition"
+      ],
+      "properties": {
+        "tracking_issue": { "const": 143 },
+        "openraft_git": { "const": "https://github.com/openpacketcore/openraft" },
+        "openraft_rev": { "const": "f607e636406b16bd0ad7925dbb631da1b7a4cd96" },
+        "affected_workspace_crates": {
+          "type": "array",
+          "minItems": 26,
+          "maxItems": 26,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "opc-alarm",
+              "opc-alarm-k8s",
+              "opc-alarm-testkit",
+              "opc-alarm-yang",
+              "opc-amf-lite",
+              "opc-amf-lite-testkit",
+              "opc-config-bus",
+              "opc-consensus",
+              "opc-gnmi-server",
+              "opc-ipsec-lb",
+              "opc-mgmt-authz",
+              "opc-mgmt-transport",
+              "opc-netconf-server",
+              "opc-persist",
+              "opc-runtime",
+              "opc-sa-mirror",
+              "opc-sbi",
+              "opc-sdk",
+              "opc-sdk-integration",
+              "opc-session-cache",
+              "opc-session-net",
+              "opc-session-store",
+              "opc-session-testkit",
+              "operator-controller",
+              "operator-lifecycle",
+              "operator-lifecycle-cli"
+            ]
+          }
+        },
+        "crates_io_check_date": { "const": "2026-07-13" },
+        "crates_io_exact_matches": { "type": "array", "maxItems": 0 },
+        "removal_condition": { "const": "official stable Openraft release containing the fix, registry pin and checksum, and full issue #143 requalification" }
+      }
+    },
     "artifacts": {
       "type": "array",
-      "minItems": 4,
-      "maxItems": 4,
+      "minItems": 5,
+      "maxItems": 5,
       "uniqueItems": true,
       "items": {
         "type": "object",
@@ -170,6 +228,8 @@
         "max_startup_millis",
         "max_single_member_stop_service_continuity_millis",
         "max_restart_catchup_millis",
+        "max_leader_failover_millis",
+        "max_leader_restart_catchup_millis",
         "minimum_soak_seconds"
       ],
       "properties": {
@@ -180,6 +240,8 @@
         "max_startup_millis": { "type": "integer", "minimum": 1 },
         "max_single_member_stop_service_continuity_millis": { "type": "integer", "minimum": 1 },
         "max_restart_catchup_millis": { "type": "integer", "minimum": 1 },
+        "max_leader_failover_millis": { "type": "integer", "minimum": 1 },
+        "max_leader_restart_catchup_millis": { "type": "integer", "minimum": 1 },
         "minimum_soak_seconds": { "type": "integer", "minimum": 1 }
       }
     },
