@@ -19,6 +19,7 @@ serde_json = "1.0"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "time"] }
 tracing = { workspace = true }
+time = { workspace = true }
 x509-parser = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls = { workspace = true }
@@ -28,7 +29,6 @@ opc-identity = { path = "../opc-identity", version = "0.2.0" }
 
 [dev-dependencies]
 rcgen = { workspace = true }
-time = { workspace = true }
 
 [lints]
 workspace = true
