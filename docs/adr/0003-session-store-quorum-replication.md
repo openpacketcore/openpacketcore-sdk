@@ -104,12 +104,14 @@ SVIDs cannot inherit cached replica authority.
 
 #163 now applies a finite maximum authentication age and exact local/peer leaf
 expiry to every connection, retires retained connections on coherent material
-epoch or explicit reauthentication changes, drains only already admitted work,
-and repeats the full handshake. The qualified CNF/operator profile must still
-prove fleet trust overlap/removal, revocation, reconnect-storm behavior, and
-multi-process continuity under #164/#143. Session/lease TTL is an
-application-state lifetime and does not set certificate expiry, trust-bundle
-validity, or authentication age.
+epoch or explicit reauthentication changes, ends transport waits and releases
+connection slots by the hard deadline, and repeats the full handshake.
+Already-admitted supervised mutations may finish later; they remain typed
+ambiguous and are never automatically replayed. The qualified CNF/operator
+profile must still prove fleet trust overlap/removal, revocation,
+reconnect-storm behavior, and multi-process continuity under #164/#143.
+Session/lease TTL is an application-state lifetime and does not set certificate
+expiry, trust-bundle validity, or authentication age.
 
 Transport authentication does not replace topology admission or prove physical
 store provenance. The operator must still map each logical member to exactly

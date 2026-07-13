@@ -528,8 +528,10 @@ Session caches, tickets, resumption, early data, and 0-RTT are disabled, so a
 reconnect performs a full mutual-TLS certificate exchange. #163 gives every
 connection a finite maximum authentication age and exact local/peer leaf-expiry
 bound, retires retained connections on coherent material-epoch or explicit
-reauthentication changes, drains only already admitted work, and reconnects
-watches from the exact delivered cursor. Fleet trust overlap/removal,
+reauthentication changes, ends transport waits and releases connection slots by
+the hard deadline, and reconnects watches from the exact delivered cursor. A
+bounded supervised mutation may still finish later; its outcome remains typed
+ambiguous and must not be automatically retried. Fleet trust overlap/removal,
 revocation, reconnect-storm, multi-process rotation, seamless continuity, and
 soak remain production evidence under #164/#143.
 

@@ -16,8 +16,11 @@
 //! Every authenticated direct and consensus connection also has one finite
 //! [`ConnectionLifecyclePolicy`]. The transport records the completed
 //! handshake's material epoch and local/peer leaf-expiry evidence, stops
-//! admitting new work at the earliest retirement boundary, and bounds work
-//! already in flight by the hard deadline. Material publication or an explicit
+//! admitting new work at the earliest retirement boundary, and bounds the
+//! transport wait plus connection-slot lifetime by the hard deadline. A
+//! supervised backend mutation may still finish after its caller future is
+//! dropped, so transport retirement reports typed ambiguity and never proves
+//! rollback or permits an automatic replay. Material publication or an explicit
 //! [`SessionReauthenticationControl`] request drains existing connections;
 //! replacements always repeat the complete mutual-TLS and application-profile
 //! handshake. Direct watch streams reconnect from the exact next

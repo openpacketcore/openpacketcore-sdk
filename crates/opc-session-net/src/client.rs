@@ -3276,6 +3276,15 @@ mod tests {
         compare_and_set_release: tokio::sync::Notify,
     }
 
+    #[derive(Default)]
+    struct SupervisedLateMutationBackend {
+        compare_and_set_calls: AtomicUsize,
+        compare_and_set_completed: Arc<AtomicUsize>,
+        compare_and_set_started: tokio::sync::Notify,
+        compare_and_set_release: Arc<tokio::sync::Notify>,
+        committed_record: Arc<StdMutex<Option<StoredSessionRecord>>>,
+    }
+
     #[async_trait]
     impl SessionBackend for CountingBackend {
         async fn capabilities(&self) -> BackendCapabilities {
@@ -3350,6 +3359,97 @@ mod tests {
 
         async fn release(&self, _lease: LeaseGuard) -> Result<(), LeaseError> {
             self.lease_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionBackend for SupervisedLateMutationBackend {
+        async fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::all_enabled()
+        }
+
+        async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+            Ok(self
+                .committed_record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .filter(|record| &record.key == key)
+                .cloned())
+        }
+
+        async fn compare_and_set(
+            &self,
+            operation: CompareAndSet,
+        ) -> Result<CompareAndSetResult, StoreError> {
+            self.compare_and_set_calls.fetch_add(1, Ordering::SeqCst);
+            self.compare_and_set_started.notify_one();
+            let release = self.compare_and_set_release.clone();
+            let completed = self.compare_and_set_completed.clone();
+            let committed_record = self.committed_record.clone();
+            // Model a bounded backend supervisor: dropping this public future
+            // detaches only the already-admitted, still-supervised task. The
+            // task may finish later, which is permitted by SessionBackend.
+            tokio::spawn(async move {
+                release.notified().await;
+                *committed_record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(operation.new_record);
+                completed.fetch_add(1, Ordering::SeqCst);
+                CompareAndSetResult::Success
+            })
+            .await
+            .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)
+        }
+
+        async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn batch(
+            &self,
+            operations: Vec<SessionOp>,
+        ) -> Result<Vec<SessionOpResult>, StoreError> {
+            Ok(operations
+                .into_iter()
+                .map(|operation| match operation {
+                    SessionOp::Get { .. } => SessionOpResult::Get(Ok(None)),
+                    SessionOp::CompareAndSet(_) => {
+                        SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success))
+                    }
+                    SessionOp::DeleteFenced { .. } => SessionOpResult::DeleteFenced(Ok(())),
+                    SessionOp::RefreshTtl { .. } => SessionOpResult::RefreshTtl(Ok(())),
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl SessionLeaseManager for SupervisedLateMutationBackend {
+        async fn acquire(
+            &self,
+            _key: &SessionKey,
+            _owner: OwnerId,
+            _ttl: Duration,
+        ) -> Result<LeaseGuard, LeaseError> {
+            Err(LeaseError::Backend("unused supervised acquire".to_string()))
+        }
+
+        async fn renew(
+            &self,
+            _lease: &LeaseGuard,
+            _ttl: Duration,
+        ) -> Result<LeaseGuard, LeaseError> {
+            Err(LeaseError::Backend("unused supervised renew".to_string()))
+        }
+
+        async fn release(&self, _lease: LeaseGuard) -> Result<(), LeaseError> {
             Ok(())
         }
     }
@@ -3737,7 +3837,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authentication_hard_deadline_cancels_slow_work_and_releases_connection_slot() {
+    async fn authentication_hard_deadline_cancels_a_cancellation_sensitive_backend_and_releases_connection_slot(
+    ) {
         let counting = Arc::new(CountingBackend::default());
         counting
             .block_compare_and_set
@@ -3794,7 +3895,7 @@ mod tests {
         assert_eq!(
             counting.compare_and_set_completed.load(Ordering::SeqCst),
             0,
-            "hard retirement must cancel backend work before completion"
+            "this cancellation-sensitive backend must stop when its future is dropped"
         );
 
         counting
@@ -3806,6 +3907,122 @@ mod tests {
                 .expect("retired handler must release the sole connection slot")
                 .atomic_compare_and_set
         );
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn authentication_hard_deadline_reports_ambiguity_without_retrying_a_late_supervised_mutation(
+    ) {
+        let supervised = Arc::new(SupervisedLateMutationBackend::default());
+        let server_control = SessionReauthenticationControl::new();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("test lifecycle policy");
+        let (server, addr) =
+            crate::server::SessionReplicationServer::new_insecure(supervised.clone())
+                .with_max_connections(1)
+                .with_connection_lifecycle(policy)
+                .with_reauthentication_control(server_control.clone())
+                .listen("127.0.0.1:0".parse().expect("listen address"))
+                .await
+                .expect("start test server");
+        let client = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)))
+            .with_connection_lifecycle(policy);
+        assert!(client.capabilities().await.atomic_compare_and_set);
+
+        let operation = valid_compare_and_set(0).await;
+        let operation_for_replay = operation.clone();
+        let committed_key = operation.key.clone();
+        let mutation_client = client.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_client
+                .send_mutation_once(Request::CompareAndSet {
+                    op: operation,
+                    request_id: Some(uuid::Uuid::nil().hyphenated().to_string()),
+                    idempotency_epoch: None,
+                })
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            supervised.compare_and_set_started.notified(),
+        )
+        .await
+        .expect("supervised backend mutation must start");
+        server_control
+            .request_reauthentication()
+            .expect("retire supervised mutation connection");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), mutation)
+                .await
+                .expect("hard deadline must close the transport wait")
+                .expect("mutation join"),
+            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+        assert_eq!(supervised.compare_and_set_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            supervised.compare_and_set_completed.load(Ordering::SeqCst),
+            0,
+            "transport completion must not pretend the supervised mutation rolled back"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), client.capabilities())
+                .await
+                .expect("retired handler must release the sole connection slot")
+                .atomic_compare_and_set
+        );
+        assert_eq!(
+            supervised.compare_and_set_calls.load(Ordering::SeqCst),
+            1,
+            "the ambiguous mutation must never be automatically retried"
+        );
+
+        supervised.compare_and_set_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while supervised.compare_and_set_completed.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded supervised mutation may finish after transport retirement");
+        assert_eq!(
+            supervised.compare_and_set_completed.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(supervised.compare_and_set_calls.load(Ordering::SeqCst), 1);
+        assert!(client
+            .get(&committed_key)
+            .await
+            .expect("authoritative reread after ambiguous completion")
+            .is_some());
+        let replay = client
+            .send_mutation_once(Request::CompareAndSet {
+                op: operation_for_replay,
+                request_id: Some(uuid::Uuid::nil().hyphenated().to_string()),
+                idempotency_epoch: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                replay,
+                Ok(Response::CompareAndSet(Err(
+                    StoreError::CasIdempotencyOutcomeUnavailable
+                )))
+            ),
+            "unexpected exact ambiguity replay result: {replay:?}"
+        );
+        assert_eq!(
+            supervised.compare_and_set_calls.load(Ordering::SeqCst),
+            1,
+            "the exact replay must resolve from the ambiguity tombstone without redispatch"
+        );
+
         server.abort_and_wait().await;
     }
 

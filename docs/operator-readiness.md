@@ -732,8 +732,12 @@ commands or make consensus decisions.
 #161 atomic identity/trust reload, #162 bounded material epochs, and #163 finite
 peer reauthentication are implemented. Clients and listeners retain exact
 handshake epoch and local/peer leaf-expiry evidence, stop new admission at the
-soft retirement boundary, bound already admitted work by the hard deadline,
-and repeat the complete mutual-TLS/application handshake on replacements.
+soft retirement boundary, bound transport waits and connection slots by the
+hard deadline, and repeat the complete mutual-TLS/application handshake on
+replacements. A supervised backend mutation may finish after its caller future
+is dropped; retirement therefore preserves typed ambiguity, forbids automatic
+replay, and requires authoritative readback or the existing operation-bound
+idempotency/fencing contract.
 Legacy watches resume from the exact caller-delivered sequence. #164 still
 owns fleet rotation qualification under umbrella #158; a production CNF must
 qualify old/new trust overlap and removal, revocation, reconnect storms, and

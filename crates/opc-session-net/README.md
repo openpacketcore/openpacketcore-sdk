@@ -460,8 +460,14 @@ Retirement has these invariants:
 
 - no request is assigned or dispatched after its connection's soft retirement
   boundary;
-- work already admitted may finish once, but the connection is closed no later
-  than its hard deadline;
+- work already admitted may return once before the hard deadline; at that
+  deadline the transport stops waiting, closes the connection, releases its
+  slot, and reports a typed ambiguous mutation outcome where an effect may
+  already have crossed the backend boundary;
+- dropping the backend future requests cancellation but does not prove
+  rollback: a bounded supervised mutation may finish after transport closure,
+  so callers never automatically replay it and must authoritatively re-read or
+  use its operation-bound idempotency/fencing contract;
 - a replacement repeats TCP resolution, mutual TLS, canonical SPIFFE identity,
   nonce/challenge, ALPN, version, and exact contract-profile checks;
 - the fixed, fully decoded `ConnectionRetiring` response proves that a legacy
@@ -522,14 +528,16 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   cannot reuse a cached peer certificate or authority decision.
 - Authenticated connections now retire at a finite age, exact local/peer leaf
   expiry, material-epoch change, or explicit reauthentication request. Both
-  sides stop new admission at the soft boundary, bound in-flight work by the
-  hard deadline, and reconnect through a complete mutual-TLS/application
-  handshake. Legacy watches resume from the exact delivered cursor. Scoped
-  real-mTLS tests cover retained connections and continuous request/watch
-  recycling. #164 and #143 still own multi-process fleet trust-overlap,
-  revocation, reconnect-storm, resource, soak, and release evidence. The
-  365-day session TTL remains unrelated to certificate lifetime, trust-bundle
-  lifetime, or authentication age.
+  sides stop new admission at the soft boundary, bound the transport wait and
+  connection-slot lifetime by the hard deadline, and reconnect through a
+  complete mutual-TLS/application handshake. An already-admitted supervised
+  backend mutation may still finish later and therefore remains typed
+  ambiguous and non-retryable. Legacy watches resume from the exact delivered
+  cursor. Scoped real-mTLS tests cover retained connections and continuous
+  request/watch recycling. #164 and #143 still own multi-process fleet
+  trust-overlap, revocation, reconnect-storm, resource, soak, and release
+  evidence. The 365-day session TTL remains unrelated to certificate lifetime,
+  trust-bundle lifetime, or authentication age.
 - The configuration ID is a SHA-256 digest of the cluster ID, explicit
   generation, and the full sorted descriptor set. Changing a member ID,
   endpoint, TLS identity, failure domain, backing identity, cluster, or
