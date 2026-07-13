@@ -12,6 +12,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use opc_session_net::{
+    SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
+};
 use opc_session_store::{
     validate_session_ttl, OwnerId, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
     ReplicaId, ReplicaTlsIdentity, STABLE_ID_MAX_BYTES,
@@ -19,6 +22,7 @@ use opc_session_store::{
 use opc_types::SpiffeId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Exact profile inventory consumed by qualification tooling.
 pub const SESSION_HA_PROFILE_JSON: &str =
@@ -44,6 +48,8 @@ pub const QUALIFICATION_MAX_CONFIG_BYTES: u64 = 64 * 1024;
 pub const QUALIFICATION_MAX_CONTROL_LINE_BYTES: usize = 16 * 1024;
 /// Maximum number of synthetic payload bytes admitted by the node harness.
 pub const QUALIFICATION_MAX_VALUE_BYTES: usize = 512;
+/// Maximum retained lease handles in one qualification child.
+pub const QUALIFICATION_MAX_LEASE_HANDLES: usize = 1024;
 /// Exact operation timeout pinned by the experimental profile.
 pub const QUALIFICATION_OPERATION_TIMEOUT_MILLIS: u64 = 10_000;
 
@@ -165,7 +171,13 @@ pub struct QualificationEvidenceRequirements {
 pub struct QualificationNodeConfig {
     pub schema_version: u16,
     pub node_index: usize,
+    pub cluster_id: String,
+    pub configuration_generation: String,
+    pub configuration_epoch: u64,
+    pub backend_namespace: String,
+    pub workload_schedule_sha256: String,
     pub members: Vec<QualificationMember>,
+    pub workspace_directory: PathBuf,
     pub database_path: PathBuf,
     pub snapshot_directory: PathBuf,
     pub operation_timeout_millis: u64,
@@ -182,8 +194,21 @@ impl QualificationNodeConfig {
         }
         if self.node_index >= self.members.len()
             || self.operation_timeout_millis != QUALIFICATION_OPERATION_TIMEOUT_MILLIS
+            || self.configuration_epoch == 0
+            || !is_bounded_label(&self.backend_namespace, 128)
+            || !is_exact_sha256(&self.workload_schedule_sha256)
+            || SessionClusterId::new(self.cluster_id.clone()).is_err()
+            || SessionConfigurationGeneration::new(self.configuration_generation.clone()).is_err()
+            || SessionConfigurationEpoch::new(self.configuration_epoch).is_err()
+            || !self.workspace_directory.is_absolute()
             || !self.database_path.is_absolute()
             || !self.snapshot_directory.is_absolute()
+            || self.workspace_directory.parent().is_none()
+            || self.database_path == self.snapshot_directory
+            || !self.database_path.starts_with(&self.workspace_directory)
+            || !self
+                .snapshot_directory
+                .starts_with(&self.workspace_directory)
         {
             return Err(QualificationConfigError::Configuration);
         }
@@ -239,11 +264,62 @@ impl fmt::Debug for QualificationNodeConfig {
             .field("schema_version", &self.schema_version)
             .field("node_index", &self.node_index)
             .field("configured_members", &self.members.len())
+            .field("cluster_scope", &"<redacted>")
+            .field("workload_schedule", &"<redacted>")
+            .field("workspace_directory", &"<redacted>")
             .field("database_path", &"<redacted>")
             .field("snapshot_directory", &"<redacted>")
             .field("operation_timeout_millis", &self.operation_timeout_millis)
             .finish()
     }
+}
+
+fn is_bounded_label(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+/// Return the exact evidence digest for one synthetic qualification key.
+pub fn qualification_key_sha256(value: &str) -> String {
+    qualification_digest("key", value.as_bytes())
+}
+
+/// Return the exact evidence digest for one synthetic qualification owner.
+pub fn qualification_owner_sha256(value: &str) -> String {
+    qualification_digest("owner", value.as_bytes())
+}
+
+/// Return the exact evidence digest for a synthetic qualification value.
+pub fn qualification_value_sha256(value: &[u8]) -> String {
+    qualification_digest("value", value)
+}
+
+fn qualification_digest(kind: &str, value: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"opc-session-ha/");
+    hasher.update(kind.as_bytes());
+    hasher.update(b"/v1\0");
+    hasher.update(value);
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn is_exact_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// One immutable fleet member descriptor plus its local test dial route.
@@ -462,7 +538,7 @@ pub enum QualificationNodeErrorCode {
     InvalidRequest,
     InitializationUnavailable,
     BackendUnavailable,
-    LeaseUnavailable,
+    LeaseRejected,
     LeaseHandleMissing,
     MutationRejected,
 }
@@ -595,7 +671,13 @@ mod tests {
         let config = QualificationNodeConfig {
             schema_version: QUALIFICATION_NODE_SCHEMA_VERSION,
             node_index: 0,
+            cluster_id: "qualification-cluster".to_owned(),
+            configuration_generation: "v1".to_owned(),
+            configuration_epoch: 1,
+            backend_namespace: "qualification-cluster".to_owned(),
+            workload_schedule_sha256: format!("sha256:{}", "a".repeat(64)),
             members,
+            workspace_directory: PathBuf::from("/qualification"),
             database_path: PathBuf::from("/qualification/node.sqlite"),
             snapshot_directory: PathBuf::from("/qualification/snapshots"),
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
@@ -623,7 +705,13 @@ mod tests {
         QualificationNodeConfig {
             schema_version: QUALIFICATION_NODE_SCHEMA_VERSION,
             node_index: 0,
+            cluster_id: "qualification-cluster".to_owned(),
+            configuration_generation: "v1".to_owned(),
+            configuration_epoch: 1,
+            backend_namespace: "qualification-cluster".to_owned(),
+            workload_schedule_sha256: format!("sha256:{}", "a".repeat(64)),
             members,
+            workspace_directory: PathBuf::from("/qualification"),
             database_path: PathBuf::from("/qualification/node.sqlite"),
             snapshot_directory: PathBuf::from("/qualification/snapshots"),
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
@@ -723,5 +811,21 @@ mod tests {
         ] {
             assert!(!rendered.contains(secret));
         }
+    }
+
+    #[test]
+    fn qualification_digests_match_the_independent_checker_domains() {
+        assert_eq!(
+            qualification_key_sha256("session-a"),
+            "sha256:7689422ed433cc7ee36ce78ed7f5b7d30e3c1d39a6a2a2c72df5b7260ffb8c73"
+        );
+        assert_eq!(
+            qualification_owner_sha256("owner-a"),
+            "sha256:12a3b845112c3df86bd8f7658d6c9394622c66b4f50f3bdb951b7185b253f4ba"
+        );
+        assert_eq!(
+            qualification_value_sha256(b"value-1"),
+            "sha256:eec72ba1a373f38b17ec083cb92efdef4e526cc8d2d987079d3f336a4ec2f7f5"
+        );
     }
 }

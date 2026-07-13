@@ -9,7 +9,10 @@ use opc_consensus::{
     derive_configuration_id, derive_node_id, ConsensusClusterId as SessionConsensusClusterId,
     ConsensusIdentity as SessionConsensusIdentity, ConsensusNodeId as SessionConsensusNodeId,
 };
-#[cfg(any(feature = "insecure-test", test))]
+#[cfg(any(
+    all(feature = "insecure-test", feature = "legacy-session-net-compat"),
+    test
+))]
 use opc_session_store::ReplicaBackingIdentity;
 #[cfg(any(feature = "legacy-session-net-compat", test))]
 use opc_session_store::{BackendPeerBinding, BackendPeerScopeIdentity};
@@ -541,7 +544,7 @@ fn hash_field(hasher: &mut Sha256, field: &[u8]) {
     hasher.update(field);
 }
 
-#[cfg(feature = "insecure-test")]
+#[cfg(all(feature = "insecure-test", feature = "legacy-session-net-compat"))]
 fn insecure_test_manifest() -> Arc<SessionReplicationManifest> {
     let descriptor = |id: &str, instance: &str, port| {
         QuorumReplicaDescriptor::new(
@@ -571,7 +574,7 @@ fn insecure_test_manifest() -> Arc<SessionReplicationManifest> {
     )
 }
 
-#[cfg(feature = "insecure-test")]
+#[cfg(all(feature = "insecure-test", feature = "legacy-session-net-compat"))]
 pub(crate) fn insecure_test_client_binding() -> RemoteReplicaBinding {
     insecure_test_manifest()
         .bind_local(ReplicaId::new("insecure-client").expect("fixed insecure-test client"))
@@ -580,7 +583,7 @@ pub(crate) fn insecure_test_client_binding() -> RemoteReplicaBinding {
         .expect("fixed insecure-test remote binding")
 }
 
-#[cfg(feature = "insecure-test")]
+#[cfg(all(feature = "insecure-test", feature = "legacy-session-net-compat"))]
 pub(crate) fn insecure_test_server_binding() -> LocalReplicaBinding {
     insecure_test_manifest()
         .bind_local(ReplicaId::new("insecure-server").expect("fixed insecure-test server"))
