@@ -509,6 +509,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that additive field. Short-lived SVID expiry is the bounded same-issuer
   compromise mechanism; generic CRL/OCSP/denylist revocation remains
   unsupported, and #164 fleet rotation qualification remains open.
+- **TLS fleet-rotation mechanics — `opc-session-net`:** a bounded in-process
+  test now runs real three- and five-voter Openraft/SQLite fleets over the
+  production mTLS transport through leaf, presented-intermediate, root,
+  overlap/removal, and pre/post-removal rollback transitions. Each changed
+  voter proves fresh bidirectional handshakes and durable readiness; each phase
+  preserves an acknowledged encryption-wrapper canary, and removed old-root
+  chains fail to establish. This is SDK-generated loopback evidence only:
+  `opc-session-testkit` still reports `foundation_counts_for_tls_rotation =
+  false`, and the remaining #164 multi-process/fault/resource/soak/signed
+  qualification stays open.
 - **BREAKING — `opc-persist`:** #177 replaces the crate's custom Raft-style
   config engine and `QuorumConfigStore` majority wrapper with
   `ConsensusConfigStore` on the exact-pinned `opc-consensus` Openraft engine.
