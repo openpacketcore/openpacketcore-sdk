@@ -401,12 +401,27 @@ async fn generic_unsigned_eof_remains_a_failure(
         .expect("bind unsigned EOF listener");
     let address = listener.local_addr().expect("unsigned EOF address");
     let server = tokio::spawn(async move {
-        let mut tls = accept_tls(&listener, &server_config, SESSION_NET_ALPN).await;
-        let _: Request = read_frame(&mut tls, DEFAULT_MAX_FRAME_SIZE)
+        for attempt in 0..2 {
+            let mut tls = accept_tls(&listener, &server_config, SESSION_NET_ALPN).await;
+            let _: Request = read_frame(&mut tls, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read unsigned EOF Hello");
+            if attempt == 0 {
+                // No complete control frame: dropping the first authenticated
+                // stream must remain a transport failure and never become
+                // safe-retry proof.
+                continue;
+            }
+            // End the retry deterministically with a complete non-retirement
+            // protocol violation. The client cannot reach this route until it
+            // has classified and retried the first route's EOF.
+            write_frame(
+                &mut tls,
+                &serde_json::json!({"InvalidBootstrapTerminator": true}),
+            )
             .await
-            .expect("read unsigned EOF Hello");
-        // No complete control frame: dropping the authenticated stream must
-        // remain a transport failure and never become safe-retry proof.
+            .expect("write non-retryable bootstrap terminator");
+        }
     });
     let (_client_source, client_config) = pki.client_source(CLIENT_REPLICA);
     let binding = manifest
@@ -418,7 +433,7 @@ async fn generic_unsigned_eof_remains_a_failure(
         binding,
         resolver(address),
         client_config,
-        Some(Duration::from_millis(80)),
+        Some(Duration::from_secs(2)),
     )
     .with_connection_lifecycle(lifecycle_policy());
     let before = MetricSnapshot::capture();
@@ -426,13 +441,15 @@ async fn generic_unsigned_eof_remains_a_failure(
     assert!(client.max_replication_sequence().await.is_err());
     server.await.expect("unsigned EOF server");
     let delta = MetricSnapshot::capture().since(before);
+    assert_eq!(delta.attempts, 2);
     assert!(delta.transport_failures >= 1);
+    assert!(delta.protocol_failures >= 1);
     assert!(delta.reconnect_failures >= 1);
     assert_eq!(delta.successes, 0);
     assert_eq!(
         [
             delta.authentication_failures,
-            delta.protocol_failures,
+            delta.timeout_failures,
             delta.backend_failures,
         ],
         [0; 3]
@@ -559,25 +576,36 @@ async fn consensus_partial_retirement_control_eof_remains_a_failure(
         .local_addr()
         .expect("partial consensus retirement address");
     let server = tokio::spawn(async move {
-        let mut tls = accept_tls(&listener, &server_config, SESSION_CONSENSUS_ALPN).await;
-        let _: serde_json::Value = read_frame(&mut tls, DEFAULT_MAX_FRAME_SIZE)
-            .await
-            .expect("read partial-control consensus Hello");
-        let mut control = Vec::new();
-        write_frame(&mut control, &serde_json::json!({"Rejected": "Rejected"}))
-            .await
-            .expect("encode complete consensus retirement control");
-        control
-            .pop()
-            .expect("retirement control has a final byte to withhold");
-        tokio::io::AsyncWriteExt::write_all(&mut tls, &control)
-            .await
-            .expect("write incomplete consensus retirement control");
-        tokio::io::AsyncWriteExt::flush(&mut tls)
-            .await
-            .expect("flush incomplete consensus retirement control");
-        // The authenticated stream ends before the declared frame completes.
-        // It must remain a transport failure, never safe-retirement proof.
+        for attempt in 0..2 {
+            let mut tls = accept_tls(&listener, &server_config, SESSION_CONSENSUS_ALPN).await;
+            let _: serde_json::Value = read_frame(&mut tls, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read partial-control consensus Hello");
+            if attempt == 0 {
+                let mut control = Vec::new();
+                write_frame(&mut control, &serde_json::json!({"Rejected": "Rejected"}))
+                    .await
+                    .expect("encode complete consensus retirement control");
+                control
+                    .pop()
+                    .expect("retirement control has a final byte to withhold");
+                tokio::io::AsyncWriteExt::write_all(&mut tls, &control)
+                    .await
+                    .expect("write incomplete consensus retirement control");
+                tokio::io::AsyncWriteExt::flush(&mut tls)
+                    .await
+                    .expect("flush incomplete consensus retirement control");
+                // The first authenticated stream ends before the declared
+                // frame completes. It must remain a transport failure, never
+                // safe-retirement proof.
+                continue;
+            }
+            // A complete ordinary protocol rejection stops the retry only
+            // after the client has classified the incomplete first route.
+            write_frame(&mut tls, &serde_json::json!({"Rejected": "Protocol"}))
+                .await
+                .expect("write non-retryable consensus terminator");
+        }
     });
     let (_client_source, client_config) = pki.client_source(CLIENT_REPLICA);
     let binding = manifest
@@ -596,7 +624,7 @@ async fn consensus_partial_retirement_control_eof_remains_a_failure(
         binding,
         resolver(address),
         client_config,
-        Some(Duration::from_millis(80)),
+        Some(Duration::from_secs(2)),
     )
     .with_connection_lifecycle(lifecycle_policy());
     let before = MetricSnapshot::capture();
@@ -604,13 +632,15 @@ async fn consensus_partial_retirement_control_eof_remains_a_failure(
     assert!(peer.call(request).await.is_err());
     server.await.expect("partial consensus retirement server");
     let delta = MetricSnapshot::capture().since(before);
+    assert_eq!(delta.attempts, 2);
     assert!(delta.transport_failures >= 1);
+    assert!(delta.protocol_failures >= 1);
     assert!(delta.reconnect_failures >= 1);
     assert_eq!(delta.successes, 0);
     assert_eq!(
         [
             delta.authentication_failures,
-            delta.protocol_failures,
+            delta.timeout_failures,
             delta.backend_failures,
         ],
         [0; 3]
