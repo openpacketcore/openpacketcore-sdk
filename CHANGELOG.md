@@ -35,23 +35,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   envelopes, AAD, Openraft authority, SQLite state, HKMS/provider placement,
   and at-rest encryption are unchanged.
 - **Experimental production-mTLS session qualification checkpoint —
-  `opc-session-testkit`:** the default multiprocess node now consumes coherent
+  `opc-session-testkit`:** the default multiprocess node consumes coherent
   projected SVID material and uses the production authenticated session
-  consensus peer/server constructors with exact manifest SPIFFE binding and a
-  finite shared connection-lifecycle/reauthentication policy. A real
-  three-process, distinct-SQLite test reaches durable readiness and exercises
-  every directed fresh authenticated-TLS plus exact manifest-bootstrap path
-  while collecting redaction-safe material status, expiry, and lifecycle
-  metrics; it does not claim valid private ReadBarrier handler execution. The
-  historical loopback
-  plaintext foundation is isolated behind the explicit `foundation-insecure`
-  feature. A strict candidate-evidence schema prevents this initial checkpoint
-  from claiming seamless TLS rotation or completed production qualification;
-  the five-member multiprocess/deployed, overlap/removal,
-  rotation-under-traffic, expiry, drain/reconnect, platform, and soak matrices
-  remain open under #164/#158. Session payload
-  encryption, AAD, key-provider/HKMS boundaries, and durable formats are
-  unchanged.
+  consensus peer/server constructors with exact manifest SPIFFE binding and
+  production connection-lifecycle defaults. Its control boundary now reports
+  projected-source reload status separately from TLS-controller material
+  status, so source publication cannot be mistaken for handshake readiness.
+  Real three- and five-process, distinct-SQLite tests atomically replace
+  immutable Kubernetes-style `..data` generations through trust overlap,
+  per-member leaf and intermediate changes, pre-removal rollback, new-root
+  forward/rollback/forward, old-root removal, overlap-first post-removal
+  rollback, and a final new-only state. Every member transition requires both
+  status planes to advance, explicit process reauthentication, resolver-fresh
+  handshakes in both directions for every edge touching the changed member,
+  fresh durable readiness, and an encrypted canary read through every voter.
+  Each completed fleet phase proves all `N*(N-1)` directed paths and advances
+  the acknowledged lease/CAS canary. Separate stale
+  old-root clients are rejected by each live new-only server with a typed
+  authentication metric, and shutdown scans confirm the exact test canary
+  bytes are absent from SQLite/WAL/SHM. This is MemoryKeyProvider wrapper
+  evidence, not remote-HKMS qualification. The historical loopback
+  plaintext foundation remains behind `foundation-insecure`; the immutable v1
+  candidate schema still describes only its earlier formation checkpoint.
+  This bounded single-host core is experimental and non-deployed: expiry,
+  unavailable/malformed members, partition/restart, mixed watch/restore load,
+  reconnect storms, resource pressure, supported-platform, soak, and signed
+  candidate evidence remain open under #164/#158/#143. Session payload
+  encryption, AAD, key-provider/HKMS boundaries, durable formats, and
+  Openraft's sole authority are unchanged.
 - **Experimental HA qualification — `opc-consensus`, `opc-session-store`, and
   `opc-persist`:** both durable domains now use one fail-closed Openraft runtime
   profile and the exact `openpacketcore/openraft` revision
