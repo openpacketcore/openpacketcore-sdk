@@ -33,9 +33,10 @@ use crate::lifecycle::{
     SessionReauthenticationControl,
 };
 use crate::protocol::{
-    checked_frame_size, checked_wire_frame_size, negotiate_response_frame_size, read_frame,
-    read_frame_within, write_frame_bounded_until, write_frame_bounded_until_cancellable,
-    SessionConsensusBootstrapAck, SessionConsensusBootstrapHello, SessionConsensusBootstrapRequest,
+    checked_frame_size, checked_wire_frame_size, negotiate_response_frame_size,
+    read_authenticated_frame_within, read_frame, read_frame_within, write_frame_bounded_until,
+    write_frame_bounded_until_cancellable, SessionConsensusBootstrapAck,
+    SessionConsensusBootstrapHello, SessionConsensusBootstrapRequest,
     SessionConsensusBootstrapResponse, SessionConsensusTransportRequest,
     SessionConsensusTransportResponse, CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
     MAX_HANDSHAKE_FRAME_SIZE, MAX_NEGOTIATED_FRAME_SIZE, MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -227,6 +228,17 @@ fn record_consensus_server_connection_failure(error: &ProtocolError) {
         _ => &METRICS.session_net_connection_failure_protocol,
     }
     .fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_consensus_server_connection_outcome(result: &Result<(), ProtocolError>) {
+    match result {
+        Ok(()) => {
+            METRICS
+                .session_net_connection_successes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Err(error) => record_consensus_server_connection_failure(error),
+    }
 }
 
 fn map_tls_connect_error(error: io::Error) -> SessionConsensusPeerError {
@@ -1111,13 +1123,7 @@ impl SessionConsensusServer {
                         reauthentication,
                     )
                     .await;
-                    if let Err(error) = result {
-                        record_consensus_server_connection_failure(&error);
-                    } else {
-                        METRICS
-                            .session_net_connection_successes
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                    record_consensus_server_connection_outcome(&result);
                 });
                 registry.handles.push(handle);
             }
@@ -1842,10 +1848,14 @@ where
             biased;
             _ = hard_rx.changed() => return Ok(()),
             _ = retirement_rx.changed() => return Ok(()),
-            inbound = read_frame_within(reader, max_frame_size, idle_timeout) => inbound,
+            inbound = read_authenticated_frame_within(reader, max_frame_size, idle_timeout) => inbound,
         };
         let inbound: SessionConsensusTransportRequest = match inbound_result {
-            Ok(request) => request,
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                lifecycle.record_forced_retirement(RetirementReason::IdleTimeout);
+                return Ok(());
+            }
             Err(ProtocolError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 return Ok(());
             }
@@ -2041,6 +2051,166 @@ mod tests {
         .await
         .expect("encode valid consensus Hello");
         bytes
+    }
+
+    #[derive(Clone, Copy)]
+    struct ConnectionOutcomeMetricSnapshot {
+        idle_retirements: u64,
+        timeout_failures: u64,
+        successes: u64,
+        drain_started: u64,
+        drain_completed: u64,
+    }
+
+    fn connection_outcome_metrics() -> ConnectionOutcomeMetricSnapshot {
+        ConnectionOutcomeMetricSnapshot {
+            idle_retirements: METRICS
+                .session_net_lifecycle_retirement_idle_timeout
+                .load(Ordering::Relaxed),
+            timeout_failures: METRICS
+                .session_net_connection_failure_timeout
+                .load(Ordering::Relaxed),
+            successes: METRICS
+                .session_net_connection_successes
+                .load(Ordering::Relaxed),
+            drain_started: METRICS
+                .session_net_lifecycle_drain_started
+                .load(Ordering::Relaxed),
+            drain_completed: METRICS
+                .session_net_lifecycle_drain_completed
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    async fn wait_for_drain_completion(minimum: u64) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while METRICS
+                .session_net_lifecycle_drain_completed
+                .load(Ordering::Relaxed)
+                < minimum
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted consensus lifecycle task must release its draining metric");
+    }
+
+    async fn dispatch_after_authentication(
+        trailing_frame_bytes: &[u8],
+    ) -> (Result<(), ProtocolError>, Vec<u8>) {
+        let (server_binding, client_binding) = bindings();
+        let reauthentication = SessionReauthenticationControl::new();
+        let pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
+        let mut input = valid_consensus_hello_bytes(&client_binding).await;
+        input.extend_from_slice(trailing_frame_bytes);
+        let (mut peer, mut reader) = tokio::io::duplex(input.len() + 16);
+        peer.write_all(&input)
+            .await
+            .expect("write authenticated consensus test input");
+        let mut writer = Vec::new();
+        let cancellation = AtomicBool::new(false);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let result = dispatch_consensus(
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            server_binding,
+            Arc::new(CountingHandler(AtomicUsize::new(0))),
+            MAX_NEGOTIATED_FRAME_SIZE,
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            &cancellation,
+            shutdown_rx,
+            test_consensus_lifecycle_policy(),
+            reauthentication,
+        )
+        .await;
+        drop(peer);
+        (result, writer)
+    }
+
+    #[tokio::test]
+    async fn consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+
+        let before_idle = connection_outcome_metrics();
+        let (idle_result, acknowledgement) = dispatch_after_authentication(&[]).await;
+        record_consensus_server_connection_outcome(&idle_result);
+        idle_result.expect("byte-idle authenticated consensus connection is a policy retirement");
+        wait_for_drain_completion(before_idle.drain_completed + 1).await;
+        let after_idle = connection_outcome_metrics();
+        assert_eq!(
+            after_idle.idle_retirements,
+            before_idle.idle_retirements + 1
+        );
+        assert_eq!(after_idle.timeout_failures, before_idle.timeout_failures);
+        assert!(after_idle.successes > before_idle.successes);
+        assert!(after_idle.drain_started > before_idle.drain_started);
+        assert!(after_idle.drain_completed > before_idle.drain_completed);
+        let mut acknowledgement = std::io::Cursor::new(acknowledgement);
+        assert!(matches!(
+            read_frame::<_, SessionConsensusBootstrapResponse>(
+                &mut acknowledgement,
+                MAX_HANDSHAKE_FRAME_SIZE,
+            )
+            .await
+            .expect("decode authenticated consensus acknowledgement"),
+            SessionConsensusBootstrapResponse::Accepted(_)
+        ));
+
+        let before_partial = connection_outcome_metrics();
+        let (partial_result, _acknowledgement) = dispatch_after_authentication(&[0]).await;
+        assert!(matches!(
+            partial_result,
+            Err(ProtocolError::Io(ref error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
+        record_consensus_server_connection_outcome(&partial_result);
+        let after_partial = connection_outcome_metrics();
+        assert_eq!(
+            after_partial.idle_retirements, before_partial.idle_retirements,
+            "one active consensus frame byte must preserve the slowloris timeout failure"
+        );
+        assert!(after_partial.timeout_failures > before_partial.timeout_failures);
+
+        let before_handshake = connection_outcome_metrics();
+        let (server_binding, _client_binding) = bindings();
+        let reauthentication = SessionReauthenticationControl::new();
+        let pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
+        let (_peer, mut reader) = tokio::io::duplex(16);
+        let mut writer = Vec::new();
+        let cancellation = AtomicBool::new(false);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handshake_result = dispatch_consensus(
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            server_binding,
+            Arc::new(CountingHandler(AtomicUsize::new(0))),
+            MAX_NEGOTIATED_FRAME_SIZE,
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            &cancellation,
+            shutdown_rx,
+            test_consensus_lifecycle_policy(),
+            reauthentication,
+        )
+        .await;
+        assert!(matches!(
+            handshake_result,
+            Err(ProtocolError::Io(ref error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
+        record_consensus_server_connection_outcome(&handshake_result);
+        let after_handshake = connection_outcome_metrics();
+        assert_eq!(
+            after_handshake.idle_retirements,
+            before_handshake.idle_retirements
+        );
+        assert!(after_handshake.timeout_failures > before_handshake.timeout_failures);
     }
 
     #[tokio::test]

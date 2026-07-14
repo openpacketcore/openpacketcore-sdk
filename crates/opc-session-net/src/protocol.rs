@@ -3705,22 +3705,101 @@ where
     }
 }
 
-/// Deadline-bounded counterpart to [`read_request_frame`].
-pub(crate) async fn read_request_frame_within<R>(
+/// Read one post-authentication frame with an absolute idle deadline.
+///
+/// `Ok(None)` means the peer sent no byte before the next-request idle policy
+/// expired. Once any frame byte arrives, every remaining prefix/payload byte
+/// must arrive by the same deadline; a partial-frame stall remains a timed-out
+/// [`ProtocolError`] so authenticated slowloris behavior is never relabeled as
+/// a normal idle retirement.
+pub(crate) async fn read_authenticated_frame_within<R, T>(
     reader: &mut R,
     max_frame_size: usize,
     timeout: std::time::Duration,
-) -> Result<InboundRequest, ProtocolError>
+) -> Result<Option<T>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    let payload =
+        match read_authenticated_frame_payload_within(reader, max_frame_size, timeout).await? {
+            Some(payload) => payload,
+            None => return Ok(None),
+        };
+    serde_json::from_slice(&payload)
+        .map(Some)
+        .map_err(ProtocolError::Serialization)
+}
+
+async fn read_authenticated_frame_payload_within<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+    timeout: std::time::Duration,
+) -> Result<Option<Vec<u8>>, ProtocolError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    match tokio::time::timeout(timeout, read_request_frame(reader, max_frame_size)).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(ProtocolError::Io(std::io::Error::new(
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or(ProtocolError::InvalidWireValue)?;
+    let mut len_bytes = [0_u8; 4];
+    match tokio::time::timeout_at(deadline, reader.read_exact(&mut len_bytes[..1])).await {
+        Ok(result) => {
+            result.map_err(ProtocolError::Io)?;
+        }
+        Err(_) => return Ok(None),
+    }
+    read_exact_frame_bytes_until(reader, &mut len_bytes[1..], deadline).await?;
+    let len = usize::try_from(u32::from_be_bytes(len_bytes))
+        .map_err(|_| ProtocolError::InvalidWireValue)?;
+    if len > max_frame_size {
+        return Err(ProtocolError::FrameTooLarge(len));
+    }
+    let mut payload = vec![0_u8; len];
+    read_exact_frame_bytes_until(reader, &mut payload, deadline).await?;
+    Ok(Some(payload))
+}
+
+async fn read_exact_frame_bytes_until<R>(
+    reader: &mut R,
+    bytes: &mut [u8],
+    deadline: tokio::time::Instant,
+) -> Result<(), ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match tokio::time::timeout_at(deadline, reader.read_exact(bytes)).await {
+        Ok(result) => {
+            result.map_err(ProtocolError::Io)?;
+            Ok(())
+        }
+        Err(_) => Err(ProtocolError::Io(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            "timed out reading frame from peer",
+            "timed out reading active frame from peer",
         ))),
     }
+}
+
+/// Post-authentication request decoder that distinguishes a no-byte idle
+/// policy expiry from a partial active-frame timeout.
+pub(crate) async fn read_authenticated_request_frame_within<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+    timeout: std::time::Duration,
+) -> Result<Option<InboundRequest>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let payload =
+        match read_authenticated_frame_payload_within(reader, max_frame_size, timeout).await? {
+            Some(payload) => payload,
+            None => return Ok(None),
+        };
+    let wire =
+        serde_json::from_slice::<WireRequest>(&payload).map_err(ProtocolError::Serialization)?;
+    InboundRequest::try_from(wire)
+        .map(Some)
+        .map_err(|_| ProtocolError::InvalidWireValue)
 }
 
 #[cfg(test)]

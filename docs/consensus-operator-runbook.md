@@ -3114,6 +3114,15 @@ cargo test --locked -p opc-amf-lite --test config_consensus_encryption
 cargo test --locked -p opc-session-net --test consensus_transport
 ```
 
+The Linux projected-mTLS traffic/resource campaigns are manual and serialized.
+Run each alone from a clean host; they are intentionally ignored by the default
+workspace suite:
+
+```bash
+cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1
+cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1
+```
+
 Run the default package contract and formatting check:
 
 ```bash

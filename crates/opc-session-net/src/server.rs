@@ -41,8 +41,8 @@ use crate::protocol::{
     ensure_frame_fits_until as ensure_frame_fits_until_controlled,
     ensure_replication_log_success_frame_fits_until as ensure_replication_log_success_frame_fits_until_controlled,
     ensure_restore_scan_success_frame_fits_until as ensure_restore_scan_success_frame_fits_until_controlled,
-    get_result_matches_key, negotiate_response_frame_size, read_frame_within, read_request_frame,
-    read_request_frame_within, session_op_results_match_expectations,
+    get_result_matches_key, negotiate_response_frame_size, read_authenticated_request_frame_within,
+    read_frame_within, read_request_frame, session_op_results_match_expectations,
     validate_request_payload_limit, write_frame_bounded_until_cancellable, BootstrapHello,
     BootstrapHelloAck, BootstrapRequest, BootstrapResponse, HelloRejectReason, InboundRequest,
     Request, Response, CONTRACT_VERSION, CURRENT_CONTRACT_PROFILE, DEFAULT_MAX_FRAME_SIZE,
@@ -255,6 +255,17 @@ fn record_server_connection_failure(error: &ProtocolError) {
         _ => &METRICS.session_net_connection_failure_protocol,
     }
     .fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_server_connection_outcome(result: &Result<(), ProtocolError>) {
+    match result {
+        Ok(()) => {
+            METRICS
+                .session_net_connection_successes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Err(error) => record_server_connection_failure(error),
+    }
 }
 
 fn capabilities_for_transport(
@@ -1948,16 +1959,12 @@ impl SessionReplicationServer {
                                         dispatch_config,
                                     )
                                     .await;
+                                    record_server_connection_outcome(&result);
                                     if let Err(error) = result {
-                                        record_server_connection_failure(&error);
                                         tracing::debug!(
                                             reason = connection_failure_reason(&error),
                                             "connection handler exited"
                                         );
-                                    } else {
-                                        METRICS
-                                            .session_net_connection_successes
-                                            .fetch_add(1, Ordering::Relaxed);
                                     }
                                 });
                                 registry.handles.push(conn_handle);
@@ -2705,7 +2712,8 @@ where
         // sent to the backend, or inserted into an outcome cache. A complete
         // fixed response therefore proves that this request did not execute.
         let inbound_result = {
-            let inbound_read = read_request_frame_within(reader, max_frame_size, idle_timeout);
+            let inbound_read =
+                read_authenticated_request_frame_within(reader, max_frame_size, idle_timeout);
             tokio::pin!(inbound_read);
             let mut admitted_request = None;
             let retiring = if *retirement_rx.borrow() {
@@ -2730,7 +2738,7 @@ where
                     inbound = &mut inbound_read => inbound,
                 };
                 match correlated_request {
-                    Ok(_request_never_dispatched) => {
+                    Ok(Some(_request_never_dispatched)) => {
                         write_post_auth_response(
                             writer,
                             &Response::ConnectionRetiring,
@@ -2742,6 +2750,7 @@ where
                         .await?;
                         return Ok(());
                     }
+                    Ok(None) => return Ok(()),
                     Err(ProtocolError::Io(error))
                         if error.kind() == std::io::ErrorKind::UnexpectedEof =>
                     {
@@ -2756,7 +2765,11 @@ where
             }
         };
         let inbound = match inbound_result {
-            Ok(request) => request,
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                lifecycle.record_forced_retirement(RetirementReason::IdleTimeout);
+                return Ok(());
+            }
             Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
         };
@@ -3816,7 +3829,7 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId};
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     static TEST_NOT_CANCELLED: AtomicBool = AtomicBool::new(false);
     static TEST_SERVER_NOT_CANCELLED: std::sync::LazyLock<ServerCancellation> =
@@ -3912,6 +3925,151 @@ mod tests {
         .await
         .expect("encode valid bootstrap Hello");
         bytes
+    }
+
+    #[derive(Clone, Copy)]
+    struct ConnectionOutcomeMetricSnapshot {
+        idle_retirements: u64,
+        timeout_failures: u64,
+        successes: u64,
+        drain_started: u64,
+        drain_completed: u64,
+    }
+
+    fn connection_outcome_metrics() -> ConnectionOutcomeMetricSnapshot {
+        ConnectionOutcomeMetricSnapshot {
+            idle_retirements: METRICS
+                .session_net_lifecycle_retirement_idle_timeout
+                .load(Ordering::Relaxed),
+            timeout_failures: METRICS
+                .session_net_connection_failure_timeout
+                .load(Ordering::Relaxed),
+            successes: METRICS
+                .session_net_connection_successes
+                .load(Ordering::Relaxed),
+            drain_started: METRICS
+                .session_net_lifecycle_drain_started
+                .load(Ordering::Relaxed),
+            drain_completed: METRICS
+                .session_net_lifecycle_drain_completed
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    async fn wait_for_drain_completion(minimum: u64) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while METRICS
+                .session_net_lifecycle_drain_completed
+                .load(Ordering::Relaxed)
+                < minimum
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted lifecycle task must release its draining metric");
+    }
+
+    async fn dispatch_after_authentication(
+        trailing_frame_bytes: &[u8],
+    ) -> (Result<(), ProtocolError>, Vec<u8>) {
+        let reauthentication = SessionReauthenticationControl::new();
+        let pending = PendingServerLifecycle::insecure(reauthentication.generation());
+        let mut config = test_dispatch_config(reauthentication);
+        config.idle_timeout = Duration::from_millis(20);
+        let mut input = valid_bootstrap_hello_bytes().await;
+        input.extend_from_slice(trailing_frame_bytes);
+        let (mut peer, mut reader) = tokio::io::duplex(input.len() + 16);
+        peer.write_all(&input)
+            .await
+            .expect("write authenticated server test input");
+        let mut writer = Vec::new();
+        let result = dispatch(
+            Arc::new(opc_session_store::fake::FakeSessionBackend::new()),
+            Arc::new(StdMutex::new(CasIdempotencyCache::default())),
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            config,
+        )
+        .await;
+        drop(peer);
+        (result, writer)
+    }
+
+    #[tokio::test]
+    async fn generic_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+
+        let before_idle = connection_outcome_metrics();
+        let (idle_result, acknowledgement) = dispatch_after_authentication(&[]).await;
+        record_server_connection_outcome(&idle_result);
+        idle_result.expect("byte-idle authenticated connection is a policy retirement");
+        wait_for_drain_completion(before_idle.drain_completed + 1).await;
+        let after_idle = connection_outcome_metrics();
+        assert_eq!(
+            after_idle.idle_retirements,
+            before_idle.idle_retirements + 1
+        );
+        assert_eq!(after_idle.timeout_failures, before_idle.timeout_failures);
+        assert!(after_idle.successes > before_idle.successes);
+        assert!(after_idle.drain_started > before_idle.drain_started);
+        assert!(after_idle.drain_completed > before_idle.drain_completed);
+        let mut acknowledgement = std::io::Cursor::new(acknowledgement);
+        assert!(matches!(
+            read_frame::<_, BootstrapResponse>(&mut acknowledgement, MAX_HANDSHAKE_FRAME_SIZE)
+                .await
+                .expect("decode authenticated acknowledgement"),
+            BootstrapResponse::HelloAck(_)
+        ));
+
+        let before_partial = connection_outcome_metrics();
+        let (partial_result, _acknowledgement) = dispatch_after_authentication(&[0]).await;
+        assert!(matches!(
+            partial_result,
+            Err(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        record_server_connection_outcome(&partial_result);
+        let after_partial = connection_outcome_metrics();
+        assert_eq!(
+            after_partial.idle_retirements, before_partial.idle_retirements,
+            "one active frame byte must preserve the slowloris timeout failure"
+        );
+        assert!(after_partial.timeout_failures > before_partial.timeout_failures);
+
+        let before_handshake = connection_outcome_metrics();
+        let reauthentication = SessionReauthenticationControl::new();
+        let pending = PendingServerLifecycle::insecure(reauthentication.generation());
+        let mut config = test_dispatch_config(reauthentication);
+        config.idle_timeout = Duration::from_millis(20);
+        let (_peer, mut reader) = tokio::io::duplex(16);
+        let mut writer = Vec::new();
+        let handshake_result = dispatch(
+            Arc::new(opc_session_store::fake::FakeSessionBackend::new()),
+            Arc::new(StdMutex::new(CasIdempotencyCache::default())),
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            config,
+        )
+        .await;
+        assert!(matches!(
+            handshake_result,
+            Err(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        record_server_connection_outcome(&handshake_result);
+        let after_handshake = connection_outcome_metrics();
+        assert_eq!(
+            after_handshake.idle_retirements,
+            before_handshake.idle_retirements
+        );
+        assert!(after_handshake.timeout_failures > before_handshake.timeout_failures);
     }
 
     #[tokio::test]

@@ -134,6 +134,11 @@ mutation or rebuild authority beside Openraft.
   encoding, prefix, payload, and flush. Their checked sum is the post-decode
   lifetime. Full connection-slot occupancy has three bounded phases: one
   inbound `idle_timeout`, backend queue/work, and one outbound `idle_timeout`.
+  After authentication, receiving no byte of the next request during the
+  inbound interval is a bounded `idle_timeout` lifecycle retirement. Once any
+  frame byte arrives, the complete prefix and payload retain that same absolute
+  deadline; a partial-frame stall is a timeout failure. TLS/application
+  bootstrap silence is also a timeout failure, not a lifecycle retirement.
   `with_restore_scan_timeout` may further shorten cancellable restore work.
 - `RemoteSessionBackend::scan_restore_records` validates requests and peer
   pages against the exact request limit actually dispatched after frame
@@ -540,6 +545,14 @@ Retirement has these invariants:
   authentication, identity/scope, contract, protocol, and post-bootstrap
   engine rejections remain distinct and are never reclassified as this
   rotation control;
+- after acknowledgement, a connection that sends no byte of its next request
+  before the listener idle deadline retires with the fixed `idle_timeout`
+  lifecycle reason, completes the normal drain/slot-release path, and records a
+  successful connection-handler outcome without dispatching work. This applies
+  to both the production consensus listener and the quarantined direct
+  listener. Bootstrap silence remains a timeout failure. Once one byte of an
+  authenticated request frame arrives, a prefix/payload stall remains a
+  timeout failure and is never relabeled as benign idleness;
 - the fixed, fully decoded `ConnectionRetiring` response proves that a legacy
   direct mutation was not dispatched after bootstrap and is therefore the only
   post-bootstrap retirement signal that permits an automatic mutation retry;
@@ -567,20 +580,27 @@ protection and HKMS placement are also unchanged: encryption remains above
 consensus and the network lifecycle never receives plaintext, provider handles,
 or raw key material.
 
-The server records a connection-attempt `success` only after completely writing
-the bootstrap retirement control; the client records its own `success` only
-after decoding the complete control. In both cases `success` means authenticated
-transport/control completion rather than application admission. That decode
-initiates the client's existing bounded deadline/backoff path and records a
-reconnect `attempt`. The client records no reconnect `failure` or
-connection-failure outcome for the complete control. EOF and incomplete
-controls retain their ordinary transport/protocol failure accounting.
+The server records a connection-attempt `success` after completely writing the
+bootstrap retirement control, and also when an authenticated byte-idle handler
+finishes its bounded lifecycle retirement; the client records its own bootstrap
+`success` only after decoding the complete control. In each case `success`
+means authenticated transport/control completion rather than application
+admission. A decoded bootstrap retirement initiates the client's existing
+bounded deadline/backoff path and records a reconnect `attempt`. The client
+records no reconnect `failure` or connection-failure outcome for the complete
+control. EOF, incomplete controls, bootstrap timeouts, and partial active-frame
+timeouts retain their ordinary transport/protocol/timeout failure accounting.
 
 This closes only the narrow authenticated post-TLS/pre-acknowledgement rotation
-race. It does not complete #164's remaining multi-process trust-removal,
-short-lived-SVID, reconnect-storm, resource, or soak qualification.
+race. The existing single-host multi-process campaign now covers trust removal,
+bounded reconnects, and sampled resource regressions. Remaining #164/#143 gates
+include short-lived-SVID expiry/drain, partition/restart and unavailable or
+malformed reload fault matrices, deployed-network/platform-pressure evidence,
+supported-platform sizing, soak, remote HKMS, and signed release evidence.
 
-The exporter provides only closed, low-cardinality lifecycle dimensions:
+The exporter provides only closed, low-cardinality lifecycle dimensions. The
+connection-retirement reason set includes `idle_timeout` alongside the finite
+age, certificate, material-epoch, and explicit reasons:
 `opc_session_net_connection_retirements_total{reason}`, current
 `opc_session_net_connection_lifecycle{state}`,
 `opc_session_net_connection_drain_events_total{event}`,

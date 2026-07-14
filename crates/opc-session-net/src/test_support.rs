@@ -1,5 +1,9 @@
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 
+pub(crate) static SESSION_CONNECTION_METRICS_TEST_LOCK: std::sync::LazyLock<
+    tokio::sync::Mutex<()>,
+> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 pub(crate) struct RotatableServerMaterial {
     ca_certificate: rcgen::Certificate,
     ca_key: rcgen::KeyPair,

@@ -259,6 +259,7 @@ pub(crate) enum RetirementReason {
     PeerCertificateChainExpiry,
     MaterialEpoch,
     Explicit,
+    IdleTimeout,
 }
 
 const LIFECYCLE_METRIC_ACTIVE: u8 = 0;
@@ -343,6 +344,7 @@ impl RetirementReason {
             Self::PeerCertificateChainExpiry => "peer_certificate_chain_expiry",
             Self::MaterialEpoch => "material_epoch",
             Self::Explicit => "explicit",
+            Self::IdleTimeout => "idle_timeout",
         }
     }
 
@@ -359,6 +361,7 @@ impl RetirementReason {
             }
             Self::MaterialEpoch => &METRICS.session_net_lifecycle_retirement_material_epoch,
             Self::Explicit => &METRICS.session_net_lifecycle_retirement_explicit,
+            Self::IdleTimeout => &METRICS.session_net_lifecycle_retirement_idle_timeout,
         }
     }
 }
