@@ -1,26 +1,31 @@
 //! Experimental qualification profile and multi-process node protocol.
 //!
-//! The plaintext node protocol exists only to qualify Openraft, SQLite, and
-//! the exact consensus framing independently from the still-open seamless TLS
-//! rotation work. It is never a production transport and is deliberately
-//! confined to this unpublished testkit crate.
+//! The node protocol supports a production-constructor projected-SVID mTLS
+//! candidate path. Its older loopback plaintext foundation remains available
+//! only behind the testkit's explicit `foundation-insecure` feature and never
+//! counts as TLS-rotation evidence.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
+use opc_identity::projected_svid::{
+    MAX_PROJECTED_SVID_BUNDLE_FILES, MIN_PROJECTED_SVID_POLL_INTERVAL,
+};
 use opc_session_net::{
-    SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
+    ConnectionLifecyclePolicy, SessionClusterId, SessionConfigurationEpoch,
+    SessionConfigurationGeneration,
 };
 use opc_session_store::{
     validate_session_ttl, OwnerId, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
     ReplicaId, ReplicaTlsIdentity, STABLE_ID_MAX_BYTES,
 };
-use opc_types::SpiffeId;
+use opc_tls::{TlsMaterialAvailability, TlsMaterialReloadReason, TlsMaterialStatus};
+use opc_types::{SpiffeId, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,6 +45,9 @@ pub const SESSION_HA_SCHEDULE_SCHEMA_JSON: &str =
 /// JSON Schema for one experimental qualification evidence record.
 pub const SESSION_HA_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v2/session-ha-evidence.schema.json");
+/// Strict schema for one incomplete production-mTLS harness checkpoint.
+pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
+    include_str!("../qualification/v1/session-mtls-candidate-evidence.schema.json");
 
 /// Version of the private node-control protocol.
 pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 1;
@@ -54,6 +62,8 @@ pub const QUALIFICATION_MAX_LEASE_HANDLES: usize = 1024;
 /// Exact operation timeout pinned by the experimental profile.
 pub const QUALIFICATION_OPERATION_TIMEOUT_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Largest accepted finite lifecycle field in the private harness config.
+pub const QUALIFICATION_MAX_LIFECYCLE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 
 /// Machine-readable experimental session-HA profile.
 #[derive(Debug, Clone, Deserialize)]
@@ -204,7 +214,7 @@ pub struct QualificationEvidenceRequirements {
     pub unresolved_dependencies: Vec<u64>,
 }
 
-/// Configuration for one real process in the plaintext qualification fleet.
+/// Configuration for one real process in the qualification fleet.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationNodeConfig {
@@ -220,10 +230,12 @@ pub struct QualificationNodeConfig {
     pub database_path: PathBuf,
     pub snapshot_directory: PathBuf,
     pub operation_timeout_millis: u64,
+    #[serde(default)]
+    pub transport: QualificationTransportConfig,
 }
 
 impl QualificationNodeConfig {
-    /// Validate all allocation, path, topology, and plaintext-lab boundaries.
+    /// Validate all allocation, path, topology, and transport boundaries.
     pub fn validate(&self) -> Result<(), QualificationConfigError> {
         if self.schema_version != QUALIFICATION_NODE_SCHEMA_VERSION {
             return Err(QualificationConfigError::Schema);
@@ -248,6 +260,10 @@ impl QualificationNodeConfig {
             || !self
                 .snapshot_directory
                 .starts_with(&self.workspace_directory)
+            || self
+                .transport
+                .validate(&self.workspace_directory, self.operation_timeout_millis)
+                .is_err()
         {
             return Err(QualificationConfigError::Configuration);
         }
@@ -309,8 +325,161 @@ impl fmt::Debug for QualificationNodeConfig {
             .field("database_path", &"<redacted>")
             .field("snapshot_directory", &"<redacted>")
             .field("operation_timeout_millis", &self.operation_timeout_millis)
+            .field("transport", &self.transport)
             .finish()
     }
+}
+
+/// Transport selected by one qualification node.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "mode",
+    content = "configuration",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum QualificationTransportConfig {
+    /// Historical loopback-only foundation. Runtime support is feature-gated.
+    #[default]
+    LoopbackPlaintextTestOnly,
+    /// Production mTLS constructors backed by one coherent projected source.
+    ProjectedMtls(QualificationProjectedMtlsConfig),
+}
+
+impl fmt::Debug for QualificationTransportConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoopbackPlaintextTestOnly => {
+                formatter.write_str("QualificationTransportConfig::LoopbackPlaintextTestOnly")
+            }
+            Self::ProjectedMtls(config) => formatter
+                .debug_tuple("QualificationTransportConfig::ProjectedMtls")
+                .field(config)
+                .finish(),
+        }
+    }
+}
+
+impl QualificationTransportConfig {
+    fn validate(
+        &self,
+        workspace_directory: &Path,
+        operation_timeout_millis: u64,
+    ) -> Result<(), QualificationConfigError> {
+        match self {
+            Self::LoopbackPlaintextTestOnly => Ok(()),
+            Self::ProjectedMtls(config) => {
+                config.validate(workspace_directory, operation_timeout_millis)
+            }
+        }
+    }
+}
+
+/// Bounded projected-SVID and connection-lifecycle settings for mTLS.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationProjectedMtlsConfig {
+    pub projected_volume_root: PathBuf,
+    pub certificate_file: PathBuf,
+    pub private_key_file: PathBuf,
+    pub trust_bundle_files: Vec<PathBuf>,
+    pub poll_interval_millis: u64,
+    pub lifecycle: QualificationConnectionLifecycleConfig,
+}
+
+impl fmt::Debug for QualificationProjectedMtlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QualificationProjectedMtlsConfig")
+            .field("projected_volume_root", &"<redacted>")
+            .field("certificate_file", &"<redacted>")
+            .field("private_key_file", &"<redacted>")
+            .field("trust_bundle_file_count", &self.trust_bundle_files.len())
+            .field("poll_interval_millis", &self.poll_interval_millis)
+            .field("lifecycle", &self.lifecycle)
+            .finish()
+    }
+}
+
+impl QualificationProjectedMtlsConfig {
+    fn validate(
+        &self,
+        workspace_directory: &Path,
+        operation_timeout_millis: u64,
+    ) -> Result<(), QualificationConfigError> {
+        let poll_interval = Duration::from_millis(self.poll_interval_millis);
+        if !self.projected_volume_root.is_absolute()
+            || !self.projected_volume_root.starts_with(workspace_directory)
+            || self.projected_volume_root == workspace_directory
+            || !is_normalized_relative_path(&self.certificate_file)
+            || !is_normalized_relative_path(&self.private_key_file)
+            || self.trust_bundle_files.is_empty()
+            || self.trust_bundle_files.len() > MAX_PROJECTED_SVID_BUNDLE_FILES
+            || self
+                .trust_bundle_files
+                .iter()
+                .any(|path| !is_normalized_relative_path(path))
+            || self.certificate_file == self.private_key_file
+            || self
+                .trust_bundle_files
+                .iter()
+                .any(|path| path == &self.certificate_file || path == &self.private_key_file)
+            || self.trust_bundle_files.iter().collect::<HashSet<_>>().len()
+                != self.trust_bundle_files.len()
+            || poll_interval < MIN_PROJECTED_SVID_POLL_INTERVAL
+            || self.poll_interval_millis > operation_timeout_millis
+            || self.lifecycle.to_policy().is_err()
+        {
+            return Err(QualificationConfigError::Transport);
+        }
+        Ok(())
+    }
+}
+
+/// Exact finite connection retirement and reconnect policy used by a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationConnectionLifecycleConfig {
+    pub maximum_authentication_age_millis: u64,
+    pub rotation_drain_window_millis: u64,
+    pub reconnect_backoff_min_millis: u64,
+    pub reconnect_backoff_max_millis: u64,
+    pub rotation_jitter_millis: u64,
+}
+
+impl QualificationConnectionLifecycleConfig {
+    /// Validate and construct the production transport lifecycle policy.
+    pub fn to_policy(self) -> Result<ConnectionLifecyclePolicy, QualificationConfigError> {
+        let values = [
+            self.maximum_authentication_age_millis,
+            self.rotation_drain_window_millis,
+            self.reconnect_backoff_min_millis,
+            self.reconnect_backoff_max_millis,
+            self.rotation_jitter_millis,
+        ];
+        if values
+            .into_iter()
+            .any(|value| value > QUALIFICATION_MAX_LIFECYCLE_MILLIS)
+        {
+            return Err(QualificationConfigError::Transport);
+        }
+        ConnectionLifecyclePolicy::try_new(
+            Duration::from_millis(self.maximum_authentication_age_millis),
+            Duration::from_millis(self.rotation_drain_window_millis),
+            Duration::from_millis(self.reconnect_backoff_min_millis),
+            Duration::from_millis(self.reconnect_backoff_max_millis),
+            Duration::from_millis(self.rotation_jitter_millis),
+        )
+        .map_err(|_| QualificationConfigError::Transport)
+    }
+}
+
+fn is_normalized_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn is_bounded_label(value: &str, maximum: usize) -> bool {
@@ -397,6 +566,8 @@ pub enum QualificationConfigError {
     Configuration,
     #[error("qualification member descriptor is invalid")]
     Member,
+    #[error("qualification transport configuration is invalid")]
+    Transport,
 }
 
 /// Bounded commands accepted by one qualification child process.
@@ -406,6 +577,18 @@ pub enum QualificationNodeCommand {
     Configure,
     Initialize,
     Probe,
+    MaterialStatus,
+    RequestReauthentication,
+    /// Prove one fresh authenticated TLS connection and exact manifest-bound
+    /// consensus bootstrap to a configured remote node.
+    ///
+    /// An exact authenticated `Protocol` application result also satisfies
+    /// this transport proof; this command does not claim valid private
+    /// ReadBarrier handler execution.
+    DirectedHandshake {
+        remote_node_index: usize,
+    },
+    LifecycleMetrics,
     Acquire {
         lease_handle: String,
         stable_id: String,
@@ -434,6 +617,17 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::Configure => formatter.write_str("QualificationNodeCommand::Configure"),
             Self::Initialize => formatter.write_str("QualificationNodeCommand::Initialize"),
             Self::Probe => formatter.write_str("QualificationNodeCommand::Probe"),
+            Self::MaterialStatus => formatter.write_str("QualificationNodeCommand::MaterialStatus"),
+            Self::RequestReauthentication => {
+                formatter.write_str("QualificationNodeCommand::RequestReauthentication")
+            }
+            Self::DirectedHandshake { remote_node_index } => formatter
+                .debug_struct("QualificationNodeCommand::DirectedHandshake")
+                .field("remote_node_index", remote_node_index)
+                .finish(),
+            Self::LifecycleMetrics => {
+                formatter.write_str("QualificationNodeCommand::LifecycleMetrics")
+            }
             Self::Acquire { .. } => formatter.write_str("QualificationNodeCommand::Acquire"),
             Self::CompareAndSet { value, .. } => formatter
                 .debug_struct("QualificationNodeCommand::CompareAndSet")
@@ -451,7 +645,20 @@ impl QualificationNodeCommand {
     /// consulted by the child process.
     pub fn validate(&self) -> Result<(), QualificationCommandError> {
         match self {
-            Self::Configure | Self::Initialize | Self::Probe | Self::Shutdown => Ok(()),
+            Self::Configure
+            | Self::Initialize
+            | Self::Probe
+            | Self::MaterialStatus
+            | Self::RequestReauthentication
+            | Self::LifecycleMetrics
+            | Self::Shutdown => Ok(()),
+            Self::DirectedHandshake { remote_node_index } => {
+                if *remote_node_index < 5 {
+                    Ok(())
+                } else {
+                    Err(QualificationCommandError::NodeIndex)
+                }
+            }
             Self::Acquire {
                 lease_handle,
                 stable_id,
@@ -510,6 +717,8 @@ fn validate_stable_id(value: &str) -> Result<(), QualificationCommandError> {
 /// Fixed validation failures for the child control boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QualificationCommandError {
+    #[error("qualification node index is invalid")]
+    NodeIndex,
     #[error("qualification lease handle is invalid")]
     LeaseHandle,
     #[error("qualification stable ID is invalid")]
@@ -547,6 +756,21 @@ pub enum QualificationNodeReply {
         committed_index: Option<u64>,
         applied_index: Option<u64>,
     },
+    MaterialStatus {
+        status: QualificationTlsMaterialStatus,
+    },
+    ReauthenticationRequested {
+        generation: u64,
+    },
+    /// Successful authenticated TLS plus exact manifest-bootstrap proof.
+    /// This reply does not attest to valid ReadBarrier handler execution.
+    DirectedHandshake {
+        remote_node_index: usize,
+        reauthentication_generation: u64,
+    },
+    LifecycleMetrics {
+        metrics: QualificationConnectionLifecycleMetrics,
+    },
     LeaseAcquired {
         fence: u64,
     },
@@ -578,6 +802,114 @@ pub enum QualificationReadinessCode {
     RecoveryRequired,
 }
 
+/// Redaction-safe TLS material state emitted by a qualification child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationTlsMaterialStatus {
+    pub epoch: u64,
+    pub availability: QualificationTlsMaterialAvailability,
+    pub reason: Option<QualificationTlsMaterialReason>,
+    pub leaf_expires_at: Option<Timestamp>,
+    pub certificate_chain_expires_at: Option<Timestamp>,
+}
+
+impl From<TlsMaterialStatus> for QualificationTlsMaterialStatus {
+    fn from(status: TlsMaterialStatus) -> Self {
+        Self {
+            epoch: status.epoch().get(),
+            availability: status.availability().into(),
+            reason: status.reason().map(Into::into),
+            leaf_expires_at: status.leaf_expires_at(),
+            certificate_chain_expires_at: status.certificate_chain_expires_at(),
+        }
+    }
+}
+
+/// Closed TLS material availability vocabulary for qualification evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationTlsMaterialAvailability {
+    Initializing,
+    Ready,
+    RetainingLastGood,
+    Unavailable,
+}
+
+impl From<TlsMaterialAvailability> for QualificationTlsMaterialAvailability {
+    fn from(availability: TlsMaterialAvailability) -> Self {
+        match availability {
+            TlsMaterialAvailability::Initializing => Self::Initializing,
+            TlsMaterialAvailability::Ready => Self::Ready,
+            TlsMaterialAvailability::RetainingLastGood => Self::RetainingLastGood,
+            TlsMaterialAvailability::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// Closed TLS material reason vocabulary for qualification evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationTlsMaterialReason {
+    AwaitingInitialMaterial,
+    MaterialUnavailable,
+    SourceClosed,
+    MaterialLimitExceeded,
+    InvalidCertificateChain,
+    PrivateKeyMismatch,
+    ExpiredMaterial,
+    NotYetValidMaterial,
+    InvalidWorkloadIdentity,
+    LocalIdentityChanged,
+    LastGoodExpired,
+    EpochExhausted,
+}
+
+impl From<TlsMaterialReloadReason> for QualificationTlsMaterialReason {
+    fn from(reason: TlsMaterialReloadReason) -> Self {
+        match reason {
+            TlsMaterialReloadReason::AwaitingInitialMaterial => Self::AwaitingInitialMaterial,
+            TlsMaterialReloadReason::MaterialUnavailable => Self::MaterialUnavailable,
+            TlsMaterialReloadReason::SourceClosed => Self::SourceClosed,
+            TlsMaterialReloadReason::MaterialLimitExceeded => Self::MaterialLimitExceeded,
+            TlsMaterialReloadReason::InvalidCertificateChain => Self::InvalidCertificateChain,
+            TlsMaterialReloadReason::PrivateKeyMismatch => Self::PrivateKeyMismatch,
+            TlsMaterialReloadReason::ExpiredMaterial => Self::ExpiredMaterial,
+            TlsMaterialReloadReason::NotYetValidMaterial => Self::NotYetValidMaterial,
+            TlsMaterialReloadReason::InvalidWorkloadIdentity => Self::InvalidWorkloadIdentity,
+            TlsMaterialReloadReason::LocalIdentityChanged => Self::LocalIdentityChanged,
+            TlsMaterialReloadReason::LastGoodExpired => Self::LastGoodExpired,
+            TlsMaterialReloadReason::EpochExhausted => Self::EpochExhausted,
+        }
+    }
+}
+
+/// Fixed-cardinality process-local lifecycle metrics captured at one instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationConnectionLifecycleMetrics {
+    pub retirement_maximum_age: u64,
+    pub retirement_local_leaf_expiry: u64,
+    pub retirement_peer_leaf_expiry: u64,
+    pub retirement_local_certificate_chain_expiry: u64,
+    pub retirement_peer_certificate_chain_expiry: u64,
+    pub retirement_material_epoch: u64,
+    pub retirement_explicit: u64,
+    pub active_connections: i64,
+    pub draining_connections: i64,
+    pub drain_started: u64,
+    pub drain_completed: u64,
+    pub drain_overruns: u64,
+    pub connection_attempts: u64,
+    pub connection_successes: u64,
+    pub connection_failure_transport: u64,
+    pub connection_failure_authentication: u64,
+    pub connection_failure_timeout: u64,
+    pub connection_failure_protocol: u64,
+    pub connection_failure_backend: u64,
+    pub reconnect_attempts: u64,
+    pub reconnect_failures: u64,
+}
+
 /// Low-cardinality child-process error codes; raw backend errors never cross
 /// the control boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +922,9 @@ pub enum QualificationNodeErrorCode {
     LeaseHandleDuplicate,
     LeaseHandleMissing,
     MutationRejected,
+    TransportUnavailable,
+    MaterialUnavailable,
+    DirectedHandshakeUnavailable,
 }
 
 /// Bounded JSON-line decoding failure.
@@ -730,6 +1065,7 @@ mod tests {
             database_path: PathBuf::from("/qualification/node.sqlite"),
             snapshot_directory: PathBuf::from("/qualification/snapshots"),
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+            transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         };
         assert_eq!(config.validate(), Err(QualificationConfigError::Member));
     }
@@ -764,6 +1100,7 @@ mod tests {
             database_path: PathBuf::from("/qualification/node.sqlite"),
             snapshot_directory: PathBuf::from("/qualification/snapshots"),
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+            transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         }
     }
 
@@ -827,6 +1164,48 @@ mod tests {
         assert_eq!(
             invalid_generation.validate(),
             Err(QualificationCommandError::Generation)
+        );
+
+        assert_eq!(
+            QualificationNodeCommand::DirectedHandshake {
+                remote_node_index: 5,
+            }
+            .validate(),
+            Err(QualificationCommandError::NodeIndex)
+        );
+    }
+
+    #[test]
+    fn projected_mtls_config_is_bounded_and_redacts_material_paths() {
+        let mut config = valid_config();
+        config.transport =
+            QualificationTransportConfig::ProjectedMtls(QualificationProjectedMtlsConfig {
+                projected_volume_root: PathBuf::from("/qualification/projected"),
+                certificate_file: PathBuf::from("tls.crt"),
+                private_key_file: PathBuf::from("tls.key"),
+                trust_bundle_files: vec![PathBuf::from("ca.crt")],
+                poll_interval_millis: 100,
+                lifecycle: QualificationConnectionLifecycleConfig {
+                    maximum_authentication_age_millis: 60_000,
+                    rotation_drain_window_millis: 5_000,
+                    reconnect_backoff_min_millis: 25,
+                    reconnect_backoff_max_millis: 250,
+                    rotation_jitter_millis: 1_000,
+                },
+            });
+        assert_eq!(config.validate(), Ok(()));
+        let rendered = format!("{config:?}");
+        for path in ["/qualification/projected", "tls.crt", "tls.key", "ca.crt"] {
+            assert!(!rendered.contains(path));
+        }
+
+        let QualificationTransportConfig::ProjectedMtls(projected) = &mut config.transport else {
+            panic!("projected transport")
+        };
+        projected.certificate_file = PathBuf::from("../tls.crt");
+        assert_eq!(
+            config.validate(),
+            Err(QualificationConfigError::Configuration)
         );
     }
 

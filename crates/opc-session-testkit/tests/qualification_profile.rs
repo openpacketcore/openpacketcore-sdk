@@ -20,6 +20,7 @@ use opc_session_store::{
 use opc_session_testkit::qualification::{
     SessionHaQualificationProfile, SESSION_HA_EVIDENCE_SCHEMA_JSON, SESSION_HA_HISTORY_SCHEMA_JSON,
     SESSION_HA_PROFILE_JSON, SESSION_HA_PROFILE_SCHEMA_JSON, SESSION_HA_SCHEDULE_SCHEMA_JSON,
+    SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON,
 };
 use serde_json::Value;
 
@@ -28,6 +29,15 @@ const HISTORY_FIXTURE: &str = include_str!("fixtures/session-ha/history-valid.js
 const SCHEDULE_FIXTURE: &str = include_str!("fixtures/session-ha/schedule-valid.jsonl");
 const OMITTED_HISTORY_FIXTURE: &str =
     include_str!("fixtures/session-ha/history-invalid-omitted.jsonl");
+const MTLS_CANDIDATE_REMAINING_ACCEPTANCE: [&str; 7] = [
+    "five_member_mtls_matrix",
+    "projected_material_rotation_under_continuous_traffic",
+    "old_and_new_trust_overlap",
+    "post_overlap_old_trust_rejection",
+    "certificate_expiry_retirement",
+    "bounded_drain_and_reconnect_evidence",
+    "platform_and_soak_matrix",
+];
 
 fn run_checker(history: &str) -> Output {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -99,6 +109,32 @@ fn validate_structural_schema(schema: &Value, instance: &Value) -> Result<(), St
         &structural_schema_for_lightweight_validator(schema.clone()),
         instance,
     )
+}
+
+fn validate_mtls_candidate_evidence(schema: &Value, evidence: &Value) -> Result<(), String> {
+    validate_structural_schema(schema, evidence)?;
+    if evidence["topology"]["members"].as_u64() != Some(3)
+        || evidence["observations"]["directed_handshake_count"].as_u64() != Some(6)
+    {
+        return Err("mTLS candidate topology does not match the v1 checkpoint".to_owned());
+    }
+    let remaining = evidence["remaining_acceptance"]
+        .as_array()
+        .ok_or_else(|| "mTLS remaining acceptance is missing".to_owned())?;
+    let actual = remaining
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected = MTLS_CANDIDATE_REMAINING_ACCEPTANCE
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if remaining.len() != MTLS_CANDIDATE_REMAINING_ACCEPTANCE.len()
+        || actual.len() != remaining.len()
+        || actual != expected
+    {
+        return Err("mTLS remaining acceptance is not exact and unique".to_owned());
+    }
+    Ok(())
 }
 
 fn is_lower_hex(value: &str, width: usize) -> bool {
@@ -954,16 +990,20 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         })
     );
     let testkit = package("opc-session-testkit");
+    assert_eq!(
+        testkit["features"],
+        serde_json::json!({
+            "default": [],
+            "foundation-insecure": ["opc-session-net/insecure-test"]
+        })
+    );
     let foundation_network = testkit["dependencies"]
         .as_array()
         .expect("testkit dependencies")
         .iter()
         .find(|dependency| dependency["name"] == "opc-session-net")
         .expect("testkit session-net dependency");
-    assert_eq!(
-        foundation_network["features"],
-        serde_json::json!(["insecure-test"])
-    );
+    assert_eq!(foundation_network["features"], serde_json::json!([]));
 }
 
 #[test]
@@ -1141,4 +1181,75 @@ fn schemas_prevent_premature_production_or_tls_rotation_claims() {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ]);
     assert!(validate_exact_evidence_fields(&evidence).is_err());
+}
+
+#[test]
+fn mtls_candidate_checkpoint_is_strictly_incomplete_and_excludes_insecure_test() {
+    let schema: Value = serde_json::from_str(SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON)
+        .expect("mTLS candidate evidence schema JSON");
+    let mut evidence = serde_json::json!({
+        "schema_version": "opc-session-mtls-candidate-evidence/v1",
+        "experimental": true,
+        "qualification_complete": false,
+        "artifact": {
+            "crate_name": "opc-session-testkit",
+            "default_features_only": true,
+            "insecure_test_enabled": false
+        },
+        "topology": {
+            "members": 3,
+            "distinct_processes": true,
+            "distinct_sqlite_databases": true,
+            "transport_mode": "projected_svid_mtls",
+            "counts_for_seamless_tls_rotation": false
+        },
+        "observations": {
+            "material_status_collected": true,
+            "durable_readiness_reached": true,
+            "directed_fresh_handshakes_succeeded": true,
+            "directed_handshake_count": 6,
+            "lifecycle_metrics_collected": true
+        },
+        "remaining_acceptance": [
+            "five_member_mtls_matrix",
+            "projected_material_rotation_under_continuous_traffic",
+            "old_and_new_trust_overlap",
+            "post_overlap_old_trust_rejection",
+            "certificate_expiry_retirement",
+            "bounded_drain_and_reconnect_evidence",
+            "platform_and_soak_matrix"
+        ]
+    });
+    validate_mtls_candidate_evidence(&schema, &evidence)
+        .expect("candidate checkpoint satisfies strict schema");
+
+    evidence["qualification_complete"] = true.into();
+    assert!(validate_mtls_candidate_evidence(&schema, &evidence).is_err());
+    evidence["qualification_complete"] = false.into();
+    evidence["artifact"]["insecure_test_enabled"] = true.into();
+    assert!(validate_mtls_candidate_evidence(&schema, &evidence).is_err());
+    evidence["artifact"]["insecure_test_enabled"] = false.into();
+    evidence["topology"]["counts_for_seamless_tls_rotation"] = true.into();
+    assert!(validate_mtls_candidate_evidence(&schema, &evidence).is_err());
+
+    evidence["topology"]["counts_for_seamless_tls_rotation"] = false.into();
+    evidence["topology"]["members"] = 5.into();
+    evidence["observations"]["directed_handshake_count"] = 6.into();
+    assert!(validate_mtls_candidate_evidence(&schema, &evidence).is_err());
+
+    evidence["topology"]["members"] = 3.into();
+    let omitted = evidence["remaining_acceptance"]
+        .as_array_mut()
+        .expect("remaining acceptance array")
+        .pop()
+        .expect("remaining acceptance item");
+    assert!(validate_mtls_candidate_evidence(&schema, &evidence).is_err());
+    evidence["remaining_acceptance"]
+        .as_array_mut()
+        .expect("remaining acceptance array")
+        .push(omitted);
+
+    let duplicate = evidence["remaining_acceptance"][0].clone();
+    evidence["remaining_acceptance"][6] = duplicate;
+    assert!(validate_mtls_candidate_evidence(&schema, &evidence).is_err());
 }

@@ -17,9 +17,9 @@ use opc_session_testkit::qualification::{
     qualification_key_sha256, qualification_owner_sha256, qualification_value_sha256,
     read_bounded_json_line, write_json_line, QualificationMember, QualificationNodeCommand,
     QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
-    QualificationReadinessCode, SessionHaQualificationProfile, QUALIFICATION_NODE_SCHEMA_VERSION,
-    QUALIFICATION_OPERATION_TIMEOUT_MILLIS, SESSION_HA_EVIDENCE_SCHEMA_JSON,
-    SESSION_HA_PROFILE_JSON,
+    QualificationReadinessCode, QualificationTransportConfig, SessionHaQualificationProfile,
+    QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    SESSION_HA_EVIDENCE_SCHEMA_JSON, SESSION_HA_PROFILE_JSON,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1719,6 +1719,7 @@ impl CanonicalConfigurationManifest {
                 database_path: root.join(&paths.database_relative_path),
                 snapshot_directory: root.join(&paths.snapshot_relative_path),
                 operation_timeout_millis: self.operation_timeout_millis,
+                transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
             };
             config.validate().map_err(|_| HarnessError::Evidence)?;
             configs.push(config);

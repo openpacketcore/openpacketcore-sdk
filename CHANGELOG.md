@@ -34,6 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure/resource/soak, payload-key, and candidate-release evidence. Payload
   envelopes, AAD, Openraft authority, SQLite state, HKMS/provider placement,
   and at-rest encryption are unchanged.
+- **Experimental production-mTLS session qualification checkpoint —
+  `opc-session-testkit`:** the default multiprocess node now consumes coherent
+  projected SVID material and uses the production authenticated session
+  consensus peer/server constructors with exact manifest SPIFFE binding and a
+  finite shared connection-lifecycle/reauthentication policy. A real
+  three-process, distinct-SQLite test reaches durable readiness and exercises
+  every directed fresh authenticated-TLS plus exact manifest-bootstrap path
+  while collecting redaction-safe material status, expiry, and lifecycle
+  metrics; it does not claim valid private ReadBarrier handler execution. The
+  historical loopback
+  plaintext foundation is isolated behind the explicit `foundation-insecure`
+  feature. A strict candidate-evidence schema prevents this initial checkpoint
+  from claiming seamless TLS rotation or completed production qualification;
+  the five-member multiprocess/deployed, overlap/removal,
+  rotation-under-traffic, expiry, drain/reconnect, platform, and soak matrices
+  remain open under #164/#158. Session payload
+  encryption, AAD, key-provider/HKMS boundaries, and durable formats are
+  unchanged.
 - **Experimental HA qualification — `opc-consensus`, `opc-session-store`, and
   `opc-persist`:** both durable domains now use one fail-closed Openraft runtime
   profile and the exact `openpacketcore/openraft` revision
