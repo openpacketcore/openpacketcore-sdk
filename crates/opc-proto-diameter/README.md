@@ -30,7 +30,10 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   `AvpDataType`, `AvpFlagRules`, and related metadata types.
 - The `peer` feature adds transport-neutral CER/CEA, DWR/DWA, DPR/DPA
   builders/parsers, capability negotiation helpers, result-code helpers, and
-  `PeerSession` projection state.
+  `PeerSession` projection state. Its trusted CER/CEA command profiles permit
+  the six explicitly repeatable RFC 6733 capability AVPs, including every
+  advertised Host-IP-Address for an SCTP-multihomed peer; singleton fields and
+  the watchdog/disconnect profiles retain conservative duplicate rejection.
 - The `app-rf` feature adds typed Rf accounting helpers.
 - The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA helpers, including
   exact, fail-closed resolution of an opt-in top-level default

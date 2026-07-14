@@ -2919,6 +2919,232 @@ mod tests {
         }
     }
 
+    fn decode_peer_message_conservatively(encoded: &[u8]) -> Message<'_> {
+        match Message::decode_with_dictionary(
+            encoded,
+            DecodeContext::conservative(),
+            PEER_DICTIONARIES,
+        ) {
+            Ok((remaining, decoded)) => {
+                assert!(remaining.is_empty());
+                decoded
+            }
+            Err(error) => panic!("conservative peer message decode failed: {error}"),
+        }
+    }
+
+    fn assert_conservative_dictionary_duplicate(message: &OwnedMessage) {
+        let encoded = encode_owned(message);
+        let result = Message::decode_with_dictionary(
+            &encoded,
+            DecodeContext::conservative(),
+            PEER_DICTIONARIES,
+        );
+        assert!(matches!(
+            result,
+            Err(error) if matches!(error.code(), DecodeErrorCode::DuplicateIe)
+        ));
+    }
+
+    #[test]
+    fn multihomed_cer_and_cea_round_trip_with_conservative_dictionary_decode() {
+        let mut capabilities = sample_capabilities();
+        capabilities
+            .host_ip_addresses
+            .push(HostIpAddress::ipv4([198, 51, 100, 20]));
+
+        let request = match build_capabilities_exchange_request(
+            &capabilities,
+            0x0102_0304,
+            0x0506_0708,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("multihomed CER build failed: {error}"),
+        };
+        let encoded_request = encode_owned(&request);
+        let decoded_request = decode_peer_message_conservatively(&encoded_request);
+        match parse_capabilities_exchange_request(&decoded_request, DecodeContext::conservative()) {
+            Ok(parsed) => assert_eq!(parsed, capabilities),
+            Err(error) => panic!("multihomed CER parse failed: {error}"),
+        }
+
+        let answer = CapabilitiesExchangeAnswer {
+            result_code: RESULT_CODE_DIAMETER_SUCCESS,
+            capabilities,
+            diagnostics: AnswerDiagnostics::default(),
+        };
+        let built_answer = match build_capabilities_exchange_answer(
+            &answer,
+            0x0102_0304,
+            0x0506_0708,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("multihomed CEA build failed: {error}"),
+        };
+        let encoded_answer = encode_owned(&built_answer);
+        let decoded_answer = decode_peer_message_conservatively(&encoded_answer);
+        match parse_capabilities_exchange_answer(&decoded_answer, DecodeContext::conservative()) {
+            Ok(parsed) => assert_eq!(parsed, answer),
+            Err(error) => panic!("multihomed CEA parse failed: {error}"),
+        }
+    }
+
+    #[test]
+    fn raw_conservative_decode_retains_blanket_duplicate_rejection() {
+        let mut capabilities = sample_capabilities();
+        capabilities
+            .host_ip_addresses
+            .push(HostIpAddress::ipv4([198, 51, 100, 20]));
+        let request = match build_capabilities_exchange_request(
+            &capabilities,
+            0x0102_0304,
+            0x0506_0708,
+            EncodeContext::default(),
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("multihomed CER build failed: {error}"),
+        };
+        let encoded = encode_owned(&request);
+
+        let result = Message::decode(&encoded, DecodeContext::conservative());
+        assert!(matches!(
+            result,
+            Err(error) if matches!(error.code(), DecodeErrorCode::DuplicateIe)
+        ));
+    }
+
+    #[test]
+    fn capabilities_dictionary_rejects_singleton_duplicates() {
+        let mut duplicate_origin_host = BytesMut::new();
+        for host in ["aaa1.example.net", "aaa2.example.net"] {
+            if let Err(error) = append_utf8_avp(
+                &mut duplicate_origin_host,
+                AVP_ORIGIN_HOST,
+                host,
+                true,
+                EncodeContext::default(),
+            ) {
+                panic!("Origin-Host AVP build failed: {error}");
+            }
+        }
+        let request = match build_message(
+            peer_request_flags(PeerProcedure::CapabilitiesExchange),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            duplicate_origin_host,
+            1,
+            2,
+            EncodeContext::default(),
+            "5.3.1",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("duplicate Origin-Host CER build failed: {error}"),
+        };
+        assert_conservative_dictionary_duplicate(&request);
+
+        let mut duplicate_result_code = BytesMut::new();
+        for result_code in [
+            RESULT_CODE_DIAMETER_SUCCESS,
+            RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION,
+        ] {
+            if let Err(error) = append_u32_avp(
+                &mut duplicate_result_code,
+                AVP_RESULT_CODE,
+                result_code,
+                true,
+                EncodeContext::default(),
+            ) {
+                panic!("Result-Code AVP build failed: {error}");
+            }
+        }
+        let answer = match build_message(
+            peer_answer_flags(PeerProcedure::CapabilitiesExchange, false),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            duplicate_result_code,
+            1,
+            2,
+            EncodeContext::default(),
+            "5.3.2",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("duplicate Result-Code CEA build failed: {error}"),
+        };
+        assert_conservative_dictionary_duplicate(&answer);
+
+        let mut failed_value = BytesMut::new();
+        if let Err(error) = append_utf8_avp(
+            &mut failed_value,
+            AVP_ORIGIN_HOST,
+            "invalid.example.net",
+            true,
+            EncodeContext::default(),
+        ) {
+            panic!("nested Failed-AVP value build failed: {error}");
+        }
+        let mut duplicate_failed_avp = BytesMut::new();
+        for _ in 0..2 {
+            if let Err(error) = append_avp(
+                &mut duplicate_failed_avp,
+                AvpHeader::ietf(AVP_FAILED_AVP, true),
+                &failed_value,
+                EncodeContext::default(),
+            ) {
+                panic!("Failed-AVP build failed: {error}");
+            }
+        }
+        let answer = match build_message(
+            peer_answer_flags(PeerProcedure::CapabilitiesExchange, true),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            duplicate_failed_avp,
+            1,
+            2,
+            EncodeContext::default(),
+            "5.3.2",
+        ) {
+            Ok(message) => message,
+            Err(error) => panic!("duplicate Failed-AVP CEA build failed: {error}"),
+        };
+        assert_conservative_dictionary_duplicate(&answer);
+    }
+
+    #[test]
+    fn watchdog_and_disconnect_dictionary_decode_rejects_duplicates() {
+        for procedure in [PeerProcedure::DeviceWatchdog, PeerProcedure::DisconnectPeer] {
+            for kind in [CommandKind::Request, CommandKind::Answer] {
+                let mut duplicate_origin_host = BytesMut::new();
+                for host in ["aaa1.example.net", "aaa2.example.net"] {
+                    if let Err(error) = append_utf8_avp(
+                        &mut duplicate_origin_host,
+                        AVP_ORIGIN_HOST,
+                        host,
+                        true,
+                        EncodeContext::default(),
+                    ) {
+                        panic!("Origin-Host AVP build failed: {error}");
+                    }
+                }
+                let flags = match kind {
+                    CommandKind::Request => peer_request_flags(procedure),
+                    CommandKind::Answer => peer_answer_flags(procedure, false),
+                };
+                let message = match build_message(
+                    flags,
+                    procedure.command_code(),
+                    duplicate_origin_host,
+                    1,
+                    2,
+                    EncodeContext::default(),
+                    procedure.spec_section(kind),
+                ) {
+                    Ok(message) => message,
+                    Err(error) => panic!("peer message build failed: {error}"),
+                };
+                assert_conservative_dictionary_duplicate(&message);
+            }
+        }
+    }
+
     #[test]
     fn classifies_device_watchdog_answer() {
         let header = Header::new(
