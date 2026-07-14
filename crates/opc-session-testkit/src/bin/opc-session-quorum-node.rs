@@ -35,8 +35,8 @@ use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_value_sha256, read_bounded_json_line,
     write_json_line, QualificationConnectionLifecycleMetrics, QualificationNodeCommand,
     QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
-    QualificationReadinessCode, QualificationTlsMaterialStatus, QualificationTransportConfig,
-    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
+    QualificationProjectedSvidStatus, QualificationReadinessCode, QualificationTlsMaterialStatus,
+    QualificationTransportConfig, QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
 };
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder, TlsMaterialController,
@@ -75,7 +75,7 @@ enum QualificationTransportRuntime {
 }
 
 struct QualificationProjectedMtlsRuntime {
-    _source: ProjectedSvidSource,
+    source: ProjectedSvidSource,
     client_config: AuthenticatedClientConfig,
     reauthentication: SessionReauthenticationControl,
     directed_peers: BTreeMap<usize, QualificationDirectedPeer>,
@@ -260,6 +260,7 @@ impl QualificationNode {
                 },
             },
             QualificationNodeCommand::Probe => self.probe().await,
+            QualificationNodeCommand::ProjectedSourceStatus => self.projected_source_status(),
             QualificationNodeCommand::MaterialStatus => self.material_status(),
             QualificationNodeCommand::RequestReauthentication => self.request_reauthentication(),
             QualificationNodeCommand::DirectedHandshake { remote_node_index } => {
@@ -439,6 +440,17 @@ impl QualificationNode {
         };
         QualificationNodeReply::MaterialStatus {
             status: QualificationTlsMaterialStatus::from(transport.client_config.material_status()),
+        }
+    }
+
+    fn projected_source_status(&self) -> QualificationNodeReply {
+        let QualificationTransportRuntime::ProjectedMtls(transport) = &self.transport else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TransportUnavailable,
+            };
+        };
+        QualificationNodeReply::ProjectedSourceStatus {
+            status: QualificationProjectedSvidStatus::from(transport.source.status()),
         }
     }
 
@@ -775,7 +787,7 @@ async fn prepare_transport(
                 )),
                 QualificationTransportRuntime::ProjectedMtls(Box::new(
                     QualificationProjectedMtlsRuntime {
-                        _source: source,
+                        source,
                         client_config,
                         reauthentication,
                         directed_peers,

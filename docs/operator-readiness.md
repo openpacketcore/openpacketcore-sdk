@@ -849,6 +849,16 @@ draining gauge does not prove current-material authentication; require fresh
 durable readiness and exercise every directed peer path before old-trust
 removal.
 
+The private `opc-session-testkit` component core now runs the documented
+trust/leaf/intermediate/root forward and rollback order in separate three- and
+five-process fleets on one host. It uses atomic projected `..data` swaps,
+production lifecycle defaults, separate source/controller status, affected-path
+fresh handshakes after every member, all paths at completed fleet cutovers,
+fresh all-voter readiness, and an encrypted canary. This does not qualify a CNF
+deployment, expiry/drain behavior, fault and resource pressure, supported
+platforms, soak, remote HKMS, or signed release evidence; keep #164/#143 gates
+closed until those campaigns pass.
+
 ### Legacy direct-backend session-net v5 rollout boundary
 
 The opt-in legacy `opc-session-net` v5 surface carries cursor-paged remote

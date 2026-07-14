@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
 use opc_identity::projected_svid::{
+    ProjectedSvidAvailability, ProjectedSvidReloadReason, ProjectedSvidReloadStatus,
     MAX_PROJECTED_SVID_BUNDLE_FILES, MIN_PROJECTED_SVID_POLL_INTERVAL,
 };
 use opc_session_net::{
@@ -577,6 +578,7 @@ pub enum QualificationNodeCommand {
     Configure,
     Initialize,
     Probe,
+    ProjectedSourceStatus,
     MaterialStatus,
     RequestReauthentication,
     /// Prove one fresh authenticated TLS connection and exact manifest-bound
@@ -617,6 +619,9 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::Configure => formatter.write_str("QualificationNodeCommand::Configure"),
             Self::Initialize => formatter.write_str("QualificationNodeCommand::Initialize"),
             Self::Probe => formatter.write_str("QualificationNodeCommand::Probe"),
+            Self::ProjectedSourceStatus => {
+                formatter.write_str("QualificationNodeCommand::ProjectedSourceStatus")
+            }
             Self::MaterialStatus => formatter.write_str("QualificationNodeCommand::MaterialStatus"),
             Self::RequestReauthentication => {
                 formatter.write_str("QualificationNodeCommand::RequestReauthentication")
@@ -648,6 +653,7 @@ impl QualificationNodeCommand {
             Self::Configure
             | Self::Initialize
             | Self::Probe
+            | Self::ProjectedSourceStatus
             | Self::MaterialStatus
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
@@ -756,6 +762,9 @@ pub enum QualificationNodeReply {
         committed_index: Option<u64>,
         applied_index: Option<u64>,
     },
+    ProjectedSourceStatus {
+        status: QualificationProjectedSvidStatus,
+    },
     MaterialStatus {
         status: QualificationTlsMaterialStatus,
     },
@@ -790,6 +799,105 @@ pub enum QualificationNodeReply {
     Error {
         code: QualificationNodeErrorCode,
     },
+}
+
+/// Redaction-safe status from the projected-volume source, kept separate from
+/// the TLS controller status so a coherent file publication cannot be
+/// mistaken for handshake-ready material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationProjectedSvidStatus {
+    pub generation: u64,
+    pub availability: QualificationProjectedSvidAvailability,
+    pub reason: Option<QualificationProjectedSvidReason>,
+}
+
+impl From<ProjectedSvidReloadStatus> for QualificationProjectedSvidStatus {
+    fn from(status: ProjectedSvidReloadStatus) -> Self {
+        Self {
+            generation: status.generation(),
+            availability: status.availability().into(),
+            reason: status.reason().map(Into::into),
+        }
+    }
+}
+
+/// Closed projected-volume source availability vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationProjectedSvidAvailability {
+    Initializing,
+    Ready,
+    RetainingLastGood,
+    Unavailable,
+}
+
+impl From<ProjectedSvidAvailability> for QualificationProjectedSvidAvailability {
+    fn from(availability: ProjectedSvidAvailability) -> Self {
+        match availability {
+            ProjectedSvidAvailability::Initializing => Self::Initializing,
+            ProjectedSvidAvailability::Ready => Self::Ready,
+            ProjectedSvidAvailability::RetainingLastGood => Self::RetainingLastGood,
+            ProjectedSvidAvailability::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// Closed, redaction-safe projected-volume reload reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationProjectedSvidReason {
+    AwaitingInitialMaterial,
+    GenerationUnavailable,
+    InvalidGenerationLink,
+    GenerationChanged,
+    GenerationRetryLimit,
+    ReadAttemptTimeout,
+    MaterialUnavailable,
+    MaterialNotRegular,
+    MaterialFileTooLarge,
+    TotalMaterialTooLarge,
+    CertificateCountExceeded,
+    TrustAnchorCountExceeded,
+    MalformedCertificate,
+    MalformedPrivateKey,
+    MalformedTrustBundle,
+    InvalidCertificateChain,
+    PrivateKeyMismatch,
+    ExpiredSvid,
+    NotYetValidSvid,
+    InvalidWorkloadIdentity,
+    LastGoodExpired,
+    GenerationExhausted,
+}
+
+impl From<ProjectedSvidReloadReason> for QualificationProjectedSvidReason {
+    fn from(reason: ProjectedSvidReloadReason) -> Self {
+        match reason {
+            ProjectedSvidReloadReason::AwaitingInitialMaterial => Self::AwaitingInitialMaterial,
+            ProjectedSvidReloadReason::GenerationUnavailable => Self::GenerationUnavailable,
+            ProjectedSvidReloadReason::InvalidGenerationLink => Self::InvalidGenerationLink,
+            ProjectedSvidReloadReason::GenerationChanged => Self::GenerationChanged,
+            ProjectedSvidReloadReason::GenerationRetryLimit => Self::GenerationRetryLimit,
+            ProjectedSvidReloadReason::ReadAttemptTimeout => Self::ReadAttemptTimeout,
+            ProjectedSvidReloadReason::MaterialUnavailable => Self::MaterialUnavailable,
+            ProjectedSvidReloadReason::MaterialNotRegular => Self::MaterialNotRegular,
+            ProjectedSvidReloadReason::MaterialFileTooLarge => Self::MaterialFileTooLarge,
+            ProjectedSvidReloadReason::TotalMaterialTooLarge => Self::TotalMaterialTooLarge,
+            ProjectedSvidReloadReason::CertificateCountExceeded => Self::CertificateCountExceeded,
+            ProjectedSvidReloadReason::TrustAnchorCountExceeded => Self::TrustAnchorCountExceeded,
+            ProjectedSvidReloadReason::MalformedCertificate => Self::MalformedCertificate,
+            ProjectedSvidReloadReason::MalformedPrivateKey => Self::MalformedPrivateKey,
+            ProjectedSvidReloadReason::MalformedTrustBundle => Self::MalformedTrustBundle,
+            ProjectedSvidReloadReason::InvalidCertificateChain => Self::InvalidCertificateChain,
+            ProjectedSvidReloadReason::PrivateKeyMismatch => Self::PrivateKeyMismatch,
+            ProjectedSvidReloadReason::ExpiredSvid => Self::ExpiredSvid,
+            ProjectedSvidReloadReason::NotYetValidSvid => Self::NotYetValidSvid,
+            ProjectedSvidReloadReason::InvalidWorkloadIdentity => Self::InvalidWorkloadIdentity,
+            ProjectedSvidReloadReason::LastGoodExpired => Self::LastGoodExpired,
+            ProjectedSvidReloadReason::GenerationExhausted => Self::GenerationExhausted,
+        }
+    }
 }
 
 /// Closed durable-readiness result carried across the test control boundary.
@@ -1034,6 +1142,44 @@ mod tests {
             .expect("read bounded frame")
             .expect("frame present");
         assert!(matches!(second, QualificationNodeCommand::Probe));
+    }
+
+    #[test]
+    fn projected_source_status_has_a_distinct_strict_control_frame() {
+        let reply = QualificationNodeReply::ProjectedSourceStatus {
+            status: QualificationProjectedSvidStatus {
+                generation: 7,
+                availability: QualificationProjectedSvidAvailability::Ready,
+                reason: None,
+            },
+        };
+        let mut encoded = Vec::new();
+        write_json_line(&mut encoded, &reply).expect("encode projected status");
+        let text = std::str::from_utf8(&encoded).expect("status is JSON");
+        assert!(text.contains("projected_source_status"));
+        assert!(!text.contains("material_status"));
+        assert!(!text.contains("tls.crt"));
+        assert!(!text.contains("..data"));
+
+        let mut reader = io::BufReader::new(encoded.as_slice());
+        let decoded = read_bounded_json_line::<_, QualificationNodeReply>(&mut reader)
+            .expect("decode projected status")
+            .expect("projected status frame");
+        assert!(matches!(
+            decoded,
+            QualificationNodeReply::ProjectedSourceStatus {
+                status: QualificationProjectedSvidStatus {
+                    generation: 7,
+                    availability: QualificationProjectedSvidAvailability::Ready,
+                    reason: None,
+                },
+            }
+        ));
+
+        let with_unknown = text
+            .trim_end()
+            .replace("\"reason\":null}", "\"reason\":null,\"path\":\"secret\"}");
+        assert!(serde_json::from_str::<QualificationNodeReply>(&with_unknown).is_err());
     }
 
     #[test]
