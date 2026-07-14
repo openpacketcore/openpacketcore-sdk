@@ -346,6 +346,28 @@ that depends on that root, rather than selectively revoking one credential.
 Treat any requirement for immediate generic per-credential revocation as
 unsupported, not as evidence provided by a rotation campaign.
 
+The SDK's non-ignored single-host regression qualification exercises this
+lifecycle in separate three- and five-process Openraft/SQLite fleets. A
+test-only consensus-RPC admission gate removes one stable follower while a
+different member publishes malformed trust and retains its exact last-good TLS
+epoch; survivors must remain durably ready and advance an encrypted canary.
+The test restarts the gated member at the exact manifest address, proves
+catch-up, repairs the malformed member, and proves its retained-last-good retry
+counter stops. It then publishes a same-issuer leaf with a 75-second
+remaining-validity/expiry budget. The fixed 30-second drain window establishes
+an `expiry - 30 seconds` soft boundary, followed by complete hard-deadline drain
+and source/controller `LastGoodExpired`; survivors continue canary progress and
+a valid long-lived leaf restores the affected member in the same process.
+
+This evidence does not authorize an operator to treat the admission gate as a
+real or deployed network partition. It carries no mixed traffic/watch/restore
+load, broader restart/fault matrix, resource/soak result, remote-HKMS result,
+deployed-CNF result, signed release evidence, or evidence-schema/profile claim.
+It does not alter this runbook's executable CNF campaign or alarms. Openraft
+remains the sole commit authority, and payload encryption, AAD,
+key-provider/HKMS placement, SQLite/Openraft durable formats, and
+encryption-at-rest responsibilities remain unchanged.
+
 ### 7.1 Required CNF wiring and signals
 
 Construct one shared `TlsMaterialController` per process through the projected
@@ -3075,10 +3097,13 @@ Use coordinated recovery rather than enabling plaintext or weakening identity
 checks.
 
 #163 provides the in-process bounded-retirement and request/watch continuity
-mechanism. #164/#143 still gate production claims on multi-process trust
-overlap/removal, short-lived-SVID expiry, root-cutover, reconnect-storm,
-resource, and soak evidence. These semantics do not provide fleet qualification
-or close either issue.
+mechanism. The single-host multi-process campaigns now cover trust
+overlap/removal plus the exact synthetic fault/expiry recovery slice described
+above. #164/#143 still gate production claims on deployed trust/root cutover,
+real network/storage partition and broader restart/fault behavior, mixed
+traffic/watch/restore during faults, reconnect storms, resource/soak, remote
+HKMS, deployed CNF, and signed release evidence. These semantics do not provide
+production fleet qualification or close either issue.
 
 ## 8. Snapshots, backups, and rollback
 
@@ -3121,6 +3146,14 @@ workspace suite:
 ```bash
 cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1
 cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1
+```
+
+The bounded single-host fault/expiry scenarios are non-ignored. Run their
+three- and five-process cases exactly and serially:
+
+```bash
+cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1
+cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1
 ```
 
 Run the default package contract and formatting check:

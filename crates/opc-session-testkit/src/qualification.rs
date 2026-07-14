@@ -17,6 +17,9 @@ use opc_identity::projected_svid::{
     ProjectedSvidAvailability, ProjectedSvidReloadReason, ProjectedSvidReloadStatus,
     MAX_PROJECTED_SVID_BUNDLE_FILES, MIN_PROJECTED_SVID_POLL_INTERVAL,
 };
+use opc_redaction::metrics::{
+    SecurityMetricsSnapshot, SecurityRotationKind, SecurityRotationOutcome,
+};
 use opc_session_net::{
     ConnectionLifecyclePolicy, SessionClusterId, SessionConfigurationEpoch,
     SessionConfigurationGeneration,
@@ -716,6 +719,13 @@ pub enum QualificationNodeCommand {
         remote_node_index: usize,
     },
     LifecycleMetrics,
+    /// Enable or fail closed every consensus RPC path owned by this child.
+    /// The stdin control channel remains available while RPCs are disabled.
+    SetConsensusRpcAvailability {
+        availability: QualificationConsensusRpcAvailability,
+    },
+    /// Return a redacted fixed-cardinality security telemetry snapshot.
+    SecurityMetrics,
     /// Register exactly one protected applied-state watch before any traffic
     /// mutation can begin. All schedule values are bound by the node
     /// configuration digest; this frame intentionally carries no free-form
@@ -773,6 +783,13 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::LifecycleMetrics => {
                 formatter.write_str("QualificationNodeCommand::LifecycleMetrics")
             }
+            Self::SetConsensusRpcAvailability { availability } => formatter
+                .debug_struct("QualificationNodeCommand::SetConsensusRpcAvailability")
+                .field("availability", availability)
+                .finish(),
+            Self::SecurityMetrics => {
+                formatter.write_str("QualificationNodeCommand::SecurityMetrics")
+            }
             Self::StartTrafficWatch => {
                 formatter.write_str("QualificationNodeCommand::StartTrafficWatch")
             }
@@ -810,6 +827,8 @@ impl QualificationNodeCommand {
             | Self::MaterialStatus
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
+            | Self::SetConsensusRpcAvailability { .. }
+            | Self::SecurityMetrics
             | Self::StartTrafficWatch
             | Self::StartTrafficMutation
             | Self::StopTrafficMutation
@@ -916,6 +935,12 @@ pub enum QualificationNodeReply {
         term: u64,
         leader_id: Option<u64>,
         configured_voters: usize,
+        /// Minimum distinct voters proven reachable by the successful
+        /// Openraft barrier, or zero when no barrier succeeded.
+        fresh_reachable_voters: usize,
+        /// Minimum distinct voters whose agreement was proven by Openraft
+        /// commit, or zero when no barrier succeeded.
+        agreeing_voters: usize,
         required_quorum: usize,
         committed_index: Option<u64>,
         applied_index: Option<u64>,
@@ -937,6 +962,12 @@ pub enum QualificationNodeReply {
     },
     LifecycleMetrics {
         metrics: QualificationConnectionLifecycleMetrics,
+    },
+    ConsensusRpcAvailability {
+        availability: QualificationConsensusRpcAvailability,
+    },
+    SecurityMetrics {
+        metrics: QualificationSecurityMetricsSnapshot,
     },
     TrafficStatus {
         status: QualificationTrafficStatus,
@@ -960,6 +991,79 @@ pub enum QualificationNodeReply {
     Error {
         code: QualificationNodeErrorCode,
     },
+}
+
+/// Closed availability state for the qualification-only consensus RPC gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationConsensusRpcAvailability {
+    Available,
+    Unavailable,
+}
+
+/// Fixed four-outcome snapshot for one closed security-material class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationSecurityRotationSnapshot {
+    pub success: u64,
+    pub retained_last_good: u64,
+    pub rejected: u64,
+    pub expired: u64,
+    pub success_saturated: bool,
+    pub retained_last_good_saturated: bool,
+    pub rejected_saturated: bool,
+    pub expired_saturated: bool,
+}
+
+/// Redacted, fixed-cardinality security telemetry exposed to qualification.
+///
+/// The shape deliberately contains no labels, identities, paths, certificate
+/// material, or dynamically sized collections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationSecurityMetricsSnapshot {
+    pub svid_expires_seconds: i64,
+    pub bundle_version: u64,
+    pub saturated_series: usize,
+    pub tls_material: QualificationSecurityRotationSnapshot,
+    pub svid: QualificationSecurityRotationSnapshot,
+    pub trust_bundle: QualificationSecurityRotationSnapshot,
+}
+
+impl From<SecurityMetricsSnapshot> for QualificationSecurityMetricsSnapshot {
+    fn from(snapshot: SecurityMetricsSnapshot) -> Self {
+        Self {
+            svid_expires_seconds: snapshot.svid_expires_seconds(),
+            bundle_version: snapshot.bundle_version(),
+            saturated_series: snapshot.saturated_series(),
+            tls_material: qualification_security_rotation_snapshot(
+                snapshot,
+                SecurityRotationKind::TlsMaterial,
+            ),
+            svid: qualification_security_rotation_snapshot(snapshot, SecurityRotationKind::Svid),
+            trust_bundle: qualification_security_rotation_snapshot(
+                snapshot,
+                SecurityRotationKind::TrustBundle,
+            ),
+        }
+    }
+}
+
+fn qualification_security_rotation_snapshot(
+    snapshot: SecurityMetricsSnapshot,
+    kind: SecurityRotationKind,
+) -> QualificationSecurityRotationSnapshot {
+    QualificationSecurityRotationSnapshot {
+        success: snapshot.rotation(kind, SecurityRotationOutcome::Success),
+        retained_last_good: snapshot.rotation(kind, SecurityRotationOutcome::RetainedLastGood),
+        rejected: snapshot.rotation(kind, SecurityRotationOutcome::Rejected),
+        expired: snapshot.rotation(kind, SecurityRotationOutcome::Expired),
+        success_saturated: snapshot.rotation_saturated(kind, SecurityRotationOutcome::Success),
+        retained_last_good_saturated: snapshot
+            .rotation_saturated(kind, SecurityRotationOutcome::RetainedLastGood),
+        rejected_saturated: snapshot.rotation_saturated(kind, SecurityRotationOutcome::Rejected),
+        expired_saturated: snapshot.rotation_saturated(kind, SecurityRotationOutcome::Expired),
+    }
 }
 
 /// Redaction-safe status from the projected-volume source, kept separate from
@@ -1400,6 +1504,98 @@ mod tests {
             .trim_end()
             .replace("\"reason\":null}", "\"reason\":null,\"path\":\"secret\"}");
         assert!(serde_json::from_str::<QualificationNodeReply>(&with_unknown).is_err());
+    }
+
+    #[test]
+    fn rpc_gate_and_security_metrics_have_closed_redacted_control_frames() {
+        let command = QualificationNodeCommand::SetConsensusRpcAvailability {
+            availability: QualificationConsensusRpcAvailability::Unavailable,
+        };
+        let encoded = serde_json::to_string(&command).expect("encode RPC gate command");
+        assert_eq!(
+            encoded,
+            r#"{"command":"set_consensus_rpc_availability","availability":"unavailable"}"#
+        );
+        assert!(command.validate().is_ok());
+        assert!(serde_json::from_str::<QualificationNodeCommand>(
+            r#"{"command":"set_consensus_rpc_availability","availability":"unavailable","node":"secret"}"#
+        )
+        .is_err());
+
+        let zero_rotation = QualificationSecurityRotationSnapshot {
+            success: 0,
+            retained_last_good: 0,
+            rejected: 0,
+            expired: 0,
+            success_saturated: false,
+            retained_last_good_saturated: false,
+            rejected_saturated: false,
+            expired_saturated: false,
+        };
+        let reply = QualificationNodeReply::SecurityMetrics {
+            metrics: QualificationSecurityMetricsSnapshot {
+                svid_expires_seconds: 0,
+                bundle_version: 0,
+                saturated_series: 0,
+                tls_material: zero_rotation,
+                svid: zero_rotation,
+                trust_bundle: zero_rotation,
+            },
+        };
+        let encoded = serde_json::to_string(&reply).expect("encode security metrics");
+        for forbidden in ["spiffe://", "tls.crt", "ca.crt", "private_key", "identity"] {
+            assert!(!encoded.contains(forbidden));
+        }
+        let with_unknown = encoded.replacen(
+            "\"bundle_version\":0,",
+            "\"bundle_version\":0,\"certificate\":\"secret\",",
+            1,
+        );
+        assert!(serde_json::from_str::<QualificationNodeReply>(&with_unknown).is_err());
+
+        let source = opc_redaction::metrics::SecurityMetricsReader::global().snapshot();
+        let mapped = QualificationSecurityMetricsSnapshot::from(source);
+        assert_eq!(mapped.svid_expires_seconds, source.svid_expires_seconds());
+        assert_eq!(mapped.bundle_version, source.bundle_version());
+        assert_eq!(mapped.saturated_series, source.saturated_series());
+        for (kind, actual) in [
+            (SecurityRotationKind::TlsMaterial, mapped.tls_material),
+            (SecurityRotationKind::Svid, mapped.svid),
+            (SecurityRotationKind::TrustBundle, mapped.trust_bundle),
+        ] {
+            assert_eq!(
+                actual.success,
+                source.rotation(kind, SecurityRotationOutcome::Success)
+            );
+            assert_eq!(
+                actual.retained_last_good,
+                source.rotation(kind, SecurityRotationOutcome::RetainedLastGood)
+            );
+            assert_eq!(
+                actual.rejected,
+                source.rotation(kind, SecurityRotationOutcome::Rejected)
+            );
+            assert_eq!(
+                actual.expired,
+                source.rotation(kind, SecurityRotationOutcome::Expired)
+            );
+            assert_eq!(
+                actual.success_saturated,
+                source.rotation_saturated(kind, SecurityRotationOutcome::Success)
+            );
+            assert_eq!(
+                actual.retained_last_good_saturated,
+                source.rotation_saturated(kind, SecurityRotationOutcome::RetainedLastGood)
+            );
+            assert_eq!(
+                actual.rejected_saturated,
+                source.rotation_saturated(kind, SecurityRotationOutcome::Rejected)
+            );
+            assert_eq!(
+                actual.expired_saturated,
+                source.rotation_saturated(kind, SecurityRotationOutcome::Expired)
+            );
+        }
     }
 
     #[test]

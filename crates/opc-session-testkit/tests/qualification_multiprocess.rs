@@ -126,6 +126,8 @@ struct ReadinessDiagnostic {
     term: u64,
     leader_id: Option<u64>,
     configured_voters: usize,
+    fresh_reachable_voters: usize,
+    agreeing_voters: usize,
     required_quorum: usize,
     committed_index: Option<u64>,
     applied_index: Option<u64>,
@@ -2134,6 +2136,8 @@ impl Fleet {
                         term,
                         leader_id,
                         configured_voters,
+                        fresh_reachable_voters,
+                        agreeing_voters,
                         required_quorum,
                         committed_index,
                         applied_index,
@@ -2148,6 +2152,8 @@ impl Fleet {
                                 term,
                                 leader_id,
                                 configured_voters,
+                                fresh_reachable_voters,
+                                agreeing_voters,
                                 required_quorum,
                                 committed_index,
                                 applied_index,
@@ -2155,6 +2161,9 @@ impl Fleet {
                         );
                         if configured_voters != self.nodes.len()
                             || required_quorum != (self.nodes.len() / 2) + 1
+                            || (node_ready
+                                && (fresh_reachable_voters < required_quorum
+                                    || agreeing_voters < required_quorum))
                         {
                             return Err(HarnessError::Stage(Box::new(
                                 HarnessStageFailure::new(
@@ -2242,6 +2251,8 @@ impl Fleet {
                 term,
                 leader_id,
                 configured_voters,
+                fresh_reachable_voters,
+                agreeing_voters,
                 required_quorum,
                 committed_index,
                 applied_index,
@@ -2262,6 +2273,8 @@ impl Fleet {
                     term,
                     leader_id,
                     configured_voters,
+                    fresh_reachable_voters,
+                    agreeing_voters,
                     required_quorum,
                     committed_index,
                     applied_index,
@@ -2269,6 +2282,9 @@ impl Fleet {
             );
             if configured_voters != self.nodes.len()
                 || required_quorum != (self.nodes.len() / 2) + 1
+                || (ready
+                    && (fresh_reachable_voters < required_quorum
+                        || agreeing_voters < required_quorum))
             {
                 return Err(HarnessError::Stage(Box::new(
                     HarnessStageFailure::new(stage, Some(node_index), HarnessFailureKind::Protocol)

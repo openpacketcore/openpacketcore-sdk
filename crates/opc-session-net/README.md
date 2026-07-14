@@ -593,10 +593,21 @@ timeouts retain their ordinary transport/protocol/timeout failure accounting.
 
 This closes only the narrow authenticated post-TLS/pre-acknowledgement rotation
 race. The existing single-host multi-process campaign now covers trust removal,
-bounded reconnects, and sampled resource regressions. Remaining #164/#143 gates
-include short-lived-SVID expiry/drain, partition/restart and unavailable or
-malformed reload fault matrices, deployed-network/platform-pressure evidence,
-supported-platform sizing, soak, remote HKMS, and signed release evidence.
+bounded reconnects, and sampled resource regressions. Separate non-ignored
+three- and five-process synthetic cases now combine a test-only consensus-RPC
+admission loss on one stable follower with malformed trust/last-good retention
+on a different member, then prove exact-manifest-address restart, repair,
+survivor durable readiness, and encrypted-canary progress. They also qualify a
+same-issuer leaf with a 75-second remaining-validity/expiry budget: the fixed
+soft boundary is expiry minus the 30-second drain window, hard expiry completely
+drains the affected member and produces source/controller `LastGoodExpired`,
+and a valid leaf restores the fleet in the same process. This is not a real or
+deployed network partition, and those cases run no mixed
+traffic/watch/restore workload. Remaining
+#164/#143 gates include the broader deployed partition/restart/fault matrix,
+deployed-network/platform-pressure evidence, resource/soak, remote HKMS, and
+signed release evidence. They make no evidence-schema or production-profile
+claim.
 
 The exporter provides only closed, low-cardinality lifecycle dimensions. The
 connection-retirement reason set includes `idle_timeout` alongside the finite
@@ -653,12 +664,19 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   trust removal; fresh directed mutual-TLS handshakes and durable probes; old
   root rejection; and an encrypted acknowledged canary. It is SDK-generated
   loopback evidence, not the independent multi-process qualification profile.
-  #164 and #143 still own unavailable-member/malformed-reload, short-lived-SVID
-  expiry, partition/restart, continuous mixed traffic/watch, reconnect-storm,
-  resource, soak, deployed-network, and signed release evidence. Any production
-  acceptance criteria must explicitly acknowledge that immediate generic
-  revocation remains unsupported. The 365-day session TTL remains unrelated to
-  certificate lifetime, trust-bundle lifetime, or authentication age.
+  `opc-session-testkit` separately provides non-ignored three- and five-process
+  single-host coverage of one stable-follower consensus-admission loss plus a
+  different member's malformed retained-last-good state, exact-address restart
+  and repair, and same-issuer leaf expiry with a 75-second
+  remaining-validity/expiry budget through soft retirement,
+  hard drain, survivor progress, and same-process replacement. #164 and #143
+  still own real/deployed partitions, the broader restart/fault matrix,
+  continuous mixed traffic/watch/restore during faults, reconnect storms,
+  resource, soak, remote-HKMS, deployed-network, and signed release evidence.
+  Any production acceptance criteria must explicitly acknowledge that
+  immediate generic revocation remains unsupported. The 365-day session TTL
+  remains unrelated to certificate lifetime, trust-bundle lifetime, or
+  authentication age.
 - The configuration ID is a SHA-256 digest of the cluster ID, explicit
   generation, and the full sorted descriptor set. Changing a member ID,
   endpoint, TLS identity, failure domain, backing identity, cluster, or
@@ -833,10 +851,12 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
 
 - Retain #171's bounded cursor contract and add distributed
   failure and soak evidence. Connection continuity, bounded authentication age,
-  and full-handshake reauthentication are implemented; complete fleet
-  trust-bundle overlap/removal, short-lived-SVID expiry and compromise response,
-  reconnect-storm, multi-process/deployed-network, payload-protection-key, and
-  production qualification evidence remains under #164/#143. Close those
+  and full-handshake reauthentication are implemented. The exact single-host
+  multi-process trust and synthetic fault/expiry slices above are covered;
+  deployed trust-bundle/root cutover, real network/storage faults, broader
+  restart/recovery, mixed traffic/watch/restore under faults, reconnect storms,
+  resource/soak, remote-HKMS, payload-protection-key, signed-release, and
+  production qualification evidence remain under #164/#143. Close those
   evidence gates before treating this as production transport.
 - Keep plaintext transport limited to tests.
 - Keep the compatibility server wrapping `SessionStoreBackend` rather than
@@ -872,6 +892,12 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   schema and does not change `foundation_counts_for_tls_rotation = false`;
   out-of-process deployment and the remaining #164/#143 matrix are still
   required.
+- The non-ignored `opc-session-testkit` fault/expiry scenarios are run exactly
+  with
+  `cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1`
+  and
+  `cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1`.
+  They do not advance an evidence schema or profile.
 - `tests/three_node_quorum.rs` covers typed TTL and replication-tree-limit
   rejection before resolution and authenticated server dispatch, plus
   connection reuse after rejection, deterministic listener/handler teardown,

@@ -7,7 +7,7 @@ use std::io::{self, BufReader, BufWriter, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use opc_identity::ProjectedSvidSource;
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
-use opc_redaction::metrics::METRICS;
+use opc_redaction::metrics::{SecurityMetricsReader, METRICS};
 use opc_session_net::{
     ConnectionLifecyclePolicy, LocalReplicaBinding, RemoteAddrResolver, RemoteSessionConsensusPeer,
     SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
@@ -37,13 +37,14 @@ use opc_session_store::{
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
     qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
-    write_json_line, QualificationConnectionLifecycleMetrics, QualificationNodeCommand,
-    QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
-    QualificationProjectedSvidStatus, QualificationReadinessCode, QualificationTlsMaterialStatus,
-    QualificationTrafficFailureCode, QualificationTrafficState, QualificationTrafficStatus,
-    QualificationTransportConfig, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
-    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
-    QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS,
+    write_json_line, QualificationConnectionLifecycleMetrics,
+    QualificationConsensusRpcAvailability, QualificationNodeCommand, QualificationNodeConfig,
+    QualificationNodeErrorCode, QualificationNodeReply, QualificationProjectedSvidStatus,
+    QualificationReadinessCode, QualificationSecurityMetricsSnapshot,
+    QualificationTlsMaterialStatus, QualificationTrafficFailureCode, QualificationTrafficState,
+    QualificationTrafficStatus, QualificationTransportConfig,
+    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_MAX_CONFIG_BYTES,
+    QUALIFICATION_MAX_LEASE_HANDLES, QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS,
     QUALIFICATION_TRAFFIC_MUTATION_DELAY_SPAN_MILLIS, QUALIFICATION_TRAFFIC_RESTORE_LIMIT,
 };
 use opc_tls::{
@@ -71,6 +72,121 @@ struct QualificationLease {
 #[derive(Debug, thiserror::Error)]
 #[error("qualification node failed")]
 struct NodeFailure;
+
+#[derive(Clone)]
+struct QualificationConsensusRpcGate {
+    available: Arc<AtomicBool>,
+}
+
+impl QualificationConsensusRpcGate {
+    fn available() -> Self {
+        Self {
+            available: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn set(&self, availability: QualificationConsensusRpcAvailability) {
+        self.available.store(
+            matches!(
+                availability,
+                QualificationConsensusRpcAvailability::Available
+            ),
+            Ordering::SeqCst,
+        );
+    }
+
+    fn availability(&self) -> QualificationConsensusRpcAvailability {
+        if self.available.load(Ordering::SeqCst) {
+            QualificationConsensusRpcAvailability::Available
+        } else {
+            QualificationConsensusRpcAvailability::Unavailable
+        }
+    }
+
+    fn permits_rpc(&self) -> bool {
+        matches!(
+            self.availability(),
+            QualificationConsensusRpcAvailability::Available
+        )
+    }
+}
+
+impl std::fmt::Debug for QualificationConsensusRpcGate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QualificationConsensusRpcGate")
+            .field("availability", &self.availability())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct QualificationGatedConsensusPeer {
+    inner: Arc<dyn SessionConsensusPeer>,
+    gate: QualificationConsensusRpcGate,
+}
+
+impl QualificationGatedConsensusPeer {
+    fn new(inner: Arc<dyn SessionConsensusPeer>, gate: QualificationConsensusRpcGate) -> Self {
+        Self { inner, gate }
+    }
+}
+
+impl std::fmt::Debug for QualificationGatedConsensusPeer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QualificationGatedConsensusPeer")
+            .field("availability", &self.gate.availability())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionConsensusPeer for QualificationGatedConsensusPeer {
+    fn node_id(&self) -> SessionConsensusNodeId {
+        self.inner.node_id()
+    }
+
+    async fn call(
+        &self,
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if !self.gate.permits_rpc() {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        self.inner.call(request).await
+    }
+}
+
+struct QualificationGatedConsensusRpcHandler {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+    gate: QualificationConsensusRpcGate,
+}
+
+impl std::fmt::Debug for QualificationGatedConsensusRpcHandler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QualificationGatedConsensusRpcHandler")
+            .field("availability", &self.gate.availability())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionConsensusRpcHandler for QualificationGatedConsensusRpcHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if !self.gate.permits_rpc() {
+            return SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Unavailable),
+            };
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
 
 #[derive(Debug)]
 struct QualificationProbeDispatchCountingHandler {
@@ -103,6 +219,7 @@ struct QualificationNode {
     traffic_schedule_bound: bool,
     traffic: Option<QualificationTrafficRuntime>,
     empty_vote_dispatches: Arc<AtomicU64>,
+    rpc_gate: QualificationConsensusRpcGate,
 }
 
 struct QualificationTrafficRuntime {
@@ -207,7 +324,7 @@ struct QualificationProjectedMtlsRuntime {
 }
 
 struct QualificationDirectedPeer {
-    peer: RemoteSessionConsensusPeer,
+    peer: QualificationGatedConsensusPeer,
     resolver_evidence: QualificationResolverEvidence,
     required_resolution: Option<QualificationRequiredResolution>,
 }
@@ -314,8 +431,14 @@ impl QualificationNode {
             manifest.consensus_identity(),
         ))
         .map_err(|_| NodeFailure)?;
-        let (peers, server_transport, transport) =
-            prepare_transport(config, &local_binding, manifest.consensus_identity()).await?;
+        let rpc_gate = QualificationConsensusRpcGate::available();
+        let (peers, server_transport, transport) = prepare_transport(
+            config,
+            &local_binding,
+            manifest.consensus_identity(),
+            rpc_gate.clone(),
+        )
+        .await?;
 
         let backend = SqliteSessionBackend::open(&config.database_path).map_err(|_| NodeFailure)?;
         let store = Arc::new(
@@ -330,10 +453,15 @@ impl QualificationNode {
             .map_err(|_| NodeFailure)?,
         );
         let empty_vote_dispatches = Arc::new(AtomicU64::new(0));
-        let handler: Arc<dyn SessionConsensusRpcHandler> =
+        let counting_handler: Arc<dyn SessionConsensusRpcHandler> =
             Arc::new(QualificationProbeDispatchCountingHandler {
                 inner: store.rpc_handler(),
                 empty_vote_dispatches: Arc::clone(&empty_vote_dispatches),
+            });
+        let handler: Arc<dyn SessionConsensusRpcHandler> =
+            Arc::new(QualificationGatedConsensusRpcHandler {
+                inner: counting_handler,
+                gate: rpc_gate.clone(),
             });
         let server = match server_transport {
             #[cfg(feature = "foundation-insecure")]
@@ -379,6 +507,7 @@ impl QualificationNode {
                 .is_some_and(|digest| digest == config.workload_schedule_sha256),
             traffic: None,
             empty_vote_dispatches,
+            rpc_gate,
         })
     }
 
@@ -405,6 +534,17 @@ impl QualificationNode {
                     metrics: lifecycle_metrics(self.empty_vote_dispatches.load(Ordering::SeqCst)),
                 }
             }
+            QualificationNodeCommand::SetConsensusRpcAvailability { availability } => {
+                self.rpc_gate.set(availability);
+                QualificationNodeReply::ConsensusRpcAvailability {
+                    availability: self.rpc_gate.availability(),
+                }
+            }
+            QualificationNodeCommand::SecurityMetrics => QualificationNodeReply::SecurityMetrics {
+                metrics: QualificationSecurityMetricsSnapshot::from(
+                    SecurityMetricsReader::global().snapshot(),
+                ),
+            },
             QualificationNodeCommand::StartTrafficWatch => self.start_traffic_watch().await,
             QualificationNodeCommand::StartTrafficMutation => self.start_traffic_mutation().await,
             QualificationNodeCommand::StopTrafficMutation => self.stop_traffic_mutation().await,
@@ -979,6 +1119,8 @@ impl QualificationNode {
             term: status.term,
             leader_id: status.leader_id.map(|node_id| node_id.get()),
             configured_voters: report.configured_voters(),
+            fresh_reachable_voters: report.fresh_reachable_voters(),
+            agreeing_voters: report.agreeing_voters(),
             required_quorum: report.required_quorum(),
             committed_index: report.committed_barrier_index(),
             applied_index: progress.local_applied_index(),
@@ -1396,6 +1538,7 @@ async fn prepare_transport(
     config: &QualificationNodeConfig,
     local_binding: &LocalReplicaBinding,
     consensus_identity: SessionConsensusIdentity,
+    rpc_gate: QualificationConsensusRpcGate,
 ) -> Result<
     (
         BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>>,
@@ -1419,13 +1562,13 @@ async fn prepare_transport(
                         )
                         .map_err(|_| NodeFailure)?;
                     let node_id = binding.remote_consensus_node_id();
+                    let peer: Arc<dyn SessionConsensusPeer> = Arc::new(
+                        RemoteSessionConsensusPeer::new_insecure(binding, member.dial_addr, None),
+                    );
                     peers.insert(
                         node_id,
-                        Arc::new(RemoteSessionConsensusPeer::new_insecure(
-                            binding,
-                            member.dial_addr,
-                            None,
-                        )) as Arc<dyn SessionConsensusPeer>,
+                        Arc::new(QualificationGatedConsensusPeer::new(peer, rpc_gate.clone()))
+                            as Arc<dyn SessionConsensusPeer>,
                     );
                 }
                 Ok((
@@ -1500,13 +1643,15 @@ async fn prepare_transport(
                         Ok(dial_addr)
                     })
                 });
-                let peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+                let remote_peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
                     binding,
                     resolver,
                     client_config.clone(),
                 )
                 .with_connection_lifecycle(lifecycle)
                 .with_reauthentication_control(reauthentication.clone());
+                let peer =
+                    QualificationGatedConsensusPeer::new(Arc::new(remote_peer), rpc_gate.clone());
                 directed_peers.insert(
                     member.node_index,
                     QualificationDirectedPeer {
@@ -1784,6 +1929,112 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct CountingPeer {
+        node_id: SessionConsensusNodeId,
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionConsensusPeer for CountingPeer {
+        fn node_id(&self) -> SessionConsensusNodeId {
+            self.node_id
+        }
+
+        async fn call(
+            &self,
+            _request: SessionConsensusWireRequest,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SessionConsensusWireResponse {
+                result: Ok(Vec::new()),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingHandler {
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionConsensusRpcHandler for CountingHandler {
+        async fn handle(
+            &self,
+            _authenticated_sender: SessionConsensusNodeId,
+            _request: SessionConsensusWireRequest,
+        ) -> SessionConsensusWireResponse {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            SessionConsensusWireResponse {
+                result: Ok(Vec::new()),
+            }
+        }
+    }
+
+    fn gate_test_request(sender: SessionConsensusNodeId) -> SessionConsensusWireRequest {
+        let identity = SessionConsensusIdentity::new(
+            opc_session_store::SessionConsensusClusterId::new("qualification-rpc-gate-test")
+                .expect("cluster identity"),
+            opc_session_store::SessionConsensusConfigurationId::from_bytes([0x64; 32]),
+            opc_session_store::SessionConsensusConfigurationEpoch::new(1)
+                .expect("configuration epoch"),
+        );
+        SessionConsensusWireRequest::try_new(
+            identity,
+            sender,
+            SessionConsensusRpcFamily::Vote,
+            Vec::new(),
+        )
+        .expect("bounded request")
+    }
+
+    #[tokio::test]
+    async fn rpc_gate_fails_closed_before_outbound_or_inbound_dispatch() {
+        let sender = SessionConsensusNodeId::new(1).expect("sender node ID");
+        let target = SessionConsensusNodeId::new(2).expect("target node ID");
+        let gate = QualificationConsensusRpcGate::available();
+        gate.set(QualificationConsensusRpcAvailability::Unavailable);
+
+        let outbound_calls = Arc::new(AtomicU64::new(0));
+        let peer = QualificationGatedConsensusPeer::new(
+            Arc::new(CountingPeer {
+                node_id: target,
+                calls: Arc::clone(&outbound_calls),
+            }),
+            gate.clone(),
+        );
+        assert_eq!(
+            peer.call(gate_test_request(sender)).await,
+            Err(SessionConsensusPeerError::Unavailable)
+        );
+        assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
+
+        let inbound_calls = Arc::new(AtomicU64::new(0));
+        let handler = QualificationGatedConsensusRpcHandler {
+            inner: Arc::new(CountingHandler {
+                calls: Arc::clone(&inbound_calls),
+            }),
+            gate: gate.clone(),
+        };
+        assert_eq!(
+            handler.handle(sender, gate_test_request(sender)).await,
+            SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Unavailable),
+            }
+        );
+        assert_eq!(inbound_calls.load(Ordering::SeqCst), 0);
+
+        gate.set(QualificationConsensusRpcAvailability::Available);
+        assert!(peer.call(gate_test_request(sender)).await.is_ok());
+        assert_eq!(outbound_calls.load(Ordering::SeqCst), 1);
+        assert!(handler
+            .handle(sender, gate_test_request(sender))
+            .await
+            .result
+            .is_ok());
+        assert_eq!(inbound_calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn directed_proof_requires_resolution_after_the_requested_generation() {
