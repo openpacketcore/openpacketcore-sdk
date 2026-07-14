@@ -96,10 +96,71 @@ acknowledged lease/CAS canary. The campaign covers trust overlap, leaf renewal,
 same-root intermediate rotation and rollback, new-root
 forward/rollback/forward, old-root removal, network rejection of stale old-root
 clients, overlap-first post-removal rollback, and a final new-only state. After
-shutdown it confirms the exact test
-canary bytes are absent from each SQLite database/WAL/SHM family; this is a
+shutdown it validates every retained exact canary belongs to one fixed
+domain-separated qualification prefix, then confirms both prefixes are absent
+from each SQLite database/WAL/SHM family; this is a
 MemoryKeyProvider wrapper check, not remote-HKMS qualification. Openraft remains
 the only commit authority and the `EncryptingSessionBackend` remains outside it.
+
+The deliberate stale-root negative probe is isolated to exactly one connection
+attempt: its qualification-only reconnect minimum and maximum equal the whole
+cold-connect subdeadline, and a counted resolver must run once. A rejecting TLS
+server can surface its client-certificate alert to the client as either an
+authentication error or an EOF-derived timeout, so target-process evidence is
+authoritative: exactly one authentication failure and no invalid empty Vote
+application dispatch. This does not change production retry or
+ordinary EOF/reset classification.
+
+The companion traffic/resource cases run the same complete campaign in both
+three- and five-process topologies while every process owns one deterministic
+mutation loop and one applied-state watch. Watch registration is a fleet-wide
+first phase, so no traffic CAS can precede any observer. Each mutation cycle
+requires renewal to preserve key, owner, and fence; performs a fenced
+generation CAS; reads and restore-scans the exact key, generation, owner,
+fence, class, type, no-expiry marker, and plaintext value through the encryption
+wrapper; obtains fresh durable readiness; and requires release/reacquire to
+preserve key/owner while strictly advancing the fence. After every publication
+and resolver-fresh directed-handshake checkpoint, every observer must advance
+its gap-free watch sequence, applied-record count, and every topology-ordered
+synthetic-key generation before that transition can complete. Final all-voter
+reads bind the last acknowledged generation, owner, fence, and value digest;
+SQLite/WAL/SHM scans reject both fixed plaintext-canary prefixes after every
+retained exact value is assigned to exactly one prefix. Repeated
+same-issuer leaf changes
+exercise bounded connection rate/backoff before the full overlap,
+intermediate/root, trust removal, old-chain rejection, and both rollback paths.
+The 90-second per-transition value is a hard fail-safe only: ready material,
+fresh directed handshakes, durable/application progress, and complete
+connection accounting are the completion conditions. Transport,
+authentication/trust (outside the deliberate stale-chain probe), protocol,
+backend, timeout, and reconnect failures have a zero budget. A chained
+post-formation ledger covers warmup, every interstitial checkpoint, final
+generation, and resource settle; authentication failures must equal exactly
+the one deliberate removed-root ring probe delivered to each member; all other
+connection-failure, reconnect-failure, and drain-overrun deltas must remain
+zero. An authenticated
+server's policy-driven wait for the next request is reported separately as the
+fixed `idle_timeout` lifecycle-retirement reason, never as a failed attempt.
+
+Resource evidence is intentionally explicit and Linux-specific. A warmed
+`/proc/<pid>` baseline is sampled every 25 ms through the campaign. The checks
+bound the sampled total-FD and OS-thread maxima by the configured 128 inbound
+slots, remote-peer routes, and fixed allowances; `VmHWM` supplies the kernel's
+process high-water value. These are sampled regression maxima, not a claim that
+every instantaneous FD/thread peak was observed. Completion waits for every
+started connection drain to complete and
+for eight consecutive equal FD/socket/thread samples, then bounds settled total
+FDs, socket FDs, and `VmRSS` relative to the warmed process. The control status
+also proves the two qualification-owned async tasks reach zero. It does not
+claim to enumerate Tokio/Openraft internal tasks, and debug-build single-host
+RSS/FD values are regression ceilings rather than CNF resource requests or
+deployed-platform capacity evidence. Openraft heartbeat connections
+intentionally remain live: connection accounting derives the non-overlapping
+`outstanding = attempts - terminal_successes - fixed_failures`, rejects
+overflow/underflow, and requires `outstanding <= active + draining`. Requiring
+equality against the mixed-direction gauges would double-count successful live
+outbound connections. Final settle requires zero draining connections and
+bounds the active connections that cover any persistent inbound handlers.
 
 `qualification/v1/session-mtls-candidate-evidence.schema.json` deliberately
 requires `experimental = true`, `qualification_complete = false`,
@@ -127,13 +188,15 @@ deployed production evidence.
 - The production-mTLS rotation core now covers three- and five-process
   projected-material overlap/leaf/intermediate/root transitions, rollback,
   stale old-root client rejection, resolver-fresh reauthentication, durable
-  lease/CAS/read traffic, and absence of the exact test canary bytes from the
-  SQLite database family on one host.
+  continuous lease/CAS/read/watch/restore/readiness traffic, repeated leaf
+  rotations with explicit connection/reconnect limits, Linux process-resource
+  regression bounds, and absence of exact test canary bytes from the SQLite
+  database family on one host.
   It does not cover deployed Kubernetes/network/storage behavior,
   unavailable-member and malformed-reload combinations, certificate-expiry
-  retirement, partition/restart, mixed watch/restore traffic, reconnect storms,
-  resource pressure, supported-platform execution, soak, or signed candidate
-  evidence. Those cases remain required before #164/#158 can be closed.
+  retirement, partition/restart, external resource pressure, supported-platform
+  sizing, soak, or signed candidate evidence. Those cases remain required
+  before #164/#158 can be closed.
 - Long-running network, resource, and soak qualification remains #143. Watch
   handoff and bounded replication-log cursor/retention semantics are
   implemented under #145/#171.
@@ -155,7 +218,12 @@ deployed production evidence.
 
 - Source checked: `Cargo.toml`, `src/lib.rs`, and dependent session tests.
 - Run production-mTLS qualification with:
-  `cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features`.
+  `cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features -- --test-threads=1`.
+- The Linux traffic/resource cases are manual long-running qualification and
+  remain ignored in the default suite. Run them individually from a clean host:
+  `cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1`
+  and
+  `cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1`.
 - Run the historical plaintext foundation explicitly with:
   `cargo test -p opc-session-testkit --features foundation-insecure --test qualification_multiprocess`.
 

@@ -1330,6 +1330,18 @@ nonce/challenge, ALPN, version, and exact contract-profile checks. TLS
 resumption, cached peer authority, plaintext fallback, and task-abort
 reauthentication MUST NOT replace that handshake.
 
+After authentication and bootstrap acknowledgement, if no byte of the next
+request arrives before the listener idle deadline, the server MUST record the
+fixed `idle_timeout` lifecycle-retirement reason, enter and complete the normal
+drain/slot-release path, dispatch no request, and finish the connection handler
+as a successful bounded lifecycle outcome rather than a timeout failure. This
+rule applies to both the consensus listener and the legacy direct listener.
+Silence during TLS/application bootstrap MUST remain a timeout failure. Once
+any byte of an authenticated frame arrives, the remaining length prefix and
+payload MUST complete within the original absolute idle deadline; an incomplete
+active frame MUST remain a timeout failure and MUST NOT be relabeled as idle
+retirement.
+
 If a lifecycle retirement boundary (maximum authentication age, local or peer
 certificate expiry, material epoch, or explicit reauthentication) is observed
 after mutual TLS but before any bootstrap acknowledgement bytes are written,
@@ -1590,7 +1602,9 @@ Required metrics:
 The lifecycle metric labels MUST come only from their closed SDK-owned reason,
 state, event, and outcome enums. They MUST NOT contain endpoints, DNS names,
 SPIFFE IDs, certificates, key material, transaction IDs, record keys, or
-payload/backend text.
+payload/backend text. The closed connection-retirement reason set includes
+`idle_timeout`; it MUST NOT be counted as the `timeout` connection-attempt
+failure. Bootstrap and partial active-frame timeouts remain `timeout` failures.
 - `opc_session_restore_page_latency_seconds{cursor_profile}`
 - `opc_session_restore_restarts_total{reason}` where `reason` is one of
   `stale_cursor`, `work_budget`, `response_too_large`, or `cancelled`

@@ -18,6 +18,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed data fail closed. Source validation, response rate limiting,
   retransmission behavior, and other unauthenticated anti-amplification policy
   remain product responsibilities.
+- **Experimental projected-mTLS traffic/resource qualification —
+  `opc-session-testkit`:** the real 3/5-process rotation harness now registers
+  every encrypted applied-state watch before starting deterministic
+  per-member lease/renew/CAS/read/complete-restore/readiness/reacquire loops,
+  then keeps those loops live through repeated same-issuer leaves and the
+  complete overlap, intermediate, root, trust-removal, stale-old-chain
+  rejection, pre-removal rollback, and overlap-first post-removal rollback
+  campaign. Every publication proves resolver-fresh directed mTLS paths,
+  durable readiness, acknowledged canary continuity, and workload progress.
+  After each publication/handshake checkpoint, every observer must advance its
+  gap-free committed sequence, applied-record count, and exact monotonic
+  generation for every synthetic traffic key; final catch-up cannot mask a
+  stalled rotation watch. Renewal preserves the exact lease fence,
+  reacquisition strictly advances it, and get/restore compare every record
+  field. A chained campaign ledger permits only the exact removed-root ring
+  probes and rejects every other connection/reconnect/drain failure. Linux
+  qualification samples each child process's `/proc` FD/thread maxima and
+  kernel-reported `VmHWM`, and
+  semantically settled FD/socket/thread/VmRSS state against explicit warmed
+  bounds, alongside connection/drain/reconnect and qualification-owned async
+  task bounds. Authenticated next-request idle expiry is a fixed lifecycle
+  retirement reason rather than a false timeout failure; real timeout and all
+  other connection failures retain a zero budget. The 90-second transition
+  value is only a hard fail-safe;
+  semantic completion ends each transition. These single-host synthetic bounds
+  are regression evidence, not deployed Kubernetes/platform sizing, soak, or
+  signed release evidence. Openraft remains the sole commit authority, and the
+  `EncryptingSessionBackend`/key-provider/HKMS boundary and durable formats are
+  unchanged.
 - **Experimental HA transport hardening — `opc-session-net`:** each directed
   `RemoteSessionConsensusPeer` now retains at most one authenticated connection
   behind its existing one-call gate. A socket returns to that sole slot only

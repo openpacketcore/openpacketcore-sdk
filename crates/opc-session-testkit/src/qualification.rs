@@ -60,6 +60,53 @@ pub const QUALIFICATION_MAX_CONTROL_LINE_BYTES: usize = 16 * 1024;
 pub const QUALIFICATION_MAX_VALUE_BYTES: usize = 512;
 /// Maximum retained lease handles in one qualification child.
 pub const QUALIFICATION_MAX_LEASE_HANDLES: usize = 1024;
+/// Explicit inbound consensus connection-slot limit used by fleet resource
+/// qualification. Keeping the value here makes the process budget and the
+/// listener configuration one contract rather than an inferred default.
+pub const QUALIFICATION_INBOUND_CONNECTION_SLOTS: usize = 128;
+/// Domain-separated deterministic seed for the repeated-rotation workload.
+pub const QUALIFICATION_TRAFFIC_SEED_BASE: u64 = 0x0164_7A11_C0DE_2026;
+/// Number of same-issuer leaf rotations applied to every voter.
+pub const QUALIFICATION_TRAFFIC_ROTATIONS_PER_MEMBER: usize = 2;
+/// Maximum wall-clock budget for one repeated valid-leaf transition and its
+/// complete fresh directed-connection proof. Semantic progress, not sleeping
+/// for this duration, determines completion.
+pub const QUALIFICATION_TRAFFIC_TRANSITION_MILLIS: u64 = 90_000;
+/// Fleet-wide explicit reauthentication generations proved in every round.
+pub const QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND: usize = 2;
+/// `/proc` sampling interval used by the Linux resource qualification.
+pub const QUALIFICATION_RESOURCE_SAMPLE_MILLIS: u64 = 25;
+/// Maximum semantic-settle bound before final FD/RSS/lifecycle assertions.
+pub const QUALIFICATION_RESOURCE_SETTLE_MILLIS: u64 = 40_000;
+/// Consecutive equal FD/socket/thread samples required after every connection
+/// drain has completed.
+pub const QUALIFICATION_RESOURCE_STABLE_SAMPLES: usize = 8;
+/// Non-transport FD allowance above listener slots and peer routes.
+pub const QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE: usize = 8;
+/// Final FD allowance above the warmed process baseline.
+pub const QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE: usize = 4;
+/// Thread high-water allowance above the warmed process baseline.
+pub const QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE: usize = 8;
+/// VmHWM growth allowance in KiB.
+pub const QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB: u64 = 128 * 1024;
+/// Settled VmRSS growth allowance in KiB.
+pub const QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB: u64 = 32 * 1024;
+/// Per-round connection/reconnect budget coefficient and fixed allowance.
+pub const QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR: u64 = 8;
+/// Fixed per-round connection/reconnect allowance after the peer coefficient.
+pub const QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE: u64 = 8;
+/// Final active connection bound coefficient over configured remote peers.
+pub const QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR: i64 = 2;
+/// Real-mTLS completion upper bound for the isolated resolver retry proof.
+pub const QUALIFICATION_RESOLVER_PROOF_MILLIS: u64 = 1_500;
+/// Exact exponential reconnect lower bounds proved after three failures.
+pub const QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS: [u64; 3] = [50, 100, 200];
+/// Complete first-page restore bound for the 3/5-voter synthetic workload.
+pub const QUALIFICATION_TRAFFIC_RESTORE_LIMIT: usize = 16;
+/// Lower bound for deterministic mutation-task pacing.
+pub const QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS: u64 = 5;
+/// Number of deterministic millisecond values above the minimum.
+pub const QUALIFICATION_TRAFFIC_MUTATION_DELAY_SPAN_MILLIS: u64 = 11;
 /// Exact operation timeout pinned by the experimental profile.
 pub const QUALIFICATION_OPERATION_TIMEOUT_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
@@ -505,6 +552,84 @@ pub fn qualification_value_sha256(value: &[u8]) -> String {
     qualification_digest("value", value)
 }
 
+/// Exact deterministic seed for the 3/5-voter traffic/resource workload.
+pub fn qualification_traffic_seed(member_count: usize) -> Option<u64> {
+    matches!(member_count, 3 | 5)
+        .then_some(QUALIFICATION_TRAFFIC_SEED_BASE ^ u64::try_from(member_count).ok()?)
+}
+
+/// Digest binding every fixed traffic/resource schedule value to a node's
+/// existing `workload_schedule_sha256` configuration field.
+pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<String> {
+    let seed = qualification_traffic_seed(member_count)?;
+    let schedule = format!(
+        concat!(
+            "opc-session-ha/traffic-resource/v1\n",
+            "member_count={member_count}\n",
+            "seed={seed}\n",
+            "rotations_per_member={}\n",
+            "transition_millis={}\n",
+            "reauthentications_per_round={}\n",
+            "baseline_reauthentications={}\n",
+            "resource_sample_millis={}\n",
+            "resource_settle_millis={}\n",
+            "resource_stable_samples={}\n",
+            "resource_fd_misc_allowance={}\n",
+            "resource_final_fd_allowance={}\n",
+            "resource_thread_growth_allowance={}\n",
+            "resource_vmhwm_growth_kib={}\n",
+            "resource_settled_rss_growth_kib={}\n",
+            "connection_bound_factor={}\n",
+            "connection_bound_allowance={}\n",
+            "active_connection_factor={}\n",
+            "resolver_proof_millis={}\n",
+            "resolver_backoff_lower_bounds_millis=50,100,200\n",
+            "restore_limit={}\n",
+            "mutation_delay_min_millis={}\n",
+            "mutation_delay_span_millis={}\n",
+            "owned_mutation_tasks_per_node=1\n",
+            "owned_watch_tasks_per_node=1\n",
+            "rotation_order=seed_mod_member_count_then_round_robin\n",
+            "leaf_issuer=unchanged\n"
+        ),
+        QUALIFICATION_TRAFFIC_ROTATIONS_PER_MEMBER,
+        QUALIFICATION_TRAFFIC_TRANSITION_MILLIS,
+        QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND,
+        QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND,
+        QUALIFICATION_RESOURCE_SAMPLE_MILLIS,
+        QUALIFICATION_RESOURCE_SETTLE_MILLIS,
+        QUALIFICATION_RESOURCE_STABLE_SAMPLES,
+        QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE,
+        QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE,
+        QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE,
+        QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB,
+        QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB,
+        QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR,
+        QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE,
+        QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR,
+        QUALIFICATION_RESOLVER_PROOF_MILLIS,
+        QUALIFICATION_TRAFFIC_RESTORE_LIMIT,
+        QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS,
+        QUALIFICATION_TRAFFIC_MUTATION_DELAY_SPAN_MILLIS,
+        member_count = member_count,
+        seed = seed,
+    );
+    Some(qualification_digest(
+        "traffic-schedule",
+        schedule.as_bytes(),
+    ))
+}
+
+/// Exact redaction-safe synthetic payload used by one mutation-task cycle.
+pub fn qualification_traffic_value(
+    seed: u64,
+    member_count: usize,
+    node_index: usize,
+    generation: u64,
+) -> String {
+    format!("opc-rotation-traffic-canary/{seed:016x}/{member_count}/{node_index}/{generation}")
+}
+
 fn qualification_digest(kind: &str, value: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -591,6 +716,21 @@ pub enum QualificationNodeCommand {
         remote_node_index: usize,
     },
     LifecycleMetrics,
+    /// Register exactly one protected applied-state watch before any traffic
+    /// mutation can begin. All schedule values are bound by the node
+    /// configuration digest; this frame intentionally carries no free-form
+    /// workload input.
+    StartTrafficWatch,
+    /// Start exactly one deterministic mutation task after every fleet member
+    /// has registered its watch.
+    StartTrafficMutation,
+    /// Cooperatively stop and join only the mutation task.
+    StopTrafficMutation,
+    /// Cooperatively stop and join the remaining applied-state watch task.
+    StopTrafficWatch,
+    /// Return bounded, plaintext-free workload progress and the local
+    /// linearizable replication head.
+    TrafficStatus,
     Acquire {
         lease_handle: String,
         stable_id: String,
@@ -633,6 +773,19 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::LifecycleMetrics => {
                 formatter.write_str("QualificationNodeCommand::LifecycleMetrics")
             }
+            Self::StartTrafficWatch => {
+                formatter.write_str("QualificationNodeCommand::StartTrafficWatch")
+            }
+            Self::StartTrafficMutation => {
+                formatter.write_str("QualificationNodeCommand::StartTrafficMutation")
+            }
+            Self::StopTrafficMutation => {
+                formatter.write_str("QualificationNodeCommand::StopTrafficMutation")
+            }
+            Self::StopTrafficWatch => {
+                formatter.write_str("QualificationNodeCommand::StopTrafficWatch")
+            }
+            Self::TrafficStatus => formatter.write_str("QualificationNodeCommand::TrafficStatus"),
             Self::Acquire { .. } => formatter.write_str("QualificationNodeCommand::Acquire"),
             Self::CompareAndSet { value, .. } => formatter
                 .debug_struct("QualificationNodeCommand::CompareAndSet")
@@ -657,6 +810,11 @@ impl QualificationNodeCommand {
             | Self::MaterialStatus
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
+            | Self::StartTrafficWatch
+            | Self::StartTrafficMutation
+            | Self::StopTrafficMutation
+            | Self::StopTrafficWatch
+            | Self::TrafficStatus
             | Self::Shutdown => Ok(()),
             Self::DirectedHandshake { remote_node_index } => {
                 if *remote_node_index < 5 {
@@ -779,6 +937,9 @@ pub enum QualificationNodeReply {
     },
     LifecycleMetrics {
         metrics: QualificationConnectionLifecycleMetrics,
+    },
+    TrafficStatus {
+        status: QualificationTrafficStatus,
     },
     LeaseAcquired {
         fence: u64,
@@ -1002,6 +1163,7 @@ pub struct QualificationConnectionLifecycleMetrics {
     pub retirement_peer_certificate_chain_expiry: u64,
     pub retirement_material_epoch: u64,
     pub retirement_explicit: u64,
+    pub retirement_idle_timeout: u64,
     pub active_connections: i64,
     pub draining_connections: i64,
     pub drain_started: u64,
@@ -1016,6 +1178,63 @@ pub struct QualificationConnectionLifecycleMetrics {
     pub connection_failure_backend: u64,
     pub reconnect_attempts: u64,
     pub reconnect_failures: u64,
+    /// Invalid empty Vote requests that reached the application handler.
+    /// Qualification uses this fixed probe shape to prove stale credentials
+    /// fail before consensus dispatch.
+    pub empty_vote_dispatches: u64,
+}
+
+/// Closed lifecycle state for the two qualification-owned workload tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationTrafficState {
+    WatchReady,
+    Running,
+    MutationStopped,
+    Stopped,
+    Failed,
+}
+
+/// Fixed, non-sensitive failure categories for background qualification work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationTrafficFailureCode {
+    BackendUnavailable,
+    LeaseRejected,
+    WatchUnavailable,
+    RestoreScanRejected,
+    ReadinessUnavailable,
+    InvariantViolation,
+    TaskJoinUnavailable,
+}
+
+/// Plaintext-free progress from one node's deterministic traffic workload.
+///
+/// `owned_async_tasks` counts only the watch and mutation tasks created by the
+/// two traffic-start commands; it does not pretend to inventory Openraft, TLS,
+/// or Tokio internal tasks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationTrafficStatus {
+    pub state: QualificationTrafficState,
+    pub failure: Option<QualificationTrafficFailureCode>,
+    pub seed: u64,
+    pub owned_async_tasks: u8,
+    pub mutation_cycles: u64,
+    pub linearizable_reads: u64,
+    pub lease_renewals: u64,
+    pub lease_reacquisitions: u64,
+    pub complete_restore_scans: u64,
+    pub durable_readiness_probes: u64,
+    pub last_generation: u64,
+    pub last_record_fence: u64,
+    pub watch_entries: u64,
+    pub watch_applied_records: u64,
+    pub watch_sequence: u64,
+    /// Last gap-free generation observed for each topology-ordered synthetic
+    /// traffic key. The vector is bounded to the validated 3/5-member fleet.
+    pub watch_traffic_generations: Vec<u64>,
+    pub replication_head: u64,
 }
 
 /// Low-cardinality child-process error codes; raw backend errors never cross
@@ -1033,6 +1252,7 @@ pub enum QualificationNodeErrorCode {
     TransportUnavailable,
     MaterialUnavailable,
     DirectedHandshakeUnavailable,
+    TrafficUnavailable,
 }
 
 /// Bounded JSON-line decoding failure.
@@ -1179,6 +1399,56 @@ mod tests {
         let with_unknown = text
             .trim_end()
             .replace("\"reason\":null}", "\"reason\":null,\"path\":\"secret\"}");
+        assert!(serde_json::from_str::<QualificationNodeReply>(&with_unknown).is_err());
+    }
+
+    #[test]
+    fn traffic_schedule_is_topology_bound_and_status_is_strict() {
+        assert_eq!(
+            qualification_traffic_seed(3),
+            Some(QUALIFICATION_TRAFFIC_SEED_BASE ^ 3)
+        );
+        assert_eq!(
+            qualification_traffic_seed(5),
+            Some(QUALIFICATION_TRAFFIC_SEED_BASE ^ 5)
+        );
+        assert_eq!(qualification_traffic_seed(4), None);
+        let three = qualification_traffic_schedule_sha256(3).expect("three-voter schedule");
+        let five = qualification_traffic_schedule_sha256(5).expect("five-voter schedule");
+        assert!(is_exact_sha256(&three));
+        assert!(is_exact_sha256(&five));
+        assert_ne!(three, five);
+        assert_eq!(qualification_traffic_schedule_sha256(4), None);
+
+        let reply = QualificationNodeReply::TrafficStatus {
+            status: QualificationTrafficStatus {
+                state: QualificationTrafficState::Running,
+                failure: None,
+                seed: QUALIFICATION_TRAFFIC_SEED_BASE ^ 3,
+                owned_async_tasks: 2,
+                mutation_cycles: 7,
+                linearizable_reads: 7,
+                lease_renewals: 7,
+                lease_reacquisitions: 7,
+                complete_restore_scans: 7,
+                durable_readiness_probes: 7,
+                last_generation: 7,
+                last_record_fence: 8,
+                watch_entries: 43,
+                watch_applied_records: 21,
+                watch_sequence: 44,
+                watch_traffic_generations: vec![7, 8, 9],
+                replication_head: 44,
+            },
+        };
+        let encoded = serde_json::to_string(&reply).expect("encode strict traffic status");
+        assert!(!encoded.contains("opc-rotation-traffic-canary"));
+        assert!(!encoded.contains("rotation-traffic-owner"));
+        let with_unknown = encoded.replacen(
+            "\"replication_head\":44}",
+            "\"replication_head\":44,\"payload\":\"secret\"}",
+            1,
+        );
         assert!(serde_json::from_str::<QualificationNodeReply>(&with_unknown).is_err());
     }
 

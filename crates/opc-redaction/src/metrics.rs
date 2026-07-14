@@ -1145,6 +1145,7 @@ pub struct SdkMetrics {
     pub session_net_lifecycle_retirement_peer_certificate_chain_expiry: AtomicU64,
     pub session_net_lifecycle_retirement_material_epoch: AtomicU64,
     pub session_net_lifecycle_retirement_explicit: AtomicU64,
+    pub session_net_lifecycle_retirement_idle_timeout: AtomicU64,
     pub session_net_lifecycle_active_connections: AtomicI64,
     pub session_net_lifecycle_draining_connections: AtomicI64,
     pub session_net_lifecycle_drain_started: AtomicU64,
@@ -1313,6 +1314,7 @@ impl SdkMetrics {
             session_net_lifecycle_retirement_peer_certificate_chain_expiry: AtomicU64::new(0),
             session_net_lifecycle_retirement_material_epoch: AtomicU64::new(0),
             session_net_lifecycle_retirement_explicit: AtomicU64::new(0),
+            session_net_lifecycle_retirement_idle_timeout: AtomicU64::new(0),
             session_net_lifecycle_active_connections: AtomicI64::new(0),
             session_net_lifecycle_draining_connections: AtomicI64::new(0),
             session_net_lifecycle_drain_started: AtomicU64::new(0),
@@ -1524,6 +1526,8 @@ impl SdkMetrics {
         self.session_net_lifecycle_retirement_material_epoch
             .store(0, Ordering::Relaxed);
         self.session_net_lifecycle_retirement_explicit
+            .store(0, Ordering::Relaxed);
+        self.session_net_lifecycle_retirement_idle_timeout
             .store(0, Ordering::Relaxed);
         self.session_net_lifecycle_active_connections
             .store(0, Ordering::Relaxed);
@@ -2534,6 +2538,12 @@ pub fn export_prometheus_text() -> String {
                 .session_net_lifecycle_retirement_explicit
                 .load(Ordering::Relaxed),
         ),
+        (
+            "idle_timeout",
+            METRICS
+                .session_net_lifecycle_retirement_idle_timeout
+                .load(Ordering::Relaxed),
+        ),
     ] {
         out.push_str(&format!(
             "opc_session_net_connection_retirements_total{{reason=\"{reason}\"}} {value}\n"
@@ -3362,6 +3372,9 @@ mod tests {
             .session_net_lifecycle_retirement_explicit
             .store(27, Ordering::Relaxed);
         METRICS
+            .session_net_lifecycle_retirement_idle_timeout
+            .store(45, Ordering::Relaxed);
+        METRICS
             .session_net_lifecycle_active_connections
             .store(28, Ordering::Relaxed);
         METRICS
@@ -3523,6 +3536,9 @@ mod tests {
         ));
         assert!(exported
             .contains("opc_session_net_connection_retirements_total{reason=\"explicit\"} 27\n"));
+        assert!(exported.contains(
+            "opc_session_net_connection_retirements_total{reason=\"idle_timeout\"} 45\n"
+        ));
         assert!(exported.contains("opc_session_net_connection_lifecycle{state=\"active\"} 28\n"));
         assert!(exported.contains("opc_session_net_connection_lifecycle{state=\"draining\"} 29\n"));
         assert!(exported
@@ -3625,6 +3641,8 @@ mod tests {
         assert!(after.contains(
             "opc_session_net_connection_retirements_total{reason=\"material_epoch\"} 0\n"
         ));
+        assert!(after
+            .contains("opc_session_net_connection_retirements_total{reason=\"idle_timeout\"} 0\n"));
         assert!(after.contains("opc_session_net_connection_lifecycle{state=\"active\"} 0\n"));
         assert!(
             after.contains("opc_session_net_connection_drain_events_total{event=\"overrun\"} 0\n")
@@ -3647,6 +3665,7 @@ mod tests {
             &metrics.session_net_lifecycle_retirement_peer_certificate_chain_expiry,
             &metrics.session_net_lifecycle_retirement_material_epoch,
             &metrics.session_net_lifecycle_retirement_explicit,
+            &metrics.session_net_lifecycle_retirement_idle_timeout,
             &metrics.session_net_lifecycle_drain_started,
             &metrics.session_net_lifecycle_drain_completed,
             &metrics.session_net_lifecycle_drain_overruns,
@@ -3689,6 +3708,7 @@ mod tests {
             &metrics.session_net_lifecycle_retirement_peer_certificate_chain_expiry,
             &metrics.session_net_lifecycle_retirement_material_epoch,
             &metrics.session_net_lifecycle_retirement_explicit,
+            &metrics.session_net_lifecycle_retirement_idle_timeout,
             &metrics.session_net_lifecycle_drain_started,
             &metrics.session_net_lifecycle_drain_completed,
             &metrics.session_net_lifecycle_drain_overruns,

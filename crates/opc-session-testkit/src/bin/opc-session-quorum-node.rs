@@ -7,11 +7,13 @@ use std::io::{self, BufReader, BufWriter, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
 use opc_identity::ProjectedSvidSource;
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_redaction::metrics::METRICS;
@@ -25,28 +27,38 @@ use opc_session_store::{
     CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload,
     EncryptingSessionBackend, Generation, LeaseError, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
     QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
-    ReplicaTlsIdentity, SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId,
+    ReplicaTlsIdentity, ReplicationEntry, ReplicationOp, RestoreScanCursorProfile,
+    RestoreScanRequest, SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
-    SessionConsensusWireRequest, SessionKey, SessionKeyType, SessionLeaseManager,
-    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
-    ValidatedQuorumTopology,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionKey, SessionKeyType, SessionLeaseManager, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
-    qualification_owner_sha256, qualification_value_sha256, read_bounded_json_line,
+    qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
+    qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
     write_json_line, QualificationConnectionLifecycleMetrics, QualificationNodeCommand,
     QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
     QualificationProjectedSvidStatus, QualificationReadinessCode, QualificationTlsMaterialStatus,
-    QualificationTransportConfig, QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
+    QualificationTrafficFailureCode, QualificationTrafficState, QualificationTrafficStatus,
+    QualificationTransportConfig, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
+    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
+    QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS,
+    QUALIFICATION_TRAFFIC_MUTATION_DELAY_SPAN_MILLIS, QUALIFICATION_TRAFFIC_RESTORE_LIMIT,
 };
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder, TlsMaterialController,
 };
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 const QUALIFICATION_TENANT: &str = "session-ha-qualification";
 const QUALIFICATION_KEY_ID: &str = "session-ha-qualification-key-v1";
 const QUALIFICATION_STATE_TYPE: &str = "session-ha-qualification-state";
+const QUALIFICATION_TRAFFIC_STATE_TYPE: &str = "session-ha-qualification-traffic-state";
+const QUALIFICATION_TRAFFIC_TTL: Duration = Duration::from_secs(60 * 60);
 const QUALIFICATION_KEY_BYTES: [u8; AES_256_GCM_SIV_KEY_LEN] = [0x5a; AES_256_GCM_SIV_KEY_LEN];
 
 type ProtectedStore = EncryptingSessionBackend<ConsensusSessionStore, MemoryKeyProvider>;
@@ -60,12 +72,123 @@ struct QualificationLease {
 #[error("qualification node failed")]
 struct NodeFailure;
 
+#[derive(Debug)]
+struct QualificationProbeDispatchCountingHandler {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+    empty_vote_dispatches: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl SessionConsensusRpcHandler for QualificationProbeDispatchCountingHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::Vote && request.payload.is_empty() {
+            self.empty_vote_dispatches.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
 struct QualificationNode {
     store: Arc<ConsensusSessionStore>,
     protected: ProtectedStore,
     server: Option<SessionConsensusServerHandle>,
     transport: QualificationTransportRuntime,
     leases: HashMap<String, QualificationLease>,
+    node_index: usize,
+    member_count: usize,
+    traffic_schedule_bound: bool,
+    traffic: Option<QualificationTrafficRuntime>,
+    empty_vote_dispatches: Arc<AtomicU64>,
+}
+
+struct QualificationTrafficRuntime {
+    seed: u64,
+    observation: Arc<QualificationTrafficObservation>,
+    mutation_started: bool,
+    mutation_cancel: Option<oneshot::Sender<()>>,
+    mutation_task: Option<JoinHandle<Result<(), QualificationTrafficFailureCode>>>,
+    watch_cancel: Option<oneshot::Sender<()>>,
+    watch_task: Option<JoinHandle<Result<(), QualificationTrafficFailureCode>>>,
+}
+
+struct QualificationTrafficObservation {
+    failure: AtomicU8,
+    mutation_cycles: AtomicU64,
+    linearizable_reads: AtomicU64,
+    lease_renewals: AtomicU64,
+    lease_reacquisitions: AtomicU64,
+    complete_restore_scans: AtomicU64,
+    durable_readiness_probes: AtomicU64,
+    last_generation: AtomicU64,
+    last_record_fence: AtomicU64,
+    watch_entries: AtomicU64,
+    watch_applied_records: AtomicU64,
+    watch_sequence: AtomicU64,
+    watch_traffic_generations: Vec<AtomicU64>,
+}
+
+impl QualificationTrafficObservation {
+    fn new(initial_watch_sequence: u64, member_count: usize) -> Self {
+        Self {
+            failure: AtomicU8::new(0),
+            mutation_cycles: AtomicU64::new(0),
+            linearizable_reads: AtomicU64::new(0),
+            lease_renewals: AtomicU64::new(0),
+            lease_reacquisitions: AtomicU64::new(0),
+            complete_restore_scans: AtomicU64::new(0),
+            durable_readiness_probes: AtomicU64::new(0),
+            last_generation: AtomicU64::new(0),
+            last_record_fence: AtomicU64::new(0),
+            watch_entries: AtomicU64::new(0),
+            watch_applied_records: AtomicU64::new(0),
+            watch_sequence: AtomicU64::new(initial_watch_sequence),
+            watch_traffic_generations: (0..member_count).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn record_failure(&self, failure: QualificationTrafficFailureCode) {
+        let _ = self.failure.compare_exchange(
+            0,
+            traffic_failure_code(failure),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn failure(&self) -> Option<QualificationTrafficFailureCode> {
+        match self.failure.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(QualificationTrafficFailureCode::BackendUnavailable),
+            2 => Some(QualificationTrafficFailureCode::LeaseRejected),
+            3 => Some(QualificationTrafficFailureCode::WatchUnavailable),
+            4 => Some(QualificationTrafficFailureCode::RestoreScanRejected),
+            5 => Some(QualificationTrafficFailureCode::ReadinessUnavailable),
+            6 => Some(QualificationTrafficFailureCode::InvariantViolation),
+            _ => Some(QualificationTrafficFailureCode::TaskJoinUnavailable),
+        }
+    }
+}
+
+const fn traffic_failure_code(failure: QualificationTrafficFailureCode) -> u8 {
+    match failure {
+        QualificationTrafficFailureCode::BackendUnavailable => 1,
+        QualificationTrafficFailureCode::LeaseRejected => 2,
+        QualificationTrafficFailureCode::WatchUnavailable => 3,
+        QualificationTrafficFailureCode::RestoreScanRejected => 4,
+        QualificationTrafficFailureCode::ReadinessUnavailable => 5,
+        QualificationTrafficFailureCode::InvariantViolation => 6,
+        QualificationTrafficFailureCode::TaskJoinUnavailable => 7,
+    }
+}
+
+fn increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_add(1))
+    });
 }
 
 enum QualificationTransportRuntime {
@@ -206,19 +329,24 @@ impl QualificationNode {
             .await
             .map_err(|_| NodeFailure)?,
         );
+        let empty_vote_dispatches = Arc::new(AtomicU64::new(0));
+        let handler: Arc<dyn SessionConsensusRpcHandler> =
+            Arc::new(QualificationProbeDispatchCountingHandler {
+                inner: store.rpc_handler(),
+                empty_vote_dispatches: Arc::clone(&empty_vote_dispatches),
+            });
         let server = match server_transport {
             #[cfg(feature = "foundation-insecure")]
             QualificationServerTransport::FoundationPlaintext => {
-                SessionConsensusServer::new_insecure(store.rpc_handler(), local_binding)
+                SessionConsensusServer::new_insecure(handler, local_binding)
             }
-            QualificationServerTransport::ProjectedMtls(transport) => SessionConsensusServer::new(
-                store.rpc_handler(),
-                transport.server_config,
-                local_binding,
-            )
-            .with_connection_lifecycle(transport.lifecycle)
-            .with_reauthentication_control(transport.reauthentication),
-        };
+            QualificationServerTransport::ProjectedMtls(transport) => {
+                SessionConsensusServer::new(handler, transport.server_config, local_binding)
+                    .with_connection_lifecycle(transport.lifecycle)
+                    .with_reauthentication_control(transport.reauthentication)
+            }
+        }
+        .with_max_connections(QUALIFICATION_INBOUND_CONNECTION_SLOTS);
         let (server, actual_addr) = server.listen_on(listener).await.map_err(|_| NodeFailure)?;
         if actual_addr != expected_addr {
             server.abort_and_wait().await;
@@ -245,6 +373,12 @@ impl QualificationNode {
             server: Some(server),
             transport,
             leases: HashMap::new(),
+            node_index: config.node_index,
+            member_count: config.members.len(),
+            traffic_schedule_bound: qualification_traffic_schedule_sha256(config.members.len())
+                .is_some_and(|digest| digest == config.workload_schedule_sha256),
+            traffic: None,
+            empty_vote_dispatches,
         })
     }
 
@@ -268,9 +402,14 @@ impl QualificationNode {
             }
             QualificationNodeCommand::LifecycleMetrics => {
                 QualificationNodeReply::LifecycleMetrics {
-                    metrics: lifecycle_metrics(),
+                    metrics: lifecycle_metrics(self.empty_vote_dispatches.load(Ordering::SeqCst)),
                 }
             }
+            QualificationNodeCommand::StartTrafficWatch => self.start_traffic_watch().await,
+            QualificationNodeCommand::StartTrafficMutation => self.start_traffic_mutation().await,
+            QualificationNodeCommand::StopTrafficMutation => self.stop_traffic_mutation().await,
+            QualificationNodeCommand::StopTrafficWatch => self.stop_traffic_watch().await,
+            QualificationNodeCommand::TrafficStatus => self.traffic_status().await,
             QualificationNodeCommand::Acquire {
                 lease_handle,
                 stable_id,
@@ -432,6 +571,275 @@ impl QualificationNode {
         }
     }
 
+    async fn start_traffic_watch(&mut self) -> QualificationNodeReply {
+        if self.traffic.is_some() || !self.traffic_schedule_bound {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        }
+        let Some(seed) = qualification_traffic_seed(self.member_count) else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let initial_head = match self.protected.max_replication_sequence().await {
+            Ok(head) => head,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                }
+            }
+        };
+        let Some(watch_start) = initial_head.checked_add(1) else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let stream = match self.protected.watch(watch_start).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                };
+            }
+        };
+
+        let observation = Arc::new(QualificationTrafficObservation::new(
+            initial_head,
+            self.member_count,
+        ));
+        let (watch_cancel, watch_cancel_rx) = oneshot::channel();
+        let watch_task = tokio::spawn(run_traffic_watch_task(
+            stream,
+            watch_start,
+            self.member_count,
+            watch_cancel_rx,
+            Arc::clone(&observation),
+        ));
+        self.traffic = Some(QualificationTrafficRuntime {
+            seed,
+            observation,
+            mutation_started: false,
+            mutation_cancel: None,
+            mutation_task: None,
+            watch_cancel: Some(watch_cancel),
+            watch_task: Some(watch_task),
+        });
+        self.traffic_status().await
+    }
+
+    async fn start_traffic_mutation(&mut self) -> QualificationNodeReply {
+        let Some(traffic) = &self.traffic else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        if traffic.mutation_started
+            || traffic.mutation_task.is_some()
+            || traffic
+                .watch_task
+                .as_ref()
+                .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        }
+        let key = match qualification_traffic_key(self.node_index) {
+            Ok(key) => key,
+            Err(()) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                }
+            }
+        };
+        let owner = match OwnerId::new(format!("rotation-traffic-owner-{}", self.node_index)) {
+            Ok(owner) => owner,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                }
+            }
+        };
+        let lease = match self
+            .protected
+            .acquire(&key, owner.clone(), QUALIFICATION_TRAFFIC_TTL)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                }
+            }
+        };
+        let Some(traffic) = self.traffic.as_mut() else {
+            let _ = self.protected.release(lease).await;
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let (mutation_cancel, mutation_cancel_rx) = oneshot::channel();
+        let mutation_task = tokio::spawn(run_traffic_mutation_task(
+            self.protected.clone(),
+            Arc::clone(&self.store),
+            key,
+            owner,
+            lease,
+            traffic.seed,
+            self.member_count,
+            self.node_index,
+            mutation_cancel_rx,
+            Arc::clone(&traffic.observation),
+        ));
+        traffic.mutation_started = true;
+        traffic.mutation_cancel = Some(mutation_cancel);
+        traffic.mutation_task = Some(mutation_task);
+        self.traffic_status().await
+    }
+
+    async fn stop_traffic_mutation(&mut self) -> QualificationNodeReply {
+        let Some(traffic) = &mut self.traffic else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let (cancel, task, observation) = (
+            traffic.mutation_cancel.take(),
+            traffic.mutation_task.take(),
+            Arc::clone(&traffic.observation),
+        );
+        let (Some(cancel), Some(task)) = (cancel, task) else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let _ = cancel.send(());
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => observation.record_failure(failure),
+            Err(_) => {
+                observation.record_failure(QualificationTrafficFailureCode::TaskJoinUnavailable)
+            }
+        }
+        self.traffic_status().await
+    }
+
+    async fn stop_traffic_watch(&mut self) -> QualificationNodeReply {
+        let Some(traffic) = &mut self.traffic else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        if traffic.mutation_task.is_some() {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        }
+        let (cancel, task, observation) = (
+            traffic.watch_cancel.take(),
+            traffic.watch_task.take(),
+            Arc::clone(&traffic.observation),
+        );
+        let (Some(cancel), Some(task)) = (cancel, task) else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let _ = cancel.send(());
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => observation.record_failure(failure),
+            Err(_) => {
+                observation.record_failure(QualificationTrafficFailureCode::TaskJoinUnavailable)
+            }
+        }
+        self.traffic_status().await
+    }
+
+    async fn traffic_status(&self) -> QualificationNodeReply {
+        let Some(traffic) = &self.traffic else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let replication_head = match self.protected.max_replication_sequence().await {
+            Ok(head) => head,
+            Err(_) => {
+                traffic
+                    .observation
+                    .record_failure(QualificationTrafficFailureCode::BackendUnavailable);
+                traffic.observation.watch_sequence.load(Ordering::Acquire)
+            }
+        };
+        let mutation_running = traffic
+            .mutation_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+        let watch_running = traffic
+            .watch_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+        let failure = traffic.observation.failure();
+        let state = if failure.is_some() {
+            QualificationTrafficState::Failed
+        } else if mutation_running {
+            QualificationTrafficState::Running
+        } else if watch_running {
+            if traffic.mutation_started {
+                QualificationTrafficState::MutationStopped
+            } else {
+                QualificationTrafficState::WatchReady
+            }
+        } else {
+            QualificationTrafficState::Stopped
+        };
+        QualificationNodeReply::TrafficStatus {
+            status: QualificationTrafficStatus {
+                state,
+                failure,
+                seed: traffic.seed,
+                owned_async_tasks: u8::from(mutation_running) + u8::from(watch_running),
+                mutation_cycles: traffic.observation.mutation_cycles.load(Ordering::Acquire),
+                linearizable_reads: traffic
+                    .observation
+                    .linearizable_reads
+                    .load(Ordering::Acquire),
+                lease_renewals: traffic.observation.lease_renewals.load(Ordering::Acquire),
+                lease_reacquisitions: traffic
+                    .observation
+                    .lease_reacquisitions
+                    .load(Ordering::Acquire),
+                complete_restore_scans: traffic
+                    .observation
+                    .complete_restore_scans
+                    .load(Ordering::Acquire),
+                durable_readiness_probes: traffic
+                    .observation
+                    .durable_readiness_probes
+                    .load(Ordering::Acquire),
+                last_generation: traffic.observation.last_generation.load(Ordering::Acquire),
+                last_record_fence: traffic
+                    .observation
+                    .last_record_fence
+                    .load(Ordering::Acquire),
+                watch_entries: traffic.observation.watch_entries.load(Ordering::Acquire),
+                watch_applied_records: traffic
+                    .observation
+                    .watch_applied_records
+                    .load(Ordering::Acquire),
+                watch_sequence: traffic.observation.watch_sequence.load(Ordering::Acquire),
+                watch_traffic_generations: traffic
+                    .observation
+                    .watch_traffic_generations
+                    .iter()
+                    .map(|generation| generation.load(Ordering::Acquire))
+                    .collect(),
+                replication_head,
+            },
+        }
+    }
+
     fn material_status(&self) -> QualificationNodeReply {
         let QualificationTransportRuntime::ProjectedMtls(transport) = &self.transport else {
             return QualificationNodeReply::Error {
@@ -578,13 +986,341 @@ impl QualificationNode {
     }
 
     async fn stop_server(&mut self) {
+        if self
+            .traffic
+            .as_ref()
+            .and_then(|traffic| traffic.mutation_task.as_ref())
+            .is_some()
+        {
+            let _ = self.stop_traffic_mutation().await;
+        }
+        if self
+            .traffic
+            .as_ref()
+            .and_then(|traffic| traffic.watch_task.as_ref())
+            .is_some()
+        {
+            let _ = self.stop_traffic_watch().await;
+        }
         if let Some(server) = self.server.take() {
             server.abort_and_wait().await;
         }
     }
 }
 
-fn lifecycle_metrics() -> QualificationConnectionLifecycleMetrics {
+#[allow(clippy::too_many_arguments)]
+async fn run_traffic_mutation_task(
+    protected: ProtectedStore,
+    store: Arc<ConsensusSessionStore>,
+    key: SessionKey,
+    owner: OwnerId,
+    mut lease: LeaseGuard,
+    seed: u64,
+    member_count: usize,
+    node_index: usize,
+    mut cancellation: oneshot::Receiver<()>,
+    observation: Arc<QualificationTrafficObservation>,
+) -> Result<(), QualificationTrafficFailureCode> {
+    let result = run_traffic_mutation_task_inner(
+        &protected,
+        &store,
+        &key,
+        &owner,
+        &mut lease,
+        seed,
+        member_count,
+        node_index,
+        &mut cancellation,
+        &observation,
+    )
+    .await;
+    match result {
+        Ok(()) => match protected.release(lease).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                observation.record_failure(QualificationTrafficFailureCode::LeaseRejected);
+                Err(QualificationTrafficFailureCode::LeaseRejected)
+            }
+        },
+        Err(failure) => {
+            observation.record_failure(failure);
+            let _ = protected.release(lease).await;
+            Err(failure)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_traffic_mutation_task_inner(
+    protected: &ProtectedStore,
+    store: &ConsensusSessionStore,
+    key: &SessionKey,
+    owner: &OwnerId,
+    lease: &mut LeaseGuard,
+    seed: u64,
+    member_count: usize,
+    node_index: usize,
+    cancellation: &mut oneshot::Receiver<()>,
+    observation: &QualificationTrafficObservation,
+) -> Result<(), QualificationTrafficFailureCode> {
+    let mut schedule_state = seed ^ (u64::try_from(node_index).unwrap_or(u64::MAX) << 32);
+    loop {
+        match cancellation.try_recv() {
+            Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return Ok(()),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+
+        let renewed = protected
+            .renew(lease, QUALIFICATION_TRAFFIC_TTL)
+            .await
+            .map_err(|_| QualificationTrafficFailureCode::LeaseRejected)?;
+        if !lease_authority_is_preserved(
+            key,
+            owner,
+            lease.fence().get(),
+            renewed.key(),
+            renewed.owner(),
+            renewed.fence().get(),
+        ) {
+            return Err(QualificationTrafficFailureCode::InvariantViolation);
+        }
+        *lease = renewed;
+        increment(&observation.lease_renewals);
+
+        let generation = observation
+            .last_generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or(QualificationTrafficFailureCode::InvariantViolation)?;
+        let value = qualification_traffic_value(seed, member_count, node_index, generation);
+        let expected_record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(generation),
+            owner: lease.owner().clone(),
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static(QUALIFICATION_TRAFFIC_STATE_TYPE),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(value.as_bytes()),
+        };
+        let expected_generation = generation.checked_sub(1).filter(|value| *value != 0);
+        match protected
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: expected_generation.map(Generation::new),
+                new_record: expected_record.clone(),
+            })
+            .await
+            .map_err(|_| QualificationTrafficFailureCode::BackendUnavailable)?
+        {
+            CompareAndSetResult::Success => {}
+            CompareAndSetResult::Conflict { .. } => {
+                return Err(QualificationTrafficFailureCode::InvariantViolation)
+            }
+        }
+
+        let stored = protected
+            .get(key)
+            .await
+            .map_err(|_| QualificationTrafficFailureCode::BackendUnavailable)?
+            .ok_or(QualificationTrafficFailureCode::InvariantViolation)?;
+        if !traffic_record_is_exact(&expected_record, &stored) {
+            return Err(QualificationTrafficFailureCode::InvariantViolation);
+        }
+        increment(&observation.linearizable_reads);
+
+        let page = protected
+            .scan_restore_records(RestoreScanRequest::all(QUALIFICATION_TRAFFIC_RESTORE_LIMIT))
+            .await
+            .map_err(|_| QualificationTrafficFailureCode::RestoreScanRejected)?;
+        if !page.complete
+            || page.next_cursor.is_some()
+            || page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
+            || page.loaded_count != page.records.len()
+            || page.loaded_count > QUALIFICATION_TRAFFIC_RESTORE_LIMIT
+            || !page
+                .records
+                .iter()
+                .any(|candidate| traffic_record_is_exact(&expected_record, candidate))
+        {
+            return Err(QualificationTrafficFailureCode::RestoreScanRejected);
+        }
+        increment(&observation.complete_restore_scans);
+
+        let readiness = store.probe_durable_readiness().await;
+        if !readiness.is_ready() {
+            return Err(QualificationTrafficFailureCode::ReadinessUnavailable);
+        }
+        increment(&observation.durable_readiness_probes);
+
+        let record_fence = lease.fence().get();
+        protected
+            .release(lease.clone())
+            .await
+            .map_err(|_| QualificationTrafficFailureCode::LeaseRejected)?;
+        let reacquired = protected
+            .acquire(key, owner.clone(), QUALIFICATION_TRAFFIC_TTL)
+            .await
+            .map_err(|_| QualificationTrafficFailureCode::LeaseRejected)?;
+        if !lease_authority_is_advanced(
+            key,
+            owner,
+            record_fence,
+            reacquired.key(),
+            reacquired.owner(),
+            reacquired.fence().get(),
+        ) {
+            return Err(QualificationTrafficFailureCode::InvariantViolation);
+        }
+        *lease = reacquired;
+        increment(&observation.lease_reacquisitions);
+        observation
+            .last_record_fence
+            .store(record_fence, Ordering::Release);
+        observation
+            .last_generation
+            .store(generation, Ordering::Release);
+        increment(&observation.mutation_cycles);
+
+        schedule_state = schedule_state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let delay = QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS
+            + schedule_state % QUALIFICATION_TRAFFIC_MUTATION_DELAY_SPAN_MILLIS;
+        tokio::select! {
+            _ = &mut *cancellation => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+        }
+    }
+}
+
+fn lease_authority_is_preserved(
+    expected_key: &SessionKey,
+    expected_owner: &OwnerId,
+    expected_fence: u64,
+    actual_key: &SessionKey,
+    actual_owner: &OwnerId,
+    actual_fence: u64,
+) -> bool {
+    actual_key == expected_key && actual_owner == expected_owner && actual_fence == expected_fence
+}
+
+fn lease_authority_is_advanced(
+    expected_key: &SessionKey,
+    expected_owner: &OwnerId,
+    previous_fence: u64,
+    actual_key: &SessionKey,
+    actual_owner: &OwnerId,
+    actual_fence: u64,
+) -> bool {
+    actual_key == expected_key && actual_owner == expected_owner && actual_fence > previous_fence
+}
+
+fn traffic_record_is_exact(expected: &StoredSessionRecord, actual: &StoredSessionRecord) -> bool {
+    actual == expected
+}
+
+async fn run_traffic_watch_task(
+    mut stream: BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+    mut expected_sequence: u64,
+    member_count: usize,
+    mut cancellation: oneshot::Receiver<()>,
+    observation: Arc<QualificationTrafficObservation>,
+) -> Result<(), QualificationTrafficFailureCode> {
+    let traffic_keys = (0..member_count)
+        .map(qualification_traffic_key)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|()| QualificationTrafficFailureCode::InvariantViolation)?;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut cancellation => return Ok(()),
+            entry = stream.next() => {
+                let Some(entry) = entry else {
+                    observation.record_failure(QualificationTrafficFailureCode::WatchUnavailable);
+                    return Err(QualificationTrafficFailureCode::WatchUnavailable);
+                };
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        observation.record_failure(QualificationTrafficFailureCode::WatchUnavailable);
+                        return Err(QualificationTrafficFailureCode::WatchUnavailable);
+                    }
+                };
+                if entry.sequence != expected_sequence {
+                    observation.record_failure(QualificationTrafficFailureCode::InvariantViolation);
+                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                }
+                let applied_records = observe_applied_records(
+                    &entry.op,
+                    &traffic_keys,
+                    &observation.watch_traffic_generations,
+                )?;
+                observation.watch_sequence.store(entry.sequence, Ordering::Release);
+                increment(&observation.watch_entries);
+                if applied_records != 0 {
+                    let _ = observation.watch_applied_records.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |value| Some(value.saturating_add(applied_records)),
+                    );
+                }
+                let Some(next_sequence) = expected_sequence.checked_add(1) else {
+                    observation.record_failure(QualificationTrafficFailureCode::InvariantViolation);
+                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                };
+                expected_sequence = next_sequence;
+            }
+        }
+    }
+}
+
+fn observe_applied_records(
+    operation: &ReplicationOp,
+    traffic_keys: &[SessionKey],
+    watch_traffic_generations: &[AtomicU64],
+) -> Result<u64, QualificationTrafficFailureCode> {
+    if traffic_keys.len() != watch_traffic_generations.len() {
+        return Err(QualificationTrafficFailureCode::InvariantViolation);
+    }
+    let mut count = 0_u64;
+    let mut pending = vec![operation];
+    while let Some(operation) = pending.pop() {
+        match operation {
+            ReplicationOp::CompareAndSet {
+                key, new_record, ..
+            } => {
+                count = count.saturating_add(1);
+                if let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                {
+                    if new_record.key != *key {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    let generation = new_record.generation.get();
+                    let previous = watch_traffic_generations[node_index].load(Ordering::Acquire);
+                    if previous.checked_add(1) != Some(generation) {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    watch_traffic_generations[node_index].store(generation, Ordering::Release);
+                }
+            }
+            ReplicationOp::Batch { ops } => pending.extend(ops.iter()),
+            ReplicationOp::DeleteFenced { .. }
+            | ReplicationOp::RefreshTtl { .. }
+            | ReplicationOp::AcquireLease { .. }
+            | ReplicationOp::RenewLease { .. }
+            | ReplicationOp::ReleaseLease { .. } => {}
+        }
+    }
+    Ok(count)
+}
+
+fn qualification_traffic_key(node_index: usize) -> Result<SessionKey, ()> {
+    qualification_key(&format!("rotation-traffic-{node_index}"))
+}
+
+fn lifecycle_metrics(empty_vote_dispatches: u64) -> QualificationConnectionLifecycleMetrics {
     QualificationConnectionLifecycleMetrics {
         retirement_maximum_age: METRICS
             .session_net_lifecycle_retirement_maximum_age
@@ -606,6 +1342,9 @@ fn lifecycle_metrics() -> QualificationConnectionLifecycleMetrics {
             .load(Ordering::Relaxed),
         retirement_explicit: METRICS
             .session_net_lifecycle_retirement_explicit
+            .load(Ordering::Relaxed),
+        retirement_idle_timeout: METRICS
+            .session_net_lifecycle_retirement_idle_timeout
             .load(Ordering::Relaxed),
         active_connections: METRICS
             .session_net_lifecycle_active_connections
@@ -649,6 +1388,7 @@ fn lifecycle_metrics() -> QualificationConnectionLifecycleMetrics {
         reconnect_failures: METRICS
             .session_net_reconnect_failures
             .load(Ordering::Relaxed),
+        empty_vote_dispatches,
     }
 }
 
@@ -1099,5 +1839,85 @@ mod tests {
             validate_new_lease_handle(&leases, "lease"),
             Err(QualificationNodeErrorCode::LeaseHandleDuplicate)
         );
+    }
+
+    #[test]
+    fn traffic_lease_contract_requires_preserved_renewal_and_advanced_reacquisition() {
+        let key = qualification_key("traffic-lease-contract").expect("traffic key");
+        let other_key = qualification_key("other-traffic-lease").expect("other traffic key");
+        let owner = OwnerId::new("traffic-owner").expect("traffic owner");
+        let other_owner = OwnerId::new("other-traffic-owner").expect("other traffic owner");
+
+        assert!(lease_authority_is_preserved(
+            &key, &owner, 7, &key, &owner, 7
+        ));
+        assert!(!lease_authority_is_preserved(
+            &key, &owner, 7, &key, &owner, 8
+        ));
+        assert!(!lease_authority_is_preserved(
+            &key, &owner, 7, &other_key, &owner, 7
+        ));
+        assert!(!lease_authority_is_preserved(
+            &key,
+            &owner,
+            7,
+            &key,
+            &other_owner,
+            7
+        ));
+
+        assert!(lease_authority_is_advanced(
+            &key, &owner, 7, &key, &owner, 8
+        ));
+        assert!(!lease_authority_is_advanced(
+            &key, &owner, 7, &key, &owner, 7
+        ));
+        assert!(!lease_authority_is_advanced(
+            &key, &owner, 7, &key, &owner, 6
+        ));
+        assert!(!lease_authority_is_advanced(
+            &key,
+            &owner,
+            7,
+            &key,
+            &other_owner,
+            8
+        ));
+    }
+
+    #[test]
+    fn traffic_record_equality_rejects_every_metadata_substitution() {
+        let expected = StoredSessionRecord {
+            key: qualification_key("traffic-record-contract").expect("traffic key"),
+            generation: Generation::new(9),
+            owner: OwnerId::new("traffic-record-owner").expect("traffic owner"),
+            fence: opc_session_store::FenceToken::new(11),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static(QUALIFICATION_TRAFFIC_STATE_TYPE),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"traffic-record-value"),
+        };
+        assert!(traffic_record_is_exact(&expected, &expected.clone()));
+
+        let mut substitutions = Vec::new();
+        let mut substituted = expected.clone();
+        substituted.key = qualification_key("other-traffic-record").expect("other traffic key");
+        substitutions.push(substituted);
+        let mut substituted = expected.clone();
+        substituted.state_class = StateClass::ReplicatedDr;
+        substitutions.push(substituted);
+        let mut substituted = expected.clone();
+        substituted.state_type = StateType::from_static("other-traffic-state");
+        substitutions.push(substituted);
+        let mut substituted = expected.clone();
+        substituted.expires_at = Some(opc_types::Timestamp::now_utc());
+        substitutions.push(substituted);
+        let mut substituted = expected.clone();
+        substituted.payload = EncryptedSessionPayload::new(b"other-traffic-record-value");
+        substitutions.push(substituted);
+
+        for substituted in substitutions {
+            assert!(!traffic_record_is_exact(&expected, &substituted));
+        }
     }
 }

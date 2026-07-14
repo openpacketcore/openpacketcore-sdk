@@ -24,7 +24,9 @@
 //! rollback or permits an automatic replay. Material publication or an explicit
 //! [`SessionReauthenticationControl`] request drains existing connections;
 //! replacements always repeat the complete mutual-TLS and application-profile
-//! handshake. Direct watch streams reconnect from the exact next
+//! handshake. Post-bootstrap byte-idle listeners retire through a fixed
+//! lifecycle reason; bootstrap silence and partial active frames remain
+//! timeout failures. Direct watch streams reconnect from the exact next
 //! caller-visible sequence. Protocol-profile upgrades remain coordinated
 //! stop/upgrade/start operations; this lifecycle provides seamless credential
 //! rotation only after every participant already runs the same profile.

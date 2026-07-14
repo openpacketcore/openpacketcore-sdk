@@ -576,6 +576,18 @@ fn fleet_rotation_lifecycle() -> ConnectionLifecyclePolicy {
     .expect("fleet rotation lifecycle policy")
 }
 
+fn single_attempt_removed_root_probe_lifecycle() -> ConnectionLifecyclePolicy {
+    let cold_connect_timeout = DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout();
+    ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        cold_connect_timeout,
+        cold_connect_timeout,
+        Duration::ZERO,
+    )
+    .expect("single-attempt removed-root probe lifecycle policy")
+}
+
 struct RotatingNodeMaterial {
     source: tokio::sync::watch::Sender<Option<opc_identity::IdentityState>>,
     client: AuthenticatedClientConfig,
@@ -1032,12 +1044,20 @@ impl RotatingConsensusFleet {
                 .expect("old-chain local binding")
                 .bind_remote(replica_id(self.replicas[target]))
                 .expect("old-chain remote binding");
+            let resolver_calls = Arc::new(AtomicUsize::new(0));
+            let resolver_calls_for_probe = Arc::clone(&resolver_calls);
+            let target_address = self.addresses[target];
+            let resolver: RemoteAddrResolver = Arc::new(move || {
+                resolver_calls_for_probe.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(target_address) })
+            });
             let peer = RemoteSessionConsensusPeer::new_with_resolver(
                 binding,
-                resolver(self.addresses[target]),
+                resolver,
                 client,
-                Some(Duration::from_secs(1)),
-            );
+                Some(DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout()),
+            )
+            .with_connection_lifecycle(single_attempt_removed_root_probe_lifecycle());
             let dispatches_before = self.probe_dispatches[target].load(Ordering::SeqCst);
             let outcome = peer
                 .call(request(&self.manifest, self.replicas[source], Vec::new()))
@@ -1051,6 +1071,11 @@ impl RotatingConsensusFleet {
                     )
                 ),
                 "new-only server trust must reject the removed old issuer before application admission: source={source}, target={target}, outcome={outcome:?}"
+            );
+            assert_eq!(
+                resolver_calls.load(Ordering::SeqCst),
+                1,
+                "the qualification-only removed-root probe must make exactly one connection attempt"
             );
             assert_eq!(
                 self.probe_dispatches[target].load(Ordering::SeqCst),

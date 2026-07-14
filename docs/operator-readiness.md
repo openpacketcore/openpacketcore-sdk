@@ -861,15 +861,32 @@ private inherited descriptor and is never evidence. Emergency serving
 withdrawal runs before and independently of evidence persistence; ENOSPC or an
 unwritable evidence root must fail the campaign without suppressing or
 repeating that action. The deliberate old-chain negative probe remains visible
-to the critical authentication alert and is accepted only when its isolated
-per-member delta is exact and no concurrent increase occurred.
+to the critical authentication alert. Its qualification-only reconnect delay
+spans the complete cold-connect subdeadline and its resolver must run exactly
+once; the target must record exactly one authentication failure and no invalid
+empty Vote application dispatch. The client may report authentication or
+an EOF-derived timeout because those wire observations are platform-dependent;
+production EOF/reset classification and retry behavior are unchanged.
+
+The Linux three- and five-process traffic/resource qualifications are explicit
+manual tests so the serialized campaigns cannot consume the workspace CI time
+budget. Run each alone from a clean host with, respectively,
+`cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1`
+and
+`cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1`.
+Their post-shutdown persistence proof validates every retained exact canary
+against exactly one of two fixed domain-separated prefixes, then scans each
+SQLite/WAL/SHM artifact once for each prefix.
 
 Alert on the fixed connection retirement, active/draining, drain-overrun,
 connection-outcome, reconnect, and watch-slow-consumer metrics. Do not add
 endpoint, SPIFFE ID, certificate, key, transaction, or payload labels. A zero
 draining gauge does not prove current-material authentication; require fresh
 durable readiness and exercise every directed peer path before old-trust
-removal.
+removal. Treat `connection_retirements_total{reason="idle_timeout"}` as bounded
+authenticated connection turnover, not a transport incident. Continue paging
+on `connection_attempts_total{outcome="timeout"}`: TLS/application bootstrap
+silence and partial authenticated frames remain true timeout failures.
 
 The private `opc-session-testkit` component core now runs the documented
 trust/leaf/intermediate/root forward and rollback order in separate three- and
