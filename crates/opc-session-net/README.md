@@ -234,7 +234,14 @@ restore cursor, explicit durable-page profile, fixed 4 MiB restore payload and
 budgets and exact configuration/process epoch binding for direct CAS. Revision
 5 adds the bounded, payload-free `RecordExpiryPreflight` authority exchange.
 Revision 6 adds the fixed `ConnectionRetiring` no-dispatch proof used for safe
-reconnection during authentication-material rotation.
+reconnection during authentication-material rotation. When lifecycle
+retirement is observed after mutual TLS and before any `HelloAck` bytes are
+written, the server returns the same complete control as
+`BootstrapResponse::ConnectionRetiring`. The client retries before sending an
+application request only after decoding that complete authenticated frame.
+EOF, an incomplete frame, and a partially written acknowledgement remain
+fail-closed; the server does not append a retirement frame after a partial
+acknowledgement.
 The error-set revision is 8. Directional budgets are part of the exact
 handshake. `requested_response_frame_size`,
 `accepted_response_frame_size`, and `server_request_frame_size` are public
@@ -524,10 +531,23 @@ Retirement has these invariants:
   response passes wire validation; a typed failed response, cancellation, or
   every uncertain stream position leaves the slot empty, and a subsequent
   Openraft retry reconnects without an implicit transport replay;
+- after mutual TLS and before acknowledgement, a complete generic
+  `BootstrapResponse::ConnectionRetiring` result proves server admission did
+  not occur; the sequential client has not yet sent application request bytes.
+  The consensus bootstrap context reserves
+  `SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Rejected)`
+  for the equivalent state before any Openraft request bytes. Ordinary
+  authentication, identity/scope, contract, protocol, and post-bootstrap
+  engine rejections remain distinct and are never reclassified as this
+  rotation control;
 - the fixed, fully decoded `ConnectionRetiring` response proves that a legacy
-  direct mutation was not dispatched and is therefore the only retirement
-  signal that permits an automatic mutation retry; EOF, a partial frame, or a
-  generic error remains an ambiguous mutation outcome;
+  direct mutation was not dispatched after bootstrap and is therefore the only
+  post-bootstrap retirement signal that permits an automatic mutation retry;
+  EOF, a partial frame, or a generic error remains an ambiguous mutation
+  outcome;
+- if an acknowledgement write has partially completed when rotation is
+  observed, the server closes without appending a second frame; the client
+  treats that incomplete stream as a failure, never as a no-dispatch proof;
 - a caller-visible legacy watch survives planned retirement and resumes from
   checked `last_delivered_sequence + 1`; a partially read item stays on the old
   connection, the cursor advances only after caller delivery, and overflow,
@@ -538,9 +558,27 @@ This is credential continuity, not protocol negotiation. The move to direct
 wire-schema revision 6 is still a coordinated drained stop/upgrade/start of
 every participant. After the fleet is uniformly on revision 6, leaf and trust
 rotation uses the lifecycle above without a protocol downgrade or plaintext
-fallback. Session payload protection and HKMS placement are unchanged:
-encryption remains above consensus and the network lifecycle never receives
-plaintext, provider handles, or raw key material.
+fallback. The bootstrap retirement control does not advance the direct or
+consensus profile revision and does not change the public API, but an older
+same-profile decoder fails closed rather than treating the new control as an
+acknowledgement. Mixed-patch rolling rotation is therefore not seamless.
+Persistent formats and Openraft authority are unchanged. Session payload
+protection and HKMS placement are also unchanged: encryption remains above
+consensus and the network lifecycle never receives plaintext, provider handles,
+or raw key material.
+
+The server records a connection-attempt `success` only after completely writing
+the bootstrap retirement control; the client records its own `success` only
+after decoding the complete control. In both cases `success` means authenticated
+transport/control completion rather than application admission. That decode
+initiates the client's existing bounded deadline/backoff path and records a
+reconnect `attempt`. The client records no reconnect `failure` or
+connection-failure outcome for the complete control. EOF and incomplete
+controls retain their ordinary transport/protocol failure accounting.
+
+This closes only the narrow authenticated post-TLS/pre-acknowledgement rotation
+race. It does not complete #164's remaining multi-process trust-removal,
+short-lived-SVID, reconnect-storm, resource, or soak qualification.
 
 The exporter provides only closed, low-cardinality lifecycle dimensions:
 `opc_session_net_connection_retirements_total{reason}`, current

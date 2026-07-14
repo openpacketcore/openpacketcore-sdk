@@ -1330,6 +1330,35 @@ nonce/challenge, ALPN, version, and exact contract-profile checks. TLS
 resumption, cached peer authority, plaintext fallback, and task-abort
 reauthentication MUST NOT replace that handshake.
 
+If a lifecycle retirement boundary (maximum authentication age, local or peer
+certificate expiry, material epoch, or explicit reauthentication) is observed
+after mutual TLS but before any bootstrap acknowledgement bytes are written,
+the generic transport MUST return one complete authenticated
+`BootstrapResponse::ConnectionRetiring` result. The consensus bootstrap context
+MUST use
+`SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Rejected)`
+as the corresponding no-dispatch control. That nested value is reserved in
+this context only: ordinary authentication, identity or scope, contract, and
+protocol failures MUST retain their existing classifications and MUST NOT be
+emitted or interpreted as this control; a post-bootstrap engine `Rejected`
+result MUST remain an ordinary call response. The sequential client MUST NOT
+send application or Openraft request bytes before bootstrap succeeds. After it
+decodes the complete retirement control, it MUST discard that connection and
+retry the pending operation only through the existing bounded deadline and
+backoff path.
+
+EOF, an incomplete control, or an acknowledgement whose write has partially
+completed MUST fail closed. Once an acknowledgement write may have emitted a
+byte, the server MUST close rather than append a bootstrap retirement frame.
+The client MUST NOT infer no-dispatch from that incomplete stream. The server
+MUST count a connection-attempt `success` only after completely writing the
+bootstrap retirement control; the client MUST count its own `success` only
+after decoding the complete control. In both cases `success` means authenticated
+transport/control completion, not application admission. That decode MUST
+initiate the client's existing bounded deadline/backoff path and count a
+reconnect `attempt`; the client MUST NOT count a reconnect `failure` or a
+connection-failure outcome for that complete control.
+
 The legacy direct profile MAY automatically retry a mutation after retirement
 only when it has decoded the complete fixed `ConnectionRetiring` response,
 which proves server dispatch did not occur. EOF, a partial retirement frame,
@@ -1340,6 +1369,16 @@ connection, advance the resume cursor only after caller delivery, and resume
 from checked `last_delivered_sequence + 1`. Cursor overflow, compaction or
 another permanent backend error, cancellation, and bounded slow-consumer
 failure MUST terminate explicitly rather than reconnect forever.
+
+This bootstrap behavior admits the already-frozen direct revision-6 variant and
+existing consensus error value in their restricted bootstrap contexts. It
+changes no public API, direct or consensus profile revision, persisted
+SQLite/journal/snapshot format, Openraft commit authority, payload envelope,
+encryption-at-rest boundary, or HKMS/provider placement. Older same-profile
+decoders fail closed on the control rather than negotiating a downgrade, so
+mixed-patch rolling rotation is not seamless. This closes only the narrow
+authenticated post-TLS/pre-acknowledgement race; it does not satisfy the
+remaining #164 fleet qualification.
 
 This authenticated transport plus #127 commit authority is still not a
 production qualification. #128 supplies current-format divergence recovery,

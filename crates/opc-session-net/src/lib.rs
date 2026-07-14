@@ -43,6 +43,8 @@ mod protocol;
 pub mod protocol;
 #[cfg(feature = "legacy-session-net-compat")]
 pub mod server;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(feature = "legacy-session-net-compat")]
 pub use client::RemoteSessionBackend;

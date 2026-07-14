@@ -565,6 +565,17 @@ impl ConnectionLifecycle {
         self.record_retirement(reason);
     }
 
+    #[cfg(test)]
+    pub(crate) fn recorded_retirement_count(&self) -> u8 {
+        u8::from(self.retirement_recorded.load(Ordering::Acquire))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_at_final_ack_boundary_for_test(&mut self) {
+        self.rotation_retire_at = None;
+        self.retire_at = tokio::time::Instant::now();
+    }
+
     fn record_retirement(&self, reason: RetirementReason) {
         if self.retirement_recorded.swap(true, Ordering::Relaxed) {
             return;

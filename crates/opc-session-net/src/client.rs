@@ -215,6 +215,16 @@ struct NegotiatedResponse {
     frame_limits: NegotiatedFrameLimits,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ConnectionOpenError {
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+    #[error("connection retired before application admission")]
+    /// Authenticated proof that the server retired before admitting any
+    /// application request or transmitting its bootstrap acknowledgement.
+    Retired,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteRequestFailure {
     Transport,
@@ -236,6 +246,13 @@ struct RemoteRequestAttemptFailure {
 }
 
 impl RemoteRequestAttemptFailure {
+    fn before_connection(error: &ConnectionOpenError) -> Self {
+        match error {
+            ConnectionOpenError::Protocol(error) => Self::before_transmission(error),
+            ConnectionOpenError::Retired => Self::connection_retiring(),
+        }
+    }
+
     fn before_transmission(error: &ProtocolError) -> Self {
         Self {
             failure: RemoteRequestFailure::from_protocol_error(error),
@@ -283,6 +300,13 @@ impl RemoteRequestAttemptFailure {
 }
 
 impl RemoteRequestFailure {
+    fn from_connection_error(error: &ConnectionOpenError) -> Self {
+        match error {
+            ConnectionOpenError::Protocol(error) => Self::from_protocol_error(error),
+            ConnectionOpenError::Retired => Self::ConnectionRetiring,
+        }
+    }
+
     fn from_protocol_error(error: &ProtocolError) -> Self {
         match error {
             ProtocolError::Io(error) if error.kind() == io::ErrorKind::TimedOut => Self::Timeout,
@@ -475,9 +499,9 @@ async fn open_connection(
     operation_deadline: tokio::time::Instant,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
-) -> Result<Connection, ProtocolError> {
+) -> Result<Connection, ConnectionOpenError> {
     // Local configuration rejection is not a connection attempt.
-    checked_wire_frame_size(requested_response_frame_size)?;
+    checked_wire_frame_size(requested_response_frame_size).map_err(ConnectionOpenError::from)?;
     METRICS
         .session_net_connection_attempts
         .fetch_add(1, Ordering::Relaxed);
@@ -493,14 +517,24 @@ async fn open_connection(
     .await;
     match &result {
         Ok(_) => &METRICS.session_net_connection_successes,
-        Err(ProtocolError::Io(error)) if error.kind() == io::ErrorKind::TimedOut => {
+        // A complete authenticated retirement control is a successful
+        // transport/control exchange, but not an admitted application
+        // connection. Account for the attempt without misclassifying the
+        // expected local-rotation race as a failure; the caller reconnects
+        // before transmitting any application request.
+        Err(ConnectionOpenError::Retired) => &METRICS.session_net_connection_successes,
+        Err(ConnectionOpenError::Protocol(ProtocolError::Io(error)))
+            if error.kind() == io::ErrorKind::TimedOut =>
+        {
             &METRICS.session_net_connection_failure_timeout
         }
-        Err(ProtocolError::Io(_)) => &METRICS.session_net_connection_failure_transport,
-        Err(ProtocolError::Authentication) => {
+        Err(ConnectionOpenError::Protocol(ProtocolError::Io(_))) => {
+            &METRICS.session_net_connection_failure_transport
+        }
+        Err(ConnectionOpenError::Protocol(ProtocolError::Authentication)) => {
             &METRICS.session_net_connection_failure_authentication
         }
-        Err(ProtocolError::BackendUnavailable(_)) => {
+        Err(ConnectionOpenError::Protocol(ProtocolError::BackendUnavailable(_))) => {
             &METRICS.session_net_connection_failure_backend
         }
         Err(_) => &METRICS.session_net_connection_failure_protocol,
@@ -517,7 +551,7 @@ async fn open_connection_attempt(
     operation_deadline: tokio::time::Instant,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
-) -> Result<Connection, ProtocolError> {
+) -> Result<Connection, ConnectionOpenError> {
     // Reject unrepresentable or unusably small local budgets before DNS or a
     // socket allocation. The handshake repeats this conversion when building
     // the fixed-width field, keeping direct callers fail closed as well.
@@ -539,13 +573,13 @@ async fn open_connection_attempt(
                         .await
                         .map_err(classify_tls_io_error)?;
                     if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_NET_ALPN) {
-                        return Err(ProtocolError::UnexpectedResponse);
+                        return Err(ProtocolError::UnexpectedResponse.into());
                     }
                     let peer =
                         opc_tls::peer_tls_identity_from_client_connection(tls_stream.get_ref().1)
                             .map_err(|_| ProtocolError::Authentication)?;
                     if peer.spiffe_id().as_str() != binding.remote_spiffe_id().as_str() {
-                        return Err(ProtocolError::Authentication);
+                        return Err(ProtocolError::Authentication.into());
                     }
                     let tls_completed_at = tokio::time::Instant::now();
                     let local_expiry = CertificateExpiryEvidence::capture(
@@ -569,7 +603,7 @@ async fn open_connection_attempt(
                             operation_deadline,
                         )
                         .await?;
-                    Ok::<_, ProtocolError>((
+                    Ok::<_, ConnectionOpenError>((
                         reader,
                         writer,
                         tls_completed_at,
@@ -583,7 +617,9 @@ async fn open_connection_attempt(
             })
             .await
             .map_err(|error| match error {
-                opc_tls::TlsHandshakeRunError::Material(_) => ProtocolError::Authentication,
+                opc_tls::TlsHandshakeRunError::Material(_) => {
+                    ConnectionOpenError::Protocol(ProtocolError::Authentication)
+                }
                 opc_tls::TlsHandshakeRunError::Operation(error) => error,
             })?;
         let admission = outcome.admission();
@@ -656,7 +692,7 @@ async fn perform_client_handshake<R, W>(
     binding: &RemoteReplicaBinding,
     requested_response_frame_size: usize,
     operation_deadline: tokio::time::Instant,
-) -> Result<(ContractProfile, NegotiatedFrameLimits, uuid::Uuid), ProtocolError>
+) -> Result<(ContractProfile, NegotiatedFrameLimits, uuid::Uuid), ConnectionOpenError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -689,10 +725,11 @@ where
                 return Err(ProtocolError::VersionMismatch {
                     local: CONTRACT_VERSION,
                     remote: ack.contract_version,
-                });
+                }
+                .into());
             }
             if ack.contract_profile != Some(CURRENT_CONTRACT_PROFILE) {
-                return Err(ProtocolError::ContractMismatch);
+                return Err(ProtocolError::ContractMismatch.into());
             }
             let identity_matches = ack.server_replica_id.as_deref()
                 == Some(binding.remote_replica_id().as_str())
@@ -702,17 +739,17 @@ where
                 && ack.configuration_id.as_deref() == Some(configuration_id.as_str())
                 && ack.configuration_epoch == Some(binding.configuration_epoch().get());
             if !identity_matches {
-                return Err(ProtocolError::Authentication);
+                return Err(ProtocolError::Authentication.into());
             }
             if ack.handshake_nonce != Some(handshake_nonce) {
-                return Err(ProtocolError::UnexpectedResponse);
+                return Err(ProtocolError::UnexpectedResponse.into());
             }
             let accepted_response_frame_size = checked_frame_size(
                 ack.accepted_response_frame_size
                     .ok_or(ProtocolError::ContractMismatch)?,
             )?;
             if accepted_response_frame_size > checked_frame_size(requested_response_frame_size)? {
-                return Err(ProtocolError::ContractMismatch);
+                return Err(ProtocolError::ContractMismatch.into());
             }
             let request_frame_size = checked_frame_size(
                 ack.server_request_frame_size
@@ -731,7 +768,10 @@ where
                 cas_idempotency_epoch,
             ))
         }
-        BootstrapResponse::HelloRejected { .. } => Err(ProtocolError::Authentication),
+        BootstrapResponse::HelloRejected { .. } => {
+            Err(ConnectionOpenError::Protocol(ProtocolError::Authentication))
+        }
+        BootstrapResponse::ConnectionRetiring => Err(ConnectionOpenError::Retired),
     }
 }
 
@@ -1383,7 +1423,7 @@ impl RemoteSessionBackend {
                 None => match self.connect(operation_deadline).await {
                     Ok(connection) => connection,
                     Err(error) => {
-                        let attempt = RemoteRequestAttemptFailure::before_transmission(&error);
+                        let attempt = RemoteRequestAttemptFailure::before_connection(&error);
                         *pretransmission_failure
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -1394,9 +1434,11 @@ impl RemoteSessionBackend {
                         METRICS
                             .session_net_reconnect_attempts
                             .fetch_add(1, Ordering::Relaxed);
-                        METRICS
-                            .session_net_reconnect_failures
-                            .fetch_add(1, Ordering::Relaxed);
+                        if attempt.failure != RemoteRequestFailure::ConnectionRetiring {
+                            METRICS
+                                .session_net_reconnect_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         let now = tokio::time::Instant::now();
                         let retry_at = now
                             .checked_add(backoff)
@@ -1671,7 +1713,7 @@ impl RemoteSessionBackend {
     async fn connect(
         &self,
         operation_deadline: tokio::time::Instant,
-    ) -> Result<Connection, ProtocolError> {
+    ) -> Result<Connection, ConnectionOpenError> {
         let result = open_connection(
             self.target.clone(),
             self.tls_config.clone(),
@@ -1693,7 +1735,9 @@ impl RemoteSessionBackend {
                 *limits = Some(connection.frame_limits);
             }
         }
-        if result.as_ref().is_err_and(invalidates_negotiated_contract) {
+        if result.as_ref().is_err_and(|error| {
+            matches!(error, ConnectionOpenError::Protocol(error) if invalidates_negotiated_contract(error))
+        }) {
             self.clear_cached_capabilities();
         }
         result
@@ -2270,9 +2314,11 @@ impl SessionBackend for RemoteSessionBackend {
                     METRICS
                         .session_net_reconnect_attempts
                         .fetch_add(1, Ordering::Relaxed);
-                    METRICS
-                        .session_net_reconnect_failures
-                        .fetch_add(1, Ordering::Relaxed);
+                    if failure != RemoteRequestFailure::ConnectionRetiring {
+                        METRICS
+                            .session_net_reconnect_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     let now = tokio::time::Instant::now();
                     if now >= operation_deadline {
                         return Err(watch_open_store_error(WatchOpenFailure::Remote(failure)));
@@ -2468,7 +2514,8 @@ async fn open_watch_connection(
                 return Err(ProtocolError::Io(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "watch connection admission deadline expired",
-                )));
+                ))
+                .into());
             }
         };
         let watch = Request::Watch {
@@ -2527,7 +2574,8 @@ async fn open_watch_connection(
                     return Err(ProtocolError::Io(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "watch connection retired before setup",
-                    )));
+                    ))
+                    .into());
                 }
                 let lifecycle_hard_deadline = lifecycle
                     .hard_deadline()
@@ -2544,11 +2592,12 @@ async fn open_watch_connection(
                         return Err(ProtocolError::Io(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "watch setup exceeded the authentication hard deadline",
-                        )));
+                        ))
+                        .into());
                     }
                     changed = reauthentication_rx.changed() => {
                         if changed.is_err() {
-                            return Err(ProtocolError::Authentication);
+                            return Err(ProtocolError::Authentication.into());
                         }
                     }
                     _ = wait_for_material_change(&mut material_rx) => {}
@@ -2558,22 +2607,19 @@ async fn open_watch_connection(
         };
         connection.lifecycle = lifecycle;
         match response {
-            Response::WatchStream => Ok::<_, ProtocolError>(Ok(connection)),
-            Response::ConnectionRetiring => Err(ProtocolError::Io(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "watch request was not dispatched before connection retirement",
-            ))),
+            Response::WatchStream => Ok::<_, ConnectionOpenError>(Ok(connection)),
+            Response::ConnectionRetiring => Err(ConnectionOpenError::Retired),
             Response::WatchEntry(Err(error))
                 if store_error_matches_class(&error, StoreResponseClass::Read) =>
             {
                 Ok(Err(error))
             }
-            Response::Error { .. } => Err(ProtocolError::BackendUnavailable(
-                "watch request rejected".to_string(),
-            )),
+            Response::Error { .. } => {
+                Err(ProtocolError::BackendUnavailable("watch request rejected".to_string()).into())
+            }
             response => {
                 discard_replication_payloads_from_response(response);
-                Err(ProtocolError::UnexpectedResponse)
+                Err(ProtocolError::UnexpectedResponse.into())
             }
         }
     };
@@ -2581,7 +2627,7 @@ async fn open_watch_connection(
         Ok(Ok(Ok(connection))) => Ok(connection),
         Ok(Ok(Err(error))) => Err(WatchOpenFailure::Backend(error)),
         Ok(Err(error)) => Err(WatchOpenFailure::Remote(
-            RemoteRequestFailure::from_protocol_error(&error),
+            RemoteRequestFailure::from_connection_error(&error),
         )),
         Err(_) => Err(WatchOpenFailure::Remote(RemoteRequestFailure::Timeout)),
     }
@@ -2642,9 +2688,11 @@ async fn reconnect_watch(
         match result {
             Ok(connection) => return Ok(Some(connection)),
             Err(WatchOpenFailure::Remote(failure)) if failure.is_retryable() => {
-                METRICS
-                    .session_net_reconnect_failures
-                    .fetch_add(1, Ordering::Relaxed);
+                if failure != RemoteRequestFailure::ConnectionRetiring {
+                    METRICS
+                        .session_net_reconnect_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 tokio::select! {
                     _ = tx.closed() => return Ok(None),
                     _ = tokio::time::sleep(backoff) => {}
@@ -3125,6 +3173,53 @@ mod tests {
         (addr, handle)
     }
 
+    async fn bootstrap_retirement_then_capability_server(
+        caps: BackendCapabilities,
+    ) -> (SocketAddr, tokio::task::JoinHandle<(usize, usize)>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bootstrap-retirement listener");
+        let addr = listener.local_addr().expect("bootstrap-retirement address");
+        let handle = tokio::spawn(async move {
+            let mut application_requests = 0;
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept bootstrap client");
+                let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("read bootstrap Hello");
+                if attempt == 0 {
+                    write_frame(&mut stream, &BootstrapResponse::ConnectionRetiring)
+                        .await
+                        .expect("write authenticated pre-admission retirement control");
+                    if matches!(
+                        tokio::time::timeout(
+                            Duration::from_millis(100),
+                            read_frame::<_, Request>(&mut stream, DEFAULT_MAX_FRAME_SIZE),
+                        )
+                        .await,
+                        Ok(Ok(_))
+                    ) {
+                        application_requests += 1;
+                    }
+                    continue;
+                }
+                write_frame(&mut stream, &successful_hello_ack(&hello))
+                    .await
+                    .expect("write replacement Hello acknowledgement");
+                let request: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("read replacement request");
+                assert!(matches!(request, Request::Capabilities));
+                application_requests += 1;
+                write_frame(&mut stream, &Response::Capabilities(caps))
+                    .await
+                    .expect("write replacement capabilities");
+            }
+            (2, application_requests)
+        });
+        (addr, handle)
+    }
+
     async fn response_loss_server() -> (SocketAddr, tokio::task::JoinHandle<usize>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3149,6 +3244,59 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn authenticated_bootstrap_retirement_retries_before_any_application_dispatch() {
+        let expected = BackendCapabilities {
+            max_value_bytes: conservative_payload_budget(DEFAULT_MAX_FRAME_SIZE),
+            ..BackendCapabilities::all_enabled()
+        };
+        let (addr, server) = bootstrap_retirement_then_capability_server(expected).await;
+        let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(2)))
+            .with_connection_lifecycle(
+                ConnectionLifecyclePolicy::try_new(
+                    Duration::from_secs(10),
+                    Duration::from_secs(1),
+                    Duration::from_millis(1),
+                    Duration::from_millis(5),
+                    Duration::ZERO,
+                )
+                .expect("test lifecycle policy"),
+            );
+
+        assert_eq!(backend.capabilities().await, expected);
+        assert_eq!(
+            server.await.expect("bootstrap-retirement server"),
+            (2, 1),
+            "the retired route must receive no application request and the fresh route exactly one"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsigned_bootstrap_eof_remains_a_transport_failure_not_a_retirement_proof() {
+        let (client, mut peer) = tokio::io::duplex(16 * 1024);
+        let (mut reader, mut writer) = tokio::io::split(client);
+        let peer_task = tokio::spawn(async move {
+            let _: BootstrapRequest = read_frame(&mut peer, MAX_HANDSHAKE_FRAME_SIZE)
+                .await
+                .expect("read bootstrap Hello");
+            // A legacy server or broken route can close here. Without the
+            // complete explicit control this is never safe-retry proof.
+        });
+        let result = perform_client_handshake(
+            &mut reader,
+            &mut writer,
+            &crate::identity::insecure_test_client_binding(),
+            DEFAULT_MAX_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ConnectionOpenError::Protocol(ProtocolError::Io(_)))
+        ));
+        peer_task.await.expect("legacy-close peer");
     }
 
     async fn retirement_then_response_server(
@@ -4452,7 +4600,10 @@ mod tests {
                 Err(error) if accepted => {
                     panic!("an in-profile HelloAck frame limit must succeed: {error}")
                 }
-                Err(error) => assert!(matches!(error, ProtocolError::InvalidWireValue)),
+                Err(error) => assert!(matches!(
+                    error,
+                    ConnectionOpenError::Protocol(ProtocolError::InvalidWireValue)
+                )),
             };
             server.await.expect("frame-limit server task");
         }
