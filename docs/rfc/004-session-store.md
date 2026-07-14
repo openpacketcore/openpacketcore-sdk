@@ -1533,19 +1533,32 @@ The projected source's ongoing expiry monitor clears retained source material
 at leaf expiry. It is not the authority for an earlier intermediate expiry.
 `TlsMaterialController` MUST pre-scan every configured SVID-chain certificate,
 mark material unavailable at the earliest effective chain expiry, and provide
-the TLS readiness status. Source `Ready` alone MUST NOT satisfy this section.
+the TLS readiness status. A production projected source MUST be paired through
+`TlsMaterialController::new_from_projected_source` or
+`new_pinned_from_projected_source`; direct subscription through a generic
+controller constructor does not bind source failures and controller gauges to
+one recorder. Source `Ready` alone MUST NOT satisfy this section.
 
 An operator MUST publish overlapping old/new trust before new leaves, preserve
 the exact stable SPIFFE and consensus scope, trigger reauthentication, and
 verify that every directed peer path has authenticated on current material
 before removing old trust. Removing that anchor cuts over later handshakes;
 trigger reauthentication and prove that every chain depending on it is
-rejected. Rollback before old-trust removal restores the prior leaf/material
+rejected. The negative proof MUST remain visible to authentication/trust
+alerting and MUST be accepted only when an immediate checkpoint proves the
+exact qualified per-member delta with no concurrent increase, process reset, or
+alert silence. Rollback before old-trust removal restores the prior leaf/material
 publication and triggers another monotonic reauthentication generation;
 rollback after removal MUST first restore overlapping trust and prove the
 controller status is `Ready`, then restore the old leaf and trigger
 reauthentication. A rollback MUST NOT reuse an old authenticated connection as
-evidence. Reconnect-storm,
+evidence. Its deadline MUST be derived from the exact fleet size and all bounded
+two-pass operations, and the selected complete rollback material MUST be
+revalidated against the deadline remaining immediately before every
+publication. Evidence MUST bind one invocation, live-lease binding, monotonic
+operation/nonce, exact member/checkpoint, phase/step, and fresh timestamp; it
+MUST NOT contain the lease token. Serving withdrawal MUST remain executable
+when evidence storage is unavailable. Reconnect-storm,
 short-lived-SVID expiry, root-cutover, multi-process trust-removal, soak, and
 wider distributed production evidence remain #164/#143 under umbrella #158.
 

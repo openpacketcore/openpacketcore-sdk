@@ -27,8 +27,9 @@ pub mod file_svid;
 pub mod projected_svid;
 pub use file_svid::FileSvidSource;
 pub use projected_svid::{
-    ProjectedSvidAvailability, ProjectedSvidConfigError, ProjectedSvidReloadReason,
-    ProjectedSvidReloadStatus, ProjectedSvidSource,
+    ProjectedSvidAuthoritativeError, ProjectedSvidAvailability, ProjectedSvidConfigError,
+    ProjectedSvidControllerClaimError, ProjectedSvidControllerInput, ProjectedSvidReloadReason,
+    ProjectedSvidReloadStatus, ProjectedSvidSource, ProjectedSvidWithMetricsError,
 };
 
 #[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

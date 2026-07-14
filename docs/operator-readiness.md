@@ -811,17 +811,22 @@ cluster epoch or membership identity. Page on `generation_retry_limit`,
 `read_attempt_timeout`, and `last_good_expired`; the last reason stays active
 until a validated replacement is published.
 
-Construct one shared `TlsMaterialController` from the identity source and pass
-clones through `TlsConfigBuilder::from_material_controller`. Pin the expected
-local SPIFFE ID explicitly when configuration already knows it; otherwise the
-first valid state becomes the process-lifetime pin. Gate startup and new TLS
-traffic on controller `Ready`, not source status alone. The controller pre-scans
-every configured SVID-chain certificate, marks material unavailable at the
-earliest expiry, and exposes both leaf and effective chain expiry. Use
-`run_handshake` for the complete TLS plus application bootstrap and retain its
-admitted epoch, leaf expiry, and effective configured/presented-chain expiry
-with the connection. A raw `rustls_config()` call is compatibility-only and does
-not supply epoch-current application admission.
+Construct one shared `TlsMaterialController` with
+`new_from_projected_source` or `new_pinned_from_projected_source`, then pass
+clones through `TlsConfigBuilder::from_material_controller`. These one-time
+paired constructors carry the projected source's exact identity channel and
+metrics recorder into the controller; direct subscription plus a generic
+controller constructor does not establish production projected-source
+observability. Pin the expected local SPIFFE ID explicitly when configuration
+already knows it; otherwise the first valid state becomes the process-lifetime
+pin. Gate startup and new TLS traffic on controller `Ready`, not source status
+alone. The controller pre-scans every configured SVID-chain certificate, marks
+material unavailable at the earliest expiry, and exposes both leaf and
+effective chain expiry. Use `run_handshake` for the complete TLS plus
+application bootstrap and retain its admitted epoch, leaf expiry, and effective
+configured/presented-chain expiry with the connection. A raw `rustls_config()`
+call is compatibility-only and does not supply epoch-current application
+admission.
 
 Every readiness evaluation must call `material_status()` or
 `TlsMaterialController::status()` so wall-clock expiry is reconciled at that
@@ -841,6 +846,23 @@ a 15-minute maximum authentication age, 30-second drain, 50 ms through 1 second
 reconnect backoff, and at most 30 seconds of directed stable jitter. Use the
 forward and reverse trust/leaf procedure in
 [`consensus-operator-runbook.md`](consensus-operator-runbook.md#7-shared-mtls-certificate-rotation).
+Do not use a fixed 1320-second certificate horizon. The executable campaign
+derives the worst-case two-pass sequential rollback bound from the exact three-
+or five-member inventory, every outer CNF timeout, operation-ID allocation,
+durable evidence publication, and final withdrawal. Add authentication age,
+jitter, drain, reconnect, and observation to that bound, render alerts from the
+same value, and revalidate the selected rollback material against the actual
+deadline remaining immediately before every publication.
+
+Campaign evidence is valid only when its invocation, non-secret live-lease
+binding, monotonic operation ID, one-use nonce, exact member/checkpoint,
+phase/step, and fresh timestamp all match. The lease token travels only over a
+private inherited descriptor and is never evidence. Emergency serving
+withdrawal runs before and independently of evidence persistence; ENOSPC or an
+unwritable evidence root must fail the campaign without suppressing or
+repeating that action. The deliberate old-chain negative probe remains visible
+to the critical authentication alert and is accepted only when its isolated
+per-member delta is exact and no concurrent increase occurred.
 
 Alert on the fixed connection retirement, active/draining, drain-overrun,
 connection-outcome, reconnect, and watch-slow-consumer metrics. Do not add

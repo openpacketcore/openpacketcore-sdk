@@ -7,8 +7,9 @@
 use crate::TelcoIdentifier;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_LABEL_VALUE_LEN: usize = 64;
 const MAX_DYNAMIC_ADMIN_ROUTE_LABELS: usize = 128;
@@ -440,6 +441,627 @@ impl LatencyHistogram {
     }
 }
 
+const SECURITY_ROTATION_KIND_COUNT: usize = 3;
+const SECURITY_ROTATION_OUTCOME_COUNT: usize = 4;
+const SECURITY_ROTATION_SERIES_COUNT: usize =
+    SECURITY_ROTATION_KIND_COUNT * SECURITY_ROTATION_OUTCOME_COUNT;
+
+/// Closed security-material class used by `opc_security_rotation_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityRotationKind {
+    /// A coherent TLS material snapshot whose changed component is not known.
+    TlsMaterial,
+    /// An SVID chain or its matching private key.
+    Svid,
+    /// A projected trust bundle.
+    TrustBundle,
+}
+
+impl SecurityRotationKind {
+    const ALL: [Self; SECURITY_ROTATION_KIND_COUNT] =
+        [Self::TlsMaterial, Self::Svid, Self::TrustBundle];
+
+    /// Stable fixed-cardinality Prometheus label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TlsMaterial => "tls_material",
+            Self::Svid => "svid",
+            Self::TrustBundle => "trust_bundle",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::TlsMaterial => 0,
+            Self::Svid => 1,
+            Self::TrustBundle => 2,
+        }
+    }
+}
+
+/// Closed result used by `opc_security_rotation_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityRotationOutcome {
+    /// A coherent material epoch was accepted.
+    Success,
+    /// A candidate was rejected while the prior unexpired epoch stayed active.
+    RetainedLastGood,
+    /// A candidate was rejected with no usable prior epoch.
+    Rejected,
+    /// An observed coherent source publication crossed its SVID-chain expiry.
+    Expired,
+}
+
+impl SecurityRotationOutcome {
+    const ALL: [Self; SECURITY_ROTATION_OUTCOME_COUNT] = [
+        Self::Success,
+        Self::RetainedLastGood,
+        Self::Rejected,
+        Self::Expired,
+    ];
+
+    /// Stable fixed-cardinality Prometheus label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::RetainedLastGood => "retained_last_good",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Success => 0,
+            Self::RetainedLastGood => 1,
+            Self::Rejected => 2,
+            Self::Expired => 3,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SecurityMetricsState {
+    svid_expires_seconds: AtomicI64,
+    bundle_version: AtomicU64,
+    rotation: [AtomicU64; SECURITY_ROTATION_SERIES_COUNT],
+    rotation_saturated: [AtomicBool; SECURITY_ROTATION_SERIES_COUNT],
+    active_publication: Mutex<Option<Arc<Mutex<SecurityPublicationLifecycle>>>>,
+}
+
+impl Default for SecurityMetricsState {
+    fn default() -> Self {
+        Self {
+            svid_expires_seconds: AtomicI64::new(0),
+            bundle_version: AtomicU64::new(0),
+            rotation: std::array::from_fn(|_| AtomicU64::new(0)),
+            rotation_saturated: std::array::from_fn(|_| AtomicBool::new(false)),
+            active_publication: Mutex::new(None),
+        }
+    }
+}
+
+/// Read-only access to fixed-cardinality security rotation metrics.
+///
+/// A reader cannot mutate or reset either an isolated registry or the
+/// process-wide registry. In particular, the following does not compile:
+///
+/// ```compile_fail
+/// use opc_redaction::metrics::SecurityMetricsReader;
+///
+/// let reader = SecurityMetricsReader::global();
+/// reader.record_success(1, 1_900_000_000);
+/// ```
+#[derive(Clone, Debug)]
+pub struct SecurityMetricsReader {
+    state: Arc<SecurityMetricsState>,
+}
+
+/// Single-use authority for one security telemetry source/controller pair.
+///
+/// The authority is deliberately non-`Clone`. An isolated authority is useful
+/// for deterministic tests and embedders. The process authority is claimed by
+/// the production projected-SVID constructor and cannot be claimed twice.
+/// These composition APIs are public because Rust has no cross-crate friend
+/// visibility. Code running in the same trusted process can claim them first;
+/// cryptographic/material validation and the TLS controller still own identity
+/// and peer authorization. The ticket/permit is an internal publication-
+/// integrity gate, but exported metric values are never read to authorize TLS,
+/// readiness, or access.
+///
+/// ```compile_fail
+/// use opc_redaction::metrics::SecurityMetricsAuthority;
+///
+/// let (authority, _reader) = SecurityMetricsAuthority::isolated();
+/// let duplicate = authority.clone();
+/// # let _ = duplicate;
+/// ```
+pub struct SecurityMetricsAuthority {
+    state: Arc<SecurityMetricsState>,
+}
+
+impl fmt::Debug for SecurityMetricsAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecurityMetricsAuthority([opaque])")
+    }
+}
+
+/// Failure to claim the sole process-wide security telemetry authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SecurityMetricsAuthorityClaimError {
+    /// Another projected source already owns the process authority.
+    #[error("process security metrics authority is already claimed")]
+    AlreadyClaimed,
+}
+
+/// Result of preparing one controller publication transition.
+#[doc(hidden)]
+#[derive(Debug)]
+#[must_use]
+pub enum SecurityMetricsAcceptance<'a> {
+    /// The unexpired publication may be installed while this permit is held.
+    Ready(SecurityMetricsAcceptancePermit<'a>),
+    /// This publication was already accepted by this controller authority.
+    AlreadyAccepted,
+    /// The publication was expired at the serialized acceptance boundary.
+    Expired,
+    /// The publication belongs to another metrics registry.
+    RegistryMismatch,
+}
+
+/// Non-cloneable transaction joining one TLS controller state update to its
+/// publication lifecycle and metrics transition.
+///
+/// The permit contains no callback. The controller updates its already-locked
+/// material state synchronously, then consumes the permit with [`Self::commit`].
+/// Dropping it abandons the metrics transition and releases both registry locks.
+/// The required lock order is controller state, publication lifecycle, then
+/// active registry. Trusted composition code must not call another source or
+/// controller metrics transition while a permit is live; deliberate reentry is
+/// unsupported misuse of this doc-hidden cross-crate primitive.
+#[doc(hidden)]
+#[must_use]
+pub struct SecurityMetricsAcceptancePermit<'a> {
+    state: &'a SecurityMetricsState,
+    publication_lifecycle: Arc<Mutex<SecurityPublicationLifecycle>>,
+    active_publication: MutexGuard<'a, Option<Arc<Mutex<SecurityPublicationLifecycle>>>>,
+    lifecycle: MutexGuard<'a, SecurityPublicationLifecycle>,
+    bundle_version: u64,
+    svid_expires_seconds: i64,
+}
+
+impl fmt::Debug for SecurityMetricsAcceptancePermit<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecurityMetricsAcceptancePermit([opaque])")
+    }
+}
+
+impl SecurityMetricsAcceptancePermit<'_> {
+    /// Commit the already-installed controller state to the active registry.
+    ///
+    /// After validation and permit preparation this transition is infallible
+    /// and performs only atomic stores/counter updates.
+    pub fn commit(mut self) {
+        self.lifecycle.controller_epoch = Some(self.bundle_version);
+        *self.active_publication = Some(self.publication_lifecycle.clone());
+        record_success(self.state, self.bundle_version, self.svid_expires_seconds);
+    }
+}
+
+/// Source-side half of a security telemetry authority.
+///
+/// This type is public only so `opc-identity` can own the source half across a
+/// crate boundary. Products should construct a projected source instead of
+/// recording outcomes directly.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SecurityMetricsSource {
+    state: Arc<SecurityMetricsState>,
+}
+
+impl fmt::Debug for SecurityMetricsSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecurityMetricsSource([opaque])")
+    }
+}
+
+/// Controller-side half of a security telemetry authority.
+///
+/// The controller half is deliberately non-`Clone`; `opc-identity` moves it
+/// into exactly one paired `opc-tls` controller.
+#[doc(hidden)]
+pub struct SecurityMetricsController {
+    state: Arc<SecurityMetricsState>,
+}
+
+impl fmt::Debug for SecurityMetricsController {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecurityMetricsController([opaque])")
+    }
+}
+
+#[derive(Debug, Default)]
+struct SecurityPublicationLifecycle {
+    expired: bool,
+    controller_epoch: Option<u64>,
+}
+
+/// Per-publication exact-once expiry coordination.
+///
+/// A ticket carries no mutation authority. It must be paired with the source
+/// or controller half that created it, and both halves verify that registry
+/// binding before changing metrics.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SecurityMetricsPublication {
+    state: Arc<SecurityMetricsState>,
+    lifecycle: Arc<Mutex<SecurityPublicationLifecycle>>,
+}
+
+impl fmt::Debug for SecurityMetricsPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecurityMetricsPublication([opaque])")
+    }
+}
+
+/// Numeric snapshot of the fixed security rotation metric families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecurityMetricsSnapshot {
+    svid_expires_seconds: i64,
+    bundle_version: u64,
+    rotation: [u64; SECURITY_ROTATION_SERIES_COUNT],
+    rotation_saturated: [bool; SECURITY_ROTATION_SERIES_COUNT],
+}
+
+impl SecurityMetricsSnapshot {
+    /// Effective configured/presented SVID-chain expiry as Unix seconds.
+    ///
+    /// Zero means no coherent, unexpired TLS material is currently available.
+    pub const fn svid_expires_seconds(self) -> i64 {
+        self.svid_expires_seconds
+    }
+
+    /// Last accepted opaque process-local coherent TLS-material epoch.
+    ///
+    /// The value remains available for correlation after the active ticket
+    /// expires; `svid_expires_seconds == 0` carries unavailability.
+    pub const fn bundle_version(self) -> u64 {
+        self.bundle_version
+    }
+
+    /// Counter value for one closed kind/outcome pair.
+    pub const fn rotation(
+        self,
+        kind: SecurityRotationKind,
+        outcome: SecurityRotationOutcome,
+    ) -> u64 {
+        self.rotation[rotation_index(kind, outcome)]
+    }
+
+    /// Whether one fixed counter reached its `u64` representation ceiling.
+    pub const fn rotation_saturated(
+        self,
+        kind: SecurityRotationKind,
+        outcome: SecurityRotationOutcome,
+    ) -> bool {
+        self.rotation_saturated[rotation_index(kind, outcome)]
+    }
+
+    /// Number of fixed counter series at the representation ceiling.
+    pub fn saturated_series(self) -> usize {
+        self.rotation_saturated
+            .into_iter()
+            .filter(|saturated| *saturated)
+            .count()
+    }
+}
+
+impl SecurityMetricsReader {
+    /// Return a read-only view of the process-wide security metrics registry.
+    #[must_use]
+    pub fn global() -> Self {
+        Self {
+            state: SECURITY_METRICS.clone(),
+        }
+    }
+
+    /// Return whether two readers observe the same metrics registry.
+    #[must_use]
+    pub fn shares_registry(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Read a consistent-enough numeric telemetry snapshot.
+    ///
+    /// Metrics atomics are intentionally relaxed: individual samples are
+    /// independent observations and do not authorize TLS or rotation state.
+    #[must_use]
+    pub fn snapshot(&self) -> SecurityMetricsSnapshot {
+        snapshot_security_metrics(&self.state)
+    }
+}
+
+impl SecurityMetricsAuthority {
+    /// Create a single-use isolated authority and its read-only view.
+    #[must_use]
+    pub fn isolated() -> (Self, SecurityMetricsReader) {
+        let state = Arc::new(SecurityMetricsState::default());
+        (
+            Self {
+                state: state.clone(),
+            },
+            SecurityMetricsReader { state },
+        )
+    }
+
+    /// Claim the sole process-wide security telemetry authority.
+    ///
+    /// This is an SDK composition primitive used by `opc-identity`. A second
+    /// claim fails closed and the claim is not reset during the process
+    /// lifetime, so stale controllers cannot overlap a replacement authority.
+    /// Rust cannot restrict this public function to a friend crate: all
+    /// same-process callers are part of the trusted composition boundary.
+    #[doc(hidden)]
+    pub fn claim_process() -> Result<Self, SecurityMetricsAuthorityClaimError> {
+        claim_security_metrics_authority(
+            &SECURITY_METRICS_AUTHORITY_CLAIMED,
+            SECURITY_METRICS.clone(),
+        )
+    }
+
+    /// Consume this authority into its source and controller halves.
+    #[doc(hidden)]
+    pub fn split(self) -> (SecurityMetricsSource, SecurityMetricsController) {
+        (
+            SecurityMetricsSource {
+                state: self.state.clone(),
+            },
+            SecurityMetricsController { state: self.state },
+        )
+    }
+}
+
+impl SecurityMetricsSource {
+    /// Allocate exact-once lifecycle state for one successful publication.
+    #[must_use]
+    pub fn new_publication(&self) -> SecurityMetricsPublication {
+        SecurityMetricsPublication {
+            state: self.state.clone(),
+            lifecycle: Arc::new(Mutex::new(SecurityPublicationLifecycle::default())),
+        }
+    }
+
+    /// Record a rejected candidate while retaining the prior source epoch.
+    pub fn record_retained_last_good(&self, kind: SecurityRotationKind) {
+        record_rotation_count(
+            &self.state,
+            kind,
+            SecurityRotationOutcome::RetainedLastGood,
+            1,
+        );
+    }
+
+    /// Record source-observed rejections without changing controller gauges.
+    pub fn record_rejected_count(&self, kind: SecurityRotationKind, count: u64) {
+        record_rotation_count(&self.state, kind, SecurityRotationOutcome::Rejected, count);
+    }
+
+    /// Record this publication's expiry for the first source/controller observer.
+    ///
+    /// Each observed registry-bound ticket can increment at most once. Only
+    /// expiry of the currently accepted ticket may zero the expiry gauge;
+    /// unaccepted and superseded observations preserve it, and supersession
+    /// alone emits no expiry outcome.
+    pub fn record_expired_once(&self, publication: &SecurityMetricsPublication) -> bool {
+        record_publication_expired_once(&self.state, publication)
+    }
+}
+
+impl SecurityMetricsController {
+    /// Prepare an atomic unexpired-publication transition.
+    ///
+    /// A ready permit holds the publication and active-registry locks while the
+    /// TLS controller synchronously installs its already validated state. The
+    /// controller then commits the permit; no arbitrary callback runs under
+    /// these locks. Dropping a permit abandons the transition.
+    /// Effective expiry is compared with the current Unix second while both
+    /// the ticket lifecycle and active-publication registry are locked.
+    pub fn prepare_success_if_active<'a>(
+        &'a self,
+        publication: &'a SecurityMetricsPublication,
+        bundle_version: u64,
+        svid_expires_seconds: i64,
+    ) -> SecurityMetricsAcceptance<'a> {
+        self.prepare_success_if_active_with_clock(
+            publication,
+            bundle_version,
+            svid_expires_seconds,
+            current_unix_seconds,
+        )
+    }
+
+    fn prepare_success_if_active_with_clock<'a>(
+        &'a self,
+        publication: &'a SecurityMetricsPublication,
+        bundle_version: u64,
+        svid_expires_seconds: i64,
+        current_time: impl FnOnce() -> i64,
+    ) -> SecurityMetricsAcceptance<'a> {
+        if !Arc::ptr_eq(&self.state, &publication.state) {
+            return SecurityMetricsAcceptance::RegistryMismatch;
+        }
+        let mut lifecycle = lock_or_recover(&publication.lifecycle);
+        let mut active_publication = lock_or_recover(&self.state.active_publication);
+        if lifecycle.expired {
+            return SecurityMetricsAcceptance::Expired;
+        }
+        if lifecycle.controller_epoch.is_some() {
+            return SecurityMetricsAcceptance::AlreadyAccepted;
+        }
+        if svid_expires_seconds <= current_time() {
+            expire_publication_locked(
+                &self.state,
+                publication,
+                &mut lifecycle,
+                &mut active_publication,
+            );
+            return SecurityMetricsAcceptance::Expired;
+        }
+        SecurityMetricsAcceptance::Ready(SecurityMetricsAcceptancePermit {
+            state: &self.state,
+            publication_lifecycle: publication.lifecycle.clone(),
+            lifecycle,
+            active_publication,
+            bundle_version,
+            svid_expires_seconds,
+        })
+    }
+
+    /// Record a rejected controller candidate while retaining the prior epoch.
+    pub fn record_retained_last_good(&self, kind: SecurityRotationKind) {
+        record_rotation_count(
+            &self.state,
+            kind,
+            SecurityRotationOutcome::RetainedLastGood,
+            1,
+        );
+    }
+
+    /// Record an unavailable or rejected candidate with no usable prior epoch.
+    pub fn record_rejected(&self, kind: SecurityRotationKind, bundle_version: u64) {
+        let mut active_publication = lock_or_recover(&self.state.active_publication);
+        *active_publication = None;
+        self.state.svid_expires_seconds.store(0, Ordering::Relaxed);
+        self.state
+            .bundle_version
+            .store(bundle_version, Ordering::Relaxed);
+        record_rotation_count(&self.state, kind, SecurityRotationOutcome::Rejected, 1);
+        drop(active_publication);
+    }
+
+    /// Record this publication's expiry for the first controller/source observer.
+    pub fn record_expired_once(&self, publication: &SecurityMetricsPublication) -> bool {
+        record_publication_expired_once(&self.state, publication)
+    }
+}
+
+fn claim_security_metrics_authority(
+    claimed: &AtomicBool,
+    state: Arc<SecurityMetricsState>,
+) -> Result<SecurityMetricsAuthority, SecurityMetricsAuthorityClaimError> {
+    claimed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| SecurityMetricsAuthorityClaimError::AlreadyClaimed)?;
+    Ok(SecurityMetricsAuthority { state })
+}
+
+fn snapshot_security_metrics(state: &SecurityMetricsState) -> SecurityMetricsSnapshot {
+    SecurityMetricsSnapshot {
+        svid_expires_seconds: state.svid_expires_seconds.load(Ordering::Relaxed),
+        bundle_version: state.bundle_version.load(Ordering::Relaxed),
+        rotation: std::array::from_fn(|index| state.rotation[index].load(Ordering::Relaxed)),
+        rotation_saturated: std::array::from_fn(|index| {
+            state.rotation_saturated[index].load(Ordering::Relaxed)
+        }),
+    }
+}
+
+fn record_success(state: &SecurityMetricsState, bundle_version: u64, svid_expires_seconds: i64) {
+    state
+        .svid_expires_seconds
+        .store(svid_expires_seconds.max(0), Ordering::Relaxed);
+    state
+        .bundle_version
+        .store(bundle_version, Ordering::Relaxed);
+    record_rotation_count(
+        state,
+        SecurityRotationKind::TlsMaterial,
+        SecurityRotationOutcome::Success,
+        1,
+    );
+}
+
+fn record_publication_expired_once(
+    state: &Arc<SecurityMetricsState>,
+    publication: &SecurityMetricsPublication,
+) -> bool {
+    if !Arc::ptr_eq(state, &publication.state) {
+        return false;
+    }
+    let mut lifecycle = lock_or_recover(&publication.lifecycle);
+    let mut active_publication = lock_or_recover(&state.active_publication);
+    if lifecycle.expired {
+        return false;
+    }
+    expire_publication_locked(state, publication, &mut lifecycle, &mut active_publication);
+    true
+}
+
+fn expire_publication_locked(
+    state: &SecurityMetricsState,
+    publication: &SecurityMetricsPublication,
+    lifecycle: &mut SecurityPublicationLifecycle,
+    active_publication: &mut Option<Arc<Mutex<SecurityPublicationLifecycle>>>,
+) {
+    lifecycle.expired = true;
+    let publication_is_active = active_publication
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(active, &publication.lifecycle));
+    if publication_is_active {
+        *active_publication = None;
+        state.svid_expires_seconds.store(0, Ordering::Relaxed);
+        state
+            .bundle_version
+            .store(lifecycle.controller_epoch.unwrap_or(0), Ordering::Relaxed);
+    }
+    record_rotation_count(
+        state,
+        SecurityRotationKind::Svid,
+        SecurityRotationOutcome::Expired,
+        1,
+    );
+}
+
+fn current_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(i64::MAX)
+}
+
+fn record_rotation_count(
+    state: &SecurityMetricsState,
+    kind: SecurityRotationKind,
+    outcome: SecurityRotationOutcome,
+    count: u64,
+) {
+    let index = rotation_index(kind, outcome);
+    add_saturating(
+        &state.rotation[index],
+        &state.rotation_saturated[index],
+        count,
+    );
+}
+
+const fn rotation_index(kind: SecurityRotationKind, outcome: SecurityRotationOutcome) -> usize {
+    kind.index() * SECURITY_ROTATION_OUTCOME_COUNT + outcome.index()
+}
+
+fn add_saturating(counter: &AtomicU64, saturated: &AtomicBool, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let previous = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(count))
+        })
+        .unwrap_or_else(|value| value);
+    if previous >= u64::MAX.saturating_sub(count) {
+        saturated.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The global SDK metrics registry holding all atomic counters and gauges.
 pub struct SdkMetrics {
     // === Config Bus ===
@@ -771,6 +1393,10 @@ impl SdkMetrics {
     }
 
     /// Reset all metrics to their default initial values.
+    ///
+    /// Process-wide security rotation evidence is deliberately excluded: a
+    /// newly constructed `SdkMetrics` value must not be able to erase the sole
+    /// TLS telemetry authority's monotonic counters or current gauges.
     pub fn reset_all(&self) {
         self.config_bus_pending_commits.store(0, Ordering::Relaxed);
         self.break_glass_sessions_active.store(0, Ordering::Relaxed);
@@ -1052,7 +1678,22 @@ impl Default for SdkMetrics {
 /// Global static SDK metrics registry instance.
 pub static METRICS: LazyLock<SdkMetrics> = LazyLock::new(SdkMetrics::new);
 
+/// Private process-wide state for security-material telemetry.
+static SECURITY_METRICS: LazyLock<Arc<SecurityMetricsState>> =
+    LazyLock::new(|| Arc::new(SecurityMetricsState::default()));
+static SECURITY_METRICS_AUTHORITY_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 fn write_metric(out: &mut String, name: &str, mtype: &str, help: &str, val: f64) {
+    out.push_str(&format!(
+        "# HELP {} {}\n",
+        name,
+        escape_prometheus_help(help)
+    ));
+    out.push_str(&format!("# TYPE {name} {mtype}\n"));
+    out.push_str(&format!("{name} {val}\n"));
+}
+
+fn write_metric_u64(out: &mut String, name: &str, mtype: &str, help: &str, val: u64) {
     out.push_str(&format!(
         "# HELP {} {}\n",
         name,
@@ -1224,9 +1865,58 @@ fn write_labeled_histogram_1(
     }
 }
 
+fn write_security_metrics(out: &mut String, reader: &SecurityMetricsReader) {
+    let security = reader.snapshot();
+    write_metric(
+        out,
+        "opc_security_svid_expires_seconds",
+        "gauge",
+        "Effective earliest configured/presented SVID-chain expiry as Unix seconds, or zero when unavailable",
+        security.svid_expires_seconds() as f64,
+    );
+    write_metric_u64(
+        out,
+        "opc_security_bundle_version",
+        "gauge",
+        "Opaque process-local coherent TLS-material epoch",
+        security.bundle_version(),
+    );
+    out.push_str(
+        "# HELP opc_security_rotation_total Total count of coherent TLS-material rotation outcomes\n",
+    );
+    out.push_str("# TYPE opc_security_rotation_total counter\n");
+    for kind in SecurityRotationKind::ALL {
+        for outcome in SecurityRotationOutcome::ALL {
+            let value = security.rotation(kind, outcome);
+            out.push_str(&format!(
+                "opc_security_rotation_total{{kind=\"{}\",outcome=\"{}\"}} {value}\n",
+                kind.as_str(),
+                outcome.as_str(),
+            ));
+        }
+    }
+    out.push_str(
+        "# HELP opc_security_rotation_saturated Whether a fixed rotation counter reached its u64 representation ceiling\n",
+    );
+    out.push_str("# TYPE opc_security_rotation_saturated gauge\n");
+    for kind in SecurityRotationKind::ALL {
+        for outcome in SecurityRotationOutcome::ALL {
+            let value = u8::from(security.rotation_saturated(kind, outcome));
+            out.push_str(&format!(
+                "opc_security_rotation_saturated{{kind=\"{}\",outcome=\"{}\"}} {value}\n",
+                kind.as_str(),
+                outcome.as_str(),
+            ));
+        }
+    }
+}
+
 /// Export all SDK metrics in standard Prometheus text exposition format.
 pub fn export_prometheus_text() -> String {
     let mut out = String::new();
+
+    // --- Security / TLS material ---
+    write_security_metrics(&mut out, &SecurityMetricsReader::global());
 
     // --- Config Bus ---
     let pending = METRICS.config_bus_pending_commits.load(Ordering::Relaxed);
@@ -2489,6 +3179,13 @@ pub fn export_prometheus_text() -> String {
 mod tests {
     use super::*;
 
+    fn commit_ready(acceptance: SecurityMetricsAcceptance<'_>) {
+        match acceptance {
+            SecurityMetricsAcceptance::Ready(permit) => permit.commit(),
+            other => panic!("expected ready security metrics permit, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_metrics_label_safe_valid() {
         assert_eq!(metrics_label_safe("critical"), "critical");
@@ -3077,6 +3774,345 @@ mod tests {
                 .session_durable_readiness_ready
                 .load(Ordering::Relaxed),
             0
+        );
+    }
+
+    #[test]
+    fn security_metrics_export_has_only_the_fixed_rotation_series() {
+        let (authority, reader) = SecurityMetricsAuthority::isolated();
+        let (source, controller) = authority.split();
+        let publication = source.new_publication();
+        commit_ready(controller.prepare_success_if_active(&publication, u64::MAX, 1_900_000_000));
+        source.record_retained_last_good(SecurityRotationKind::Svid);
+        controller.record_rejected(SecurityRotationKind::TrustBundle, u64::MAX);
+        assert!(controller.record_expired_once(&publication));
+
+        let mut exported = String::new();
+        write_security_metrics(&mut exported, &reader);
+        assert!(exported.contains("opc_security_svid_expires_seconds 0\n"));
+        assert!(exported.contains(&format!("opc_security_bundle_version {}\n", u64::MAX)));
+        assert!(exported.contains(
+            "opc_security_rotation_total{kind=\"tls_material\",outcome=\"success\"} 1\n"
+        ));
+        assert!(exported.contains(
+            "opc_security_rotation_total{kind=\"svid\",outcome=\"retained_last_good\"} 1\n"
+        ));
+        assert!(exported.contains(
+            "opc_security_rotation_total{kind=\"trust_bundle\",outcome=\"rejected\"} 1\n"
+        ));
+        assert!(
+            exported.contains("opc_security_rotation_total{kind=\"svid\",outcome=\"expired\"} 1\n")
+        );
+
+        let rotation_rows = exported
+            .lines()
+            .filter(|line| line.starts_with("opc_security_rotation_total{"))
+            .collect::<Vec<_>>();
+        assert_eq!(rotation_rows.len(), SECURITY_ROTATION_SERIES_COUNT);
+        assert!(rotation_rows.iter().all(|row| {
+            SecurityRotationKind::ALL
+                .iter()
+                .any(|kind| row.contains(&format!("kind=\"{}\"", kind.as_str())))
+                && SecurityRotationOutcome::ALL
+                    .iter()
+                    .any(|outcome| row.contains(&format!("outcome=\"{}\"", outcome.as_str())))
+        }));
+        let saturation_rows = exported
+            .lines()
+            .filter(|line| line.starts_with("opc_security_rotation_saturated{"))
+            .collect::<Vec<_>>();
+        assert_eq!(saturation_rows.len(), SECURITY_ROTATION_SERIES_COUNT);
+        assert!(saturation_rows.iter().all(|row| row.ends_with(" 0")));
+        assert!(!exported.contains("spiffe://"));
+        assert!(!exported.contains("BEGIN"));
+        assert!(!exported.contains("/var/run"));
+    }
+
+    #[test]
+    fn security_rotation_counters_signal_saturation_without_wrapping() {
+        let (authority, reader) = SecurityMetricsAuthority::isolated();
+        let (source, _controller) = authority.split();
+        let kind = SecurityRotationKind::Svid;
+        let outcome = SecurityRotationOutcome::Rejected;
+        let index = rotation_index(kind, outcome);
+        reader.state.rotation[index].store(u64::MAX - 1, Ordering::Relaxed);
+
+        source.record_rejected_count(kind, 2);
+        source.record_rejected_count(kind, 1);
+
+        let snapshot = reader.snapshot();
+        assert_eq!(snapshot.rotation(kind, outcome), u64::MAX);
+        assert!(snapshot.rotation_saturated(kind, outcome));
+        assert_eq!(snapshot.saturated_series(), 1);
+        assert_eq!(snapshot.svid_expires_seconds(), 0);
+        assert_eq!(snapshot.bundle_version(), 0);
+
+        let mut exported = String::new();
+        write_security_metrics(&mut exported, &reader);
+        assert!(exported
+            .contains("opc_security_rotation_saturated{kind=\"svid\",outcome=\"rejected\"} 1\n"));
+    }
+
+    #[test]
+    fn security_export_uses_read_only_global_or_isolated_registry() {
+        let (authority, injected) = SecurityMetricsAuthority::isolated();
+        let (source, controller) = authority.split();
+        let publication = source.new_publication();
+        commit_ready(controller.prepare_success_if_active(&publication, u64::MAX, 1_900_000_000));
+        for _ in 0..64 {
+            source.record_retained_last_good(SecurityRotationKind::Svid);
+        }
+        let mut injected_export = String::new();
+        write_security_metrics(&mut injected_export, &injected);
+        assert!(injected_export.contains(&format!("opc_security_bundle_version {}\n", u64::MAX)));
+        assert!(injected_export.contains(
+            "opc_security_rotation_total{kind=\"svid\",outcome=\"retained_last_good\"} 64\n"
+        ));
+
+        let global = SecurityMetricsReader::global();
+        assert!(Arc::ptr_eq(&global.state, &SECURITY_METRICS));
+        assert!(!injected.shares_registry(&global));
+        let global_export = export_prometheus_text();
+        assert!(global_export.contains("# TYPE opc_security_bundle_version gauge\n"));
+    }
+
+    #[test]
+    fn sdk_metrics_reset_cannot_erase_security_evidence() {
+        let metrics = SdkMetrics::new();
+        let authority =
+            claim_security_metrics_authority(&AtomicBool::new(false), SECURITY_METRICS.clone())
+                .expect("test-only process-registry authority");
+        let reader = SecurityMetricsReader::global();
+        let (source, controller) = authority.split();
+        let publication = source.new_publication();
+        commit_ready(controller.prepare_success_if_active(&publication, 9, 1_900_000_000));
+        source.record_rejected_count(SecurityRotationKind::TrustBundle, 3);
+        let before = reader.snapshot();
+
+        metrics.reset_all();
+        assert_eq!(reader.snapshot(), before);
+    }
+
+    #[test]
+    fn security_authority_claim_is_one_shot() {
+        let claimed = AtomicBool::new(false);
+        let state = Arc::new(SecurityMetricsState::default());
+        assert!(claim_security_metrics_authority(&claimed, state.clone()).is_ok());
+        assert!(matches!(
+            claim_security_metrics_authority(&claimed, state),
+            Err(SecurityMetricsAuthorityClaimError::AlreadyClaimed)
+        ));
+    }
+
+    #[test]
+    fn publication_expiry_is_exact_once_across_source_and_controller() {
+        let (authority, reader) = SecurityMetricsAuthority::isolated();
+        let (source, controller) = authority.split();
+        let publication = source.new_publication();
+        commit_ready(controller.prepare_success_if_active(&publication, 17, 1_900_000_000));
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let source = source.clone();
+                let publication = publication.clone();
+                scope.spawn(move || {
+                    source.record_expired_once(&publication);
+                });
+            }
+            scope.spawn(|| {
+                controller.record_expired_once(&publication);
+            });
+        });
+
+        let snapshot = reader.snapshot();
+        assert_eq!(
+            snapshot.rotation(SecurityRotationKind::Svid, SecurityRotationOutcome::Expired),
+            1
+        );
+        assert_eq!(snapshot.bundle_version(), 17);
+        assert_eq!(snapshot.svid_expires_seconds(), 0);
+
+        let next = source.new_publication();
+        assert!(source.record_expired_once(&next));
+        assert!(matches!(
+            controller.prepare_success_if_active(&next, 18, 1_900_000_100),
+            SecurityMetricsAcceptance::Expired
+        ));
+        let snapshot = reader.snapshot();
+        assert_eq!(
+            snapshot.rotation(SecurityRotationKind::Svid, SecurityRotationOutcome::Expired),
+            2
+        );
+        assert_eq!(snapshot.bundle_version(), 17);
+        assert_eq!(snapshot.svid_expires_seconds(), 0);
+    }
+
+    #[test]
+    fn expired_unaccepted_publication_preserves_active_gauges_at_exact_boundary() {
+        const NOW: i64 = 1_000;
+        const ACTIVE_EXPIRY: i64 = NOW + 100;
+        let (authority, reader) = SecurityMetricsAuthority::isolated();
+        let (source, controller) = authority.split();
+        let active = source.new_publication();
+        commit_ready(controller.prepare_success_if_active_with_clock(
+            &active,
+            41,
+            ACTIVE_EXPIRY,
+            || NOW,
+        ));
+
+        let expired_candidate = source.new_publication();
+        assert!(matches!(
+            controller.prepare_success_if_active_with_clock(&expired_candidate, 42, NOW, || NOW,),
+            SecurityMetricsAcceptance::Expired
+        ));
+        assert!(!source.record_expired_once(&expired_candidate));
+
+        let snapshot = reader.snapshot();
+        assert_eq!(snapshot.bundle_version(), 41);
+        assert_eq!(snapshot.svid_expires_seconds(), ACTIVE_EXPIRY);
+        assert_eq!(
+            snapshot.rotation(
+                SecurityRotationKind::TlsMaterial,
+                SecurityRotationOutcome::Success,
+            ),
+            1
+        );
+        assert_eq!(
+            snapshot.rotation(SecurityRotationKind::Svid, SecurityRotationOutcome::Expired),
+            1
+        );
+    }
+
+    #[test]
+    fn superseded_publication_expiry_cannot_clear_the_new_active_gauges() {
+        const NOW: i64 = 1_000;
+        let (authority, reader) = SecurityMetricsAuthority::isolated();
+        let (source, controller) = authority.split();
+        let first = source.new_publication();
+        let second = source.new_publication();
+        commit_ready(controller.prepare_success_if_active_with_clock(
+            &first,
+            71,
+            NOW + 100,
+            || NOW,
+        ));
+        commit_ready(controller.prepare_success_if_active_with_clock(
+            &second,
+            72,
+            NOW + 200,
+            || NOW,
+        ));
+
+        assert!(source.record_expired_once(&first));
+        let after_superseded_expiry = reader.snapshot();
+        assert_eq!(after_superseded_expiry.bundle_version(), 72);
+        assert_eq!(after_superseded_expiry.svid_expires_seconds(), NOW + 200);
+
+        assert!(controller.record_expired_once(&second));
+        let after_active_expiry = reader.snapshot();
+        assert_eq!(after_active_expiry.bundle_version(), 72);
+        assert_eq!(after_active_expiry.svid_expires_seconds(), 0);
+        assert_eq!(
+            after_active_expiry
+                .rotation(SecurityRotationKind::Svid, SecurityRotationOutcome::Expired,),
+            2
+        );
+    }
+
+    #[test]
+    fn abandoned_acceptance_permit_is_retryable_and_releases_followup_transitions() {
+        const NOW: i64 = 1_000;
+        let (authority, reader) = SecurityMetricsAuthority::isolated();
+        let (source, controller) = authority.split();
+        let publication = source.new_publication();
+
+        let abandoned =
+            controller.prepare_success_if_active_with_clock(&publication, 91, NOW + 100, || NOW);
+        let SecurityMetricsAcceptance::Ready(abandoned) = abandoned else {
+            panic!("first acceptance must be ready");
+        };
+        drop(abandoned);
+        assert_eq!(reader.snapshot().bundle_version(), 0);
+        assert_eq!(reader.snapshot().svid_expires_seconds(), 0);
+
+        commit_ready(controller.prepare_success_if_active_with_clock(
+            &publication,
+            91,
+            NOW + 100,
+            || NOW,
+        ));
+        assert!(source.record_expired_once(&publication));
+        controller.record_rejected(SecurityRotationKind::TlsMaterial, 92);
+
+        let snapshot = reader.snapshot();
+        assert_eq!(snapshot.bundle_version(), 92);
+        assert_eq!(snapshot.svid_expires_seconds(), 0);
+        assert_eq!(
+            snapshot.rotation(SecurityRotationKind::Svid, SecurityRotationOutcome::Expired),
+            1
+        );
+        assert_eq!(
+            snapshot.rotation(
+                SecurityRotationKind::TlsMaterial,
+                SecurityRotationOutcome::Rejected,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn acceptance_expiry_and_rejection_race_keeps_marker_and_gauges_consistent() {
+        const NOW: i64 = 1_000;
+        let (authority, reader) = SecurityMetricsAuthority::isolated();
+        let (source, controller) = authority.split();
+        let publication = source.new_publication();
+        let acceptance =
+            controller.prepare_success_if_active_with_clock(&publication, 101, NOW + 100, || NOW);
+        let SecurityMetricsAcceptance::Ready(permit) = acceptance else {
+            panic!("acceptance race permit must be ready");
+        };
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            let source = source.clone();
+            let source_publication = publication.clone();
+            let source_barrier = &barrier;
+            scope.spawn(move || {
+                source_barrier.wait();
+                source.record_expired_once(&source_publication)
+            });
+            let rejection_barrier = &barrier;
+            scope.spawn(|| {
+                rejection_barrier.wait();
+                controller.record_rejected(SecurityRotationKind::TrustBundle, 102);
+            });
+            barrier.wait();
+            permit.commit();
+        });
+
+        let active_publication = lock_or_recover(&reader.state.active_publication);
+        let snapshot = reader.snapshot();
+        assert!(active_publication.is_none());
+        assert_eq!(snapshot.bundle_version(), 102);
+        assert_eq!(snapshot.svid_expires_seconds(), 0);
+        assert_eq!(
+            snapshot.rotation(SecurityRotationKind::Svid, SecurityRotationOutcome::Expired),
+            1
+        );
+        assert_eq!(
+            snapshot.rotation(
+                SecurityRotationKind::TlsMaterial,
+                SecurityRotationOutcome::Success,
+            ),
+            1
+        );
+        assert_eq!(
+            snapshot.rotation(
+                SecurityRotationKind::TrustBundle,
+                SecurityRotationOutcome::Rejected,
+            ),
+            1
         );
     }
 

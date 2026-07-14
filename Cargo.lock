@@ -2505,6 +2505,7 @@ version = "0.2.0"
 name = "opc-identity"
 version = "0.2.0"
 dependencies = [
+ "opc-redaction",
  "opc-types",
  "rcgen",
  "rustls",
@@ -3281,6 +3282,7 @@ name = "opc-tls"
 version = "0.2.0"
 dependencies = [
  "opc-identity",
+ "opc-redaction",
  "opc-types",
  "rcgen",
  "rustls",

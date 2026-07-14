@@ -26,6 +26,7 @@ time = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
 opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 
 [dev-dependencies]
 rcgen = { workspace = true }

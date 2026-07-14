@@ -12,6 +12,10 @@ use crate::{
     IdentityReloadError, IdentityReloadEvent, IdentityState, TrustBundle, TrustBundleSet,
     TrustDomain,
 };
+use opc_redaction::metrics::{
+    SecurityMetricsAuthority, SecurityMetricsController, SecurityMetricsPublication,
+    SecurityMetricsSource, SecurityRotationKind,
+};
 use rustls_pki_types::CertificateDer;
 use std::collections::HashSet;
 use std::fmt;
@@ -19,6 +23,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+use tokio::runtime::Handle;
 use tokio::sync::{broadcast, watch, Mutex};
 use zeroize::Zeroizing;
 
@@ -65,6 +70,70 @@ pub enum ProjectedSvidConfigError {
     /// A zero or excessively aggressive poll interval was requested.
     #[error("projected source poll interval is below the minimum")]
     PollIntervalTooShort,
+}
+
+/// Failure to construct a process-authoritative projected-volume source.
+///
+/// Configuration remains wrapped separately so the exhaustive public
+/// [`ProjectedSvidConfigError`] contract is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ProjectedSvidAuthoritativeError {
+    /// The projected-volume configuration is invalid.
+    #[error(transparent)]
+    Configuration(#[from] ProjectedSvidConfigError),
+    /// Construction was attempted without an entered Tokio runtime.
+    #[error("projected source requires an active Tokio runtime")]
+    RuntimeUnavailable,
+    /// Another source already owns process-wide security telemetry.
+    #[error("process security metrics authority is already claimed")]
+    SecurityMetricsAuthorityAlreadyClaimed,
+}
+
+/// Recoverable failure from [`ProjectedSvidSource::new_with_metrics`].
+///
+/// The supplied non-cloneable authority is returned intact so configuration or
+/// runtime preflight failure cannot consume a process-wide claim.
+pub struct ProjectedSvidWithMetricsError {
+    reason: ProjectedSvidAuthoritativeError,
+    authority: SecurityMetricsAuthority,
+}
+
+impl ProjectedSvidWithMetricsError {
+    fn new(reason: ProjectedSvidAuthoritativeError, authority: SecurityMetricsAuthority) -> Self {
+        Self { reason, authority }
+    }
+
+    /// Redaction-safe reason for the failed construction attempt.
+    pub const fn reason(&self) -> ProjectedSvidAuthoritativeError {
+        self.reason
+    }
+
+    /// Recover the exact authority supplied to the failed attempt.
+    pub fn into_authority(self) -> SecurityMetricsAuthority {
+        self.authority
+    }
+}
+
+impl fmt::Debug for ProjectedSvidWithMetricsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectedSvidWithMetricsError")
+            .field("reason", &self.reason)
+            .field("authority", &"[opaque]")
+            .finish()
+    }
+}
+
+impl fmt::Display for ProjectedSvidWithMetricsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.reason.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ProjectedSvidWithMetricsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.reason)
+    }
 }
 
 /// Availability of the projected identity source.
@@ -144,6 +213,32 @@ pub enum ProjectedSvidReloadReason {
 }
 
 impl ProjectedSvidReloadReason {
+    /// Every closed reason, for exhaustive fixed-cardinality handling.
+    pub const ALL: [Self; 22] = [
+        Self::AwaitingInitialMaterial,
+        Self::GenerationUnavailable,
+        Self::InvalidGenerationLink,
+        Self::GenerationChanged,
+        Self::GenerationRetryLimit,
+        Self::ReadAttemptTimeout,
+        Self::MaterialUnavailable,
+        Self::MaterialNotRegular,
+        Self::MaterialFileTooLarge,
+        Self::TotalMaterialTooLarge,
+        Self::CertificateCountExceeded,
+        Self::TrustAnchorCountExceeded,
+        Self::MalformedCertificate,
+        Self::MalformedPrivateKey,
+        Self::MalformedTrustBundle,
+        Self::InvalidCertificateChain,
+        Self::PrivateKeyMismatch,
+        Self::ExpiredSvid,
+        Self::NotYetValidSvid,
+        Self::InvalidWorkloadIdentity,
+        Self::LastGoodExpired,
+        Self::GenerationExhausted,
+    ];
+
     /// Stable low-cardinality representation for events and metrics.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -217,6 +312,78 @@ impl ProjectedSvidReloadStatus {
     }
 }
 
+/// A projected source permits exactly one authoritative TLS controller.
+#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
+pub enum ProjectedSvidControllerClaimError {
+    /// Controller construction was attempted without an entered Tokio runtime.
+    #[error("projected SVID controller requires an active Tokio runtime")]
+    RuntimeUnavailable,
+    /// Another controller already owns this source's channel and recorder.
+    #[error("projected SVID source already has an authoritative TLS controller")]
+    AlreadyClaimed,
+}
+
+/// One-time paired input for the authoritative projected-source controller.
+///
+/// The input carries the exact identity channel and metrics recorder selected
+/// by the source. It is intentionally non-cloneable so different controllers
+/// cannot split source outcomes from controller gauges.
+pub struct ProjectedSvidControllerInput {
+    state_rx: watch::Receiver<Option<ProjectedSvidControllerPublication>>,
+    metrics: SecurityMetricsController,
+    runtime: Handle,
+}
+
+impl ProjectedSvidControllerInput {
+    /// Consume the one-time input into its paired channel and recorder.
+    #[doc(hidden)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        watch::Receiver<Option<ProjectedSvidControllerPublication>>,
+        SecurityMetricsController,
+        Handle,
+    ) {
+        (self.state_rx, self.metrics, self.runtime)
+    }
+}
+
+impl fmt::Debug for ProjectedSvidControllerInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProjectedSvidControllerInput([redacted])")
+    }
+}
+
+/// One coherent projected identity publication for the paired controller.
+///
+/// This type is an SDK crate-boundary adapter. Raw compatibility subscribers
+/// continue to receive `IdentityState`; only the paired controller feed carries
+/// the exact-once telemetry ticket.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ProjectedSvidControllerPublication {
+    state: Arc<IdentityState>,
+    metrics: SecurityMetricsPublication,
+}
+
+impl ProjectedSvidControllerPublication {
+    /// Borrow the coherent identity state for controller validation.
+    pub fn identity_state(&self) -> &IdentityState {
+        &self.state
+    }
+
+    /// Borrow this publication's exact-once metrics ticket.
+    pub fn metrics_publication(&self) -> &SecurityMetricsPublication {
+        &self.metrics
+    }
+}
+
+impl fmt::Debug for ProjectedSvidControllerPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProjectedSvidControllerPublication([redacted])")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ProjectedSvidConfig {
     root: PathBuf,
@@ -235,7 +402,9 @@ struct ProjectedSvidConfig {
 /// unavailable even if no replacement can be loaded.
 pub struct ProjectedSvidSource {
     state_rx: watch::Receiver<Option<IdentityState>>,
+    controller_rx: watch::Receiver<Option<ProjectedSvidControllerPublication>>,
     status_rx: watch::Receiver<ProjectedSvidReloadStatus>,
+    controller_metrics: std::sync::Mutex<Option<SecurityMetricsController>>,
     event_tx: broadcast::Sender<IdentityReloadEvent>,
     task_handle: tokio::task::JoinHandle<()>,
     expiry_task_handle: tokio::task::JoinHandle<()>,
@@ -254,52 +423,135 @@ impl ProjectedSvidSource {
         bundle_files: Vec<impl AsRef<Path>>,
         poll_interval: Option<Duration>,
     ) -> Result<Self, ProjectedSvidConfigError> {
-        let cert_file = cert_file.as_ref().to_path_buf();
-        let key_file = key_file.as_ref().to_path_buf();
-        let bundle_files = bundle_files
-            .into_iter()
-            .map(|path| path.as_ref().to_path_buf())
-            .collect::<Vec<_>>();
-        validate_config_paths(&cert_file, &key_file, &bundle_files)?;
-
-        let poll_interval = poll_interval.unwrap_or(Duration::from_secs(5));
-        if poll_interval < MIN_PROJECTED_SVID_POLL_INTERVAL {
-            return Err(ProjectedSvidConfigError::PollIntervalTooShort);
-        }
-
-        let config = ProjectedSvidConfig {
-            root: volume_root.as_ref().to_path_buf(),
-            cert_file,
-            key_file,
-            bundle_files,
+        let config = prepare_config(
+            volume_root.as_ref().to_path_buf(),
+            cert_file.as_ref().to_path_buf(),
+            key_file.as_ref().to_path_buf(),
+            bundle_files
+                .into_iter()
+                .map(|path| path.as_ref().to_path_buf())
+                .collect(),
             poll_interval,
+        )?;
+        let runtime = Handle::current();
+        let (metrics, _reader) = SecurityMetricsAuthority::isolated();
+        Ok(Self::new_prepared(config, metrics, runtime))
+    }
+
+    /// Start the sole process-authoritative projected-volume source.
+    ///
+    /// This constructor is required for production TLS rotation telemetry. It
+    /// validates configuration and captures the entered Tokio runtime before
+    /// claiming process-wide metrics, so a returned error cannot burn the
+    /// claim. Rejection and expiry remain observable even before the TLS
+    /// controller is paired. A second claim fails closed for the process.
+    pub fn new_authoritative(
+        volume_root: impl AsRef<Path>,
+        cert_file: impl AsRef<Path>,
+        key_file: impl AsRef<Path>,
+        bundle_files: Vec<impl AsRef<Path>>,
+        poll_interval: Option<Duration>,
+    ) -> Result<Self, ProjectedSvidAuthoritativeError> {
+        let config = prepare_config(
+            volume_root.as_ref().to_path_buf(),
+            cert_file.as_ref().to_path_buf(),
+            key_file.as_ref().to_path_buf(),
+            bundle_files
+                .into_iter()
+                .map(|path| path.as_ref().to_path_buf())
+                .collect(),
+            poll_interval,
+        )?;
+        let runtime = Handle::try_current()
+            .map_err(|_| ProjectedSvidAuthoritativeError::RuntimeUnavailable)?;
+        let metrics = SecurityMetricsAuthority::claim_process()
+            .map_err(|_| ProjectedSvidAuthoritativeError::SecurityMetricsAuthorityAlreadyClaimed)?;
+        Ok(Self::new_prepared(config, metrics, runtime))
+    }
+
+    /// Start a bounded source using one explicitly selected metrics registry.
+    ///
+    /// The same recorder is carried into the source's one authoritative TLS
+    /// controller input, so source counters and controller gauges cannot split
+    /// across registries. Runtime preflight precedes task spawning; this
+    /// cross-crate composition API is public for trusted same-process wiring.
+    /// Failure returns [`ProjectedSvidWithMetricsError`], which owns the
+    /// unchanged authority for an explicit retry.
+    pub fn new_with_metrics(
+        volume_root: impl AsRef<Path>,
+        cert_file: impl AsRef<Path>,
+        key_file: impl AsRef<Path>,
+        bundle_files: Vec<impl AsRef<Path>>,
+        poll_interval: Option<Duration>,
+        metrics: SecurityMetricsAuthority,
+    ) -> Result<Self, ProjectedSvidWithMetricsError> {
+        let config = match prepare_config(
+            volume_root.as_ref().to_path_buf(),
+            cert_file.as_ref().to_path_buf(),
+            key_file.as_ref().to_path_buf(),
+            bundle_files
+                .into_iter()
+                .map(|path| path.as_ref().to_path_buf())
+                .collect(),
+            poll_interval,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                return Err(ProjectedSvidWithMetricsError::new(error.into(), metrics));
+            }
         };
+        let runtime = match Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return Err(ProjectedSvidWithMetricsError::new(
+                    ProjectedSvidAuthoritativeError::RuntimeUnavailable,
+                    metrics,
+                ));
+            }
+        };
+        Ok(Self::new_prepared(config, metrics, runtime))
+    }
+
+    fn new_prepared(
+        config: ProjectedSvidConfig,
+        metrics: SecurityMetricsAuthority,
+        runtime: Handle,
+    ) -> Self {
+        let (source_metrics, controller_metrics) = metrics.split();
         let (state_tx, state_rx) = watch::channel(None);
+        let (controller_tx, controller_rx) = watch::channel(None);
         let (status_tx, status_rx) = watch::channel(ProjectedSvidReloadStatus::initial());
         let (event_tx, _) = broadcast::channel(32);
         let publication_guard = Arc::new(Mutex::new(()));
 
-        let task_handle = tokio::spawn(run_source(
+        let task_handle = runtime.spawn(run_source(
             config,
             state_tx.clone(),
+            controller_tx.clone(),
             status_tx.clone(),
             event_tx.clone(),
             publication_guard.clone(),
+            source_metrics.clone(),
         ));
         let expiry_task_handle = spawn_projected_expiry_monitor(
+            &runtime,
             state_tx,
+            controller_tx,
             status_tx,
             event_tx.clone(),
             publication_guard,
+            source_metrics,
         );
 
-        Ok(Self {
+        Self {
             state_rx,
+            controller_rx,
             status_rx,
+            controller_metrics: std::sync::Mutex::new(Some(controller_metrics)),
             event_tx,
             task_handle,
             expiry_task_handle,
-        })
+        }
     }
 
     /// Subscribe to the source-compatible identity-state channel.
@@ -317,6 +569,31 @@ impl ProjectedSvidSource {
         self.status_rx.clone()
     }
 
+    /// Claim the exact channel and recorder for one authoritative controller.
+    ///
+    /// The claim is permanent for this source lifetime. Controller clones
+    /// share the claimed authority; construction of a distinct controller is
+    /// rejected before it can publish duplicate or split telemetry. Runtime
+    /// capture occurs before consuming the claim, and the paired input carries
+    /// that handle to the controller's reconciliation task.
+    pub fn claim_tls_controller(
+        &self,
+    ) -> Result<ProjectedSvidControllerInput, ProjectedSvidControllerClaimError> {
+        let runtime = Handle::try_current()
+            .map_err(|_| ProjectedSvidControllerClaimError::RuntimeUnavailable)?;
+        let metrics = self
+            .controller_metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or(ProjectedSvidControllerClaimError::AlreadyClaimed)?;
+        Ok(ProjectedSvidControllerInput {
+            state_rx: self.controller_rx.clone(),
+            metrics,
+            runtime,
+        })
+    }
+
     /// Return the current typed projected-source status.
     pub fn status(&self) -> ProjectedSvidReloadStatus {
         *self.status_rx.borrow()
@@ -328,7 +605,7 @@ impl ProjectedSvidSource {
         &self,
         timeout: Duration,
     ) -> Result<IdentityState, IdentityReloadError> {
-        let mut rx = self.subscribe();
+        let mut rx = self.state_rx.clone();
         if let Some(state) = rx.borrow().clone() {
             return Ok(state);
         }
@@ -355,6 +632,27 @@ impl Drop for ProjectedSvidSource {
         self.task_handle.abort();
         self.expiry_task_handle.abort();
     }
+}
+
+fn prepare_config(
+    root: PathBuf,
+    cert_file: PathBuf,
+    key_file: PathBuf,
+    bundle_files: Vec<PathBuf>,
+    poll_interval: Option<Duration>,
+) -> Result<ProjectedSvidConfig, ProjectedSvidConfigError> {
+    validate_config_paths(&cert_file, &key_file, &bundle_files)?;
+    let poll_interval = poll_interval.unwrap_or(Duration::from_secs(5));
+    if poll_interval < MIN_PROJECTED_SVID_POLL_INTERVAL {
+        return Err(ProjectedSvidConfigError::PollIntervalTooShort);
+    }
+    Ok(ProjectedSvidConfig {
+        root,
+        cert_file,
+        key_file,
+        bundle_files,
+        poll_interval,
+    })
 }
 
 fn validate_config_paths(
@@ -394,9 +692,11 @@ fn is_normal_relative_path(path: &Path) -> bool {
 async fn run_source(
     config: ProjectedSvidConfig,
     state_tx: watch::Sender<Option<IdentityState>>,
+    controller_tx: watch::Sender<Option<ProjectedSvidControllerPublication>>,
     status_tx: watch::Sender<ProjectedSvidReloadStatus>,
     event_tx: broadcast::Sender<IdentityReloadEvent>,
     publication_guard: Arc<Mutex<()>>,
+    metrics: SecurityMetricsSource,
 ) {
     let mut last_published_target: Option<PathBuf> = None;
     let mut last_observed_target: Option<PathBuf> = None;
@@ -426,9 +726,11 @@ async fn run_source(
                         publish_failure(
                             ProjectedSvidReloadReason::GenerationExhausted,
                             &state_tx,
+                            &controller_tx,
                             &status_tx,
                             &event_tx,
                             &publication_guard,
+                            &metrics,
                         )
                         .await;
                         tokio::time::sleep(config.poll_interval).await;
@@ -440,7 +742,13 @@ async fn run_source(
                         .expires_at
                         .as_offset_datetime()
                         .unix_timestamp();
-                    state_tx.send_replace(Some(loaded.state));
+                    let state = Arc::new(loaded.state);
+                    let metrics_publication = metrics.new_publication();
+                    state_tx.send_replace(Some((*state).clone()));
+                    controller_tx.send_replace(Some(ProjectedSvidControllerPublication {
+                        state,
+                        metrics: metrics_publication,
+                    }));
                     status_tx.send_replace(ProjectedSvidReloadStatus {
                         generation: next_generation,
                         availability: ProjectedSvidAvailability::Ready,
@@ -453,8 +761,16 @@ async fn run_source(
                     });
                 }
                 Err(reason) => {
-                    publish_failure(reason, &state_tx, &status_tx, &event_tx, &publication_guard)
-                        .await;
+                    publish_failure(
+                        reason,
+                        &state_tx,
+                        &controller_tx,
+                        &status_tx,
+                        &event_tx,
+                        &publication_guard,
+                        &metrics,
+                    )
+                    .await;
                 }
             }
         }
@@ -466,21 +782,21 @@ async fn run_source(
 async fn publish_failure(
     reason: ProjectedSvidReloadReason,
     state_tx: &watch::Sender<Option<IdentityState>>,
+    controller_tx: &watch::Sender<Option<ProjectedSvidControllerPublication>>,
     status_tx: &watch::Sender<ProjectedSvidReloadStatus>,
     event_tx: &broadcast::Sender<IdentityReloadEvent>,
     publication_guard: &Mutex<()>,
+    metrics: &SecurityMetricsSource,
 ) {
     let _publication = publication_guard.lock().await;
-    let (has_last_good, expired_last_good) = match state_tx.borrow().as_ref() {
-        Some(current) if current.is_expired() => (false, true),
+    let current_publication = controller_tx.borrow().clone();
+    let (has_last_good, expired_last_good) = match current_publication.as_ref() {
+        Some(current) if current.identity_state().is_expired() => (false, true),
         Some(_) => (true, false),
         None => (false, false),
     };
-    if expired_last_good {
-        state_tx.send_replace(None);
-    }
     let current_status = *status_tx.borrow();
-    let reason = if expired_last_good
+    let reported_reason = if expired_last_good
         || (!has_last_good
             && current_status.reason == Some(ProjectedSvidReloadReason::LastGoodExpired))
     {
@@ -494,26 +810,74 @@ async fn publish_failure(
         ProjectedSvidAvailability::Unavailable
     };
     let generation = current_status.generation;
+    let kind = projected_reason_kind(reason);
+    if has_last_good {
+        metrics.record_retained_last_good(kind);
+    } else {
+        metrics.record_rejected_count(kind, 1);
+    }
+    if expired_last_good {
+        if let Some(publication) = current_publication.as_ref() {
+            metrics.record_expired_once(publication.metrics_publication());
+        }
+        state_tx.send_replace(None);
+        controller_tx.send_replace(None);
+    }
     status_tx.send_replace(ProjectedSvidReloadStatus {
         generation,
         availability,
-        reason: Some(reason),
+        reason: Some(reported_reason),
     });
     let _ = event_tx.send(IdentityReloadEvent::Failure {
-        error: reason.to_string(),
+        error: reported_reason.to_string(),
     });
 }
 
+fn projected_reason_kind(reason: ProjectedSvidReloadReason) -> SecurityRotationKind {
+    match reason {
+        ProjectedSvidReloadReason::MalformedCertificate
+        | ProjectedSvidReloadReason::MalformedPrivateKey
+        | ProjectedSvidReloadReason::CertificateCountExceeded
+        | ProjectedSvidReloadReason::PrivateKeyMismatch
+        | ProjectedSvidReloadReason::ExpiredSvid
+        | ProjectedSvidReloadReason::NotYetValidSvid => SecurityRotationKind::Svid,
+        ProjectedSvidReloadReason::MalformedTrustBundle
+        | ProjectedSvidReloadReason::TrustAnchorCountExceeded => SecurityRotationKind::TrustBundle,
+        ProjectedSvidReloadReason::AwaitingInitialMaterial
+        | ProjectedSvidReloadReason::GenerationUnavailable
+        | ProjectedSvidReloadReason::InvalidGenerationLink
+        | ProjectedSvidReloadReason::GenerationChanged
+        | ProjectedSvidReloadReason::GenerationRetryLimit
+        | ProjectedSvidReloadReason::ReadAttemptTimeout
+        | ProjectedSvidReloadReason::MaterialUnavailable
+        | ProjectedSvidReloadReason::MaterialNotRegular
+        | ProjectedSvidReloadReason::MaterialFileTooLarge
+        | ProjectedSvidReloadReason::TotalMaterialTooLarge
+        | ProjectedSvidReloadReason::InvalidCertificateChain
+        | ProjectedSvidReloadReason::InvalidWorkloadIdentity
+        | ProjectedSvidReloadReason::LastGoodExpired
+        | ProjectedSvidReloadReason::GenerationExhausted => SecurityRotationKind::TlsMaterial,
+    }
+}
+
 fn spawn_projected_expiry_monitor(
+    runtime: &Handle,
     state_tx: watch::Sender<Option<IdentityState>>,
+    controller_tx: watch::Sender<Option<ProjectedSvidControllerPublication>>,
     status_tx: watch::Sender<ProjectedSvidReloadStatus>,
     event_tx: broadcast::Sender<IdentityReloadEvent>,
     publication_guard: Arc<Mutex<()>>,
+    metrics: SecurityMetricsSource,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut state_rx = state_tx.subscribe();
+    runtime.spawn(async move {
+        let mut state_rx = controller_tx.subscribe();
         loop {
-            let sleep_for = projected_expiry_sleep_duration(state_rx.borrow().as_ref());
+            let sleep_for = projected_expiry_sleep_duration(
+                state_rx
+                    .borrow()
+                    .as_ref()
+                    .map(ProjectedSvidControllerPublication::identity_state),
+            );
             tokio::select! {
                 changed = state_rx.changed() => {
                     if changed.is_err() {
@@ -523,12 +887,14 @@ fn spawn_projected_expiry_monitor(
                 () = tokio::time::sleep(sleep_for) => {
                     let _publication = publication_guard.lock().await;
                     let observed_generation = status_tx.borrow().generation;
-                    let expired = state_tx
-                        .borrow()
+                    let current_publication = controller_tx.borrow().clone();
+                    let expired = current_publication
                         .as_ref()
-                        .is_some_and(IdentityState::is_expired);
-                    if expired {
+                        .is_some_and(|current| current.identity_state().is_expired());
+                    if let Some(publication) = current_publication.filter(|_| expired) {
+                        metrics.record_expired_once(publication.metrics_publication());
                         state_tx.send_replace(None);
+                        controller_tx.send_replace(None);
                         let generation_is_current =
                             status_tx.borrow().generation == observed_generation;
                         if generation_is_current {
@@ -910,6 +1276,7 @@ fn map_identity_error(error: IdentityReloadError) -> ProjectedSvidReloadReason {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use opc_redaction::metrics::SecurityRotationOutcome;
     use opc_types::Timestamp;
     use rcgen::{CertificateParams, DnType, KeyPair, SanType};
     use std::fs;
@@ -1233,6 +1600,126 @@ mod tests {
             below,
             Err(ProjectedSvidConfigError::PollIntervalTooShort)
         ));
+    }
+
+    #[test]
+    fn process_authority_is_recovered_across_preflight_failure_then_one_shot() {
+        let directory = TestDirectory::new("authoritative-claim");
+        let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ProjectedSvidSource::new_authoritative(
+                directory.path(),
+                CERT_FILE,
+                KEY_FILE,
+                Vec::<&str>::new(),
+                Some(MIN_PROJECTED_SVID_POLL_INTERVAL),
+            )
+        }));
+        assert!(invalid.is_ok(), "invalid configuration must not panic");
+        assert!(matches!(
+            invalid.expect("configuration result"),
+            Err(ProjectedSvidAuthoritativeError::Configuration(
+                ProjectedSvidConfigError::MissingTrustBundle
+            ))
+        ));
+
+        let without_runtime = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ProjectedSvidSource::new_authoritative(
+                directory.path(),
+                CERT_FILE,
+                KEY_FILE,
+                vec![BUNDLE_FILE],
+                Some(MIN_PROJECTED_SVID_POLL_INTERVAL),
+            )
+        }));
+        assert!(
+            without_runtime.is_ok(),
+            "runtime preflight must return instead of panicking"
+        );
+        assert!(matches!(
+            without_runtime.expect("runtime result"),
+            Err(ProjectedSvidAuthoritativeError::RuntimeUnavailable)
+        ));
+
+        let authority = SecurityMetricsAuthority::claim_process().expect("first process claim");
+        let configuration_failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ProjectedSvidSource::new_with_metrics(
+                directory.path(),
+                CERT_FILE,
+                KEY_FILE,
+                Vec::<&str>::new(),
+                Some(MIN_PROJECTED_SVID_POLL_INTERVAL),
+                authority,
+            )
+        }));
+        assert!(
+            configuration_failure.is_ok(),
+            "explicit-authority configuration preflight must not panic"
+        );
+        let configuration_failure = match configuration_failure.expect("configuration result") {
+            Ok(_) => panic!("missing bundle must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            configuration_failure.reason(),
+            ProjectedSvidAuthoritativeError::Configuration(
+                ProjectedSvidConfigError::MissingTrustBundle
+            )
+        );
+        let authority = configuration_failure.into_authority();
+
+        let recoverable_failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ProjectedSvidSource::new_with_metrics(
+                directory.path(),
+                CERT_FILE,
+                KEY_FILE,
+                vec![BUNDLE_FILE],
+                Some(MIN_PROJECTED_SVID_POLL_INTERVAL),
+                authority,
+            )
+        }));
+        assert!(
+            recoverable_failure.is_ok(),
+            "explicit-authority runtime preflight must not panic"
+        );
+        let recoverable_failure = match recoverable_failure.expect("recoverable result") {
+            Ok(_) => panic!("construction outside a runtime must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            recoverable_failure.reason(),
+            ProjectedSvidAuthoritativeError::RuntimeUnavailable
+        );
+        let recovered_authority = recoverable_failure.into_authority();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let root = directory.path().to_path_buf();
+        runtime.block_on(async move {
+            let first = ProjectedSvidSource::new_with_metrics(
+                &root,
+                CERT_FILE,
+                KEY_FILE,
+                vec![BUNDLE_FILE],
+                Some(MIN_PROJECTED_SVID_POLL_INTERVAL),
+                recovered_authority,
+            );
+            assert!(
+                first.is_ok(),
+                "recovered process authority must remain usable"
+            );
+            assert!(matches!(
+                ProjectedSvidSource::new_authoritative(
+                    &root,
+                    CERT_FILE,
+                    KEY_FILE,
+                    vec![BUNDLE_FILE],
+                    Some(MIN_PROJECTED_SVID_POLL_INTERVAL),
+                ),
+                Err(ProjectedSvidAuthoritativeError::SecurityMetricsAuthorityAlreadyClaimed)
+            ));
+        });
     }
 
     #[tokio::test]
@@ -1795,15 +2282,31 @@ mod tests {
         loaded.identity.expires_at = expired;
         loaded.svid.expires_at = expired;
 
-        let (state_tx, mut state_rx) = watch::channel(Some(loaded));
+        let (authority, metrics_reader) = SecurityMetricsAuthority::isolated();
+        let (metrics, _controller_metrics) = authority.split();
+        let loaded = Arc::new(loaded);
+        let (state_tx, mut state_rx) = watch::channel(Some((*loaded).clone()));
+        let (controller_tx, _controller_rx) =
+            watch::channel(Some(ProjectedSvidControllerPublication {
+                state: loaded,
+                metrics: metrics.new_publication(),
+            }));
         let (status_tx, status_rx) = watch::channel(ProjectedSvidReloadStatus {
             generation: 7,
             availability: ProjectedSvidAvailability::RetainingLastGood,
             reason: Some(ProjectedSvidReloadReason::MalformedCertificate),
         });
         let (event_tx, _) = broadcast::channel(4);
-        let handle =
-            spawn_projected_expiry_monitor(state_tx, status_tx, event_tx, Arc::new(Mutex::new(())));
+        let runtime = Handle::current();
+        let handle = spawn_projected_expiry_monitor(
+            &runtime,
+            state_tx,
+            controller_tx,
+            status_tx,
+            event_tx,
+            Arc::new(Mutex::new(())),
+            metrics,
+        );
         timeout(Duration::from_secs(1), async {
             loop {
                 if state_rx.borrow().is_none() {
@@ -1822,6 +2325,12 @@ mod tests {
                 reason: Some(ProjectedSvidReloadReason::LastGoodExpired),
             }
         );
+        assert_eq!(
+            metrics_reader
+                .snapshot()
+                .rotation(SecurityRotationKind::Svid, SecurityRotationOutcome::Expired,),
+            1
+        );
         handle.abort();
     }
 
@@ -1838,7 +2347,15 @@ mod tests {
         loaded.identity.expires_at = expired;
         loaded.svid.expires_at = expired;
 
-        let (state_tx, state_rx) = watch::channel(Some(loaded));
+        let (authority, metrics_reader) = SecurityMetricsAuthority::isolated();
+        let (metrics, _controller_metrics) = authority.split();
+        let loaded = Arc::new(loaded);
+        let (state_tx, state_rx) = watch::channel(Some((*loaded).clone()));
+        let (controller_tx, controller_rx) =
+            watch::channel(Some(ProjectedSvidControllerPublication {
+                state: loaded,
+                metrics: metrics.new_publication(),
+            }));
         let (status_tx, status_rx) = watch::channel(ProjectedSvidReloadStatus {
             generation: 11,
             availability: ProjectedSvidAvailability::Ready,
@@ -1850,12 +2367,15 @@ mod tests {
         publish_failure(
             ProjectedSvidReloadReason::MalformedCertificate,
             &state_tx,
+            &controller_tx,
             &status_tx,
             &event_tx,
             &publication_guard,
+            &metrics,
         )
         .await;
         assert!(state_rx.borrow().is_none());
+        assert!(controller_rx.borrow().is_none());
         assert_eq!(
             *status_rx.borrow(),
             ProjectedSvidReloadStatus {
@@ -1869,18 +2389,42 @@ mod tests {
             Ok(IdentityReloadEvent::Failure { error })
                 if error == ProjectedSvidReloadReason::LastGoodExpired.as_str()
         ));
+        assert_eq!(
+            metrics_reader.snapshot().rotation(
+                SecurityRotationKind::Svid,
+                SecurityRotationOutcome::Rejected,
+            ),
+            1
+        );
 
         publish_failure(
             ProjectedSvidReloadReason::MaterialUnavailable,
             &state_tx,
+            &controller_tx,
             &status_tx,
             &event_tx,
             &publication_guard,
+            &metrics,
         )
         .await;
         assert_eq!(
             status_rx.borrow().reason(),
             Some(ProjectedSvidReloadReason::LastGoodExpired)
+        );
+        let snapshot = metrics_reader.snapshot();
+        assert_eq!(
+            snapshot.rotation(
+                SecurityRotationKind::TlsMaterial,
+                SecurityRotationOutcome::Rejected,
+            ),
+            1
+        );
+        assert_eq!(snapshot.svid_expires_seconds(), 0);
+        assert_eq!(snapshot.bundle_version(), 0);
+        assert_eq!(
+            snapshot.rotation(SecurityRotationKind::Svid, SecurityRotationOutcome::Expired,),
+            1,
+            "failure discovery and later retries must not duplicate expiry"
         );
     }
 
@@ -1956,6 +2500,42 @@ mod tests {
             status.reason(),
             Some(ProjectedSvidReloadReason::AwaitingInitialMaterial)
         );
+    }
+
+    #[test]
+    fn projected_reason_classification_is_exhaustive_and_conservative() {
+        assert_eq!(ProjectedSvidReloadReason::ALL.len(), 22);
+        for reason in ProjectedSvidReloadReason::ALL {
+            let expected = match reason {
+                ProjectedSvidReloadReason::MalformedCertificate
+                | ProjectedSvidReloadReason::MalformedPrivateKey
+                | ProjectedSvidReloadReason::CertificateCountExceeded
+                | ProjectedSvidReloadReason::PrivateKeyMismatch
+                | ProjectedSvidReloadReason::ExpiredSvid
+                | ProjectedSvidReloadReason::NotYetValidSvid => SecurityRotationKind::Svid,
+                ProjectedSvidReloadReason::MalformedTrustBundle
+                | ProjectedSvidReloadReason::TrustAnchorCountExceeded => {
+                    SecurityRotationKind::TrustBundle
+                }
+                ProjectedSvidReloadReason::AwaitingInitialMaterial
+                | ProjectedSvidReloadReason::GenerationUnavailable
+                | ProjectedSvidReloadReason::InvalidGenerationLink
+                | ProjectedSvidReloadReason::GenerationChanged
+                | ProjectedSvidReloadReason::GenerationRetryLimit
+                | ProjectedSvidReloadReason::ReadAttemptTimeout
+                | ProjectedSvidReloadReason::MaterialUnavailable
+                | ProjectedSvidReloadReason::MaterialNotRegular
+                | ProjectedSvidReloadReason::MaterialFileTooLarge
+                | ProjectedSvidReloadReason::TotalMaterialTooLarge
+                | ProjectedSvidReloadReason::InvalidCertificateChain
+                | ProjectedSvidReloadReason::InvalidWorkloadIdentity
+                | ProjectedSvidReloadReason::LastGoodExpired
+                | ProjectedSvidReloadReason::GenerationExhausted => {
+                    SecurityRotationKind::TlsMaterial
+                }
+            };
+            assert_eq!(projected_reason_kind(reason), expected, "{reason:?}");
+        }
     }
 
     #[test]

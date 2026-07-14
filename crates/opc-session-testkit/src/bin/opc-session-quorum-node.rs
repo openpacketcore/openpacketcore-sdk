@@ -701,7 +701,7 @@ async fn prepare_transport(
         }
         QualificationTransportConfig::ProjectedMtls(projected) => {
             let lifecycle = projected.lifecycle.to_policy().map_err(|_| NodeFailure)?;
-            let source = ProjectedSvidSource::new(
+            let source = ProjectedSvidSource::new_authoritative(
                 &projected.projected_volume_root,
                 &projected.certificate_file,
                 &projected.private_key_file,
@@ -717,7 +717,9 @@ async fn prepare_transport(
             let local_spiffe_id =
                 SpiffeId::new(config.members[config.node_index].tls_identity.clone())
                     .map_err(|_| NodeFailure)?;
-            let controller = TlsMaterialController::new_pinned(source.subscribe(), local_spiffe_id);
+            let controller =
+                TlsMaterialController::new_pinned_from_projected_source(&source, local_spiffe_id)
+                    .map_err(|_| NodeFailure)?;
             let client_config = TlsConfigBuilder::from_material_controller(controller.clone())
                 .allow_any_trusted_peer()
                 .build_authenticated_client_config()
