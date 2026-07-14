@@ -18,6 +18,7 @@ use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError}
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
     decode_bounded, durable_openraft_config, encode_bounded, DurableOpenraftDomain,
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
@@ -62,7 +63,8 @@ use crate::ttl::{
 
 /// Default complete client-operation deadline, including leader discovery,
 /// forwarding, quorum confirmation, commit, and local apply.
-pub const DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT: Duration =
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT;
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 

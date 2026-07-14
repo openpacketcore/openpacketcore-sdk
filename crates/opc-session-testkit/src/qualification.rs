@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
 use opc_session_net::{
     SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
 };
@@ -26,10 +27,10 @@ use sha2::{Digest, Sha256};
 
 /// Exact profile inventory consumed by qualification tooling.
 pub const SESSION_HA_PROFILE_JSON: &str =
-    include_str!("../qualification/v1/session-ha-profile.json");
+    include_str!("../qualification/v2/session-ha-profile.json");
 /// JSON Schema for the exact experimental profile inventory.
 pub const SESSION_HA_PROFILE_SCHEMA_JSON: &str =
-    include_str!("../qualification/v1/session-ha-profile.schema.json");
+    include_str!("../qualification/v2/session-ha-profile.schema.json");
 /// JSON Schema for one independent history-checker input operation.
 pub const SESSION_HA_HISTORY_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-ha-history.schema.json");
@@ -38,7 +39,7 @@ pub const SESSION_HA_SCHEDULE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-ha-schedule.schema.json");
 /// JSON Schema for one experimental qualification evidence record.
 pub const SESSION_HA_EVIDENCE_SCHEMA_JSON: &str =
-    include_str!("../qualification/v1/session-ha-evidence.schema.json");
+    include_str!("../qualification/v2/session-ha-evidence.schema.json");
 
 /// Version of the private node-control protocol.
 pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 1;
@@ -51,7 +52,8 @@ pub const QUALIFICATION_MAX_VALUE_BYTES: usize = 512;
 /// Maximum retained lease handles in one qualification child.
 pub const QUALIFICATION_MAX_LEASE_HANDLES: usize = 1024;
 /// Exact operation timeout pinned by the experimental profile.
-pub const QUALIFICATION_OPERATION_TIMEOUT_MILLIS: u64 = 10_000;
+pub const QUALIFICATION_OPERATION_TIMEOUT_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
 
 /// Machine-readable experimental session-HA profile.
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +69,7 @@ pub struct SessionHaQualificationProfile {
     pub platforms: Vec<QualificationPlatform>,
     pub topology: QualificationTopology,
     pub protocol: QualificationProtocol,
+    pub consensus_timing: QualificationConsensusTiming,
     pub bounds: QualificationBounds,
     pub provisional_test_thresholds: QualificationThresholds,
     pub evidence: QualificationEvidenceRequirements,
@@ -133,6 +136,24 @@ pub struct QualificationProtocol {
     pub max_frame_bytes: usize,
     pub max_rpc_payload_bytes: usize,
     pub legacy_direct_backend_enabled: bool,
+}
+
+/// Fixed non-operator-tunable consensus timing inventory.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationConsensusTiming {
+    pub cold_connect_budget_composition: String,
+    pub cold_connect_timeout_millis: u64,
+    pub append_entries_timeout_millis: u64,
+    pub heartbeat_interval_millis: u64,
+    pub vote_timeout_millis: u64,
+    pub election_timeout_min_millis: u64,
+    pub election_timeout_max_millis: u64,
+    pub install_snapshot_timeout_millis: u64,
+    pub forward_mutation_timeout_millis: u64,
+    pub read_barrier_timeout_millis: u64,
+    pub server_idle_timeout_millis: u64,
+    pub server_handler_timeout_millis: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

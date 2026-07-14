@@ -13,7 +13,7 @@ use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
     durable_openraft_config, encode_bounded, ConsensusNodeId, ConsensusPeer, ConsensusPeerError,
     ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
-    DurableOpenraftDomain,
+    DurableOpenraftDomain, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,7 +35,8 @@ use crate::types::{
 };
 
 /// Complete client-operation deadline including routing, quorum, commit, and apply.
-pub const DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT: Duration =
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT;
 
 const ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_FORWARDED_BUDGET: Duration = Duration::from_secs(60);

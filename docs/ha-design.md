@@ -26,13 +26,18 @@ yet approved as a production deployment profile.
 
 ### Interim Openraft source and shared runtime profile
 
-Both domains use `opc_consensus::durable_openraft_config` and the same Tokio
-runtime. The fixed profile uses a 250 ms heartbeat, a fresh 1,000–2,000 ms
-election timeout for every campaign, a 10 second snapshot-install timeout,
-one-entry replication payloads, a 4,096-log snapshot trigger, 1 MiB snapshot
-chunks, and 1,024 retained applied logs. Domain adapters select only their
-cluster label. These are code-path constants, not operator tuning knobs and not
-proof that the experimental profile meets #143 under deployed load.
+Both domains use `opc_consensus::durable_openraft_config`, the same Tokio
+runtime, and the same end-to-end timing profile. AppendEntries/Openraft
+read-index and the heartbeat are 2,000 ms; Vote is 5,000 ms; elections sample
+freshly from `[5,000 ms, 8,000 ms)`; InstallSnapshot, forwarded mutation,
+consumer ReadBarrier, and the operation default are 10,000 ms. Listener
+idle/handler ceilings are 30,000 ms. A fresh connection has a contained
+1,500 ms DNS/TCP/mTLS/bootstrap cap inside its already-running family deadline,
+never in addition to it. The engine profile also uses one-entry replication
+payloads, a 4,096-log snapshot trigger, 1 MiB snapshot chunks, and 1,024 retained
+applied logs. Domain adapters select only their cluster label. These are
+code-path constants, not operator tuning knobs and not proof that the
+experimental profile meets #143 under deployed load.
 
 The workspace temporarily exact-pins `openpacketcore/openraft` revision
 `f607e636406b16bd0ad7925dbb631da1b7a4cd96`. Registry 0.9.24 reuses a sampled

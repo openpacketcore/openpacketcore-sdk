@@ -1,0 +1,173 @@
+{
+  "schema_version": "opc-session-ha-profile/v2",
+  "profile_id": "opc-session-openraft-ha/v2",
+  "maturity": "experimental",
+  "qualification_complete": false,
+  "workspace": {
+    "version": "0.2.0",
+    "rust_msrv": "1.88",
+    "source_revision": "required-in-evidence"
+  },
+  "source_build_gate": {
+    "tracking_issue": 143,
+    "openraft_git": "https://github.com/openpacketcore/openraft",
+    "openraft_rev": "f607e636406b16bd0ad7925dbb631da1b7a4cd96",
+    "affected_workspace_crates": [
+      "opc-alarm",
+      "opc-alarm-k8s",
+      "opc-alarm-testkit",
+      "opc-alarm-yang",
+      "opc-amf-lite",
+      "opc-amf-lite-testkit",
+      "opc-config-bus",
+      "opc-consensus",
+      "opc-gnmi-server",
+      "opc-ipsec-lb",
+      "opc-mgmt-authz",
+      "opc-mgmt-transport",
+      "opc-netconf-server",
+      "opc-persist",
+      "opc-runtime",
+      "opc-sa-mirror",
+      "opc-sbi",
+      "opc-sdk",
+      "opc-sdk-integration",
+      "opc-session-cache",
+      "opc-session-net",
+      "opc-session-store",
+      "opc-session-testkit",
+      "operator-controller",
+      "operator-lifecycle",
+      "operator-lifecycle-cli"
+    ],
+    "crates_io_check_date": "2026-07-13",
+    "crates_io_exact_matches": [],
+    "removal_condition": "official stable Openraft release containing the fix, registry pin and checksum, and full issue #143 requalification"
+  },
+  "artifacts": [
+    {
+      "crate_name": "opc-consensus",
+      "version": "0.2.0",
+      "publish": false,
+      "required_features": [],
+      "excluded_features": []
+    },
+    {
+      "crate_name": "opc-session-store",
+      "version": "0.2.0",
+      "publish": false,
+      "required_features": [],
+      "excluded_features": []
+    },
+    {
+      "crate_name": "opc-persist",
+      "version": "0.2.0",
+      "publish": false,
+      "required_features": [],
+      "excluded_features": []
+    },
+    {
+      "crate_name": "opc-session-net",
+      "version": "0.2.0",
+      "publish": false,
+      "required_features": [],
+      "excluded_features": [
+        "insecure-test",
+        "legacy-session-net-compat"
+      ]
+    },
+    {
+      "crate_name": "openraft",
+      "version": "0.9.24",
+      "publish": false,
+      "required_features": [
+        "serde",
+        "single-term-leader",
+        "storage-v2"
+      ],
+      "excluded_features": []
+    }
+  ],
+  "platforms": [
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "status": "qualification-pending"
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "status": "qualification-pending"
+    }
+  ],
+  "topology": {
+    "member_counts": [3, 5],
+    "maximum_members": 31,
+    "quorum_rule": "floor(n/2)+1",
+    "distinct_failure_domain_per_voter": true,
+    "distinct_backing_store_per_voter": true,
+    "stable_identity_independent_of_route": true
+  },
+  "protocol": {
+    "consensus_alpn": "opc-session-consensus/2",
+    "transport_revision": 2,
+    "wire_schema_revision": 2,
+    "error_set_revision": 4,
+    "consensus_schema_version": 1,
+    "min_frame_bytes": 9437184,
+    "max_frame_bytes": 16777216,
+    "max_rpc_payload_bytes": 2097152,
+    "legacy_direct_backend_enabled": false
+  },
+  "consensus_timing": {
+    "cold_connect_budget_composition": "contained-within-family-deadline",
+    "cold_connect_timeout_millis": 1500,
+    "append_entries_timeout_millis": 2000,
+    "heartbeat_interval_millis": 2000,
+    "vote_timeout_millis": 5000,
+    "election_timeout_min_millis": 5000,
+    "election_timeout_max_millis": 8000,
+    "install_snapshot_timeout_millis": 10000,
+    "forward_mutation_timeout_millis": 10000,
+    "read_barrier_timeout_millis": 10000,
+    "server_idle_timeout_millis": 30000,
+    "server_handler_timeout_millis": 30000
+  },
+  "bounds": {
+    "operation_timeout_millis": 10000,
+    "max_session_ttl_seconds": 31536000,
+    "max_stable_id_bytes": 64,
+    "max_replication_transaction_id_bytes": 128,
+    "max_replication_operation_depth": 16,
+    "max_replication_operations_per_entry": 256,
+    "max_replication_log_page_entries": 65536,
+    "max_watch_backlog_entries": 64,
+    "max_restore_page_records": 1024,
+    "max_restore_page_payload_bytes": 4194304,
+    "max_restore_examined_rows": 4096,
+    "max_restore_sqlite_work_millis": 1000
+  },
+  "provisional_test_thresholds": {
+    "acknowledged_write_loss": 0,
+    "stale_owner_mutation_successes": 0,
+    "conflicting_committed_entries": 0,
+    "watch_gaps": 0,
+    "max_startup_millis": 30000,
+    "max_single_member_stop_service_continuity_millis": 30000,
+    "max_restart_catchup_millis": 120000,
+    "max_leader_failover_millis": 30000,
+    "max_leader_restart_catchup_millis": 120000,
+    "minimum_soak_seconds": 86400
+  },
+  "evidence": {
+    "schedule_schema": "session-ha-schedule.schema.json",
+    "history_schema": "session-ha-history.schema.json",
+    "evidence_schema": "session-ha-evidence.schema.json",
+    "independent_checker": "scripts/check-session-ha-history.py",
+    "required_topologies": [3, 5],
+    "required_transport_modes": ["mtls"],
+    "foundation_transport_mode": "loopback-plaintext-test-only",
+    "foundation_counts_for_tls_rotation": false,
+    "foundation_payload_protection": "fixed-memory-provider-synthetic-wrapper-only",
+    "foundation_counts_for_production_encryption": false,
+    "unresolved_dependencies": [143, 158, 163, 164]
+  }
+}

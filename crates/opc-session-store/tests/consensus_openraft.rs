@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+    DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
@@ -34,8 +35,16 @@ use tempfile::TempDir;
 
 const MEMBER_COUNT: usize = 3;
 const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
-const CLUSTER_START_TIMEOUT: Duration = Duration::from_secs(12);
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+// Allow one complete resampled election after a split vote, followed by one
+// complete profiled operation. These test-evidence ceilings follow the shared
+// timing authority instead of assuming the former short election window.
+const RECOVERY_TIMEOUT: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .election_timeout_max_millis
+        .saturating_mul(2)
+        .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
+);
+const CLUSTER_START_TIMEOUT: Duration = RECOVERY_TIMEOUT;
 const SNAPSHOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const SNAPSHOT_CATCH_UP_COMMANDS: usize = 4_300;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);

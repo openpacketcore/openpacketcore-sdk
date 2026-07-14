@@ -133,7 +133,7 @@ def main() -> int:
         if packages.get(name, {}).get("publish") != []:
             errors.append(f"{name}: must remain publish=false while the Openraft fork is pinned")
 
-    profile_path = Path("crates/opc-session-testkit/qualification/v1/session-ha-profile.json")
+    profile_path = Path("crates/opc-session-testkit/qualification/v2/session-ha-profile.json")
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     source_gate = profile.get("source_build_gate", {})
     if set(source_gate.get("affected_workspace_crates", [])) != SOURCE_BUILD_ONLY:

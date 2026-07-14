@@ -119,6 +119,20 @@ the receiver uses the lesser of that remainder and its local cap. A route or
 receiver never starts a fresh full operation timeout. Each shared transport
 call also has its transport-owned complete deadline within that operation.
 
+The production transport profile is fixed, not operator-tunable:
+
+- AppendEntries and Openraft read-index confirmation: 2 seconds;
+- Vote: 5 seconds;
+- InstallSnapshot, forwarded mutation, and consumer ReadBarrier: 10 seconds;
+- election timeout: freshly sampled from `[5 seconds, 8 seconds)`; and
+- server frame-idle and handler ceilings: 30 seconds.
+
+For an initial or replacement connection, DNS, TCP, mTLS, identity admission,
+and bootstrap have a 1.5-second sub-bound inside the already-running family
+deadline. It is never an additional allowance. A healthy directed peer reuses
+one single-in-flight authenticated connection only after a complete correlated
+successful response; failure or uncertain stream position forces reconnect.
+
 Use only `probe_durable_readiness` for traffic admission. The probe exercises
 Openraft's linearizable path and current admitted membership. These are not
 readiness evidence:

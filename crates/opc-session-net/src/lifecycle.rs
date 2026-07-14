@@ -542,6 +542,7 @@ impl ConnectionLifecycle {
         self.evidence.material_epoch
     }
 
+    #[cfg(feature = "legacy-session-net-compat")]
     pub(crate) const fn rotation_was_observed(&self) -> bool {
         self.rotation_retire_at.is_some()
     }

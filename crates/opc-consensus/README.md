@@ -22,6 +22,13 @@ through `opc_consensus::engine`, allowing every production consensus consumer
 to share one exact engine version while keeping Openraft details out of
 domain-facing wire and storage APIs.
 
+`DURABLE_CONSENSUS_TIMING_PROFILE` is the sole timing authority for both
+durable domains: AppendEntries/Openraft read-index and heartbeat 2,000 ms,
+Vote 5,000 ms, elections `[5,000 ms, 8,000 ms)`, InstallSnapshot/forwarded
+mutation/consumer ReadBarrier and operation default 10,000 ms, and listener
+idle/handler ceilings 30,000 ms. The 1,500 ms DNS/TCP/mTLS/bootstrap cold cap is
+contained inside the selected family deadline, never added to it.
+
 ## Interim source-build gate
 
 Issue #143 remains open and the HA profile remains experimental. The workspace

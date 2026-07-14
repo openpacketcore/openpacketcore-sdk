@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use opc_consensus::{DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_CONSENSUS_TIMING_PROFILE};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_persist::{
@@ -38,6 +39,12 @@ use opc_tls::{
 use opc_types::{NetworkFunctionKind, TenantId};
 
 const SERVER_REPLICA: u16 = 2;
+const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .election_timeout_max_millis
+        .saturating_mul(2)
+        .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
+);
 
 struct TestPki {
     ca_cert: rcgen::Certificate,
@@ -195,6 +202,35 @@ fn deferred_resolver(
     })
 }
 
+fn delayed_profiled_resolver(
+    address: Arc<StdRwLock<Option<SocketAddr>>>,
+    delay_enabled: Arc<AtomicBool>,
+    delayed_completions: Arc<AtomicUsize>,
+) -> RemoteAddrResolver {
+    Arc::new(move || {
+        let address = Arc::clone(&address);
+        let delay_enabled = Arc::clone(&delay_enabled);
+        let delayed_completions = Arc::clone(&delayed_completions);
+        Box::pin(async move {
+            if delay_enabled.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                delayed_completions.fetch_add(1, Ordering::AcqRel);
+            }
+            address
+                .read()
+                .map_err(|_| std::io::Error::other("consensus address lock poisoned"))?
+                .as_ref()
+                .copied()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "consensus server is not listening",
+                    )
+                })
+        })
+    })
+}
+
 fn restore_key(label: &'static [u8]) -> SessionKey {
     SessionKey {
         tenant: TenantId::from_static("mtls-restore-tenant"),
@@ -229,7 +265,7 @@ async fn wait_for_ready_nodes(
     failure_message: &'static str,
     transport_stats: &BTreeMap<(usize, usize), Arc<TransportStats>>,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     let mut attempts = 0_usize;
     loop {
         attempts += 1;
@@ -336,7 +372,10 @@ async fn wait_for_observed_leader(
         .iter()
         .map(|(path, value)| (*path, value.count("append_entries:ok")))
         .collect::<BTreeMap<_, _>>();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    // A fresh observation may begin immediately after the prior heartbeat;
+    // keep it within one complete profiled operation rather than the former
+    // short-heartbeat assumption.
+    let deadline = tokio::time::Instant::now() + DURABLE_CONSENSUS_OPERATION_TIMEOUT;
     loop {
         for source in 0..members {
             let observed_all_targets =
@@ -377,6 +416,25 @@ impl SessionConsensusRpcHandler for EchoHandler {
         request: SessionConsensusWireRequest,
     ) -> SessionConsensusWireResponse {
         tokio::time::sleep(self.delay).await;
+        SessionConsensusWireResponse {
+            result: Ok(request.payload),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CountingEchoHandler {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for CountingEchoHandler {
+    async fn handle(
+        &self,
+        _authenticated_sender: opc_session_store::SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         SessionConsensusWireResponse {
             result: Ok(request.payload),
         }
@@ -452,30 +510,49 @@ fn request(
     sender: u16,
     payload: Vec<u8>,
 ) -> SessionConsensusWireRequest {
+    request_for_family(manifest, sender, SessionConsensusRpcFamily::Vote, payload)
+}
+
+fn request_for_family(
+    manifest: &Arc<SessionReplicationManifest>,
+    sender: u16,
+    family: SessionConsensusRpcFamily,
+    payload: Vec<u8>,
+) -> SessionConsensusWireRequest {
     let binding = manifest
         .bind_local(replica_id(sender))
         .expect("sender binding");
     SessionConsensusWireRequest::try_new(
         binding.consensus_identity(),
         binding.local_consensus_node_id(),
-        SessionConsensusRpcFamily::Vote,
+        family,
         payload,
     )
     .expect("bounded request")
 }
 
 #[tokio::test]
-async fn authenticated_consensus_call_uses_stable_manifest_node_ids() {
+async fn authenticated_consensus_calls_reuse_one_manifest_bound_connection() {
     let pki = TestPki::new();
     let manifest = manifest("cluster-a", 7, 1);
     let (handle, addr) = start_server(&pki, &manifest, Duration::ZERO).await;
-    let peer = peer(
-        &manifest,
-        1,
-        SERVER_REPLICA,
-        addr,
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("local binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
         pki.client_config(1),
-        Duration::from_secs(1),
+        Some(Duration::from_secs(1)),
     );
     let port: Arc<dyn SessionConsensusPeer> = Arc::new(peer.clone());
 
@@ -485,15 +562,573 @@ async fn authenticated_consensus_call_uses_stable_manifest_node_ids() {
         .local_consensus_node_id();
     assert_eq!(port.node_id(), expected_server_node);
     assert_ne!(port.node_id().get(), 0);
+    for payload in [b"bounded-vote-one".as_slice(), b"bounded-vote-two"] {
+        assert_eq!(
+            port.call(request(&manifest, 1, payload.to_vec())).await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(payload.to_vec()),
+            })
+        );
+    }
     assert_eq!(
-        port.call(request(&manifest, 1, b"bounded-vote".to_vec()))
-            .await,
-        Ok(SessionConsensusWireResponse {
-            result: Ok(b"bounded-vote".to_vec()),
-        })
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "the second validated RPC must reuse the sole resolver/TCP/mTLS/bootstrap path"
     );
 
     handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn profiled_cold_connection_is_a_contained_fifteen_hundred_millisecond_bound() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-profiled-cold-bound", 8, 1);
+    let handler = Arc::new(CountingEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("profiled cold-bound listener");
+
+    let delayed_resolver = |delay: Duration| -> RemoteAddrResolver {
+        Arc::new(move || {
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(addr)
+            })
+        })
+    };
+    let remote_binding = || {
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding")
+    };
+    let within_bound = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+        remote_binding(),
+        delayed_resolver(Duration::from_millis(500)),
+        pki.client_config(1),
+    );
+    let payload = b"within-cold-bound".to_vec();
+    assert_eq!(
+        within_bound
+            .call(request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::AppendEntries,
+                payload.clone(),
+            ))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(payload),
+        })
+    );
+
+    let beyond_bound = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+        remote_binding(),
+        delayed_resolver(Duration::from_millis(1_600)),
+        pki.client_config(1),
+    );
+    assert_eq!(
+        beyond_bound
+            .call(request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::AppendEntries,
+                b"must-not-dispatch".to_vec(),
+            ))
+            .await,
+        Err(SessionConsensusPeerError::Timeout)
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        1,
+        "work beyond the cold sub-bound must fail before handler dispatch"
+    );
+
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn profiled_long_rpc_families_are_not_truncated_by_the_append_deadline() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-profiled-family-deadlines", 9, 1);
+    let (server, addr) = start_server(&pki, &manifest, Duration::from_millis(2_100)).await;
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+    );
+
+    assert_eq!(
+        peer.call(request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"append-times-out".to_vec(),
+        ))
+        .await,
+        Err(SessionConsensusPeerError::Timeout)
+    );
+    for family in [
+        SessionConsensusRpcFamily::Vote,
+        SessionConsensusRpcFamily::InstallSnapshot,
+        SessionConsensusRpcFamily::ForwardMutation,
+        SessionConsensusRpcFamily::ReadBarrier,
+    ] {
+        let payload = family.as_str().as_bytes().to_vec();
+        assert_eq!(
+            peer.call(request_for_family(&manifest, 1, family, payload.clone(),))
+                .await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(payload),
+            }),
+            "{family:?} must retain its family deadline above two seconds"
+        );
+    }
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "the timed-out AppendEntries socket is replaced once and longer families reuse it"
+    );
+
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn consensus_reauthentication_and_material_epochs_each_replace_the_cached_connection_once() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-cached-rotation", 8, 1);
+    let (handle, addr) = start_server(&pki, &manifest, Duration::ZERO).await;
+    let (client_tx, client_rx) = tokio::sync::watch::channel(Some(pki.identity_state(1)));
+    let client_config = TlsConfigBuilder::new(client_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("rotating consensus client config");
+    let reauthentication = SessionReauthenticationControl::new();
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("server binding"),
+        counted_resolver,
+        client_config.clone(),
+        Some(Duration::from_secs(2)),
+    )
+    .with_reauthentication_control(reauthentication.clone());
+
+    for payload in [b"initial".as_slice(), b"initial-reuse"] {
+        assert_eq!(
+            peer.call(request(&manifest, 1, payload.to_vec())).await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(payload.to_vec()),
+            })
+        );
+    }
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+
+    reauthentication
+        .request_reauthentication()
+        .expect("request explicit consensus reauthentication");
+    for payload in [b"after-explicit".as_slice(), b"explicit-reuse"] {
+        assert_eq!(
+            peer.call(request(&manifest, 1, payload.to_vec())).await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(payload.to_vec()),
+            })
+        );
+    }
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "one explicit generation change must create exactly one replacement"
+    );
+
+    let previous_epoch = client_config.material_status().epoch();
+    client_tx.send_replace(Some(pki.identity_state(1)));
+    wait_for_material_epoch_change(|| client_config.material_status(), previous_epoch).await;
+    for payload in [b"after-material".as_slice(), b"material-reuse"] {
+        assert_eq!(
+            peer.call(request(&manifest, 1, payload.to_vec())).await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(payload.to_vec()),
+            })
+        );
+    }
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        3,
+        "one admitted material epoch change must create exactly one replacement"
+    );
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn cancelled_consensus_rpc_drops_its_taken_connection_before_the_next_call() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-cancelled-call", 9, 1);
+    let handler = Arc::new(LifecycleEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("consensus cancellation listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(2)),
+    );
+
+    let cancelled = tokio::spawn({
+        let peer = peer.clone();
+        let request = request(&manifest, 1, b"cancelled".to_vec());
+        async move { peer.call(request).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), handler.first_started.notified())
+        .await
+        .expect("cancelled call entered the handler");
+    cancelled.abort();
+    assert!(cancelled
+        .await
+        .expect_err("cancelled task join")
+        .is_cancelled());
+
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"after-cancel".to_vec()))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"after-cancel".to_vec()),
+        })
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "a cancelled in-flight RPC must not return its ambiguous socket to the slot"
+    );
+    handler.first_release.notify_one();
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn timed_out_consensus_rpc_drops_its_connection_before_the_next_call() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-timeout-call", 10, 1);
+    let handler = Arc::new(LifecycleEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("consensus timeout listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_millis(500)),
+    );
+
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"times-out".to_vec()))
+            .await,
+        Err(SessionConsensusPeerError::Timeout)
+    );
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"after-timeout".to_vec()))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"after-timeout".to_vec()),
+        })
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "a timed-out response cannot leave a reusable stream with an unknown frame position"
+    );
+    handler.first_release.notify_one();
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn typed_inner_consensus_timeout_is_returned_but_its_connection_is_not_reused() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-inner-timeout", 10, 1);
+    let handler = Arc::new(LifecycleEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .with_rpc_timeout(Duration::from_millis(25))
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("consensus inner-timeout listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(1)),
+    );
+
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"inner-timeout".to_vec()))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Err(SessionConsensusPeerError::Timeout),
+        })
+    );
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"after-inner-timeout".to_vec()))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"after-inner-timeout".to_vec()),
+        })
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "a fully decoded inner timeout still forces one fresh authenticated connection"
+    );
+    handler.first_release.notify_one();
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn cached_dead_consensus_socket_is_evicted_before_a_fresh_reconnect() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-cached-dead-socket", 11, 1);
+    let server_binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) = SessionConsensusServer::new(
+        Arc::new(EchoHandler {
+            delay: Duration::ZERO,
+        }),
+        pki.server_config(SERVER_REPLICA),
+        server_binding,
+    )
+    .listen("127.0.0.1:0".parse().expect("listen address"))
+    .await
+    .expect("initial consensus listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(1)),
+    );
+
+    assert!(peer
+        .call(request(&manifest, 1, b"cache-before-restart".to_vec()))
+        .await
+        .is_ok());
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+    server.abort_and_wait().await;
+
+    let replacement_binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("replacement server binding");
+    let (replacement, replacement_addr) = SessionConsensusServer::new(
+        Arc::new(EchoHandler {
+            delay: Duration::ZERO,
+        }),
+        pki.server_config(SERVER_REPLICA),
+        replacement_binding,
+    )
+    .listen(addr)
+    .await
+    .expect("replacement consensus listener");
+    assert_eq!(replacement_addr, addr);
+
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"stale-socket".to_vec()))
+            .await,
+        Err(SessionConsensusPeerError::Unavailable),
+        "the first post-restart call discovers the cached socket's EOF without replay"
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "discovering EOF on the cached socket must not hide an in-call replay"
+    );
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"fresh-after-restart".to_vec()))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"fresh-after-restart".to_vec()),
+        })
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "the next Openraft retry must perform one fresh resolver/TCP/mTLS/bootstrap path"
+    );
+
+    replacement.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn cached_consensus_connection_retires_at_the_finite_soft_lifecycle_bound() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-cached-lifetime", 12, 1);
+    let client_policy = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+        Duration::ZERO,
+    )
+    .expect("client lifecycle policy");
+    let server_policy = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(120),
+        Duration::from_secs(2),
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+        Duration::ZERO,
+    )
+    .expect("server lifecycle policy");
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) = SessionConsensusServer::new(
+        Arc::new(EchoHandler {
+            delay: Duration::ZERO,
+        }),
+        pki.server_config(SERVER_REPLICA),
+        binding,
+    )
+    .with_connection_lifecycle(server_policy)
+    .listen("127.0.0.1:0".parse().expect("listen address"))
+    .await
+    .expect("consensus lifecycle listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(2)),
+    )
+    .with_connection_lifecycle(client_policy);
+
+    assert!(peer
+        .call(request(&manifest, 1, b"before-soft-bound".to_vec()))
+        .await
+        .is_ok());
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(21)).await;
+    tokio::time::resume();
+    assert!(peer
+        .call(request(&manifest, 1, b"after-soft-bound".to_vec()))
+        .await
+        .is_ok());
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "soft retirement must evict the cached connection before dispatch"
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::resume();
+    assert!(peer
+        .call(request(&manifest, 1, b"after-old-hard-bound".to_vec()))
+        .await
+        .is_ok());
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "the replacement remains the only cached connection after the original hard bound"
+    );
+
+    server.abort_and_wait().await;
 }
 
 #[tokio::test]
@@ -612,13 +1247,15 @@ async fn consensus_inflight_rpc_drains_and_reauthenticates_on_renewed_material()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
+    const REPLICAS: [u16; 3] = [1, 2, 3];
+
     let pki = TestPki::new();
     let manifest = manifest("config-openraft-mtls", 9, 1);
     let directory = tempfile::tempdir().expect("config cluster directory");
     let addresses = (0..3)
         .map(|_| Arc::new(StdRwLock::new(None)))
         .collect::<Vec<_>>();
-    let node_ids = [1_u16, 2, 3].map(|replica| {
+    let node_ids = REPLICAS.map(|replica| {
         manifest
             .bind_local(replica_id(replica))
             .expect("local manifest binding")
@@ -629,14 +1266,24 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
         .bind_local(replica_id(1))
         .expect("identity binding")
         .consensus_identity();
+    let mut path_delay_enabled = BTreeMap::new();
+    let mut path_delayed_completions = BTreeMap::new();
+    for source in 0..REPLICAS.len() {
+        for target in 0..REPLICAS.len() {
+            if source != target {
+                path_delay_enabled.insert((source, target), Arc::new(AtomicBool::new(false)));
+                path_delayed_completions.insert((source, target), Arc::new(AtomicUsize::new(0)));
+            }
+        }
+    }
 
     let mut stores = Vec::new();
-    for (source, source_replica) in [1_u16, 2, 3].into_iter().enumerate() {
+    for (source, source_replica) in REPLICAS.into_iter().enumerate() {
         let local = manifest
             .bind_local(replica_id(source_replica))
             .expect("source binding");
         let mut peers: BTreeMap<_, Arc<dyn SessionConsensusPeer>> = BTreeMap::new();
-        for (target, target_replica) in [1_u16, 2, 3].into_iter().enumerate() {
+        for (target, target_replica) in REPLICAS.into_iter().enumerate() {
             if source == target {
                 continue;
             }
@@ -644,14 +1291,22 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
                 .clone()
                 .bind_remote(replica_id(target_replica))
                 .expect("remote binding");
-            let peer = RemoteSessionConsensusPeer::new_with_resolver(
+            let peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
                 binding,
-                deferred_resolver(
+                delayed_profiled_resolver(
                     Arc::clone(&addresses[target]),
-                    Arc::new(AtomicBool::new(true)),
+                    Arc::clone(
+                        path_delay_enabled
+                            .get(&(source, target))
+                            .expect("directed delay control"),
+                    ),
+                    Arc::clone(
+                        path_delayed_completions
+                            .get(&(source, target))
+                            .expect("directed delayed completion count"),
+                    ),
                 ),
                 pki.client_config(source_replica),
-                Some(Duration::from_secs(3)),
             );
             peers.insert(node_ids[target], Arc::new(peer));
         }
@@ -670,7 +1325,7 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
                 backend,
                 directory.path().join(format!("snapshots-{source}")),
                 peers,
-                Duration::from_secs(8),
+                DURABLE_CONSENSUS_OPERATION_TIMEOUT,
             )
             .await
             .expect("config store"),
@@ -678,7 +1333,7 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
     }
 
     let mut servers = Vec::new();
-    for (index, replica) in [1_u16, 2, 3].into_iter().enumerate() {
+    for (index, replica) in REPLICAS.into_iter().enumerate() {
         let binding = manifest
             .bind_local(replica_id(replica))
             .expect("server binding");
@@ -691,7 +1346,7 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
         .await
         .expect("config consensus listener");
         *addresses[index].write().expect("consensus address lock") = Some(actual);
-        servers.push(handle);
+        servers.push(Some(handle));
     }
 
     let (one, two, three) = tokio::join!(
@@ -764,12 +1419,173 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter() {
     .await
     .expect("committed config command applied on every mTLS peer");
 
+    let stable_statuses = tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+        loop {
+            let statuses = stores
+                .iter()
+                .map(ConsensusConfigStore::status)
+                .collect::<Vec<_>>();
+            let applied = statuses[0].applied_index;
+            if applied.is_some()
+                && statuses
+                    .iter()
+                    .all(|status| status.applied_index == applied)
+            {
+                break statuses;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("all mTLS peers converge before follower listener restart");
+    let original_term = stable_statuses[0].term;
+    assert!(original_term > 0, "formed cluster must have a nonzero term");
+    assert!(stable_statuses
+        .iter()
+        .all(|status| status.term == original_term && status.leader_id == Some(leader)));
+    let leader_index = stable_statuses
+        .iter()
+        .position(|status| status.node_id == leader)
+        .expect("leader index");
+    let follower_index = stable_statuses
+        .iter()
+        .position(|status| status.node_id != leader)
+        .expect("restart follower index");
+    let follower_applied_before_restart = stable_statuses[follower_index]
+        .applied_index
+        .expect("follower applied index before restart");
+
+    // Bind the replacement first so listener restart has no bind race. The
+    // address remains unpublished while the old listener is stopped and a
+    // quorum command commits without this follower.
+    let replacement_listener = tokio::net::TcpListener::bind(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("replacement bind address"),
+    )
+    .await
+    .expect("pre-bind replacement follower listener");
+    let replacement_addr = replacement_listener
+        .local_addr()
+        .expect("replacement listener address");
+    servers[follower_index]
+        .take()
+        .expect("running follower listener")
+        .abort_and_wait()
+        .await;
+    *addresses[follower_index]
+        .write()
+        .expect("consensus address lock") = None;
+
+    let down_follower_error = tokio::time::timeout(
+        DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+        stores[leader_index].mark_confirmed_idempotent(
+            ConfigConsensusRequestId::from_bytes([0xBD; 16]),
+            opc_types::TxId::new(),
+        ),
+    )
+    .await
+    .expect("quorum command must finish while one follower listener is down")
+    .expect_err("committed missing target returns deterministic domain error");
+    assert!(matches!(
+        down_follower_error.kind(),
+        PersistErrorKind::RollbackNotFound
+    ));
+    let catchup_index = tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+        loop {
+            let leader_applied = stores[leader_index].status().applied_index;
+            let follower_applied = stores[follower_index].status().applied_index;
+            if let Some(index) = leader_applied.filter(|index| {
+                *index > follower_applied_before_restart
+                    && follower_applied.is_some_and(|follower| follower < *index)
+            }) {
+                break index;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("stopped follower remains behind the newly committed index");
+
+    let restarted_path = (leader_index, follower_index);
+    path_delay_enabled
+        .get(&restarted_path)
+        .expect("leader-to-restarted-follower delay control")
+        .store(true, Ordering::Release);
+    let restarted_replica = REPLICAS[follower_index];
+    let (replacement_server, actual_replacement_addr) = SessionConsensusServer::new(
+        stores[follower_index].rpc_handler(),
+        pki.server_config(restarted_replica),
+        manifest
+            .bind_local(replica_id(restarted_replica))
+            .expect("replacement follower binding"),
+    )
+    .listen_on(replacement_listener)
+    .await
+    .expect("restart follower listener");
+    assert_eq!(actual_replacement_addr, replacement_addr);
+    servers[follower_index] = Some(replacement_server);
+    *addresses[follower_index]
+        .write()
+        .expect("consensus address lock") = Some(actual_replacement_addr);
+
+    // No raw peer preflight is allowed here. Openraft must evict the dead
+    // cached socket, resolve after the injected 500 ms cold delay, and repair
+    // the follower through its normal replication stream under the same
+    // leader and term.
+    tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+        loop {
+            let statuses = stores
+                .iter()
+                .map(ConsensusConfigStore::status)
+                .collect::<Vec<_>>();
+            if path_delayed_completions
+                .get(&restarted_path)
+                .expect("leader-to-follower delayed completion count")
+                .load(Ordering::Acquire)
+                > 0
+                && statuses[follower_index]
+                    .applied_index
+                    .is_some_and(|index| index >= catchup_index)
+                && statuses
+                    .iter()
+                    .all(|status| status.term == original_term && status.leader_id == Some(leader))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        stores[follower_index]
+            .probe_durable_readiness()
+            .await
+            .expect("restarted follower durable readiness");
+        assert!(stores[follower_index]
+            .load_latest()
+            .await
+            .expect("restarted follower linearizable read")
+            .is_none());
+    })
+    .await
+    .expect("restarted follower catches up and becomes ready within ten seconds");
+
+    let final_statuses = stores
+        .iter()
+        .map(ConsensusConfigStore::status)
+        .collect::<Vec<_>>();
+    assert!(final_statuses.iter().all(|status| {
+        status.term == original_term
+            && status.leader_id == Some(leader)
+            && status
+                .applied_index
+                .is_some_and(|index| index >= catchup_index)
+    }));
+
     let _ = tokio::join!(
         stores[0].shutdown(),
         stores[1].shutdown(),
         stores[2].shutdown(),
     );
-    for server in servers {
+    for server in servers.into_iter().flatten() {
         server.abort_and_wait().await;
     }
 }

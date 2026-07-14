@@ -122,8 +122,10 @@ gates.
 The current exact pin is the immutable `openpacketcore/openraft` revision
 `f607e636406b16bd0ad7925dbb631da1b7a4cd96`, not registry 0.9.24. Both domains
 consume one fixed runtime profile from `opc-consensus`, including fresh
-per-campaign 1,000–2,000 ms election-timeout sampling. This temporary git
-source makes the mechanically derived 26-crate normal reverse-dependency
+per-campaign `[5,000 ms, 8,000 ms)` election-timeout sampling, a 2,000 ms
+heartbeat/AppendEntries ceiling, and the shared 10,000 ms operation default.
+This temporary git source makes the mechanically derived 26-crate normal
+reverse-dependency
 closure source-build-only and `publish = false`. Keep that boundary until an
 official stable Openraft release contains the fix, an exact registry
 pin/checksum replaces it, and #143 is requalified. This restriction does not
@@ -736,20 +738,28 @@ sequencing. Legacy `opc-session-net/5` direct-backend networking is a
 non-default compatibility feature and must not share the production consensus
 listener.
 
-Every connection performs a fresh mutual-TLS handshake. Before an Openraft RPC
-is dispatched, both sides bind the canonical certificate SPIFFE URI, logical
-`ReplicaId`, derived stable node ID, expected opposite peer, cluster ID,
+Each directed peer keeps at most one authenticated, single-in-flight
+connection. Every initial or replacement connection performs a fresh
+mutual-TLS handshake. Before an Openraft RPC is dispatched, both sides bind the
+canonical certificate SPIFFE URI, logical `ReplicaId`, derived stable node ID,
+expected opposite peer, cluster ID,
 configuration digest, configuration epoch, consensus role, exact transport
 profile, and a fresh challenge. The authenticated sender in the outer request
 must also match the sender encoded in the bounded Openraft payload. DNS, FQDN,
 short hostname, IP, and resolver aliases select only the dial route. They never
 select self, a vote, or a certificate identity.
 
-Each call has one absolute deadline covering admission, resolution, connect,
-TLS, handshake, bounded encoding, write, and response read. Authentication or
-identity mismatch fails before engine dispatch. The outer consensus frame is
-bounded for the shared compact Openraft payload; transport code does not decode
-commands or make consensus decisions.
+Each call's absolute family deadline begins before admission/gate acquisition
+and covers bounded encoding, write, and response read. When a connection is
+needed, resolution, TCP, mTLS, identity admission, and bootstrap receive at
+most 1,500 ms inside that family deadline; they do not add time. AppendEntries
+and Openraft read-index use 2,000 ms, Vote 5,000 ms, and
+InstallSnapshot/ForwardMutation/consumer ReadBarrier 10,000 ms. Only a complete,
+correlated, validated success is cached; every uncertain stream position or
+typed failure evicts it. Authentication or identity mismatch fails before
+engine dispatch. The outer consensus frame is bounded for the shared compact
+Openraft payload; transport code does not decode commands or make consensus
+decisions.
 
 #161 atomic identity/trust reload, #162 bounded material epochs, and #163 finite
 peer reauthentication are implemented. Clients and listeners retain exact

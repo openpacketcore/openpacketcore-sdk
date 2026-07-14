@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
+use opc_consensus::{ConsensusRpcFamily, DURABLE_CONSENSUS_TIMING_PROFILE};
 use opc_redaction::metrics::METRICS;
 use opc_session_store::{
     ReplicaId, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
@@ -40,9 +41,32 @@ use crate::protocol::{
     SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION,
 };
 
-const DEFAULT_CONSENSUS_DEADLINE: Duration = Duration::from_secs(2);
-const DEFAULT_CONSENSUS_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_CONSENSUS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONSENSUS_IDLE_TIMEOUT: Duration =
+    DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout();
+const DEFAULT_CONSENSUS_RPC_TIMEOUT: Duration =
+    DURABLE_CONSENSUS_TIMING_PROFILE.server_handler_timeout();
+
+#[derive(Clone, Copy, Debug)]
+enum ConsensusDeadlinePolicy {
+    Profiled,
+    Fixed(Duration),
+}
+
+impl ConsensusDeadlinePolicy {
+    const fn from_override(deadline: Option<Duration>) -> Self {
+        match deadline {
+            Some(deadline) => Self::Fixed(deadline),
+            None => Self::Profiled,
+        }
+    }
+
+    const fn for_family(self, family: ConsensusRpcFamily) -> Duration {
+        match self {
+            Self::Profiled => DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(family),
+            Self::Fixed(deadline) => deadline,
+        }
+    }
+}
 
 /// Resolver callback used by [`RemoteSessionConsensusPeer::new_with_resolver`]
 /// and, when explicitly enabled, the legacy remote-backend compatibility
@@ -239,9 +263,9 @@ pub struct RemoteSessionConsensusPeer {
     target: ConsensusTarget,
     tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     binding: RemoteReplicaBinding,
-    deadline: Duration,
+    deadline_policy: ConsensusDeadlinePolicy,
     max_frame_size: usize,
-    call_gate: Arc<Mutex<()>>,
+    call_gate: Arc<Mutex<Option<ConsensusConnection>>>,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
 }
@@ -251,7 +275,7 @@ impl fmt::Debug for RemoteSessionConsensusPeer {
         f.debug_struct("RemoteSessionConsensusPeer")
             .field("target", &self.target)
             .field("authenticated", &self.tls_config.is_some())
-            .field("deadline", &self.deadline)
+            .field("deadline_policy", &self.deadline_policy)
             .field("max_frame_size", &self.max_frame_size)
             .finish_non_exhaustive()
     }
@@ -259,6 +283,11 @@ impl fmt::Debug for RemoteSessionConsensusPeer {
 
 impl RemoteSessionConsensusPeer {
     /// Construct a mutually authenticated consensus-only peer.
+    ///
+    /// `None` selects the fixed family-specific durable timing profile.
+    /// `Some` retains the source-compatible uniform complete-call override for
+    /// tests and controlled compatibility only; it cannot enlarge the shared
+    /// cold-connection sub-bound and is not the production profile.
     pub fn new(
         binding: RemoteReplicaBinding,
         tls_config: opc_tls::AuthenticatedClientConfig,
@@ -268,7 +297,19 @@ impl RemoteSessionConsensusPeer {
         Self::from_transport(target, Some(tls_config), binding, deadline)
     }
 
+    /// Construct a production-profiled mutually authenticated peer.
+    pub fn new_profiled(
+        binding: RemoteReplicaBinding,
+        tls_config: opc_tls::AuthenticatedClientConfig,
+    ) -> Self {
+        Self::new(binding, tls_config, None)
+    }
+
     /// Construct a mutually authenticated peer with a reconnect-time resolver.
+    ///
+    /// `None` selects the fixed family-specific durable timing profile.
+    /// `Some` is a non-qualifying uniform complete-call test/compatibility
+    /// override and cannot enlarge the shared cold-connection sub-bound.
     pub fn new_with_resolver(
         binding: RemoteReplicaBinding,
         resolve: RemoteAddrResolver,
@@ -277,6 +318,15 @@ impl RemoteSessionConsensusPeer {
     ) -> Self {
         let target = ConsensusTarget::resolved(&binding, resolve);
         Self::from_transport(target, Some(tls_config), binding, deadline)
+    }
+
+    /// Construct a production-profiled peer with reconnect-time resolution.
+    pub fn new_profiled_with_resolver(
+        binding: RemoteReplicaBinding,
+        resolve: RemoteAddrResolver,
+        tls_config: opc_tls::AuthenticatedClientConfig,
+    ) -> Self {
+        Self::new_with_resolver(binding, resolve, tls_config, None)
     }
 
     /// Construct a plaintext consensus peer for transport tests.
@@ -299,11 +349,11 @@ impl RemoteSessionConsensusPeer {
             target,
             tls_config,
             binding,
-            deadline: deadline.unwrap_or(DEFAULT_CONSENSUS_DEADLINE),
+            deadline_policy: ConsensusDeadlinePolicy::from_override(deadline),
             // The bounded inner consensus payload needs the maximum profile
             // frame in its worst-case JSON byte-array expansion.
             max_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
-            call_gate: Arc::new(Mutex::new(())),
+            call_gate: Arc::new(Mutex::new(None)),
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
             reauthentication: SessionReauthenticationControl::new(),
         }
@@ -313,6 +363,9 @@ impl RemoteSessionConsensusPeer {
     #[must_use]
     pub fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
         self.max_frame_size = max_frame_size;
+        // A clone-local wire budget cannot reuse a connection negotiated by a
+        // differently configured clone.
+        self.call_gate = Arc::new(Mutex::new(None));
         self
     }
 
@@ -320,6 +373,7 @@ impl RemoteSessionConsensusPeer {
     #[must_use]
     pub fn with_connection_lifecycle(mut self, policy: ConnectionLifecyclePolicy) -> Self {
         self.lifecycle_policy = policy;
+        self.call_gate = Arc::new(Mutex::new(None));
         self
     }
 
@@ -330,6 +384,7 @@ impl RemoteSessionConsensusPeer {
         control: SessionReauthenticationControl,
     ) -> Self {
         self.reauthentication = control;
+        self.call_gate = Arc::new(Mutex::new(None));
         self
     }
 
@@ -340,6 +395,7 @@ impl RemoteSessionConsensusPeer {
 
     async fn call_once(
         &self,
+        connection_slot: &mut Option<ConsensusConnection>,
         request: SessionConsensusWireRequest,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
@@ -355,15 +411,43 @@ impl RemoteSessionConsensusPeer {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
 
+        // The sole connection is owned by this call until a complete response
+        // has passed every correlation and payload validation check. If this
+        // future is cancelled after any request bytes may have been written,
+        // the taken socket is dropped rather than exposing a late response to
+        // the next Openraft RPC.
+        if let Some(mut connection) = connection_slot.take() {
+            if self.connection_is_current(&mut connection, tokio::time::Instant::now()) {
+                let result = self
+                    .call_negotiated(&mut connection, request, deadline)
+                    .await;
+                if result
+                    .as_ref()
+                    .is_ok_and(|response| response.result.is_ok())
+                    && self.connection_is_current(&mut connection, tokio::time::Instant::now())
+                {
+                    *connection_slot = Some(connection);
+                }
+                return result;
+            }
+            METRICS
+                .session_net_reconnect_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let connect_deadline = tokio::time::Instant::now()
+            .checked_add(DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout())
+            .ok_or(SessionConsensusPeerError::Protocol)?
+            .min(deadline);
         let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
         let mut connection = loop {
-            if tokio::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= connect_deadline {
                 return Err(SessionConsensusPeerError::Timeout);
             }
             METRICS
                 .session_net_connection_attempts
                 .fetch_add(1, Ordering::Relaxed);
-            let connection_result = async {
+            let connection_result = tokio::time::timeout_at(connect_deadline, async {
                 let admitted_generation = self.reauthentication.generation();
                 let connection = if let Some(tls_config) = &self.tls_config {
                     let outcome = tls_config
@@ -411,8 +495,9 @@ impl RemoteSessionConsensusPeer {
                                     tls_completed_at,
                                 );
                                 let (mut reader, mut writer) = tokio::io::split(tls_stream);
-                                let (response_frame_size, request_frame_size) =
-                                    self.bootstrap(&mut reader, &mut writer, deadline).await?;
+                                let (response_frame_size, request_frame_size) = self
+                                    .bootstrap(&mut reader, &mut writer, connect_deadline)
+                                    .await?;
                                 Ok::<_, SessionConsensusPeerError>((
                                     Box::new(reader) as Box<dyn AsyncRead + Unpin + Send>,
                                     Box::new(writer) as Box<dyn AsyncWrite + Unpin + Send>,
@@ -468,8 +553,9 @@ impl RemoteSessionConsensusPeer {
                         .map_err(|_| SessionConsensusPeerError::Unavailable)?;
                     let (mut reader, mut writer) = tokio::io::split(tcp);
                     let established_at = tokio::time::Instant::now();
-                    let (response_frame_size, request_frame_size) =
-                        self.bootstrap(&mut reader, &mut writer, deadline).await?;
+                    let (response_frame_size, request_frame_size) = self
+                        .bootstrap(&mut reader, &mut writer, connect_deadline)
+                        .await?;
                     ConsensusConnection {
                         reader: Box::new(reader),
                         writer: Box::new(writer),
@@ -487,8 +573,9 @@ impl RemoteSessionConsensusPeer {
                     }
                 };
                 Ok::<_, SessionConsensusPeerError>(connection)
-            }
-            .await;
+            })
+            .await
+            .unwrap_or(Err(SessionConsensusPeerError::Timeout));
             let mut connection = match connection_result {
                 Ok(connection) => {
                     METRICS
@@ -526,7 +613,10 @@ impl RemoteSessionConsensusPeer {
                         .session_net_reconnect_failures
                         .fetch_add(1, Ordering::Relaxed);
                     let now = tokio::time::Instant::now();
-                    let retry_at = now.checked_add(backoff).unwrap_or(deadline).min(deadline);
+                    let retry_at = now
+                        .checked_add(backoff)
+                        .unwrap_or(connect_deadline)
+                        .min(connect_deadline);
                     tokio::time::sleep_until(retry_at).await;
                     backoff = self.lifecycle_policy.next_backoff(backoff);
                     continue;
@@ -560,12 +650,54 @@ impl RemoteSessionConsensusPeer {
             METRICS
                 .session_net_reconnect_attempts
                 .fetch_add(1, Ordering::Relaxed);
-            let retry_at = now.checked_add(backoff).unwrap_or(deadline).min(deadline);
+            let retry_at = now
+                .checked_add(backoff)
+                .unwrap_or(connect_deadline)
+                .min(connect_deadline);
             tokio::time::sleep_until(retry_at).await;
             backoff = self.lifecycle_policy.next_backoff(backoff);
         };
-        self.call_negotiated(&mut connection, request, deadline)
-            .await
+        let result = self
+            .call_negotiated(&mut connection, request, deadline)
+            .await;
+        if result
+            .as_ref()
+            .is_ok_and(|response| response.result.is_ok())
+            && self.connection_is_current(&mut connection, tokio::time::Instant::now())
+        {
+            *connection_slot = Some(connection);
+        }
+        result
+    }
+
+    fn connection_is_current(
+        &self,
+        connection: &mut ConsensusConnection,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let current_generation = self.reauthentication.generation();
+        let current_material_epoch = self
+            .tls_config
+            .as_ref()
+            .map(|config| config.material_status().epoch());
+        connection.lifecycle.observe_rotation(
+            now,
+            current_generation,
+            current_material_epoch,
+            &directed_connection_key(
+                b"consensus",
+                self.binding.local_replica_id().as_str(),
+                self.binding.remote_replica_id().as_str(),
+            ),
+        );
+        let mismatch = connection
+            .lifecycle
+            .evidence_mismatch_reason(current_generation, current_material_epoch);
+        if let Some(reason) = mismatch {
+            connection.lifecycle.record_forced_retirement(reason);
+            return false;
+        }
+        connection.lifecycle.retirement(now).is_none()
     }
 
     async fn bootstrap<R, W>(
@@ -663,7 +795,7 @@ impl RemoteSessionConsensusPeer {
             .tls_config
             .as_ref()
             .map(opc_tls::AuthenticatedClientConfig::subscribe_material_changes);
-        loop {
+        let response = loop {
             let now = tokio::time::Instant::now();
             lifecycle.observe_rotation(
                 now,
@@ -689,13 +821,15 @@ impl RemoteSessionConsensusPeer {
                         let _ = lifecycle.retirement(now);
                         lifecycle.record_hard_overrun();
                     }
-                    return Err(SessionConsensusPeerError::Timeout);
+                    break Err(SessionConsensusPeerError::Timeout);
                 }
-                response = &mut call => return response,
+                response = &mut call => break response,
                 _ = reauthentication_rx.changed() => {}
                 _ = wait_consensus_material_change(&mut material_rx) => {}
             }
-        }
+        };
+        connection.lifecycle = lifecycle;
+        response
     }
 }
 
@@ -709,14 +843,15 @@ impl SessionConsensusPeer for RemoteSessionConsensusPeer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let call_timeout = self.deadline_policy.for_family(request.family);
         let deadline = tokio::time::Instant::now()
-            .checked_add(self.deadline)
+            .checked_add(call_timeout)
             .ok_or(SessionConsensusPeerError::Protocol)?;
         // The gate bounds concurrent connection/TLS/frame memory per peer. It
         // is acquired under the same logical call deadline.
         let call = async {
-            let _guard = self.call_gate.lock().await;
-            self.call_once(request, deadline).await
+            let mut guard = self.call_gate.lock().await;
+            self.call_once(&mut guard, request, deadline).await
         };
         tokio::time::timeout_at(deadline, call)
             .await
@@ -1742,6 +1877,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bad_or_incomplete_consensus_response_connection_is_never_reused() {
+        let (_server_binding, client_binding) = bindings();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind adversarial consensus listener");
+        let addr = listener.local_addr().expect("adversarial listener address");
+        let server_binding = client_binding.clone();
+        let server = tokio::spawn(async move {
+            for attempt in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("accept consensus client");
+                let hello: SessionConsensusBootstrapRequest =
+                    read_frame(&mut stream, MAX_HANDSHAKE_FRAME_SIZE)
+                        .await
+                        .expect("read consensus Hello");
+                let SessionConsensusBootstrapRequest::Hello(hello) = hello;
+                write_frame(
+                    &mut stream,
+                    &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                        transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+                        contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+                        identity: hello.identity,
+                        server_node_id: server_binding.remote_consensus_node_id(),
+                        accepted_sender_node_id: hello.sender_node_id,
+                        handshake_nonce: hello.handshake_nonce,
+                        accepted_response_frame_size: hello.requested_response_frame_size,
+                        server_request_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+                    }),
+                )
+                .await
+                .expect("write consensus acknowledgement");
+                let call: SessionConsensusTransportRequest =
+                    read_frame(&mut stream, MAX_NEGOTIATED_FRAME_SIZE)
+                        .await
+                        .expect("read consensus call");
+                let SessionConsensusTransportRequest::Call { call_id, request } = call;
+                if attempt == 1 {
+                    // EOF after a complete request leaves the response position
+                    // unknown and must make this stream permanently unusable.
+                    continue;
+                }
+                let response_call_id = if attempt == 0 {
+                    uuid::Uuid::new_v4()
+                } else {
+                    call_id
+                };
+                write_frame(
+                    &mut stream,
+                    &SessionConsensusTransportResponse::Call {
+                        call_id: response_call_id,
+                        response: SessionConsensusWireResponse {
+                            result: Ok(request.payload),
+                        },
+                    },
+                )
+                .await
+                .expect("write consensus response");
+            }
+        });
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let counted_resolver: RemoteAddrResolver = {
+            let resolutions = Arc::clone(&resolutions);
+            Arc::new(move || {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(addr) })
+            })
+        };
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, counted_resolver),
+            None,
+            client_binding.clone(),
+            Some(Duration::from_secs(1)),
+        );
+        let wire_request = |payload: &'static [u8]| {
+            SessionConsensusWireRequest::try_new(
+                client_binding.consensus_identity(),
+                client_binding.local_consensus_node_id(),
+                SessionConsensusRpcFamily::Vote,
+                payload.to_vec(),
+            )
+            .expect("bounded consensus request")
+        };
+
+        assert_eq!(
+            peer.call(wire_request(b"wrong-correlation")).await,
+            Err(SessionConsensusPeerError::Protocol)
+        );
+        assert_eq!(
+            peer.call(wire_request(b"incomplete-response")).await,
+            Err(SessionConsensusPeerError::Unavailable)
+        );
+        assert_eq!(
+            peer.call(wire_request(b"fresh-after-errors")).await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"fresh-after-errors".to_vec()),
+            })
+        );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            3,
+            "correlation failure and EOF must each force one fresh bootstrap"
+        );
+        server.await.expect("adversarial consensus server");
+    }
+
+    #[tokio::test]
     async fn consensus_bootstrap_rejects_the_previous_nested_error_set() {
         let (server_binding, client_binding) = bindings();
         let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
@@ -1893,5 +2133,43 @@ mod tests {
         )
         .expect("request");
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn clone_local_consensus_builders_detach_incompatible_connection_state() {
+        let (_server_binding, client_binding) = bindings();
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(
+                &client_binding,
+                Arc::new(|| {
+                    Box::pin(async {
+                        Err(io::Error::new(io::ErrorKind::NotFound, "test resolver"))
+                    })
+                }),
+            ),
+            None,
+            client_binding,
+            None,
+        );
+        let shared = peer.clone();
+        assert!(Arc::ptr_eq(&peer.call_gate, &shared.call_gate));
+
+        let different_frame = peer
+            .clone()
+            .with_max_frame_size(MIN_SESSION_CONSENSUS_FRAME_SIZE);
+        assert!(!Arc::ptr_eq(&peer.call_gate, &different_frame.call_gate));
+
+        let different_lifecycle = peer
+            .clone()
+            .with_connection_lifecycle(ConnectionLifecyclePolicy::default());
+        assert!(!Arc::ptr_eq(
+            &peer.call_gate,
+            &different_lifecycle.call_gate
+        ));
+
+        let different_control = peer
+            .clone()
+            .with_reauthentication_control(SessionReauthenticationControl::new());
+        assert!(!Arc::ptr_eq(&peer.call_gate, &different_control.call_gate));
     }
 }

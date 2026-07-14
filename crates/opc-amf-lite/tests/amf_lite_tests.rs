@@ -18,7 +18,7 @@ use opc_testbed::VirtualClock;
 use opc_types::{TenantId, Timestamp};
 
 mod config_consensus_common;
-use config_consensus_common::ConfigCluster;
+use config_consensus_common::{cluster_transition_timeout, ConfigCluster};
 
 const TEST_AUDIT_KEY_BYTES: [u8; 32] = [0xA5; 32];
 fn test_audit_key() -> AuditKey {
@@ -443,8 +443,12 @@ async fn test_amf_lite_config_ha_failover_and_session_recovery() {
     // 7. Commit through one member of the Openraft session fleet.
     let imsi = "208960000000002";
     println!("[HA] Registering UE context through Openraft session member 0");
+    // This test proves recovery rather than expiry. Keep the record alive for
+    // two complete bounded cluster transitions so a valid resampled election,
+    // config recovery, and the subsequent session read cannot consume its TTL.
+    let recovery_session_ttl = cluster_transition_timeout().saturating_mul(2);
     amf_0
-        .register_ue(imsi, 202, Duration::from_secs(10))
+        .register_ue(imsi, 202, recovery_session_ttl)
         .await
         .unwrap();
 

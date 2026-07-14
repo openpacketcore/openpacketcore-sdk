@@ -1285,14 +1285,23 @@ aliases, and Kubernetes pod hostnames MUST affect only connection routing and
 MUST NOT be accepted as substitutes for any logical, stable, or certificate
 identity.
 
-One absolute logical deadline MUST cover admission, concurrency gating,
-resolution, TCP connect, TLS, bootstrap, bounded encode, write, and response
-read. A late connection or response after cancellation MUST NOT be reused. The
-transport MUST carry only the shared bounded consensus envelope; the
-session-store adapter compact-encodes Openraft RPCs, and the network layer MUST
-NOT interpret commands or decide leadership, voting, log matching, commit, or
-repair. An identity, authentication, schema, payload-bound, or sender mismatch
-MUST fail before Openraft dispatch with redaction-safe diagnostics.
+One absolute family deadline MUST begin before concurrency gating and cover
+bounded encode, write, and response read. AppendEntries/Openraft read-index
+MUST use 2,000 ms, Vote 5,000 ms, and InstallSnapshot, forwarded mutation, and
+consumer ReadBarrier 10,000 ms. If no valid cached connection exists,
+resolution, TCP connect, mutual TLS, identity admission, and bootstrap MUST use
+the lesser of the remaining family budget and a 1,500 ms cold sub-bound; cold
+time MUST NOT be added to the family deadline. Each directed peer MAY cache at
+most one single-in-flight authenticated connection. It MUST recache only after
+a complete, correctly correlated, validated successful response; cancellation,
+timeout, EOF, malformed/cross-correlated response, typed failure, or lifecycle
+evidence mismatch MUST evict it. A late connection or response after
+cancellation MUST NOT be reused. The transport MUST carry only the shared
+bounded consensus envelope; the session-store adapter compact-encodes Openraft
+RPCs, and the network layer MUST NOT interpret commands or decide leadership,
+voting, log matching, commit, or repair. An identity, authentication, schema,
+payload-bound, or sender mismatch MUST fail before Openraft dispatch with
+redaction-safe diagnostics.
 
 Every authenticated client, peer, and listener MUST apply one finite
 `ConnectionLifecyclePolicy`. Its hard deadline MUST be the earliest of the
