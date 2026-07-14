@@ -102,6 +102,43 @@ from each SQLite database/WAL/SHM family; this is a
 MemoryKeyProvider wrapper check, not remote-HKMS qualification. Openraft remains
 the only commit authority and the `EncryptingSessionBackend` remains outside it.
 
+Two additional non-ignored cases run serialized single-host three- and
+five-process fleets through bounded fault and expiry recovery. First, a
+test-only consensus-RPC admission gate makes one stable nonzero follower
+unavailable while node 0, a different member, atomically publishes malformed
+trust. The malformed candidate never perturbs the active controller epoch:
+the source reports `RetainingLastGood` with `MalformedTrustBundle`, its fixed
+counter advances at no more than the polling bound, and the survivor quorum
+retains fresh durable readiness and advances the encrypted canary. The gated
+member is then restarted with the exact manifest address and existing backing
+state; after catch-up, a valid projected generation repairs node 0 and the
+malformed-generation retry counter becomes stable.
+
+Second, a stable nonzero follower receives a same-issuer leaf with a 75-second
+remaining-validity/expiry budget. Fresh directed paths, all-voter readiness,
+and the encrypted canary are established first, and every path incident to that
+member is refreshed below the authenticated idle timeout until the pre-boundary
+observation window. The fixed 30-second drain policy sets the soft boundary at
+`not_after - 30 seconds`; the test rejects early local or peer leaf-expiry
+retirement, then requires both retirement observations on every endpoint by
+expiry. At the hard deadline the member must have zero active/draining
+connections with every started drain completed, both projected source and TLS
+controller must report `Unavailable`/`LastGoodExpired`, the SVID expiry gauge
+must be zero, and exactly one SVID expiry outcome must be recorded. The
+survivors must remain durably ready and advance the encrypted canary. Publishing
+a valid long-lived leaf then restores every directed path, all-voter readiness,
+and canary progress without changing that process's PID.
+
+These controls are qualification-only. Consensus-RPC admission loss is not a
+real or deployed network partition, and these cases intentionally do not run
+the mixed mutation/watch/restore workload from the separate traffic/resource
+campaign. They do not provide a broader restart/fault matrix, resource or soak
+qualification, remote-HKMS evidence, deployed-CNF evidence, signed release
+evidence, or a new evidence-schema/profile claim. They change neither
+Openraft's sole commit authority nor payload encryption, AAD,
+key-provider/HKMS placement, SQLite/Openraft durable formats, or
+encryption-at-rest responsibilities.
+
 The deliberate stale-root negative probe is isolated to exactly one connection
 attempt: its qualification-only reconnect minimum and maximum equal the whole
 cold-connect subdeadline, and a counted resolver must run once. A rejecting TLS
@@ -191,12 +228,17 @@ deployed production evidence.
   continuous lease/CAS/read/watch/restore/readiness traffic, repeated leaf
   rotations with explicit connection/reconnect limits, Linux process-resource
   regression bounds, and absence of exact test canary bytes from the SQLite
-  database family on one host.
-  It does not cover deployed Kubernetes/network/storage behavior,
-  unavailable-member and malformed-reload combinations, certificate-expiry
-  retirement, partition/restart, external resource pressure, supported-platform
-  sizing, soak, or signed candidate evidence. Those cases remain required
-  before #164/#158 can be closed.
+  database family on one host. Separate non-ignored three- and five-process
+  cases cover the exact synthetic one-follower consensus-admission-loss plus
+  different-member malformed-last-good combination, exact-address restart and
+  repair, and a same-issuer leaf with a 75-second remaining-validity/expiry
+  budget through soft retirement, hard drain,
+  `LastGoodExpired`, survivor progress, and same-process replacement.
+  They do not cover a real/deployed network partition, deployed
+  Kubernetes/network/storage behavior, mixed traffic/watch/restore during
+  those two scenarios, a broader restart/fault matrix, external resource
+  pressure, supported-platform sizing, soak, remote HKMS, or signed candidate
+  evidence. Those cases remain required before #164/#158 can be closed.
 - Long-running network, resource, and soak qualification remains #143. Watch
   handoff and bounded replication-log cursor/retention semantics are
   implemented under #145/#171.
@@ -219,6 +261,10 @@ deployed production evidence.
 - Source checked: `Cargo.toml`, `src/lib.rs`, and dependent session tests.
 - Run production-mTLS qualification with:
   `cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features -- --test-threads=1`.
+- Run the non-ignored three- and five-process fault/expiry cases exactly with:
+  `cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1`
+  and
+  `cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1`.
 - The Linux traffic/resource cases are manual long-running qualification and
   remain ignored in the default suite. Run them individually from a clean host:
   `cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_traffic_and_resource_bounds -- --ignored --exact --test-threads=1`

@@ -1,9 +1,9 @@
 #![cfg(target_os = "linux")]
 
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, BufWriter};
-use std::net::SocketAddr;
-use std::os::unix::fs::symlink;
+use std::net::{SocketAddr, TcpListener};
+use std::os::unix::fs::{symlink, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,12 +33,14 @@ use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
     qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
     write_json_line, QualificationConnectionLifecycleConfig,
-    QualificationConnectionLifecycleMetrics, QualificationMember, QualificationNodeCommand,
-    QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
-    QualificationProjectedMtlsConfig, QualificationProjectedSvidAvailability,
+    QualificationConnectionLifecycleMetrics, QualificationConsensusRpcAvailability,
+    QualificationMember, QualificationNodeCommand, QualificationNodeConfig,
+    QualificationNodeErrorCode, QualificationNodeReply, QualificationProjectedMtlsConfig,
+    QualificationProjectedSvidAvailability, QualificationProjectedSvidReason,
     QualificationProjectedSvidStatus, QualificationReadinessCode,
-    QualificationTlsMaterialAvailability, QualificationTlsMaterialStatus,
-    QualificationTrafficState, QualificationTrafficStatus, QualificationTransportConfig,
+    QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
+    QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficState,
+    QualificationTrafficStatus, QualificationTransportConfig,
     QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_NODE_SCHEMA_VERSION,
     QUALIFICATION_OPERATION_TIMEOUT_MILLIS, QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS,
     QUALIFICATION_RESOLVER_PROOF_MILLIS, QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE,
@@ -51,6 +53,7 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND, QUALIFICATION_TRAFFIC_ROTATIONS_PER_MEMBER,
     QUALIFICATION_TRAFFIC_TRANSITION_MILLIS,
 };
+use opc_types::Timestamp;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, SanType};
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -67,6 +70,7 @@ const CANARY_TTL_MILLIS: u64 = 60 * 60 * 1_000;
 const CANARY_STABLE_ID: &str = "rotation-core-canary";
 const CANARY_LEASE_HANDLE: &str = "rotation-core-lease";
 const CANARY_OWNER: &str = "rotation-core-owner";
+const FAULT_EXPIRY_SECONDS: i64 = 75;
 const ROTATION_PLAINTEXT_CANARY_PREFIX: &[u8] = b"opc-rotation-plaintext-canary/";
 const TRAFFIC_PLAINTEXT_CANARY_PREFIX: &[u8] = b"opc-rotation-traffic-canary/";
 const PLAINTEXT_CANARY_PREFIXES: [&[u8]; 2] = [
@@ -713,6 +717,17 @@ impl Issuer {
     }
 
     fn issue_workload(&self, spiffe_id: &str) -> ProjectedCredential {
+        let now = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .expect("second-aligned qualification issuance time");
+        self.issue_workload_until(spiffe_id, now + time::Duration::hours(1))
+    }
+
+    fn issue_workload_until(
+        &self,
+        spiffe_id: &str,
+        not_after: time::OffsetDateTime,
+    ) -> ProjectedCredential {
         let key = KeyPair::generate().expect("generate qualification workload key");
         let mut parameters = CertificateParams::default();
         parameters
@@ -721,9 +736,15 @@ impl Issuer {
         parameters.subject_alt_names.push(SanType::URI(
             rcgen::Ia5String::try_from(spiffe_id).expect("valid qualification SPIFFE URI"),
         ));
-        let now = time::OffsetDateTime::now_utc();
+        let now = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .expect("second-aligned qualification issuance time");
+        assert!(
+            not_after > now,
+            "qualification leaf must expire in the future"
+        );
         parameters.not_before = now - time::Duration::hours(1);
-        parameters.not_after = now + time::Duration::hours(1);
+        parameters.not_after = not_after;
         let certificate = parameters
             .signed_by(&key, &self.certificate, &self.key)
             .expect("sign qualification workload certificate");
@@ -766,6 +787,7 @@ enum TrustGeneration {
 struct TestPki {
     old_root_pem: String,
     new_root_pem: String,
+    old_intermediate: Issuer,
     members: Vec<MemberCredentials>,
 }
 
@@ -793,8 +815,21 @@ impl TestPki {
         Self {
             old_root_pem: old_root.certificate.pem(),
             new_root_pem: new_root.certificate.pem(),
+            old_intermediate,
             members,
         }
+    }
+
+    fn expiring_workload(&self, node_index: usize) -> (ProjectedCredential, time::OffsetDateTime) {
+        let issuance_reference = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .expect("second-aligned qualification issuance reference");
+        let not_after = issuance_reference + time::Duration::seconds(FAULT_EXPIRY_SECONDS);
+        (
+            self.old_intermediate
+                .issue_workload_until(&spiffe_id(node_index), not_after),
+            not_after,
+        )
     }
 
     fn credential(
@@ -859,18 +894,39 @@ struct ChildNode {
     stdin: Option<BufWriter<ChildStdin>>,
     replies: Receiver<ReaderMessage>,
     reader: Option<JoinHandle<()>>,
+    node_index: usize,
+    stderr_path: PathBuf,
 }
 
 impl ChildNode {
     fn spawn(config: &Path, node_index: usize, stderr: &Path) -> (Self, SocketAddr) {
-        let stderr = File::create(stderr).expect("create qualification stderr");
+        Self::spawn_bound(
+            config,
+            node_index,
+            stderr,
+            "127.0.0.1:0".parse().expect("loopback qualification bind"),
+        )
+    }
+
+    fn spawn_bound(
+        config: &Path,
+        node_index: usize,
+        stderr_path: &Path,
+        bind_addr: SocketAddr,
+    ) -> (Self, SocketAddr) {
+        let stderr = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(stderr_path)
+            .expect("open qualification stderr");
         let mut child = Command::new(env!("CARGO_BIN_EXE_opc-session-quorum-node"))
             .arg("--config")
             .arg(config)
             .arg("--node-index")
             .arg(node_index.to_string())
             .arg("--bind-addr")
-            .arg("127.0.0.1:0")
+            .arg(bind_addr.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr))
@@ -901,6 +957,8 @@ impl ChildNode {
             stdin: Some(BufWriter::new(stdin)),
             replies,
             reader: Some(reader),
+            node_index,
+            stderr_path: stderr_path.to_path_buf(),
         };
         let reply = node.receive();
         let QualificationNodeReply::Bound {
@@ -926,9 +984,27 @@ impl ChildNode {
     fn receive(&mut self) -> QualificationNodeReply {
         match self.replies.recv_timeout(CHILD_TIMEOUT) {
             Ok(ReaderMessage::Reply(reply)) => reply,
-            Ok(ReaderMessage::Invalid) => panic!("invalid qualification child response"),
-            Err(error) => panic!("qualification child response unavailable: {error}"),
+            Ok(ReaderMessage::Invalid) => panic!(
+                "invalid qualification child response: node={}, status={:?}, stderr={}",
+                self.node_index,
+                self.child.try_wait().ok().flatten(),
+                self.stderr_tail()
+            ),
+            Err(error) => panic!(
+                "qualification child response unavailable: node={}, error={error}, status={:?}, stderr={}",
+                self.node_index,
+                self.child.try_wait().ok().flatten(),
+                self.stderr_tail()
+            ),
         }
+    }
+
+    fn stderr_tail(&self) -> String {
+        let Ok(bytes) = fs::read(&self.stderr_path) else {
+            return "unavailable".to_owned();
+        };
+        let tail = &bytes[bytes.len().saturating_sub(8 * 1024)..];
+        String::from_utf8_lossy(tail).into_owned()
     }
 
     fn invoke(&mut self, command: &QualificationNodeCommand) -> QualificationNodeReply {
@@ -938,6 +1014,40 @@ impl ChildNode {
 
     fn process_id(&self) -> u32 {
         self.child.id()
+    }
+
+    fn kill_unclean(&mut self) {
+        if let Some(status) = self
+            .child
+            .try_wait()
+            .expect("inspect qualification child before deliberate restart")
+        {
+            panic!(
+                "qualification child exited before deliberate restart: status={status}, stderr reader remains bounded"
+            );
+        }
+        self.child.kill().expect("kill qualification child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll killed child") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "killed qualification child did not exit inside the restart bound"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            !status.success(),
+            "uncleanly killed child exited successfully"
+        );
+        self.stdin.take();
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .expect("join killed qualification stdout reader");
+        }
     }
 
     fn shutdown(&mut self) {
@@ -973,10 +1083,25 @@ impl Drop for ChildNode {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FleetReadiness {
+    node_index: usize,
+    ready: bool,
+    reason_code: QualificationReadinessCode,
+    node_id: u64,
+    term: u64,
+    leader_id: Option<u64>,
+    configured_voters: usize,
+    fresh_reachable_voters: usize,
+    agreeing_voters: usize,
+    required_quorum: usize,
+}
+
 struct Fleet {
     nodes: Vec<ChildNode>,
     // Keep the workspace alive until every child has been killed on panic.
     workspace: TempDir,
+    config_paths: Vec<PathBuf>,
     stderr_paths: Vec<PathBuf>,
     projected_roots: Vec<PathBuf>,
     database_paths: Vec<PathBuf>,
@@ -1105,6 +1230,7 @@ impl Fleet {
         let mut fleet = Self {
             nodes,
             workspace,
+            config_paths: configs,
             stderr_paths,
             projected_roots,
             database_paths,
@@ -1137,35 +1263,128 @@ impl Fleet {
         self.member_count() / 2 + 1
     }
 
-    fn wait_ready(&mut self) {
+    fn readiness_reports(&mut self, node_indices: &[usize]) -> Vec<FleetReadiness> {
+        for node_index in node_indices {
+            self.nodes[*node_index].send(&QualificationNodeCommand::Probe);
+        }
+        node_indices
+            .iter()
+            .map(|node_index| match self.nodes[*node_index].receive() {
+                QualificationNodeReply::Readiness {
+                    ready,
+                    reason_code,
+                    node_id,
+                    term,
+                    leader_id,
+                    configured_voters,
+                    fresh_reachable_voters,
+                    agreeing_voters,
+                    required_quorum,
+                    ..
+                } => FleetReadiness {
+                    node_index: *node_index,
+                    ready,
+                    reason_code,
+                    node_id,
+                    term,
+                    leader_id,
+                    configured_voters,
+                    fresh_reachable_voters,
+                    agreeing_voters,
+                    required_quorum,
+                },
+                reply => panic!("unexpected readiness response: {reply:?}"),
+            })
+            .collect()
+    }
+
+    fn stable_nonzero_follower(&mut self) -> usize {
         let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        let all = (0..self.member_count()).collect::<Vec<_>>();
         loop {
-            let mut ready = true;
-            let member_count = self.member_count();
-            let required_quorum = self.required_quorum();
-            for node in &mut self.nodes {
-                node.send(&QualificationNodeCommand::Probe);
-            }
-            let mut reports = Vec::with_capacity(member_count);
-            for node in &mut self.nodes {
-                let reply = node.receive();
-                reports.push(format!("{reply:?}"));
-                match reply {
-                    QualificationNodeReply::Readiness {
-                        ready: node_ready,
-                        reason_code,
-                        configured_voters,
-                        required_quorum: actual_quorum,
-                        ..
-                    } => {
-                        assert_eq!(configured_voters, member_count);
-                        assert_eq!(actual_quorum, required_quorum);
-                        ready &= node_ready && reason_code == QualificationReadinessCode::Ready;
-                    }
-                    reply => panic!("unexpected readiness response: {reply:?}"),
+            let reports = self.readiness_reports(&all);
+            let leader = reports
+                .first()
+                .and_then(|report| report.leader_id)
+                .filter(|leader| {
+                    reports.iter().all(|report| {
+                        report.ready
+                            && report.reason_code == QualificationReadinessCode::Ready
+                            && report.leader_id == Some(*leader)
+                            && report.term == reports[0].term
+                    })
+                });
+            if let Some(leader) = leader {
+                if let Some(follower) = reports
+                    .iter()
+                    .find(|report| report.node_index != 0 && report.node_id != leader)
+                {
+                    return follower.node_index;
                 }
             }
-            if ready {
+            assert!(
+                Instant::now() < deadline,
+                "fleet did not expose one stable nonzero follower: reports={reports:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn set_consensus_rpc_availability(
+        &mut self,
+        node_index: usize,
+        availability: QualificationConsensusRpcAvailability,
+    ) {
+        assert!(matches!(
+            self.nodes[node_index].invoke(
+                &QualificationNodeCommand::SetConsensusRpcAvailability { availability }
+            ),
+            QualificationNodeReply::ConsensusRpcAvailability { availability: actual }
+                if actual == availability
+        ));
+    }
+
+    fn restart_node_at_manifest_address(&mut self, node_index: usize) {
+        let expected_address = self.members[node_index].dial_addr;
+        let previous_process_id = self.nodes[node_index].process_id();
+        self.nodes[node_index].kill_unclean();
+        wait_for_bind_address_release(expected_address);
+        let (node, actual_address) = ChildNode::spawn_bound(
+            &self.config_paths[node_index],
+            node_index,
+            &self.stderr_paths[node_index],
+            expected_address,
+        );
+        assert_eq!(actual_address, expected_address);
+        self.nodes[node_index] = node;
+        assert_ne!(self.nodes[node_index].process_id(), previous_process_id);
+        assert!(matches!(
+            self.nodes[node_index].invoke(&QualificationNodeCommand::Configure),
+            QualificationNodeReply::Started { node_index: actual } if actual == node_index
+        ));
+        assert!(matches!(
+            self.nodes[node_index].invoke(&QualificationNodeCommand::Initialize),
+            QualificationNodeReply::Initialized
+        ));
+        self.wait_ready();
+    }
+
+    fn wait_ready(&mut self) {
+        let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        loop {
+            let member_count = self.member_count();
+            let required_quorum = self.required_quorum();
+            let reports = self.readiness_reports(&node_indices);
+            if reports.iter().all(|report| {
+                report.ready
+                    && report.reason_code == QualificationReadinessCode::Ready
+                    && report.configured_voters == member_count
+                    && report.fresh_reachable_voters == required_quorum
+                    && report.agreeing_voters == required_quorum
+                    && report.required_quorum == required_quorum
+            }) {
                 return;
             }
             assert!(
@@ -1188,6 +1407,309 @@ impl Fleet {
         match self.nodes[node_index].invoke(&QualificationNodeCommand::MaterialStatus) {
             QualificationNodeReply::MaterialStatus { status } => status,
             reply => panic!("unexpected material response: {reply:?}"),
+        }
+    }
+
+    fn security_metrics(&mut self, node_index: usize) -> QualificationSecurityMetricsSnapshot {
+        match self.nodes[node_index].invoke(&QualificationNodeCommand::SecurityMetrics) {
+            QualificationNodeReply::SecurityMetrics { metrics } => metrics,
+            reply => panic!("unexpected security metrics response: {reply:?}"),
+        }
+    }
+
+    fn wait_for_malformed_trust_retention(
+        &mut self,
+        node_index: usize,
+        source_before: QualificationProjectedSvidStatus,
+        controller_before: QualificationTlsMaterialStatus,
+        metrics_before: QualificationSecurityMetricsSnapshot,
+    ) -> QualificationSecurityMetricsSnapshot {
+        let started = Instant::now();
+        let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        loop {
+            let source = self.projected_status(node_index);
+            let controller = self.material_status(node_index);
+            let metrics = self.security_metrics(node_index);
+            assert_security_metrics_unsaturated(node_index, &metrics);
+            assert_eq!(
+                controller, controller_before,
+                "malformed projected trust must never replace or perturb the active TLS epoch: node={node_index}, source={source:?}, metrics={metrics:?}, stderr={}",
+                self.node_stderr(node_index)
+            );
+            assert_eq!(metrics.bundle_version, metrics_before.bundle_version);
+            assert_eq!(
+                metrics.svid_expires_seconds,
+                metrics_before.svid_expires_seconds
+            );
+            assert_eq!(metrics.tls_material, metrics_before.tls_material);
+            assert_eq!(metrics.svid, metrics_before.svid);
+            assert_eq!(
+                metrics.trust_bundle.success,
+                metrics_before.trust_bundle.success
+            );
+            assert_eq!(
+                metrics.trust_bundle.rejected,
+                metrics_before.trust_bundle.rejected
+            );
+            assert_eq!(
+                metrics.trust_bundle.expired,
+                metrics_before.trust_bundle.expired
+            );
+            assert!(
+                metrics.trust_bundle.retained_last_good
+                    >= metrics_before.trust_bundle.retained_last_good
+            );
+            if source.generation == source_before.generation
+                && source.availability == QualificationProjectedSvidAvailability::RetainingLastGood
+                && source.reason == Some(QualificationProjectedSvidReason::MalformedTrustBundle)
+                && metrics.trust_bundle.retained_last_good
+                    > metrics_before.trust_bundle.retained_last_good
+            {
+                let elapsed_intervals =
+                    started.elapsed().as_nanos() / MIN_PROJECTED_SVID_POLL_INTERVAL.as_nanos();
+                let retry_bound = u64::try_from(elapsed_intervals)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(3);
+                assert!(
+                    metrics
+                        .trust_bundle
+                        .retained_last_good
+                        .saturating_sub(metrics_before.trust_bundle.retained_last_good)
+                        <= retry_bound,
+                    "malformed projected generation retried faster than its configured poll bound"
+                );
+                return metrics;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "malformed projected trust was not rejected while retaining the exact last-good epoch: node={node_index}, source_before={source_before:?}, source={source:?}, controller={controller:?}, metrics_before={metrics_before:?}, metrics={metrics:?}, stderr={}",
+                self.node_stderr(node_index)
+            );
+            thread::sleep(MIN_PROJECTED_SVID_POLL_INTERVAL);
+        }
+    }
+
+    fn wait_for_malformed_retry_to_stop(
+        &mut self,
+        node_index: usize,
+        minimum_retained_last_good: u64,
+    ) {
+        let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        let stable_for = MIN_PROJECTED_SVID_POLL_INTERVAL.saturating_mul(3);
+        let mut previous = self.security_metrics(node_index);
+        let mut stable_since = Instant::now();
+        loop {
+            thread::sleep(MIN_PROJECTED_SVID_POLL_INTERVAL);
+            let current = self.security_metrics(node_index);
+            assert_security_metrics_unsaturated(node_index, &current);
+            assert!(
+                current.trust_bundle.retained_last_good >= minimum_retained_last_good,
+                "malformed trust retention counter regressed"
+            );
+            if current.trust_bundle.retained_last_good == previous.trust_bundle.retained_last_good {
+                if stable_since.elapsed() >= stable_for {
+                    return;
+                }
+            } else {
+                stable_since = Instant::now();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "malformed projected generation continued retrying after valid repair: node={node_index}, previous={previous:?}, current={current:?}, stderr={}",
+                self.node_stderr(node_index)
+            );
+            previous = current;
+        }
+    }
+
+    fn wait_for_expiry_soft_retirement(
+        &mut self,
+        expiring_node_index: usize,
+        lifecycle_before: &[QualificationConnectionLifecycleMetrics],
+        not_after: time::OffsetDateTime,
+    ) -> Vec<QualificationConnectionLifecycleMetrics> {
+        assert_eq!(lifecycle_before.len(), self.member_count());
+        let drain_window = time::Duration::try_from(DEFAULT_ROTATION_DRAIN_WINDOW)
+            .expect("rotation drain window fits time duration");
+        let soft_retirement_at = not_after - drain_window;
+        let early_observation_at = soft_retirement_at - time::Duration::seconds(1);
+        while time::OffsetDateTime::now_utc() < early_observation_at {
+            self.keep_member_directed_paths_alive(expiring_node_index);
+            let remaining = duration_until_wall_time(early_observation_at);
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(remaining.min(Duration::from_secs(5)));
+        }
+        loop {
+            if time::OffsetDateTime::now_utc() >= soft_retirement_at {
+                break;
+            }
+            let early = self.all_lifecycle_metrics();
+            if time::OffsetDateTime::now_utc() < soft_retirement_at {
+                assert_eq!(
+                    early[expiring_node_index].retirement_local_leaf_expiry,
+                    lifecycle_before[expiring_node_index].retirement_local_leaf_expiry,
+                    "local leaf retirement began before the fixed soft deadline"
+                );
+                for node_index in 0..self.member_count() {
+                    if node_index != expiring_node_index {
+                        assert_eq!(
+                            early[node_index].retirement_peer_leaf_expiry,
+                            lifecycle_before[node_index].retirement_peer_leaf_expiry,
+                            "peer leaf retirement began before the fixed soft deadline: node={node_index}"
+                        );
+                    }
+                }
+            }
+            let remaining = duration_until_wall_time(soft_retirement_at);
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(20)));
+        }
+
+        let deadline =
+            Instant::now() + duration_until_wall_time(not_after) + Duration::from_secs(1);
+        loop {
+            let current = self.all_lifecycle_metrics();
+            let local_retired = current[expiring_node_index].retirement_local_leaf_expiry
+                > lifecycle_before[expiring_node_index].retirement_local_leaf_expiry;
+            let peer_retired = current
+                .iter()
+                .enumerate()
+                .filter(|(node_index, _)| *node_index != expiring_node_index)
+                .all(|(node_index, metrics)| {
+                    metrics.retirement_peer_leaf_expiry
+                        > lifecycle_before[node_index].retirement_peer_leaf_expiry
+                });
+            for (node_index, (before, after)) in lifecycle_before.iter().zip(&current).enumerate() {
+                assert_eq!(
+                    after.drain_overruns, before.drain_overruns,
+                    "leaf-expiry soft retirement overran its hard deadline: node={node_index}"
+                );
+            }
+            if local_retired && peer_retired {
+                return current;
+            }
+            assert!(
+                Instant::now() <= deadline,
+                "short-lived SVID connections did not begin local/peer retirement by expiry: expiring_node={expiring_node_index}, before={lifecycle_before:?}, current={current:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_expired_member_state(
+        &mut self,
+        expiring_node_index: usize,
+        expected_source_generation: u64,
+        expected_material_epoch: u64,
+        security_before: QualificationSecurityMetricsSnapshot,
+        lifecycle_before: &[QualificationConnectionLifecycleMetrics],
+        not_after: time::OffsetDateTime,
+    ) -> (
+        QualificationSecurityMetricsSnapshot,
+        QualificationConnectionLifecycleMetrics,
+    ) {
+        let deadline =
+            Instant::now() + duration_until_wall_time(not_after) + CLUSTER_TRANSITION_TIMEOUT;
+        loop {
+            let source = self.projected_status(expiring_node_index);
+            let controller = self.material_status(expiring_node_index);
+            let security = self.security_metrics(expiring_node_index);
+            let lifecycle_by_node = self.all_lifecycle_metrics();
+            let lifecycle = lifecycle_by_node[expiring_node_index];
+            assert_security_metrics_unsaturated(expiring_node_index, &security);
+            assert!(
+                security.svid.expired <= security_before.svid.expired.saturating_add(1),
+                "one accepted projected publication must emit at most one SVID expiry outcome"
+            );
+            for (node_index, (before, after)) in
+                lifecycle_before.iter().zip(&lifecycle_by_node).enumerate()
+            {
+                assert_eq!(
+                    after.drain_overruns, before.drain_overruns,
+                    "leaf expiry exceeded the connection hard-drain deadline: node={node_index}"
+                );
+            }
+            let source_expired = source.generation == expected_source_generation
+                && source.availability == QualificationProjectedSvidAvailability::Unavailable
+                && source.reason == Some(QualificationProjectedSvidReason::LastGoodExpired);
+            let controller_expired = controller.epoch == expected_material_epoch
+                && controller.availability == QualificationTlsMaterialAvailability::Unavailable
+                && controller.reason == Some(QualificationTlsMaterialReason::LastGoodExpired)
+                && controller.leaf_expires_at.is_none()
+                && controller.certificate_chain_expires_at.is_none();
+            let security_expired = security.svid_expires_seconds == 0
+                && security.bundle_version == expected_material_epoch
+                && security.svid.expired == security_before.svid.expired.saturating_add(1);
+            let every_survivor_observed_peer_retirement = lifecycle_by_node
+                .iter()
+                .enumerate()
+                .filter(|(node_index, _)| *node_index != expiring_node_index)
+                .all(|(node_index, metrics)| {
+                    metrics.retirement_peer_leaf_expiry
+                        > lifecycle_before[node_index].retirement_peer_leaf_expiry
+                });
+            let every_drain_completed = lifecycle_by_node.iter().all(|metrics| {
+                metrics.draining_connections == 0
+                    && metrics.drain_started == metrics.drain_completed
+            });
+            let connections_drained = lifecycle.active_connections == 0
+                && every_survivor_observed_peer_retirement
+                && every_drain_completed;
+            if source_expired && controller_expired && security_expired && connections_drained {
+                return (security, lifecycle);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "accepted short-lived SVID did not become unavailable and fully drain every affected endpoint inside the hard bound: node={expiring_node_index}, source={source:?}, controller={controller:?}, security={security:?}, lifecycle={lifecycle_by_node:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_isolated_member_and_survivors(
+        &mut self,
+        isolated_node_index: usize,
+    ) -> Vec<FleetReadiness> {
+        let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        let survivors = (0..self.member_count())
+            .filter(|node_index| *node_index != isolated_node_index)
+            .collect::<Vec<_>>();
+        loop {
+            let isolated = self.readiness_reports(&[isolated_node_index]);
+            let survivor_reports = self.readiness_reports(&survivors);
+            let required_quorum = self.required_quorum();
+            let configured_voters = self.member_count();
+            let isolated_ready = isolated.iter().all(|report| {
+                !report.ready
+                    && report.reason_code == QualificationReadinessCode::NoQuorum
+                    && report.configured_voters == configured_voters
+                    && report.fresh_reachable_voters == 0
+                    && report.agreeing_voters == 0
+                    && report.required_quorum == required_quorum
+            });
+            let survivors_ready = survivor_reports.iter().all(|report| {
+                report.ready
+                    && report.reason_code == QualificationReadinessCode::Ready
+                    && report.configured_voters == configured_voters
+                    && report.fresh_reachable_voters == required_quorum
+                    && report.agreeing_voters == required_quorum
+                    && report.required_quorum == required_quorum
+            });
+            if isolated_ready && survivors_ready {
+                return survivor_reports;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "consensus RPC fault did not yield isolated/survivor readiness: isolated={isolated:?}, survivors={survivor_reports:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -1522,6 +2044,32 @@ impl Fleet {
         self.prove_all_directed_paths_parallel(&generations);
     }
 
+    fn keep_member_directed_paths_alive(&mut self, member: usize) {
+        for remote in 0..self.member_count() {
+            if remote == member {
+                continue;
+            }
+            for (source, target) in [(remote, member), (member, remote)] {
+                match self.nodes[source].invoke(&QualificationNodeCommand::DirectedHandshake {
+                    remote_node_index: target,
+                }) {
+                    QualificationNodeReply::DirectedHandshake {
+                        remote_node_index,
+                        reauthentication_generation,
+                    } => {
+                        assert_eq!(remote_node_index, target);
+                        assert!(reauthentication_generation >= 1);
+                    }
+                    reply => panic!(
+                        "incident directed path did not remain authenticated before expiry: source={source}, target={target}, reply={reply:?}, source_stderr={}, target_stderr={}",
+                        self.node_stderr(source),
+                        self.node_stderr(target)
+                    ),
+                }
+            }
+        }
+    }
+
     fn verify_all_traffic_records(&mut self, statuses: &[QualificationTrafficStatus]) {
         assert_eq!(statuses.len(), self.member_count());
         let seed = qualification_traffic_seed(self.member_count())
@@ -1638,6 +2186,46 @@ impl Fleet {
             assert!(
                 Instant::now() < deadline,
                 "projected source and TLS controller did not publish a new ready generation: node={node_index}, source={source:?}, controller={controller:?}, stderr={}",
+                self.node_stderr(node_index)
+            );
+            thread::sleep(MIN_PROJECTED_SVID_POLL_INTERVAL);
+        }
+    }
+
+    fn wait_for_member_recovery_publication(
+        &mut self,
+        node_index: usize,
+        previous_source_generation: u64,
+        previous_material_epoch: u64,
+    ) {
+        let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        loop {
+            let source = self.projected_status(node_index);
+            let controller = self.material_status(node_index);
+            let source_advanced = source.generation > previous_source_generation;
+            let controller_advanced = controller.epoch > previous_material_epoch;
+            if source_advanced
+                && source.availability == QualificationProjectedSvidAvailability::Ready
+                && source.reason.is_none()
+                && controller_advanced
+                && controller.availability == QualificationTlsMaterialAvailability::Ready
+                && controller.reason.is_none()
+                && controller.leaf_expires_at.is_some()
+                && controller.certificate_chain_expires_at.is_some()
+            {
+                return;
+            }
+            assert!(
+                source.generation == previous_source_generation || source_advanced,
+                "projected source generation regressed during recovery"
+            );
+            assert!(
+                controller.epoch == previous_material_epoch || controller_advanced,
+                "TLS material epoch regressed during recovery"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "valid projected recovery did not publish a new ready generation: node={node_index}, source={source:?}, controller={controller:?}, stderr={}",
                 self.node_stderr(node_index)
             );
             thread::sleep(MIN_PROJECTED_SVID_POLL_INTERVAL);
@@ -1849,6 +2437,28 @@ impl Fleet {
     }
 
     fn advance_canary(&mut self, phase: &str) {
+        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        self.advance_canary_on_nodes(0, &node_indices, phase);
+    }
+
+    fn advance_canary_for_survivors(&mut self, isolated_node_index: usize, phase: &str) {
+        assert_ne!(
+            isolated_node_index, 0,
+            "the fixed canary writer must remain in the survivor quorum"
+        );
+        let survivors = (0..self.member_count())
+            .filter(|node_index| *node_index != isolated_node_index)
+            .collect::<Vec<_>>();
+        self.advance_canary_on_nodes(0, &survivors, phase);
+    }
+
+    fn advance_canary_on_nodes(
+        &mut self,
+        writer_node_index: usize,
+        reader_node_indices: &[usize],
+        phase: &str,
+    ) {
+        assert!(reader_node_indices.contains(&writer_node_index));
         let expected_generation = (self.canary_generation != 0).then_some(self.canary_generation);
         self.canary_generation += 1;
         let value = format!(
@@ -1856,7 +2466,7 @@ impl Fleet {
             self.member_count(),
             self.canary_generation
         );
-        match self.nodes[0].invoke(&QualificationNodeCommand::CompareAndSet {
+        match self.nodes[writer_node_index].invoke(&QualificationNodeCommand::CompareAndSet {
             lease_handle: CANARY_LEASE_HANDLE.to_owned(),
             stable_id: CANARY_STABLE_ID.to_owned(),
             expected_generation,
@@ -1871,10 +2481,16 @@ impl Fleet {
         }
 
         self.canary_values.push(value);
-        self.verify_canary();
+        self.verify_canary_on_nodes(reader_node_indices);
     }
 
     fn verify_canary(&mut self) {
+        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        self.verify_canary_on_nodes(&node_indices);
+    }
+
+    fn verify_canary_on_nodes(&mut self, node_indices: &[usize]) {
+        assert!(!node_indices.is_empty());
         let expected_owner = qualification_owner_sha256(CANARY_OWNER);
         let expected_value = qualification_value_sha256(
             self.canary_values
@@ -1882,13 +2498,13 @@ impl Fleet {
                 .expect("seeded rotation canary")
                 .as_bytes(),
         );
-        for node in &mut self.nodes {
-            node.send(&QualificationNodeCommand::Get {
+        for node_index in node_indices {
+            self.nodes[*node_index].send(&QualificationNodeCommand::Get {
                 stable_id: CANARY_STABLE_ID.to_owned(),
             });
         }
-        for node in &mut self.nodes {
-            match node.receive() {
+        for node_index in node_indices {
+            match self.nodes[*node_index].receive() {
                 QualificationNodeReply::Record {
                     present: true,
                     generation: Some(actual_generation),
@@ -1901,7 +2517,10 @@ impl Fleet {
                     assert!(fence >= 1);
                     assert_eq!(actual_value, &expected_value);
                 }
-                reply => panic!("rotation canary read failed: {reply:?}"),
+                reply => panic!(
+                    "rotation canary read failed: node={node_index}, reply={reply:?}, stderr={}",
+                    self.node_stderr(*node_index)
+                ),
             }
         }
     }
@@ -2328,23 +2947,142 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).expect("production duration fits milliseconds")
 }
 
+fn duration_until_wall_time(deadline: time::OffsetDateTime) -> Duration {
+    let remaining_nanos = deadline
+        .unix_timestamp_nanos()
+        .saturating_sub(time::OffsetDateTime::now_utc().unix_timestamp_nanos());
+    if remaining_nanos <= 0 {
+        return Duration::ZERO;
+    }
+    let seconds = remaining_nanos / 1_000_000_000;
+    let nanos = remaining_nanos % 1_000_000_000;
+    Duration::new(
+        u64::try_from(seconds).expect("bounded qualification wall-time seconds"),
+        u32::try_from(nanos).expect("subsecond qualification wall-time nanos"),
+    )
+}
+
+fn wait_for_bind_address_release(address: SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpListener::bind(address) {
+            Ok(listener) => {
+                assert_eq!(
+                    listener.local_addr().expect("probe released bind address"),
+                    address
+                );
+                drop(listener);
+                return;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                assert!(
+                    Instant::now() < deadline,
+                    "qualification manifest address remained in use after deliberate child exit: address={address}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!(
+                "qualification manifest address could not be probed after deliberate child exit: address={address}, error_kind={:?}",
+                error.kind()
+            ),
+        }
+    }
+}
+
+fn assert_security_metrics_unsaturated(
+    node_index: usize,
+    metrics: &QualificationSecurityMetricsSnapshot,
+) {
+    assert_eq!(
+        metrics.saturated_series, 0,
+        "security metrics saturated during bounded qualification: node={node_index}, metrics={metrics:?}"
+    );
+    let saturation_flags = [
+        metrics.tls_material.success_saturated,
+        metrics.tls_material.retained_last_good_saturated,
+        metrics.tls_material.rejected_saturated,
+        metrics.tls_material.expired_saturated,
+        metrics.svid.success_saturated,
+        metrics.svid.retained_last_good_saturated,
+        metrics.svid.rejected_saturated,
+        metrics.svid.expired_saturated,
+        metrics.trust_bundle.success_saturated,
+        metrics.trust_bundle.retained_last_good_saturated,
+        metrics.trust_bundle.rejected_saturated,
+        metrics.trust_bundle.expired_saturated,
+    ];
+    assert!(
+        saturation_flags.into_iter().all(|saturated| !saturated),
+        "security metric series reported saturation during bounded qualification: node={node_index}, metrics={metrics:?}"
+    );
+}
+
+fn assert_fault_lifecycle_failures_unchanged(
+    before: &[QualificationConnectionLifecycleMetrics],
+    after: &[QualificationConnectionLifecycleMetrics],
+) {
+    assert_eq!(before.len(), after.len());
+    for (node_index, (before, after)) in before.iter().zip(after).enumerate() {
+        assert_eq!(
+            after.connection_failure_transport, before.connection_failure_transport,
+            "consensus admission loss changed the transport failure ledger: node={node_index}"
+        );
+        assert_eq!(
+            after.connection_failure_authentication, before.connection_failure_authentication,
+            "retained malformed trust changed the authentication failure ledger: node={node_index}"
+        );
+        assert_eq!(
+            after.connection_failure_timeout, before.connection_failure_timeout,
+            "consensus admission loss changed the timeout failure ledger: node={node_index}"
+        );
+        assert_eq!(
+            after.connection_failure_protocol, before.connection_failure_protocol,
+            "consensus admission loss changed the protocol failure ledger: node={node_index}"
+        );
+        assert_eq!(
+            after.connection_failure_backend, before.connection_failure_backend,
+            "consensus admission loss changed the connection backend failure ledger: node={node_index}"
+        );
+        assert_eq!(
+            after.reconnect_failures, before.reconnect_failures,
+            "consensus admission loss produced an unexpected reconnect failure: node={node_index}"
+        );
+        assert_eq!(
+            after.drain_overruns, before.drain_overruns,
+            "consensus admission loss or malformed trust produced a drain overrun: node={node_index}"
+        );
+    }
+}
+
 fn publish_projected_generation(
     root: &Path,
     generation_counter: &mut u64,
     credential: &ProjectedCredential,
     trust_bundle_pem: &str,
 ) {
+    publish_projected_files(
+        root,
+        generation_counter,
+        &credential.certificate_chain_pem,
+        &credential.private_key_pem,
+        trust_bundle_pem,
+    );
+}
+
+fn publish_projected_files(
+    root: &Path,
+    generation_counter: &mut u64,
+    certificate_chain_pem: &str,
+    private_key_pem: &str,
+    trust_bundle_pem: &str,
+) {
     *generation_counter += 1;
     let generation_name = format!("..2026_07_13_{generation_counter:04}");
     let generation = root.join(&generation_name);
     fs::create_dir(&generation).expect("create immutable projected generation");
-    fs::write(
-        generation.join("tls.crt"),
-        &credential.certificate_chain_pem,
-    )
-    .expect("write projected certificate chain");
-    fs::write(generation.join("tls.key"), &credential.private_key_pem)
-        .expect("write projected private key");
+    fs::write(generation.join("tls.crt"), certificate_chain_pem)
+        .expect("write projected certificate chain");
+    fs::write(generation.join("tls.key"), private_key_pem).expect("write projected private key");
     fs::write(generation.join("ca.crt"), trust_bundle_pem).expect("write projected trust bundle");
 
     let next_link = root.join(format!("..data-next-{generation_counter:04}"));
@@ -2407,6 +3145,238 @@ fn spiffe_id(node_index: usize) -> String {
     format!(
         "spiffe://qualification.invalid/tenant/test/ns/test/sa/session/nf/test/instance/{node_index}"
     )
+}
+
+fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
+    const MALFORMED_TRUST_BUNDLE: &str =
+        "-----BEGIN CERTIFICATE-----\nqualification-malformed\n-----END CERTIFICATE-----\n";
+
+    let mut fleet = Fleet::start(member_count);
+
+    // Keep node 0 in the survivor quorum because it owns the fixed canary lease.
+    // A different stable follower loses consensus RPC admission while node 0
+    // atomically publishes malformed trust and retains its exact last-good
+    // identity. This is a test-control fault, not a network partition.
+    let isolated_node_index = fleet.stable_nonzero_follower();
+    let malformed_node_index = 0;
+    let malformed_source_before = fleet.projected_status(malformed_node_index);
+    let malformed_controller_before = fleet.material_status(malformed_node_index);
+    let malformed_security_before = fleet.security_metrics(malformed_node_index);
+    assert_security_metrics_unsaturated(malformed_node_index, &malformed_security_before);
+    let fault_lifecycle_before = fleet.all_lifecycle_metrics();
+
+    fleet.set_consensus_rpc_availability(
+        isolated_node_index,
+        QualificationConsensusRpcAvailability::Unavailable,
+    );
+    fleet.wait_for_isolated_member_and_survivors(isolated_node_index);
+    let malformed_credential = fleet
+        .pki
+        .credential(malformed_node_index, CredentialGeneration::Initial);
+    publish_projected_files(
+        &fleet.projected_roots[malformed_node_index],
+        &mut fleet.projected_generation[malformed_node_index],
+        &malformed_credential.certificate_chain_pem,
+        &malformed_credential.private_key_pem,
+        MALFORMED_TRUST_BUNDLE,
+    );
+    let malformed_security = fleet.wait_for_malformed_trust_retention(
+        malformed_node_index,
+        malformed_source_before,
+        malformed_controller_before,
+        malformed_security_before,
+    );
+    fleet.wait_for_isolated_member_and_survivors(isolated_node_index);
+    fleet.advance_canary_for_survivors(
+        isolated_node_index,
+        "consensus-unavailable-malformed-retained",
+    );
+    let fault_lifecycle_after = fleet.all_lifecycle_metrics();
+    assert_fault_lifecycle_failures_unchanged(&fault_lifecycle_before, &fault_lifecycle_after);
+
+    fleet.restart_node_at_manifest_address(isolated_node_index);
+    fleet.verify_canary();
+    fleet.advance_canary("exact-address-restart-recovered");
+
+    let repair_source_before = fleet.projected_status(malformed_node_index);
+    let repair_controller_before = fleet.material_status(malformed_node_index);
+    let repair_credential = fleet
+        .pki
+        .credential(malformed_node_index, CredentialGeneration::Initial);
+    let old_trust = fleet.pki.trust_bundle(TrustGeneration::OldOnly);
+    publish_projected_generation(
+        &fleet.projected_roots[malformed_node_index],
+        &mut fleet.projected_generation[malformed_node_index],
+        repair_credential,
+        &old_trust,
+    );
+    fleet.wait_for_member_recovery_publication(
+        malformed_node_index,
+        repair_source_before.generation,
+        repair_controller_before.epoch,
+    );
+    fleet.fresh_all_directed_generation();
+    fleet.wait_ready();
+    fleet.advance_canary("malformed-trust-repaired");
+    fleet.wait_for_malformed_retry_to_stop(
+        malformed_node_index,
+        malformed_security.trust_bundle.retained_last_good,
+    );
+
+    // Publish a same-issuer leaf with a 75-second remaining-validity/expiry
+    // budget to a stable nonzero follower, establish fresh authenticated paths,
+    // and retain the PID so recovery can prove a same-process material
+    // replacement.
+    let expiring_node_index = fleet.stable_nonzero_follower();
+    let expiring_process_id = fleet.nodes[expiring_node_index].process_id();
+    let expiring_source_before = fleet.projected_status(expiring_node_index);
+    let expiring_controller_before = fleet.material_status(expiring_node_index);
+    let expiring_security_before = fleet.security_metrics(expiring_node_index);
+    assert_security_metrics_unsaturated(expiring_node_index, &expiring_security_before);
+    let (expiring_credential, not_after) = fleet.pki.expiring_workload(expiring_node_index);
+    let old_trust = fleet.pki.trust_bundle(TrustGeneration::OldOnly);
+    publish_projected_generation(
+        &fleet.projected_roots[expiring_node_index],
+        &mut fleet.projected_generation[expiring_node_index],
+        &expiring_credential,
+        &old_trust,
+    );
+    fleet.wait_for_member_publication(
+        expiring_node_index,
+        expiring_source_before.generation,
+        expiring_controller_before.epoch,
+    );
+    let expiring_source = fleet.projected_status(expiring_node_index);
+    let expiring_controller = fleet.material_status(expiring_node_index);
+    let expected_expiry = Timestamp::from_offset_datetime(not_after);
+    assert_eq!(expiring_controller.leaf_expires_at, Some(expected_expiry));
+    assert_eq!(
+        expiring_controller.certificate_chain_expires_at,
+        Some(expected_expiry)
+    );
+    let security_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    let expiring_security = loop {
+        let security = fleet.security_metrics(expiring_node_index);
+        assert_security_metrics_unsaturated(expiring_node_index, &security);
+        if security.svid_expires_seconds == not_after.unix_timestamp()
+            && security.bundle_version == expiring_controller.epoch
+        {
+            break security;
+        }
+        assert!(
+            Instant::now() < security_deadline,
+            "accepted short-lived SVID was not reflected in fixed security gauges: node={expiring_node_index}, controller={expiring_controller:?}, security={security:?}, stderr={}",
+            fleet.node_stderr(expiring_node_index)
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        expiring_security.svid.expired,
+        expiring_security_before.svid.expired
+    );
+
+    let lifecycle_setup_before = fleet.all_lifecycle_metrics();
+    fleet.fresh_all_directed_generation();
+    fleet.wait_ready();
+    fleet.advance_canary("short-lived-svid-ready");
+    let lifecycle_before_expiry = fleet.wait_for_round_lifecycle_completion(
+        &lifecycle_setup_before,
+        Instant::now() + CLUSTER_TRANSITION_TIMEOUT,
+        "short-lived-svid-connection-setup",
+    );
+    let remote_peers = u64::try_from(member_count - 1).expect("bounded member count");
+    assert_lifecycle_delta_bounds(
+        member_count,
+        &lifecycle_setup_before,
+        &lifecycle_before_expiry,
+        remote_peers,
+    );
+    let soft_retirement_at = not_after
+        - time::Duration::try_from(DEFAULT_ROTATION_DRAIN_WINDOW)
+            .expect("rotation drain window fits time duration");
+    assert!(
+        time::OffsetDateTime::now_utc() < soft_retirement_at,
+        "short-lived SVID setup did not complete before its soft-retirement deadline"
+    );
+
+    fleet.wait_for_expiry_soft_retirement(expiring_node_index, &lifecycle_before_expiry, not_after);
+    let (expired_security, _) = fleet.wait_for_expired_member_state(
+        expiring_node_index,
+        expiring_source.generation,
+        expiring_controller.epoch,
+        expiring_security,
+        &lifecycle_before_expiry,
+        not_after,
+    );
+    fleet.wait_for_isolated_member_and_survivors(expiring_node_index);
+    fleet.advance_canary_for_survivors(expiring_node_index, "short-lived-svid-expired");
+
+    let survivor_node_index = (0..member_count)
+        .find(|node_index| *node_index != expiring_node_index)
+        .expect("survivor member");
+    assert!(matches!(
+        fleet.nodes[expiring_node_index].invoke(&QualificationNodeCommand::DirectedHandshake {
+            remote_node_index: survivor_node_index,
+        }),
+        QualificationNodeReply::Error {
+            code: QualificationNodeErrorCode::MaterialUnavailable,
+        }
+    ));
+    assert!(matches!(
+        fleet.nodes[survivor_node_index].invoke(&QualificationNodeCommand::DirectedHandshake {
+            remote_node_index: expiring_node_index,
+        }),
+        QualificationNodeReply::Error {
+            code: QualificationNodeErrorCode::DirectedHandshakeUnavailable,
+        }
+    ));
+
+    let replacement_source_before = fleet.projected_status(expiring_node_index);
+    let replacement_controller_before = fleet.material_status(expiring_node_index);
+    let replacement = fleet
+        .pki
+        .credential(expiring_node_index, CredentialGeneration::RenewedLeaf);
+    let old_trust = fleet.pki.trust_bundle(TrustGeneration::OldOnly);
+    publish_projected_generation(
+        &fleet.projected_roots[expiring_node_index],
+        &mut fleet.projected_generation[expiring_node_index],
+        replacement,
+        &old_trust,
+    );
+    fleet.wait_for_member_recovery_publication(
+        expiring_node_index,
+        replacement_source_before.generation,
+        replacement_controller_before.epoch,
+    );
+    assert_eq!(
+        fleet.nodes[expiring_node_index].process_id(),
+        expiring_process_id,
+        "short-lived SVID recovery must reload material in the same process"
+    );
+    fleet.complete_fleet_phase("short-lived-svid-replacement-recovered");
+    let recovered_controller = fleet.material_status(expiring_node_index);
+    let recovered_security = fleet.security_metrics(expiring_node_index);
+    assert_security_metrics_unsaturated(expiring_node_index, &recovered_security);
+    assert_eq!(
+        recovered_security.bundle_version,
+        recovered_controller.epoch
+    );
+    assert_eq!(
+        recovered_security.svid_expires_seconds,
+        recovered_controller
+            .certificate_chain_expires_at
+            .expect("recovered certificate-chain expiry")
+            .as_offset_datetime()
+            .unix_timestamp()
+    );
+    assert_eq!(
+        recovered_security.svid.expired,
+        expired_security.svid.expired
+    );
+
+    fleet.shutdown();
+    fleet.assert_plaintext_canaries_absent_from_sqlite();
+    assert!(fleet.workspace.path().is_dir());
 }
 
 fn run_projected_mtls_rotation_core(member_count: usize) {
@@ -2891,6 +3861,22 @@ fn run_projected_mtls_traffic_resources(member_count: usize) {
     fleet.shutdown();
     fleet.assert_plaintext_canaries_absent_from_sqlite();
     assert!(fleet.workspace.path().is_dir());
+}
+
+#[test]
+fn three_process_projected_mtls_unavailable_malformed_and_expiry_recovery() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_projected_mtls_fault_and_expiry_recovery(3);
+}
+
+#[test]
+fn five_process_projected_mtls_unavailable_malformed_and_expiry_recovery() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_projected_mtls_fault_and_expiry_recovery(5);
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 **Status**: Draft; commit authority implemented, production qualification pending<br>
 **Version**: 2.1.0<br>
-**Date**: 2026-07-12<br>
+**Date**: 2026-07-14<br>
 **Audience**: SDK implementers, NF owners, data-plane engineers, reliability engineers
 
 ## 1. Abstract
@@ -28,9 +28,13 @@ current-format recovery and #129 supplies the audited offline legacy-fork
 campaign, while #133 supplies bounded restore from the Openraft-applied state
 without becoming readiness evidence by itself. Connection reauthentication and
 retained-connection continuity are implemented under #163. Distributed fleet
-qualification of trust overlap/removal, short-lived-SVID expiry and root
-cutover, reconnect storms, resources, and soak (#164/#143) remains a gate;
-generic CRL/OCSP/denylist revocation is not implemented.
+qualification (#164/#143) remains a gate. Single-host three- and five-process
+tests cover trust overlap/removal and one bounded synthetic
+admission-loss/malformed-last-good plus short-lived-SVID-expiry recovery slice;
+they do not cover deployed partitions, a broader restart/fault matrix, mixed
+traffic/watch/restore during those faults, resource/soak, remote HKMS, deployed
+CNFs, or signed release evidence. Generic CRL/OCSP/denylist revocation is not
+implemented.
 
 ## 2. Scope
 
@@ -1236,10 +1240,18 @@ replacement negotiation, old-trust rejection, and request/watch continuity.
 TLS material tests separately prove effective configured/presented-chain expiry
 through a real mutual-TLS handshake, while lifecycle unit tests prove the
 corresponding local/peer retirement deadlines and fixed metric reasons.
-That scoped evidence is not #164/#143's multi-process rotation/soak,
-reconnect-storm, short-lived-SVID expiry/root-cutover, or fleet trust-removal
-qualification. Generic CRL/OCSP/certificate-or-identity-denylist revocation is
-not implemented. #177 removes
+Additional non-ignored single-host three- and five-process tests now exercise
+one bounded multi-process slice: a test-only consensus-RPC admission loss on
+one stable follower while a different member retains last-good material after
+malformed trust; exact-address restart, catch-up, and repair; and a
+same-issuer leaf with a 75-second remaining-validity/expiry budget through the
+`expiry - 30 seconds` soft boundary, hard drain, source/controller
+`LastGoodExpired`, survivor durable readiness and
+encrypted-canary progress, and same-process valid replacement. This is not a
+real/deployed partition, mixed traffic/watch/restore fault qualification, a
+broader restart/fault matrix, resource/soak, remote-HKMS, deployed-CNF, signed
+release, or evidence-schema/profile claim. Generic
+CRL/OCSP/certificate-or-identity-denylist revocation is not implemented. #177 removes
 `opc-persist`'s separate config TCP
 path and reuses the shared consensus peer/handler boundary instead of defining
 another timeout or credential lifecycle. An in-process real-mTLS integration
@@ -1400,11 +1412,14 @@ reopening a direct backend/rebuild port. #143 remains the distributed
 partition/restart/resource/soak and payload-key gate. #161 atomic reload, #162
 material epochs, and #163 bounded reauthentication are implemented, including
 scoped retained-connection, request, and watch continuity evidence. Production
-rotation MUST additionally qualify old/new trust overlap and removal,
-short-lived-SVID expiry and root cutover, reconnect-storm bounds, and
-multi-process/soak behavior under #164/#143. The lack of immediate generic CRL,
-OCSP, or certificate/identity-denylist revocation MUST remain explicit. #158
-remains the umbrella until that fleet evidence passes.
+rotation already has single-host multi-process trust transitions and the exact
+synthetic fault/expiry slice described above. It MUST additionally qualify
+deployed trust/root cutover, real network/storage faults and a broader restart
+matrix, mixed traffic/watch/restore under those faults, reconnect-storm bounds,
+resources, soak, remote HKMS, deployed CNFs, and signed release evidence under
+#164/#143. The lack of immediate generic CRL, OCSP, or
+certificate/identity-denylist revocation MUST remain explicit. #158 remains the
+umbrella until that fleet evidence passes.
 
 ## 13. Local Cache
 
@@ -1571,8 +1586,14 @@ publication. Evidence MUST bind one invocation, live-lease binding, monotonic
 operation/nonce, exact member/checkpoint, phase/step, and fresh timestamp; it
 MUST NOT contain the lease token. Serving withdrawal MUST remain executable
 when evidence storage is unavailable. Reconnect-storm,
-short-lived-SVID expiry, root-cutover, multi-process trust-removal, soak, and
-wider distributed production evidence remain #164/#143 under umbrella #158.
+deployed root cutover, real partition/restart and broader fault behavior, mixed
+traffic/watch/restore during faults, resource/soak, remote-HKMS, deployed-CNF,
+signed release, and wider distributed production evidence remain #164/#143
+under umbrella #158. The single-host tests described in §12.3 cover only their
+exact synthetic fault/expiry slice and make no evidence-schema/profile claim.
+They do not change Openraft's sole commit authority, payload encryption, AAD,
+key-provider/HKMS placement, durable formats, or encryption-at-rest
+responsibilities.
 
 ## 15. Observability
 
@@ -1729,6 +1750,24 @@ fencing.
 - Plaintext canaries written through the encryption wrapper are absent from
   SQLite database/WAL/SHM files, Raft logs and outcomes, captured consensus
   frames, and snapshots; restart and active-key rotation retain decryptability.
+- Non-ignored three- and five-process single-host projected-mTLS cases combine
+  one stable follower's test-only consensus-RPC admission loss with a different
+  member's malformed-trust retained-last-good state, then prove survivor
+  readiness/encrypted-canary progress, exact-address restart/catch-up, and
+  repair. They separately drive a same-issuer leaf with a 75-second
+  remaining-validity/expiry budget through its fixed 30-second soft-retirement
+  window, hard drain, `LastGoodExpired`,
+  survivor progress, and same-process valid replacement.
+
+Run those two exact cases serially:
+
+```bash
+cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1
+cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1
+```
+
+They are synthetic regression evidence, not a deployed network partition or a
+production qualification; they run no mixed traffic/watch/restore workload.
 
 ### 17.3 Fault Injection
 

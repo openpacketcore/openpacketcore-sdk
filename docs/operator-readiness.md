@@ -489,10 +489,11 @@ networked session HA. #143 and the remaining dependencies still block the
 experimental profile. A renewed SVID on a subsequent new call/full handshake
 and wrong-scope rejection have scoped real-mTLS qualification; fleet-scale
 seamless connection retirement, payload-protection key rotation, and the
-complete trust-overlap/removal, short-lived-SVID expiry/root-cutover,
-authentication-age, multi-process, and soak lifecycle remain separate mandatory
-production gates. Immediate generic CRL/OCSP/certificate-or-identity-denylist
-revocation is not implemented.
+deployed trust/root-cutover, authentication-age, broader fault/restart,
+resource, and soak lifecycle remain separate mandatory production gates. The
+single-host multi-process trust and bounded synthetic fault/expiry slices
+described below do not satisfy those deployed gates. Immediate generic
+CRL/OCSP/certificate-or-identity-denylist revocation is not implemented.
 
 ### Session durable readiness
 
@@ -785,12 +786,15 @@ certificate/identity-denylist, and other selective same-issuer revocation are
 unsupported. Root removal is instead a trust-anchor cutover for every chain
 that depends on it; it is not an expiry deadline.
 
-Legacy watches resume from the exact caller-delivered sequence. #164 still
-owns fleet rotation qualification under umbrella #158; a production CNF must
-qualify old/new trust overlap and removal, short-lived-SVID expiry and root
-cutover, reconnect storms, and multi-process/soak continuity. The unsupported
-generic-revocation limitation remains part of that acceptance decision. #143
-owns the wider distributed qualification.
+Legacy watches resume from the exact caller-delivered sequence. Scoped
+single-host three- and five-process tests now cover the trust campaign and one
+bounded same-issuer leaf-expiry recovery case with a 75-second
+remaining-validity/expiry budget described below. #164
+still owns production CNF fleet qualification under umbrella #158: deployed
+trust overlap/removal and root cutover, real network/storage faults, reconnect
+storms, resources, and soak remain open. The unsupported generic-revocation
+limitation remains part of that acceptance decision. #143 owns the wider
+distributed qualification.
 
 When TLS material is mounted as a Kubernetes projected Secret, construct
 `ProjectedSvidSource` with the mount root and relative Secret-key paths. Do not
@@ -878,6 +882,39 @@ Their post-shutdown persistence proof validates every retained exact canary
 against exactly one of two fixed domain-separated prefixes, then scans each
 SQLite/WAL/SHM artifact once for each prefix.
 
+The companion fault/expiry cases are non-ignored and serialized by the same
+fleet lock. Run them exactly with:
+
+`cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1`
+
+`cargo test --locked -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features five_process_projected_mtls_unavailable_malformed_and_expiry_recovery -- --exact --test-threads=1`.
+
+Each single-host synthetic fleet first applies a test-only consensus-RPC
+admission gate to one stable follower while a different member publishes
+malformed trust and retains its exact last-good TLS epoch. The survivor quorum
+must retain fresh durable readiness and advance an encrypted canary. The test
+then restarts the gated member at its exact manifest address, proves catch-up,
+repairs the malformed generation, and proves its retry counter stops. It next
+publishes a same-issuer leaf with a 75-second remaining-validity/expiry budget.
+With the default 30-second drain window, its fixed soft-retirement boundary is
+`not_after - 30 seconds`: every incident directed path is refreshed below the
+idle timeout until the pre-boundary observation window, local and peer
+leaf-expiry retirement must not begin early, and every endpoint must observe
+retirement by expiry. At the hard deadline every affected connection is
+drained, the source and controller report
+`Unavailable`/`LastGoodExpired`, and the SVID expiry gauge is zero. Survivors
+again prove readiness and encrypted-canary progress before a valid long-lived
+leaf restores all paths and all-voter readiness without restarting that
+process.
+
+The admission gate is not a real or deployed network partition. These two
+cases deliberately omit the separate mixed mutation/watch/restore workload and
+do not provide a broader restart/fault matrix, resource or soak evidence,
+remote-HKMS evidence, deployed-CNF evidence, signed release evidence, or an
+evidence-schema/profile claim. Openraft remains the sole commit authority;
+payload encryption, AAD, key-provider/HKMS placement, SQLite/Openraft durable
+formats, and encryption-at-rest responsibilities do not change.
+
 Alert on the fixed connection retirement, active/draining, drain-overrun,
 connection-outcome, reconnect, and watch-slow-consumer metrics. Do not add
 endpoint, SPIFFE ID, certificate, key, transaction, or payload labels. A zero
@@ -893,8 +930,11 @@ trust/leaf/intermediate/root forward and rollback order in separate three- and
 five-process fleets on one host. It uses atomic projected `..data` swaps,
 production lifecycle defaults, separate source/controller status, affected-path
 fresh handshakes after every member, all paths at completed fleet cutovers,
-fresh all-voter readiness, and an encrypted canary. This does not qualify a CNF
-deployment, expiry/drain behavior, fault and resource pressure, supported
+fresh all-voter readiness, and an encrypted canary. The companion cases add
+the exact synthetic admission-loss/malformed-last-good combination and bounded
+same-issuer expiry/replacement behavior above. This still does not qualify a
+CNF deployment, a real network partition, mixed traffic/watch/restore under
+those faults, a broader restart/fault matrix, resource pressure, supported
 platforms, soak, remote HKMS, or signed release evidence; keep #164/#143 gates
 closed until those campaigns pass.
 
@@ -1156,8 +1196,11 @@ routing/quorum/commit/apply operation deadline remain separate bounded layers;
 the removed private config TCP timeout is not a production setting. A renewed
 SVID rotation has scoped real-mTLS qualification. #161 atomic reload, #162
 coherent material epochs, and #163 finite connection retirement are
-implemented; complete fleet trust removal, short-lived-SVID expiry/root-cutover,
-reconnect-storm, and multi-process continuity evidence remains #164 under
+implemented. The exact single-host multi-process trust and synthetic
+fault/expiry slices described above are covered; deployed trust/root cutover,
+real network/storage faults and broader restart behavior, mixed
+traffic/watch/restore under faults, reconnect storms, resources, soak, remote
+HKMS, deployed-CNF, and signed-release continuity evidence remains #164 under
 umbrella #158. Immediate generic CRL/OCSP/certificate-or-identity-denylist
 revocation remains unsupported. The remaining distributed/payload-key
 production evidence stays open in #143.

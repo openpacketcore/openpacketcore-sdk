@@ -18,6 +18,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed data fail closed. Source validation, response rate limiting,
   retransmission behavior, and other unauthenticated anti-amplification policy
   remain product responsibilities.
+- **Experimental projected-mTLS fault/expiry qualification —
+  `opc-session-testkit`:** non-ignored, serialized single-host tests now run
+  real three- and five-process Openraft/SQLite fleets through two bounded
+  scenarios. The first applies a test-only consensus-RPC admission gate to one
+  stable follower while a different member atomically publishes malformed
+  trust, retains its exact last-good TLS epoch, and leaves the survivor quorum
+  able to prove fresh durable readiness and advance an encrypted canary. It
+  then restarts the gated member on its exact manifest address, proves catch-up,
+  repairs the malformed generation, and proves retries stop. The second
+  publishes a same-issuer leaf with a 75-second remaining-validity/expiry
+  budget, keeps every incident directed path live below the idle timeout,
+  proves no local/peer leaf-expiry retirement before the fixed
+  `expiry - 30 seconds` soft boundary, then requires retirement, complete
+  hard-deadline drain, source/controller `LastGoodExpired`, a zero SVID-expiry
+  gauge, one expiry outcome, survivor readiness, and encrypted-canary progress.
+  A valid long-lived leaf restores every directed path and all-voter readiness
+  in the same process. These are synthetic regression scenarios, not a real or
+  deployed network partition; they run no mixed traffic/watch/restore workload
+  and provide no broader restart/fault matrix, resource/soak, remote-HKMS,
+  deployed-CNF, signed-release, evidence-schema, or profile claim. Openraft
+  remains the sole commit authority, and payload encryption, AAD,
+  key-provider/HKMS boundaries, SQLite/Openraft durable formats, and
+  encryption-at-rest responsibilities are unchanged.
 - **Experimental projected-mTLS traffic/resource qualification —
   `opc-session-testkit`:** the real 3/5-process rotation harness now registers
   every encrypted applied-state watch before starting deterministic
@@ -96,12 +119,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence, not remote-HKMS qualification. The historical loopback
   plaintext foundation remains behind `foundation-insecure`; the immutable v1
   candidate schema still describes only its earlier formation checkpoint.
-  This bounded single-host core is experimental and non-deployed: expiry,
-  unavailable/malformed members, partition/restart, mixed watch/restore load,
-  reconnect storms, resource pressure, supported-platform, soak, and signed
-  candidate evidence remain open under #164/#158/#143. Session payload
-  encryption, AAD, key-provider/HKMS boundaries, durable formats, and
-  Openraft's sole authority are unchanged.
+  This bounded single-host core is experimental and non-deployed. The later
+  fault/expiry slice above covers one exact synthetic admission-loss plus
+  malformed-last-good combination and a same-issuer leaf with a 75-second
+  remaining-validity/expiry budget, but not a
+  real network partition, mixed traffic/watch/restore during those faults, or a
+  broader restart/fault matrix. Resource/soak, remote-HKMS, deployed-CNF,
+  supported-platform, and signed candidate evidence remain open under
+  #164/#158/#143. Session payload encryption, AAD, key-provider/HKMS
+  boundaries, durable formats, and Openraft's sole authority are unchanged.
 - **Experimental HA qualification — `opc-consensus`, `opc-session-store`, and
   `opc-persist`:** both durable domains now use one fail-closed Openraft runtime
   profile and the exact `openpacketcore/openraft` revision
@@ -639,8 +665,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserves an acknowledged encryption-wrapper canary, and removed old-root
   chains fail to establish. This is SDK-generated loopback evidence only:
   `opc-session-testkit` still reports `foundation_counts_for_tls_rotation =
-  false`, and the remaining #164 multi-process/fault/resource/soak/signed
-  qualification stays open.
+  false`. The later non-ignored testkit cases cover one exact single-host
+  multi-process fault/expiry slice without advancing that schema; deployed and
+  broader fault/resource/soak/remote-HKMS/signed qualification stays open.
 - **BREAKING — `opc-persist`:** #177 replaces the crate's custom Raft-style
   config engine and `QuorumConfigStore` majority wrapper with
   `ConsensusConfigStore` on the exact-pinned `opc-consensus` Openraft engine.
