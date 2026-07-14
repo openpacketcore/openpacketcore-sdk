@@ -1361,6 +1361,7 @@ dependencies = [
 name = "opc-identity"
 version = "0.2.0"
 dependencies = [
+ "opc-redaction",
  "opc-types",
  "rustls",
  "rustls-pki-types",
@@ -1525,6 +1526,7 @@ name = "opc-tls"
 version = "0.2.0"
 dependencies = [
  "opc-identity",
+ "opc-redaction",
  "opc-types",
  "rustls",
  "rustls-pki-types",

@@ -197,8 +197,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Bounded `run_handshake` helpers retry an epoch change through TLS plus
   application negotiation, publish exact admitted epoch/leaf-expiry evidence,
   redact operation errors, cap concurrent attempts, and keep tickets,
-  resumption, early data, and 0-RTT disabled. Existing `rustls_config()` and
-  identity-source event APIs remain source compatible.
+  resumption, early data, and 0-RTT disabled. Fixed 3-by-4 redaction-safe
+  rotation counters, exact integer material epochs, and effective-chain expiry
+  are exported through `opc-redaction`; authoritative projected-source failures
+  use cumulative producer accounting in the source publication critical
+  section, while a one-time paired controller claim carries a non-cloneable
+  process telemetry authority. Per-publication lifecycle tickets record each
+  observed expiry exactly once across pre-pairing, source, and controller paths;
+  only the registry's active accepted ticket can change current gauges, so an
+  observed rejected or retained superseded ticket preserves active material
+  evidence. Supersession alone does not synthesize expiry. Acceptance performs
+  a serialized current-time expiry check and returns a typed outcome.
+  Configuration and Tokio-runtime preflight precede process/controller claims,
+  with dedicated runtime/claim errors that do not expand the exhaustive
+  compatibility config error. The registry is excluded from
+  `SdkMetrics::reset_all`; generic compatibility controllers cannot mutate it.
+  Its doc-hidden composition surface is public for trusted cross-crate wiring,
+  while cryptographic/material validation and the TLS controller retain
+  authorization. A non-cloneable transaction permit gates coherent publication
+  without invoking arbitrary code under registry locks; exported metric values
+  are never read to authorize TLS or readiness. Explicit-authority constructor
+  failures return that authority intact for retry.
+  Failures remain counted
+  across burst, notification coalescing, recovery before controller
+  construction, and source closure; there is no separately droppable monitor
+  or public outcome cursor. Existing `rustls_config()`, raw projected identity
+  subscriptions, and identity-source event APIs remain source compatible. The
+  operator campaign now derives its three-/five-member two-pass rollback
+  horizon from every bounded command and
+  evidence operation, binds evidence to one live-lease invocation and exact
+  operation/member/checkpoint, durably publishes without replacement, keeps
+  emergency withdrawal independent of evidence storage, and accounts the
+  deliberate old-chain probe without silencing authentication alerts. Its
+  adversarial shell harness exercises replay, ENOSPC/unwritable evidence,
+  collision/sync failure, recovery signals, bounded math, and concurrent probe
+  deltas; this is procedure validation, not deployed fleet qualification.
 - **BREAKING — legacy direct `opc-session-net` peers:** every authenticated
   direct and consensus connection now applies one finite
   `ConnectionLifecyclePolicy`, retaining exact admitted material epoch,

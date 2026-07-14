@@ -817,6 +817,12 @@ async fn last_good_expiry_fails_closed_with_stable_status() {
             now + time::Duration::seconds(2),
         )),
     );
+    let mut malformed_after_expiry = material(CLIENT_ID, &ca, &ca_key, None).state;
+    malformed_after_expiry.svid.private_key = material(CLIENT_ID, &ca, &ca_key, None)
+        .state
+        .svid
+        .private_key
+        .clone_key();
     let (source_tx, source_rx) = watch::channel(Some(short.state));
     let controller = TlsMaterialController::new(source_rx);
     assert_eq!(
@@ -832,6 +838,17 @@ async fn last_good_expiry_fails_closed_with_stable_status() {
         controller.status().availability(),
         TlsMaterialAvailability::Unavailable
     );
+    source_tx
+        .send(Some(malformed_after_expiry))
+        .expect("publish malformed candidate after expiry");
+    assert_eq!(
+        controller.status().reason(),
+        Some(TlsMaterialReloadReason::LastGoodExpired),
+        "the authoritative unavailable reason remains expiry"
+    );
+    drop(source_tx);
+    let _ = controller.status();
+    let _ = controller.status();
     assert!(matches!(
         TlsConfigBuilder::from_material_controller(controller)
             .allow_any_trusted_peer()
@@ -840,7 +857,25 @@ async fn last_good_expiry_fails_closed_with_stable_status() {
             .begin_handshake(),
         Err(TlsMaterialError::Unavailable)
     ));
-    drop(source_tx);
+}
+
+#[test]
+fn initial_malformed_svid_without_predecessor_is_rejected_as_svid() {
+    let (ca, ca_key) = test_ca("initial malformed metrics CA");
+    let mut malformed = material(CLIENT_ID, &ca, &ca_key, None).state;
+    malformed.svid.private_key = material(CLIENT_ID, &ca, &ca_key, None)
+        .state
+        .svid
+        .private_key
+        .clone_key();
+    let (_source_tx, source_rx) = watch::channel(Some(malformed));
+    let controller = TlsMaterialController::new(source_rx);
+
+    assert_eq!(controller.status().epoch().get(), 0);
+    assert_eq!(
+        controller.status().reason(),
+        Some(TlsMaterialReloadReason::PrivateKeyMismatch)
+    );
 }
 
 #[test]

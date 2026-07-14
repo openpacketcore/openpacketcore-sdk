@@ -213,6 +213,24 @@ epoch and #163's bounded connection reauthentication. Source `Ready` alone is
 not TLS readiness; consumers MUST gate on the controller status described
 below.
 
+Because a rejected projected candidate deliberately leaves the identity-state
+watch unchanged, `ProjectedSvidSource` MUST synchronously record its fixed
+rejection outcome under the publication lock before notifying observers. This
+producer accounting MUST use the recorder selected when constructing the
+source, and MUST remain independent of watch delivery and controller lifetime;
+burst, coalescing, scheduler lag, recovery before controller construction, and
+source closure therefore cannot lose an outcome. There is no public outcome
+cursor or separately droppable monitor.
+
+TLS consumers MUST construct the sole projected controller through
+`TlsMaterialController::new_from_projected_source` or
+`new_pinned_from_projected_source`. That one-time claim carries the source's
+exact identity channel and recorder into the controller, and rejects a second
+authority before it can split or duplicate telemetry. Generic controller
+constructors remain valid for independent-file, socket, and custom sources, but
+subscribing a projected source through them does not establish this production
+observability pairing.
+
 `opc-tls::TlsMaterialController` MUST revalidate each identity state under fixed
 certificate, trust-anchor, private-key, and aggregate byte bounds before it can
 become handshake authority. It MUST pin the explicit local SPIFFE identity or
@@ -636,6 +654,39 @@ For TLS readiness and lifecycle reporting, SVID expiry means the controller's
 effective earliest configured/presented-chain expiry, not an assumption that
 the leaf always expires first. Certificates present only in trust bundles are
 not independently included in that expiry value.
+
+`opc_security_svid_expires_seconds` is that expiry as a Unix timestamp and is
+zero when no coherent unexpired controller snapshot is available.
+`opc_security_bundle_version` is the opaque process-local coherent material
+epoch; it is not a Kubernetes generation name, path, material hash, cluster
+identity, or value that may be compared across process restarts or replicas.
+The fixed `opc_security_rotation_total` label space is the Cartesian product of
+`kind={tls_material,svid,trust_bundle}` and
+`outcome={success,retained_last_good,rejected,expired}`. A source reason is
+classified as `svid` or `trust_bundle` only when its closed enum proves that
+component; ambiguous failures remain `tls_material`. Reload rejection with an
+unexpired predecessor (`retained_last_good`), rejection without one
+(`rejected`), and observed lifecycle expiry of a coherent source publication
+(`expired`) are distinct from peer authentication/trust failure. Expiry can be
+observed before pairing, while controller-active, or after controller rejection;
+only expiry of the active accepted ticket may clear the expiry gauge, and
+supersession alone does not synthesize an outcome. Controller private-key
+mismatch, local
+identity-pin, temporal-validity, and expiry reasons are provably SVID outcomes.
+Chain/workload-identity validation, source acquisition, material-limit, closure,
+and epoch failures do not prove one changed component and remain
+`tls_material`. Expiry does not suppress a later malformed-candidate rejection,
+and that later rejection MUST NOT increment expiry again.
+
+Fleet rotation alerts and evidence MUST use the mechanically derived hard span
+in the consensus operator runbook, not a fixed sample duration. Evidence MUST
+bind exactly one invocation, non-secret live-lease binding, monotonic
+operation/nonce, member/checkpoint, phase/step, and fresh timestamp, and MUST be
+published with no-replace and crash-durable filesystem semantics. The lease
+token MUST travel only through a private descriptor and MUST NOT be logged or
+persisted. Emergency serving withdrawal MUST execute independently of evidence
+storage. A deliberate old-chain negative probe MUST remain visible to the
+authentication/trust alert and fail if its isolated delta is not exact.
 
 Metrics MUST control label cardinality. Raw SPIFFE IDs SHOULD be exposed through
 logs, not high-cardinality metrics, unless explicitly enabled.

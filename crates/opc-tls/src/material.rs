@@ -1,12 +1,21 @@
 //! Coherent, bounded TLS material epochs for individual handshakes.
 
-use opc_identity::{build_identity_state, IdentityReloadError, IdentityState};
+use opc_identity::projected_svid::ProjectedSvidControllerPublication;
+use opc_identity::{
+    build_identity_state, IdentityReloadError, IdentityState, ProjectedSvidControllerClaimError,
+    ProjectedSvidSource,
+};
+use opc_redaction::metrics::{
+    SecurityMetricsAcceptance, SecurityMetricsController, SecurityMetricsPublication,
+    SecurityRotationKind,
+};
 use opc_types::{SpiffeId, Timestamp};
 use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::CertificateDer;
 use serde::Serialize;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::runtime::Handle;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 /// Maximum certificate count accepted in one local SVID chain.
@@ -96,6 +105,22 @@ pub enum TlsMaterialReloadReason {
 }
 
 impl TlsMaterialReloadReason {
+    /// Every closed reason, for exhaustive fixed-cardinality handling.
+    pub const ALL: [Self; 12] = [
+        Self::AwaitingInitialMaterial,
+        Self::MaterialUnavailable,
+        Self::SourceClosed,
+        Self::MaterialLimitExceeded,
+        Self::InvalidCertificateChain,
+        Self::PrivateKeyMismatch,
+        Self::ExpiredMaterial,
+        Self::NotYetValidMaterial,
+        Self::InvalidWorkloadIdentity,
+        Self::LocalIdentityChanged,
+        Self::LastGoodExpired,
+        Self::EpochExhausted,
+    ];
+
     /// Stable low-cardinality representation for events and metrics.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -208,6 +233,7 @@ pub(crate) struct TlsMaterialSnapshot {
     leaf_expires_at: Timestamp,
     certificate_chain_expires_at: Timestamp,
     pub(crate) state: Arc<IdentityState>,
+    metrics_publication: Option<SecurityMetricsPublication>,
 }
 
 impl TlsMaterialSnapshot {
@@ -245,10 +271,41 @@ struct ControllerState {
 }
 
 struct ControllerInner {
-    source_rx: Mutex<watch::Receiver<Option<IdentityState>>>,
+    source_rx: Mutex<MaterialSourceReceiver>,
+    builder_rx: watch::Receiver<Option<IdentityState>>,
     state: Mutex<ControllerState>,
     status_tx: watch::Sender<TlsMaterialStatus>,
     handshake_gate: Arc<Semaphore>,
+    metrics: Option<SecurityMetricsController>,
+    reconciliation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[derive(Clone)]
+enum MaterialSourceReceiver {
+    Generic(watch::Receiver<Option<IdentityState>>),
+    Projected(watch::Receiver<Option<ProjectedSvidControllerPublication>>),
+}
+
+impl MaterialSourceReceiver {
+    async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        match self {
+            Self::Generic(receiver) => receiver.changed().await,
+            Self::Projected(receiver) => receiver.changed().await,
+        }
+    }
+}
+
+impl Drop for ControllerInner {
+    fn drop(&mut self) {
+        let task = self
+            .reconciliation_task
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
 }
 
 /// Shared coherent TLS material authority for new handshakes.
@@ -267,7 +324,7 @@ pub struct TlsMaterialController {
 /// certificate and key material never cross this boundary.
 pub struct TlsMaterialStatusReceiver {
     controller: TlsMaterialController,
-    source_rx: watch::Receiver<Option<IdentityState>>,
+    source_rx: MaterialSourceReceiver,
 }
 
 impl TlsMaterialStatusReceiver {
@@ -294,8 +351,19 @@ impl fmt::Debug for TlsMaterialStatusReceiver {
 
 impl TlsMaterialController {
     /// Create a controller that pins the first accepted local SPIFFE identity.
+    ///
+    /// Use [`Self::new_from_projected_source`] for a
+    /// [`ProjectedSvidSource`]; that constructor pairs the exact channel and
+    /// telemetry authority and owns background reconciliation. Generic
+    /// controllers remain compatible but never mutate process-wide security
+    /// evidence.
     pub fn new(source_rx: watch::Receiver<Option<IdentityState>>) -> Self {
-        Self::new_with_optional_pin(source_rx, None)
+        Self::new_with_optional_pin(
+            MaterialSourceReceiver::Generic(source_rx.clone()),
+            source_rx,
+            None,
+            None,
+        )
     }
 
     /// Create a controller pinned to one explicit local SPIFFE identity.
@@ -303,17 +371,63 @@ impl TlsMaterialController {
         source_rx: watch::Receiver<Option<IdentityState>>,
         local_spiffe_id: SpiffeId,
     ) -> Self {
-        Self::new_with_optional_pin(source_rx, Some(local_spiffe_id))
+        Self::new_with_optional_pin(
+            MaterialSourceReceiver::Generic(source_rx.clone()),
+            source_rx,
+            Some(local_spiffe_id),
+            None,
+        )
+    }
+
+    /// Claim one projected source as this controller's sole authority.
+    ///
+    /// The source records source failures, while this controller publishes
+    /// accepted epochs and controller rejections. Either side's first
+    /// observation of expiry for the active ticket may clear the expiry gauge
+    /// under their shared lifecycle. The paired input prevents channel/recorder
+    /// mismatch, and a background reconciliation task is owned by the controller
+    /// rather than a droppable external monitor.
+    pub fn new_from_projected_source(
+        source: &ProjectedSvidSource,
+    ) -> Result<Self, ProjectedSvidControllerClaimError> {
+        Self::new_from_projected_source_with_optional_pin(source, None)
+    }
+
+    /// Claim one projected source and pin its expected local SPIFFE identity.
+    pub fn new_pinned_from_projected_source(
+        source: &ProjectedSvidSource,
+        local_spiffe_id: SpiffeId,
+    ) -> Result<Self, ProjectedSvidControllerClaimError> {
+        Self::new_from_projected_source_with_optional_pin(source, Some(local_spiffe_id))
+    }
+
+    fn new_from_projected_source_with_optional_pin(
+        source: &ProjectedSvidSource,
+        pinned_spiffe_id: Option<SpiffeId>,
+    ) -> Result<Self, ProjectedSvidControllerClaimError> {
+        let builder_rx = source.subscribe();
+        let (source_rx, metrics, runtime) = source.claim_tls_controller()?.into_parts();
+        let controller = Self::new_with_optional_pin(
+            MaterialSourceReceiver::Projected(source_rx),
+            builder_rx,
+            pinned_spiffe_id,
+            Some(metrics),
+        );
+        controller.start_reconciliation_task(runtime);
+        Ok(controller)
     }
 
     fn new_with_optional_pin(
-        source_rx: watch::Receiver<Option<IdentityState>>,
+        source_rx: MaterialSourceReceiver,
+        builder_rx: watch::Receiver<Option<IdentityState>>,
         pinned_spiffe_id: Option<SpiffeId>,
+        metrics: Option<SecurityMetricsController>,
     ) -> Self {
         let (status_tx, _) = watch::channel(TlsMaterialStatus::initial());
         let controller = Self {
             inner: Arc::new(ControllerInner {
                 source_rx: Mutex::new(source_rx),
+                builder_rx,
                 state: Mutex::new(ControllerState {
                     pinned_spiffe_id,
                     snapshot: None,
@@ -321,10 +435,33 @@ impl TlsMaterialController {
                 }),
                 status_tx,
                 handshake_gate: Arc::new(Semaphore::new(MAX_TLS_CONCURRENT_HANDSHAKES)),
+                metrics,
+                reconciliation_task: Mutex::new(None),
             }),
         };
         controller.refresh_initial();
         controller
+    }
+
+    fn start_reconciliation_task(&self, runtime: Handle) {
+        let mut source_changes = self.material_source_receiver();
+        let weak = Arc::downgrade(&self.inner);
+        let task = runtime.spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                TlsMaterialController { inner }.status();
+
+                if source_changes.changed().await.is_err() {
+                    if let Some(inner) = weak.upgrade() {
+                        TlsMaterialController { inner }.status();
+                    }
+                    break;
+                }
+            }
+        });
+        *lock_unpoisoned(&self.inner.reconciliation_task) = Some(task);
     }
 
     /// Return the current redaction-safe status after reconciling source changes.
@@ -343,12 +480,16 @@ impl TlsMaterialController {
     pub fn subscribe_material_changes(&self) -> TlsMaterialStatusReceiver {
         TlsMaterialStatusReceiver {
             controller: self.clone(),
-            source_rx: self.source_receiver(),
+            source_rx: self.material_source_receiver(),
         }
     }
 
-    pub(crate) fn source_receiver(&self) -> watch::Receiver<Option<IdentityState>> {
+    fn material_source_receiver(&self) -> MaterialSourceReceiver {
         lock_unpoisoned(&self.inner.source_rx).clone()
+    }
+
+    pub(crate) fn source_receiver(&self) -> watch::Receiver<Option<IdentityState>> {
+        self.inner.builder_rx.clone()
     }
 
     pub(crate) fn snapshot(&self) -> Result<TlsMaterialSnapshot, TlsMaterialError> {
@@ -390,30 +531,71 @@ impl TlsMaterialController {
 
     fn refresh_initial(&self) {
         let mut source_rx = lock_unpoisoned(&self.inner.source_rx);
-        let candidate = source_rx.borrow_and_update();
-        self.apply_candidate(candidate.as_ref());
+        match &mut *source_rx {
+            MaterialSourceReceiver::Generic(receiver) => {
+                let candidate = receiver.borrow_and_update();
+                self.apply_candidate(candidate.as_ref(), None);
+            }
+            MaterialSourceReceiver::Projected(receiver) => {
+                let candidate = receiver.borrow_and_update();
+                self.apply_candidate(
+                    candidate
+                        .as_ref()
+                        .map(ProjectedSvidControllerPublication::identity_state),
+                    candidate
+                        .as_ref()
+                        .map(ProjectedSvidControllerPublication::metrics_publication),
+                );
+            }
+        }
     }
 
     fn refresh(&self) {
         let mut source_rx = lock_unpoisoned(&self.inner.source_rx);
-        match source_rx.has_changed() {
-            Ok(true) => {
-                let candidate = source_rx.borrow_and_update();
-                self.apply_candidate(candidate.as_ref());
-            }
-            Ok(false) => self.expire_if_needed(),
-            Err(_) => self.report_source_closed(),
+        match &mut *source_rx {
+            MaterialSourceReceiver::Generic(receiver) => match receiver.has_changed() {
+                Ok(true) => {
+                    let candidate = receiver.borrow_and_update();
+                    self.apply_candidate(candidate.as_ref(), None);
+                }
+                Ok(false) => self.expire_if_needed(),
+                Err(_) => self.report_source_closed(),
+            },
+            MaterialSourceReceiver::Projected(receiver) => match receiver.has_changed() {
+                Ok(true) => {
+                    let candidate = receiver.borrow_and_update();
+                    self.apply_candidate(
+                        candidate
+                            .as_ref()
+                            .map(ProjectedSvidControllerPublication::identity_state),
+                        candidate
+                            .as_ref()
+                            .map(ProjectedSvidControllerPublication::metrics_publication),
+                    );
+                }
+                Ok(false) => self.expire_if_needed(),
+                Err(_) => self.report_source_closed(),
+            },
         }
     }
 
-    fn apply_candidate(&self, candidate: Option<&IdentityState>) {
+    fn apply_candidate(
+        &self,
+        candidate: Option<&IdentityState>,
+        metrics_publication: Option<&SecurityMetricsPublication>,
+    ) {
         let mut controller = lock_unpoisoned(&self.inner.state);
-        expire_locked(&mut controller, &self.inner.status_tx);
+        expire_locked(
+            &mut controller,
+            &self.inner.status_tx,
+            self.inner.metrics.as_ref(),
+        );
 
         let Some(candidate) = candidate else {
             publish_rejection(
                 &controller,
                 &self.inner.status_tx,
+                self.inner.metrics.as_ref(),
                 TlsMaterialReloadReason::MaterialUnavailable,
             );
             return;
@@ -421,7 +603,12 @@ impl TlsMaterialController {
         let (validated, certificate_chain_expires_at) = match validate_candidate(candidate) {
             Ok(validated) => validated,
             Err(reason) => {
-                publish_rejection(&controller, &self.inner.status_tx, reason);
+                publish_rejection(
+                    &controller,
+                    &self.inner.status_tx,
+                    self.inner.metrics.as_ref(),
+                    reason,
+                );
                 return;
             }
         };
@@ -431,6 +618,7 @@ impl TlsMaterialController {
                 publish_rejection(
                     &controller,
                     &self.inner.status_tx,
+                    self.inner.metrics.as_ref(),
                     TlsMaterialReloadReason::LocalIdentityChanged,
                 );
                 return;
@@ -442,37 +630,96 @@ impl TlsMaterialController {
             publish_rejection(
                 &controller,
                 &self.inner.status_tx,
+                self.inner.metrics.as_ref(),
                 TlsMaterialReloadReason::EpochExhausted,
             );
             return;
         };
-        if controller.pinned_spiffe_id.is_none() {
-            controller.pinned_spiffe_id = Some(validated.identity.spiffe_id.clone());
-        }
         let leaf_expires_at = validated.identity.expires_at;
-        controller.snapshot = Some(TlsMaterialSnapshot {
+        let snapshot = TlsMaterialSnapshot {
             epoch: next_epoch,
             leaf_expires_at,
             certificate_chain_expires_at,
             state: Arc::new(validated),
-        });
-        self.inner.status_tx.send_replace(TlsMaterialStatus {
+            metrics_publication: metrics_publication.cloned(),
+        };
+        let status = TlsMaterialStatus {
             epoch: next_epoch,
             availability: TlsMaterialAvailability::Ready,
             reason: None,
             leaf_expires_at: Some(leaf_expires_at),
             certificate_chain_expires_at: Some(certificate_chain_expires_at),
-        });
+        };
+        let pin = snapshot.state.identity.spiffe_id.clone();
+        match (self.inner.metrics.as_ref(), metrics_publication) {
+            (Some(metrics), Some(publication)) => {
+                // Lock order is ControllerState (held above), publication
+                // lifecycle, then active registry. Once Ready, only infallible
+                // field moves occur before commit; status is published after.
+                let acceptance = metrics.prepare_success_if_active(
+                    publication,
+                    next_epoch.get(),
+                    certificate_chain_expires_at
+                        .as_offset_datetime()
+                        .unix_timestamp(),
+                );
+                match acceptance {
+                    SecurityMetricsAcceptance::Ready(permit) => {
+                        if controller.pinned_spiffe_id.is_none() {
+                            controller.pinned_spiffe_id = Some(pin);
+                        }
+                        controller.snapshot = Some(snapshot);
+                        permit.commit();
+                        self.inner.status_tx.send_replace(status);
+                    }
+                    SecurityMetricsAcceptance::AlreadyAccepted => {}
+                    SecurityMetricsAcceptance::Expired => {
+                        publish_expired_candidate(&controller, &self.inner.status_tx);
+                    }
+                    SecurityMetricsAcceptance::RegistryMismatch => {
+                        publish_rejection(
+                            &controller,
+                            &self.inner.status_tx,
+                            self.inner.metrics.as_ref(),
+                            TlsMaterialReloadReason::MaterialUnavailable,
+                        );
+                    }
+                }
+            }
+            (None, None) => {
+                if controller.pinned_spiffe_id.is_none() {
+                    controller.pinned_spiffe_id = Some(pin);
+                }
+                controller.snapshot = Some(snapshot);
+                self.inner.status_tx.send_replace(status);
+            }
+            _ => {
+                publish_rejection(
+                    &controller,
+                    &self.inner.status_tx,
+                    self.inner.metrics.as_ref(),
+                    TlsMaterialReloadReason::MaterialUnavailable,
+                );
+            }
+        }
     }
 
     fn expire_if_needed(&self) {
         let mut controller = lock_unpoisoned(&self.inner.state);
-        expire_locked(&mut controller, &self.inner.status_tx);
+        expire_locked(
+            &mut controller,
+            &self.inner.status_tx,
+            self.inner.metrics.as_ref(),
+        );
     }
 
     fn report_source_closed(&self) {
         let mut controller = lock_unpoisoned(&self.inner.state);
-        expire_locked(&mut controller, &self.inner.status_tx);
+        expire_locked(
+            &mut controller,
+            &self.inner.status_tx,
+            self.inner.metrics.as_ref(),
+        );
         if controller.source_closed_reported {
             return;
         }
@@ -480,6 +727,7 @@ impl TlsMaterialController {
         publish_rejection(
             &controller,
             &self.inner.status_tx,
+            self.inner.metrics.as_ref(),
             TlsMaterialReloadReason::SourceClosed,
         );
     }
@@ -497,7 +745,11 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn expire_locked(controller: &mut ControllerState, status_tx: &watch::Sender<TlsMaterialStatus>) {
+fn expire_locked(
+    controller: &mut ControllerState,
+    status_tx: &watch::Sender<TlsMaterialStatus>,
+    metrics: Option<&SecurityMetricsController>,
+) {
     let expired = controller
         .snapshot
         .as_ref()
@@ -505,6 +757,11 @@ fn expire_locked(controller: &mut ControllerState, status_tx: &watch::Sender<Tls
     if !expired {
         return;
     }
+    let metrics_publication = controller
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.metrics_publication.as_ref())
+        .cloned();
     controller.snapshot = None;
     let epoch = status_tx.borrow().epoch;
     status_tx.send_replace(TlsMaterialStatus {
@@ -514,11 +771,15 @@ fn expire_locked(controller: &mut ControllerState, status_tx: &watch::Sender<Tls
         leaf_expires_at: None,
         certificate_chain_expires_at: None,
     });
+    if let (Some(metrics), Some(publication)) = (metrics, metrics_publication.as_ref()) {
+        metrics.record_expired_once(publication);
+    }
 }
 
 fn publish_rejection(
     controller: &ControllerState,
     status_tx: &watch::Sender<TlsMaterialStatus>,
+    metrics: Option<&SecurityMetricsController>,
     reason: TlsMaterialReloadReason,
 ) {
     let current = *status_tx.borrow();
@@ -541,6 +802,63 @@ fn publish_rejection(
         certificate_chain_expires_at: retained
             .map(TlsMaterialSnapshot::certificate_chain_expires_at),
     });
+    if reason == TlsMaterialReloadReason::LastGoodExpired {
+        return;
+    }
+    let kind = controller_reason_kind(reason);
+    if retained.is_some() {
+        if let Some(metrics) = metrics {
+            metrics.record_retained_last_good(kind);
+        }
+    } else {
+        let initial_absence = current.reason
+            == Some(TlsMaterialReloadReason::AwaitingInitialMaterial)
+            && reason == TlsMaterialReloadReason::MaterialUnavailable;
+        let expiry_source_clear = current.reason == Some(TlsMaterialReloadReason::LastGoodExpired)
+            && reason == TlsMaterialReloadReason::MaterialUnavailable;
+        if !initial_absence && !expiry_source_clear {
+            if let Some(metrics) = metrics {
+                metrics.record_rejected(kind, current.epoch.get());
+            }
+        }
+    }
+}
+
+fn publish_expired_candidate(
+    controller: &ControllerState,
+    status_tx: &watch::Sender<TlsMaterialStatus>,
+) {
+    let current = *status_tx.borrow();
+    let retained = controller.snapshot.as_ref();
+    status_tx.send_replace(TlsMaterialStatus {
+        epoch: current.epoch,
+        availability: if retained.is_some() {
+            TlsMaterialAvailability::RetainingLastGood
+        } else {
+            TlsMaterialAvailability::Unavailable
+        },
+        reason: Some(TlsMaterialReloadReason::ExpiredMaterial),
+        leaf_expires_at: retained.map(TlsMaterialSnapshot::leaf_expires_at),
+        certificate_chain_expires_at: retained
+            .map(TlsMaterialSnapshot::certificate_chain_expires_at),
+    });
+}
+
+fn controller_reason_kind(reason: TlsMaterialReloadReason) -> SecurityRotationKind {
+    match reason {
+        TlsMaterialReloadReason::PrivateKeyMismatch
+        | TlsMaterialReloadReason::ExpiredMaterial
+        | TlsMaterialReloadReason::NotYetValidMaterial
+        | TlsMaterialReloadReason::LocalIdentityChanged
+        | TlsMaterialReloadReason::LastGoodExpired => SecurityRotationKind::Svid,
+        TlsMaterialReloadReason::AwaitingInitialMaterial
+        | TlsMaterialReloadReason::MaterialUnavailable
+        | TlsMaterialReloadReason::SourceClosed
+        | TlsMaterialReloadReason::MaterialLimitExceeded
+        | TlsMaterialReloadReason::InvalidCertificateChain
+        | TlsMaterialReloadReason::InvalidWorkloadIdentity
+        | TlsMaterialReloadReason::EpochExhausted => SecurityRotationKind::TlsMaterial,
+    }
 }
 
 fn validate_candidate_chain_temporal_validity(
@@ -926,5 +1244,27 @@ mod tests {
         let debug = format!("{:?}", controller.status());
         assert!(!debug.contains("spiffe://"));
         assert!(!debug.contains("BEGIN"));
+    }
+
+    #[test]
+    fn controller_reasons_use_svid_only_when_the_component_is_provable() {
+        assert_eq!(TlsMaterialReloadReason::ALL.len(), 12);
+        for reason in TlsMaterialReloadReason::ALL {
+            let expected = match reason {
+                TlsMaterialReloadReason::PrivateKeyMismatch
+                | TlsMaterialReloadReason::ExpiredMaterial
+                | TlsMaterialReloadReason::NotYetValidMaterial
+                | TlsMaterialReloadReason::LocalIdentityChanged
+                | TlsMaterialReloadReason::LastGoodExpired => SecurityRotationKind::Svid,
+                TlsMaterialReloadReason::AwaitingInitialMaterial
+                | TlsMaterialReloadReason::MaterialUnavailable
+                | TlsMaterialReloadReason::SourceClosed
+                | TlsMaterialReloadReason::MaterialLimitExceeded
+                | TlsMaterialReloadReason::InvalidCertificateChain
+                | TlsMaterialReloadReason::InvalidWorkloadIdentity
+                | TlsMaterialReloadReason::EpochExhausted => SecurityRotationKind::TlsMaterial,
+            };
+            assert_eq!(controller_reason_kind(reason), expected, "{reason:?}");
+        }
     }
 }

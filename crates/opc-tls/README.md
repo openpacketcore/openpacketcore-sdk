@@ -27,8 +27,35 @@ and instance metadata.
   reloadable SVID resolver. Security-sensitive consumers such as
   `opc-session-net` require these wrappers instead of raw Rustls configs.
 - `TlsMaterialController::new(source)` pins the first accepted local SPIFFE ID;
-  `new_pinned(source, id)` enforces an explicit pin. Clones share one bounded,
-  process-local monotonic epoch and last-good state.
+  `new_pinned(source, id)` enforces an explicit pin for generic file, socket, or
+  custom identity-state channels. Clones share one bounded, process-local
+  monotonic epoch and last-good state. These compatibility controllers do not
+  mutate process-global security rotation metrics.
+- `new_from_projected_source(source)` and
+  `new_pinned_from_projected_source(source, id)` are the production pairing
+  boundary for an authoritative `ProjectedSvidSource`. They atomically claim
+  that source's exact paired feed and non-cloneable controller metrics
+  authority; a second controller claim fails before it can split or duplicate
+  exported telemetry. Runtime capture happens before the one-time claim, and
+  the captured handle owns reconciliation spawning; construction outside an
+  entered runtime returns `RuntimeUnavailable` without consuming the claim.
+- Projected-source failures are counted synchronously by the source even when a
+  rejected candidate leaves the identity-state watch unchanged. The paired
+  controller publishes accepted epochs, controller rejections, and current
+  gauges. One per-publication ticket deduplicates controller effective-chain
+  expiry and source leaf expiry, including expiry observed before pairing or
+  after controller rejection. There is no public outcome cursor or separately
+  droppable monitor. Supersession alone does not synthesize expiry; production
+  normally drops the replaced ticket. A retained late observation of an
+  unaccepted or superseded ticket is counted once without changing the active
+  snapshot's gauges. Source or controller may clear the expiry gauge only when
+  first observing expiry of the active accepted ticket.
+- Acceptance follows one lock order: controller state, publication lifecycle,
+  then active registry. After validation, the controller installs the snapshot
+  and pin, commits the non-cloneable permit with no intervening fallible work,
+  and only then publishes `Ready`. No callback executes under registry locks.
+  Deliberate same-thread metrics reentry while holding this doc-hidden permit is
+  forbidden trusted-process misuse.
 - `TlsConfigBuilder::from_material_controller(controller)` lets client and
   server wrappers share that exact authority. `begin_handshake()` freezes one
   leaf/key/chain/trust snapshot; its config must be used for the complete TLS
@@ -64,7 +91,7 @@ async fn build_configs(
 }
 ```
 
-For coherent production handshake admission:
+For coherent handshake admission from a generic file, socket, or custom source:
 
 ```rust,no_run
 use opc_tls::{PeerPolicy, TlsConfigBuilder, TlsMaterialController};
@@ -92,6 +119,23 @@ async fn coherent_handshake(
 }
 ```
 
+For a Kubernetes projected Secret, use the paired constructor instead of
+subscribing its generic identity-state channel directly:
+
+```rust,ignore
+let source = opc_identity::ProjectedSvidSource::new_authoritative(
+    projected_root,
+    "tls.crt",
+    "tls.key",
+    vec!["ca.crt"],
+    Some(projected_poll_interval),
+)?;
+let controller = opc_tls::TlsMaterialController::new_pinned_from_projected_source(
+    &source,
+    expected_local_spiffe_id,
+)?;
+```
+
 ## Relationships
 
 - Consumes `opc-identity::IdentityState` from `ProjectedSvidSource`,
@@ -99,6 +143,21 @@ async fn coherent_handshake(
 - Uses `opc-types` identity values embedded in SPIFFE IDs.
 - Intended for KMS, session transport, consensus transport, and other mTLS
   service boundaries.
+- Both `opc-identity` and `opc-tls` use the shared `opc-redaction` registry for
+  the fixed
+  `opc_security_svid_expires_seconds`, `opc_security_bundle_version`, and
+  `opc_security_rotation_total{kind,outcome}` families: the identity source
+  records source outcomes and owns publication tickets, while the paired TLS
+  controller records controller outcomes and accepted epochs. Parsing and
+  validation do not require an installed exporter. Normal consumers use the
+  read-only reader, while one source/controller capability owns writes and
+  `SdkMetrics::reset_all` cannot erase them. The
+  doc-hidden composition APIs must be public across SDK crates; trusted
+  same-process code can claim that sole writer first. Cryptographic/material
+  validation and this controller own identity and peer authorization. The
+  non-cloneable lifecycle permit is an internal coherent-publication gate;
+  exported metric values are never read as an authorization, TLS-admission, or
+  readiness input.
 
 ## Status Notes
 
@@ -117,6 +176,19 @@ async fn coherent_handshake(
   Status/snapshot access reconciles the latest watch value and enforces the
   earliest configured-chain expiry. This controller status is authoritative
   for TLS admission; an upstream source `Ready` status alone is not.
+- The SVID expiry gauge is the controller's effective configured/presented-chain
+  Unix expiry (zero when unavailable), not necessarily the leaf expiry. The
+  bundle-version gauge is the last accepted opaque process-local controller
+  epoch, retained when that active ticket expires for correlation. An observed
+  rejected, unaccepted, or superseded ticket expiry can increment `expired` but
+  changes neither gauge; supersession alone does not synthesize that outcome.
+  Rotation labels are a fixed 3-by-4 set; they cannot include identities,
+  paths, material, endpoints, or caller text. `retained_last_good`, `rejected`,
+  `expired`, and peer authentication/trust failure remain distinct outcomes.
+  Private-key mismatch, local-identity change, temporal validity, and expiry
+  controller reasons use `kind="svid"`. Chain/workload-identity validation,
+  acquisition, limit, closure, and epoch failures do not prove one changed
+  component and conservatively use `kind="tls_material"`.
 - Readiness code must call `material_status()` or
   `TlsMaterialController::status()` for each evaluation. A previously borrowed
   status/watch value is not a wall-clock expiry timer; source activity or an
@@ -133,7 +205,9 @@ async fn coherent_handshake(
 ## Compatibility
 
 `TlsConfigBuilder::new`, raw config builders, `rustls_config()`, peer-identity
-helpers, and identity-source events remain source compatible. The legacy
+helpers, raw projected identity subscriptions, and identity-source events
+remain source compatible. Generic controllers built from those raw channels
+do not write process-global security metrics. The legacy
 `rustls_config()` view remains reloadable for existing consumers; it does not
 provide the new post-application epoch-current admission proof. New production
 transport integrations should use `run_handshake()` by default. Direct

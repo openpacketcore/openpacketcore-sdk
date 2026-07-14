@@ -20,10 +20,17 @@ for TLS and service clients.
 - `FileSvidSource::new(cert_path, key_path, bundle_paths, poll_interval)` polls
   independently managed PEM files and emits the same state/events interface.
 - `ProjectedSvidSource::new(volume_root, cert_file, key_file, bundle_files,
-  poll_interval)` is the production Kubernetes projected-volume adapter. It
-  resolves one `..data` generation, reads every file from that immutable
-  directory, rejects a generation switch during any read phase, and publishes
-  an opaque monotonic generation plus typed status.
+  poll_interval)` preserves the compatibility source without process-global
+  telemetry. `new_authoritative(...)` is the production Kubernetes
+  projected-volume adapter and claims the sole process security-metrics
+  authority. Both constructors resolve one `..data` generation, read every
+  file from that immutable directory, reject a generation switch during any
+  read phase, and publish an opaque monotonic generation plus typed status.
+  `new_authoritative(...)` validates configuration and captures the active
+  Tokio runtime before claiming process telemetry; its
+  `ProjectedSvidAuthoritativeError` distinguishes configuration, unavailable
+  runtime, and already-claimed authority without changing the exhaustive
+  `ProjectedSvidConfigError` variants.
 - `parse_certs_pem` and `parse_key_pem` are available for callers that already
   own the reload loop.
 - Core data types include `TrustDomain`, `TrustBundle`, `TrustBundleSet`,
@@ -52,7 +59,7 @@ use opc_identity::ProjectedSvidSource;
 use std::time::Duration;
 
 fn projected_source() -> ProjectedSvidSource {
-    ProjectedSvidSource::new(
+    ProjectedSvidSource::new_authoritative(
         "/var/run/secrets/openpacketcore/tls",
         "tls.crt",
         "tls.key",
@@ -80,6 +87,40 @@ fn projected_source() -> ProjectedSvidSource {
   or carrying an invalid workload path.
 - Watchers retain the last good identity after invalid updates and clear expired
   state during expiry monitoring.
+- Authoritative projected-source failure outcomes are synchronously accumulated
+  in a fixed, monotonic producer-side matrix under the publication lock.
+  Counting does not depend on identity-watch delivery or controller
+  construction, so coalescing, scheduler lag, recovery before pairing, and
+  source closure cannot lose a failure. Every coherent publication carries one
+  exact-once expiry ticket, so an expiry observed before controller pairing,
+  while controller-active, or after controller rejection produces one
+  `expired` outcome across source/controller races. There is no public outcome
+  cursor or separately droppable monitor. Supersession alone does not synthesize
+  expiry; production normally drops the replaced ticket. A retained late
+  observation of a rejected or superseded ticket is still deduplicated and
+  cannot clear the active controller publication's expiry or version gauges.
+  Only expiry of the active accepted ticket zeroes the expiry gauge, retaining
+  its last accepted controller epoch for correlation.
+- `ProjectedSvidSource::claim_tls_controller()` is a one-time pairing boundary
+  used by `opc-tls`: it carries the source's exact paired feed and non-cloneable
+  controller metrics authority into one process-global telemetry authority. A
+  second claim fails before another controller can split or duplicate exported
+  telemetry; clones of the first controller remain supported. Compatibility
+  identity subscriptions remain available, but controllers built from those
+  raw channels never mutate process-global security metrics.
+- The controller claim captures an entered Tokio runtime before consuming its
+  one-time authority and carries that handle into `opc-tls`; construction
+  outside a runtime returns `RuntimeUnavailable` without burning the claim.
+- Rust has no cross-crate friend visibility, so the doc-hidden process metrics
+  composition primitives remain public for trusted same-process SDK wiring.
+  Such code can claim the sole writer first. Cryptographic/material validation
+  and the TLS controller own identity and peer authorization. The lifecycle
+  ticket and transactional permit gate coherent publication internally, while
+  exported metric values are never read to authorize TLS, access, or readiness.
+- `new_with_metrics(...)` returns a `ProjectedSvidWithMetricsError` containing
+  the unchanged authority when configuration or runtime preflight fails. A
+  caller that explicitly claimed process authority can therefore recover it
+  and retry without resetting or duplicating the global claim.
 - `ProjectedSvidSource` accepts 1 MiB for the SVID chain, 64 KiB for the private
   key, and 1 MiB per trust-bundle file, with a 4 MiB total candidate limit. It
   accepts at most 16 bundle files, 16 SVID-chain certificates, and 128 trust
@@ -104,9 +145,18 @@ or compared across process restarts. Rollback to an earlier Kubernetes Secret
 payload is a new successful publication and receives a larger generation.
 
 The projected source makes identity material publication coherent. `opc-tls`
-now turns accepted states into coherent per-handshake epochs under #162. Neither
-layer retires already authenticated TLS connections; bounded connection
-reauthentication remains #163.
+turns accepted states into coherent per-handshake epochs under #162, and
+`opc-session-net` consumes those epochs for #163's bounded connection
+retirement and full-handshake reauthentication. Authoritative projected-source
+rejection and source-observed expiry counters are recorded directly by this
+crate. The one-time paired `opc-tls` controller publishes accepted epoch/expiry
+gauges and controller-level outcomes in the same selected registry; whichever
+side first observes expiry of the active ticket may clear its expiry gauge under
+the shared exact-once lifecycle.
+`SdkMetrics::reset_all` cannot erase this process security evidence. Exported
+metric values are not authorization or readiness inputs and do not change the
+legacy identity-state publication contract. Fleet rotation and deployed-network
+qualification remain #164/#143.
 
 ## Roadmap
 
