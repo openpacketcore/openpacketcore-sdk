@@ -7,8 +7,8 @@
 use opc_protocol::SpecRef;
 
 use crate::dictionary::{
-    ApplicationDefinition, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey, CommandDefinition,
-    CommandKind, Dictionary,
+    ApplicationDefinition, AvpCardinality, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey,
+    CommandAvpRule, CommandDefinition, CommandKind, Dictionary,
 };
 use crate::{ApplicationId, AvpCode, CommandCode};
 
@@ -88,6 +88,37 @@ const BASE_APPLICATIONS: [ApplicationDefinition; 1] = [ApplicationDefinition::ne
     SpecRef::new("ietf", "RFC6733", "3"),
 )];
 
+// RFC 6733 sections 5.3.1 and 5.3.2 use the same explicit repeatable
+// capability fields for CER and CEA. The trailing extension AVP wildcard is
+// intentionally not modeled as blanket repeatability: an extension needs its
+// own trusted command profile before it can bypass duplicate rejection.
+const CAPABILITIES_EXCHANGE_REPEATABLE_AVP_RULES: [CommandAvpRule; 6] = [
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_HOST_IP_ADDRESS),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_SUPPORTED_VENDOR_ID),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_AUTH_APPLICATION_ID),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_INBAND_SECURITY_ID),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_ACCT_APPLICATION_ID),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID),
+        AvpCardinality::ZeroOrMore,
+    ),
+];
+
 const BASE_COMMANDS: [CommandDefinition; 6] = [
     CommandDefinition::new(
         COMMAND_CAPABILITIES_EXCHANGE,
@@ -96,7 +127,8 @@ const BASE_COMMANDS: [CommandDefinition; 6] = [
         APPLICATION_ID_COMMON_MESSAGES,
         false,
         SpecRef::new("ietf", "RFC6733", "5.3.1"),
-    ),
+    )
+    .with_avp_rules(&CAPABILITIES_EXCHANGE_REPEATABLE_AVP_RULES),
     CommandDefinition::new(
         COMMAND_CAPABILITIES_EXCHANGE,
         "Capabilities-Exchange-Answer",
@@ -104,7 +136,8 @@ const BASE_COMMANDS: [CommandDefinition; 6] = [
         APPLICATION_ID_COMMON_MESSAGES,
         false,
         SpecRef::new("ietf", "RFC6733", "5.3.2"),
-    ),
+    )
+    .with_avp_rules(&CAPABILITIES_EXCHANGE_REPEATABLE_AVP_RULES),
     CommandDefinition::new(
         COMMAND_DEVICE_WATCHDOG,
         "Device-Watchdog-Request",
@@ -338,6 +371,67 @@ mod tests {
                 CommandKind::Answer,
             )
             .is_some());
+    }
+
+    #[test]
+    fn capabilities_exchange_declares_only_rfc_repeatable_avps() {
+        let repeatable = [
+            AVP_HOST_IP_ADDRESS,
+            AVP_SUPPORTED_VENDOR_ID,
+            AVP_AUTH_APPLICATION_ID,
+            AVP_INBAND_SECURITY_ID,
+            AVP_ACCT_APPLICATION_ID,
+            AVP_VENDOR_SPECIFIC_APPLICATION_ID,
+        ];
+        let singletons = [
+            AVP_ORIGIN_HOST,
+            AVP_ORIGIN_REALM,
+            AVP_VENDOR_ID,
+            AVP_PRODUCT_NAME,
+            AVP_RESULT_CODE,
+            AVP_FAILED_AVP,
+        ];
+
+        for kind in [CommandKind::Request, CommandKind::Answer] {
+            let command = dictionary()
+                .find_command(
+                    APPLICATION_ID_COMMON_MESSAGES,
+                    COMMAND_CAPABILITIES_EXCHANGE,
+                    kind,
+                )
+                .unwrap_or_else(|| panic!("capabilities command missing for {kind:?}"));
+            assert_eq!(command.avp_rules().len(), repeatable.len());
+            for code in repeatable {
+                assert!(
+                    command.allows_multiple(AvpKey::ietf(code)),
+                    "{kind:?} must allow AVP {} to repeat",
+                    code.get()
+                );
+            }
+            for code in singletons {
+                assert!(
+                    !command.allows_multiple(AvpKey::ietf(code)),
+                    "{kind:?} must keep AVP {} singleton",
+                    code.get()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn watchdog_and_disconnect_commands_declare_no_repeatable_base_avps() {
+        for code in [COMMAND_DEVICE_WATCHDOG, COMMAND_DISCONNECT_PEER] {
+            for kind in [CommandKind::Request, CommandKind::Answer] {
+                let command = dictionary()
+                    .find_command(APPLICATION_ID_COMMON_MESSAGES, code, kind)
+                    .unwrap_or_else(|| panic!("base command {} missing for {kind:?}", code.get()));
+                assert!(
+                    command.avp_rules().is_empty(),
+                    "base command {} {kind:?} must retain singleton known AVPs",
+                    code.get()
+                );
+            }
+        }
     }
 
     #[test]

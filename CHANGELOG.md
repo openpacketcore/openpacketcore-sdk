@@ -939,6 +939,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- `opc-proto-diameter`: RFC 6733 CER/CEA command metadata now marks
+  Host-IP-Address, Supported-Vendor-Id, Auth-Application-Id,
+  Inband-Security-Id, Acct-Application-Id, and
+  Vendor-Specific-Application-Id as repeatable. Trusted conservative decode
+  therefore accepts the multihomed CER/CEA messages emitted by the peer
+  helpers, while Failed-AVP and every other singleton remain fail-closed;
+  watchdog/disconnect commands and raw reject-all decode are unchanged.
 - `opc-yanggen`: generated semantic validation now supports an absolute
   `leafref` on a `leaf-list` by checking each vector element against the target
   set. Generated code compiles, accepts empty and fully resolved lists, and

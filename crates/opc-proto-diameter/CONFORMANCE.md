@@ -76,6 +76,13 @@ Peer helpers include:
   do not retain those opaque AVPs. Use the raw AVP iterators for lossless
   preserve/forward behavior.
 
+The trusted CER and CEA command profiles mark only the six explicitly
+repeatable RFC 6733 capability fields as repeatable: Host-IP-Address,
+Supported-Vendor-Id, Auth-Application-Id, Inband-Security-Id,
+Acct-Application-Id, and Vendor-Specific-Application-Id. In particular,
+Failed-AVP remains singleton. DWR, DWA, DPR, and DPA declare no repeatable
+known base AVPs, and raw decode retains blanket duplicate rejection.
+
 ### 5. Application dictionaries
 
 Feature-gated per application. Dictionary metadata (applications, commands,
