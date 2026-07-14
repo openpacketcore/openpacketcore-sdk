@@ -11,6 +11,7 @@ claim.
 | --- | --- | --- |
 | Fixed IKE header (`RFC 7296` §3.1) | Experimental structural coverage | `src/header.rs`; `tests/header.rs` decodes and raw-preserving re-encodes a hand-authored IKEv2 header, rejects bad major versions, short lengths, truncation, and strict reserved flag bits. |
 | Generic payload header and chain (`RFC 7296` §3.2) | Experimental structural coverage for unencrypted payloads | `src/payload.rs`; `tests/payload_chain.rs` walks a hand-authored SA -> Nonce chain, validates length fields, count limits, truncation, strict reserved bits, and byte-exact raw re-encode through `Message`. |
+| IKE_SA_INIT error Notify responses (`RFC 7296` §1.2, §2.6, §2.7, §2.21.1, §3.10.1) | Bounded wire-mechanism coverage | `src/sa_init.rs` and `tests/sa_init_error_notify.rs` build a single notify-only response with the non-zero request initiator SPI, zero responder SPI, Message ID zero, and canonical responder flags. The allowlist contains only IKE-SA-shaped `NO_PROPOSAL_CHOSEN` with empty data and `INVALID_KE_PAYLOAD` with an exact non-zero two-octet big-endian accepted group. Byte-exact and decode-roundtrip evidence covers both forms; malformed exchange/flag/SPI/Message ID, count, Notify Protocol ID/SPI, type, and data-length cases fail closed. `INVALID_SYNTAX` is rejected because RFC 7296 permits it only in a cryptographically validated encrypted packet. The caller retains source validation, rate limiting, retransmission behavior, and all anti-amplification policy. |
 | Unknown payload preservation | Experimental structural coverage | Unknown non-critical payloads remain raw-preserved; unknown critical payloads fail closed by default as required by RFC 7296 §2.2. |
 | Protected payload boundary (`SK`, `SKF`) | Boundary plus AES-GCM `SK` opener/sealer | `src/crypto.rs` and `tests/payload_chain.rs` expose `ProtectedPayloadContext` and `CryptoProvider`; the codec classifies both `SK` and `SKF`, treats protected bodies as opaque, and never parses ciphertext as cleartext. `src/protected_payload_crypto.rs` and `tests/protected_payload_crypto.rs` provide caller-keyed RFC 5282 AES-GCM-16 `SK` open and seal helpers for already-derived SA_INIT key material. |
 | IKEv2 encrypted fragmentation (`RFC 7383` `SKF`) | Experimental structural coverage | `src/fragmentation.rs` decodes/builds SKF fixed fields, enforces nonzero Fragment Number/Total Fragments, rejects number > total, enforces `Next Payload = 0` for non-first fragments, exposes the `IKEV2_FRAGMENTATION_SUPPORTED` notify type, and reassembles already-decrypted fragment cleartext with duplicate/missing/total/size checks. It does not decrypt SKF ciphertext or own retransmission/reassembly queues. |
@@ -85,6 +86,15 @@ on the conformance fixtures in `tests/header.rs` and `tests/payload_chain.rs`.
 They are suitable for this scaffold's structural coverage only. They are not
 independent-peer interoperability fixtures, and no source-product bytes are
 counted as conformance evidence.
+
+`tests/sa_init_error_notify.rs` separately hand-authors complete 36-octet
+`NO_PROPOSAL_CHOSEN` and 38-octet `INVALID_KE_PAYLOAD` response vectors. Both
+use RFC 7296 §2.6 for a zero responder SPI, §3.1 for the IKE header, §3.2 for
+generic-payload chaining, and §3.10 for the Notify body. The former uses §2.7
+and §3.10.1 for error type 14 with no notification data; the latter uses
+§1.2, §1.3, and §3.10.1 for error type 17 and the accepted Diffie-Hellman
+group as exactly two big-endian octets. These are specification-derived wire
+vectors, not independent-peer captures.
 
 Future fixtures must follow ADR 0015: spec-authored or independently captured
 bytes, octet-level comments, raw preservation for unknown payloads, negative

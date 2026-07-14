@@ -26,7 +26,11 @@ stack.
   payload open result types.
 - `sa_init` and `sa_init_crypto` provide typed SA/KE/Nonce/Notify helpers,
   SA_INIT response builders, Diffie-Hellman group/profile types, and IKE/Child
-  SA key-material derivation.
+  SA key-material derivation. The notify-only error builder is deliberately
+  bounded to one IKE-SA-shaped `NO_PROPOSAL_CHOSEN` or `INVALID_KE_PAYLOAD`;
+  the latter has a convenience builder that writes the accepted non-zero group
+  as exactly two big-endian octets. These failures are mutually exclusive, so
+  the builder rejects a multi-Notify response rather than emitting ambiguity.
 - `protected_payload_crypto` provides caller-keyed AES-GCM-16 `SK` open/seal
   helpers for already-derived SA_INIT key material.
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
@@ -72,6 +76,12 @@ The crate is experimental and `publish = false`. It has structural coverage and
 targeted crypto/helper tests for the documented scaffold, but it is not a full
 IKEv2 implementation. Certificate-chain, validity-period, name, and key-usage
 validation are caller responsibilities when using signature AUTH helpers.
+
+IKE_SA_INIT error responses are unauthenticated. The product owns source
+validation, response rate limiting, retransmission behavior, and other
+anti-amplification policy. The cleartext builder intentionally rejects
+`INVALID_SYNTAX`: RFC 7296 §3.10.1 only permits that error in an encrypted
+packet after Message ID and cryptographic checksum validation.
 
 DEVICE_IDENTITY carries equipment identity only; it does not define or weaken
 IKE authentication. Emergency procedures continue to use the ordinary RFC 7296
