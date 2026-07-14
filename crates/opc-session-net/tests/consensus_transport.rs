@@ -299,10 +299,30 @@ fn deferred_resolver(
     address: Arc<StdRwLock<Option<SocketAddr>>>,
     enabled: Arc<AtomicBool>,
 ) -> RemoteAddrResolver {
+    deferred_resolver_with_counter(address, enabled, None)
+}
+
+fn counted_deferred_resolver(
+    address: Arc<StdRwLock<Option<SocketAddr>>>,
+    enabled: Arc<AtomicBool>,
+    resolutions: Arc<AtomicUsize>,
+) -> RemoteAddrResolver {
+    deferred_resolver_with_counter(address, enabled, Some(resolutions))
+}
+
+fn deferred_resolver_with_counter(
+    address: Arc<StdRwLock<Option<SocketAddr>>>,
+    enabled: Arc<AtomicBool>,
+    resolutions: Option<Arc<AtomicUsize>>,
+) -> RemoteAddrResolver {
     Arc::new(move || {
         let address = Arc::clone(&address);
         let enabled = Arc::clone(&enabled);
+        let resolutions = resolutions.clone();
         Box::pin(async move {
+            if let Some(resolutions) = resolutions {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+            }
             if !enabled.load(Ordering::Acquire) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
@@ -545,9 +565,6 @@ async fn wait_for_observed_leader(
     }
 }
 
-const FLEET_ROTATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-const FLEET_ROTATION_ASSERTION_TIMEOUT: Duration = Duration::from_secs(20);
-
 fn fleet_rotation_lifecycle() -> ConnectionLifecyclePolicy {
     ConnectionLifecyclePolicy::try_new(
         Duration::from_secs(60),
@@ -612,6 +629,7 @@ struct RotatingConsensusFleet {
     addresses: Vec<SocketAddr>,
     probes: BTreeMap<(usize, usize), Arc<InstrumentedConsensusPeer>>,
     transport_stats: BTreeMap<(usize, usize), Arc<TransportStats>>,
+    resolver_calls: BTreeMap<(usize, usize), Arc<AtomicUsize>>,
     probe_dispatches: Vec<Arc<AtomicUsize>>,
     servers: Vec<opc_session_net::SessionConsensusServerHandle>,
     provider: Arc<MemoryKeyProvider>,
@@ -664,6 +682,7 @@ impl RotatingConsensusFleet {
             .collect::<Vec<_>>();
         let mut probes = BTreeMap::new();
         let mut transport_stats = BTreeMap::new();
+        let mut resolver_calls = BTreeMap::new();
         let mut stores = Vec::with_capacity(member_count);
 
         for (source, replica) in replicas.iter().copied().enumerate() {
@@ -679,14 +698,15 @@ impl RotatingConsensusFleet {
                     .bind_remote(replica_id(remote_replica))
                     .expect("rotation remote binding");
                 let node_id = binding.remote_consensus_node_id();
-                let remote = RemoteSessionConsensusPeer::new_with_resolver(
+                let resolutions = Arc::new(AtomicUsize::new(0));
+                let remote = RemoteSessionConsensusPeer::new_profiled_with_resolver(
                     binding,
-                    deferred_resolver(
+                    counted_deferred_resolver(
                         Arc::clone(&address_slots[target]),
                         Arc::new(AtomicBool::new(true)),
+                        Arc::clone(&resolutions),
                     ),
                     materials[source].client.clone(),
-                    Some(FLEET_ROTATION_OPERATION_TIMEOUT),
                 )
                 .with_connection_lifecycle(fleet_rotation_lifecycle())
                 .with_reauthentication_control(materials[source].reauthentication.clone());
@@ -696,6 +716,7 @@ impl RotatingConsensusFleet {
                     stats: Arc::clone(&stats),
                 });
                 transport_stats.insert((source, target), stats);
+                resolver_calls.insert((source, target), resolutions);
                 probes.insert((source, target), Arc::clone(&remote));
                 peers.insert(node_id, remote);
             }
@@ -708,7 +729,7 @@ impl RotatingConsensusFleet {
                         .join(format!("rotation-snapshots-{replica}")),
                     peers,
                     Arc::new(SystemClock),
-                    FLEET_ROTATION_OPERATION_TIMEOUT,
+                    DURABLE_CONSENSUS_OPERATION_TIMEOUT,
                 )
                 .await
                 .expect("open rotation consensus store"),
@@ -760,6 +781,7 @@ impl RotatingConsensusFleet {
             addresses,
             probes,
             transport_stats,
+            resolver_calls,
             probe_dispatches,
             servers,
             provider,
@@ -821,20 +843,50 @@ impl RotatingConsensusFleet {
     async fn probe_paths(&self, paths: Vec<(usize, usize)>) {
         let outcomes = futures_util::future::join_all(paths.into_iter().map(|path| {
             let peer = self.probes.get(&path).expect("rotation probe path");
+            let resolver_calls = self
+                .resolver_calls
+                .get(&path)
+                .expect("rotation resolver counter");
+            let baseline = resolver_calls.load(Ordering::SeqCst);
             let manifest = Arc::clone(&self.manifest);
             let sender = self.replicas[path.0];
             async move {
+                let deadline = tokio::time::Instant::now() + DURABLE_CONSENSUS_OPERATION_TIMEOUT;
+                let mut unavailable_seen = false;
+                let outcome = loop {
+                    match peer.call(request(&manifest, sender, Vec::new())).await {
+                        Ok(response) if resolver_calls.load(Ordering::SeqCst) > baseline => {
+                            break Ok(response);
+                        }
+                        Ok(_) => {}
+                        Err(SessionConsensusPeerError::Unavailable) if !unavailable_seen => {
+                            unavailable_seen = true;
+                        }
+                        Err(error) => break Err(error),
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break Err(SessionConsensusPeerError::Timeout);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
                 (
                     path,
-                    peer.call(request(&manifest, sender, Vec::new())).await,
+                    outcome,
+                    baseline,
+                    resolver_calls.load(Ordering::SeqCst),
+                    unavailable_seen,
                 )
             }
         }))
         .await;
-        for (path, outcome) in outcomes {
+        for (path, outcome, baseline, resolutions, unavailable_seen) in outcomes {
             assert!(
                 outcome.is_ok(),
-                "fresh bidirectional rotation handshake failed: path={path:?}, outcome={outcome:?}"
+                "fresh bidirectional rotation handshake failed: path={path:?}, outcome={outcome:?}, baseline={baseline}, resolutions={resolutions}, unavailable_seen={unavailable_seen}"
+            );
+            assert!(
+                resolutions > baseline,
+                "rotation probe did not establish a fresh connection: path={path:?}, baseline={baseline}, resolutions={resolutions}"
             );
         }
     }
@@ -928,7 +980,7 @@ impl RotatingConsensusFleet {
         let canary = self.canary.as_ref().expect("seeded rotation canary");
         for index in 0..self.stores.len() {
             let record = tokio::time::timeout(
-                FLEET_ROTATION_ASSERTION_TIMEOUT,
+                DURABLE_CONSENSUS_OPERATION_TIMEOUT,
                 self.protected_store(index).get(&canary.key),
             )
             .await
