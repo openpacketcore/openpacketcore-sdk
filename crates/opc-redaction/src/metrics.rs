@@ -1900,7 +1900,7 @@ pub fn export_prometheus_text() -> String {
         ));
     }
     out.push_str(
-        "# HELP opc_session_net_connection_attempts_total Session connection attempts by fixed outcome\n",
+        "# HELP opc_session_net_connection_attempts_total Session connection attempts by fixed transport/control outcome; success includes an authenticated pre-admission retirement control exchange\n",
     );
     out.push_str("# TYPE opc_session_net_connection_attempts_total counter\n");
     for (outcome, value) in [

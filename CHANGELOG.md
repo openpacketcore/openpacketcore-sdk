@@ -200,15 +200,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cooperative CNF trigger with deterministic directed-peer jitter and bounded
   reconnect backoff. Legacy watches resume from the exact delivered successor;
   mutations retry only after the complete fixed `ConnectionRetiring`
-  no-dispatch proof. Direct v5 wire-schema revision advances from 5 to 6 and
+  no-dispatch proof. An authenticated post-TLS rotation race before bootstrap
+  acknowledgement now returns
+  `BootstrapResponse::ConnectionRetiring` on the generic transport; the
+  consensus bootstrap context reserves
+  `SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Rejected)`
+  for the equivalent no-Openraft-dispatch proof. A client retries only after
+  decoding the complete control, before sending application or Openraft request
+  bytes. Authentication, scope, contract, protocol, and post-bootstrap engine
+  rejections remain distinct. EOF, an incomplete
+  control, or retirement after an acknowledgement write has partially
+  completed fails closed; the server closes without appending a second frame.
+  The server counts a successful authenticated connection/control exchange only
+  after completely writing the control; the client does so only after decoding
+  it completely. That decode initiates the client's bounded retry path and
+  counts a reconnect attempt, not a reconnect failure. Direct v5 wire-schema
+  revision advances from 5 to 6 and
   requires a coordinated drained full-profile upgrade; the consensus-only
-  profile remains transport/wire revision 2. Fixed lifecycle/reconnect metrics
-  use closed redaction-safe labels. A supervised backend mutation may finish
+  profile remains transport/wire revision 2. This bootstrap hardening admits
+  the already-frozen revision-6 generic variant and existing consensus error
+  value in their restricted bootstrap contexts; it changes neither profile
+  revision nor public API. Older same-profile decoders fail closed on the
+  control, so mixed-patch rolling rotation is not seamless.
+  Fixed lifecycle/reconnect metrics use closed redaction-safe labels. A
+  supervised backend mutation may finish
   after transport retirement; that path remains typed ambiguous, is never
   automatically retried, and requires authoritative readback or its existing
-  operation-bound idempotency/fencing contract. Payload encryption, persisted
-  records, Openraft state, consensus payloads, HKMS/provider placement, and key
-  material are unchanged. #164/#143 retain fleet trust-removal, revocation,
+  operation-bound idempotency/fencing contract. Persisted formats, Openraft
+  commit authority, and payload-encryption/HKMS/provider boundaries and
+  handling are unchanged. This closes only the narrow pre-acknowledgement
+  rotation race; #164/#143 retain fleet trust-removal, revocation,
   reconnect-storm, resource, and soak qualification.
 - **BREAKING — `opc-proto-diameter`:** trusted dictionary decode now resolves
   exactly one command by application id, command code, and request/answer role

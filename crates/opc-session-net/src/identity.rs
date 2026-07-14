@@ -544,7 +544,10 @@ fn hash_field(hasher: &mut Sha256, field: &[u8]) {
     hasher.update(field);
 }
 
-#[cfg(all(feature = "insecure-test", feature = "legacy-session-net-compat"))]
+#[cfg(all(
+    feature = "legacy-session-net-compat",
+    any(test, feature = "insecure-test")
+))]
 fn insecure_test_manifest() -> Arc<SessionReplicationManifest> {
     let descriptor = |id: &str, instance: &str, port| {
         QuorumReplicaDescriptor::new(
@@ -574,7 +577,10 @@ fn insecure_test_manifest() -> Arc<SessionReplicationManifest> {
     )
 }
 
-#[cfg(all(feature = "insecure-test", feature = "legacy-session-net-compat"))]
+#[cfg(all(
+    feature = "legacy-session-net-compat",
+    any(test, feature = "insecure-test")
+))]
 pub(crate) fn insecure_test_client_binding() -> RemoteReplicaBinding {
     insecure_test_manifest()
         .bind_local(ReplicaId::new("insecure-client").expect("fixed insecure-test client"))
@@ -583,7 +589,10 @@ pub(crate) fn insecure_test_client_binding() -> RemoteReplicaBinding {
         .expect("fixed insecure-test remote binding")
 }
 
-#[cfg(all(feature = "insecure-test", feature = "legacy-session-net-compat"))]
+#[cfg(all(
+    feature = "legacy-session-net-compat",
+    any(test, feature = "insecure-test")
+))]
 pub(crate) fn insecure_test_server_binding() -> LocalReplicaBinding {
     insecure_test_manifest()
         .bind_local(ReplicaId::new("insecure-server").expect("fixed insecure-test server"))

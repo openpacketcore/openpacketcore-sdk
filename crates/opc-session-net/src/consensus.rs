@@ -29,7 +29,8 @@ use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::identity::{LocalReplicaBinding, RemoteReplicaBinding};
 use crate::lifecycle::{
     directed_connection_key, material_status_matches_admission, CertificateExpiryEvidence,
-    ConnectionLifecycle, ConnectionLifecyclePolicy, SessionReauthenticationControl,
+    ConnectionLifecycle, ConnectionLifecyclePolicy, RetirementReason,
+    SessionReauthenticationControl,
 };
 use crate::protocol::{
     checked_frame_size, checked_wire_frame_size, negotiate_response_frame_size, read_frame,
@@ -582,6 +583,29 @@ impl RemoteSessionConsensusPeer {
                         .session_net_connection_successes
                         .fetch_add(1, Ordering::Relaxed);
                     connection
+                }
+                // `Rejected` is reserved contextually for the authenticated
+                // bootstrap-retirement control. The server's ordinary
+                // bootstrap rejection helper refuses this value, while a
+                // post-bootstrap backend rejection is handled only by
+                // `call_negotiated`. Count the completed control exchange as
+                // successful transport accounting, then retry before any
+                // Openraft request bytes can have been sent.
+                Err(SessionConsensusPeerError::Rejected) => {
+                    METRICS
+                        .session_net_connection_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .session_net_reconnect_attempts
+                        .fetch_add(1, Ordering::Relaxed);
+                    let now = tokio::time::Instant::now();
+                    let retry_at = now
+                        .checked_add(backoff)
+                        .unwrap_or(connect_deadline)
+                        .min(connect_deadline);
+                    tokio::time::sleep_until(retry_at).await;
+                    backoff = self.lifecycle_policy.next_backoff(backoff);
+                    continue;
                 }
                 Err(error) => {
                     match error {
@@ -1174,6 +1198,13 @@ struct PendingConsensusLifecycle {
     peer_certificate_expiry: Option<CertificateExpiryEvidence>,
     established_at: tokio::time::Instant,
     generation: u64,
+    #[cfg(test)]
+    expire_at_final_ack_boundary: bool,
+}
+
+enum PendingConsensusAdmissionError {
+    Retired(RetirementReason),
+    Protocol(ProtocolError),
 }
 
 impl PendingConsensusLifecycle {
@@ -1185,6 +1216,8 @@ impl PendingConsensusLifecycle {
             peer_certificate_expiry: None,
             established_at: tokio::time::Instant::now(),
             generation,
+            #[cfg(test)]
+            expire_at_final_ack_boundary: false,
         }
     }
 
@@ -1197,16 +1230,18 @@ impl PendingConsensusLifecycle {
             ConnectionLifecycle,
             Option<opc_tls::AuthenticatedServerConfig>,
         ),
-        ProtocolError,
+        PendingConsensusAdmissionError,
     > {
         if current_generation != self.generation {
-            return Err(ProtocolError::Authentication);
+            return Err(PendingConsensusAdmissionError::Retired(
+                RetirementReason::Explicit,
+            ));
         }
         let epoch = match self.handshake {
             Some(handshake) => {
-                let admission = handshake
-                    .admit()
-                    .map_err(|_| ProtocolError::Authentication)?;
+                let admission = handshake.admit().map_err(|_| {
+                    PendingConsensusAdmissionError::Retired(RetirementReason::MaterialEpoch)
+                })?;
                 Some(admission.epoch())
             }
             None => None,
@@ -1219,7 +1254,7 @@ impl PendingConsensusLifecycle {
             self.generation,
             epoch,
         )
-        .map_err(|_| ProtocolError::InvalidWireValue)?;
+        .map_err(|_| PendingConsensusAdmissionError::Protocol(ProtocolError::InvalidWireValue))?;
         Ok((lifecycle, self.tls_config))
     }
 
@@ -1371,6 +1406,8 @@ async fn handle_consensus_connection(
                 peer_certificate_expiry: Some(peer_certificate_expiry),
                 established_at,
                 generation,
+                #[cfg(test)]
+                expire_at_final_ack_boundary: false,
             },
             binding,
             handler,
@@ -1413,12 +1450,44 @@ async fn reject_consensus_bootstrap<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    // `Rejected` is the bootstrap-only retirement sentinel. Keeping it out of
+    // this ordinary error path proves that a real authentication, scope,
+    // contract, or protocol rejection cannot be masked as a retryable local
+    // rotation race.
+    if error == SessionConsensusPeerError::Rejected {
+        return Err(ProtocolError::InvalidWireValue);
+    }
     let deadline = tokio::time::Instant::now()
         .checked_add(idle_timeout)
         .ok_or(ProtocolError::InvalidWireValue)?;
     write_frame_bounded_until_cancellable(
         writer,
         &SessionConsensusBootstrapResponse::Rejected(error),
+        MAX_HANDSHAKE_FRAME_SIZE,
+        deadline,
+        cancellation,
+    )
+    .await
+}
+
+async fn retire_consensus_bootstrap<W>(
+    writer: &mut W,
+    idle_timeout: Duration,
+    cancellation: &AtomicBool,
+) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    tracing::debug!(
+        reason = "rotation_bootstrap_retired",
+        "retiring authenticated consensus connection before request admission"
+    );
+    let deadline = tokio::time::Instant::now()
+        .checked_add(idle_timeout)
+        .ok_or(ProtocolError::InvalidWireValue)?;
+    write_frame_bounded_until_cancellable(
+        writer,
+        &SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Rejected),
         MAX_HANDSHAKE_FRAME_SIZE,
         deadline,
         cancellation,
@@ -1446,6 +1515,8 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    #[cfg(test)]
+    let expire_at_final_ack_boundary = pending_lifecycle.expire_at_final_ack_boundary;
     let bootstrap_lifecycle = pending_lifecycle.provisional_lifecycle(lifecycle_policy)?;
     let bootstrap_cancellation =
         Arc::new(AtomicBool::new(global_cancellation.load(Ordering::Acquire)));
@@ -1488,14 +1559,17 @@ where
             );
             if let Some(reason) = mismatch {
                 bootstrap_lifecycle.record_forced_retirement(reason);
-                return Err(ProtocolError::Authentication);
+                return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
             }
             if !material_status_matches_admission(
                 bootstrap_lifecycle.admitted_material_epoch(),
                 current_material_status,
-            ) || bootstrap_lifecycle.retirement(now).is_some()
-            {
-                return Err(ProtocolError::Authentication);
+            ) {
+                bootstrap_lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
+                return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+            }
+            if bootstrap_lifecycle.retirement(now).is_some() {
+                return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
             }
             tokio::select! {
                 biased;
@@ -1517,7 +1591,6 @@ where
         }
     };
     let SessionConsensusBootstrapRequest::Hello(hello) = hello;
-    drop(bootstrap_lifecycle);
     if hello.transport_revision != SESSION_CONSENSUS_TRANSPORT_REVISION
         || !hello.contract_profile.is_current()
     {
@@ -1615,10 +1688,17 @@ where
     let (mut lifecycle, lifecycle_tls_config) =
         match pending_lifecycle.admit(lifecycle_policy, reauthentication.generation()) {
             Ok(admitted) => admitted,
-            // Authentication and scope already succeeded. This is a local
-            // epoch/generation retirement, not a permanent peer failure.
-            Err(_) => return Ok(()),
+            // Authentication and scope already succeeded. Prove the local
+            // epoch/generation retirement before any Openraft request can be
+            // dispatched, allowing exactly this cold-connect attempt to be
+            // retried safely.
+            Err(PendingConsensusAdmissionError::Retired(reason)) => {
+                bootstrap_lifecycle.record_forced_retirement(reason);
+                return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+            }
+            Err(PendingConsensusAdmissionError::Protocol(error)) => return Err(error),
         };
+    drop(bootstrap_lifecycle);
     let mut admission_material_rx = lifecycle_tls_config
         .as_ref()
         .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
@@ -1638,18 +1718,30 @@ where
         current_material_status.map(|status| status.epoch()),
         &edge_key,
     );
-    if admission_reauthentication_rx.has_changed().unwrap_or(true)
-        || !material_status_matches_admission(admitted_material_epoch, current_material_status)
-        || lifecycle.retirement(now).is_some()
-    {
-        return Ok(());
+    if let Some(reason) = lifecycle.evidence_mismatch_reason(
+        reauthentication.generation(),
+        current_material_status.map(|status| status.epoch()),
+    ) {
+        lifecycle.record_forced_retirement(reason);
+        return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+    }
+    if admission_reauthentication_rx.has_changed().unwrap_or(true) {
+        lifecycle.record_forced_retirement(RetirementReason::Explicit);
+        return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+    }
+    if !material_status_matches_admission(admitted_material_epoch, current_material_status) {
+        lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
+        return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
+    }
+    if lifecycle.retirement(now).is_some() {
+        return retire_consensus_bootstrap(writer, idle_timeout, server_cancellation).await;
     }
     drop(_bootstrap_hard_task);
     let connection_cancellation = Arc::new(AtomicBool::new(false));
     let admitted_generation = lifecycle.admitted_generation();
     let mut admission_shutdown = server_shutdown.clone();
     let (_lifecycle_task, mut retirement_rx, mut hard_rx) = spawn_consensus_lifecycle(
-        lifecycle,
+        lifecycle.clone(),
         edge_key,
         lifecycle_tls_config.clone(),
         reauthentication.clone(),
@@ -1669,6 +1761,40 @@ where
         accepted_response_frame_size: requested_response_frame_size,
         server_request_frame_size,
     });
+    // This is the final zero-Accepted-byte boundary. Once the write future is
+    // polled it may have emitted a partial Accepted frame, so a subsequent
+    // retirement must conservatively close instead of appending the reserved
+    // bootstrap retirement response.
+    let pre_ack_material_status = lifecycle_tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedServerConfig::material_status);
+    if let Some(reason) = lifecycle.evidence_mismatch_reason(
+        reauthentication.generation(),
+        pre_ack_material_status.map(|status| status.epoch()),
+    ) {
+        lifecycle.record_forced_retirement(reason);
+        return retire_consensus_bootstrap(writer, idle_timeout, connection_cancellation.as_ref())
+            .await;
+    }
+    if !material_status_matches_admission(admitted_material_epoch, pre_ack_material_status) {
+        lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
+        return retire_consensus_bootstrap(writer, idle_timeout, connection_cancellation.as_ref())
+            .await;
+    }
+    if *retirement_rx.borrow() || *hard_rx.borrow() {
+        return retire_consensus_bootstrap(writer, idle_timeout, connection_cancellation.as_ref())
+            .await;
+    }
+    #[cfg(test)]
+    if expire_at_final_ack_boundary {
+        // Deterministically model the soft deadline crossing after the earlier
+        // sample while the spawned lifecycle task has not been scheduled.
+        lifecycle.expire_at_final_ack_boundary_for_test();
+    }
+    if lifecycle.retirement(tokio::time::Instant::now()).is_some() {
+        return retire_consensus_bootstrap(writer, idle_timeout, connection_cancellation.as_ref())
+            .await;
+    }
     {
         let acknowledgement = write_frame_bounded_until_cancellable(
             writer,
@@ -1684,6 +1810,7 @@ where
                 _ = admission_shutdown.changed() => return Ok(()),
                 changed = admission_reauthentication_rx.changed() => {
                     if changed.is_err() || reauthentication.generation() != admitted_generation {
+                        lifecycle.record_forced_retirement(RetirementReason::Explicit);
                         return Ok(());
                     }
                 }
@@ -1692,6 +1819,7 @@ where
                         .as_ref()
                         .map(opc_tls::AuthenticatedServerConfig::material_status);
                     if !material_status_matches_admission(admitted_material_epoch, status) {
+                        lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
                         return Ok(());
                     }
                 }
@@ -1775,12 +1903,15 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex as StdMutex;
+    use std::{pin::Pin, task::Context, task::Poll};
 
     use opc_session_store::{
         QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
         ReplicaTlsIdentity, SessionConsensusRpcFamily, SessionOp,
     };
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::identity::{
@@ -1803,6 +1934,46 @@ mod tests {
             SessionConsensusWireResponse {
                 result: Ok(request.payload),
             }
+        }
+    }
+
+    struct PartialConsensusAcknowledgementWriter {
+        bytes: Arc<StdMutex<Vec<u8>>>,
+        first_chunk_written: bool,
+        wrote_first_chunk: Arc<Notify>,
+    }
+
+    impl AsyncWrite for PartialConsensusAcknowledgementWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            if self.first_chunk_written {
+                return Poll::Pending;
+            }
+            let written = buffer.len().min(2);
+            self.bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(&buffer[..written]);
+            self.first_chunk_written = true;
+            self.wrote_first_chunk.notify_one();
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -1840,6 +2011,262 @@ mod tests {
         (server, client)
     }
 
+    fn test_consensus_lifecycle_policy() -> ConnectionLifecyclePolicy {
+        ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+            Duration::ZERO,
+        )
+        .expect("test consensus lifecycle policy")
+    }
+
+    async fn valid_consensus_hello_bytes(binding: &RemoteReplicaBinding) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &SessionConsensusBootstrapRequest::Hello(SessionConsensusBootstrapHello {
+                transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+                contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+                sender_replica_id: binding.local_replica_id().as_str().to_owned(),
+                expected_server_replica_id: binding.remote_replica_id().as_str().to_owned(),
+                identity: binding.consensus_identity(),
+                sender_node_id: binding.local_consensus_node_id(),
+                expected_server_node_id: binding.remote_consensus_node_id(),
+                handshake_nonce: uuid::Uuid::nil(),
+                requested_response_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+            }),
+        )
+        .await
+        .expect("encode valid consensus Hello");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn consensus_pre_hello_generation_retirement_emits_one_no_dispatch_control() {
+        let (server_binding, _client_binding) = bindings();
+        let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
+        let reauthentication = SessionReauthenticationControl::new();
+        let pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
+        reauthentication
+            .request_reauthentication()
+            .expect("advance consensus test generation");
+        let mut reader = tokio::io::empty();
+        let mut writer = Vec::new();
+        let cancellation = AtomicBool::new(false);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        dispatch_consensus(
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            server_binding,
+            handler.clone(),
+            MAX_NEGOTIATED_FRAME_SIZE,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &cancellation,
+            shutdown_rx,
+            test_consensus_lifecycle_policy(),
+            reauthentication,
+        )
+        .await
+        .expect("pre-Hello consensus retirement is an expected control exchange");
+
+        let mut encoded = std::io::Cursor::new(writer);
+        assert!(matches!(
+            read_frame::<_, SessionConsensusBootstrapResponse>(
+                &mut encoded,
+                MAX_HANDSHAKE_FRAME_SIZE,
+            )
+            .await
+            .expect("read consensus retirement control"),
+            SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Rejected)
+        ));
+        assert_eq!(
+            usize::try_from(encoded.position()).expect("cursor position"),
+            encoded.get_ref().len(),
+            "exactly one consensus control frame must be emitted"
+        );
+        assert_eq!(handler.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn consensus_expiry_crossing_at_final_zero_ack_boundary_emits_only_retirement_control() {
+        let (server_binding, client_binding) = bindings();
+        let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
+        let reauthentication = SessionReauthenticationControl::new();
+        let mut pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
+        pending.expire_at_final_ack_boundary = true;
+        let mut input = valid_consensus_hello_bytes(&client_binding).await;
+        let hello_bytes = input.len();
+        let request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::Vote,
+            b"must-not-dispatch".to_vec(),
+        )
+        .expect("bounded consensus request");
+        write_frame(
+            &mut input,
+            &SessionConsensusTransportRequest::Call {
+                call_id: uuid::Uuid::nil(),
+                request,
+            },
+        )
+        .await
+        .expect("append Openraft call behind valid consensus Hello");
+        let mut reader = std::io::Cursor::new(input);
+        let mut writer = Vec::new();
+        let cancellation = AtomicBool::new(false);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        dispatch_consensus(
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            server_binding,
+            handler.clone(),
+            MAX_NEGOTIATED_FRAME_SIZE,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &cancellation,
+            shutdown_rx,
+            test_consensus_lifecycle_policy(),
+            reauthentication,
+        )
+        .await
+        .expect("final-boundary consensus expiry is an expected control exchange");
+
+        assert_eq!(
+            usize::try_from(reader.position()).expect("reader position"),
+            hello_bytes,
+            "no Openraft call bytes may be read or dispatched"
+        );
+        let mut encoded = std::io::Cursor::new(writer);
+        assert!(matches!(
+            read_frame::<_, SessionConsensusBootstrapResponse>(
+                &mut encoded,
+                MAX_HANDSHAKE_FRAME_SIZE,
+            )
+            .await
+            .expect("read final-boundary consensus retirement control"),
+            SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Rejected)
+        ));
+        assert_eq!(
+            usize::try_from(encoded.position()).expect("writer position"),
+            encoded.get_ref().len(),
+            "one complete retirement control and zero Accepted bytes must be emitted"
+        );
+        assert_eq!(handler.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn consensus_post_hello_pre_admit_material_change_is_recorded_once() {
+        let material = crate::test_support::RotatableServerMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/server",
+        );
+        let tls_config = material.config();
+        let handshake = tls_config
+            .begin_handshake()
+            .expect("capture pre-rotation consensus material");
+        let established_at = tokio::time::Instant::now();
+        let pending = PendingConsensusLifecycle {
+            handshake: Some(handshake),
+            tls_config: Some(tls_config),
+            local_certificate_expiry: None,
+            peer_certificate_expiry: None,
+            established_at,
+            generation: 0,
+            expire_at_final_ack_boundary: false,
+        };
+        let policy = test_consensus_lifecycle_policy();
+        let bootstrap_lifecycle = pending
+            .provisional_lifecycle(policy)
+            .expect("provisional post-TLS consensus lifecycle");
+
+        // This admission gate runs after the consensus Hello has passed its
+        // identity/scope checks and before Accepted or any Openraft call.
+        material.rotate();
+        let reason = match pending.admit(policy, 0) {
+            Err(PendingConsensusAdmissionError::Retired(reason)) => reason,
+            Err(PendingConsensusAdmissionError::Protocol(error)) => {
+                panic!("consensus material race was misclassified as protocol: {error}")
+            }
+            Ok(_) => panic!("stale consensus handshake snapshot must not be admitted"),
+        };
+        assert_eq!(reason, RetirementReason::MaterialEpoch);
+        bootstrap_lifecycle.record_forced_retirement(reason);
+        bootstrap_lifecycle.record_forced_retirement(reason);
+        assert_eq!(
+            bootstrap_lifecycle.recorded_retirement_count(),
+            1,
+            "the consensus admission race must publish one retirement outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_rotation_after_ack_bytes_start_never_appends_retirement_control() {
+        let (server_binding, client_binding) = bindings();
+        let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
+        let reauthentication = SessionReauthenticationControl::new();
+        let pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
+        let mut reader = std::io::Cursor::new(valid_consensus_hello_bytes(&client_binding).await);
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let wrote_first_chunk = Arc::new(Notify::new());
+        let first_chunk = wrote_first_chunk.notified();
+        tokio::pin!(first_chunk);
+        let mut writer = PartialConsensusAcknowledgementWriter {
+            bytes: Arc::clone(&bytes),
+            first_chunk_written: false,
+            wrote_first_chunk: Arc::clone(&wrote_first_chunk),
+        };
+        let cancellation = AtomicBool::new(false);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let dispatch = dispatch_consensus(
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            server_binding,
+            handler.clone(),
+            MAX_NEGOTIATED_FRAME_SIZE,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &cancellation,
+            shutdown_rx,
+            test_consensus_lifecycle_policy(),
+            reauthentication.clone(),
+        );
+        tokio::pin!(dispatch);
+        tokio::select! {
+            _ = &mut first_chunk => {}
+            result = &mut dispatch => panic!("consensus dispatch ended before partial Ack: {result:?}"),
+        }
+        reauthentication
+            .request_reauthentication()
+            .expect("retire consensus connection after Ack transmission starts");
+        tokio::time::timeout(Duration::from_secs(1), &mut dispatch)
+            .await
+            .expect("partial consensus Ack retirement must close promptly")
+            .expect("partial consensus Ack retirement is a conservative close");
+
+        let written = bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            written.len(),
+            2,
+            "only the partial Ack prefix may be written"
+        );
+        assert!(!String::from_utf8_lossy(&written).contains("Rejected"));
+        assert_eq!(handler.0.load(Ordering::Relaxed), 0);
+    }
+
     async fn raw_consensus_connection(
         addr: SocketAddr,
         binding: &RemoteReplicaBinding,
@@ -1874,6 +2301,162 @@ mod tests {
             }) if handshake_nonce == nonce
         ));
         stream
+    }
+
+    async fn bootstrap_retirement_then_consensus_response_server(
+        server_binding: RemoteReplicaBinding,
+    ) -> (SocketAddr, tokio::task::JoinHandle<(usize, usize)>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind consensus bootstrap-retirement listener");
+        let address = listener
+            .local_addr()
+            .expect("consensus bootstrap-retirement address");
+        let task = tokio::spawn(async move {
+            let mut application_calls = 0;
+            for attempt in 0..2 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept consensus bootstrap client");
+                let hello: SessionConsensusBootstrapRequest =
+                    read_frame(&mut stream, MAX_HANDSHAKE_FRAME_SIZE)
+                        .await
+                        .expect("read consensus bootstrap Hello");
+                let SessionConsensusBootstrapRequest::Hello(hello) = hello;
+                if attempt == 0 {
+                    write_frame(
+                        &mut stream,
+                        &SessionConsensusBootstrapResponse::Rejected(
+                            SessionConsensusPeerError::Rejected,
+                        ),
+                    )
+                    .await
+                    .expect("write consensus pre-admission retirement control");
+                    if matches!(
+                        tokio::time::timeout(
+                            Duration::from_millis(100),
+                            read_frame::<_, SessionConsensusTransportRequest>(
+                                &mut stream,
+                                MAX_NEGOTIATED_FRAME_SIZE,
+                            ),
+                        )
+                        .await,
+                        Ok(Ok(_))
+                    ) {
+                        application_calls += 1;
+                    }
+                    continue;
+                }
+                write_frame(
+                    &mut stream,
+                    &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                        transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+                        contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+                        identity: hello.identity,
+                        server_node_id: server_binding.remote_consensus_node_id(),
+                        accepted_sender_node_id: hello.sender_node_id,
+                        handshake_nonce: hello.handshake_nonce,
+                        accepted_response_frame_size: hello.requested_response_frame_size,
+                        server_request_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+                    }),
+                )
+                .await
+                .expect("write fresh consensus acknowledgement");
+                let call: SessionConsensusTransportRequest =
+                    read_frame(&mut stream, MAX_NEGOTIATED_FRAME_SIZE)
+                        .await
+                        .expect("read fresh consensus call");
+                let SessionConsensusTransportRequest::Call { call_id, request } = call;
+                application_calls += 1;
+                write_frame(
+                    &mut stream,
+                    &SessionConsensusTransportResponse::Call {
+                        call_id,
+                        response: SessionConsensusWireResponse {
+                            result: Ok(request.payload),
+                        },
+                    },
+                )
+                .await
+                .expect("write fresh consensus response");
+            }
+            (2, application_calls)
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn consensus_bootstrap_retirement_retries_before_any_openraft_call_dispatch() {
+        let (_server_binding, client_binding) = bindings();
+        let (address, server) =
+            bootstrap_retirement_then_consensus_response_server(client_binding.clone()).await;
+        let resolve: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolve),
+            None,
+            client_binding.clone(),
+            Some(Duration::from_secs(2)),
+        )
+        .with_connection_lifecycle(
+            ConnectionLifecyclePolicy::try_new(
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                Duration::from_millis(5),
+                Duration::ZERO,
+            )
+            .expect("test consensus lifecycle policy"),
+        );
+        let request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::Vote,
+            b"fresh-consensus-route".to_vec(),
+        )
+        .expect("bounded consensus request");
+
+        assert_eq!(
+            peer.call(request).await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"fresh-consensus-route".to_vec()),
+            })
+        );
+        assert_eq!(
+            server.await.expect("consensus bootstrap-retirement server"),
+            (2, 1),
+            "the retired route must receive no Openraft call and the fresh route exactly one"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_is_reserved_exclusively_for_consensus_bootstrap_retirement() {
+        let mut sink = tokio::io::sink();
+        let cancellation = AtomicBool::new(false);
+        assert!(matches!(
+            reject_consensus_bootstrap(
+                &mut sink,
+                SessionConsensusPeerError::Rejected,
+                Duration::from_secs(1),
+                &cancellation,
+            )
+            .await,
+            Err(ProtocolError::InvalidWireValue)
+        ));
+
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        retire_consensus_bootstrap(&mut writer, Duration::from_secs(1), &cancellation)
+            .await
+            .expect("write reserved bootstrap retirement");
+        assert!(matches!(
+            read_frame::<_, SessionConsensusBootstrapResponse>(
+                &mut reader,
+                MAX_HANDSHAKE_FRAME_SIZE,
+            )
+            .await
+            .expect("read reserved bootstrap retirement"),
+            SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Rejected)
+        ));
     }
 
     #[tokio::test]

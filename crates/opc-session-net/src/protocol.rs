@@ -389,7 +389,15 @@ pub(crate) enum BootstrapRequest {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BootstrapResponse {
     HelloAck(Box<BootstrapHelloAck>),
-    HelloRejected { reason: HelloRejectReason },
+    HelloRejected {
+        reason: HelloRejectReason,
+    },
+    /// Authenticated control proof that no application request was admitted.
+    ///
+    /// This reuses the already-frozen full-protocol wire variant. Legacy
+    /// bootstrap decoders reject it as an unknown variant, so mixed-version
+    /// peers remain fail closed rather than silently downgrading admission.
+    ConnectionRetiring,
 }
 
 /// First frame on a dedicated consensus-only connection.
@@ -3076,6 +3084,7 @@ impl TryFrom<&Response> for BootstrapResponse {
                 server_request_frame_size: *server_request_frame_size,
             }))),
             Response::HelloRejected { reason } => Ok(Self::HelloRejected { reason: *reason }),
+            Response::ConnectionRetiring => Ok(Self::ConnectionRetiring),
             _ => Err(WireConversionError(
                 "expected a bootstrap acknowledgement frame",
             )),
@@ -3103,6 +3112,7 @@ impl From<BootstrapResponse> for Response {
                 }
             }
             BootstrapResponse::HelloRejected { reason } => Self::HelloRejected { reason },
+            BootstrapResponse::ConnectionRetiring => Self::ConnectionRetiring,
         }
     }
 }
@@ -4042,8 +4052,34 @@ mod tests {
             .expect("connection-retiring response");
         assert_eq!(retiring, serde_json::json!("ConnectionRetiring"));
         assert!(matches!(
-            serde_json::from_value::<Response>(retiring),
+            serde_json::from_value::<Response>(retiring.clone()),
             Ok(Response::ConnectionRetiring)
+        ));
+
+        // The bootstrap control uses an already-frozen full-response shape,
+        // so no profile revision is needed. A current restricted decoder
+        // admits exactly that control, while a legacy restricted decoder
+        // rejects the unknown variant and therefore remains fail closed.
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        enum LegacyBootstrapResponse {
+            HelloAck(Box<BootstrapHelloAck>),
+            HelloRejected { reason: HelloRejectReason },
+        }
+        let bootstrap_retiring = serde_json::to_value(BootstrapResponse::ConnectionRetiring)
+            .expect("bootstrap retirement control");
+        assert_eq!(bootstrap_retiring, retiring);
+        assert!(matches!(
+            serde_json::from_value::<BootstrapResponse>(bootstrap_retiring.clone()),
+            Ok(BootstrapResponse::ConnectionRetiring)
+        ));
+        assert!(
+            serde_json::from_value::<LegacyBootstrapResponse>(bootstrap_retiring).is_err(),
+            "an older bootstrap decoder must reject rather than downgrade the new control context"
+        );
+        assert!(matches!(
+            Response::from(BootstrapResponse::ConnectionRetiring),
+            Response::ConnectionRetiring
         ));
 
         let legacy = serde_json::json!({

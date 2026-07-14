@@ -32,7 +32,8 @@ use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::identity::{LocalReplicaBinding, SessionClusterId};
 use crate::lifecycle::{
     directed_connection_key, material_status_matches_admission, CertificateExpiryEvidence,
-    ConnectionLifecycle, ConnectionLifecyclePolicy, SessionReauthenticationControl,
+    ConnectionLifecycle, ConnectionLifecyclePolicy, RetirementReason,
+    SessionReauthenticationControl,
 };
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
@@ -2030,6 +2031,13 @@ struct PendingServerLifecycle {
     peer_certificate_expiry: Option<CertificateExpiryEvidence>,
     established_at: tokio::time::Instant,
     generation: u64,
+    #[cfg(test)]
+    expire_at_final_ack_boundary: bool,
+}
+
+enum PendingServerAdmissionError {
+    Retired(RetirementReason),
+    Protocol(ProtocolError),
 }
 
 impl PendingServerLifecycle {
@@ -2041,6 +2049,8 @@ impl PendingServerLifecycle {
             peer_certificate_expiry: None,
             established_at: tokio::time::Instant::now(),
             generation,
+            #[cfg(test)]
+            expire_at_final_ack_boundary: false,
         }
     }
 
@@ -2053,16 +2063,18 @@ impl PendingServerLifecycle {
             ConnectionLifecycle,
             Option<opc_tls::AuthenticatedServerConfig>,
         ),
-        ProtocolError,
+        PendingServerAdmissionError,
     > {
         if admitted_generation != self.generation {
-            return Err(ProtocolError::Authentication);
+            return Err(PendingServerAdmissionError::Retired(
+                RetirementReason::Explicit,
+            ));
         }
         let epoch = match self.handshake {
             Some(handshake) => {
-                let admission = handshake
-                    .admit()
-                    .map_err(|_| ProtocolError::Authentication)?;
+                let admission = handshake.admit().map_err(|_| {
+                    PendingServerAdmissionError::Retired(RetirementReason::MaterialEpoch)
+                })?;
                 Some(admission.epoch())
             }
             None => None,
@@ -2075,7 +2087,7 @@ impl PendingServerLifecycle {
             self.generation,
             epoch,
         )
-        .map_err(|_| ProtocolError::InvalidWireValue)?;
+        .map_err(|_| PendingServerAdmissionError::Protocol(ProtocolError::InvalidWireValue))?;
         Ok((lifecycle, self.tls_config))
     }
 
@@ -2230,6 +2242,8 @@ async fn handle_connection(
                 peer_certificate_expiry: Some(peer_certificate_expiry),
                 established_at,
                 generation,
+                #[cfg(test)]
+                expire_at_final_ack_boundary: false,
             },
             dispatch_config,
         )
@@ -2274,6 +2288,8 @@ where
         lifecycle_policy,
         reauthentication,
     } = dispatch_config;
+    #[cfg(test)]
+    let expire_at_final_ack_boundary = pending_lifecycle.expire_at_final_ack_boundary;
 
     // Start the authentication clock at TLS completion, not after a peer
     // eventually sends Hello. A stalled peer cannot retain a slot past the
@@ -2322,14 +2338,17 @@ where
             );
             if let Some(reason) = mismatch {
                 bootstrap_lifecycle.record_forced_retirement(reason);
-                return Err(ProtocolError::Authentication);
+                return retire_bootstrap(writer, idle_timeout, &cancellation).await;
             }
             if !material_status_matches_admission(
                 bootstrap_lifecycle.admitted_material_epoch(),
                 current_material_status,
-            ) || bootstrap_lifecycle.retirement(now).is_some()
-            {
-                return Err(ProtocolError::Authentication);
+            ) {
+                bootstrap_lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
+                return retire_bootstrap(writer, idle_timeout, &cancellation).await;
+            }
+            if bootstrap_lifecycle.retirement(now).is_some() {
+                return retire_bootstrap(writer, idle_timeout, &cancellation).await;
             }
             tokio::select! {
                 biased;
@@ -2361,8 +2380,6 @@ where
         contract_profile,
         requested_response_frame_size,
     }) = hello;
-    drop(bootstrap_lifecycle);
-
     if contract_version != CONTRACT_VERSION {
         write_bootstrap_ack(
             writer,
@@ -2542,11 +2559,17 @@ where
     let (mut lifecycle, lifecycle_tls_config) =
         match pending_lifecycle.admit(lifecycle_policy, reauthentication.generation()) {
             Ok(admitted) => admitted,
-            // Peer identity and scope already succeeded. A failure here is a
-            // concurrent local material/generation retirement, so close
-            // before Accepted and let the client retry pre-transmission.
-            Err(_) => return Ok(()),
+            // Peer identity and scope already succeeded. An admission epoch
+            // mismatch is a concurrent local retirement, not a permanent
+            // peer authentication failure. Prove that no request was
+            // dispatched so a client can reconnect safely.
+            Err(PendingServerAdmissionError::Retired(reason)) => {
+                bootstrap_lifecycle.record_forced_retirement(reason);
+                return retire_bootstrap(writer, idle_timeout, &cancellation).await;
+            }
+            Err(PendingServerAdmissionError::Protocol(error)) => return Err(error),
         };
+    drop(bootstrap_lifecycle);
     let mut admission_material_rx = lifecycle_tls_config
         .as_ref()
         .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
@@ -2567,23 +2590,66 @@ where
         current_material_status.map(|status| status.epoch()),
         &peer_key,
     );
-    if admission_reauthentication_rx.has_changed().unwrap_or(true)
-        || !material_status_matches_admission(admitted_material_epoch, current_material_status)
-        || lifecycle.retirement(now).is_some()
-    {
-        return Ok(());
+    if let Some(reason) = lifecycle.evidence_mismatch_reason(
+        reauthentication.generation(),
+        current_material_status.map(|status| status.epoch()),
+    ) {
+        lifecycle.record_forced_retirement(reason);
+        return retire_bootstrap(writer, idle_timeout, &cancellation).await;
+    }
+    if admission_reauthentication_rx.has_changed().unwrap_or(true) {
+        lifecycle.record_forced_retirement(RetirementReason::Explicit);
+        return retire_bootstrap(writer, idle_timeout, &cancellation).await;
+    }
+    if !material_status_matches_admission(admitted_material_epoch, current_material_status) {
+        lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
+        return retire_bootstrap(writer, idle_timeout, &cancellation).await;
+    }
+    if lifecycle.retirement(now).is_some() {
+        return retire_bootstrap(writer, idle_timeout, &cancellation).await;
     }
     drop(_bootstrap_hard_task);
     let cancellation = Arc::new(ServerCancellation::default());
     let admitted_generation = lifecycle.admitted_generation();
     let (_lifecycle_task, mut retirement_rx) = spawn_connection_lifecycle(
-        lifecycle,
+        lifecycle.clone(),
         peer_key,
         lifecycle_tls_config.clone(),
         reauthentication.clone(),
         server_cancellation.clone(),
         cancellation.clone(),
     );
+    // This is the final zero-Ack-byte boundary. Before the acknowledgement
+    // future exists, a complete retirement frame is an unambiguous proof of
+    // no application admission. Once that future is polled it may have
+    // written a partial frame, so every later retirement branch only closes
+    // the connection and must never append a second bootstrap frame.
+    let pre_ack_material_status = lifecycle_tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedServerConfig::material_status);
+    if let Some(reason) = lifecycle.evidence_mismatch_reason(
+        reauthentication.generation(),
+        pre_ack_material_status.map(|status| status.epoch()),
+    ) {
+        lifecycle.record_forced_retirement(reason);
+        return retire_bootstrap(writer, idle_timeout, &cancellation).await;
+    }
+    if !material_status_matches_admission(admitted_material_epoch, pre_ack_material_status) {
+        lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
+        return retire_bootstrap(writer, idle_timeout, &cancellation).await;
+    }
+    if *retirement_rx.borrow() {
+        return retire_bootstrap(writer, idle_timeout, &cancellation).await;
+    }
+    #[cfg(test)]
+    if expire_at_final_ack_boundary {
+        // Deterministically model the soft deadline crossing after the earlier
+        // sample while the spawned lifecycle task has not been scheduled.
+        lifecycle.expire_at_final_ack_boundary_for_test();
+    }
+    if lifecycle.retirement(tokio::time::Instant::now()).is_some() {
+        return retire_bootstrap(writer, idle_timeout, &cancellation).await;
+    }
     {
         let acknowledgement = write_bootstrap_ack(
             writer,
@@ -2606,6 +2672,7 @@ where
                 _ = server_cancellation.cancelled() => return Ok(()),
                 changed = admission_reauthentication_rx.changed() => {
                     if changed.is_err() || reauthentication.generation() != admitted_generation {
+                        lifecycle.record_forced_retirement(RetirementReason::Explicit);
                         return Ok(());
                     }
                 }
@@ -2614,6 +2681,7 @@ where
                         .as_ref()
                         .map(opc_tls::AuthenticatedServerConfig::material_status);
                     if !material_status_matches_admission(admitted_material_epoch, status) {
+                        lifecycle.record_forced_retirement(RetirementReason::MaterialEpoch);
                         return Ok(());
                     }
                 }
@@ -3711,16 +3779,44 @@ where
     Err(ProtocolError::Authentication)
 }
 
+async fn retire_bootstrap<W>(
+    writer: &mut W,
+    timeout: std::time::Duration,
+    cancellation: &ServerCancellation,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tracing::debug!(
+        reason = "rotation_bootstrap_retired",
+        "retiring authenticated session connection before application admission"
+    );
+    let deadline = response_write_deadline(timeout)?;
+    write_frame_until_server_cancellation(
+        writer,
+        &BootstrapResponse::ConnectionRetiring,
+        MAX_HANDSHAKE_FRAME_SIZE,
+        deadline,
+        cancellation,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ensure_frame_fits, ensure_restore_scan_success_frame_fits};
+    use crate::protocol::{
+        ensure_frame_fits, ensure_restore_scan_success_frame_fits, read_frame, write_frame,
+    };
     use bytes::Bytes;
     use opc_session_store::{
         EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionKey, SessionKeyType,
         StateClass, StateType, StoredSessionRecord,
     };
     use opc_types::{NetworkFunctionKind, TenantId};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
 
     static TEST_NOT_CANCELLED: AtomicBool = AtomicBool::new(false);
     static TEST_SERVER_NOT_CANCELLED: std::sync::LazyLock<ServerCancellation> =
@@ -3732,6 +3828,266 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
+    }
+
+    struct PartialAcknowledgementWriter {
+        bytes: Arc<StdMutex<Vec<u8>>>,
+        first_chunk_written: bool,
+        wrote_first_chunk: Arc<Notify>,
+    }
+
+    impl AsyncWrite for PartialAcknowledgementWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            if self.first_chunk_written {
+                return Poll::Pending;
+            }
+            let written = buffer.len().min(2);
+            self.bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(&buffer[..written]);
+            self.first_chunk_written = true;
+            self.wrote_first_chunk.notify_one();
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn test_dispatch_config(reauthentication: SessionReauthenticationControl) -> DispatchConfig {
+        DispatchConfig {
+            binding: crate::identity::insecure_test_server_binding(),
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            idle_timeout: Duration::from_secs(1),
+            backend_operation_timeout: Duration::from_secs(1),
+            backend_slots: BackendOperationSlots::new(1),
+            restore_scan_timeout: Duration::from_secs(1),
+            restore_scan_slots: Arc::new(Semaphore::new(1)),
+            cancellation: Arc::new(ServerCancellation::default()),
+            lifecycle_policy: ConnectionLifecyclePolicy::try_new(
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                Duration::from_millis(5),
+                Duration::ZERO,
+            )
+            .expect("test lifecycle policy"),
+            reauthentication,
+        }
+    }
+
+    async fn valid_bootstrap_hello_bytes() -> Vec<u8> {
+        let binding = crate::identity::insecure_test_client_binding();
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &BootstrapRequest::Hello(BootstrapHello {
+                contract_version: CONTRACT_VERSION,
+                node_id: binding.local_replica_id().as_str().to_owned(),
+                expected_server_replica_id: Some(binding.remote_replica_id().as_str().to_owned()),
+                cluster_id: Some(binding.cluster_id().as_str().to_owned()),
+                configuration_id: Some(binding.configuration_id().to_hex()),
+                configuration_epoch: Some(binding.configuration_epoch().get()),
+                handshake_nonce: Some(uuid::Uuid::nil()),
+                contract_profile: Some(CURRENT_CONTRACT_PROFILE),
+                requested_response_frame_size: Some(DEFAULT_MAX_FRAME_SIZE as u32),
+            }),
+        )
+        .await
+        .expect("encode valid bootstrap Hello");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn pre_hello_generation_retirement_emits_one_explicit_no_dispatch_control() {
+        let reauthentication = SessionReauthenticationControl::new();
+        let pending = PendingServerLifecycle::insecure(reauthentication.generation());
+        reauthentication
+            .request_reauthentication()
+            .expect("advance test generation");
+        let config = test_dispatch_config(reauthentication);
+        let mut reader = tokio::io::empty();
+        let mut writer = Vec::new();
+
+        dispatch(
+            Arc::new(opc_session_store::fake::FakeSessionBackend::new()),
+            Arc::new(StdMutex::new(CasIdempotencyCache::default())),
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            config,
+        )
+        .await
+        .expect("pre-Hello retirement is an expected control exchange");
+
+        let mut encoded = std::io::Cursor::new(writer);
+        assert!(matches!(
+            read_frame::<_, BootstrapResponse>(&mut encoded, MAX_HANDSHAKE_FRAME_SIZE)
+                .await
+                .expect("read retirement control"),
+            BootstrapResponse::ConnectionRetiring
+        ));
+        assert_eq!(
+            usize::try_from(encoded.position()).expect("cursor position"),
+            encoded.get_ref().len(),
+            "exactly one control frame must be emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_crossing_at_final_zero_ack_boundary_emits_only_retirement_control() {
+        let reauthentication = SessionReauthenticationControl::new();
+        let mut pending = PendingServerLifecycle::insecure(reauthentication.generation());
+        pending.expire_at_final_ack_boundary = true;
+        let config = test_dispatch_config(reauthentication);
+        let mut input = valid_bootstrap_hello_bytes().await;
+        let hello_bytes = input.len();
+        write_frame(&mut input, &Request::Capabilities)
+            .await
+            .expect("append application request behind valid Hello");
+        let mut reader = std::io::Cursor::new(input);
+        let mut writer = Vec::new();
+
+        dispatch(
+            Arc::new(opc_session_store::fake::FakeSessionBackend::new()),
+            Arc::new(StdMutex::new(CasIdempotencyCache::default())),
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            config,
+        )
+        .await
+        .expect("final-boundary expiry is an expected control exchange");
+
+        assert_eq!(
+            usize::try_from(reader.position()).expect("reader position"),
+            hello_bytes,
+            "no application request bytes may be read or dispatched"
+        );
+        let mut encoded = std::io::Cursor::new(writer);
+        assert!(matches!(
+            read_frame::<_, BootstrapResponse>(&mut encoded, MAX_HANDSHAKE_FRAME_SIZE)
+                .await
+                .expect("read final-boundary retirement control"),
+            BootstrapResponse::ConnectionRetiring
+        ));
+        assert_eq!(
+            usize::try_from(encoded.position()).expect("writer position"),
+            encoded.get_ref().len(),
+            "one complete retirement control and zero Ack bytes must be emitted"
+        );
+    }
+
+    #[test]
+    fn post_hello_pre_admit_material_change_is_recorded_once_as_material_retirement() {
+        let material = crate::test_support::RotatableServerMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/server",
+        );
+        let tls_config = material.config();
+        let handshake = tls_config
+            .begin_handshake()
+            .expect("capture pre-rotation server material");
+        let established_at = tokio::time::Instant::now();
+        let pending = PendingServerLifecycle {
+            handshake: Some(handshake),
+            tls_config: Some(tls_config),
+            local_certificate_expiry: None,
+            peer_certificate_expiry: None,
+            established_at,
+            generation: 0,
+            expire_at_final_ack_boundary: false,
+        };
+        let policy = test_dispatch_config(SessionReauthenticationControl::new()).lifecycle_policy;
+        let bootstrap_lifecycle = pending
+            .provisional_lifecycle(policy)
+            .expect("provisional post-TLS lifecycle");
+
+        // `PendingServerLifecycle::admit` is the exact gate called only after
+        // Hello identity/scope validation and before any Ack write or backend
+        // dispatch. Advance the snapshot at that narrow boundary.
+        material.rotate();
+        let reason = match pending.admit(policy, 0) {
+            Err(PendingServerAdmissionError::Retired(reason)) => reason,
+            Err(PendingServerAdmissionError::Protocol(error)) => {
+                panic!("material race was misclassified as protocol: {error}")
+            }
+            Ok(_) => panic!("stale handshake snapshot must not be admitted"),
+        };
+        assert_eq!(reason, RetirementReason::MaterialEpoch);
+        bootstrap_lifecycle.record_forced_retirement(reason);
+        bootstrap_lifecycle.record_forced_retirement(reason);
+        assert_eq!(
+            bootstrap_lifecycle.recorded_retirement_count(),
+            1,
+            "the admission race must select and publish one lifecycle retirement outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_after_ack_bytes_start_closes_without_appending_retirement_control() {
+        let reauthentication = SessionReauthenticationControl::new();
+        let pending = PendingServerLifecycle::insecure(reauthentication.generation());
+        let config = test_dispatch_config(reauthentication.clone());
+        let mut reader = std::io::Cursor::new(valid_bootstrap_hello_bytes().await);
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let wrote_first_chunk = Arc::new(Notify::new());
+        let first_chunk = wrote_first_chunk.notified();
+        tokio::pin!(first_chunk);
+        let mut writer = PartialAcknowledgementWriter {
+            bytes: Arc::clone(&bytes),
+            first_chunk_written: false,
+            wrote_first_chunk: Arc::clone(&wrote_first_chunk),
+        };
+        let dispatch = dispatch(
+            Arc::new(opc_session_store::fake::FakeSessionBackend::new()),
+            Arc::new(StdMutex::new(CasIdempotencyCache::default())),
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            config,
+        );
+        tokio::pin!(dispatch);
+        tokio::select! {
+            _ = &mut first_chunk => {}
+            result = &mut dispatch => panic!("dispatch ended before partial Ack: {result:?}"),
+        }
+        reauthentication
+            .request_reauthentication()
+            .expect("retire after Ack transmission starts");
+        tokio::time::timeout(Duration::from_secs(1), &mut dispatch)
+            .await
+            .expect("partial-Ack retirement must close promptly")
+            .expect("partial-Ack retirement is a conservative close");
+
+        let written = bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            written.len(),
+            2,
+            "only the partial Ack prefix may be written"
+        );
+        assert!(!String::from_utf8_lossy(&written).contains("ConnectionRetiring"));
     }
 
     #[tokio::test]
