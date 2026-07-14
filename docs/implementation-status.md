@@ -387,9 +387,17 @@ through material admission and local/peer lifecycle deadlines, gives earlier
 intermediate expiry distinct fixed metrics, and classifies certificate/trust,
 TLS-protocol, and transport failures separately. Short-lived SVID expiry is the
 bounded same-issuer credential-compromise mechanism; immediate generic
-CRL/OCSP/certificate-or-identity-denylist revocation is unsupported. Fleet
-trust removal, expiry/rollback qualification, reconnect-storm, multi-process
-continuity, and soak evidence remain open under #164/#143. #159 implements ordinary
+CRL/OCSP/certificate-or-identity-denylist revocation is unsupported. A first
+in-process #164 fleet-mechanics test now covers real three- and five-voter
+Openraft/SQLite operation over production mTLS while leaf, presented
+intermediate, roots, overlap, old-trust removal, and both rollback procedures
+change; fresh directed handshakes, changed-voter durable probes, old-root
+rejection, and an encrypted committed canary are asserted. It is not independent
+or multi-process evidence and deliberately leaves the testkit profile's
+`foundation_counts_for_tls_rotation` false. Unavailable-member plus malformed
+reload, expiry, partition/restart, continuous mixed traffic/watch,
+reconnect-storm/resource/soak, deployed-network, and signed evidence remain open
+under #164/#143. #159 implements ordinary
 response/watch frame and write-deadline enforcement plus transaction-ID wire
 containment. #167 now supplies the production `StableId` model, bounded Serde,
 store/cache/Openraft/restore/replication/watch enforcement, privacy derivation,

@@ -589,9 +589,15 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   backend mutation may still finish later and therefore remains typed
   ambiguous and non-retryable. Legacy watches resume from the exact delivered
   cursor. Scoped real-mTLS tests cover retained connections and continuous
-  request/watch recycling. #164 and #143 still own multi-process fleet
-  trust-overlap/removal, short-lived-SVID expiry, root-cutover,
-  reconnect-storm, resource, soak, and release evidence. Any production
+  request/watch recycling. An in-process three- and five-voter Openraft/SQLite
+  campaign additionally exercises one-member-at-a-time leaf, presented
+  intermediate, and root changes; overlap-first rollback before and after old
+  trust removal; fresh directed mutual-TLS handshakes and durable probes; old
+  root rejection; and an encrypted acknowledged canary. It is SDK-generated
+  loopback evidence, not the independent multi-process qualification profile.
+  #164 and #143 still own unavailable-member/malformed-reload, short-lived-SVID
+  expiry, partition/restart, continuous mixed traffic/watch, reconnect-storm,
+  resource, soak, deployed-network, and signed release evidence. Any production
   acceptance criteria must explicitly acknowledge that immediate generic
   revocation remains unsupported. The 365-day session TTL remains unrelated to
   certificate lifetime, trust-bundle lifetime, or authentication age.
@@ -795,13 +801,19 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   complete call deadlines, scope binding, validated steady-state connection
   reuse, cancellation/timeout/dead-socket eviction, exact replacement after an
   explicit generation or material epoch, finite cached-connection retirement,
-  a renewed SVID observed on a subsequent full handshake, wrong rotated
-  identities, rejection of legacy backend authority, the 1,500 ms contained
-  cold cap, and every 2/5/10-second family. It also forms a real three-node
-  `ConsensusConfigStore` over the existing mTLS peer/server, restarts a follower
-  listener, injects a persistent 500 ms cold delay, and proves same-leader,
-  same-term catch-up/readiness/linearizable read within 10 seconds without a
-  preflight. Out-of-process deployment remains #164/#143 qualification.
+  renewed SVID handshakes, wrong rotated identities, rejection of legacy
+  backend authority, the 1,500 ms contained cold cap, and every 2/5/10-second
+  family. It forms a real three-node `ConsensusConfigStore` over the existing
+  mTLS peer/server, restarts a follower listener, injects a persistent 500 ms
+  cold delay, and proves same-leader, same-term
+  catch-up/readiness/linearizable read within 10 seconds without a preflight.
+  Its bounded session-store rotation case also forms real three- and five-voter
+  Openraft/SQLite fleets over the production mTLS peer/server, executes forward
+  and rollback trust procedures, and preserves an encryption-wrapper canary
+  through every phase. It does not emit the `opc-session-testkit` evidence
+  schema and does not change `foundation_counts_for_tls_rotation = false`;
+  out-of-process deployment and the remaining #164/#143 matrix are still
+  required.
 - `tests/three_node_quorum.rs` covers typed TTL and replication-tree-limit
   rejection before resolution and authenticated server dispatch, plus
   connection reuse after rejection, deterministic listener/handler teardown,
