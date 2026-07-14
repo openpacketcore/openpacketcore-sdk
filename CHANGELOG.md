@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Bounded IKE_SA_INIT error responses — `opc-proto-ikev2`:** responders can
+  now build notify-only `NO_PROPOSAL_CHOSEN` and `INVALID_KE_PAYLOAD` responses
+  with a zero responder SPI, canonical response flags, and Message ID zero.
+  The generic entry point accepts exactly one allowlisted IKE-SA-shaped error;
+  the invalid-KE convenience builder encodes the accepted non-zero
+  Diffie-Hellman group as exactly two big-endian octets. Cleartext
+  `INVALID_SYNTAX`, non-zero Protocol IDs, SPI bytes, ambiguous lists, and
+  malformed data fail closed. Source validation, response rate limiting,
+  retransmission behavior, and other unauthenticated anti-amplification policy
+  remain product responsibilities.
 - **Experimental HA transport hardening — `opc-session-net`:** each directed
   `RemoteSessionConsensusPeer` now retains at most one authenticated connection
   behind its existing one-call gate. A socket returns to that sole slot only

@@ -9,6 +9,7 @@
 //! decode/encode, raw-preserving generic payload-chain walking for unencrypted
 //! payloads, protected-payload boundary metadata, caller-owned crypto provider
 //! traits, narrow IKE_SA_INIT key-agreement/key-derivation material,
+//! bounded notify-only IKE_SA_INIT error responses,
 //! caller-keyed SA_INIT AES-GCM protected-payload open/seal helpers, typed
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
@@ -144,14 +145,16 @@ pub use protected_payload_crypto::{
     ProtectedPayloadSealContext, IKEV2_AES_GCM_EXPLICIT_IV_LEN,
 };
 pub use sa_init::{
+    build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response,
     build_ike_sa_init_response, decode_ike_sa_init_request_payloads, encode_nonce_payload_build,
     Ikev2KeyExchangePayload, Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError,
     Ikev2NoncePayload, Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild,
-    Ikev2SaInitBuildError, Ikev2SaInitPayloadError, Ikev2SaInitPayloads,
-    Ikev2SaInitResponsePayloads, Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaPayloadError,
-    Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform, Ikev2SaTransformBuild,
-    Ikev2TransformAttribute, Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
-    Ikev2TransformAttributeValue, Ikev2VendorIdPayload, Ikev2VendorIdPayloadError,
+    Ikev2SaInitBuildError, Ikev2SaInitNotifyBuildError, Ikev2SaInitPayloadError,
+    Ikev2SaInitPayloads, Ikev2SaInitResponsePayloads, Ikev2SaPayload, Ikev2SaPayloadBuild,
+    Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform,
+    Ikev2SaTransformBuild, Ikev2TransformAttribute, Ikev2TransformAttributeBuild,
+    Ikev2TransformAttributeBuildValue, Ikev2TransformAttributeValue, Ikev2VendorIdPayload,
+    Ikev2VendorIdPayloadError,
 };
 pub use sa_init_crypto::{
     derive_child_sa_key_material, derive_ike_sa_init_key_material, Ikev2ChildSaCryptoProfile,
