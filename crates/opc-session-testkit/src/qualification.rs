@@ -177,19 +177,50 @@ pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE: &str = "bounded-du
 /// campaign. This is one same-disk, exact-address active-mutator restart, not
 /// a deployed host or network-partition matrix.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE: &str =
-    "same-disk-exact-address-active-mutator/v1";
-/// Absolute bound from process termination through survivor progress,
-/// same-address restart, durable catch-up, journal reconciliation, and a
-/// strictly higher-fence mutation by the restarted member.
+    "same-disk-exact-address-active-mutator/v2";
+/// Maximum time for SIGKILL and process reaping before the exact manifest
+/// address is reused.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS: u64 = 5_000;
+/// Maximum time for the survivor majority to commit and expose semantic
+/// traffic progress while the selected member is absent.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Maximum time for one replacement child to bind, open its durable state,
+/// initialize its existing membership, and enable its consensus RPC path.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS: u64 =
+    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS;
+/// Maximum time after replacement startup for Openraft to regain all-voter
+/// readiness and apply the committed state on the restarted member.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Maximum time after journal reconciliation for the restarted mutator to
+/// commit under a strictly higher same-owner fence.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Composed crash-to-resume ceiling. Each constituent stage is checked
+/// independently; this total must never be used as a substitute stage timer.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS: u64 =
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS
+        + QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS;
 /// Versioned post-expiry recovery proof. Fault-era attempt outcomes first
 /// settle beyond the complete server/connect/backoff horizon; only then does
 /// the recovered member advance explicit reauthentication, reprove every
 /// incident directed path, and establish the next lifecycle baseline.
 pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE: &str =
-    "member-scoped-reauth-settled-baseline/v2";
+    "member-scoped-reauth-settled-baseline/v3";
+/// Versioned rolling survivor-progress proof used while an expired member is
+/// replaced. Every half-SLO pulse must carry one common committed key through
+/// every survivor observer, while an independent full-SLO checkpoint requires
+/// coverage of every active survivor key.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_PROFILE: &str =
+    "common-key-pulse-all-active-key-coverage/v1";
 /// Fault-attempt settlement horizon after replacement publication. One
 /// pre-admission read/handshake stage and its bounded retirement response may
 /// each consume the larger server timeout; cold connect and maximum reconnect
@@ -219,13 +250,18 @@ pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS: u64 
     };
     server_timeout * 2 + QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
 };
-/// Maximum interval between survivor-traffic progress observations during the
-/// recovered-member checkpoint. Requiring a semantic delta in every half-SLO
-/// interval bounds the worst-case gap between two actual progress events by
-/// the full availability-recovery SLO even though each event occurs somewhere
-/// between two observations.
+/// Maximum interval between survivor-traffic pulse observations during the
+/// recovered-member checkpoint. Requiring one common active key to advance on
+/// every survivor observer in each half-SLO interval bounds the worst-case gap
+/// between two actual pulse events by the full availability-recovery SLO even
+/// though each event occurs somewhere between two observations.
 pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS: u64 =
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS / 2;
+/// Maximum rolling observation interval in which every active survivor key
+/// must advance on every survivor observer. Common-key pulse observations do
+/// not reset this independent coverage checkpoint.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS: u64 =
+    QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS;
 /// Maximum recoverable workload-availability episode introduced on each
 /// survivor while one expired member rejoins. The episode must still settle
 /// inside the existing availability-recovery SLO before the clean lifecycle
@@ -247,6 +283,18 @@ pub const QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS: u64 = 75_000;
 pub const QUALIFICATION_FAULT_PATH_REFRESH_MILLIS: u64 = 5_000;
 /// Outbound and inbound qualification paths exercised for every remote peer.
 pub const QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR: u64 = 2;
+/// Per-node connection-attempt contribution from the scheduled hard-expiry
+/// negative probe. The expired caller fails local material preflight without
+/// dialing; the survivor-to-expired probe contributes one outbound attempt on
+/// the survivor and, when accepted, one inbound attempt on the expired member.
+pub const QUALIFICATION_TRAFFIC_FAULT_POST_HARD_EXPIRY_NETWORK_PROBE_ATTEMPTS_PER_NODE: u64 = 1;
+/// Versioned interval-accounting rule for the fault-era connection ledger.
+/// Scheduled new attempts and reconnects use the fixed topology/probe bound;
+/// terminal outcomes additionally admit only the exact attempts already
+/// outstanding at the baseline, as required by the connection conservation
+/// equation.
+pub const QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE: &str =
+    "new-attempts-plus-baseline-outstanding/v1";
 /// Lead between stopping all expiring-member traffic and that member's
 /// connection soft-retirement boundary.
 pub const QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS: u64 = 1_000;
@@ -712,7 +760,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v3\n",
+            "opc-session-ha/traffic-resource/v5\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -754,17 +802,26 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "watch_reconciliation_profile={}\n",
             "unclean_restart_count=1\n",
             "unclean_restart_profile={}\n",
+            "unclean_restart_termination_millis={}\n",
+            "unclean_restart_outage_millis={}\n",
+            "unclean_restart_startup_millis={}\n",
             "unclean_restart_catchup_millis={}\n",
+            "unclean_restart_resume_millis={}\n",
+            "unclean_restart_total_millis={}\n",
             "member_recovery_profile={}\n",
             "member_recovery_settlement_millis={}\n",
             "member_recovery_settlement_deadline_millis={}\n",
+            "member_recovery_progress_profile={}\n",
             "member_recovery_progress_checkpoint_millis={}\n",
+            "member_recovery_coverage_millis={}\n",
             "member_recovery_availability_interruption_budget_per_node={}\n",
             "operation_timeout_millis={}\n",
             "child_response_timeout_millis={}\n",
             "fault_expiry_validity_millis={}\n",
             "fault_path_refresh_millis={}\n",
             "fault_directed_path_factor={}\n",
+            "fault_connection_accounting_profile={}\n",
+            "fault_post_hard_expiry_network_probe_attempts_per_node={}\n",
             "fault_traffic_stop_lead_millis={}\n",
             "fault_mutation_shutdown_lead_millis={}\n",
             "traffic_cancellation_profile={}\n",
@@ -810,17 +867,26 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE,
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS,
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_PROFILE,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
         QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
         QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
         QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
         QUALIFICATION_FAULT_PATH_REFRESH_MILLIS,
         QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR,
+        QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE,
+        QUALIFICATION_TRAFFIC_FAULT_POST_HARD_EXPIRY_NETWORK_PROBE_ATTEMPTS_PER_NODE,
         QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
         QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
         QUALIFICATION_TRAFFIC_CANCELLATION_PROFILE,
@@ -2003,12 +2069,43 @@ mod tests {
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
-            "same-disk-exact-address-active-mutator/v1"
+            "same-disk-exact-address-active-mutator/v2"
         );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
+            5_000
+        );
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS, 26_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS, 45_000);
         assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS, 26_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS, 26_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS, 153_000);
+        const {
+            assert!(
+                QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS
+                    == QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS
+                        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS
+                        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS
+                        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS
+                        + QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS
+                        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS
+            );
+        }
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE,
+            "new-attempts-plus-baseline-outstanding/v1"
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_FAULT_POST_HARD_EXPIRY_NETWORK_PROBE_ATTEMPTS_PER_NODE,
+            1
+        );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
-            "member-scoped-reauth-settled-baseline/v2"
+            "member-scoped-reauth-settled-baseline/v3"
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_PROFILE,
+            "common-key-pulse-all-active-key-coverage/v1"
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
@@ -2021,6 +2118,10 @@ mod tests {
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
             13_000
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
+            26_000
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
@@ -2040,8 +2141,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:c8e63f27d205a8ddd6dd71a3892fd2cef044db96cf5d6048003c0993d1c155d9",
-                "sha256:6201fa4a5d2d9c5c9f84266e62a12499c00d6dfd55f4dfd0e90d2229ed7a2092",
+                "sha256:82da3c6fc69650e902dfb84d9ada35891a769432d40d2640f259845517a6aa01",
+                "sha256:1dcbd963848025c58fed0688dd55b77acc41ae26ee385d29328e4483f4f064d0",
             )
         );
         assert!(is_exact_sha256(&three));

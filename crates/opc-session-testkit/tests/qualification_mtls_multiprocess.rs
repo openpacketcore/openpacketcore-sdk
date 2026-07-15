@@ -57,15 +57,24 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR,
+    QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE,
     QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR,
+    QUALIFICATION_TRAFFIC_FAULT_POST_HARD_EXPIRY_NETWORK_PROBE_ATTEMPTS_PER_NODE,
     QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
+    QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
     QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
     QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
     QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
     QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND, QUALIFICATION_TRAFFIC_ROTATIONS_PER_MEMBER,
     QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
     QUALIFICATION_TRAFFIC_TRANSITION_MILLIS, QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
+    QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
 };
 use opc_types::Timestamp;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, SanType};
@@ -336,6 +345,62 @@ struct IndexedTrafficStatus {
     status: QualificationTrafficStatus,
 }
 
+#[derive(Debug, Clone)]
+struct RecoveryTrafficProgressTracker {
+    pulse_checkpoint: Vec<IndexedTrafficStatus>,
+    pulse_observed_at: Instant,
+    pulse_recovery_extended: bool,
+    coverage_checkpoint: Vec<IndexedTrafficStatus>,
+    coverage_observed_at: Instant,
+}
+
+impl RecoveryTrafficProgressTracker {
+    fn new(checkpoint: Vec<IndexedTrafficStatus>, observed_at: Instant) -> Self {
+        Self {
+            pulse_checkpoint: checkpoint.clone(),
+            pulse_observed_at: observed_at,
+            pulse_recovery_extended: false,
+            coverage_checkpoint: checkpoint,
+            coverage_observed_at: observed_at,
+        }
+    }
+
+    fn pulse_deadline(&self) -> Instant {
+        let interval = if self.pulse_recovery_extended {
+            QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
+        } else {
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS
+        };
+        self.pulse_observed_at + Duration::from_millis(interval)
+    }
+
+    fn extend_pulse_for_availability_recovery(&mut self) {
+        self.pulse_recovery_extended = true;
+    }
+
+    fn record_pulse(&mut self, checkpoint: Vec<IndexedTrafficStatus>, observed_at: Instant) {
+        self.pulse_checkpoint = checkpoint;
+        self.pulse_observed_at = observed_at;
+        self.pulse_recovery_extended = false;
+    }
+
+    fn record_coverage(&mut self, checkpoint: Vec<IndexedTrafficStatus>, observed_at: Instant) {
+        self.coverage_checkpoint = checkpoint;
+        self.coverage_observed_at = observed_at;
+    }
+
+    fn coverage_deadline(&self) -> Instant {
+        self.coverage_observed_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS)
+    }
+
+    fn next_deadline(&self, absolute_deadline: Instant) -> Instant {
+        self.pulse_deadline()
+            .min(self.coverage_deadline())
+            .min(absolute_deadline)
+    }
+}
+
 struct RecoveryFaultSettlementContext<'a> {
     before: &'a [QualificationConnectionLifecycleMetrics],
     participants: &'a TrafficParticipants,
@@ -343,8 +408,7 @@ struct RecoveryFaultSettlementContext<'a> {
     started: Instant,
     deadline: Instant,
     traffic_before: &'a [IndexedTrafficStatus],
-    rolling_traffic_checkpoint: Vec<IndexedTrafficStatus>,
-    last_traffic_progress_observed_at: Instant,
+    traffic_progress: RecoveryTrafficProgressTracker,
 }
 
 struct RecoveredMemberPhaseContext<'a> {
@@ -353,8 +417,7 @@ struct RecoveredMemberPhaseContext<'a> {
     phase: &'a str,
     fault_lifecycle_before: &'a [QualificationConnectionLifecycleMetrics],
     traffic_availability_baseline: &'a [IndexedTrafficStatus],
-    traffic_checkpoint: Vec<IndexedTrafficStatus>,
-    last_traffic_progress_observed_at: Instant,
+    traffic_progress: RecoveryTrafficProgressTracker,
     recovery_started: Instant,
     recovery_deadline: Instant,
 }
@@ -629,6 +692,114 @@ fn subset_traffic_availability_counters_equal(
         })
 }
 
+fn recovery_traffic_status_is_monotonic(
+    before: &QualificationTrafficStatus,
+    after: &QualificationTrafficStatus,
+    participants: &TrafficParticipants,
+    node_index: usize,
+) -> bool {
+    let is_mutator = participants.is_mutator(node_index);
+    let role_is_healthy = if is_mutator {
+        after.state == QualificationTrafficState::Running && after.owned_async_tasks == 2
+    } else {
+        matches!(
+            after.state,
+            QualificationTrafficState::WatchReady | QualificationTrafficState::MutationStopped
+        ) && after.owned_async_tasks == 1
+    };
+    let mutation_is_monotonic = if is_mutator {
+        traffic_live_mutator_counters_are_consistent(before)
+            && traffic_live_mutator_counters_are_consistent(after)
+            && after.mutation_cycles >= before.mutation_cycles
+            && after.linearizable_reads >= before.linearizable_reads
+            && after.lease_renewals >= before.lease_renewals
+            && after.lease_reacquisitions >= before.lease_reacquisitions
+            && after.complete_restore_scans >= before.complete_restore_scans
+            && after.durable_readiness_probes >= before.durable_readiness_probes
+            && after.mutation_resume_generation == before.mutation_resume_generation
+            && after.mutation_resume_record_fence == before.mutation_resume_record_fence
+            && after.last_generation >= before.last_generation
+            && after.last_record_fence >= before.last_record_fence
+    } else {
+        traffic_nonmutator_counters_unchanged(before, after)
+    };
+
+    role_is_healthy
+        && mutation_is_monotonic
+        && after.failure.is_none()
+        && traffic_failure_fields_are_coherent(after)
+        && traffic_availability_recovery_is_resolved(after)
+        && after.seed == before.seed
+        && after.availability_interruptions >= before.availability_interruptions
+        && after.availability_recoveries >= before.availability_recoveries
+        && after.max_consecutive_availability_interruptions
+            >= before.max_consecutive_availability_interruptions
+        && after.watch_entries >= before.watch_entries
+        && after.watch_applied_records >= before.watch_applied_records
+        && after.watch_sequence >= before.watch_sequence
+        && after.watch_reconciliations >= before.watch_reconciliations
+        && after.watch_reconciled_sequence >= before.watch_reconciled_sequence
+        && after.replication_head >= before.replication_head
+        && before.watch_traffic_generations.len() == participants.member_count
+        && after.watch_traffic_generations.len() == participants.member_count
+        && participants.mutators.iter().all(|key_index| {
+            after.watch_traffic_generations[*key_index]
+                >= before.watch_traffic_generations[*key_index]
+        })
+        && (0..participants.member_count)
+            .filter(|key_index| !participants.mutators.contains(key_index))
+            .all(|key_index| {
+                after.watch_traffic_generations[key_index]
+                    == before.watch_traffic_generations[key_index]
+            })
+}
+
+fn recovery_traffic_has_common_key_pulse(
+    before: &[IndexedTrafficStatus],
+    after: &[IndexedTrafficStatus],
+    participants: &TrafficParticipants,
+) -> bool {
+    traffic_status_snapshot_matches(before, participants)
+        && traffic_status_snapshot_matches(after, participants)
+        && participants.observers.iter().all(|node_index| {
+            indexed_traffic_status(before, *node_index)
+                .zip(indexed_traffic_status(after, *node_index))
+                .is_some_and(|(before, after)| {
+                    recovery_traffic_status_is_monotonic(before, after, participants, *node_index)
+                })
+        })
+        && participants.mutators.iter().any(|key_index| {
+            participants.observers.iter().all(|node_index| {
+                indexed_traffic_status(before, *node_index)
+                    .zip(indexed_traffic_status(after, *node_index))
+                    .is_some_and(|(before, after)| {
+                        after.watch_traffic_generations[*key_index]
+                            > before.watch_traffic_generations[*key_index]
+                    })
+            })
+        })
+}
+
+fn recovery_traffic_has_all_key_coverage(
+    before: &[IndexedTrafficStatus],
+    after: &[IndexedTrafficStatus],
+    participants: &TrafficParticipants,
+) -> bool {
+    traffic_status_snapshot_matches(before, participants)
+        && traffic_status_snapshot_matches(after, participants)
+        && participants.observers.iter().all(|node_index| {
+            indexed_traffic_status(before, *node_index)
+                .zip(indexed_traffic_status(after, *node_index))
+                .is_some_and(|(before, after)| {
+                    recovery_traffic_status_is_monotonic(before, after, participants, *node_index)
+                        && participants.mutators.iter().all(|key_index| {
+                            after.watch_traffic_generations[*key_index]
+                                > before.watch_traffic_generations[*key_index]
+                        })
+                })
+        })
+}
+
 fn subset_traffic_made_semantic_progress(
     before: &[IndexedTrafficStatus],
     after: &[IndexedTrafficStatus],
@@ -829,6 +1000,9 @@ fn recovery_fault_connection_bound(member_count: usize) -> u64 {
         .div_ceil(QUALIFICATION_FAULT_PATH_REFRESH_MILLIS);
     lifecycle_interval_connection_bound(member_count)
         .saturating_add(refresh_rounds.saturating_mul(directed_paths))
+        .saturating_add(
+            QUALIFICATION_TRAFFIC_FAULT_POST_HARD_EXPIRY_NETWORK_PROBE_ATTEMPTS_PER_NODE,
+        )
 }
 
 fn assert_lifecycle_delta_bounds_with_expected_outcomes(
@@ -1090,6 +1264,7 @@ fn assert_recovery_fault_flush_bounds(
     assert_eq!(after.len(), member_count);
     let bound = recovery_fault_connection_bound(member_count);
     for (node_index, (before, after)) in before.iter().zip(after).enumerate() {
+        assert_connection_attempts_accounted(before, node_index);
         assert_connection_attempts_accounted(after, node_index);
         assert!(
             recovery_fault_flush_has_no_unsafe_outcomes(before, after),
@@ -1150,9 +1325,19 @@ fn assert_recovery_fault_flush_bounds(
             node_index,
             "reconnect_failures",
         );
+        let (_, baseline_outstanding, _) =
+            connection_attempt_accounting(before).expect("accounted fault-outcome baseline");
+        let terminal_bound = bound.saturating_add(baseline_outstanding);
+        assert!(
+            terminal <= attempts.saturating_add(baseline_outstanding),
+            "fault-outcome flush violated interval connection conservation: node={node_index}, attempts={attempts}, terminal_outcomes={terminal}, baseline_outstanding={baseline_outstanding}"
+        );
+        assert!(
+            terminal <= terminal_bound,
+            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}"
+        );
         for (counter, observed) in [
             ("connection_attempts", attempts),
-            ("connection_terminal_outcomes", terminal),
             ("reconnect_attempts", reconnect_attempts),
             ("reconnect_failures", reconnect_failures),
         ] {
@@ -1754,6 +1939,22 @@ impl ChildNode {
         stderr_path: &Path,
         bind_addr: SocketAddr,
     ) -> (Self, SocketAddr) {
+        Self::spawn_bound_until(
+            config,
+            node_index,
+            stderr_path,
+            bind_addr,
+            Instant::now() + CHILD_TIMEOUT,
+        )
+    }
+
+    fn spawn_bound_until(
+        config: &Path,
+        node_index: usize,
+        stderr_path: &Path,
+        bind_addr: SocketAddr,
+        deadline: Instant,
+    ) -> (Self, SocketAddr) {
         let stderr = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1806,7 +2007,7 @@ impl ChildNode {
             }),
             next_command_sequence: 1,
         };
-        let reply = node.receive();
+        let reply = node.receive_until(deadline);
         let QualificationNodeReply::Bound {
             node_index: actual,
             bind_addr,
@@ -1953,11 +2154,20 @@ impl ChildNode {
         self.receive()
     }
 
+    fn invoke_until(
+        &mut self,
+        command: &QualificationNodeCommand,
+        deadline: Instant,
+    ) -> QualificationNodeReply {
+        self.send(command);
+        self.receive_until(deadline)
+    }
+
     fn process_id(&self) -> u32 {
         self.child.id()
     }
 
-    fn kill_unclean(&mut self) {
+    fn kill_unclean_by(&mut self, deadline: Instant) {
         if let Some(status) = self
             .child
             .try_wait()
@@ -1968,7 +2178,6 @@ impl ChildNode {
             );
         }
         self.child.kill().expect("kill qualification child");
-        let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = self.child.try_wait().expect("poll killed child") {
                 break status;
@@ -2216,40 +2425,50 @@ impl Fleet {
     }
 
     fn readiness_reports(&mut self, node_indices: &[usize]) -> Vec<FleetReadiness> {
+        self.readiness_reports_by(node_indices, Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn readiness_reports_by(
+        &mut self,
+        node_indices: &[usize],
+        deadline: Instant,
+    ) -> Vec<FleetReadiness> {
         for node_index in node_indices {
             self.nodes[*node_index].send(&QualificationNodeCommand::Probe);
         }
         node_indices
             .iter()
-            .map(|node_index| match self.nodes[*node_index].receive() {
-                QualificationNodeReply::Readiness {
-                    ready,
-                    reason_code,
-                    node_id,
-                    term,
-                    leader_id,
-                    configured_voters,
-                    fresh_reachable_voters,
-                    agreeing_voters,
-                    required_quorum,
-                    committed_index,
-                    applied_index,
-                } => FleetReadiness {
-                    node_index: *node_index,
-                    ready,
-                    reason_code,
-                    node_id,
-                    term,
-                    leader_id,
-                    configured_voters,
-                    fresh_reachable_voters,
-                    agreeing_voters,
-                    required_quorum,
-                    committed_index,
-                    applied_index,
+            .map(
+                |node_index| match self.nodes[*node_index].receive_until(deadline) {
+                    QualificationNodeReply::Readiness {
+                        ready,
+                        reason_code,
+                        node_id,
+                        term,
+                        leader_id,
+                        configured_voters,
+                        fresh_reachable_voters,
+                        agreeing_voters,
+                        required_quorum,
+                        committed_index,
+                        applied_index,
+                    } => FleetReadiness {
+                        node_index: *node_index,
+                        ready,
+                        reason_code,
+                        node_id,
+                        term,
+                        leader_id,
+                        configured_voters,
+                        fresh_reachable_voters,
+                        agreeing_voters,
+                        required_quorum,
+                        committed_index,
+                        applied_index,
+                    },
+                    reply => panic!("unexpected readiness response: {reply:?}"),
                 },
-                reply => panic!("unexpected readiness response: {reply:?}"),
-            })
+            )
             .collect()
     }
 
@@ -2301,10 +2520,18 @@ impl Fleet {
     }
 
     fn kill_node_unclean(&mut self, node_index: usize) -> (SocketAddr, u32) {
+        self.kill_node_unclean_by(
+            node_index,
+            Instant::now()
+                + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS),
+        )
+    }
+
+    fn kill_node_unclean_by(&mut self, node_index: usize, deadline: Instant) -> (SocketAddr, u32) {
         let expected_address = self.members[node_index].dial_addr;
         let previous_process_id = self.nodes[node_index].process_id();
-        self.nodes[node_index].kill_unclean();
-        wait_for_bind_address_release(expected_address);
+        self.nodes[node_index].kill_unclean_by(deadline);
+        wait_for_bind_address_release_by(expected_address, deadline);
         (expected_address, previous_process_id)
     }
 
@@ -2314,27 +2541,46 @@ impl Fleet {
         expected_address: SocketAddr,
         previous_process_id: u32,
     ) {
-        let (node, actual_address) = ChildNode::spawn_bound(
+        self.spawn_node_at_manifest_address_by(
+            node_index,
+            expected_address,
+            previous_process_id,
+            Instant::now() + CHILD_TIMEOUT,
+        );
+    }
+
+    fn spawn_node_at_manifest_address_by(
+        &mut self,
+        node_index: usize,
+        expected_address: SocketAddr,
+        previous_process_id: u32,
+        deadline: Instant,
+    ) {
+        let (node, actual_address) = ChildNode::spawn_bound_until(
             &self.config_paths[node_index],
             node_index,
             &self.stderr_paths[node_index],
             expected_address,
+            deadline,
         );
         assert_eq!(actual_address, expected_address);
         self.nodes[node_index] = node;
         assert_ne!(self.nodes[node_index].process_id(), previous_process_id);
+        self.nodes[node_index].send(&QualificationNodeCommand::Configure);
         assert!(matches!(
-            self.nodes[node_index].invoke(&QualificationNodeCommand::Configure),
+            self.nodes[node_index].receive_until(deadline),
             QualificationNodeReply::Started { node_index: actual } if actual == node_index
         ));
+        self.nodes[node_index].send(&QualificationNodeCommand::Initialize);
         assert!(matches!(
-            self.nodes[node_index].invoke(&QualificationNodeCommand::Initialize),
+            self.nodes[node_index].receive_until(deadline),
             QualificationNodeReply::Initialized
         ));
+        self.nodes[node_index].send(&QualificationNodeCommand::SetConsensusRpcAvailability {
+            availability: QualificationConsensusRpcAvailability::Available,
+        });
         assert!(matches!(
-            self.nodes[node_index].invoke(&QualificationNodeCommand::SetConsensusRpcAvailability {
-                availability: QualificationConsensusRpcAvailability::Available,
-            }),
+            self.nodes[node_index].receive_until(deadline),
             QualificationNodeReply::ConsensusRpcAvailability {
                 availability: QualificationConsensusRpcAvailability::Available,
             }
@@ -2410,7 +2656,7 @@ impl Fleet {
     fn restart_active_mutator_at_manifest_address(&mut self, node_index: usize) {
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
-            "same-disk-exact-address-active-mutator/v1"
+            "same-disk-exact-address-active-mutator/v2"
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
@@ -2432,8 +2678,7 @@ impl Fleet {
         let all_traffic =
             TrafficParticipants::try_new(self.member_count(), &all_node_indices, &all_node_indices)
                 .expect("bounded active-restart full-fleet traffic participants");
-        let restart_deadline = Instant::now()
-            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS);
+        let readiness_before = self.readiness_reports(&all_node_indices);
 
         let pre_restart = self
             .traffic_statuses_on(&[node_index])
@@ -2445,27 +2690,61 @@ impl Fleet {
         assert_eq!(pre_restart.status.failure, None);
         assert_completed_traffic_cycles(&pre_restart.status);
 
-        let (expected_address, previous_process_id) = self.kill_node_unclean(node_index);
+        let restart_started_at = Instant::now();
+        let restart_total_deadline = restart_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS);
+        let termination_deadline = restart_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS);
+        let (expected_address, previous_process_id) =
+            self.kill_node_unclean_by(node_index, termination_deadline);
+        let termination_completed_at = Instant::now();
+        assert!(
+            termination_completed_at.duration_since(restart_started_at)
+                <= Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,),
+            "active-mutator process termination exceeded its stage bound"
+        );
         // Sample only after SIGKILL has completed and the exact manifest
         // address is released. Every subsequent survivor delta is therefore
         // committed while the selected process is actually absent.
-        let survivor_before = self.traffic_statuses_on(&survivor_indices);
-        self.advance_canary_for_survivors(node_index, "active-mutator-restart-outage");
+        let outage_deadline = termination_completed_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS);
+        let survivor_before = self.traffic_statuses_on_by(&survivor_indices, outage_deadline);
+        self.advance_canary_for_survivors_by(
+            node_index,
+            "active-mutator-restart-outage",
+            outage_deadline,
+        );
         let survivor_progress = self.wait_for_subset_traffic_progress_with_crashed_tail(
             &survivor_before,
             &survivor_traffic,
             "active-mutator-restart-survivor-progress",
-            restart_deadline,
+            outage_deadline,
             Some(node_index),
         );
         assert!(
-            deadline_allows_completion(Instant::now(), restart_deadline),
-            "survivor progress exceeded the active-mutator restart bound"
+            deadline_allows_completion(Instant::now(), outage_deadline),
+            "survivor progress exceeded the active-mutator outage bound"
         );
 
-        self.spawn_node_at_manifest_address(node_index, expected_address, previous_process_id);
+        let startup_started_at = Instant::now();
+        let startup_deadline = startup_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS);
+        self.spawn_node_at_manifest_address_by(
+            node_index,
+            expected_address,
+            previous_process_id,
+            startup_deadline,
+        );
+        assert!(
+            deadline_allows_completion(Instant::now(), startup_deadline),
+            "active-mutator replacement startup exceeded its stage bound"
+        );
+
+        let catchup_started_at = Instant::now();
+        let catchup_deadline = catchup_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS);
         loop {
-            let reports = self.readiness_reports(&all_node_indices);
+            let reports = self.readiness_reports_by(&all_node_indices, catchup_deadline);
             let required_quorum = self.required_quorum();
             if reports.iter().all(|report| {
                 report.ready
@@ -2475,20 +2754,30 @@ impl Fleet {
                     && report.agreeing_voters == required_quorum
                     && report.required_quorum == required_quorum
             }) {
+                assert!(
+                    deadline_allows_completion(Instant::now(), catchup_deadline),
+                    "active-mutator all-voter readiness completed after its catch-up bound"
+                );
                 break;
             }
-            assert!(
-                deadline_allows_completion(Instant::now(), restart_deadline),
-                "active-mutator restart did not regain all-voter readiness: reports={reports:?}, stderr={:?}",
-                self.stderr_diagnostics()
-            );
+            if !deadline_allows_completion(Instant::now(), catchup_deadline) {
+                panic!(
+                    "active-mutator restart did not regain all-voter readiness: node={node_index}, total_elapsed_millis={}, catchup_elapsed_millis={}, readiness_before={readiness_before:?}, reports={reports:?}, stderr={:?}",
+                    restart_started_at.elapsed().as_millis(),
+                    catchup_started_at.elapsed().as_millis(),
+                    self.stderr_diagnostics()
+                );
+            }
             thread::sleep(Duration::from_millis(100));
         }
 
-        let reconciled = self.reconcile_traffic_watch_on(node_index);
+        let reconciliation_started_at = Instant::now();
+        let reconciliation_deadline = reconciliation_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+        let reconciled = self.reconcile_traffic_watch_on_by(node_index, reconciliation_deadline);
         assert!(
-            deadline_allows_completion(Instant::now(), restart_deadline),
-            "active-mutator journal reconciliation exceeded the restart bound"
+            deadline_allows_completion(Instant::now(), reconciliation_deadline),
+            "active-mutator journal reconciliation exceeded its stage bound"
         );
         assert_eq!(
             reconciled.status.state,
@@ -2522,13 +2811,15 @@ impl Fleet {
             );
         }
 
-        self.start_traffic_mutations_on(&[node_index]);
-        let resumed_before = self.traffic_statuses_on(&all_node_indices);
+        let resume_deadline = Instant::now()
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS);
+        self.start_traffic_mutations_on_by(&[node_index], resume_deadline);
+        let resumed_before = self.traffic_statuses_on_by(&all_node_indices, resume_deadline);
         let resumed = self.wait_for_subset_traffic_progress(
             &resumed_before,
             &all_traffic,
             "active-mutator-restart-higher-fence-progress",
-            restart_deadline,
+            resume_deadline,
         );
         let resumed_node = indexed_traffic_status(&resumed, node_index)
             .expect("resumed active-mutator traffic status");
@@ -2558,8 +2849,12 @@ impl Fleet {
             "a recovered committed generation rearmed the once-per-mutator synthetic response-loss fault"
         );
         assert!(
-            deadline_allows_completion(Instant::now(), restart_deadline),
-            "active-mutator recovery completed after its absolute catch-up bound"
+            deadline_allows_completion(Instant::now(), resume_deadline),
+            "active-mutator higher-fence resume exceeded its stage bound"
+        );
+        assert!(
+            deadline_allows_completion(Instant::now(), restart_total_deadline),
+            "active-mutator recovery exceeded its composed crash-to-resume bound"
         );
         self.verify_canary();
     }
@@ -2574,7 +2869,7 @@ impl Fleet {
         loop {
             let member_count = self.member_count();
             let required_quorum = self.required_quorum();
-            let reports = self.readiness_reports(&node_indices);
+            let reports = self.readiness_reports_by(&node_indices, deadline);
             if reports.iter().all(|report| {
                 report.ready
                     && report.reason_code == QualificationReadinessCode::Ready
@@ -2600,14 +2895,34 @@ impl Fleet {
     }
 
     fn projected_status(&mut self, node_index: usize) -> QualificationProjectedSvidStatus {
-        match self.nodes[node_index].invoke(&QualificationNodeCommand::ProjectedSourceStatus) {
+        self.projected_status_by(node_index, Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn projected_status_by(
+        &mut self,
+        node_index: usize,
+        deadline: Instant,
+    ) -> QualificationProjectedSvidStatus {
+        match self.nodes[node_index]
+            .invoke_until(&QualificationNodeCommand::ProjectedSourceStatus, deadline)
+        {
             QualificationNodeReply::ProjectedSourceStatus { status } => status,
             reply => panic!("unexpected projected-source response: {reply:?}"),
         }
     }
 
     fn material_status(&mut self, node_index: usize) -> QualificationTlsMaterialStatus {
-        match self.nodes[node_index].invoke(&QualificationNodeCommand::MaterialStatus) {
+        self.material_status_by(node_index, Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn material_status_by(
+        &mut self,
+        node_index: usize,
+        deadline: Instant,
+    ) -> QualificationTlsMaterialStatus {
+        match self.nodes[node_index]
+            .invoke_until(&QualificationNodeCommand::MaterialStatus, deadline)
+        {
             QualificationNodeReply::MaterialStatus { status } => status,
             reply => panic!("unexpected material response: {reply:?}"),
         }
@@ -2917,12 +3232,19 @@ impl Fleet {
     }
 
     fn all_lifecycle_metrics(&mut self) -> Vec<QualificationConnectionLifecycleMetrics> {
+        self.all_lifecycle_metrics_by(Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn all_lifecycle_metrics_by(
+        &mut self,
+        deadline: Instant,
+    ) -> Vec<QualificationConnectionLifecycleMetrics> {
         for node in &mut self.nodes {
             node.send(&QualificationNodeCommand::LifecycleMetrics);
         }
         self.nodes
             .iter_mut()
-            .map(|node| match node.receive() {
+            .map(|node| match node.receive_until(deadline) {
                 QualificationNodeReply::LifecycleMetrics { metrics } => metrics,
                 reply => panic!("unexpected lifecycle metrics response: {reply:?}"),
             })
@@ -2943,8 +3265,7 @@ impl Fleet {
             started,
             deadline,
             traffic_before,
-            mut rolling_traffic_checkpoint,
-            mut last_traffic_progress_observed_at,
+            mut traffic_progress,
         } = context;
         assert_eq!(before.len(), self.member_count());
         assert_eq!(participants.member_count, self.member_count());
@@ -2957,7 +3278,11 @@ impl Fleet {
             participants,
         ));
         assert!(traffic_status_snapshot_matches(
-            &rolling_traffic_checkpoint,
+            &traffic_progress.pulse_checkpoint,
+            participants,
+        ));
+        assert!(traffic_status_snapshot_matches(
+            &traffic_progress.coverage_checkpoint,
             participants,
         ));
         assert_eq!(
@@ -2967,9 +3292,9 @@ impl Fleet {
         let server_tail_window = recovery_fault_server_tail_window();
         let server_tail_deadline = started + server_tail_window;
         let outbound_quiet_window = recovery_fault_outbound_quiet_window();
-        let mut stable_traffic_checkpoint = rolling_traffic_checkpoint.clone();
+        let mut stable_traffic_checkpoint = traffic_progress.pulse_checkpoint.clone();
         let mut traffic_progressed_since_stable = false;
-        let mut lifecycle = self.all_lifecycle_metrics();
+        let mut lifecycle = self.all_lifecycle_metrics_by(traffic_progress.next_deadline(deadline));
         let mut stable_ledger = connection_attempt_settlement_ledgers(&lifecycle);
         let observed_at = Instant::now();
         let mut stable_since = observed_at;
@@ -2977,7 +3302,10 @@ impl Fleet {
         let node_indices = (0..self.member_count()).collect::<Vec<_>>();
 
         loop {
-            let traffic = self.traffic_status_snapshots_on(&participants.observers);
+            let traffic = self.traffic_status_snapshots_on_by(
+                &participants.observers,
+                traffic_progress.next_deadline(deadline),
+            );
             let traffic_observed_at = Instant::now();
             for indexed in &traffic {
                 assert_ne!(
@@ -3006,33 +3334,56 @@ impl Fleet {
                 "survivor availability exceeded the recovered-member interruption budget while flushing fault-era connection outcomes: phase={phase}, before={traffic_before:?}, current={traffic:?}, stderr={:?}",
                 self.stderr_diagnostics()
             );
-            let traffic_progressed = subset_traffic_made_semantic_progress_with_crashed_tail(
-                &rolling_traffic_checkpoint,
+            let traffic_progressed = recovery_traffic_has_common_key_pulse(
+                &traffic_progress.pulse_checkpoint,
                 &traffic,
                 participants,
-                None,
+            );
+            let traffic_coverage_progressed = recovery_traffic_has_all_key_coverage(
+                &traffic_progress.coverage_checkpoint,
+                &traffic,
+                participants,
             );
             let availability_changed_since_progress = subset_traffic_availability_changed_since(
-                &rolling_traffic_checkpoint,
+                &traffic_progress.pulse_checkpoint,
                 &traffic,
                 participants,
             );
-            let progress_observation_millis = if availability_changed_since_progress {
+            if availability_changed_since_progress {
+                traffic_progress.extend_pulse_for_availability_recovery();
+            }
+            let progress_observation_millis = if traffic_progress.pulse_recovery_extended {
                 QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
             } else {
                 QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS
             };
             assert!(
-                traffic_observed_at.duration_since(last_traffic_progress_observed_at)
+                traffic_observed_at.duration_since(traffic_progress.pulse_observed_at)
                     <= Duration::from_millis(progress_observation_millis),
-                "survivor traffic snapshot crossed its progress-observation deadline during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
-                traffic_observed_at.duration_since(last_traffic_progress_observed_at),
+                "survivor traffic snapshot crossed its common-key pulse deadline during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
+                traffic_observed_at.duration_since(traffic_progress.pulse_observed_at),
                 self.stderr_diagnostics()
             );
+            assert!(
+                traffic_observed_at.duration_since(traffic_progress.coverage_observed_at)
+                    <= Duration::from_millis(
+                        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
+                    ),
+                "survivor traffic snapshot crossed its all-active-key coverage deadline during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
+                traffic_observed_at.duration_since(traffic_progress.coverage_observed_at),
+                self.stderr_diagnostics()
+            );
+            if traffic_progressed {
+                traffic_progress.record_pulse(traffic.clone(), traffic_observed_at);
+            }
+            if traffic_coverage_progressed {
+                traffic_progress.record_coverage(traffic.clone(), traffic_observed_at);
+            }
 
             let member_count = self.member_count();
             let required_quorum = self.required_quorum();
-            let readiness = self.readiness_reports(&node_indices);
+            let readiness =
+                self.readiness_reports_by(&node_indices, traffic_progress.next_deadline(deadline));
             assert!(
                 readiness.iter().all(|report| {
                     report.ready
@@ -3046,7 +3397,7 @@ impl Fleet {
                 self.stderr_diagnostics()
             );
 
-            lifecycle = self.all_lifecycle_metrics();
+            lifecycle = self.all_lifecycle_metrics_by(traffic_progress.next_deadline(deadline));
             for (node_index, (fault_before, current)) in before.iter().zip(&lifecycle).enumerate() {
                 assert!(
                     recovery_fault_flush_has_no_unsafe_outcomes(fault_before, current),
@@ -3057,10 +3408,6 @@ impl Fleet {
 
             let current_ledger = connection_attempt_settlement_ledgers(&lifecycle);
             let now = Instant::now();
-            if traffic_progressed {
-                rolling_traffic_checkpoint = traffic.clone();
-                last_traffic_progress_observed_at = traffic_observed_at;
-            }
             if !server_tail_entered && now >= server_tail_deadline {
                 server_tail_entered = true;
                 stable_traffic_checkpoint = traffic.clone();
@@ -3079,20 +3426,25 @@ impl Fleet {
             ) {
                 traffic_progressed_since_stable = true;
             }
-            let progress_observation_millis = if subset_traffic_availability_changed_since(
-                &rolling_traffic_checkpoint,
-                &traffic,
-                participants,
-            ) {
+            let progress_observation_millis = if traffic_progress.pulse_recovery_extended {
                 QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
             } else {
                 QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS
             };
             assert!(
-                now.duration_since(last_traffic_progress_observed_at)
+                now.duration_since(traffic_progress.pulse_observed_at)
                     <= Duration::from_millis(progress_observation_millis),
-                "survivor traffic stopped making bounded semantic progress during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
-                now.duration_since(last_traffic_progress_observed_at),
+                "survivor traffic stopped producing bounded common-key pulses during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
+                now.duration_since(traffic_progress.pulse_observed_at),
+                self.stderr_diagnostics()
+            );
+            assert!(
+                now.duration_since(traffic_progress.coverage_observed_at)
+                    <= Duration::from_millis(
+                        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
+                    ),
+                "survivor traffic stopped covering every active key during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
+                now.duration_since(traffic_progress.coverage_observed_at),
                 self.stderr_diagnostics()
             );
             let lifecycle_settled = lifecycle
@@ -3222,6 +3574,14 @@ impl Fleet {
     }
 
     fn traffic_statuses_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
+        self.traffic_statuses_on_by(node_indices, Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn traffic_statuses_on_by(
+        &mut self,
+        node_indices: &[usize],
+        deadline: Instant,
+    ) -> Vec<IndexedTrafficStatus> {
         validate_traffic_indices(
             self.member_count(),
             node_indices,
@@ -3234,7 +3594,7 @@ impl Fleet {
         node_indices
             .iter()
             .map(|node_index| {
-                let status = match self.nodes[*node_index].receive() {
+                let status = match self.nodes[*node_index].receive_until(deadline) {
                     QualificationNodeReply::TrafficStatus { status } => status,
                     reply => panic!(
                         "traffic status unavailable: node={node_index}, reply={reply:?}, stderr={}",
@@ -3254,6 +3614,14 @@ impl Fleet {
     }
 
     fn traffic_status_snapshots_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
+        self.traffic_status_snapshots_on_by(node_indices, Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn traffic_status_snapshots_on_by(
+        &mut self,
+        node_indices: &[usize],
+        deadline: Instant,
+    ) -> Vec<IndexedTrafficStatus> {
         validate_traffic_indices(
             self.member_count(),
             node_indices,
@@ -3266,7 +3634,7 @@ impl Fleet {
         node_indices
             .iter()
             .map(|node_index| {
-                let status = match self.nodes[*node_index].receive() {
+                let status = match self.nodes[*node_index].receive_until(deadline) {
                     QualificationNodeReply::TrafficStatus { status } => status,
                     reply => panic!(
                         "traffic status snapshot unavailable: node={node_index}, reply={reply:?}, stderr={}",
@@ -3322,13 +3690,20 @@ impl Fleet {
     }
 
     fn reconcile_traffic_watch_on(&mut self, node_index: usize) -> IndexedTrafficStatus {
+        self.reconcile_traffic_watch_on_by(node_index, Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn reconcile_traffic_watch_on_by(
+        &mut self,
+        node_index: usize,
+        deadline: Instant,
+    ) -> IndexedTrafficStatus {
         assert!(node_index < self.member_count());
         let member_count = self.member_count();
         let seed = qualification_traffic_seed(member_count)
             .expect("supported traffic qualification topology");
-        let status = match self.nodes[node_index]
-            .invoke(&QualificationNodeCommand::ReconcileTrafficWatch)
-        {
+        self.nodes[node_index].send(&QualificationNodeCommand::ReconcileTrafficWatch);
+        let status = match self.nodes[node_index].receive_until(deadline) {
             QualificationNodeReply::TrafficStatus { status } => status,
             reply => panic!(
                 "traffic watch restore handoff failed: node={node_index}, reply={reply:?}, stderr={}",
@@ -3350,6 +3725,10 @@ impl Fleet {
     }
 
     fn start_traffic_mutations_on(&mut self, node_indices: &[usize]) {
+        self.start_traffic_mutations_on_by(node_indices, Instant::now() + CHILD_TIMEOUT);
+    }
+
+    fn start_traffic_mutations_on_by(&mut self, node_indices: &[usize], deadline: Instant) {
         validate_traffic_indices(
             self.member_count(),
             node_indices,
@@ -3362,7 +3741,7 @@ impl Fleet {
             self.nodes[*node_index].send(&QualificationNodeCommand::StartTrafficMutation);
         }
         for node_index in node_indices {
-            match self.nodes[*node_index].receive() {
+            match self.nodes[*node_index].receive_until(deadline) {
                 QualificationNodeReply::TrafficStatus { status } => {
                     assert_eq!(status.state, QualificationTrafficState::Running);
                     assert_eq!(status.failure, None);
@@ -3413,12 +3792,11 @@ impl Fleet {
     fn wait_for_recovery_traffic_progress(
         &mut self,
         availability_baseline: &[IndexedTrafficStatus],
-        progress_checkpoint: &[IndexedTrafficStatus],
+        progress: &mut RecoveryTrafficProgressTracker,
         participants: &TrafficParticipants,
         phase: &str,
-        last_progress_observed_at: &mut Instant,
         absolute_deadline: Instant,
-    ) -> Vec<IndexedTrafficStatus> {
+    ) {
         assert_eq!(participants.member_count, self.member_count());
         assert!(traffic_status_snapshot_matches(
             availability_baseline,
@@ -3429,13 +3807,18 @@ impl Fleet {
             participants,
         ));
         assert!(traffic_status_snapshot_matches(
-            progress_checkpoint,
+            &progress.pulse_checkpoint,
             participants,
         ));
-        let normal_progress_deadline =
-            recovery_traffic_progress_deadline(*last_progress_observed_at, absolute_deadline);
+        assert!(traffic_status_snapshot_matches(
+            &progress.coverage_checkpoint,
+            participants,
+        ));
         loop {
-            let traffic = self.traffic_status_snapshots_on(&participants.observers);
+            let traffic = self.traffic_status_snapshots_on_by(
+                &participants.observers,
+                progress.next_deadline(absolute_deadline),
+            );
             let traffic_observed_at = Instant::now();
             for indexed in &traffic {
                 assert_ne!(
@@ -3464,40 +3847,68 @@ impl Fleet {
                 "survivor availability exceeded the recovered-member interruption budget during continuity proof: phase={phase}, baseline={availability_baseline:?}, current={traffic:?}, stderr={:?}",
                 self.stderr_diagnostics()
             );
-            let progress_deadline = if subset_traffic_availability_changed_since(
-                progress_checkpoint,
+            if subset_traffic_availability_changed_since(
+                &progress.pulse_checkpoint,
                 &traffic,
                 participants,
             ) {
-                (*last_progress_observed_at
-                    + Duration::from_millis(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS))
-                .min(absolute_deadline)
-            } else {
-                normal_progress_deadline
-            };
-            if subset_traffic_made_semantic_progress_with_crashed_tail(
-                progress_checkpoint,
+                progress.extend_pulse_for_availability_recovery();
+            }
+            let pulse_deadline = progress.pulse_deadline().min(absolute_deadline);
+            let coverage_deadline = progress.coverage_deadline();
+            let coverage_progressed = recovery_traffic_has_all_key_coverage(
+                &progress.coverage_checkpoint,
                 &traffic,
                 participants,
-                None,
-            ) {
+            );
+            let pulse_progressed = recovery_traffic_has_common_key_pulse(
+                &progress.pulse_checkpoint,
+                &traffic,
+                participants,
+            );
+
+            assert!(
+                deadline_allows_completion(traffic_observed_at, absolute_deadline),
+                "survivor traffic observation crossed the absolute recovered-member deadline: phase={phase}, current={traffic:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            if coverage_progressed {
                 assert!(
-                    deadline_allows_completion(traffic_observed_at, progress_deadline),
-                    "survivor traffic progressed only after its rolling recovery deadline: phase={phase}, elapsed_since_progress={:?}, current={traffic:?}, stderr={:?}",
-                    traffic_observed_at.duration_since(*last_progress_observed_at),
+                    deadline_allows_completion(traffic_observed_at, coverage_deadline),
+                    "survivor traffic covered every active key only after its rolling recovery deadline: phase={phase}, elapsed_since_coverage={:?}, current={traffic:?}, stderr={:?}",
+                    traffic_observed_at.duration_since(progress.coverage_observed_at),
+                    self.stderr_diagnostics()
+                );
+                progress.record_coverage(traffic.clone(), traffic_observed_at);
+            } else {
+                assert!(
+                    deadline_allows_completion(traffic_observed_at, coverage_deadline),
+                    "survivor traffic did not cover every active key before its independent recovery deadline: phase={phase}, elapsed_since_coverage={:?}, checkpoint={:?}, current={traffic:?}, stderr={:?}",
+                    traffic_observed_at.duration_since(progress.coverage_observed_at),
+                    progress.coverage_checkpoint,
+                    self.stderr_diagnostics()
+                );
+            }
+            if pulse_progressed {
+                assert!(
+                    deadline_allows_completion(traffic_observed_at, pulse_deadline),
+                    "survivor traffic produced a common-key pulse only after its rolling recovery deadline: phase={phase}, elapsed_since_pulse={:?}, current={traffic:?}, stderr={:?}",
+                    traffic_observed_at.duration_since(progress.pulse_observed_at),
                     self.stderr_diagnostics()
                 );
                 // `now` is the observation boundary, not an inferred event
-                // timestamp. Requiring another delta within the next
-                // half-SLO observation interval bounds the worst-case gap
-                // between actual progress events by the full SLO.
-                *last_progress_observed_at = traffic_observed_at;
-                return traffic;
+                // timestamp. Requiring one common committed key on every
+                // observer in each half-SLO bounds the actual pulse gap by the
+                // full SLO. The independent coverage checkpoint above stops a
+                // fast key from masking another active survivor key.
+                progress.record_pulse(traffic, traffic_observed_at);
+                return;
             }
             assert!(
-                deadline_allows_completion(traffic_observed_at, progress_deadline),
-                "survivor traffic did not progress before its rolling recovery deadline: phase={phase}, elapsed_since_progress={:?}, baseline={availability_baseline:?}, checkpoint={progress_checkpoint:?}, current={traffic:?}, stderr={:?}",
-                traffic_observed_at.duration_since(*last_progress_observed_at),
+                deadline_allows_completion(traffic_observed_at, pulse_deadline),
+                "survivor traffic did not produce a common-key pulse before its rolling recovery deadline: phase={phase}, elapsed_since_pulse={:?}, baseline={availability_baseline:?}, checkpoint={:?}, current={traffic:?}, stderr={:?}",
+                traffic_observed_at.duration_since(progress.pulse_observed_at),
+                progress.pulse_checkpoint,
                 self.stderr_diagnostics()
             );
             thread::sleep(Duration::from_millis(20));
@@ -3515,7 +3926,7 @@ impl Fleet {
         assert_eq!(participants.member_count, self.member_count());
         assert!(traffic_status_snapshot_matches(before, participants));
         loop {
-            let after = self.traffic_statuses_on(&participants.observers);
+            let after = self.traffic_statuses_on_by(&participants.observers, deadline);
             for indexed in &after {
                 if indexed.status.failure.is_some()
                     || indexed.status.state == QualificationTrafficState::Failed
@@ -4052,8 +4463,12 @@ impl Fleet {
     }
 
     fn assert_all_material_ready(&mut self) {
+        self.assert_all_material_ready_by(Instant::now() + CHILD_TIMEOUT);
+    }
+
+    fn assert_all_material_ready_by(&mut self, deadline: Instant) {
         for node_index in 0..self.member_count() {
-            let source = self.projected_status(node_index);
+            let source = self.projected_status_by(node_index, deadline);
             assert!(source.generation >= 1);
             assert_eq!(
                 source.availability,
@@ -4061,7 +4476,7 @@ impl Fleet {
             );
             assert!(source.reason.is_none());
 
-            let controller = self.material_status(node_index);
+            let controller = self.material_status_by(node_index, deadline);
             assert!(controller.epoch >= 1);
             assert_eq!(
                 controller.availability,
@@ -4140,8 +4555,8 @@ impl Fleet {
         deadline: Instant,
     ) {
         loop {
-            let source = self.projected_status(node_index);
-            let controller = self.material_status(node_index);
+            let source = self.projected_status_by(node_index, deadline);
+            let controller = self.material_status_by(node_index, deadline);
             let source_advanced = source.generation > previous_source_generation;
             let controller_advanced = controller.epoch > previous_material_epoch;
             if source_advanced
@@ -4275,12 +4690,16 @@ impl Fleet {
     }
 
     fn all_reauthentication_generations(&mut self) -> Vec<u64> {
+        self.all_reauthentication_generations_by(Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn all_reauthentication_generations_by(&mut self, deadline: Instant) -> Vec<u64> {
         for node in &mut self.nodes {
             node.send(&QualificationNodeCommand::ReauthenticationGeneration);
         }
         self.nodes
             .iter_mut()
-            .map(|node| match node.receive() {
+            .map(|node| match node.receive_until(deadline) {
                 QualificationNodeReply::ReauthenticationGeneration { generation } => generation,
                 reply => panic!("unexpected reauthentication generation response: {reply:?}"),
             })
@@ -4299,45 +4718,41 @@ impl Fleet {
         member: usize,
         availability_baseline: &[IndexedTrafficStatus],
         participants: &TrafficParticipants,
-        traffic_checkpoint: &mut Vec<IndexedTrafficStatus>,
-        last_traffic_progress_observed_at: &mut Instant,
+        traffic_progress: &mut RecoveryTrafficProgressTracker,
         absolute_deadline: Instant,
     ) {
         assert!(member < self.member_count());
-        let generations_before = self.all_reauthentication_generations();
+        let generations_before = self
+            .all_reauthentication_generations_by(traffic_progress.next_deadline(absolute_deadline));
         let paths = member_incident_directed_paths(self.member_count(), member);
         assert_eq!(paths.len(), 2 * (self.member_count() - 1));
         for (source, target) in paths {
-            let progress_deadline = recovery_traffic_progress_deadline(
-                *last_traffic_progress_observed_at,
-                absolute_deadline,
-            );
+            let progress_deadline = traffic_progress.next_deadline(absolute_deadline);
             self.wait_for_directed_handshake_by(
                 source,
                 target,
                 generations_before[source],
                 progress_deadline,
             );
-            *traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+            self.wait_for_recovery_traffic_progress(
                 availability_baseline,
-                traffic_checkpoint,
+                traffic_progress,
                 participants,
                 "existing-generation-incident-path",
-                last_traffic_progress_observed_at,
                 absolute_deadline,
             );
         }
-        let generations_after = self.all_reauthentication_generations();
+        let generations_after = self
+            .all_reauthentication_generations_by(traffic_progress.next_deadline(absolute_deadline));
         assert_eq!(
             generations_after, generations_before,
             "fault-boundary path proof advanced an explicit reauthentication generation"
         );
-        *traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+        self.wait_for_recovery_traffic_progress(
             availability_baseline,
-            traffic_checkpoint,
+            traffic_progress,
             participants,
             "existing-generation-path-generation-check",
-            last_traffic_progress_observed_at,
             absolute_deadline,
         );
     }
@@ -4394,48 +4809,40 @@ impl Fleet {
             phase,
             fault_lifecycle_before,
             traffic_availability_baseline,
-            mut traffic_checkpoint,
-            mut last_traffic_progress_observed_at,
+            mut traffic_progress,
             recovery_started,
             recovery_deadline,
         } = context;
         assert!(!participants.observers.contains(&member));
-        self.assert_all_material_ready();
-        traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+        self.assert_all_material_ready_by(traffic_progress.next_deadline(recovery_deadline));
+        self.wait_for_recovery_traffic_progress(
             traffic_availability_baseline,
-            &traffic_checkpoint,
+            &mut traffic_progress,
             participants,
             "replacement-material-ready",
-            &mut last_traffic_progress_observed_at,
             recovery_deadline,
         );
         self.prove_recovered_member_paths_at_current_generation(
             member,
             traffic_availability_baseline,
             participants,
-            &mut traffic_checkpoint,
-            &mut last_traffic_progress_observed_at,
+            &mut traffic_progress,
             recovery_deadline,
         );
-        self.wait_ready_by(recovery_traffic_progress_deadline(
-            last_traffic_progress_observed_at,
-            recovery_deadline,
-        ));
-        traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+        self.wait_ready_by(traffic_progress.next_deadline(recovery_deadline));
+        self.wait_for_recovery_traffic_progress(
             traffic_availability_baseline,
-            &traffic_checkpoint,
+            &mut traffic_progress,
             participants,
             "replacement-all-voter-readiness",
-            &mut last_traffic_progress_observed_at,
             recovery_deadline,
         );
-        self.verify_canary();
-        traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+        self.verify_canary_by(traffic_progress.next_deadline(recovery_deadline));
+        self.wait_for_recovery_traffic_progress(
             traffic_availability_baseline,
-            &traffic_checkpoint,
+            &mut traffic_progress,
             participants,
             "replacement-canary-verification",
-            &mut last_traffic_progress_observed_at,
             recovery_deadline,
         );
         let (lifecycle_before, clean_traffic_baseline) = self
@@ -4446,8 +4853,7 @@ impl Fleet {
                 started: recovery_started,
                 deadline: recovery_deadline,
                 traffic_before: traffic_availability_baseline,
-                rolling_traffic_checkpoint: traffic_checkpoint,
-                last_traffic_progress_observed_at,
+                traffic_progress,
             });
         let started = Instant::now();
         let deadline = started + Duration::from_millis(QUALIFICATION_TRAFFIC_TRANSITION_MILLIS);
@@ -4597,6 +5003,24 @@ impl Fleet {
     }
 
     fn advance_canary_for_survivors(&mut self, isolated_node_index: usize, phase: &str) {
+        self.advance_canary_for_survivors_with_deadline(isolated_node_index, phase, None);
+    }
+
+    fn advance_canary_for_survivors_by(
+        &mut self,
+        isolated_node_index: usize,
+        phase: &str,
+        deadline: Instant,
+    ) {
+        self.advance_canary_for_survivors_with_deadline(isolated_node_index, phase, Some(deadline));
+    }
+
+    fn advance_canary_for_survivors_with_deadline(
+        &mut self,
+        isolated_node_index: usize,
+        phase: &str,
+        deadline: Option<Instant>,
+    ) {
         assert_ne!(
             isolated_node_index, 0,
             "the fixed canary writer must remain in the survivor quorum"
@@ -4604,7 +5028,7 @@ impl Fleet {
         let survivors = (0..self.member_count())
             .filter(|node_index| *node_index != isolated_node_index)
             .collect::<Vec<_>>();
-        self.advance_canary_on_nodes(0, &survivors, phase);
+        self.advance_canary_on_nodes_with_deadline(0, &survivors, phase, deadline);
     }
 
     fn advance_canary_on_nodes(
@@ -4612,6 +5036,21 @@ impl Fleet {
         writer_node_index: usize,
         reader_node_indices: &[usize],
         phase: &str,
+    ) {
+        self.advance_canary_on_nodes_with_deadline(
+            writer_node_index,
+            reader_node_indices,
+            phase,
+            None,
+        );
+    }
+
+    fn advance_canary_on_nodes_with_deadline(
+        &mut self,
+        writer_node_index: usize,
+        reader_node_indices: &[usize],
+        phase: &str,
+        deadline: Option<Instant>,
     ) {
         assert!(reader_node_indices.contains(&writer_node_index));
         let expected_generation = (self.canary_generation != 0).then_some(self.canary_generation);
@@ -4621,13 +5060,18 @@ impl Fleet {
             self.member_count(),
             self.canary_generation
         );
-        match self.nodes[writer_node_index].invoke(&QualificationNodeCommand::CompareAndSet {
+        self.nodes[writer_node_index].send(&QualificationNodeCommand::CompareAndSet {
             lease_handle: CANARY_LEASE_HANDLE.to_owned(),
             stable_id: CANARY_STABLE_ID.to_owned(),
             expected_generation,
             new_generation: self.canary_generation,
             value: value.clone(),
-        }) {
+        });
+        let reply = match deadline {
+            Some(deadline) => self.nodes[writer_node_index].receive_until(deadline),
+            None => self.nodes[writer_node_index].receive(),
+        };
+        match reply {
             QualificationNodeReply::CompareAndSet {
                 applied: true,
                 current_generation: Some(actual),
@@ -4636,7 +5080,7 @@ impl Fleet {
         }
 
         self.canary_values.push(value);
-        self.verify_canary_on_nodes(reader_node_indices);
+        self.verify_canary_on_nodes_with_deadline(reader_node_indices, deadline);
     }
 
     fn verify_canary(&mut self) {
@@ -4644,7 +5088,20 @@ impl Fleet {
         self.verify_canary_on_nodes(&node_indices);
     }
 
+    fn verify_canary_by(&mut self, deadline: Instant) {
+        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        self.verify_canary_on_nodes_with_deadline(&node_indices, Some(deadline));
+    }
+
     fn verify_canary_on_nodes(&mut self, node_indices: &[usize]) {
+        self.verify_canary_on_nodes_with_deadline(node_indices, None);
+    }
+
+    fn verify_canary_on_nodes_with_deadline(
+        &mut self,
+        node_indices: &[usize],
+        deadline: Option<Instant>,
+    ) {
         assert!(!node_indices.is_empty());
         let expected_owner = qualification_owner_sha256(CANARY_OWNER);
         let expected_value = qualification_value_sha256(
@@ -4659,7 +5116,11 @@ impl Fleet {
             });
         }
         for node_index in node_indices {
-            match self.nodes[*node_index].receive() {
+            let reply = match deadline {
+                Some(deadline) => self.nodes[*node_index].receive_until(deadline),
+                None => self.nodes[*node_index].receive(),
+            };
+            match reply {
                 QualificationNodeReply::Record {
                     present: true,
                     generation: Some(actual_generation),
@@ -5117,8 +5578,7 @@ fn duration_until_wall_time(deadline: time::OffsetDateTime) -> Duration {
     )
 }
 
-fn wait_for_bind_address_release(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+fn wait_for_bind_address_release_by(address: SocketAddr, deadline: Instant) {
     loop {
         match TcpListener::bind(address) {
             Ok(listener) => {
@@ -5636,34 +6096,22 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
     let replacement_controller_before = fleet.material_status(expiring_node_index);
     let replacement_traffic_baseline =
         fleet.traffic_status_snapshots_on(&expiry_survivor_traffic.observers);
-    let mut replacement_traffic_checkpoint = replacement_traffic_baseline.clone();
-    let mut replacement_last_traffic_progress_observed_at = Instant::now();
-    let prepublication_progress_deadline = recovery_traffic_progress_deadline(
-        replacement_last_traffic_progress_observed_at,
-        replacement_last_traffic_progress_observed_at
-            + Duration::from_millis(
-                QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
-            ),
-    );
-    replacement_traffic_checkpoint = fleet.wait_for_recovery_traffic_progress(
+    let mut replacement_traffic_progress =
+        RecoveryTrafficProgressTracker::new(replacement_traffic_baseline.clone(), Instant::now());
+    let prepublication_progress_deadline = replacement_traffic_progress.pulse_deadline();
+    fleet.wait_for_recovery_traffic_progress(
         &replacement_traffic_baseline,
-        &replacement_traffic_checkpoint,
+        &mut replacement_traffic_progress,
         &expiry_survivor_traffic,
         "replacement-prepublication-progress",
-        &mut replacement_last_traffic_progress_observed_at,
         prepublication_progress_deadline,
     );
     let replacement = fleet
         .pki
         .credential(expiring_node_index, CredentialGeneration::RenewedLeaf);
     let old_trust = fleet.pki.trust_bundle(TrustGeneration::OldOnly);
-    let publication_stage_deadline = recovery_traffic_progress_deadline(
-        replacement_last_traffic_progress_observed_at,
-        replacement_last_traffic_progress_observed_at
-            + Duration::from_millis(
-                QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
-            ),
-    );
+    let publication_stage_deadline =
+        replacement_traffic_progress.next_deadline(replacement_traffic_progress.pulse_deadline());
     let replacement_recovery_started = publish_projected_generation(
         &fleet.projected_roots[expiring_node_index],
         &mut fleet.projected_generation[expiring_node_index],
@@ -5680,17 +6128,13 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         expiring_node_index,
         replacement_source_before.generation,
         replacement_controller_before.epoch,
-        recovery_traffic_progress_deadline(
-            replacement_last_traffic_progress_observed_at,
-            replacement_recovery_deadline,
-        ),
+        replacement_traffic_progress.next_deadline(replacement_recovery_deadline),
     );
-    replacement_traffic_checkpoint = fleet.wait_for_recovery_traffic_progress(
+    fleet.wait_for_recovery_traffic_progress(
         &replacement_traffic_baseline,
-        &replacement_traffic_checkpoint,
+        &mut replacement_traffic_progress,
         &expiry_survivor_traffic,
         "replacement-publication",
-        &mut replacement_last_traffic_progress_observed_at,
         replacement_recovery_deadline,
     );
     assert_eq!(
@@ -5705,8 +6149,7 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
             phase: "short-lived-svid-replacement-recovered",
             fault_lifecycle_before: &lifecycle_before_expiry,
             traffic_availability_baseline: &replacement_traffic_baseline,
-            traffic_checkpoint: replacement_traffic_checkpoint,
-            last_traffic_progress_observed_at: replacement_last_traffic_progress_observed_at,
+            traffic_progress: replacement_traffic_progress,
             recovery_started: replacement_recovery_started,
             recovery_deadline: replacement_recovery_deadline,
         });
@@ -6717,6 +7160,176 @@ fn subset_traffic_fixture() -> (
     (participants, before, after)
 }
 
+fn recovery_post_cas_alignment_fixture() -> (
+    TrafficParticipants,
+    Vec<IndexedTrafficStatus>,
+    Vec<IndexedTrafficStatus>,
+) {
+    let (participants, before, mut after) = subset_traffic_fixture();
+    after.clone_from(&before);
+    for indexed in &mut after {
+        indexed.status.watch_entries += 1;
+        indexed.status.watch_applied_records += 1;
+        indexed.status.watch_sequence += 1;
+        indexed.status.replication_head += 1;
+        indexed.status.watch_traffic_generations[0] += 1;
+        match indexed.node_index {
+            0 => {
+                // Finish the cycle whose CAS was already visible in the
+                // checkpoint, then publish the next cycle's CAS.
+                indexed.status.mutation_cycles += 1;
+                indexed.status.lease_reacquisitions += 1;
+                indexed.status.lease_renewals += 1;
+                indexed.status.last_generation += 1;
+                indexed.status.last_record_fence += 1;
+            }
+            1 => {
+                // The checkpoint already observed this cycle's CAS. Its
+                // terminal publication is still real progress even though
+                // generation and watch position do not change again yet.
+                indexed.status.mutation_cycles += 1;
+                indexed.status.lease_reacquisitions += 1;
+            }
+            2 => {}
+            _ => unreachable!(),
+        }
+    }
+    (participants, before, after)
+}
+
+#[test]
+fn recovery_progress_accepts_post_cas_alignment_without_claiming_full_coverage() {
+    let (participants, before, after) = recovery_post_cas_alignment_fixture();
+    assert!(recovery_traffic_has_common_key_pulse(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(!recovery_traffic_has_all_key_coverage(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(!subset_traffic_made_semantic_progress(
+        &before,
+        &after,
+        &participants,
+    ));
+}
+
+#[test]
+fn recovery_progress_requires_one_common_key_on_every_observer() {
+    let (participants, before, mut split) = recovery_post_cas_alignment_fixture();
+    split[1].status.watch_traffic_generations[0] = before[1].status.watch_traffic_generations[0];
+    split[1].status.watch_traffic_generations[1] += 1;
+    split[2].status.watch_traffic_generations[0] = before[2].status.watch_traffic_generations[0];
+    split[2].status.watch_traffic_generations[1] += 1;
+    assert!(!recovery_traffic_has_common_key_pulse(
+        &before,
+        &split,
+        &participants,
+    ));
+}
+
+#[test]
+fn recovery_fast_key_pulses_do_not_reset_all_key_coverage() {
+    let (participants, before, first_pulse) = recovery_post_cas_alignment_fixture();
+    let observed_at = Instant::now();
+    let mut tracker = RecoveryTrafficProgressTracker::new(before.clone(), observed_at);
+    let coverage_deadline = tracker.coverage_deadline();
+    assert!(recovery_traffic_has_common_key_pulse(
+        &tracker.pulse_checkpoint,
+        &first_pulse,
+        &participants,
+    ));
+    tracker.pulse_checkpoint = first_pulse.clone();
+    tracker.pulse_observed_at += Duration::from_millis(1_000);
+
+    let mut second_pulse = first_pulse;
+    for indexed in &mut second_pulse {
+        indexed.status.watch_entries += 1;
+        indexed.status.watch_applied_records += 1;
+        indexed.status.watch_sequence += 1;
+        indexed.status.replication_head += 1;
+        indexed.status.watch_traffic_generations[0] += 1;
+        if indexed.node_index == 0 {
+            indexed.status.linearizable_reads += 1;
+            indexed.status.complete_restore_scans += 1;
+            indexed.status.durable_readiness_probes += 1;
+            indexed.status.lease_reacquisitions += 1;
+            indexed.status.mutation_cycles += 1;
+            indexed.status.lease_renewals += 1;
+            indexed.status.last_generation += 1;
+            indexed.status.last_record_fence += 1;
+        }
+    }
+    assert!(recovery_traffic_has_common_key_pulse(
+        &tracker.pulse_checkpoint,
+        &second_pulse,
+        &participants,
+    ));
+    assert!(!recovery_traffic_has_all_key_coverage(
+        &tracker.coverage_checkpoint,
+        &second_pulse,
+        &participants,
+    ));
+    assert_eq!(tracker.coverage_deadline(), coverage_deadline);
+}
+
+#[test]
+fn recovery_coverage_requires_health_monotonicity_and_inactive_key_stability() {
+    let (participants, before, after) = subset_traffic_fixture();
+    assert!(recovery_traffic_has_all_key_coverage(
+        &before,
+        &after,
+        &participants,
+    ));
+
+    let mut missing_observer_key = after.clone();
+    missing_observer_key[2].status.watch_traffic_generations[1] =
+        before[2].status.watch_traffic_generations[1];
+    assert!(!recovery_traffic_has_all_key_coverage(
+        &before,
+        &missing_observer_key,
+        &participants,
+    ));
+
+    let mut regressed = after.clone();
+    regressed[0].status.replication_head = before[0].status.replication_head - 1;
+    assert!(!recovery_traffic_has_all_key_coverage(
+        &before,
+        &regressed,
+        &participants,
+    ));
+
+    let mut unhealthy = after.clone();
+    unhealthy[0].status.state = QualificationTrafficState::Failed;
+    assert!(!recovery_traffic_has_all_key_coverage(
+        &before,
+        &unhealthy,
+        &participants,
+    ));
+
+    let mut unresolved = after.clone();
+    unresolved[0].status.availability_interruptions += 1;
+    unresolved[0]
+        .status
+        .max_consecutive_availability_interruptions += 1;
+    assert!(!recovery_traffic_has_all_key_coverage(
+        &before,
+        &unresolved,
+        &participants,
+    ));
+
+    let mut inactive_changed = after;
+    inactive_changed[2].status.watch_traffic_generations[2] += 1;
+    assert!(!recovery_traffic_has_all_key_coverage(
+        &before,
+        &inactive_changed,
+        &participants,
+    ));
+}
+
 #[test]
 fn restarted_mutator_counters_are_relative_to_exact_committed_resume_state() {
     let mut resumed = traffic_status_fixture(3);
@@ -6974,12 +7587,24 @@ fn recovery_fault_settlement_tracks_attempts_without_freezing_connection_gauges(
         recovery_fault_outbound_quiet_window(),
         Duration::from_millis(2_500)
     );
-    assert_eq!(recovery_fault_connection_bound(3), 84);
-    assert_eq!(recovery_fault_connection_bound(5), 160);
+    assert_eq!(recovery_fault_connection_bound(3), 85);
+    assert_eq!(recovery_fault_connection_bound(5), 161);
     assert_eq!(QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR, 2);
+    assert_eq!(
+        QUALIFICATION_TRAFFIC_FAULT_POST_HARD_EXPIRY_NETWORK_PROBE_ATTEMPTS_PER_NODE,
+        1
+    );
+    assert_eq!(
+        QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE,
+        "new-attempts-plus-baseline-outstanding/v1"
+    );
     assert_eq!(
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
         13_000
+    );
+    assert_eq!(
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
+        26_000
     );
     let observed_at = Instant::now();
     let absolute_deadline = observed_at + Duration::from_millis(86_000);
@@ -6991,6 +7616,22 @@ fn recovery_fault_settlement_tracks_attempts_without_freezing_connection_gauges(
     assert_eq!(
         recovery_traffic_progress_deadline(late_observation, absolute_deadline),
         absolute_deadline
+    );
+    let mut progress = RecoveryTrafficProgressTracker::new(Vec::new(), observed_at);
+    assert_eq!(
+        progress.next_deadline(absolute_deadline),
+        observed_at + Duration::from_millis(13_000)
+    );
+    progress.extend_pulse_for_availability_recovery();
+    assert_eq!(
+        progress.next_deadline(absolute_deadline),
+        observed_at + Duration::from_millis(26_000)
+    );
+    progress.record_pulse(Vec::new(), observed_at + Duration::from_millis(20_000));
+    assert!(!progress.pulse_recovery_extended);
+    assert_eq!(
+        progress.next_deadline(absolute_deadline),
+        observed_at + Duration::from_millis(26_000)
     );
 
     let baseline = lifecycle_metrics_fixture();
@@ -7036,9 +7677,76 @@ fn recovery_fault_flush_bounds_incident_failures_and_rejects_abandonment() {
     incident_fleet[0] = incident;
     assert_recovery_fault_flush_bounds(3, &before_fleet, &incident_fleet);
 
+    // The fixed maximum includes one per-node attempt for the scheduled
+    // survivor-to-expired-member negative probe after hard expiry. The reverse
+    // probe fails local material preflight and consumes no network attempt.
+    let mut scheduled_maximum = before_fleet.clone();
+    scheduled_maximum[0].connection_attempts = 85;
+    scheduled_maximum[0].connection_successes = 85;
+    assert_recovery_fault_flush_bounds(3, &before_fleet, &scheduled_maximum);
+
+    let mut reconnect_attempt_maximum = before_fleet.clone();
+    reconnect_attempt_maximum[0].reconnect_attempts = 85;
+    assert_recovery_fault_flush_bounds(3, &before_fleet, &reconnect_attempt_maximum);
+
+    let mut reconnect_failure_maximum = before_fleet.clone();
+    reconnect_failure_maximum[0].reconnect_failures = 85;
+    assert_recovery_fault_flush_bounds(3, &before_fleet, &reconnect_failure_maximum);
+
+    // A connection accepted before the interval can finish during it. Its
+    // terminal outcome is not a new interval attempt, so admit exactly the
+    // outstanding baseline carry-in while retaining the fixed new-attempt
+    // bound and the connection conservation equation.
+    let mut carry_in_before = before;
+    carry_in_before.connection_attempts = 1;
+    carry_in_before.active_connections = 1;
+    let carry_in_before_fleet = vec![carry_in_before; 3];
+    let mut carry_in_after_fleet = carry_in_before_fleet.clone();
+    carry_in_after_fleet[0].connection_attempts = 86;
+    carry_in_after_fleet[0].connection_successes = 86;
+    carry_in_after_fleet[0].active_connections = 0;
+    assert_recovery_fault_flush_bounds(3, &carry_in_before_fleet, &carry_in_after_fleet);
+
+    let mut unaccounted_terminal = carry_in_after_fleet.clone();
+    unaccounted_terminal[0].connection_successes = 87;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &carry_in_before_fleet, &unaccounted_terminal);
+    })
+    .is_err());
+
+    let mut new_attempt_storm = carry_in_after_fleet.clone();
+    new_attempt_storm[0].connection_attempts = 87;
+    new_attempt_storm[0].connection_successes = 86;
+    new_attempt_storm[0].active_connections = 1;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &carry_in_before_fleet, &new_attempt_storm);
+    })
+    .is_err());
+
+    let mut reconnect_attempt_storm = carry_in_after_fleet.clone();
+    reconnect_attempt_storm[0].reconnect_attempts = 86;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &carry_in_before_fleet, &reconnect_attempt_storm);
+    })
+    .is_err());
+
+    let mut reconnect_failure_storm = carry_in_after_fleet.clone();
+    reconnect_failure_storm[0].reconnect_failures = 86;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &carry_in_before_fleet, &reconnect_failure_storm);
+    })
+    .is_err());
+
+    let mut malformed_baseline = carry_in_before_fleet.clone();
+    malformed_baseline[0].active_connections = 0;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &malformed_baseline, &carry_in_after_fleet);
+    })
+    .is_err());
+
     let mut storm = incident_fleet.clone();
-    storm[0].connection_attempts = 85;
-    storm[0].connection_successes = 82;
+    storm[0].connection_attempts = 86;
+    storm[0].connection_successes = 83;
     assert!(std::panic::catch_unwind(|| {
         assert_recovery_fault_flush_bounds(3, &before_fleet, &storm);
     })
