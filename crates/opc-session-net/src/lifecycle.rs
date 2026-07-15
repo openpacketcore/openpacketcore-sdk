@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use opc_redaction::metrics::METRICS;
 use sha2::{Digest, Sha256};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify, OwnedSemaphorePermit, Semaphore};
 
 /// Default maximum age of one authenticated session transport connection.
 pub const DEFAULT_MAX_AUTHENTICATION_AGE: Duration = Duration::from_secs(15 * 60);
@@ -182,6 +182,268 @@ impl Default for ConnectionLifecyclePolicy {
             reconnect_backoff_max: DEFAULT_RECONNECT_BACKOFF_MAX,
             rotation_jitter: DEFAULT_ROTATION_JITTER,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectEpoch {
+    generation: u64,
+    material: Option<opc_tls::TlsMaterialEpoch>,
+}
+
+impl ReconnectEpoch {
+    fn supersedes(self, current: Self) -> bool {
+        let material_is_not_older = match (self.material, current.material) {
+            (None, None) | (Some(_), None) => true,
+            (Some(candidate), Some(current)) => candidate >= current,
+            (None, Some(_)) => false,
+        };
+        material_is_not_older && self.generation >= current.generation && self != current
+    }
+}
+
+#[derive(Debug)]
+struct ReconnectGateState {
+    epoch: Option<ReconnectEpoch>,
+    next_attempt_at: Option<tokio::time::Instant>,
+    backoff: Duration,
+}
+
+/// Per-peer reconnect admission shared by every logical call and transport lane.
+///
+/// The semaphore prevents concurrent cold connections from stampeding one
+/// peer. Failed attempts publish their next admission time into shared state,
+/// so a new RPC or watch cannot reset the exponential backoff. A local
+/// credential-material publication or explicit reauthentication generation
+/// change starts a fresh epoch immediately.
+#[derive(Debug)]
+pub(crate) struct ReconnectGate {
+    policy: ConnectionLifecyclePolicy,
+    serial: Arc<Semaphore>,
+    state: Mutex<ReconnectGateState>,
+    changed: Notify,
+}
+
+impl ReconnectGate {
+    pub(crate) fn new(policy: ConnectionLifecyclePolicy) -> Arc<Self> {
+        Arc::new(Self {
+            policy,
+            serial: Arc::new(Semaphore::new(1)),
+            state: Mutex::new(ReconnectGateState {
+                epoch: None,
+                next_attempt_at: None,
+                backoff: policy.reconnect_backoff_min(),
+            }),
+            changed: Notify::new(),
+        })
+    }
+
+    pub(crate) fn observe_epoch(
+        &self,
+        generation: u64,
+        material: Option<opc_tls::TlsMaterialEpoch>,
+    ) {
+        let epoch = ReconnectEpoch {
+            generation,
+            material,
+        };
+        let changed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state
+                .epoch
+                .is_some_and(|current| !epoch.supersedes(current))
+            {
+                false
+            } else {
+                state.epoch = Some(epoch);
+                state.next_attempt_at = None;
+                state.backoff = self.policy.reconnect_backoff_min();
+                true
+            }
+        };
+        if changed {
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub(crate) fn mark_usable(&self, generation: u64, material: Option<opc_tls::TlsMaterialEpoch>) {
+        self.observe_epoch(generation, material);
+        let epoch = ReconnectEpoch {
+            generation,
+            material,
+        };
+        let reset = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.epoch != Some(epoch) {
+                false
+            } else {
+                state.next_attempt_at = None;
+                state.backoff = self.policy.reconnect_backoff_min();
+                true
+            }
+        };
+        if reset {
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn acquire(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        generation: u64,
+        material: Option<opc_tls::TlsMaterialEpoch>,
+    ) -> Option<ReconnectAttempt> {
+        let epoch = ReconnectEpoch {
+            generation,
+            material,
+        };
+        self.observe_epoch(generation, material);
+        let permit = tokio::time::timeout_at(deadline, Arc::clone(&self.serial).acquire_owned())
+            .await
+            .ok()?
+            .ok()?;
+
+        loop {
+            // Register before inspecting state so an epoch publication cannot
+            // be lost between the check and the wait.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let wait_until = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.epoch != Some(epoch) {
+                    return None;
+                }
+                state.next_attempt_at
+            };
+            let Some(wait_until) = wait_until.filter(|wait| *wait > tokio::time::Instant::now())
+            else {
+                break;
+            };
+            if wait_until >= deadline {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut changed => continue,
+                _ = tokio::time::sleep_until(wait_until) => break,
+                _ = tokio::time::sleep_until(deadline) => return None,
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        Some(ReconnectAttempt {
+            gate: Arc::clone(self),
+            epoch,
+            _permit: permit,
+            finished: false,
+        })
+    }
+
+    fn finish(&self, epoch: ReconnectEpoch, succeeded: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // An attempt admitted under old material must not delay a newly
+        // published epoch when it completes late.
+        if state.epoch != Some(epoch) {
+            return;
+        }
+        if succeeded {
+            state.next_attempt_at = None;
+            state.backoff = self.policy.reconnect_backoff_min();
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        state.next_attempt_at = Some(now.checked_add(state.backoff).unwrap_or(now));
+        state.backoff = self.policy.next_backoff(state.backoff);
+    }
+}
+
+#[must_use = "a reconnect attempt must be completed as succeeded or failed"]
+pub(crate) struct ReconnectAttempt {
+    gate: Arc<ReconnectGate>,
+    epoch: ReconnectEpoch,
+    _permit: OwnedSemaphorePermit,
+    finished: bool,
+}
+
+/// Conserves outbound connection-attempt accounting when a caller future is
+/// cancelled while DNS, TCP, TLS, or bootstrap work is still in flight.
+pub(crate) struct ConnectionAttemptMetricGuard {
+    finished: bool,
+}
+
+impl ConnectionAttemptMetricGuard {
+    pub(crate) fn started() -> Self {
+        METRICS
+            .session_net_connection_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        Self { finished: false }
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for ConnectionAttemptMetricGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            METRICS
+                .session_net_connection_failure_timeout
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl ReconnectAttempt {
+    pub(crate) async fn superseded(&self) {
+        loop {
+            let changed = self.gate.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let superseded = self
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .epoch
+                != Some(self.epoch);
+            if superseded {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn succeeded(mut self) {
+        self.gate.finish(self.epoch, true);
+        self.finished = true;
+    }
+
+    pub(crate) fn failed(mut self) {
+        self.gate.finish(self.epoch, false);
+        self.finished = true;
+    }
+}
+
+impl Drop for ReconnectAttempt {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.gate.finish(self.epoch, false);
+        }
     }
 }
 
@@ -956,6 +1218,121 @@ mod tests {
             jittered.next_backoff(Duration::from_millis(40)),
             Duration::from_millis(40)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_gate_serializes_lanes_and_preserves_backoff_across_calls() {
+        let gate = ReconnectGate::new(policy());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        gate.acquire(deadline, 0, None)
+            .await
+            .expect("initial attempt")
+            .failed();
+
+        let (acquired_tx, mut acquired_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let mut tasks = Vec::new();
+        for lane in 0..2 {
+            let gate = Arc::clone(&gate);
+            let acquired_tx = acquired_tx.clone();
+            let release = Arc::clone(&release);
+            tasks.push(tokio::spawn(async move {
+                let attempt = gate.acquire(deadline, 0, None).await.expect("lane attempt");
+                acquired_tx.send(lane).expect("report lane admission");
+                release.notified().await;
+                attempt.failed();
+            }));
+        }
+        drop(acquired_tx);
+        tokio::task::yield_now().await;
+        assert!(acquired_rx.try_recv().is_err());
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let first = acquired_rx.recv().await.expect("first serialized lane");
+        assert!(first < 2);
+        assert!(acquired_rx.try_recv().is_err());
+        release.notify_one();
+        tokio::task::yield_now().await;
+
+        // The first failed lane advanced the shared backoff to 20 ms. The
+        // second lane cannot restart at the policy minimum.
+        tokio::time::advance(Duration::from_millis(19)).await;
+        tokio::task::yield_now().await;
+        assert!(acquired_rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let second = acquired_rx.recv().await.expect("second serialized lane");
+        assert_ne!(second, first);
+        release.notify_one();
+        for task in tasks {
+            task.await.expect("lane task");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_gate_epoch_change_supersedes_cooldown_and_in_flight_attempt() {
+        let gate = ReconnectGate::new(policy());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        gate.acquire(deadline, 0, None)
+            .await
+            .expect("initial attempt")
+            .failed();
+
+        let waiting_gate = Arc::clone(&gate);
+        let old_waiter = tokio::spawn(async move { waiting_gate.acquire(deadline, 0, None).await });
+        tokio::task::yield_now().await;
+        gate.observe_epoch(1, None);
+        assert!(old_waiter.await.expect("old waiter task").is_none());
+
+        let current = gate
+            .acquire(deadline, 1, None)
+            .await
+            .expect("new epoch bypasses old cooldown");
+        let (superseded_tx, superseded_rx) = tokio::sync::oneshot::channel();
+        let in_flight = tokio::spawn(async move {
+            current.superseded().await;
+            drop(current);
+            let _ = superseded_tx.send(());
+        });
+        tokio::task::yield_now().await;
+        gate.observe_epoch(1, None);
+        tokio::task::yield_now().await;
+        assert!(
+            !in_flight.is_finished(),
+            "re-observing one epoch must not cancel its in-flight attempt"
+        );
+        gate.observe_epoch(2, None);
+        superseded_rx.await.expect("in-flight supersession");
+        in_flight.await.expect("in-flight task");
+
+        gate.acquire(deadline, 2, None)
+            .await
+            .expect("latest epoch is immediately admitted")
+            .succeeded();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_gate_cancelled_attempt_publishes_cooldown() {
+        let gate = ReconnectGate::new(policy());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let cancelled = gate
+            .acquire(deadline, 0, None)
+            .await
+            .expect("cancelled attempt");
+        drop(cancelled);
+
+        let waiting_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiting_gate.acquire(deadline, 0, None).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(Duration::from_millis(9)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("waiter admission")
+            .succeeded();
     }
 
     #[test]

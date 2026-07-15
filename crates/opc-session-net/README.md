@@ -514,6 +514,22 @@ retirement after the configured stable jitter. Configure a shared control with
 `with_connection_lifecycle`, on every client/peer and listener that must rotate
 together.
 
+Cold-connection admission is shared per remote peer across logical calls. The
+two consensus lanes use one gate, and the legacy direct request and watch paths
+use another common gate for that backend. Only one resolver/TCP/TLS/bootstrap
+attempt may run at a time; a failed or cancelled attempt advances exponential
+backoff that later RPCs cannot reset. A connection whose authenticated evidence
+matches the current local generation/material epoch and is still dispatch-usable
+resets the gate. Publishing a newer material epoch or requesting explicit
+reauthentication supersedes old cooldowns and cancels an old-epoch handshake;
+the replacement still repeats every TLS, SPIFFE, ALPN, manifest-scope, and
+contract-profile check. Cached authenticated consensus lanes honor their stable
+rotation jitter, while a fresh handshake captured from an older epoch is
+rejected before any Openraft request bytes are written. Connection-attempt
+metrics count a cancelled in-flight attempt as a timeout terminal outcome, so
+started attempts remain conserved against terminal plus currently outstanding
+attempts.
+
 The bounded same-issuer credential-compromise/revocation mechanism is
 short-lived SVID expiry, not material rotation or connection reauthentication.
 Choose the SVID validity bound as the maximum acceptable exposure window.

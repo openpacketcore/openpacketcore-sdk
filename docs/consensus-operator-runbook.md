@@ -447,6 +447,16 @@ pairing, while controller-active, or after controller rejection. Supersession
 alone does not synthesize expiry. Peer authentication or trust failures remain
 `opc_session_net_connection_attempts_total{outcome="authentication_or_trust_failure"}`.
 
+Reconnect admission is serialized and exponentially bounded per directed peer,
+not per RPC: both consensus lanes share the same cooldown, and legacy direct
+requests and watches share the backend's cooldown. A newly published local TLS
+material epoch or explicit reauthentication generation supersedes an old-epoch
+wait or handshake immediately; it does not bypass fresh mutual-TLS, SPIFFE,
+manifest-scope, ALPN, or contract checks. Alert on sustained real connection
+attempts, not logical request volume. A cancelled in-flight attempt is exported
+as a timeout outcome so `started = terminal + outstanding` remains the
+accounting invariant.
+
 Install these alert rules for a consensus CNF. There is deliberately no fixed
 reference span. The earlier 1320-second example was unsafe because its
 300-second observation/rollback term could not contain even one member's two

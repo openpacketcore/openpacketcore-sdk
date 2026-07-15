@@ -1113,6 +1113,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- **Bounded reconnect admission — `opc-session-net`:** reconnect cooldown and
+  exponential backoff now live in one per-peer gate shared across sequential
+  calls, concurrent consensus lanes, and the legacy direct/watch paths. This
+  prevents logical RPC boundaries from resetting retry pressure during
+  certificate soft/hard expiry. Material or explicit-reauthentication epoch
+  changes supersede old waits and in-flight handshakes; only a current,
+  dispatch-usable authenticated connection resets the gate. Cached consensus
+  lanes now retain deterministic rotation jitter, while newly established
+  stale-epoch connections still fail before Openraft request bytes. Cancelled
+  outbound attempts publish a terminal timeout metric, preserving attempt
+  accounting. Openraft authority, HKMS/encryption/AAD boundaries, durable
+  formats, and the #164 fleet recovery SLO are unchanged.
 - **Conditional S2b Create Session identity — `opc-proto-gtpv2c`:**
   ProcedureAware Create Session Request decode now accepts the TS 29.274
   UICC-less emergency identity shape (MEI instance 0 plus an instance-0
