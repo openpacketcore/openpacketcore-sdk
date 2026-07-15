@@ -366,19 +366,24 @@ an `expiry - 30 seconds` soft boundary, followed by complete hard-deadline drain
 and source/controller `LastGoodExpired`; survivors continue canary progress and
 a valid long-lived leaf restores the affected member in the same process. The
 replacement proof uses the schedule-bound
-`member-scoped-reauth-settled-baseline/v2` checkpoint: its 86-second clock and
+`member-scoped-reauth-settled-baseline/v3` checkpoint: its 86-second clock and
 60-second two-stage server tail begin at the atomic projected-data rename, and
 a final 2.5-second outbound-ledger quiet tail completes the horizon. A
-prepublication delta plus 13-second semantic-progress observation checkpoints
-conservatively bound the worst-case gap between actual survivor progress events
-to 26 seconds. Each survivor may record at most one rejoin availability episode;
+prepublication common-key pulse plus 13-second observation checkpoints requires
+one active key to advance on every survivor observer and conservatively bounds
+that pulse's worst-case actual event gap to 26 seconds. An independent 26-second
+checkpoint requires every active key on every observer and cannot be reset by a
+faster key. Each survivor may record at most one rejoin availability episode;
 it must recover within that 26-second SLO and settle before the clean baseline,
 and a second or late episode fails closed. Fault-era new-attempt and reconnect
-deltas remain inside the fixed 84/160 per-node bound (ordinary 24/40 plus
-fifteen five-second refresh rounds over four/eight incident paths). Terminal
+deltas remain inside the fixed 85/161 per-node bound (ordinary 24/40, fifteen
+five-second refresh rounds over four/eight incident paths, and one scheduled
+post-hard-expiry survivor-to-expired network-negative attempt per involved
+node). The reverse probe fails local material preflight without dialing. Terminal
 outcomes may additionally contain only the exact attempts already outstanding
-at the interval baseline, and must satisfy interval conservation; Schedule v4
-binds `new-attempts-plus-baseline-outstanding/v1`.
+at the interval baseline, and must satisfy interval conservation; Schedule v5
+binds `new-attempts-plus-baseline-outstanding/v1` and
+`common-key-pulse-all-active-key-coverage/v1`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns remain forbidden throughout the fault interval. The following
 scoped-reauthentication interval again requires zero transport,
@@ -416,7 +421,7 @@ exactly one stable follower is killed uncleanly with active mutation and watch
 tasks. Survivor commits must advance during the outage, and the same-disk,
 exact-address restart must reconcile the bounded committed journal, prove the
 exact current record, catch its watch up, and resume under a strictly higher
-same-owner fence. Schedule v4 binds this one
+same-owner fence. Schedule v5 binds this one
 `same-disk-exact-address-active-mutator/v2` profile and independently enforces
 the following stage deadlines:
 

@@ -214,7 +214,13 @@ pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS: u64 =
 /// the recovered member advance explicit reauthentication, reprove every
 /// incident directed path, and establish the next lifecycle baseline.
 pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE: &str =
-    "member-scoped-reauth-settled-baseline/v2";
+    "member-scoped-reauth-settled-baseline/v3";
+/// Versioned rolling survivor-progress proof used while an expired member is
+/// replaced. Every half-SLO pulse must carry one common committed key through
+/// every survivor observer, while an independent full-SLO checkpoint requires
+/// coverage of every active survivor key.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_PROFILE: &str =
+    "common-key-pulse-all-active-key-coverage/v1";
 /// Fault-attempt settlement horizon after replacement publication. One
 /// pre-admission read/handshake stage and its bounded retirement response may
 /// each consume the larger server timeout; cold connect and maximum reconnect
@@ -244,13 +250,18 @@ pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS: u64 
     };
     server_timeout * 2 + QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
 };
-/// Maximum interval between survivor-traffic progress observations during the
-/// recovered-member checkpoint. Requiring a semantic delta in every half-SLO
-/// interval bounds the worst-case gap between two actual progress events by
-/// the full availability-recovery SLO even though each event occurs somewhere
-/// between two observations.
+/// Maximum interval between survivor-traffic pulse observations during the
+/// recovered-member checkpoint. Requiring one common active key to advance on
+/// every survivor observer in each half-SLO interval bounds the worst-case gap
+/// between two actual pulse events by the full availability-recovery SLO even
+/// though each event occurs somewhere between two observations.
 pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS: u64 =
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS / 2;
+/// Maximum rolling observation interval in which every active survivor key
+/// must advance on every survivor observer. Common-key pulse observations do
+/// not reset this independent coverage checkpoint.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS: u64 =
+    QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS;
 /// Maximum recoverable workload-availability episode introduced on each
 /// survivor while one expired member rejoins. The episode must still settle
 /// inside the existing availability-recovery SLO before the clean lifecycle
@@ -272,10 +283,16 @@ pub const QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS: u64 = 75_000;
 pub const QUALIFICATION_FAULT_PATH_REFRESH_MILLIS: u64 = 5_000;
 /// Outbound and inbound qualification paths exercised for every remote peer.
 pub const QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR: u64 = 2;
+/// Per-node connection-attempt contribution from the scheduled hard-expiry
+/// negative probe. The expired caller fails local material preflight without
+/// dialing; the survivor-to-expired probe contributes one outbound attempt on
+/// the survivor and, when accepted, one inbound attempt on the expired member.
+pub const QUALIFICATION_TRAFFIC_FAULT_POST_HARD_EXPIRY_NETWORK_PROBE_ATTEMPTS_PER_NODE: u64 = 1;
 /// Versioned interval-accounting rule for the fault-era connection ledger.
-/// New attempts and reconnects use the fixed topology bound; terminal outcomes
-/// additionally admit only the exact attempts already outstanding at the
-/// baseline, as required by the connection conservation equation.
+/// Scheduled new attempts and reconnects use the fixed topology/probe bound;
+/// terminal outcomes additionally admit only the exact attempts already
+/// outstanding at the baseline, as required by the connection conservation
+/// equation.
 pub const QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE: &str =
     "new-attempts-plus-baseline-outstanding/v1";
 /// Lead between stopping all expiring-member traffic and that member's
@@ -743,7 +760,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v4\n",
+            "opc-session-ha/traffic-resource/v5\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -794,7 +811,9 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "member_recovery_profile={}\n",
             "member_recovery_settlement_millis={}\n",
             "member_recovery_settlement_deadline_millis={}\n",
+            "member_recovery_progress_profile={}\n",
             "member_recovery_progress_checkpoint_millis={}\n",
+            "member_recovery_coverage_millis={}\n",
             "member_recovery_availability_interruption_budget_per_node={}\n",
             "operation_timeout_millis={}\n",
             "child_response_timeout_millis={}\n",
@@ -802,6 +821,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "fault_path_refresh_millis={}\n",
             "fault_directed_path_factor={}\n",
             "fault_connection_accounting_profile={}\n",
+            "fault_post_hard_expiry_network_probe_attempts_per_node={}\n",
             "fault_traffic_stop_lead_millis={}\n",
             "fault_mutation_shutdown_lead_millis={}\n",
             "traffic_cancellation_profile={}\n",
@@ -856,7 +876,9 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_PROFILE,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
         QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
         QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
@@ -864,6 +886,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_FAULT_PATH_REFRESH_MILLIS,
         QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR,
         QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE,
+        QUALIFICATION_TRAFFIC_FAULT_POST_HARD_EXPIRY_NETWORK_PROBE_ATTEMPTS_PER_NODE,
         QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
         QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
         QUALIFICATION_TRAFFIC_CANCELLATION_PROFILE,
@@ -2073,8 +2096,16 @@ mod tests {
             "new-attempts-plus-baseline-outstanding/v1"
         );
         assert_eq!(
+            QUALIFICATION_TRAFFIC_FAULT_POST_HARD_EXPIRY_NETWORK_PROBE_ATTEMPTS_PER_NODE,
+            1
+        );
+        assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
-            "member-scoped-reauth-settled-baseline/v2"
+            "member-scoped-reauth-settled-baseline/v3"
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_PROFILE,
+            "common-key-pulse-all-active-key-coverage/v1"
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
@@ -2087,6 +2118,10 @@ mod tests {
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
             13_000
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
+            26_000
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
@@ -2106,8 +2141,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:50f76c629eab650352308ef1ce93d6a22ba0b7fee7e34ca8eeb73061169822d3",
-                "sha256:b7d11362e8d8b908cd858192ad0edef16399cfa447dc2c542230a0a0415fa757",
+                "sha256:82da3c6fc69650e902dfb84d9ada35891a769432d40d2640f259845517a6aa01",
+                "sha256:1dcbd963848025c58fed0688dd55b77acc41ae26ee385d29328e4483f4f064d0",
             )
         );
         assert!(is_exact_sha256(&three));

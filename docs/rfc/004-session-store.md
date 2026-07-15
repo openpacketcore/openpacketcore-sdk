@@ -1850,19 +1850,26 @@ fencing.
   unrelated survivor explicit/material-epoch retirement counters unchanged,
   and settles all lifecycle drains plus survivor availability episodes before
   the next traffic baseline. The schedule-bound
-  `member-scoped-reauth-settled-baseline/v2` checkpoint starts its 86-second
+  `member-scoped-reauth-settled-baseline/v3` checkpoint starts its 86-second
   absolute bound and 60-second two-stage server tail at the atomic
   projected-data rename, then requires a final 2.5-second outbound-ledger quiet
-  tail. A prepublication delta and conservative 13-second observations bound
-  the worst-case gap between actual survivor progress events to 26 seconds.
+  tail. A prepublication common-key pulse and conservative 13-second
+  observations require one active key to advance on every survivor observer
+  and bound that pulse's worst-case actual event gap to 26 seconds. An
+  independent 26-second checkpoint requires every active key on every observer
+  and cannot be reset by a faster key.
   Each survivor may record at most one interruption/recovery pair while the
   expired member rejoins; it must settle inside the 26-second SLO, and a second
   or late episode fails closed. Fault-era new-attempt and reconnect deltas
-  retain a fixed 84/160 per-node bound: ordinary 24/40 plus fifteen five-second
-  refresh rounds over four/eight incident paths. Terminal outcomes may
+  retain a fixed 85/161 per-node bound: ordinary 24/40, fifteen five-second
+  refresh rounds over four/eight incident paths, and one scheduled
+  post-hard-expiry survivor-to-expired network-negative attempt per involved
+  node. The reverse probe fails local material preflight without dialing.
+  Terminal outcomes may
   additionally include only the exact attempts already outstanding at the
-  baseline and must satisfy interval conservation; Schedule v4 binds
-  `new-attempts-plus-baseline-outstanding/v1`.
+  baseline and must satisfy interval conservation; Schedule v5 binds
+  `new-attempts-plus-baseline-outstanding/v1` and
+  `common-key-pulse-all-active-key-coverage/v1`.
   Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
   drain overruns remain forbidden; the clean scoped-reauthentication interval
   retains a zero-failure budget.

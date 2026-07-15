@@ -48,27 +48,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process. Unrelated survivor explicit/material-epoch retirement counters must
   not advance. The next workload phase starts only after every connection
   drain has settled and every still-live survivor availability episode is
-  resolved. A prepublication traffic delta primes conservative 13-second
-  semantic-progress observation checkpoints, the 86-second recovery clock and
+  resolved. A prepublication common-key pulse primes conservative 13-second
+  progress checkpoints, the 86-second recovery clock and
   60-second two-stage server tail begin only after the atomic projected-data
   rename, and a final 2.5-second outbound-ledger quiet tail completes the
-  settlement horizon. Two adjacent half-SLO observations bound the worst-case
-  gap between actual progress events to 26 seconds, so neither timing nor
-  fault-era terminal outcomes can be attributed to the clean
-  scoped-reauthentication checkpoint. Each survivor may record at most one new
+  settlement horizon. Each pulse requires one common active key to advance on
+  every survivor observer; two adjacent half-SLO observations bound its
+  worst-case actual event gap to 26 seconds. An independent 26-second checkpoint
+  requires every active survivor key to advance on every observer and is not
+  reset by a faster key, so neither timing nor fault-era terminal outcomes can
+  be attributed to the clean scoped-reauthentication checkpoint. Each survivor
+  may record at most one new
   availability episode while the expired member rejoins; it must recover
   inside the existing 26-second SLO and be fully settled before the clean
   baseline. A second or late episode fails closed. The complete expiry/rejoin
-  interval has an 84/160 per-node new-attempt and reconnect bound: the ordinary
-  24/40 allowance plus at most fifteen five-second refresh rounds over the
-  four/eight incident directed paths. Terminal outcomes may additionally
+  interval has an 85/161 per-node new-attempt and reconnect bound: the ordinary
+  24/40 allowance, at most fifteen five-second refresh rounds over the
+  four/eight incident directed paths, and one scheduled post-hard-expiry
+  survivor-to-expired network-negative attempt per involved node. The reverse
+  expired-to-survivor probe fails local material preflight without dialing.
+  Terminal outcomes may additionally
   contain only the exact attempts already outstanding at the interval baseline;
-  the connection conservation equation remains mandatory. Schedule v4 binds
+  the connection conservation equation remains mandatory. Schedule v5 binds
   this as `new-attempts-plus-baseline-outstanding/v1`. Cancellation-classified
   `abandoned` outcomes, protocol/backend outcomes, and drain overruns remain
-  forbidden throughout the fault and clean intervals. Schedule v4 retains the
-  `member-scoped-reauth-settled-baseline/v2` checkpoint first bound by Schedule
-  v3. Recovery continuity polls use a
+  forbidden throughout the fault and clean intervals. Schedule v5 advances the
+  checkpoint to `member-scoped-reauth-settled-baseline/v3` and binds its rolling
+  proof as `common-key-pulse-all-active-key-coverage/v1`. Recovery continuity
+  polls use a
   non-intrusive workload snapshot; authoritative watch-head settlement keeps
   the fail-closed linearizable head observation. Deterministic encrypted
   lease/renew/CAS/read/complete-
@@ -106,7 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at most 262,144 exact journal entries within 25 seconds, and mutation resume
   under a strictly higher same-owner fence within 26 seconds. The composed
   crash-to-resume ceiling is 153 seconds, but no stage may borrow unused time
-  from another stage or substitute that total for its own bound. Schedule v4
+  from another stage or substitute that total for its own bound. Schedule v5
   binds the scenario, count, six bounds, and total, so v1 evidence cannot
   satisfy the new assertions. This corrects the under-composed v1
   qualification deadline, which incorrectly charged termination, outage work,
@@ -114,7 +121,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one 26-second clock. A stage that finishes after its fixed deadline fails
   with a closed terminal-stage plus elapsed-millisecond diagnostic rather than
   preserving an earlier ambiguous error that hides where the overrun occurred;
-  Schedule v4 binds this as `terminal-stage-elapsed-millis/v1`. A child that
+  Schedule v5 binds this as `terminal-stage-elapsed-millis/v1`. A child that
   exits during restart configuration now reports only the fixed `transport`,
   `sqlite`, `consensus`, or `listener` startup stage; underlying errors, paths,
   and identities remain redacted.

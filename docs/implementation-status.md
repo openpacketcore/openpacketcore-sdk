@@ -411,22 +411,29 @@ post-expiry replacement advances only the recovered member's explicit
 reauthentication generation, proves fresh bidirectional incident paths, leaves
 unrelated survivor explicit/material-epoch retirement counters unchanged, and
 settles lifecycle plus survivor availability before the next phase baseline.
-That schedule-bound `member-scoped-reauth-settled-baseline/v2` checkpoint
+That schedule-bound `member-scoped-reauth-settled-baseline/v3` checkpoint
 starts its 86-second fail-safe and 60-second two-stage server tail at the atomic
 projected-data rename, then requires a final 2.5-second outbound quiet tail.
-A prepublication delta plus 13-second observation checkpoints conservatively
-bound actual survivor progress gaps to 26 seconds. At most one rejoin
+A prepublication common-key pulse plus 13-second observation checkpoints
+requires one active key to advance on every survivor observer and conservatively
+bounds that pulse's actual event gap to 26 seconds. An independent 26-second
+checkpoint requires every active key on every observer and cannot be reset by a
+faster key. At most one rejoin
 interruption/recovery pair per survivor may settle within that SLO; a second or
-late episode fails closed. The checkpoint also retains bounded 84/160 per-node
-fault-era new-attempt/reconnect evidence (ordinary 24/40 plus fifteen
-five-second refresh rounds over four/eight incident paths). Terminal outcomes
+late episode fails closed. The checkpoint also retains bounded 85/161 per-node
+fault-era new-attempt/reconnect evidence (ordinary 24/40, fifteen five-second
+refresh rounds over four/eight incident paths, and one scheduled
+post-hard-expiry survivor-to-expired network-negative attempt per involved
+node; the reverse probe fails local material preflight without dialing).
+Terminal outcomes
 may additionally contain only the exact attempts already outstanding at the
 baseline, with interval conservation enforced under the schedule-bound
-`new-attempts-plus-baseline-outstanding/v1` profile. It requires zero
+`new-attempts-plus-baseline-outstanding/v1` profile. Schedule v5 also binds the
+rolling proof as `common-key-pulse-all-active-key-coverage/v1`. It requires zero
 cancellation-classified `abandoned`, protocol/backend, or drain-overrun
 evidence. Recovery polling is
 non-intrusive; final watch-head settlement retains its fail-closed
-authoritative replication-head read. Schedule v4 now binds the active-mutator
+authoritative replication-head read. Schedule v5 now binds the active-mutator
 scenario as
 `same-disk-exact-address-active-mutator/v2`: independent 5-second termination,
 26-second outage/survivor-progress, 45-second startup, 26-second Openraft

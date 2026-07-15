@@ -903,7 +903,7 @@ performs exactly one unclean same-disk, exact-address restart of a stable
 follower while that member's mutation and watch tasks are active. Survivors
 must advance committed canary and mixed traffic during the outage; the returned
 member must reconcile the exact bounded journal/current record and resume at a
-strictly higher same-owner fence. Schedule v4 binds
+strictly higher same-owner fence. Schedule v5 binds
 `same-disk-exact-address-active-mutator/v2`. The independently checked stages
 are termination/reaping (5 seconds), outage/survivor progress (26 seconds),
 replacement-child startup (45 seconds), Openraft readiness/catch-up (26
@@ -928,20 +928,26 @@ other survivors' explicit and local-material-epoch retirement counters must
 remain unchanged. All lifecycle drains and every still-live survivor
 availability episode must be settled before the next traffic baseline, then
 all-voter readiness and canary progress complete without restarting that
-process. Schedule profile `member-scoped-reauth-settled-baseline/v2` makes that
+process. Schedule profile `member-scoped-reauth-settled-baseline/v3` makes that
 boundary explicit: the atomic projected-data rename starts the 86-second
 fail-safe and 60-second two-stage server tail, while a final 2.5-second quiet
 interval covers cold connect plus maximum reconnect backoff. A prepublication
-delta and 13-second observation checkpoints conservatively bound the worst-case
-gap between actual survivor progress events to 26 seconds. Availability counters
+common-key pulse and 13-second observation checkpoints require one active key
+to advance on every survivor observer and conservatively bound that pulse's
+worst-case actual event gap to 26 seconds. An independent 26-second checkpoint
+requires every active key on every observer and cannot be reset by a faster key.
+Availability counters
 may advance by at most one interruption/recovery pair per survivor while the
 expired member rejoins; the pair must settle inside the 26-second SLO, and a
 second or late episode fails closed. Fault-era new-attempt and reconnect deltas
-remain within the fixed 84/160 per-node bound: ordinary 24/40 plus fifteen
-five-second refresh rounds over four/eight incident paths. Terminal outcomes
+remain within the fixed 85/161 per-node bound: ordinary 24/40, fifteen
+five-second refresh rounds over four/eight incident paths, and one scheduled
+post-hard-expiry survivor-to-expired network-negative attempt per involved
+node. The reverse probe fails local material preflight without dialing. Terminal outcomes
 may additionally include only the exact attempts already outstanding at the
-baseline and must satisfy interval conservation; Schedule v4 binds this as
-`new-attempts-plus-baseline-outstanding/v1`. Cancellation-classified
+baseline and must satisfy interval conservation; Schedule v5 binds this as
+`new-attempts-plus-baseline-outstanding/v1` and binds recovery progress as
+`common-key-pulse-all-active-key-coverage/v1`. Cancellation-classified
 `abandoned` outcomes, protocol/backend outcomes,
 and drain overruns remain forbidden; the subsequent scoped-reauthentication
 interval retains the zero-failure budget. Non-intrusive workload snapshots drive continuity polling; the final
