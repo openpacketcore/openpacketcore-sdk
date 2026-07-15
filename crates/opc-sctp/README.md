@@ -20,8 +20,9 @@ errors.
   and `SctpAssociation`.
 - Observability: `SctpHealth`, `SctpMetrics`, and `SctpMetricsSnapshot`.
 - Diameter helpers: `DiameterSctpPeer`, `DiameterSctpAssociation`,
-  `DiameterSctpSecurity`, `DiameterSctpConnectProjection`,
-  `DiameterSctpConnectOutcome`, and `DiameterSctpError`.
+  `DiameterSctpSecurity`, `DiameterInboundPpidPolicy`,
+  `DiameterSctpConnectProjection`, `DiameterSctpConnectOutcome`, and
+  `DiameterSctpError`.
 - Errors: `SctpError` and Diameter-specific wrappers expose stable,
   redaction-safe classifications.
 
@@ -41,6 +42,38 @@ async fn send_ngap(remote: std::net::SocketAddr, payload: Bytes) -> Result<(), S
     Ok(())
 }
 ```
+
+### Legacy Diameter PPID 0 interoperability
+
+Strict inbound PPID validation is the production default. A site that must
+interoperate with a known non-conforming or legacy clear-text Diameter peer can
+opt in for that peer only:
+
+```rust,no_run
+use opc_sctp::{
+    DiameterInboundPpidPolicy, DiameterSctpAssociation, DiameterSctpError,
+    DiameterSctpPeer,
+};
+
+async fn connect_legacy_diameter_peer(
+    remote: std::net::SocketAddr,
+) -> Result<DiameterSctpAssociation, DiameterSctpError> {
+    DiameterSctpPeer::new(remote)
+        .with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero)
+        .connect_association()
+        .await
+}
+```
+
+This escape hatch accepts inbound PPID 0 in addition to PPID 46 only for
+clear-text Diameter. Outbound clear-text messages remain PPID 46 and never
+mirror the peer's zero value. DTLS/protected Diameter remains strict. Static
+multihoming callers opt in with
+`DiameterSctpAssociation::connect_with_config_and_inbound_ppid_policy`; the
+existing `connect_with_config` remains strict. No Cargo feature is required.
+Each live association counts accepted legacy messages in
+`SctpMetricsSnapshot::accepted_legacy_diameter_zero_ppid_messages` and emits at
+most one redaction-safe warning without payload or peer-address data.
 
 Diameter framing can be applied directly to an explicit, validated connect
 configuration. This keeps the SDK's PPID and notification handling while
@@ -89,6 +122,9 @@ async fn send_diameter(
   framing to that complete connect configuration. Unsupported kernel or
   namespace multihoming remains a typed capability error; no address is
   silently discarded.
+- Diameter inbound PPID validation is strict by default. Legacy clear-text
+  PPID 0 acceptance is an explicit per-peer policy; it never affects outbound
+  PPIDs or protected Diameter.
 - `capabilities()` advertises build support, kernel policy failures are a typed
   `CapabilityUnavailable` error, and `local_addresses()`/`peer_addresses()`
   expose the kernel-active set. Consumers may therefore choose an explicit
