@@ -154,19 +154,10 @@ impl SessionRaftNetwork {
         )
         .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
 
-        let ttl = option.hard_ttl();
-        let call = tokio::time::timeout(ttl, peer.call(wire)).await;
-        let response = match call {
-            Err(_) => {
-                return Err(EngineRpcError::Timeout(Timeout {
-                    action,
-                    id: self.local_node_id,
-                    target: self.target,
-                    timeout: ttl,
-                }));
-            }
-            Ok(Err(error)) => return Err(map_peer_error(error, action, self, ttl)),
-            Ok(Ok(response)) => response,
+        let hard_ttl = option.hard_ttl();
+        let response = match peer.call_with_timeout(wire, option.soft_ttl()).await {
+            Err(error) => return Err(map_peer_error(error, action, self, hard_ttl)),
+            Ok(response) => response,
         };
 
         response
@@ -174,7 +165,7 @@ impl SessionRaftNetwork {
             .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
         let payload = response
             .result
-            .map_err(|error| map_peer_error(error, action, self, ttl))?;
+            .map_err(|error| map_peer_error(error, action, self, hard_ttl))?;
         let result: Result<Resp, RaftError<SessionConsensusNodeId, E>> = decode_bounded(&payload)
             .map_err(|error| {
             EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
@@ -463,9 +454,11 @@ struct CodecTransportError(#[source] ConsensusCodecError);
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use bytes::Bytes;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::consensus::{
@@ -493,6 +486,51 @@ mod tests {
         }
     }
 
+    struct DeadlineRecordingPeer {
+        node_id: SessionConsensusNodeId,
+        observed_timeout: Mutex<Option<Duration>>,
+        entered: Notify,
+        release: Notify,
+        response: SessionConsensusWireResponse,
+    }
+
+    impl fmt::Debug for DeadlineRecordingPeer {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("DeadlineRecordingPeer")
+                .field("node_id", &self.node_id)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionConsensusPeer for DeadlineRecordingPeer {
+        fn node_id(&self) -> SessionConsensusNodeId {
+            self.node_id
+        }
+
+        async fn call(
+            &self,
+            _request: SessionConsensusWireRequest,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            Err(SessionConsensusPeerError::Protocol)
+        }
+
+        async fn call_with_timeout(
+            &self,
+            _request: SessionConsensusWireRequest,
+            timeout: Duration,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            *self
+                .observed_timeout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(timeout);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(self.response.clone())
+        }
+    }
+
     fn node_id(value: u64) -> SessionConsensusNodeId {
         SessionConsensusNodeId::new(value).expect("non-zero test node ID")
     }
@@ -507,6 +545,62 @@ mod tests {
 
     fn vote_request(sender: SessionConsensusNodeId) -> VoteRequest<SessionConsensusNodeId> {
         VoteRequest::new(Vote::new(7, sender), None)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adapter_passes_soft_ttl_and_leaves_hard_timeout_to_openraft() {
+        let target = node_id(2);
+        let encoded_result: Result<
+            u64,
+            RaftError<SessionConsensusNodeId, opc_consensus::engine::error::Infallible>,
+        > = Ok(7);
+        let peer = Arc::new(DeadlineRecordingPeer {
+            node_id: target,
+            observed_timeout: Mutex::new(None),
+            entered: Notify::new(),
+            release: Notify::new(),
+            response: SessionConsensusWireResponse {
+                result: Ok(encode_bounded(&encoded_result).expect("bounded test response")),
+            },
+        });
+        let network = SessionRaftNetwork {
+            identity: identity(1),
+            local_node_id: node_id(1),
+            target,
+            peer: Some(peer.clone()),
+        };
+        let hard_ttl = Duration::from_secs(4);
+        let option = RPCOption::new(hard_ttl);
+        let expected_soft_ttl = option.soft_ttl();
+        let call = tokio::spawn(async move {
+            network
+                .call::<u64, opc_consensus::engine::error::Infallible>(
+                    SessionConsensusRpcFamily::Vote,
+                    opc_consensus::engine::RPCTypes::Vote,
+                    Vec::new(),
+                    option,
+                )
+                .await
+        });
+
+        peer.entered.notified().await;
+        assert_eq!(
+            *peer
+                .observed_timeout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(expected_soft_ttl)
+        );
+
+        tokio::time::advance(hard_ttl + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !call.is_finished(),
+            "the adapter must not duplicate Openraft's outer hard timeout"
+        );
+
+        peer.release.notify_one();
+        assert_eq!(call.await.expect("adapter task"), Ok(7));
     }
 
     #[test]

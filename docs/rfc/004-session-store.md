@@ -41,10 +41,13 @@ outcomes retain the already-proven guard and validate that same exact record
 without minting unnecessary fencing authority. Evidence binds this routing as
 `stage-aware-known-authority/v1`. The fixed
 schedule drops one successful release response per mutator, allows eight
-outcomes per node, 8 seconds per recovery episode, and a 50 ms retry delay;
-phase completion requires every interruption to be reconciled. Recovering a
-committed generation does not rearm the once-per-logical-mutator injection. Lease loss,
-unexpected state, and invariant failures fail closed. One additional
+outcomes per node, uses the fixed 26-second two-election-plus-operation
+transition envelope per recovery episode, and applies a 50 ms retry delay;
+phase completion requires every interruption to be reconciled. Lease loss,
+unexpected state, and invariant failures fail closed. The admission-loss
+exact-address restart is watcher-only before exit and joins the mutator set
+only after bounded journal reconciliation. Recovering a committed generation
+does not rearm the once-per-logical-mutator injection. One additional
 schedule-v3 phase kills a stable follower uncleanly while its mutation and
 watch tasks are active. Survivors advance committed canary and mixed traffic;
 the same-disk, exact-address restart must reconcile a bounded gap-free journal,
@@ -1344,9 +1347,11 @@ MUST NOT be accepted as substitutes for any logical, stable, or certificate
 identity.
 
 One absolute family deadline MUST begin before lane acquisition and cover
-bounded encode, write, and response read. AppendEntries/Openraft read-index
-MUST use 2,000 ms, Vote 5,000 ms, and InstallSnapshot, forwarded mutation, and
-consumer ReadBarrier 10,000 ms. If no valid cached connection exists,
+bounded encode, write, and response read. The outer hard/direct complete
+ceiling for AppendEntries/Openraft read-index MUST be 2,000 ms, Vote 5,000 ms,
+and InstallSnapshot, forwarded mutation, and consumer ReadBarrier 10,000 ms.
+An Openraft network call uses the smaller soft TTL described below. If no valid
+cached connection exists,
 resolution, TCP connect, mutual TLS, identity admission, and bootstrap MUST use
 the lesser of the remaining family budget and a 1,500 ms cold sub-bound; cold
 time MUST NOT be added to the family deadline. Each directed peer MAY cache a
@@ -1367,6 +1372,16 @@ NOT interpret commands or decide leadership, voting, log matching, commit, or
 repair. An
 identity, authentication, schema, payload-bound, or sender mismatch MUST fail
 before Openraft dispatch with redaction-safe diagnostics.
+
+For an Openraft engine RPC, the adapter MUST pass `RPCOption::soft_ttl()` to a
+deadline-aware network peer and MUST NOT install another hard timeout around
+that peer future. The peer MUST apply the lesser of the supplied soft TTL and
+its configured family ceiling, classify deadline expiry before returning, and
+evict any socket with an uncertain stream position. Openraft's outer
+`hard_ttl()` remains the sole hard cancellation authority. A compatibility or
+in-process peer that does not own transport deadlines MAY retain its existing
+call behavior and rely on that outer hard deadline; the deadline-aware default
+MUST NOT introduce a new soft cancellation boundary for such a peer.
 
 Every authenticated client, peer, and listener MUST apply one finite
 `ConnectionLifecyclePolicy`. Its hard deadline MUST be the earliest of the
@@ -1680,7 +1695,15 @@ state, event, and outcome enums. They MUST NOT contain endpoints, DNS names,
 SPIFFE IDs, certificates, key material, transaction IDs, record keys, or
 payload/backend text. The closed connection-retirement reason set includes
 `idle_timeout`; it MUST NOT be counted as the `timeout` connection-attempt
-failure. Bootstrap and partial active-frame timeouts remain `timeout` failures.
+failure. Resolver, TCP, TLS, bootstrap, and partial active-frame deadlines
+remain `timeout` failures. When the transport observes a newer material or
+explicit-reauthentication epoch, it MUST terminate the old attempt as
+`superseded`. When an attempt guard is dropped before any explicit terminal
+classification, it MUST use `abandoned` rather than infer timeout or
+supersession. Both outcomes participate in the quiescent
+`started = terminal + outstanding` accounting invariant but MUST NOT be treated
+as peer timeouts. Exporters MAY expose transient skew between the separate
+relaxed counters while connection handlers are changing state.
 - `opc_session_restore_page_latency_seconds{cursor_profile}`
 - `opc_session_restore_restarts_total{reason}` where `reason` is one of
   `stale_cursor`, `work_budget`, `response_too_large`, or `cancelled`
@@ -1817,7 +1840,22 @@ fencing.
   fresh bidirectional mTLS/bootstrap paths on every incident edge, leaves
   unrelated survivor explicit/material-epoch retirement counters unchanged,
   and settles all lifecycle drains plus survivor availability episodes before
-  the next traffic baseline.
+  the next traffic baseline. The schedule-bound
+  `member-scoped-reauth-settled-baseline/v2` checkpoint starts its 86-second
+  absolute bound and 60-second two-stage server tail at the atomic
+  projected-data rename, then requires a final 2.5-second outbound-ledger quiet
+  tail. A prepublication delta and conservative 13-second observations bound
+  the worst-case gap between actual survivor progress events to 26 seconds.
+  Each survivor may record at most one interruption/recovery pair while the
+  expired member rejoins; it must settle inside the 26-second SLO, and a second
+  or late episode fails closed. Fault-era attempt, terminal, and
+  reconnect deltas retain a fixed 84/160 per-node bound: ordinary 24/40 plus
+  fifteen five-second refresh rounds over four/eight incident paths.
+  Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
+  drain overruns remain forbidden; the clean scoped-reauthentication interval
+  retains a zero-failure budget.
+  Continuity polling is a non-intrusive workload snapshot; authoritative final
+  watch-head settlement still performs the fail-closed replication-head read.
 
 Run those two exact cases serially:
 

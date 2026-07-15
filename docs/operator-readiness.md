@@ -919,7 +919,22 @@ other survivors' explicit and local-material-epoch retirement counters must
 remain unchanged. All lifecycle drains and every still-live survivor
 availability episode must be settled before the next traffic baseline, then
 all-voter readiness and canary progress complete without restarting that
-process.
+process. Schedule profile `member-scoped-reauth-settled-baseline/v2` makes that
+boundary explicit: the atomic projected-data rename starts the 86-second
+fail-safe and 60-second two-stage server tail, while a final 2.5-second quiet
+interval covers cold connect plus maximum reconnect backoff. A prepublication
+delta and 13-second observation checkpoints conservatively bound the worst-case
+gap between actual survivor progress events to 26 seconds. Availability counters
+may advance by at most one interruption/recovery pair per survivor while the
+expired member rejoins; the pair must settle inside the 26-second SLO, and a
+second or late episode fails closed. Fault-era attempt,
+terminal, and reconnect deltas remain within the fixed 84/160 per-node bound:
+ordinary 24/40 plus fifteen five-second refresh rounds over four/eight incident
+paths. Cancellation-classified `abandoned` outcomes, protocol/backend outcomes,
+and drain overruns remain forbidden; the subsequent scoped-reauthentication
+interval retains the zero-failure budget. Non-intrusive workload snapshots drive continuity polling; the final
+watch-head proof still uses the fail-closed authoritative replication-head
+read.
 
 The admission gate is not a real or deployed network partition. These two
 cases keep the bounded mixed lease/CAS/read, watch, restore-scan, readiness, and
@@ -939,7 +954,12 @@ durable readiness and exercise every directed peer path before old-trust
 removal. Treat `connection_retirements_total{reason="idle_timeout"}` as bounded
 authenticated connection turnover, not a transport incident. Continue paging
 on `connection_attempts_total{outcome="timeout"}`: TLS/application bootstrap
-silence and partial authenticated frames remain true timeout failures.
+silence and partial authenticated frames remain true timeout failures. A known
+material or explicit-reauthentication epoch handoff is instead `superseded`;
+caller abort or runtime teardown before explicit terminal classification is
+`abandoned`. Neither series weakens the timeout alert. Bound `superseded`
+during intentional rotation and investigate any sustained `abandoned` rate as
+local lifecycle churn.
 
 The private `opc-session-testkit` component core now runs the documented
 trust/leaf/intermediate/root forward and rollback order in separate three- and

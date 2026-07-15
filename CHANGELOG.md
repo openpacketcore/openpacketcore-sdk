@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **SWm emergency identity construction — `opc-proto-diameter`:** consumers
+  can now obtain the canonical TS 23.003 IMEI Emergency NAI with
+  `emergency_nai` and build the byte-identical RFC 3748
+  EAP-Response/Identity required by the TS 33.402 emergency verifiers with
+  `build_eap_response_identity`. The EAP builder copies identity octets
+  verbatim, rejects bodies that exceed its two-octet packet length before
+  allocation, and reports only a stable redaction-safe error label. Existing
+  parsing, authorization evidence, and ordinary SWm wire behavior are
+  unchanged.
 - **Bounded IKE_SA_INIT error responses — `opc-proto-ikev2`:** responders can
   now build notify-only `NO_PROPOSAL_CHOSEN` and `INVALID_KE_PAYLOAD` responses
   with a zero responder SPI, canonical response flags, and Message ID zero.
@@ -39,9 +48,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process. Unrelated survivor explicit/material-epoch retirement counters must
   not advance. The next workload phase starts only after every connection
   drain has settled and every still-live survivor availability episode is
-  resolved, so work already recovering during replacement cannot be attributed
-  to the following checkpoint. Schedule v3 binds this as
-  `member-scoped-reauth-settled-baseline/v1`. Deterministic encrypted
+  resolved. A prepublication traffic delta primes conservative 13-second
+  semantic-progress observation checkpoints, the 86-second recovery clock and
+  60-second two-stage server tail begin only after the atomic projected-data
+  rename, and a final 2.5-second outbound-ledger quiet tail completes the
+  settlement horizon. Two adjacent half-SLO observations bound the worst-case
+  gap between actual progress events to 26 seconds, so neither timing nor
+  fault-era terminal outcomes can be attributed to the clean
+  scoped-reauthentication checkpoint. Each survivor may record at most one new
+  availability episode while the expired member rejoins; it must recover
+  inside the existing 26-second SLO and be fully settled before the clean
+  baseline. A second or late episode fails closed. The complete expiry/rejoin
+  interval has an 84/160 per-node attempt, terminal-outcome, and reconnect
+  bound: the ordinary 24/40 allowance plus at most fifteen five-second refresh
+  rounds over the four/eight incident directed paths. Cancellation-classified
+  `abandoned` outcomes, protocol/backend outcomes, and drain overruns remain
+  forbidden throughout the fault and clean intervals. Schedule v3 binds this as
+  `member-scoped-reauth-settled-baseline/v2`. Recovery continuity polls use a
+  non-intrusive workload snapshot; authoritative watch-head settlement keeps
+  the fail-closed linearizable head observation. Deterministic encrypted
   lease/renew/CAS/read/complete-
   restore/readiness mutations and applied-state watches run through admission
   loss, retained-last-good trust, exact-address restart, repair, and the
@@ -59,25 +84,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stage-aware-known-authority/v1`. The
   schedule deterministically drops one successful release response to exercise
   this path, permits at most eight such outcomes per node, gives each recovery
-  episode 8 seconds, retries only after a fixed 50 ms delay, and exposes total,
-  recovered, and maximum-consecutive counters. Phase completion requires every
-  interruption to be reconciled; a resumed committed generation does not rearm
-  that once-per-logical-mutator synthetic fault. Lease loss, unexpected state,
-  and invariant failures still fail immediately. After malformed-material repair, exactly
-  one stable follower is killed uncleanly while its mutation and watch tasks
-  are active. The survivor majority advances both the encrypted canary and
-  mixed traffic during the outage. Inside one absolute 26-second bound the
-  member restarts from the same disk and manifest address, reconciles at most
-  262,144 exact journal entries, proves its latest generation, owner, fence,
-  and payload through a linearizable read, catches its watch up without a gap,
-  and resumes mutation only after same-owner acquire returns a strictly higher
+  episode the fixed 26-second two-election-plus-operation transition envelope,
+  retries only after a fixed 50 ms delay, and exposes total, recovered, and
+  maximum-consecutive counters. Phase completion requires every interruption
+  to be reconciled. The admission-loss exact-address restart is watcher-only
+  before exit and enters the mutator set only after journal reconciliation. A
+  resumed committed generation does not rearm that once-per-logical-mutator
+  synthetic fault. Lease loss, unexpected state, and invariant failures still
+  fail immediately. Separately, after malformed-material repair, exactly one
+  stable follower is killed uncleanly while its mutation and watch tasks are
+  active. The survivor majority advances both the encrypted canary and mixed
+  traffic during the outage. Inside one absolute 26-second bound the member
+  restarts from the same disk and manifest address, reconciles at most 262,144
+  exact journal entries, proves its latest generation, owner, fence, and
+  payload through a linearizable read, catches its watch up without a gap, and
+  resumes mutation only after same-owner acquire returns a strictly higher
   fence. Schedule v3 binds this as
   `same-disk-exact-address-active-mutator/v1`, including the count and bound, so
   earlier evidence cannot satisfy the new assertions. Recovery operations that
-  finish after the unchanged 8-second episode deadline now fail with a closed
+  finish after the fixed 26-second episode deadline now fail with a closed
   terminal-stage plus elapsed-millisecond diagnostic rather than preserving an
   earlier ambiguous error that hides where the overrun occurred; schedule v3
-  binds this as `terminal-stage-elapsed-millis/v1`.
+  binds this as `terminal-stage-elapsed-millis/v1`. A child that exits during
+  restart configuration now reports only the fixed `transport`, `sqlite`,
+  `consensus`, or `listener` startup stage; underlying errors, paths, and
+  identities remain redacted.
   These are synthetic regression scenarios, not a real or deployed network
   partition, and provide no broader restart/fault matrix, resource/soak,
   remote-HKMS, deployed-CNF, signed-release, evidence-schema, or profile claim.
@@ -116,8 +147,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed-response, and EOF diagnostics retain only a closed pending-command
   kind, harness-local sequence, elapsed send time, and closed stderr category;
   command values, session/lease identities, payloads, and filesystem paths are
-  omitted. Cooperative task-stop replies reuse the last successfully proven
-  linearizable replication head instead of launching a new backend operation
+  omitted. Initial process-heavy `Configure`/`Started` exchanges are admitted
+  one child at a time under one shared 45-second fleet deadline, while cluster
+  `Initialize` remains concurrent. Cooperative task-stop replies reuse the last
+  successfully proven linearizable replication head instead of launching a new
+  backend operation
   after task join; subsequent recovery still requires fresh bounded journal
   reconciliation. The 90-second transition value is only a hard fail-safe;
   semantic completion ends each transition. These single-host synthetic bounds
@@ -360,9 +394,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new admission at soft retirement, bound the transport wait and connection
   slot by the hard deadline, and repeat mutual TLS plus identity, nonce, ALPN,
   version, and exact profile checks on replacements.
-  `SessionReauthenticationControl` provides a
-  cooperative CNF trigger with deterministic directed-peer jitter and bounded
-  reconnect backoff. Legacy watches resume from the exact delivered successor;
+  Material-epoch changes use deterministic directed-peer jitter;
+  `SessionReauthenticationControl` provides an immediate CNF trigger for
+  current-generation proof. Both paths retain bounded reconnect backoff.
+  Legacy watches resume from the exact delivered successor;
   mutations retry only after the complete fixed `ConnectionRetiring`
   no-dispatch proof. An authenticated post-TLS rotation race before bootstrap
   acknowledgement now returns
@@ -1125,6 +1160,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- **Bounded reconnect admission — `opc-session-net`:** reconnect cooldown and
+  exponential backoff now live in per-client, per-peer gates: one is shared
+  across sequential calls and concurrent consensus lanes, and another is
+  shared by the legacy direct/watch paths. This
+  prevents logical RPC boundaries from resetting retry pressure during
+  certificate soft/hard expiry. Material or explicit-reauthentication epoch
+  changes supersede old waits and in-flight handshakes; only a current,
+  dispatch-usable authenticated connection resets the gate. Cached consensus
+  lanes retain deterministic jitter for material rotation, while explicit
+  reauthentication retires them immediately for current-generation proof and
+  newly established stale-epoch connections still fail before Openraft request
+  bytes. A transport-observed newer epoch now publishes the fixed `superseded`
+  terminal, while an attempt guard dropped before explicit classification
+  publishes `abandoned`; actual I/O/deadline expiry remains `timeout`. Inbound
+  handlers use the same guard, preserving honest attempt accounting through
+  shutdown. Openraft authority, HKMS/encryption/AAD boundaries, and durable
+  formats are unchanged. The #164 synthetic fleet recovery envelope correction
+  is documented separately above.
+- **Single Openraft RPC deadline authority — `opc-consensus`,
+  `opc-session-store`, and `opc-session-net`:** the session Raft adapter now
+  forwards Openraft's soft TTL to deadline-aware network peers and no longer
+  installs a second hard timeout around the transport future. The remote mTLS
+  peer applies the lesser of that soft TTL and its configured family ceiling,
+  returns an explicit timeout from lane/connect/handshake/frame work, and
+  conserves connection-attempt accounting before Openraft's sole outer hard
+  deadline can cancel the call. In-process and compatibility peers retain their
+  prior outer-hard-deadline behavior unless they explicitly implement the new
+  deadline-aware method. Openraft authority, HKMS/encryption/AAD boundaries,
+  and durable formats are unchanged.
+- **Conditional S2b Create Session identity — `opc-proto-gtpv2c`:**
+  ProcedureAware Create Session Request decode now accepts the TS 29.274
+  UICC-less emergency identity shape (MEI instance 0 plus an instance-0
+  Indication carrying UIMSI) when IMSI is absent. IMSI-bearing requests and all
+  other required request IEs retain their existing validation, while an absent
+  IMSI without both emergency identity signals still fails closed.
 - `opc-proto-diameter`: RFC 6733 CER/CEA command metadata now marks
   Host-IP-Address, Supported-Vendor-Id, Auth-Application-Id,
   Inband-Security-Id, Acct-Application-Id, and

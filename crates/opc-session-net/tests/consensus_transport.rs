@@ -469,19 +469,13 @@ struct InstrumentedConsensusPeer {
     stats: Arc<TransportStats>,
 }
 
-#[async_trait]
-impl SessionConsensusPeer for InstrumentedConsensusPeer {
-    fn node_id(&self) -> opc_session_store::SessionConsensusNodeId {
-        self.inner.node_id()
-    }
-
-    async fn call(
+impl InstrumentedConsensusPeer {
+    fn record_result(
         &self,
-        request: SessionConsensusWireRequest,
-    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
-        let family = request.family.as_str();
-        let result = self.inner.call(request).await;
-        let status = match &result {
+        family: &str,
+        result: &Result<SessionConsensusWireResponse, SessionConsensusPeerError>,
+    ) {
+        let status = match result {
             Ok(response) if response.result.is_ok() => "ok",
             Ok(response) => match response.result {
                 Err(SessionConsensusPeerError::Unavailable) => "remote_unavailable",
@@ -502,6 +496,33 @@ impl SessionConsensusPeer for InstrumentedConsensusPeer {
             Err(_) => "other",
         };
         self.stats.record(format!("{family}:{status}"));
+    }
+}
+
+#[async_trait]
+impl SessionConsensusPeer for InstrumentedConsensusPeer {
+    fn node_id(&self) -> opc_session_store::SessionConsensusNodeId {
+        self.inner.node_id()
+    }
+
+    async fn call(
+        &self,
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let family = request.family.as_str();
+        let result = self.inner.call(request).await;
+        self.record_result(family, &result);
+        result
+    }
+
+    async fn call_with_timeout(
+        &self,
+        request: SessionConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let family = request.family.as_str();
+        let result = self.inner.call_with_timeout(request, timeout).await;
+        self.record_result(family, &result);
         result
     }
 }
@@ -2019,6 +2040,17 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
         .allow_any_trusted_peer()
         .build_authenticated_client_config()
         .expect("rotating consensus client config");
+    // This case verifies that both lanes are replaced by each epoch. Cached
+    // jitter is covered separately with paused time; keep it at zero here so
+    // the replacement assertion has no wall-clock sampling race.
+    let immediate_rotation = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        Duration::from_millis(1),
+        Duration::from_millis(20),
+        Duration::ZERO,
+    )
+    .expect("immediate rotation lifecycle");
     let reauthentication = SessionReauthenticationControl::new();
     let resolutions = Arc::new(AtomicUsize::new(0));
     let counted_resolver: RemoteAddrResolver = {
@@ -2038,6 +2070,7 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
         client_config.clone(),
         Some(Duration::from_secs(2)),
     )
+    .with_connection_lifecycle(immediate_rotation)
     .with_reauthentication_control(reauthentication.clone());
 
     assert_consensus_call_pair(&peer, &manifest, b"initial-primary", b"initial-overflow").await;

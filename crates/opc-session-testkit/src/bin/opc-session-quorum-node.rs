@@ -82,6 +82,25 @@ struct QualificationLease {
 #[error("qualification node failed")]
 struct NodeFailure;
 
+#[derive(Debug, Clone, Copy)]
+enum QualificationNodeOpenStage {
+    Transport,
+    Sqlite,
+    Consensus,
+    Listener,
+}
+
+fn node_open_failure(stage: QualificationNodeOpenStage) -> NodeFailure {
+    let stage = match stage {
+        QualificationNodeOpenStage::Transport => "transport",
+        QualificationNodeOpenStage::Sqlite => "sqlite",
+        QualificationNodeOpenStage::Consensus => "consensus",
+        QualificationNodeOpenStage::Listener => "listener",
+    };
+    eprintln!("qualification node open failed: {stage}");
+    NodeFailure
+}
+
 #[derive(Clone)]
 struct QualificationConsensusRpcGate {
     available: Arc<AtomicBool>,
@@ -164,6 +183,17 @@ impl SessionConsensusPeer for QualificationGatedConsensusPeer {
             return Err(SessionConsensusPeerError::Unavailable);
         }
         self.inner.call(request).await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        request: SessionConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if !self.gate.permits_rpc() {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        self.inner.call_with_timeout(request, timeout).await
     }
 }
 
@@ -636,9 +666,11 @@ impl QualificationNode {
             manifest.consensus_identity(),
             rpc_gate.clone(),
         )
-        .await?;
+        .await
+        .map_err(|_| node_open_failure(QualificationNodeOpenStage::Transport))?;
 
-        let backend = SqliteSessionBackend::open(&config.database_path).map_err(|_| NodeFailure)?;
+        let backend = SqliteSessionBackend::open(&config.database_path)
+            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Sqlite))?;
         let store = Arc::new(
             ConsensusSessionStore::open_with_operation_timeout(
                 topology,
@@ -648,7 +680,7 @@ impl QualificationNode {
                 Duration::from_millis(config.operation_timeout_millis),
             )
             .await
-            .map_err(|_| NodeFailure)?,
+            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?,
         );
         let empty_vote_dispatches = Arc::new(AtomicU64::new(0));
         let counting_handler: Arc<dyn SessionConsensusRpcHandler> =
@@ -673,7 +705,10 @@ impl QualificationNode {
             }
         }
         .with_max_connections(QUALIFICATION_INBOUND_CONNECTION_SLOTS);
-        let (server, actual_addr) = server.listen_on(listener).await.map_err(|_| NodeFailure)?;
+        let (server, actual_addr) = server
+            .listen_on(listener)
+            .await
+            .map_err(|_| node_open_failure(QualificationNodeOpenStage::Listener))?;
         if actual_addr != expected_addr {
             server.abort_and_wait().await;
             return Err(NodeFailure);
@@ -752,6 +787,7 @@ impl QualificationNode {
             QualificationNodeCommand::StopTrafficMutation => self.stop_traffic_mutation().await,
             QualificationNodeCommand::StopTrafficWatch => self.stop_traffic_watch().await,
             QualificationNodeCommand::TrafficStatus => self.traffic_status().await,
+            QualificationNodeCommand::TrafficStatusSnapshot => self.traffic_status_snapshot(),
             QualificationNodeCommand::Acquire {
                 lease_handle,
                 stable_id,
@@ -2918,6 +2954,12 @@ fn lifecycle_metrics(empty_vote_dispatches: u64) -> QualificationConnectionLifec
         connection_failure_timeout: METRICS
             .session_net_connection_failure_timeout
             .load(Ordering::Relaxed),
+        connection_superseded: METRICS
+            .session_net_connection_superseded
+            .load(Ordering::Relaxed),
+        connection_abandoned: METRICS
+            .session_net_connection_abandoned
+            .load(Ordering::Relaxed),
         connection_failure_protocol: METRICS
             .session_net_connection_failure_protocol
             .load(Ordering::Relaxed),
@@ -3470,7 +3512,8 @@ mod tests {
         ));
 
         let recovery_started_at = tokio::time::Instant::now();
-        let observed_at = recovery_started_at + Duration::from_millis(8_123);
+        let recovery_elapsed_millis = QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS + 123;
+        let observed_at = recovery_started_at + Duration::from_millis(recovery_elapsed_millis);
         let deadline_failure = QualificationTrafficFailure::recovery_deadline_exceeded_at(
             QualificationTrafficFailureStage::LeaseAcquire,
             recovery_started_at,
@@ -3482,7 +3525,7 @@ mod tests {
                 code: QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded,
                 stage: QualificationTrafficFailureStage::LeaseAcquire,
                 error_class: QualificationTrafficErrorClass::BackendUnavailable,
-                recovery_elapsed_millis: Some(8_123),
+                recovery_elapsed_millis: Some(recovery_elapsed_millis),
             }
         );
         assert!(!traffic_failure_is_recoverable(deadline_failure));
@@ -3558,6 +3601,7 @@ mod tests {
     struct CountingPeer {
         node_id: SessionConsensusNodeId,
         calls: Arc<AtomicU64>,
+        timeout_millis: Arc<AtomicU64>,
     }
 
     #[async_trait::async_trait]
@@ -3574,6 +3618,18 @@ mod tests {
             Ok(SessionConsensusWireResponse {
                 result: Ok(Vec::new()),
             })
+        }
+
+        async fn call_with_timeout(
+            &self,
+            request: SessionConsensusWireRequest,
+            timeout: Duration,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            self.timeout_millis.store(
+                u64::try_from(timeout.as_millis()).expect("bounded test timeout"),
+                Ordering::SeqCst,
+            );
+            self.call(request).await
         }
     }
 
@@ -3621,10 +3677,12 @@ mod tests {
         gate.set(QualificationConsensusRpcAvailability::Unavailable);
 
         let outbound_calls = Arc::new(AtomicU64::new(0));
+        let outbound_timeout_millis = Arc::new(AtomicU64::new(0));
         let peer = QualificationGatedConsensusPeer::new(
             Arc::new(CountingPeer {
                 node_id: target,
                 calls: Arc::clone(&outbound_calls),
+                timeout_millis: Arc::clone(&outbound_timeout_millis),
             }),
             gate.clone(),
         );
@@ -3633,6 +3691,13 @@ mod tests {
             Err(SessionConsensusPeerError::Unavailable)
         );
         assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            peer.call_with_timeout(gate_test_request(sender), Duration::from_millis(137))
+                .await,
+            Err(SessionConsensusPeerError::Unavailable)
+        );
+        assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(outbound_timeout_millis.load(Ordering::SeqCst), 0);
 
         let inbound_calls = Arc::new(AtomicU64::new(0));
         let handler = QualificationGatedConsensusRpcHandler {
@@ -3652,6 +3717,12 @@ mod tests {
         gate.set(QualificationConsensusRpcAvailability::Available);
         assert!(peer.call(gate_test_request(sender)).await.is_ok());
         assert_eq!(outbound_calls.load(Ordering::SeqCst), 1);
+        assert!(peer
+            .call_with_timeout(gate_test_request(sender), Duration::from_millis(137))
+            .await
+            .is_ok());
+        assert_eq!(outbound_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(outbound_timeout_millis.load(Ordering::SeqCst), 137);
         assert!(handler
             .handle(sender, gate_test_request(sender))
             .await

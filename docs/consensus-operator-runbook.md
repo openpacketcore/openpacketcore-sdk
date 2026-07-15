@@ -364,7 +364,25 @@ counter stops. It then publishes a same-issuer leaf with a 75-second
 remaining-validity/expiry budget. The fixed 30-second drain window establishes
 an `expiry - 30 seconds` soft boundary, followed by complete hard-deadline drain
 and source/controller `LastGoodExpired`; survivors continue canary progress and
-a valid long-lived leaf restores the affected member in the same process.
+a valid long-lived leaf restores the affected member in the same process. The
+replacement proof uses the schedule-bound
+`member-scoped-reauth-settled-baseline/v2` checkpoint: its 86-second clock and
+60-second two-stage server tail begin at the atomic projected-data rename, and
+a final 2.5-second outbound-ledger quiet tail completes the horizon. A
+prepublication delta plus 13-second semantic-progress observation checkpoints
+conservatively bound the worst-case gap between actual survivor progress events
+to 26 seconds. Each survivor may record at most one rejoin availability episode;
+it must recover within that 26-second SLO and settle before the clean baseline,
+and a second or late episode fails closed. Fault-era attempt, terminal, and
+reconnect deltas remain inside the fixed 84/160 per-node bound (ordinary 24/40
+plus fifteen five-second refresh rounds over four/eight incident paths).
+Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
+drain overruns remain forbidden throughout the fault interval. The following
+scoped-reauthentication interval again requires zero transport,
+authentication, timeout, protocol, backend, reconnect-failure, and abandoned
+outcomes. Continuity polling uses a non-intrusive workload snapshot; final
+watch-head settlement retains the fail-closed authoritative replication-head
+read.
 
 This evidence does not authorize an operator to treat the admission gate as a
 real or deployed network partition. It keeps bounded mixed lease/CAS mutation,
@@ -380,19 +398,22 @@ guard and validate that same exact record without minting unnecessary fencing
 authority. Evidence binds this routing as `stage-aware-known-authority/v1`.
 The private
 schedule drops one successful release response per mutator to prove this path.
-More than eight such outcomes per node, any recovery episode beyond 8 seconds,
-any retry before the fixed 50 ms delay, or phase completion with an unresolved
-interruption fails the campaign. A terminal operation observed after that
-deadline reports the closed operation stage and elapsed milliseconds and stays
-failed; raw backend text and identity-bearing values do not enter the control
-protocol. A restarted process that recovers a committed
-generation does not rearm that once-per-logical-mutator fault; lease loss, unexpected state, and invariant
-failures are never masked. After malformed-material repair, exactly one stable
-follower is killed uncleanly with active mutation and watch tasks. Survivor
-commits must advance during the outage, and the same-disk, exact-address
-restart must reconcile the bounded committed journal, prove the exact current
-record, catch its watch up, and resume under a strictly higher same-owner fence
-inside 26 seconds. Schedule v3 binds this one
+More than eight such outcomes per node, any recovery episode beyond the fixed
+26-second two-election-plus-operation transition envelope, any retry before the
+fixed 50 ms delay, or phase completion with an unresolved interruption fails
+the campaign. A terminal operation observed after that deadline reports the
+closed operation stage and elapsed milliseconds and stays failed; raw backend
+text and identity-bearing values do not enter the control protocol. The
+admission-loss exact-address restart is watcher-only before exit and joins the
+mutator set only after bounded journal reconciliation. A restarted process
+that recovers a committed generation does not rearm that
+once-per-logical-mutator fault; lease loss, unexpected state, and invariant
+failures are never masked. Separately, after malformed-material repair,
+exactly one stable follower is killed uncleanly with active mutation and watch
+tasks. Survivor commits must advance during the outage, and the same-disk,
+exact-address restart must reconcile the bounded committed journal, prove the
+exact current record, catch its watch up, and resume under a strictly higher
+same-owner fence inside 26 seconds. Schedule v3 binds this one
 `same-disk-exact-address-active-mutator/v1` scenario. A broader restart/fault
 matrix, resource/soak,
 remote-HKMS, deployed-CNF, signed release, and evidence-schema/profile results
@@ -454,6 +475,26 @@ lifecycle expiry of a coherent source publication was observed, whether before
 pairing, while controller-active, or after controller rejection. Supersession
 alone does not synthesize expiry. Peer authentication or trust failures remain
 `opc_session_net_connection_attempts_total{outcome="authentication_or_trust_failure"}`.
+
+Reconnect admission is serialized and exponentially bounded per directed peer,
+not per RPC: both consensus lanes share the same cooldown, and legacy direct
+requests and watches share the backend's cooldown. A newly published local TLS
+material epoch or explicit reauthentication generation supersedes an old-epoch
+wait or handshake immediately; it does not bypass fresh mutual-TLS, SPIFFE,
+manifest-scope, ALPN, or contract checks. Alert on sustained real connection
+attempts, not logical request volume. A transport-observed newer material or
+explicit-reauthentication epoch terminates the old attempt as `superseded`. An
+attempt guard dropped before explicit terminal classification is `abandoned`,
+covering caller abort and runtime teardown without guessing why it ended. Both
+preserve `started = terminal + outstanding` after lifecycle settlement;
+`timeout` remains reserved for an actual resolver, TCP, TLS, bootstrap, or
+frame deadline. Because these are separate relaxed counters, do not require
+that equation from one scrape while handlers are changing state.
+
+Material-epoch retirement of an already authenticated cached lane uses the
+configured stable per-peer jitter. An explicit reauthentication request is an
+operator demand for current-generation proof and retires cached lanes
+immediately; it does not wait for material jitter.
 
 Install these alert rules for a consensus CNF. There is deliberately no fixed
 reference span. The earlier 1320-second example was unsafe because its
@@ -3060,9 +3101,11 @@ encryption/HKMS composition above Openraft.
    `request_reauthentication()` on the controls for its affected outbound peers
    and listeners. The generation is monotonic and process-local; never set it
    back.
-5. During the deterministic jitter/drain interval, verify no new work enters
-   old connections, transport waits and connection slots end within the hard
-   deadline, replacements complete full mutual TLS/application negotiation,
+5. During the bounded retirement/drain interval, verify no new work enters old
+   connections. A material-only change may consume its deterministic jitter;
+   the explicit reauthentication in step 4 retires cached lanes immediately.
+   Verify transport waits and connection slots end within the hard deadline,
+   replacements complete full mutual TLS/application negotiation,
    drain overruns stay zero, and durable readiness remains fresh. An admitted
    supervised mutation may finish after transport closure; treat its outcome as
    ambiguous, never replay it automatically, and use authoritative readback or

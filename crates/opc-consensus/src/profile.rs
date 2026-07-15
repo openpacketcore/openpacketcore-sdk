@@ -55,9 +55,11 @@ pub struct DurableOpenraftProfile {
 
 /// Fixed end-to-end timing contract shared by every durable consensus domain.
 ///
-/// All values are complete-call ceilings. The cold-connection value is a
-/// contained sub-bound of the selected RPC-family ceiling, never additional
-/// time. The fixed server ceilings remain above every client family.
+/// All values are outer-hard/direct complete-call ceilings. A deadline-aware
+/// Openraft network call uses its supplied soft TTL, never more than the
+/// corresponding family ceiling. The cold-connection value is a contained
+/// sub-bound of the selected call ceiling, never additional time. The fixed
+/// server ceilings remain above every client family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableConsensusTimingProfile {
     /// Resolver, TCP, mutual-TLS, identity, and application-bootstrap ceiling.

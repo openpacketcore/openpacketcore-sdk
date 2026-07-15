@@ -68,10 +68,13 @@ cargo build -p opc-session-testkit --bin opc-session-quorum-node --no-default-fe
 cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features
 ```
 
-Its strict node config accepts `projected_mtls` with an absolute projected
-volume root inside the node workspace, normalized relative certificate/key/
-bundle names, a bounded polling interval, and a finite validated connection
-lifecycle policy. The control protocol exposes only redaction-safe evidence:
+Its strict private node-control schema is version 2; version 1 is rejected
+because lifecycle replies did not carry the fixed `superseded` and `abandoned`
+terminal outcomes. Node config accepts `projected_mtls` with an absolute
+projected volume root inside the node workspace, normalized relative
+certificate/key/bundle names, a bounded polling interval, and a finite
+validated connection lifecycle policy. The control protocol exposes only
+redaction-safe evidence:
 projected-source publication status separately from authoritative TLS-controller
 material status and expiries, an explicit reauthentication generation, a
 directed fresh authenticated-TLS plus exact manifest-bound consensus-bootstrap
@@ -131,10 +134,38 @@ reauthentication generation, proves a fresh resolver/TLS/bootstrap path in both
 directions on every edge incident to that member, and restores all-voter
 readiness and canary progress without changing that process's PID. Unrelated
 survivors must not record an explicit or local-material-epoch retirement from
-this member-only recovery. The harness waits for every lifecycle drain and
-every still-live survivor availability episode to settle before it captures
-the next traffic baseline. The private schedule binds this procedure as
-`member-scoped-reauth-settled-baseline/v1`.
+this member-only recovery. A prepublication survivor delta primes conservative
+13-second semantic-progress observation checkpoints. The 86-second recovery
+clock and 60-second two-stage server idle/handler tail begin only after the
+atomic projected-data rename; every publication, existing-generation incident
+path, readiness, and canary checkpoint must observe another delta. Requiring a
+delta in every half-SLO observation interval bounds the worst-case gap between
+actual progress events to the 26-second availability SLO. The attempt/terminal
+ledger must remain unchanged for the final 2.5-second
+cold-connect/maximum-reconnect-backoff tail. Each survivor may record at most
+one availability episode while the expired member rejoins; that episode must
+recover inside the existing 26-second SLO and be fully settled before the
+clean baseline. A second or late episode fails closed. The half-SLO observation
+cadence resumes immediately after recovery.
+Only after bounded fault-era transport/authentication/timeout/reconnect
+outcomes have settled does it capture the clean member-scoped reauthentication
+baseline. Fault-era attempts, terminal outcomes, and reconnects retain the
+fixed 84/160 per-node bound: the ordinary 24/40 allowance plus no more than
+fifteen five-second refresh rounds over four/eight incident directed paths.
+Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
+drain overruns retain a zero budget throughout the fault and clean intervals.
+The private schedule binds this procedure as
+`member-scoped-reauth-settled-baseline/v2`. Every epoch-changing interval
+allows `superseded` only up to the existing per-node connection-attempt bound
+`8 * (member_count - 1) + 8`; non-epoch intervals require zero. Actual timeout,
+transport, protocol, backend, reconnect failure, and `abandoned` deltas remain
+zero in the clean scoped-reauthentication interval after the bounded fault-era
+ledger has settled.
+
+Recovery continuity polling uses the child process's non-intrusive workload
+snapshot, which cannot create or hide a store outcome. The authoritative
+`TrafficStatus` path remains fail-closed and is still required when final watch
+heads settle against the linearizable replication head.
 
 These controls are qualification-only. Consensus-RPC admission loss is not a
 real or deployed network partition. The cases keep bounded mixed lease/CAS
@@ -149,8 +180,9 @@ the already-proven guard and validate that same exact record without minting
 unnecessary fencing authority. Evidence binds this routing as
 `stage-aware-known-authority/v1`. The private schedule drops one successful
 release response
-per mutator to exercise that path, and is bound to eight outcomes per node, 8
-seconds per episode, and a fixed 50 ms retry delay; all three bounds and the
+per mutator to exercise that path, and is bound to eight outcomes per node, a
+fixed 26-second two-election-plus-operation transition envelope per episode,
+and a fixed 50 ms retry delay; all three bounds and the
 total/recovered/consecutive counters are schedule evidence. Phase completion
 requires every interruption to be reconciled. A committed generation recovered
 after process restart does not rearm that once-per-logical-mutator synthetic
@@ -202,12 +234,15 @@ The 90-second per-transition value is a hard fail-safe only: ready material,
 fresh directed handshakes, durable/application progress, and complete
 connection accounting are the completion conditions. Transport,
 authentication/trust (outside the deliberate stale-chain probe), protocol,
-backend, timeout, and reconnect failures have a zero budget. A chained
+backend, timeout, reconnect failure, and `abandoned` outcomes have a zero
+budget. An epoch-changing interval may record `superseded` only within the same
+mechanically enforced per-node connection-attempt bound; intervals that do not
+change material or explicit authentication epoch require zero. A chained
 post-formation ledger covers warmup, every interstitial checkpoint, final
 generation, and resource settle; authentication failures must equal exactly
-the one deliberate removed-root ring probe delivered to each member; all other
-connection-failure, reconnect-failure, and drain-overrun deltas must remain
-zero. An authenticated
+the one deliberate removed-root ring probe delivered to each member; all real
+connection-failure, reconnect-failure, abandoned, and drain-overrun deltas must
+remain zero. An authenticated
 server's policy-driven wait for the next request is reported separately as the
 fixed `idle_timeout` lifecycle-retirement reason, never as a failed attempt.
 
@@ -242,11 +277,16 @@ response envelope, 30-second mutation-shutdown SLO, 75-second short-lived SVID
 budget, one-second
 pre-soft traffic-stop lead, and
 `accepted-operation-terminal-checkpoints/v1` cancellation discipline. If a
+fleet starts, each already-bound child completes its process-heavy
+`Configure`/`Started` exchange before the next child is admitted, under one
+shared 45-second deadline; cluster `Initialize` remains concurrent. If a
 child response times out, is malformed, or reaches EOF, the parent reports only
 the closed pending-command kind, a harness-local monotonic sequence, and the
 elapsed send time. Command values, session/lease identities, payloads, and
-filesystem paths never enter that diagnostic, and child stderr is reduced to a
-closed redacted classification. Cooperative mutation/watch stop replies reuse
+filesystem paths never enter that diagnostic. Child stderr is reduced to a
+closed redacted classification; a restart configuration exit may expose only
+the fixed `transport`, `sqlite`, `consensus`, or `listener` startup stage.
+Cooperative mutation/watch stop replies reuse
 the last successfully proven linearizable replication head and perform no new
 backend operation after joining their owned task. Normal status commands remain
 authoritative, and a recovered watcher must still reconcile the bounded durable

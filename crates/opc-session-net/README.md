@@ -56,19 +56,31 @@ client applies one absolute logical deadline to lane acquisition and, when a
 connection is required, DNS, TCP, TLS, bootstrap, bounded encoding, write, and
 response read.
 
+For Openraft dispatch, the session-store adapter passes Openraft's soft TTL to
+the remote peer as that logical deadline and does not wrap the transport in a
+second hard timer. The peer applies the lesser of the supplied soft TTL and any
+configured family ceiling, classifies its own timeout, and drops any uncertain
+socket before returning. Openraft alone retains the outer hard TTL. This margin
+prevents hard cancellation from dropping a live connection-attempt guard and
+misclassifying a real deadline as `abandoned`. In-process compatibility peers
+continue to rely on their caller's existing hard deadline unless they explicitly
+implement the deadline-aware port method.
+
 This cache removes repeated handshakes from a healthy steady-state heartbeat
 path. A first call, dead cached socket, or replacement still performs DNS, TCP,
 mutual TLS, identity admission, and bootstrap. One absolute family deadline
-starts before lane acquisition. A fresh connection receives the lesser of the
-remaining family budget and a 1,500 ms cold-phase cap; response work keeps only
-the original remaining budget, so cold time is contained and never additive.
+starts before lane acquisition. Direct calls use the fixed family ceiling;
+Openraft calls use its smaller supplied soft TTL, never more than that family
+ceiling. A fresh connection receives the lesser of the remaining budget and a
+1,500 ms cold-phase cap; response work keeps only the original remaining
+budget, so cold time is contained and never additive.
 At the 31-member ceiling, one node has at most 30 remote peers: 60 steady-state
 outbound lanes. During one bounded retirement step, at most one retiring
 generation per lane may overlap its replacement, for up to 120 server-side
 connections. Repeated churn remains governed by the listener's unchanged hard
 cap of 128 rather than that planning estimate.
 
-| RPC family | Complete deadline |
+| RPC family | Outer hard/direct complete ceiling |
 |:---|---:|
 | AppendEntries and Openraft read-index confirmation | 2,000 ms |
 | Vote | 5,000 ms |
@@ -507,12 +519,36 @@ one drain window remains.
 
 At TLS completion the transport retains exact monotonic deadline evidence for
 both presented chains and the coherent `TlsMaterialEpoch` admitted by
-`opc-tls`. A later material epoch, or
-`SessionReauthenticationControl::request_reauthentication`, starts cooperative
-retirement after the configured stable jitter. Configure a shared control with
+`opc-tls`. A later material epoch starts cooperative retirement after the
+configured stable jitter. An explicit
+`SessionReauthenticationControl::request_reauthentication` retires cached
+connections immediately so the caller can prove a current-generation
+handshake. Configure a shared control with
 `with_reauthentication_control`, and configure non-default finite bounds with
 `with_connection_lifecycle`, on every client/peer and listener that must rotate
 together.
+
+Cold-connection admission is shared per remote peer across logical calls. The
+two consensus lanes use one gate, and the legacy direct request and watch paths
+use another common gate for that backend. Only one resolver/TCP/TLS/bootstrap
+attempt may run at a time; a failed or cancelled attempt advances exponential
+backoff that later RPCs cannot reset. A connection whose authenticated evidence
+matches the current local generation/material epoch and is still dispatch-usable
+resets the gate. Publishing a newer material epoch or requesting explicit
+reauthentication supersedes old cooldowns and cancels an old-epoch handshake;
+the replacement still repeats every TLS, SPIFFE, ALPN, manifest-scope, and
+contract-profile check. Cached authenticated consensus lanes honor stable
+jitter for material rotation; explicit reauthentication retires them
+immediately. A fresh handshake captured from an older epoch is rejected before
+any Openraft request bytes are written. Connection-attempt metrics use the
+fixed `superseded` terminal only when the transport observes a newer material
+or explicit-reauthentication epoch. If an attempt guard is dropped before any
+explicit terminal classification, caller abort or runtime teardown is recorded
+as `abandoned`. Both preserve started-attempt conservation once handlers are
+quiescent without misclassifying local lifecycle control as `timeout`; that
+outcome remains reserved for an actual resolver, TCP, TLS, bootstrap, or frame
+deadline. The separate relaxed counters are not an atomic concurrent-scrape
+snapshot, so enforce the conservation equation only after lifecycle settlement.
 
 The bounded same-issuer credential-compromise/revocation mechanism is
 short-lived SVID expiry, not material rotation or connection reauthentication.
@@ -662,9 +698,9 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   0-RTT. Every reconnect pays for a full mutual-TLS handshake so SVID rotation
   cannot reuse a cached peer certificate or authority decision.
 - Authenticated connections now retire at a finite age, exact earliest
-  local/peer presented-chain expiry, material-epoch change, or explicit
-  reauthentication request. Both sides stop new admission at the soft boundary,
-  bound the transport wait and
+  local/peer presented-chain expiry, a jittered material-epoch change, or an
+  immediate explicit reauthentication request. Both sides stop new admission
+  at the soft boundary, bound the transport wait and
   connection-slot lifetime by the hard deadline, and reconnect through a
   complete mutual-TLS/application handshake. An already-admitted supervised
   backend mutation may still finish later and therefore remains typed

@@ -36,8 +36,8 @@ pub use crate::consensus::RemoteAddrResolver;
 use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::identity::RemoteReplicaBinding;
 use crate::lifecycle::{
-    directed_connection_key, CertificateExpiryEvidence, ConnectionLifecycle,
-    ConnectionLifecyclePolicy, SessionReauthenticationControl,
+    directed_connection_key, CertificateExpiryEvidence, ConnectionAttemptMetricGuard,
+    ConnectionLifecycle, ConnectionLifecyclePolicy, ReconnectGate, SessionReauthenticationControl,
 };
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
@@ -223,6 +223,10 @@ enum ConnectionOpenError {
     /// Authenticated proof that the server retired before admitting any
     /// application request or transmitting its bootstrap acknowledgement.
     Retired,
+    #[error("connection attempt superseded by a local authentication epoch")]
+    /// Local material or explicit reauthentication changed while a cold
+    /// connection was still pre-dispatch.
+    Superseded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +253,9 @@ impl RemoteRequestAttemptFailure {
     fn before_connection(error: &ConnectionOpenError) -> Self {
         match error {
             ConnectionOpenError::Protocol(error) => Self::before_transmission(error),
-            ConnectionOpenError::Retired => Self::connection_retiring(),
+            ConnectionOpenError::Retired | ConnectionOpenError::Superseded => {
+                Self::connection_retiring()
+            }
         }
     }
 
@@ -303,7 +309,9 @@ impl RemoteRequestFailure {
     fn from_connection_error(error: &ConnectionOpenError) -> Self {
         match error {
             ConnectionOpenError::Protocol(error) => Self::from_protocol_error(error),
-            ConnectionOpenError::Retired => Self::ConnectionRetiring,
+            ConnectionOpenError::Retired | ConnectionOpenError::Superseded => {
+                Self::ConnectionRetiring
+            }
         }
     }
 
@@ -491,55 +499,172 @@ fn session_client_tls_config(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls:
     Arc::new(config)
 }
 
+#[derive(Clone)]
+struct OutboundConnectionLifecycle {
+    policy: ConnectionLifecyclePolicy,
+    reauthentication: SessionReauthenticationControl,
+    reconnect_gate: Arc<ReconnectGate>,
+}
+
 async fn open_connection(
     target: RemoteTarget,
     tls_config: Option<opc_tls::AuthenticatedClientConfig>,
     binding: RemoteReplicaBinding,
     requested_response_frame_size: usize,
     operation_deadline: tokio::time::Instant,
-    lifecycle_policy: ConnectionLifecyclePolicy,
-    reauthentication: SessionReauthenticationControl,
+    lifecycle: OutboundConnectionLifecycle,
 ) -> Result<Connection, ConnectionOpenError> {
     // Local configuration rejection is not a connection attempt.
     checked_wire_frame_size(requested_response_frame_size).map_err(ConnectionOpenError::from)?;
-    METRICS
-        .session_net_connection_attempts
-        .fetch_add(1, Ordering::Relaxed);
-    let result = open_connection_attempt(
+    let mut reauthentication_rx = lifecycle.reauthentication.subscribe();
+    let mut admitted_generation = lifecycle.reauthentication.generation();
+    let mut material_rx = tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedClientConfig::subscribe_material_changes);
+    let mut admitted_material_epoch = material_rx.as_ref().map(|status| status.status().epoch());
+    let reconnect_attempt = loop {
+        let acquire = lifecycle.reconnect_gate.acquire(
+            operation_deadline,
+            admitted_generation,
+            admitted_material_epoch,
+        );
+        tokio::pin!(acquire);
+        tokio::select! {
+            biased;
+            changed = reauthentication_rx.changed() => {
+                if changed.is_err() {
+                    return Err(ConnectionOpenError::Protocol(ProtocolError::Io(
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "session reauthentication control closed during reconnect",
+                        ),
+                    )));
+                }
+                admitted_generation = lifecycle.reauthentication.generation();
+                lifecycle
+                    .reconnect_gate
+                    .observe_epoch(admitted_generation, admitted_material_epoch);
+            },
+            current_material_epoch = wait_for_material_epoch_change(
+                &mut material_rx,
+                admitted_material_epoch,
+            ) => {
+                admitted_material_epoch = current_material_epoch;
+                lifecycle
+                    .reconnect_gate
+                    .observe_epoch(admitted_generation, admitted_material_epoch);
+            },
+            attempt = &mut acquire => {
+                break attempt.ok_or_else(|| {
+                    ConnectionOpenError::Protocol(ProtocolError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "session reconnect cooldown exceeded the operation deadline",
+                    )))
+                })?;
+            },
+        }
+    };
+    let mut attempt_metrics = ConnectionAttemptMetricGuard::started();
+    let open = open_connection_attempt(
         target,
-        tls_config,
-        binding,
+        tls_config.clone(),
+        binding.clone(),
         requested_response_frame_size,
         operation_deadline,
-        lifecycle_policy,
-        reauthentication,
-    )
-    .await;
-    match &result {
-        Ok(_) => &METRICS.session_net_connection_successes,
+        lifecycle.policy,
+        lifecycle.reauthentication.clone(),
+    );
+    tokio::pin!(open);
+    let mut result = tokio::select! {
+        biased;
+        () = reconnect_attempt.superseded() => {
+            Err(ConnectionOpenError::Superseded)
+        },
+        changed = reauthentication_rx.changed() => {
+            if changed.is_ok() {
+                lifecycle.reconnect_gate.observe_epoch(
+                    lifecycle.reauthentication.generation(),
+                    tls_config
+                        .as_ref()
+                        .map(|config| config.material_status().epoch()),
+                );
+            }
+            Err(ConnectionOpenError::Superseded)
+        },
+        current_material_epoch = wait_for_material_epoch_change(
+            &mut material_rx,
+            admitted_material_epoch,
+        ) => {
+            lifecycle.reconnect_gate.observe_epoch(
+                lifecycle.reauthentication.generation(),
+                current_material_epoch,
+            );
+            Err(ConnectionOpenError::Superseded)
+        },
+        result = &mut open => result,
+    };
+    if let Ok(connection) = result.as_mut() {
+        let now = tokio::time::Instant::now();
+        let current_generation = lifecycle.reauthentication.generation();
+        let current_material_epoch = tls_config
+            .as_ref()
+            .map(|config| config.material_status().epoch());
+        connection.lifecycle.observe_rotation(
+            now,
+            current_generation,
+            current_material_epoch,
+            &directed_connection_key(
+                b"direct",
+                binding.local_replica_id().as_str(),
+                binding.remote_replica_id().as_str(),
+            ),
+        );
+        let mismatch = connection
+            .lifecycle
+            .evidence_mismatch_reason(current_generation, current_material_epoch);
+        if mismatch.is_some() || connection.lifecycle.retirement(now).is_some() {
+            if let Some(reason) = mismatch {
+                connection.lifecycle.record_forced_retirement(reason);
+            }
+            result = Err(ConnectionOpenError::Retired);
+        }
+    }
+    if result.is_ok() {
+        reconnect_attempt.succeeded();
+    } else {
+        reconnect_attempt.failed();
+    }
+    let terminal_counter = match &result {
+        Ok(_) => Some(&METRICS.session_net_connection_successes),
         // A complete authenticated retirement control is a successful
         // transport/control exchange, but not an admitted application
         // connection. Account for the attempt without misclassifying the
         // expected local-rotation race as a failure; the caller reconnects
         // before transmitting any application request.
-        Err(ConnectionOpenError::Retired) => &METRICS.session_net_connection_successes,
+        Err(ConnectionOpenError::Retired) => Some(&METRICS.session_net_connection_successes),
+        Err(ConnectionOpenError::Superseded) => None,
         Err(ConnectionOpenError::Protocol(ProtocolError::Io(error)))
             if error.kind() == io::ErrorKind::TimedOut =>
         {
-            &METRICS.session_net_connection_failure_timeout
+            Some(&METRICS.session_net_connection_failure_timeout)
         }
         Err(ConnectionOpenError::Protocol(ProtocolError::Io(_))) => {
-            &METRICS.session_net_connection_failure_transport
+            Some(&METRICS.session_net_connection_failure_transport)
         }
         Err(ConnectionOpenError::Protocol(ProtocolError::Authentication)) => {
-            &METRICS.session_net_connection_failure_authentication
+            Some(&METRICS.session_net_connection_failure_authentication)
         }
         Err(ConnectionOpenError::Protocol(ProtocolError::BackendUnavailable(_))) => {
-            &METRICS.session_net_connection_failure_backend
+            Some(&METRICS.session_net_connection_failure_backend)
         }
-        Err(_) => &METRICS.session_net_connection_failure_protocol,
+        Err(_) => Some(&METRICS.session_net_connection_failure_protocol),
+    };
+    if let Some(terminal_counter) = terminal_counter {
+        terminal_counter.fetch_add(1, Ordering::Relaxed);
+        attempt_metrics.finish();
+    } else {
+        attempt_metrics.finish_superseded();
     }
-    .fetch_add(1, Ordering::Relaxed);
     result
 }
 
@@ -975,6 +1100,7 @@ pub struct RemoteSessionBackend {
     max_frame_size: usize,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
+    reconnect_gate: Arc<ReconnectGate>,
     conn: Arc<Mutex<Option<Connection>>>,
     pool_lifecycle_monitor: Arc<PoolLifecycleMonitor>,
     negotiated_frame_limits: Arc<RwLock<Option<NegotiatedFrameLimits>>>,
@@ -1074,14 +1200,16 @@ impl RemoteSessionBackend {
         binding: RemoteReplicaBinding,
         deadline: Option<Duration>,
     ) -> Self {
+        let lifecycle_policy = ConnectionLifecyclePolicy::default();
         Self {
             target,
             tls_config,
             binding,
             deadline: deadline.unwrap_or(Duration::from_secs(2)),
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-            lifecycle_policy: ConnectionLifecyclePolicy::default(),
+            lifecycle_policy,
             reauthentication: SessionReauthenticationControl::new(),
+            reconnect_gate: ReconnectGate::new(lifecycle_policy),
             conn: Arc::new(Mutex::new(None)),
             pool_lifecycle_monitor: Arc::new(PoolLifecycleMonitor::default()),
             negotiated_frame_limits: Arc::new(RwLock::new(None)),
@@ -1102,6 +1230,7 @@ impl RemoteSessionBackend {
         // reuse connection or negotiation state created by another clone.
         self.conn = Arc::new(Mutex::new(None));
         self.pool_lifecycle_monitor = Arc::new(PoolLifecycleMonitor::default());
+        self.reconnect_gate = ReconnectGate::new(self.lifecycle_policy);
         self.negotiated_frame_limits = Arc::new(RwLock::new(None));
         self.cached_capabilities = Arc::new(RwLock::new(None));
         self
@@ -1113,6 +1242,7 @@ impl RemoteSessionBackend {
         self.lifecycle_policy = policy;
         self.conn = Arc::new(Mutex::new(None));
         self.pool_lifecycle_monitor = Arc::new(PoolLifecycleMonitor::default());
+        self.reconnect_gate = ReconnectGate::new(policy);
         self
     }
 
@@ -1126,6 +1256,7 @@ impl RemoteSessionBackend {
         self.reauthentication = control;
         self.conn = Arc::new(Mutex::new(None));
         self.pool_lifecycle_monitor = Arc::new(PoolLifecycleMonitor::default());
+        self.reconnect_gate = ReconnectGate::new(self.lifecycle_policy);
         self
     }
 
@@ -1479,6 +1610,10 @@ impl RemoteSessionBackend {
             if (mismatch.is_none() || scheduled_pool_rotation)
                 && candidate_connection.lifecycle.retirement(now).is_none()
             {
+                if mismatch.is_none() {
+                    self.reconnect_gate
+                        .mark_usable(current_generation, current_material_epoch);
+                }
                 *pretransmission_failure
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -1646,6 +1781,7 @@ impl RemoteSessionBackend {
         let weak_connection = Arc::downgrade(&self.conn);
         let tls_config = self.tls_config.clone();
         let reauthentication = self.reauthentication.clone();
+        let reconnect_gate = Arc::clone(&self.reconnect_gate);
         // Subscribe before spawning so a publication between this function
         // returning and the task's first poll is still observed.
         let mut reauthentication_rx = reauthentication.subscribe();
@@ -1682,6 +1818,7 @@ impl RemoteSessionBackend {
                 let material_epoch = tls_config
                     .as_ref()
                     .map(|config| config.material_status().epoch());
+                reconnect_gate.observe_epoch(generation, material_epoch);
                 let Some(monitor) = weak_monitor.upgrade() else {
                     return;
                 };
@@ -1720,8 +1857,11 @@ impl RemoteSessionBackend {
             self.binding.clone(),
             self.max_frame_size,
             operation_deadline,
-            self.lifecycle_policy,
-            self.reauthentication.clone(),
+            OutboundConnectionLifecycle {
+                policy: self.lifecycle_policy,
+                reauthentication: self.reauthentication.clone(),
+                reconnect_gate: Arc::clone(&self.reconnect_gate),
+            },
         )
         .await;
         if let Ok(connection) = &result {
@@ -2305,6 +2445,7 @@ impl SessionBackend for RemoteSessionBackend {
             max_frame_size: self.max_frame_size,
             lifecycle_policy: self.lifecycle_policy,
             reauthentication: self.reauthentication.clone(),
+            reconnect_gate: Arc::clone(&self.reconnect_gate),
         };
         let mut backoff = self.lifecycle_policy.reconnect_backoff_min();
         let connection = loop {
@@ -2457,6 +2598,7 @@ struct WatchConnectionConfig {
     max_frame_size: usize,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
+    reconnect_gate: Arc<ReconnectGate>,
 }
 
 async fn open_watch_connection(
@@ -2475,8 +2617,11 @@ async fn open_watch_connection(
                 config.binding.clone(),
                 config.max_frame_size,
                 operation_deadline,
-                config.lifecycle_policy,
-                config.reauthentication.clone(),
+                OutboundConnectionLifecycle {
+                    policy: config.lifecycle_policy,
+                    reauthentication: config.reauthentication.clone(),
+                    reconnect_gate: Arc::clone(&config.reconnect_gate),
+                },
             )
             .await?;
             let now = tokio::time::Instant::now();
@@ -2650,15 +2795,35 @@ fn watch_open_store_error(failure: WatchOpenFailure) -> StoreError {
 }
 
 async fn wait_for_material_change(receiver: &mut Option<opc_tls::TlsMaterialStatusReceiver>) {
-    let closed = match receiver.as_mut() {
-        Some(receiver) => receiver.changed().await.is_err(),
-        None => {
-            std::future::pending::<()>().await;
-            false
+    loop {
+        match receiver.as_mut() {
+            Some(status) => {
+                if status.changed().await.is_ok() {
+                    return;
+                }
+                *receiver = None;
+            }
+            None => {
+                std::future::pending::<()>().await;
+            }
         }
-    };
-    if closed {
-        *receiver = None;
+    }
+}
+
+async fn wait_for_material_epoch_change(
+    receiver: &mut Option<opc_tls::TlsMaterialStatusReceiver>,
+    admitted_epoch: Option<opc_tls::TlsMaterialEpoch>,
+) -> Option<opc_tls::TlsMaterialEpoch> {
+    loop {
+        let Some(status) = receiver.as_ref() else {
+            std::future::pending::<()>().await;
+            continue;
+        };
+        let current_epoch = Some(status.status().epoch());
+        if current_epoch != admitted_epoch {
+            return current_epoch;
+        }
+        wait_for_material_change(receiver).await;
     }
 }
 
@@ -4208,19 +4373,40 @@ mod tests {
         }
         assert_eq!(directed.len(), 2, "test requires two distinct edge jitters");
 
+        let material = crate::test_support::RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/client",
+        );
+        let tls_config = material.config();
+        let admitted_epoch = tls_config.material_status().epoch();
         let monitor = PoolLifecycleMonitor::default();
         let observed_at = tokio::time::Instant::now();
-        monitor.publish_generation(1, observed_at);
+        material.rotate();
+        let current_epoch = tls_config.material_status().epoch();
+        monitor.publish_material(Some(current_epoch), observed_at);
         // Model the task blocked behind the one-in-flight mutex while queued
-        // checkouts observe the new generation first.
+        // checkouts observe the new material epoch first.
         tokio::time::advance(Duration::from_millis(50)).await;
         let checkout_at = tokio::time::Instant::now();
-        let mut first = ConnectionLifecycle::new(policy, observed_at, None, None, 0, None)
-            .expect("first lifecycle");
-        let mut second = ConnectionLifecycle::new(policy, observed_at, None, None, 0, None)
-            .expect("second lifecycle");
-        monitor.apply_to(&mut first, 1, None, checkout_at, &directed[0].0);
-        monitor.apply_to(&mut second, 1, None, checkout_at, &directed[1].0);
+        let mut first =
+            ConnectionLifecycle::new(policy, observed_at, None, None, 0, Some(admitted_epoch))
+                .expect("first lifecycle");
+        let mut second =
+            ConnectionLifecycle::new(policy, observed_at, None, None, 0, Some(admitted_epoch))
+                .expect("second lifecycle");
+        monitor.apply_to(
+            &mut first,
+            0,
+            Some(current_epoch),
+            checkout_at,
+            &directed[0].0,
+        );
+        monitor.apply_to(
+            &mut second,
+            0,
+            Some(current_epoch),
+            checkout_at,
+            &directed[1].0,
+        );
         assert_eq!(first.retire_at(), observed_at + directed[0].1);
         assert_eq!(second.retire_at(), observed_at + directed[1].1);
         assert_ne!(first.retire_at(), second.retire_at());
@@ -4228,20 +4414,23 @@ mod tests {
         assert!(second.retirement(checkout_at).is_none());
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        monitor.publish_generation(2, tokio::time::Instant::now());
-        let mut coalesced = ConnectionLifecycle::new(policy, observed_at, None, None, 0, None)
-            .expect("coalesced lifecycle");
+        material.rotate();
+        let latest_epoch = tls_config.material_status().epoch();
+        monitor.publish_material(Some(latest_epoch), tokio::time::Instant::now());
+        let mut coalesced =
+            ConnectionLifecycle::new(policy, observed_at, None, None, 0, Some(admitted_epoch))
+                .expect("coalesced lifecycle");
         monitor.apply_to(
             &mut coalesced,
-            2,
-            None,
+            0,
+            Some(latest_epoch),
             tokio::time::Instant::now(),
             &directed[0].0,
         );
         assert_eq!(
             coalesced.retire_at(),
             observed_at + directed[0].1,
-            "a later generation publication must not postpone an existing stale connection"
+            "a later material publication must not postpone an existing stale connection"
         );
     }
 
@@ -4584,14 +4773,18 @@ mod tests {
             let deadline = tokio::time::Instant::now()
                 .checked_add(Duration::from_secs(1))
                 .expect("test deadline");
+            let lifecycle_policy = ConnectionLifecyclePolicy::default();
             match open_connection(
                 RemoteTarget::pinned(addr),
                 None,
                 crate::identity::insecure_test_client_binding(),
                 configured_frame_size,
                 deadline,
-                ConnectionLifecyclePolicy::default(),
-                SessionReauthenticationControl::new(),
+                OutboundConnectionLifecycle {
+                    policy: lifecycle_policy,
+                    reauthentication: SessionReauthenticationControl::new(),
+                    reconnect_gate: ReconnectGate::new(lifecycle_policy),
+                },
             )
             .await
             {
@@ -4643,6 +4836,191 @@ mod tests {
         assert_eq!(backend.capabilities().await, expected_caps_b);
         let _ = handle_b.await;
         assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_requests_and_watches_share_one_reconnect_gate() {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move || {
+                let entered_tx = entered_tx.clone();
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    entered_tx.send(attempt).expect("report resolver entry");
+                    std::future::pending::<io::Result<SocketAddr>>().await
+                })
+            })
+        };
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            Duration::from_millis(80),
+            Duration::ZERO,
+        )
+        .expect("lifecycle policy");
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(1)),
+        )
+        .with_connection_lifecycle(policy);
+
+        let request_backend = backend.clone();
+        let request = tokio::spawn(async move { request_backend.capabilities().await });
+        assert_eq!(entered_rx.recv().await, Some(0));
+
+        let watch_backend = backend.clone();
+        let watch = tokio::spawn(async move { watch_backend.watch(0).await });
+        tokio::task::yield_now().await;
+        assert!(entered_rx.try_recv().is_err());
+
+        request.abort();
+        assert!(request
+            .await
+            .expect_err("request must be cancelled")
+            .is_cancelled());
+        tokio::time::advance(Duration::from_millis(9)).await;
+        tokio::task::yield_now().await;
+        assert!(entered_rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(entered_rx.recv().await, Some(1));
+
+        watch.abort();
+        match watch.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("watch must be cancelled"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_epoch_supersession_is_distinct_from_caller_abandonment() {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move || {
+                let entered_tx = entered_tx.clone();
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    entered_tx.send(attempt).expect("report resolver entry");
+                    std::future::pending::<io::Result<SocketAddr>>().await
+                })
+            })
+        };
+        let control = SessionReauthenticationControl::new();
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(1)),
+        )
+        .with_reauthentication_control(control.clone());
+        let accounting = Arc::new(crate::lifecycle::ConnectionAttemptTestAccounting::default());
+        let call = tokio::spawn(
+            crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING
+                .scope(Arc::clone(&accounting), async move {
+                    backend.capabilities().await
+                }),
+        );
+
+        assert_eq!(entered_rx.recv().await, Some(0));
+        control.request_reauthentication().expect("advance epoch");
+        assert_eq!(entered_rx.recv().await, Some(1));
+        assert_eq!(accounting.snapshot(), (2, 1, 1, 0));
+
+        call.abort();
+        assert!(call
+            .await
+            .expect_err("call must be cancelled")
+            .is_cancelled());
+        assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_only_epoch_change_wakes_reconnect_cooldown() {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            let entered_tx = entered_tx.clone();
+            Box::pin(async move {
+                entered_tx.send(()).expect("report resolver entry");
+                std::future::pending::<io::Result<SocketAddr>>().await
+            })
+        });
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .expect("lifecycle policy");
+        let control = SessionReauthenticationControl::new();
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(5)),
+        )
+        .with_connection_lifecycle(policy)
+        .with_reauthentication_control(control.clone());
+        let started_at = tokio::time::Instant::now();
+        backend
+            .reconnect_gate
+            .acquire(
+                started_at + Duration::from_secs(2),
+                control.generation(),
+                None,
+            )
+            .await
+            .expect("seed reconnect attempt")
+            .failed();
+
+        let watch_backend = backend.clone();
+        let watch = tokio::spawn(async move { watch_backend.watch(0).await });
+        tokio::task::yield_now().await;
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the old epoch cooldown must initially hold a watch-only caller"
+        );
+
+        control.request_reauthentication().expect("advance epoch");
+        assert_eq!(entered_rx.recv().await, Some(()));
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started_at,
+            "the new epoch must bypass the old cooldown without advancing time"
+        );
+
+        watch.abort();
+        match watch.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("watch must be cancelled"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn material_epoch_wait_observes_status_already_current_at_subscription() {
+        let material = crate::test_support::RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/client",
+        );
+        let tls_config = material.config();
+        let admitted_epoch = tls_config.material_status().epoch();
+
+        material.rotate();
+        let current_epoch = tls_config.material_status().epoch();
+        let mut receiver = Some(tls_config.subscribe_material_changes());
+        let started_at = tokio::time::Instant::now();
+        let observed = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_material_epoch_change(&mut receiver, Some(admitted_epoch)),
+        )
+        .await
+        .expect("current subscription status must not require another publication");
+
+        assert_eq!(observed, Some(current_epoch));
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started_at,
+            "an already-current receiver must bypass the old epoch immediately"
+        );
     }
 
     #[tokio::test]
@@ -6347,13 +6725,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_rotation_never_restarts_a_partially_consumed_frame_on_the_same_socket() {
+    async fn watch_explicit_reauthentication_discards_a_partial_frame_and_resumes_exactly() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind partial-watch listener");
         let addr = listener.local_addr().expect("partial-watch address");
         let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
-        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept watch client");
             let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
@@ -6385,11 +6762,45 @@ mod tests {
                 .await
                 .expect("write first watch fragment");
             partial_tx.send(()).expect("publish partial frame");
-            continue_rx.await.expect("continue partial frame");
-            stream
-                .write_all(&encoded[midpoint..])
+            let mut eof = [0_u8; 1];
+            match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut eof))
                 .await
-                .expect("write final watch fragment");
+                .expect("retired partial socket close deadline")
+            {
+                Ok(0) => {}
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                result => panic!(
+                    "explicit reauthentication must close the partially consumed socket: {result:?}"
+                ),
+            }
+            drop(stream);
+
+            let (mut replacement, _) = listener
+                .accept()
+                .await
+                .expect("accept replacement watch client");
+            let hello: Request = read_frame(&mut replacement, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read replacement watch hello");
+            write_frame(&mut replacement, &successful_hello_ack(&hello))
+                .await
+                .expect("write replacement watch hello ack");
+            let request: Request = read_frame(&mut replacement, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read replacement watch request");
+            assert!(
+                matches!(request, Request::Watch { start_sequence: 1 }),
+                "a partial frame must resume from its undelivered sequence"
+            );
+            write_frame(&mut replacement, &Response::WatchStream)
+                .await
+                .expect("write replacement watch ack");
+            write_frame(
+                &mut replacement,
+                &Response::WatchEntry(Ok(valid_deadline_entry())),
+            )
+            .await
+            .expect("write complete replacement watch entry");
         });
         let control = SessionReauthenticationControl::new();
         let policy = ConnectionLifecyclePolicy::try_new(
@@ -6403,23 +6814,11 @@ mod tests {
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)))
             .with_connection_lifecycle(policy)
             .with_reauthentication_control(control.clone());
-        let edge = directed_connection_key(
-            b"direct",
-            backend.binding.local_replica_id().as_str(),
-            backend.binding.remote_replica_id().as_str(),
-        );
-        let jitter = policy.deterministic_jitter(&edge);
-        assert!(
-            jitter > Duration::from_millis(50),
-            "fixed insecure-test edge must leave a partial-frame observation window"
-        );
         let mut watch = backend.watch(1).await.expect("open partial watch");
         partial_rx.await.expect("observe partial watch frame");
         control
             .request_reauthentication()
             .expect("request partial-watch reauthentication");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        continue_tx.send(()).expect("finish partial watch frame");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), watch.next())
                 .await

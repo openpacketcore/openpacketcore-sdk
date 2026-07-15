@@ -410,7 +410,20 @@ and bounded mixed mutation/read/watch/restore/readiness traffic. The valid
 post-expiry replacement advances only the recovered member's explicit
 reauthentication generation, proves fresh bidirectional incident paths, leaves
 unrelated survivor explicit/material-epoch retirement counters unchanged, and
-settles lifecycle plus survivor availability before the next phase baseline. Real
+settles lifecycle plus survivor availability before the next phase baseline.
+That schedule-bound `member-scoped-reauth-settled-baseline/v2` checkpoint
+starts its 86-second fail-safe and 60-second two-stage server tail at the atomic
+projected-data rename, then requires a final 2.5-second outbound quiet tail.
+A prepublication delta plus 13-second observation checkpoints conservatively
+bound actual survivor progress gaps to 26 seconds. At most one rejoin
+interruption/recovery pair per survivor may settle within that SLO; a second or
+late episode fails closed. The checkpoint also retains bounded 84/160 per-node
+fault-era attempt/reconnect evidence (ordinary 24/40 plus fifteen five-second
+refresh rounds over four/eight incident paths), and requires zero
+cancellation-classified `abandoned`, protocol/backend, or drain-overrun
+evidence. Recovery polling is
+non-intrusive; final watch-head settlement retains its fail-closed
+authoritative replication-head read. Real
 network/storage partitions, broader active-mutator restart, fault, and
 reconnect-storm matrices,
 deployed resource/soak, remote-HKMS, deployed-network, and signed independent

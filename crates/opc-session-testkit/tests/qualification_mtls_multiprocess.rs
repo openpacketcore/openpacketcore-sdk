@@ -44,7 +44,8 @@ use opc_session_testkit::qualification::{
     QualificationTrafficStatus, QualificationTransportConfig,
     QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
     QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
-    QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
+    QUALIFICATION_FAULT_PATH_REFRESH_MILLIS, QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
+    QUALIFICATION_INBOUND_CONNECTION_SLOTS,
     QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE, QUALIFICATION_NODE_SCHEMA_VERSION,
     QUALIFICATION_OPERATION_TIMEOUT_MILLIS, QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS,
     QUALIFICATION_RESOLVER_PROOF_MILLIS, QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE,
@@ -53,8 +54,14 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_RESOURCE_STABLE_SAMPLES, QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE,
     QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB, QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR,
     QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
+    QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR,
+    QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR,
+    QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
+    QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
+    QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
+    QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
     QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND, QUALIFICATION_TRAFFIC_ROTATIONS_PER_MEMBER,
     QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
     QUALIFICATION_TRAFFIC_TRANSITION_MILLIS, QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
@@ -329,6 +336,29 @@ struct IndexedTrafficStatus {
     status: QualificationTrafficStatus,
 }
 
+struct RecoveryFaultSettlementContext<'a> {
+    before: &'a [QualificationConnectionLifecycleMetrics],
+    participants: &'a TrafficParticipants,
+    phase: &'a str,
+    started: Instant,
+    deadline: Instant,
+    traffic_before: &'a [IndexedTrafficStatus],
+    rolling_traffic_checkpoint: Vec<IndexedTrafficStatus>,
+    last_traffic_progress_observed_at: Instant,
+}
+
+struct RecoveredMemberPhaseContext<'a> {
+    member: usize,
+    participants: &'a TrafficParticipants,
+    phase: &'a str,
+    fault_lifecycle_before: &'a [QualificationConnectionLifecycleMetrics],
+    traffic_availability_baseline: &'a [IndexedTrafficStatus],
+    traffic_checkpoint: Vec<IndexedTrafficStatus>,
+    last_traffic_progress_observed_at: Instant,
+    recovery_started: Instant,
+    recovery_deadline: Instant,
+}
+
 fn indexed_traffic_status(
     statuses: &[IndexedTrafficStatus],
     node_index: usize,
@@ -528,6 +558,77 @@ fn traffic_nonmutator_counters_unchanged(
             == before.max_consecutive_availability_interruptions
 }
 
+fn subset_traffic_availability_within_recovery_budget(
+    before: &[IndexedTrafficStatus],
+    after: &[IndexedTrafficStatus],
+    participants: &TrafficParticipants,
+) -> bool {
+    traffic_status_snapshot_matches(before, participants)
+        && traffic_status_snapshot_matches(after, participants)
+        && participants.observers.iter().all(|node_index| {
+            let Some(before) = indexed_traffic_status(before, *node_index) else {
+                return false;
+            };
+            let Some(after) = indexed_traffic_status(after, *node_index) else {
+                return false;
+            };
+            let Some(interruptions) = after
+                .availability_interruptions
+                .checked_sub(before.availability_interruptions)
+            else {
+                return false;
+            };
+            let Some(recoveries) = after
+                .availability_recoveries
+                .checked_sub(before.availability_recoveries)
+            else {
+                return false;
+            };
+            let expected_maximum = if interruptions == 0 {
+                before.max_consecutive_availability_interruptions
+            } else {
+                before.max_consecutive_availability_interruptions.max(1)
+            };
+            interruptions
+                <= QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+                && recoveries <= interruptions
+                && after.max_consecutive_availability_interruptions == expected_maximum
+        })
+}
+
+fn subset_traffic_availability_changed_since(
+    before: &[IndexedTrafficStatus],
+    after: &[IndexedTrafficStatus],
+    participants: &TrafficParticipants,
+) -> bool {
+    participants.observers.iter().any(|node_index| {
+        indexed_traffic_status(before, *node_index)
+            .zip(indexed_traffic_status(after, *node_index))
+            .is_some_and(|(before, after)| {
+                after.availability_interruptions > before.availability_interruptions
+            })
+    })
+}
+
+fn subset_traffic_availability_counters_equal(
+    before: &[IndexedTrafficStatus],
+    after: &[IndexedTrafficStatus],
+    participants: &TrafficParticipants,
+) -> bool {
+    traffic_status_snapshot_matches(before, participants)
+        && traffic_status_snapshot_matches(after, participants)
+        && participants.observers.iter().all(|node_index| {
+            indexed_traffic_status(before, *node_index)
+                .zip(indexed_traffic_status(after, *node_index))
+                .is_some_and(|(before, after)| {
+                    after.availability_interruptions == before.availability_interruptions
+                        && after.availability_recoveries == before.availability_recoveries
+                        && after.max_consecutive_availability_interruptions
+                            == before.max_consecutive_availability_interruptions
+                })
+        })
+}
+
 fn subset_traffic_made_semantic_progress(
     before: &[IndexedTrafficStatus],
     after: &[IndexedTrafficStatus],
@@ -658,7 +759,7 @@ fn assert_round_lifecycle_bounds(
     let required_successes = u64::try_from(QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND)
         .expect("bounded generation count")
         .saturating_mul(remote_peers);
-    assert_lifecycle_delta_bounds(member_count, before, after, required_successes);
+    assert_epoch_changing_lifecycle_delta_bounds(member_count, before, after, required_successes);
 }
 
 fn assert_lifecycle_delta_bounds(
@@ -684,18 +785,72 @@ fn assert_lifecycle_delta_bounds_with_authentication(
     minimum_successes_per_node: u64,
     expected_authentication_failures: &[u64],
 ) {
+    let superseded_bounds = vec![0; member_count];
+    assert_lifecycle_delta_bounds_with_expected_outcomes(
+        member_count,
+        before,
+        after,
+        minimum_successes_per_node,
+        expected_authentication_failures,
+        &superseded_bounds,
+    );
+}
+
+fn assert_epoch_changing_lifecycle_delta_bounds(
+    member_count: usize,
+    before: &[QualificationConnectionLifecycleMetrics],
+    after: &[QualificationConnectionLifecycleMetrics],
+    minimum_successes_per_node: u64,
+) {
+    let expected_authentication_failures = vec![0; member_count];
+    let superseded_bounds = vec![lifecycle_interval_connection_bound(member_count); member_count];
+    assert_lifecycle_delta_bounds_with_expected_outcomes(
+        member_count,
+        before,
+        after,
+        minimum_successes_per_node,
+        &expected_authentication_failures,
+        &superseded_bounds,
+    );
+}
+
+fn lifecycle_interval_connection_bound(member_count: usize) -> u64 {
+    let remote_peers = u64::try_from(member_count - 1).expect("bounded member count");
+    QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR
+        .saturating_mul(remote_peers)
+        .saturating_add(QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE)
+}
+
+fn recovery_fault_connection_bound(member_count: usize) -> u64 {
+    let remote_peers = u64::try_from(member_count - 1).expect("bounded member count");
+    let directed_paths =
+        QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR.saturating_mul(remote_peers);
+    let refresh_rounds = QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS
+        .div_ceil(QUALIFICATION_FAULT_PATH_REFRESH_MILLIS);
+    lifecycle_interval_connection_bound(member_count)
+        .saturating_add(refresh_rounds.saturating_mul(directed_paths))
+}
+
+fn assert_lifecycle_delta_bounds_with_expected_outcomes(
+    member_count: usize,
+    before: &[QualificationConnectionLifecycleMetrics],
+    after: &[QualificationConnectionLifecycleMetrics],
+    minimum_successes_per_node: u64,
+    expected_authentication_failures: &[u64],
+    superseded_bounds: &[u64],
+) {
     assert_eq!(before.len(), member_count);
     assert_eq!(after.len(), member_count);
     assert_eq!(expected_authentication_failures.len(), member_count);
-    let remote_peers = u64::try_from(member_count - 1).expect("bounded member count");
-    let bound = QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR
-        .saturating_mul(remote_peers)
-        .saturating_add(QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE);
-    for (node_index, ((before, after), expected_authentication_failures)) in before
-        .iter()
-        .zip(after)
-        .zip(expected_authentication_failures)
-        .enumerate()
+    assert_eq!(superseded_bounds.len(), member_count);
+    let bound = lifecycle_interval_connection_bound(member_count);
+    for (node_index, (((before, after), expected_authentication_failures), superseded_bound)) in
+        before
+            .iter()
+            .zip(after)
+            .zip(expected_authentication_failures)
+            .zip(superseded_bounds)
+            .enumerate()
     {
         let attempts = lifecycle_counter_delta(
             before.connection_attempts,
@@ -779,6 +934,26 @@ fn assert_lifecycle_delta_bounds_with_authentication(
             0,
             "timeout-failure budget exceeded: node={node_index}"
         );
+        let superseded = lifecycle_counter_delta(
+            before.connection_superseded,
+            after.connection_superseded,
+            node_index,
+            "connection_superseded",
+        );
+        assert!(
+            superseded <= *superseded_bound,
+            "superseded-attempt budget exceeded: node={node_index}, observed={superseded}, bound={superseded_bound}"
+        );
+        assert_eq!(
+            lifecycle_counter_delta(
+                before.connection_abandoned,
+                after.connection_abandoned,
+                node_index,
+                "connection_abandoned",
+            ),
+            0,
+            "abandoned-attempt budget exceeded: node={node_index}"
+        );
         assert_eq!(
             lifecycle_counter_delta(
                 before.connection_failure_protocol,
@@ -828,6 +1003,165 @@ fn lifecycle_counter_delta(before: u64, after: u64, node_index: usize, counter: 
             "lifecycle counter regressed: node={node_index}, counter={counter}, before={before}, after={after}"
         )
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionAttemptSettlementLedger {
+    attempts: u64,
+    successes: u64,
+    transport_failures: u64,
+    authentication_failures: u64,
+    timeout_failures: u64,
+    superseded: u64,
+    abandoned: u64,
+    protocol_failures: u64,
+    backend_failures: u64,
+    reconnect_attempts: u64,
+    reconnect_failures: u64,
+}
+
+fn connection_attempt_settlement_ledger(
+    metrics: &QualificationConnectionLifecycleMetrics,
+) -> ConnectionAttemptSettlementLedger {
+    ConnectionAttemptSettlementLedger {
+        attempts: metrics.connection_attempts,
+        successes: metrics.connection_successes,
+        transport_failures: metrics.connection_failure_transport,
+        authentication_failures: metrics.connection_failure_authentication,
+        timeout_failures: metrics.connection_failure_timeout,
+        superseded: metrics.connection_superseded,
+        abandoned: metrics.connection_abandoned,
+        protocol_failures: metrics.connection_failure_protocol,
+        backend_failures: metrics.connection_failure_backend,
+        reconnect_attempts: metrics.reconnect_attempts,
+        reconnect_failures: metrics.reconnect_failures,
+    }
+}
+
+fn connection_attempt_settlement_ledgers(
+    metrics: &[QualificationConnectionLifecycleMetrics],
+) -> Vec<ConnectionAttemptSettlementLedger> {
+    metrics
+        .iter()
+        .map(connection_attempt_settlement_ledger)
+        .collect()
+}
+
+fn recovery_fault_outcome_settlement_window() -> Duration {
+    Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS)
+}
+
+fn recovery_fault_server_tail_window() -> Duration {
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .server_idle_timeout()
+        .max(DURABLE_CONSENSUS_TIMING_PROFILE.server_handler_timeout())
+        .saturating_mul(2)
+}
+
+fn recovery_fault_outbound_quiet_window() -> Duration {
+    recovery_fault_outcome_settlement_window().saturating_sub(recovery_fault_server_tail_window())
+}
+
+fn recovery_traffic_progress_deadline(
+    last_progress_observed_at: Instant,
+    absolute_deadline: Instant,
+) -> Instant {
+    (last_progress_observed_at
+        + Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS))
+    .min(absolute_deadline)
+}
+
+fn recovery_fault_flush_has_no_unsafe_outcomes(
+    before: &QualificationConnectionLifecycleMetrics,
+    after: &QualificationConnectionLifecycleMetrics,
+) -> bool {
+    after.connection_failure_protocol == before.connection_failure_protocol
+        && after.connection_failure_backend == before.connection_failure_backend
+        && after.connection_abandoned == before.connection_abandoned
+        && after.drain_overruns == before.drain_overruns
+}
+
+fn assert_recovery_fault_flush_bounds(
+    member_count: usize,
+    before: &[QualificationConnectionLifecycleMetrics],
+    after: &[QualificationConnectionLifecycleMetrics],
+) {
+    assert_eq!(before.len(), member_count);
+    assert_eq!(after.len(), member_count);
+    let bound = recovery_fault_connection_bound(member_count);
+    for (node_index, (before, after)) in before.iter().zip(after).enumerate() {
+        assert_connection_attempts_accounted(after, node_index);
+        assert!(
+            recovery_fault_flush_has_no_unsafe_outcomes(before, after),
+            "fault-outcome flush recorded abandoned, protocol, backend, or drain-overrun evidence: node={node_index}, before={before:?}, after={after:?}"
+        );
+        let attempts = lifecycle_counter_delta(
+            before.connection_attempts,
+            after.connection_attempts,
+            node_index,
+            "connection_attempts",
+        );
+        let terminal = [
+            (
+                "connection_successes",
+                before.connection_successes,
+                after.connection_successes,
+            ),
+            (
+                "connection_failure_transport",
+                before.connection_failure_transport,
+                after.connection_failure_transport,
+            ),
+            (
+                "connection_failure_authentication",
+                before.connection_failure_authentication,
+                after.connection_failure_authentication,
+            ),
+            (
+                "connection_failure_timeout",
+                before.connection_failure_timeout,
+                after.connection_failure_timeout,
+            ),
+            (
+                "connection_superseded",
+                before.connection_superseded,
+                after.connection_superseded,
+            ),
+            (
+                "connection_abandoned",
+                before.connection_abandoned,
+                after.connection_abandoned,
+            ),
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, (name, before, after)| {
+            total.checked_add(lifecycle_counter_delta(before, after, node_index, name))
+        })
+        .expect("bounded fault terminal ledger");
+        let reconnect_attempts = lifecycle_counter_delta(
+            before.reconnect_attempts,
+            after.reconnect_attempts,
+            node_index,
+            "reconnect_attempts",
+        );
+        let reconnect_failures = lifecycle_counter_delta(
+            before.reconnect_failures,
+            after.reconnect_failures,
+            node_index,
+            "reconnect_failures",
+        );
+        for (counter, observed) in [
+            ("connection_attempts", attempts),
+            ("connection_terminal_outcomes", terminal),
+            ("reconnect_attempts", reconnect_attempts),
+            ("reconnect_failures", reconnect_failures),
+        ] {
+            assert!(
+                observed <= bound,
+                "fault-outcome flush exceeded the fixed per-node connection bound: node={node_index}, counter={counter}, observed={observed}, bound={bound}"
+            );
+        }
+    }
 }
 
 fn lifecycle_active_connection_bound(member_count: usize) -> i64 {
@@ -921,6 +1255,11 @@ fn assert_campaign_lifecycle_failure_ledger(
                 after.connection_failure_timeout,
             ),
             (
+                "connection_abandoned",
+                before.connection_abandoned,
+                after.connection_abandoned,
+            ),
+            (
                 "connection_failure_protocol",
                 before.connection_failure_protocol,
                 after.connection_failure_protocol,
@@ -992,6 +1331,8 @@ fn connection_attempt_accounting(
         .checked_add(metrics.connection_failure_transport)?
         .checked_add(metrics.connection_failure_authentication)?
         .checked_add(metrics.connection_failure_timeout)?
+        .checked_add(metrics.connection_superseded)?
+        .checked_add(metrics.connection_abandoned)?
         .checked_add(metrics.connection_failure_protocol)?
         .checked_add(metrics.connection_failure_backend)?;
     let outstanding = metrics.connection_attempts.checked_sub(terminal)?;
@@ -1329,7 +1670,8 @@ impl PendingCommandKind {
             QualificationNodeCommand::StartTrafficMutation => Self::StartTrafficMutation,
             QualificationNodeCommand::StopTrafficMutation => Self::StopTrafficMutation,
             QualificationNodeCommand::StopTrafficWatch => Self::StopTrafficWatch,
-            QualificationNodeCommand::TrafficStatus => Self::TrafficStatus,
+            QualificationNodeCommand::TrafficStatus
+            | QualificationNodeCommand::TrafficStatusSnapshot => Self::TrafficStatus,
             QualificationNodeCommand::Acquire { .. } => Self::Acquire,
             QualificationNodeCommand::CompareAndSet { .. } => Self::CompareAndSet,
             QualificationNodeCommand::Get { .. } => Self::Get,
@@ -1378,6 +1720,10 @@ enum ChildStderrDiagnostic {
     Unavailable,
     Empty,
     QualificationNodeFailed,
+    QualificationNodeTransportFailed,
+    QualificationNodeSqliteFailed,
+    QualificationNodeConsensusFailed,
+    QualificationNodeListenerFailed,
     Redacted,
 }
 
@@ -1496,10 +1842,18 @@ impl ChildNode {
     }
 
     fn receive(&mut self) -> QualificationNodeReply {
+        self.receive_with_timeout(CHILD_TIMEOUT)
+    }
+
+    fn receive_until(&mut self, deadline: Instant) -> QualificationNodeReply {
+        self.receive_with_timeout(deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn receive_with_timeout(&mut self, timeout: Duration) -> QualificationNodeReply {
         let pending = self
             .pending
             .expect("qualification child response requested without a pending command");
-        match self.replies.recv_timeout(CHILD_TIMEOUT) {
+        match self.replies.recv_timeout(timeout) {
             Ok(ReaderMessage::Reply(reply)) => {
                 self.pending = None;
                 *reply
@@ -1548,15 +1902,49 @@ impl ChildNode {
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return ChildStderrDiagnostic::Empty;
         }
-        if start == 0
-            && bytes
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.is_empty())
-                .all(|line| line == b"qualification node failed")
+        if start != 0 {
+            return ChildStderrDiagnostic::Redacted;
+        }
+        let lines = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        let allowed = lines.iter().all(|line| {
+            *line == b"qualification node failed"
+                || *line == b"qualification node open failed: transport"
+                || *line == b"qualification node open failed: sqlite"
+                || *line == b"qualification node open failed: consensus"
+                || *line == b"qualification node open failed: listener"
+        });
+        if !allowed {
+            return ChildStderrDiagnostic::Redacted;
+        }
+        if lines
+            .iter()
+            .rev()
+            .any(|line| *line == b"qualification node open failed: listener")
         {
-            ChildStderrDiagnostic::QualificationNodeFailed
+            ChildStderrDiagnostic::QualificationNodeListenerFailed
+        } else if lines
+            .iter()
+            .rev()
+            .any(|line| *line == b"qualification node open failed: consensus")
+        {
+            ChildStderrDiagnostic::QualificationNodeConsensusFailed
+        } else if lines
+            .iter()
+            .rev()
+            .any(|line| *line == b"qualification node open failed: sqlite")
+        {
+            ChildStderrDiagnostic::QualificationNodeSqliteFailed
+        } else if lines
+            .iter()
+            .rev()
+            .any(|line| *line == b"qualification node open failed: transport")
+        {
+            ChildStderrDiagnostic::QualificationNodeTransportFailed
         } else {
-            ChildStderrDiagnostic::Redacted
+            ChildStderrDiagnostic::QualificationNodeFailed
         }
     }
 
@@ -1763,12 +2151,21 @@ impl Fleet {
             database_paths.push(database_path);
         }
 
-        for node in &mut nodes {
-            node.send(&QualificationNodeCommand::Configure);
-        }
+        // Bound the process-heavy store/transport startup to one child at a
+        // time. All listeners are already bound and all immutable
+        // configuration/material has already been published, so serializing
+        // only Configure/Started removes the startup fan-out without changing
+        // the concurrent cluster-initialization proof below. One shared
+        // deadline establishes one fixed fleet-wide failure bound.
+        let configure_deadline = Instant::now() + CHILD_TIMEOUT;
         for (node_index, node) in nodes.iter_mut().enumerate() {
+            assert!(
+                Instant::now() < configure_deadline,
+                "qualification fleet Configure deadline exhausted before node={node_index}"
+            );
+            node.send(&QualificationNodeCommand::Configure);
             assert!(matches!(
-                node.receive(),
+                node.receive_until(configure_deadline),
                 QualificationNodeReply::Started { node_index: actual } if actual == node_index
             ));
         }
@@ -2169,6 +2566,10 @@ impl Fleet {
 
     fn wait_ready(&mut self) {
         let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        self.wait_ready_by(deadline);
+    }
+
+    fn wait_ready_by(&mut self, deadline: Instant) {
         let node_indices = (0..self.member_count()).collect::<Vec<_>>();
         loop {
             let member_count = self.member_count();
@@ -2182,10 +2583,15 @@ impl Fleet {
                     && report.agreeing_voters == required_quorum
                     && report.required_quorum == required_quorum
             }) {
+                assert!(
+                    deadline_allows_completion(Instant::now(), deadline),
+                    "mTLS fleet became ready only after its absolute deadline: reports={reports:?}, stderr={:?}",
+                    self.stderr_diagnostics()
+                );
                 return;
             }
             assert!(
-                Instant::now() < deadline,
+                deadline_allows_completion(Instant::now(), deadline),
                 "mTLS fleet readiness deadline: reports={reports:?}, stderr={:?}",
                 self.stderr_diagnostics()
             );
@@ -2523,6 +2929,206 @@ impl Fleet {
             .collect()
     }
 
+    fn wait_for_recovery_fault_outcomes_to_settle(
+        &mut self,
+        context: RecoveryFaultSettlementContext<'_>,
+    ) -> (
+        Vec<QualificationConnectionLifecycleMetrics>,
+        Vec<IndexedTrafficStatus>,
+    ) {
+        let RecoveryFaultSettlementContext {
+            before,
+            participants,
+            phase,
+            started,
+            deadline,
+            traffic_before,
+            mut rolling_traffic_checkpoint,
+            mut last_traffic_progress_observed_at,
+        } = context;
+        assert_eq!(before.len(), self.member_count());
+        assert_eq!(participants.member_count, self.member_count());
+        assert!(traffic_status_snapshot_matches(
+            traffic_before,
+            participants,
+        ));
+        assert!(subset_traffic_availability_is_settled(
+            traffic_before,
+            participants,
+        ));
+        assert!(traffic_status_snapshot_matches(
+            &rolling_traffic_checkpoint,
+            participants,
+        ));
+        assert_eq!(
+            deadline.duration_since(started),
+            Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,),
+        );
+        let server_tail_window = recovery_fault_server_tail_window();
+        let server_tail_deadline = started + server_tail_window;
+        let outbound_quiet_window = recovery_fault_outbound_quiet_window();
+        let mut stable_traffic_checkpoint = rolling_traffic_checkpoint.clone();
+        let mut traffic_progressed_since_stable = false;
+        let mut lifecycle = self.all_lifecycle_metrics();
+        let mut stable_ledger = connection_attempt_settlement_ledgers(&lifecycle);
+        let observed_at = Instant::now();
+        let mut stable_since = observed_at;
+        let mut server_tail_entered = observed_at >= server_tail_deadline;
+        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
+
+        loop {
+            let traffic = self.traffic_status_snapshots_on(&participants.observers);
+            let traffic_observed_at = Instant::now();
+            for indexed in &traffic {
+                assert_ne!(
+                    indexed.status.state,
+                    QualificationTrafficState::Failed,
+                    "survivor traffic failed while flushing fault-era connection outcomes: phase={phase}, node={}, status={:?}, stderr={:?}",
+                    indexed.node_index,
+                    indexed.status,
+                    self.stderr_diagnostics()
+                );
+                assert_eq!(
+                    indexed.status.failure,
+                    None,
+                    "survivor traffic recorded a terminal failure while flushing fault-era connection outcomes: phase={phase}, node={}, status={:?}, stderr={:?}",
+                    indexed.node_index,
+                    indexed.status,
+                    self.stderr_diagnostics()
+                );
+            }
+            assert!(
+                subset_traffic_availability_within_recovery_budget(
+                    traffic_before,
+                    &traffic,
+                    participants,
+                ),
+                "survivor availability exceeded the recovered-member interruption budget while flushing fault-era connection outcomes: phase={phase}, before={traffic_before:?}, current={traffic:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            let traffic_progressed = subset_traffic_made_semantic_progress_with_crashed_tail(
+                &rolling_traffic_checkpoint,
+                &traffic,
+                participants,
+                None,
+            );
+            let availability_changed_since_progress = subset_traffic_availability_changed_since(
+                &rolling_traffic_checkpoint,
+                &traffic,
+                participants,
+            );
+            let progress_observation_millis = if availability_changed_since_progress {
+                QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
+            } else {
+                QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS
+            };
+            assert!(
+                traffic_observed_at.duration_since(last_traffic_progress_observed_at)
+                    <= Duration::from_millis(progress_observation_millis),
+                "survivor traffic snapshot crossed its progress-observation deadline during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
+                traffic_observed_at.duration_since(last_traffic_progress_observed_at),
+                self.stderr_diagnostics()
+            );
+
+            let member_count = self.member_count();
+            let required_quorum = self.required_quorum();
+            let readiness = self.readiness_reports(&node_indices);
+            assert!(
+                readiness.iter().all(|report| {
+                    report.ready
+                        && report.reason_code == QualificationReadinessCode::Ready
+                        && report.configured_voters == member_count
+                        && report.fresh_reachable_voters == required_quorum
+                        && report.agreeing_voters == required_quorum
+                        && report.required_quorum == required_quorum
+                }),
+                "fleet readiness regressed while flushing fault-era connection outcomes: phase={phase}, readiness={readiness:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+
+            lifecycle = self.all_lifecycle_metrics();
+            for (node_index, (fault_before, current)) in before.iter().zip(&lifecycle).enumerate() {
+                assert!(
+                    recovery_fault_flush_has_no_unsafe_outcomes(fault_before, current),
+                    "fault-outcome flush recorded protocol, backend, or drain-overrun evidence: phase={phase}, node={node_index}, before={fault_before:?}, current={current:?}, stderr={:?}",
+                    self.stderr_diagnostics()
+                );
+            }
+
+            let current_ledger = connection_attempt_settlement_ledgers(&lifecycle);
+            let now = Instant::now();
+            if traffic_progressed {
+                rolling_traffic_checkpoint = traffic.clone();
+                last_traffic_progress_observed_at = traffic_observed_at;
+            }
+            if !server_tail_entered && now >= server_tail_deadline {
+                server_tail_entered = true;
+                stable_traffic_checkpoint = traffic.clone();
+                traffic_progressed_since_stable = false;
+            }
+            if current_ledger != stable_ledger {
+                stable_ledger = current_ledger;
+                stable_since = now;
+                stable_traffic_checkpoint = traffic.clone();
+                traffic_progressed_since_stable = false;
+            } else if subset_traffic_made_semantic_progress_with_crashed_tail(
+                &stable_traffic_checkpoint,
+                &traffic,
+                participants,
+                None,
+            ) {
+                traffic_progressed_since_stable = true;
+            }
+            let progress_observation_millis = if subset_traffic_availability_changed_since(
+                &rolling_traffic_checkpoint,
+                &traffic,
+                participants,
+            ) {
+                QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
+            } else {
+                QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS
+            };
+            assert!(
+                now.duration_since(last_traffic_progress_observed_at)
+                    <= Duration::from_millis(progress_observation_millis),
+                "survivor traffic stopped making bounded semantic progress during the fault-outcome flush: phase={phase}, stalled_for={:?}, traffic={traffic:?}, stderr={:?}",
+                now.duration_since(last_traffic_progress_observed_at),
+                self.stderr_diagnostics()
+            );
+            let lifecycle_settled = lifecycle
+                .iter()
+                .all(|metrics| lifecycle_transition_is_settled(metrics, self.member_count()));
+            let traffic_settled = subset_traffic_availability_is_settled(&traffic, participants);
+            let outbound_stable_for = now
+                .checked_duration_since(stable_since.max(server_tail_deadline))
+                .unwrap_or(Duration::ZERO);
+            if lifecycle_settled
+                && traffic_settled
+                && traffic_progressed_since_stable
+                && outbound_stable_for >= outbound_quiet_window
+            {
+                assert!(
+                    deadline_allows_completion(now, deadline),
+                    "fault-era connection outcomes settled only after the absolute recovery-baseline deadline: phase={phase}, elapsed={:?}, deadline={:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                    now.duration_since(started),
+                    Duration::from_millis(
+                        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
+                    ),
+                    self.stderr_diagnostics()
+                );
+                assert_recovery_fault_flush_bounds(self.member_count(), before, &lifecycle);
+                return (lifecycle, traffic);
+            }
+            assert!(
+                deadline_allows_completion(now, deadline),
+                "fault-era connection outcomes did not settle before the recovery baseline: phase={phase}, server_tail_window={server_tail_window:?}, outbound_quiet_window={outbound_quiet_window:?}, elapsed={:?}, outbound_stable_for={outbound_stable_for:?}, readiness={readiness:?}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                now.duration_since(started),
+                self.stderr_diagnostics()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn wait_for_round_lifecycle_completion(
         &mut self,
         before: &[QualificationConnectionLifecycleMetrics],
@@ -2560,6 +3166,7 @@ impl Fleet {
                                 .connection_failure_authentication
                                 .saturating_add(*expected_authentication_failures)
                         || after.connection_failure_timeout > before.connection_failure_timeout
+                        || after.connection_abandoned > before.connection_abandoned
                         || after.connection_failure_protocol > before.connection_failure_protocol
                         || after.connection_failure_backend > before.connection_failure_backend
                         || after.reconnect_failures > before.reconnect_failures
@@ -2637,6 +3244,38 @@ impl Fleet {
                 assert!(
                     traffic_failure_fields_are_coherent(&status),
                     "traffic failure fields are incoherent: node={node_index}, status={status:?}"
+                );
+                IndexedTrafficStatus {
+                    node_index: *node_index,
+                    status,
+                }
+            })
+            .collect()
+    }
+
+    fn traffic_status_snapshots_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
+        validate_traffic_indices(
+            self.member_count(),
+            node_indices,
+            TrafficParticipantError::EmptyObservers,
+        )
+        .expect("valid bounded traffic snapshot participants");
+        for node_index in node_indices {
+            self.nodes[*node_index].send(&QualificationNodeCommand::TrafficStatusSnapshot);
+        }
+        node_indices
+            .iter()
+            .map(|node_index| {
+                let status = match self.nodes[*node_index].receive() {
+                    QualificationNodeReply::TrafficStatus { status } => status,
+                    reply => panic!(
+                        "traffic status snapshot unavailable: node={node_index}, reply={reply:?}, stderr={}",
+                        self.node_stderr(*node_index)
+                    ),
+                };
+                assert!(
+                    traffic_failure_fields_are_coherent(&status),
+                    "traffic snapshot failure fields are incoherent: node={node_index}, status={status:?}"
                 );
                 IndexedTrafficStatus {
                     node_index: *node_index,
@@ -2771,6 +3410,100 @@ impl Fleet {
         )
     }
 
+    fn wait_for_recovery_traffic_progress(
+        &mut self,
+        availability_baseline: &[IndexedTrafficStatus],
+        progress_checkpoint: &[IndexedTrafficStatus],
+        participants: &TrafficParticipants,
+        phase: &str,
+        last_progress_observed_at: &mut Instant,
+        absolute_deadline: Instant,
+    ) -> Vec<IndexedTrafficStatus> {
+        assert_eq!(participants.member_count, self.member_count());
+        assert!(traffic_status_snapshot_matches(
+            availability_baseline,
+            participants,
+        ));
+        assert!(subset_traffic_availability_is_settled(
+            availability_baseline,
+            participants,
+        ));
+        assert!(traffic_status_snapshot_matches(
+            progress_checkpoint,
+            participants,
+        ));
+        let normal_progress_deadline =
+            recovery_traffic_progress_deadline(*last_progress_observed_at, absolute_deadline);
+        loop {
+            let traffic = self.traffic_status_snapshots_on(&participants.observers);
+            let traffic_observed_at = Instant::now();
+            for indexed in &traffic {
+                assert_ne!(
+                    indexed.status.state,
+                    QualificationTrafficState::Failed,
+                    "survivor traffic failed during recovered-member continuity proof: phase={phase}, node={}, status={:?}, stderr={:?}",
+                    indexed.node_index,
+                    indexed.status,
+                    self.stderr_diagnostics()
+                );
+                assert_eq!(
+                    indexed.status.failure,
+                    None,
+                    "survivor traffic recorded a terminal failure during recovered-member continuity proof: phase={phase}, node={}, status={:?}, stderr={:?}",
+                    indexed.node_index,
+                    indexed.status,
+                    self.stderr_diagnostics()
+                );
+            }
+            assert!(
+                subset_traffic_availability_within_recovery_budget(
+                    availability_baseline,
+                    &traffic,
+                    participants,
+                ),
+                "survivor availability exceeded the recovered-member interruption budget during continuity proof: phase={phase}, baseline={availability_baseline:?}, current={traffic:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            let progress_deadline = if subset_traffic_availability_changed_since(
+                progress_checkpoint,
+                &traffic,
+                participants,
+            ) {
+                (*last_progress_observed_at
+                    + Duration::from_millis(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS))
+                .min(absolute_deadline)
+            } else {
+                normal_progress_deadline
+            };
+            if subset_traffic_made_semantic_progress_with_crashed_tail(
+                progress_checkpoint,
+                &traffic,
+                participants,
+                None,
+            ) {
+                assert!(
+                    deadline_allows_completion(traffic_observed_at, progress_deadline),
+                    "survivor traffic progressed only after its rolling recovery deadline: phase={phase}, elapsed_since_progress={:?}, current={traffic:?}, stderr={:?}",
+                    traffic_observed_at.duration_since(*last_progress_observed_at),
+                    self.stderr_diagnostics()
+                );
+                // `now` is the observation boundary, not an inferred event
+                // timestamp. Requiring another delta within the next
+                // half-SLO observation interval bounds the worst-case gap
+                // between actual progress events by the full SLO.
+                *last_progress_observed_at = traffic_observed_at;
+                return traffic;
+            }
+            assert!(
+                deadline_allows_completion(traffic_observed_at, progress_deadline),
+                "survivor traffic did not progress before its rolling recovery deadline: phase={phase}, elapsed_since_progress={:?}, baseline={availability_baseline:?}, checkpoint={progress_checkpoint:?}, current={traffic:?}, stderr={:?}",
+                traffic_observed_at.duration_since(*last_progress_observed_at),
+                self.stderr_diagnostics()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn wait_for_subset_traffic_progress_with_crashed_tail(
         &mut self,
         before: &[IndexedTrafficStatus],
@@ -2830,11 +3563,16 @@ impl Fleet {
         participants: &TrafficParticipants,
         phase: &str,
         deadline: Instant,
+        availability_baseline: &[IndexedTrafficStatus],
     ) -> (
         Vec<QualificationConnectionLifecycleMetrics>,
         Vec<IndexedTrafficStatus>,
     ) {
         assert_eq!(participants.member_count, self.member_count());
+        assert!(traffic_status_snapshot_matches(
+            availability_baseline,
+            participants,
+        ));
         loop {
             let traffic = self.traffic_statuses_on(&participants.observers);
             // TrafficStatus performs a protected backend observation and may
@@ -2860,10 +3598,25 @@ impl Fleet {
                     self.stderr_diagnostics()
                 );
             }
+            assert!(
+                subset_traffic_availability_counters_equal(
+                    availability_baseline,
+                    &traffic,
+                    participants,
+                ),
+                "clean recovered-member reauthentication changed survivor availability counters: phase={phase}, before={availability_baseline:?}, current={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
             let completed = lifecycle
                 .iter()
                 .all(|metrics| lifecycle_transition_is_settled(metrics, self.member_count()))
-                && subset_traffic_availability_is_settled(&traffic, participants);
+                && subset_traffic_availability_is_settled(&traffic, participants)
+                && subset_traffic_made_semantic_progress_with_crashed_tail(
+                    availability_baseline,
+                    &traffic,
+                    participants,
+                    None,
+                );
             let now = Instant::now();
             if completed {
                 assert!(
@@ -3196,7 +3949,9 @@ impl Fleet {
             if remaining.is_zero() {
                 return;
             }
-            thread::sleep(remaining.min(Duration::from_secs(5)));
+            thread::sleep(remaining.min(Duration::from_millis(
+                QUALIFICATION_FAULT_PATH_REFRESH_MILLIS,
+            )));
         }
     }
 
@@ -3369,6 +4124,21 @@ impl Fleet {
         previous_material_epoch: u64,
     ) {
         let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        self.wait_for_member_recovery_publication_by(
+            node_index,
+            previous_source_generation,
+            previous_material_epoch,
+            deadline,
+        );
+    }
+
+    fn wait_for_member_recovery_publication_by(
+        &mut self,
+        node_index: usize,
+        previous_source_generation: u64,
+        previous_material_epoch: u64,
+        deadline: Instant,
+    ) {
         loop {
             let source = self.projected_status(node_index);
             let controller = self.material_status(node_index);
@@ -3383,6 +4153,11 @@ impl Fleet {
                 && controller.leaf_expires_at.is_some()
                 && controller.certificate_chain_expires_at.is_some()
             {
+                assert!(
+                    deadline_allows_completion(Instant::now(), deadline),
+                    "valid projected recovery became ready only after its absolute deadline: node={node_index}, source={source:?}, controller={controller:?}, stderr={}",
+                    self.node_stderr(node_index)
+                );
                 return;
             }
             assert!(
@@ -3394,7 +4169,7 @@ impl Fleet {
                 "TLS material epoch regressed during recovery"
             );
             assert!(
-                Instant::now() < deadline,
+                deadline_allows_completion(Instant::now(), deadline),
                 "valid projected recovery did not publish a new ready generation: node={node_index}, source={source:?}, controller={controller:?}, stderr={}",
                 self.node_stderr(node_index)
             );
@@ -3472,7 +4247,7 @@ impl Fleet {
             phase,
         );
         let remote_peers = u64::try_from(self.member_count() - 1).expect("bounded member count");
-        assert_lifecycle_delta_bounds(
+        assert_epoch_changing_lifecycle_delta_bounds(
             self.member_count(),
             lifecycle_checkpoint,
             &lifecycle_after,
@@ -3519,6 +4294,54 @@ impl Fleet {
         self.prove_directed_paths(&generations, paths);
     }
 
+    fn prove_recovered_member_paths_at_current_generation(
+        &mut self,
+        member: usize,
+        availability_baseline: &[IndexedTrafficStatus],
+        participants: &TrafficParticipants,
+        traffic_checkpoint: &mut Vec<IndexedTrafficStatus>,
+        last_traffic_progress_observed_at: &mut Instant,
+        absolute_deadline: Instant,
+    ) {
+        assert!(member < self.member_count());
+        let generations_before = self.all_reauthentication_generations();
+        let paths = member_incident_directed_paths(self.member_count(), member);
+        assert_eq!(paths.len(), 2 * (self.member_count() - 1));
+        for (source, target) in paths {
+            let progress_deadline = recovery_traffic_progress_deadline(
+                *last_traffic_progress_observed_at,
+                absolute_deadline,
+            );
+            self.wait_for_directed_handshake_by(
+                source,
+                target,
+                generations_before[source],
+                progress_deadline,
+            );
+            *traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+                availability_baseline,
+                traffic_checkpoint,
+                participants,
+                "existing-generation-incident-path",
+                last_traffic_progress_observed_at,
+                absolute_deadline,
+            );
+        }
+        let generations_after = self.all_reauthentication_generations();
+        assert_eq!(
+            generations_after, generations_before,
+            "fault-boundary path proof advanced an explicit reauthentication generation"
+        );
+        *traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+            availability_baseline,
+            traffic_checkpoint,
+            participants,
+            "existing-generation-path-generation-check",
+            last_traffic_progress_observed_at,
+            absolute_deadline,
+        );
+    }
+
     fn reauthenticate_recovered_member_and_prove_paths(&mut self, member: usize) {
         assert!(member < self.member_count());
         let generations_before = self.all_reauthentication_generations();
@@ -3563,21 +4386,86 @@ impl Fleet {
 
     fn complete_recovered_member_phase_under_traffic(
         &mut self,
-        member: usize,
-        participants: &TrafficParticipants,
-        phase: &str,
+        context: RecoveredMemberPhaseContext<'_>,
     ) -> Vec<IndexedTrafficStatus> {
+        let RecoveredMemberPhaseContext {
+            member,
+            participants,
+            phase,
+            fault_lifecycle_before,
+            traffic_availability_baseline,
+            mut traffic_checkpoint,
+            mut last_traffic_progress_observed_at,
+            recovery_started,
+            recovery_deadline,
+        } = context;
         assert!(!participants.observers.contains(&member));
+        self.assert_all_material_ready();
+        traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+            traffic_availability_baseline,
+            &traffic_checkpoint,
+            participants,
+            "replacement-material-ready",
+            &mut last_traffic_progress_observed_at,
+            recovery_deadline,
+        );
+        self.prove_recovered_member_paths_at_current_generation(
+            member,
+            traffic_availability_baseline,
+            participants,
+            &mut traffic_checkpoint,
+            &mut last_traffic_progress_observed_at,
+            recovery_deadline,
+        );
+        self.wait_ready_by(recovery_traffic_progress_deadline(
+            last_traffic_progress_observed_at,
+            recovery_deadline,
+        ));
+        traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+            traffic_availability_baseline,
+            &traffic_checkpoint,
+            participants,
+            "replacement-all-voter-readiness",
+            &mut last_traffic_progress_observed_at,
+            recovery_deadline,
+        );
+        self.verify_canary();
+        traffic_checkpoint = self.wait_for_recovery_traffic_progress(
+            traffic_availability_baseline,
+            &traffic_checkpoint,
+            participants,
+            "replacement-canary-verification",
+            &mut last_traffic_progress_observed_at,
+            recovery_deadline,
+        );
+        let (lifecycle_before, clean_traffic_baseline) = self
+            .wait_for_recovery_fault_outcomes_to_settle(RecoveryFaultSettlementContext {
+                before: fault_lifecycle_before,
+                participants,
+                phase,
+                started: recovery_started,
+                deadline: recovery_deadline,
+                traffic_before: traffic_availability_baseline,
+                rolling_traffic_checkpoint: traffic_checkpoint,
+                last_traffic_progress_observed_at,
+            });
         let started = Instant::now();
         let deadline = started + Duration::from_millis(QUALIFICATION_TRAFFIC_TRANSITION_MILLIS);
-        let lifecycle_before = self.all_lifecycle_metrics();
-        self.assert_all_material_ready();
         self.reauthenticate_recovered_member_and_prove_paths(member);
         self.wait_ready();
         self.advance_canary(phase);
-        let (lifecycle_after, traffic_after) =
-            self.wait_for_member_recovery_settlement(participants, phase, deadline);
-        assert_lifecycle_delta_bounds(self.member_count(), &lifecycle_before, &lifecycle_after, 0);
+        let (lifecycle_after, traffic_after) = self.wait_for_member_recovery_settlement(
+            participants,
+            phase,
+            deadline,
+            &clean_traffic_baseline,
+        );
+        assert_epoch_changing_lifecycle_delta_bounds(
+            self.member_count(),
+            &lifecycle_before,
+            &lifecycle_after,
+            0,
+        );
         assert!(
             unrelated_survivor_reauthentication_retirements_are_unchanged(
                 &lifecycle_before,
@@ -3651,6 +4539,16 @@ impl Fleet {
         expected_generation: u64,
     ) {
         let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        self.wait_for_directed_handshake_by(source, target, expected_generation, deadline);
+    }
+
+    fn wait_for_directed_handshake_by(
+        &mut self,
+        source: usize,
+        target: usize,
+        expected_generation: u64,
+        deadline: Instant,
+    ) {
         loop {
             match self.nodes[source].invoke(&QualificationNodeCommand::DirectedHandshake {
                 remote_node_index: target,
@@ -3661,11 +4559,17 @@ impl Fleet {
                 } => {
                     assert_eq!(remote_node_index, target);
                     assert_eq!(reauthentication_generation, expected_generation);
+                    assert!(
+                        deadline_allows_completion(Instant::now(), deadline),
+                        "directed current-generation handshake {source}->{target} completed only after its absolute deadline"
+                    );
                     return;
                 }
                 QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::DirectedHandshakeUnavailable,
-                } if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                } if deadline_allows_completion(Instant::now(), deadline) => {
+                    thread::sleep(Duration::from_millis(20));
+                }
                 reply => panic!(
                     "directed current-generation handshake {source}->{target} failed: {reply:?}, source_stderr={}, target_stderr={}",
                     self.node_stderr(source),
@@ -4287,6 +5191,14 @@ fn assert_fault_lifecycle_failures_unchanged(
             "consensus admission loss changed the timeout failure ledger: node={node_index}"
         );
         assert_eq!(
+            after.connection_superseded, before.connection_superseded,
+            "consensus admission loss changed the superseded-attempt ledger: node={node_index}"
+        );
+        assert_eq!(
+            after.connection_abandoned, before.connection_abandoned,
+            "consensus admission loss changed the abandoned-attempt ledger: node={node_index}"
+        );
+        assert_eq!(
             after.connection_failure_protocol, before.connection_failure_protocol,
             "consensus admission loss changed the protocol failure ledger: node={node_index}"
         );
@@ -4310,14 +5222,14 @@ fn publish_projected_generation(
     generation_counter: &mut u64,
     credential: &ProjectedCredential,
     trust_bundle_pem: &str,
-) {
+) -> Instant {
     publish_projected_files(
         root,
         generation_counter,
         &credential.certificate_chain_pem,
         &credential.private_key_pem,
         trust_bundle_pem,
-    );
+    )
 }
 
 fn publish_projected_files(
@@ -4326,7 +5238,7 @@ fn publish_projected_files(
     certificate_chain_pem: &str,
     private_key_pem: &str,
     trust_bundle_pem: &str,
-) {
+) -> Instant {
     *generation_counter += 1;
     let generation_name = format!("..2026_07_13_{generation_counter:04}");
     let generation = root.join(&generation_name);
@@ -4339,6 +5251,7 @@ fn publish_projected_files(
     let next_link = root.join(format!("..data-next-{generation_counter:04}"));
     symlink(&generation_name, &next_link).expect("stage projected generation link");
     fs::rename(&next_link, root.join("..data")).expect("atomically publish projected generation");
+    Instant::now()
 }
 
 fn sqlite_family_paths(database_path: &Path) -> [PathBuf; 3] {
@@ -4610,7 +5523,7 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         "short-lived-svid-connection-setup",
     );
     let remote_peers = u64::try_from(member_count - 1).expect("bounded member count");
-    assert_lifecycle_delta_bounds(
+    assert_epoch_changing_lifecycle_delta_bounds(
         member_count,
         &lifecycle_setup_before,
         &lifecycle_before_expiry,
@@ -4721,31 +5634,82 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
 
     let replacement_source_before = fleet.projected_status(expiring_node_index);
     let replacement_controller_before = fleet.material_status(expiring_node_index);
+    let replacement_traffic_baseline =
+        fleet.traffic_status_snapshots_on(&expiry_survivor_traffic.observers);
+    let mut replacement_traffic_checkpoint = replacement_traffic_baseline.clone();
+    let mut replacement_last_traffic_progress_observed_at = Instant::now();
+    let prepublication_progress_deadline = recovery_traffic_progress_deadline(
+        replacement_last_traffic_progress_observed_at,
+        replacement_last_traffic_progress_observed_at
+            + Duration::from_millis(
+                QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
+            ),
+    );
+    replacement_traffic_checkpoint = fleet.wait_for_recovery_traffic_progress(
+        &replacement_traffic_baseline,
+        &replacement_traffic_checkpoint,
+        &expiry_survivor_traffic,
+        "replacement-prepublication-progress",
+        &mut replacement_last_traffic_progress_observed_at,
+        prepublication_progress_deadline,
+    );
     let replacement = fleet
         .pki
         .credential(expiring_node_index, CredentialGeneration::RenewedLeaf);
     let old_trust = fleet.pki.trust_bundle(TrustGeneration::OldOnly);
-    publish_projected_generation(
+    let publication_stage_deadline = recovery_traffic_progress_deadline(
+        replacement_last_traffic_progress_observed_at,
+        replacement_last_traffic_progress_observed_at
+            + Duration::from_millis(
+                QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
+            ),
+    );
+    let replacement_recovery_started = publish_projected_generation(
         &fleet.projected_roots[expiring_node_index],
         &mut fleet.projected_generation[expiring_node_index],
         replacement,
         &old_trust,
     );
-    fleet.wait_for_member_recovery_publication(
+    assert!(
+        deadline_allows_completion(replacement_recovery_started, publication_stage_deadline),
+        "projected replacement staging exceeded the survivor-progress checkpoint"
+    );
+    let replacement_recovery_deadline = replacement_recovery_started
+        + Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS);
+    fleet.wait_for_member_recovery_publication_by(
         expiring_node_index,
         replacement_source_before.generation,
         replacement_controller_before.epoch,
+        recovery_traffic_progress_deadline(
+            replacement_last_traffic_progress_observed_at,
+            replacement_recovery_deadline,
+        ),
+    );
+    replacement_traffic_checkpoint = fleet.wait_for_recovery_traffic_progress(
+        &replacement_traffic_baseline,
+        &replacement_traffic_checkpoint,
+        &expiry_survivor_traffic,
+        "replacement-publication",
+        &mut replacement_last_traffic_progress_observed_at,
+        replacement_recovery_deadline,
     );
     assert_eq!(
         fleet.nodes[expiring_node_index].process_id(),
         expiring_process_id,
         "short-lived SVID recovery must reload material in the same process"
     );
-    let replacement_traffic_after_boundary = fleet.complete_recovered_member_phase_under_traffic(
-        expiring_node_index,
-        &expiry_survivor_traffic,
-        "short-lived-svid-replacement-recovered",
-    );
+    let replacement_traffic_after_boundary =
+        fleet.complete_recovered_member_phase_under_traffic(RecoveredMemberPhaseContext {
+            member: expiring_node_index,
+            participants: &expiry_survivor_traffic,
+            phase: "short-lived-svid-replacement-recovered",
+            fault_lifecycle_before: &lifecycle_before_expiry,
+            traffic_availability_baseline: &replacement_traffic_baseline,
+            traffic_checkpoint: replacement_traffic_checkpoint,
+            last_traffic_progress_observed_at: replacement_last_traffic_progress_observed_at,
+            recovery_started: replacement_recovery_started,
+            recovery_deadline: replacement_recovery_deadline,
+        });
     let replacement_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     let replacement_phase = format!(
         "survivor-traffic-through-material-replacement/active-restart-{active_restart_node_index}/expiring-{expiring_node_index}"
@@ -5297,7 +6261,7 @@ fn run_projected_mtls_traffic_resources(member_count: usize) {
         "final-fresh-generation-and-traffic-stop",
     );
     let remote_peers = u64::try_from(member_count - 1).expect("bounded member count");
-    assert_lifecycle_delta_bounds(
+    assert_epoch_changing_lifecycle_delta_bounds(
         member_count,
         &lifecycle_checkpoint,
         &final_generation_lifecycle,
@@ -5405,6 +6369,8 @@ fn lifecycle_metrics_fixture() -> QualificationConnectionLifecycleMetrics {
         connection_failure_transport: 0,
         connection_failure_authentication: 0,
         connection_failure_timeout: 0,
+        connection_superseded: 0,
+        connection_abandoned: 0,
         connection_failure_protocol: 0,
         connection_failure_backend: 0,
         reconnect_attempts: 0,
@@ -5550,7 +6516,8 @@ fn traffic_progress_rejects_unresolved_or_incoherent_availability_evidence() {
     assert!(!traffic_failure_fields_are_coherent(&incoherent));
     incoherent.failure_error_class = Some(QualificationTrafficErrorClass::BackendUnavailable);
     assert!(traffic_failure_fields_are_coherent(&incoherent));
-    incoherent.failure_recovery_elapsed_millis = Some(8_123);
+    incoherent.failure_recovery_elapsed_millis =
+        Some(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS + 123);
     assert!(!traffic_failure_fields_are_coherent(&incoherent));
     incoherent.failure =
         Some(QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded);
@@ -5614,6 +6581,66 @@ fn member_recovery_settlement_rejects_an_unresolved_survivor_episode() {
     ));
     assert!(!subset_traffic_availability_is_settled(
         &settled,
+        &participants,
+    ));
+}
+
+#[test]
+fn member_recovery_fault_boundary_bounds_and_requires_availability_recovery() {
+    let (participants, before, mut after) = subset_traffic_fixture();
+    assert!(subset_traffic_availability_within_recovery_budget(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(subset_traffic_availability_counters_equal(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(!subset_traffic_availability_changed_since(
+        &before,
+        &after,
+        &participants,
+    ));
+
+    after[0].status.availability_interruptions += 1;
+    assert!(subset_traffic_availability_within_recovery_budget(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(subset_traffic_availability_changed_since(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(!subset_traffic_availability_counters_equal(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(!subset_traffic_availability_is_settled(
+        &after,
+        &participants,
+    ));
+
+    after[0].status.availability_recoveries += 1;
+    assert!(subset_traffic_availability_is_settled(
+        &after,
+        &participants,
+    ));
+    assert!(subset_traffic_availability_within_recovery_budget(
+        &before,
+        &after,
+        &participants,
+    ));
+
+    after[0].status.availability_interruptions += 1;
+    after[0].status.availability_recoveries += 1;
+    assert!(!subset_traffic_availability_within_recovery_budget(
+        &before,
+        &after,
         &participants,
     ));
 }
@@ -5856,8 +6883,9 @@ fn campaign_ledger_rejects_an_interstitial_failure_outside_leaf_rounds() {
     let before = vec![lifecycle_metrics_fixture(); member_count];
     let mut valid_after = before.clone();
     for metrics in &mut valid_after {
-        metrics.connection_attempts = 1;
+        metrics.connection_attempts = 2;
         metrics.connection_failure_authentication = 1;
+        metrics.connection_superseded = 1;
     }
     assert_campaign_lifecycle_failure_ledger(member_count, &before, &valid_after);
 
@@ -5868,6 +6896,185 @@ fn campaign_ledger_rejects_an_interstitial_failure_outside_leaf_rounds() {
         assert_campaign_lifecycle_failure_ledger(member_count, &before, &failed_after);
     });
     assert!(rejected.is_err());
+}
+
+#[test]
+fn non_epoch_lifecycle_bounds_reject_superseded_and_abandoned_attempts() {
+    let member_count = 3;
+    let before = vec![lifecycle_metrics_fixture(); member_count];
+    let mut superseded = before.clone();
+    superseded[0].connection_attempts = 1;
+    superseded[0].connection_superseded = 1;
+
+    let rejected = std::panic::catch_unwind(|| {
+        assert_lifecycle_delta_bounds(member_count, &before, &superseded, 0);
+    });
+    assert!(rejected.is_err());
+
+    let mut abandoned = before.clone();
+    abandoned[0].connection_attempts = 1;
+    abandoned[0].connection_abandoned = 1;
+    let rejected = std::panic::catch_unwind(|| {
+        assert_lifecycle_delta_bounds(member_count, &before, &abandoned, 0);
+    });
+    assert!(rejected.is_err());
+}
+
+#[test]
+fn epoch_changing_bounds_cap_supersession_and_reject_abandonment_or_timeout() {
+    let member_count = 3;
+    let before = vec![lifecycle_metrics_fixture(); member_count];
+    let bound = lifecycle_interval_connection_bound(member_count);
+    assert_eq!(bound, 24);
+    let mut valid_after = before.clone();
+    valid_after[0].connection_attempts = bound;
+    valid_after[0].connection_superseded = bound;
+    assert_epoch_changing_lifecycle_delta_bounds(member_count, &before, &valid_after, 0);
+
+    let mut excessive_supersession = valid_after;
+    excessive_supersession[0].connection_superseded += 1;
+    assert!(std::panic::catch_unwind(|| {
+        assert_epoch_changing_lifecycle_delta_bounds(
+            member_count,
+            &before,
+            &excessive_supersession,
+            0,
+        );
+    })
+    .is_err());
+
+    let mut abandoned = before.clone();
+    abandoned[1].connection_attempts = 1;
+    abandoned[1].connection_abandoned = 1;
+    assert!(std::panic::catch_unwind(|| {
+        assert_epoch_changing_lifecycle_delta_bounds(member_count, &before, &abandoned, 0);
+    })
+    .is_err());
+
+    let mut real_timeout = before.clone();
+    real_timeout[1].connection_attempts = 1;
+    real_timeout[1].connection_failure_timeout = 1;
+    assert!(std::panic::catch_unwind(|| {
+        assert_epoch_changing_lifecycle_delta_bounds(member_count, &before, &real_timeout, 0);
+    })
+    .is_err());
+}
+
+#[test]
+fn recovery_fault_settlement_tracks_attempts_without_freezing_connection_gauges() {
+    assert_eq!(
+        recovery_fault_outcome_settlement_window(),
+        Duration::from_millis(62_500)
+    );
+    assert_eq!(
+        recovery_fault_server_tail_window(),
+        Duration::from_millis(60_000)
+    );
+    assert_eq!(
+        recovery_fault_outbound_quiet_window(),
+        Duration::from_millis(2_500)
+    );
+    assert_eq!(recovery_fault_connection_bound(3), 84);
+    assert_eq!(recovery_fault_connection_bound(5), 160);
+    assert_eq!(QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR, 2);
+    assert_eq!(
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
+        13_000
+    );
+    let observed_at = Instant::now();
+    let absolute_deadline = observed_at + Duration::from_millis(86_000);
+    assert_eq!(
+        recovery_traffic_progress_deadline(observed_at, absolute_deadline),
+        observed_at + Duration::from_millis(13_000)
+    );
+    let late_observation = observed_at + Duration::from_millis(80_000);
+    assert_eq!(
+        recovery_traffic_progress_deadline(late_observation, absolute_deadline),
+        absolute_deadline
+    );
+
+    let baseline = lifecycle_metrics_fixture();
+    let baseline_ledger = connection_attempt_settlement_ledger(&baseline);
+    let mut gauge_only = baseline;
+    gauge_only.active_connections = 3;
+    gauge_only.draining_connections = 1;
+    gauge_only.retirement_peer_leaf_expiry = 1;
+    assert_eq!(
+        connection_attempt_settlement_ledger(&gauge_only),
+        baseline_ledger
+    );
+
+    let mut started = baseline;
+    started.connection_attempts = 1;
+    assert_ne!(
+        connection_attempt_settlement_ledger(&started),
+        baseline_ledger
+    );
+    let mut terminal = baseline;
+    terminal.connection_failure_timeout = 1;
+    assert_ne!(
+        connection_attempt_settlement_ledger(&terminal),
+        baseline_ledger
+    );
+}
+
+#[test]
+fn recovery_fault_flush_bounds_incident_failures_and_rejects_abandonment() {
+    let before = lifecycle_metrics_fixture();
+    let mut incident = before;
+    incident.connection_attempts = 3;
+    incident.connection_failure_transport = 1;
+    incident.connection_failure_authentication = 1;
+    incident.connection_failure_timeout = 1;
+    incident.reconnect_attempts = 1;
+    incident.reconnect_failures = 1;
+    assert!(recovery_fault_flush_has_no_unsafe_outcomes(
+        &before, &incident
+    ));
+    let before_fleet = vec![before; 3];
+    let mut incident_fleet = before_fleet.clone();
+    incident_fleet[0] = incident;
+    assert_recovery_fault_flush_bounds(3, &before_fleet, &incident_fleet);
+
+    let mut storm = incident_fleet.clone();
+    storm[0].connection_attempts = 85;
+    storm[0].connection_successes = 82;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &before_fleet, &storm);
+    })
+    .is_err());
+
+    let mut abandoned_attempt = incident_fleet;
+    abandoned_attempt[0].connection_attempts = 4;
+    abandoned_attempt[0].connection_abandoned = 1;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &before_fleet, &abandoned_attempt);
+    })
+    .is_err());
+
+    for unsafe_after in [
+        QualificationConnectionLifecycleMetrics {
+            connection_failure_protocol: 1,
+            ..before
+        },
+        QualificationConnectionLifecycleMetrics {
+            connection_failure_backend: 1,
+            ..before
+        },
+        QualificationConnectionLifecycleMetrics {
+            connection_abandoned: 1,
+            ..before
+        },
+        QualificationConnectionLifecycleMetrics {
+            drain_overruns: 1,
+            ..before
+        },
+    ] {
+        assert!(!recovery_fault_flush_has_no_unsafe_outcomes(
+            &before,
+            &unsafe_after
+        ));
+    }
 }
 
 #[test]

@@ -3,8 +3,9 @@ use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
     S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
     IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
-    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_PCO, IE_TYPE_RECOVERY, INTERFACE_TYPE_S2B_EPDG_GTP_C,
-    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_MEI, IE_TYPE_PCO, IE_TYPE_RECOVERY,
+    INTERFACE_TYPE_S2B_EPDG_GTP_C, INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
+    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -120,6 +121,36 @@ const SENDER_F_TEID_IE: &[u8] = &[
     0x01,
 ];
 const EMPTY_BEARER_CONTEXT_IE: &[u8] = &[IE_TYPE_BEARER_CONTEXT, 0x00, 0x00, 0x00];
+const IMSI_IE: &[u8] = &[
+    IE_TYPE_IMSI,
+    0x00,
+    0x08,
+    0x00,
+    0x00,
+    0x01,
+    0x01,
+    0x21,
+    0x43,
+    0x65,
+    0x87,
+    0xf9,
+];
+const MEI_IE: &[u8] = &[
+    IE_TYPE_MEI,
+    0x00,
+    0x08,
+    0x00,
+    0x94,
+    0x10,
+    0x45,
+    0x02,
+    0x23,
+    0x73,
+    0x15,
+    0xf8,
+];
+const UIMSI_INDICATION_IE: &[u8] = &[IE_TYPE_INDICATION, 0x00, 0x02, 0x00, 0x00, 0x40];
+const INDICATION_WITHOUT_UIMSI_IE: &[u8] = &[IE_TYPE_INDICATION, 0x00, 0x01, 0x00, 0x00];
 
 fn decode_s2b(bytes: &[u8]) -> S2bMessage<'_> {
     match S2bMessage::decode(bytes, procedure_context()) {
@@ -602,12 +633,28 @@ fn debug_output_redacts_subscriber_identifiers_and_raw_ie_bytes() {
 }
 
 /// Build a minimal Create Session Request where the Sender F-TEID IE appears at
-/// `fteid_instance`. All other mandatory S2b IEs are present at instance 0.
+/// `fteid_instance`. All other required S2b IEs are present at instance 0.
 fn create_session_request_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
     create_session_request_with_fteid_instance_and_bearer_context(fteid_instance, BEARER_CONTEXT_IE)
 }
 
 fn create_session_request_with_fteid_instance_and_bearer_context(
+    fteid_instance: u8,
+    bearer_context: &[u8],
+) -> Vec<u8> {
+    create_session_request_with_identity_ies_and_bearer_context(
+        &[IMSI_IE],
+        fteid_instance,
+        bearer_context,
+    )
+}
+
+fn create_session_request_with_identity_ies(identity_ies: &[&[u8]]) -> Vec<u8> {
+    create_session_request_with_identity_ies_and_bearer_context(identity_ies, 0, BEARER_CONTEXT_IE)
+}
+
+fn create_session_request_with_identity_ies_and_bearer_context(
+    identity_ies: &[&[u8]],
     fteid_instance: u8,
     bearer_context: &[u8],
 ) -> Vec<u8> {
@@ -625,10 +672,7 @@ fn create_session_request_with_fteid_instance_and_bearer_context(
         0x00,
         0x00, // Spare octets.
     ];
-    let ies: &[&[u8]] = &[
-        &[
-            0x01, 0x00, 0x08, 0x00, 0x00, 0x01, 0x01, 0x21, 0x43, 0x65, 0x87, 0xf9,
-        ], // IMSI.
+    let remaining_ies: &[&[u8]] = &[
         &[0x52, 0x00, 0x01, 0x00, 0x03],             // RAT Type.
         &[0x53, 0x00, 0x03, 0x00, 0x00, 0xf1, 0x10], // Serving Network.
         &[
@@ -654,13 +698,77 @@ fn create_session_request_with_fteid_instance_and_bearer_context(
         &[0x4f, 0x00, 0x05, 0x00, 0x01, 0xc6, 0x33, 0x64, 0x07], // PAA.
         bearer_context,
     ];
-    let body: Vec<u8> = ies.iter().copied().flatten().copied().collect();
+    let body: Vec<u8> = identity_ies
+        .iter()
+        .chain(remaining_ies)
+        .flat_map(|ie| ie.iter().copied())
+        .collect();
     let length = u16::try_from(header.len() + body.len() - 4).unwrap();
     header[2..4].copy_from_slice(&length.to_be_bytes());
     let mut message = Vec::with_capacity(header.len() + body.len());
     message.extend_from_slice(&header);
     message.extend_from_slice(&body);
     message
+}
+
+#[test]
+fn procedure_aware_accepts_uicc_less_emergency_create_session_identity() {
+    let request = create_session_request_with_identity_ies(&[MEI_IE, UIMSI_INDICATION_IE]);
+
+    let message = decode_s2b(&request);
+    assert!(matches!(message, S2bMessage::CreateSessionRequest(_)));
+    let view = procedure_view(&message);
+    assert!(!view.has_ie(IE_TYPE_IMSI));
+
+    let mei = find_ie(&view.ies, IE_TYPE_MEI);
+    assert_eq!(mei.instance, 0);
+    match &mei.value {
+        TypedIeValue::Mei(value) => assert_eq!(value.digits, "490154203237518"),
+        other => panic!("unexpected MEI value: {other:?}"),
+    }
+
+    let indication = find_ie(&view.ies, IE_TYPE_INDICATION);
+    assert_eq!(indication.instance, 0);
+    match &indication.value {
+        TypedIeValue::Indication(value) => assert_eq!(value.flags, [0x00, 0x40]),
+        other => panic!("unexpected Indication value: {other:?}"),
+    }
+
+    let encoded = encode_s2b(&message, EncodeContext::default());
+    assert_eq!(encoded.as_ref(), request.as_slice());
+}
+
+#[test]
+fn procedure_aware_rejects_incomplete_uicc_less_emergency_identity() {
+    let cases: &[(&[&[u8]], &str)] = &[
+        (&[], "no identity"),
+        (&[MEI_IE], "MEI without Indication"),
+        (&[UIMSI_INDICATION_IE], "UIMSI without MEI"),
+        (
+            &[MEI_IE, INDICATION_WITHOUT_UIMSI_IE],
+            "MEI with Indication missing UIMSI",
+        ),
+    ];
+
+    for (identity_ies, label) in cases {
+        let request = create_session_request_with_identity_ies(identity_ies);
+        let decoded = S2bMessage::decode(&request, procedure_context());
+        assert!(
+            matches!(
+                decoded,
+                Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+            ),
+            "{label} must not satisfy the conditional Create Session identity"
+        );
+    }
+}
+
+#[test]
+fn procedure_aware_imsi_identity_does_not_require_emergency_markers() {
+    for identity_ies in [&[IMSI_IE][..], &[IMSI_IE, MEI_IE][..]] {
+        let request = create_session_request_with_identity_ies(identity_ies);
+        assert!(S2bMessage::decode(&request, procedure_context()).is_ok());
+    }
 }
 
 /// Build a minimal Create Session Response where the Sender F-TEID IE appears at

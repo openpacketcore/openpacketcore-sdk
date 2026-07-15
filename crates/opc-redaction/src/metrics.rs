@@ -1156,6 +1156,8 @@ pub struct SdkMetrics {
     pub session_net_connection_failure_transport: AtomicU64,
     pub session_net_connection_failure_authentication: AtomicU64,
     pub session_net_connection_failure_timeout: AtomicU64,
+    pub session_net_connection_superseded: AtomicU64,
+    pub session_net_connection_abandoned: AtomicU64,
     pub session_net_connection_failure_protocol: AtomicU64,
     pub session_net_connection_failure_backend: AtomicU64,
     pub session_net_reconnect_attempts: AtomicU64,
@@ -1325,6 +1327,8 @@ impl SdkMetrics {
             session_net_connection_failure_transport: AtomicU64::new(0),
             session_net_connection_failure_authentication: AtomicU64::new(0),
             session_net_connection_failure_timeout: AtomicU64::new(0),
+            session_net_connection_superseded: AtomicU64::new(0),
+            session_net_connection_abandoned: AtomicU64::new(0),
             session_net_connection_failure_protocol: AtomicU64::new(0),
             session_net_connection_failure_backend: AtomicU64::new(0),
             session_net_reconnect_attempts: AtomicU64::new(0),
@@ -1548,6 +1552,10 @@ impl SdkMetrics {
         self.session_net_connection_failure_authentication
             .store(0, Ordering::Relaxed);
         self.session_net_connection_failure_timeout
+            .store(0, Ordering::Relaxed);
+        self.session_net_connection_superseded
+            .store(0, Ordering::Relaxed);
+        self.session_net_connection_abandoned
             .store(0, Ordering::Relaxed);
         self.session_net_connection_failure_protocol
             .store(0, Ordering::Relaxed);
@@ -2600,7 +2608,7 @@ pub fn export_prometheus_text() -> String {
         ));
     }
     out.push_str(
-        "# HELP opc_session_net_connection_attempts_total Session connection attempts by fixed transport/control outcome; success includes an authenticated pre-admission retirement control exchange\n",
+        "# HELP opc_session_net_connection_attempts_total Session connection attempts by fixed transport/control outcome; timeout means an actual I/O or deadline expiry, superseded means the transport observed a newer authentication epoch, abandoned means the attempt guard ended without explicit terminal classification, and success includes an authenticated pre-admission retirement control exchange\n",
     );
     out.push_str("# TYPE opc_session_net_connection_attempts_total counter\n");
     for (outcome, value) in [
@@ -2632,6 +2640,18 @@ pub fn export_prometheus_text() -> String {
             "timeout",
             METRICS
                 .session_net_connection_failure_timeout
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "superseded",
+            METRICS
+                .session_net_connection_superseded
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "abandoned",
+            METRICS
+                .session_net_connection_abandoned
                 .load(Ordering::Relaxed),
         ),
         (
@@ -3405,6 +3425,12 @@ mod tests {
             .session_net_connection_failure_timeout
             .store(37, Ordering::Relaxed);
         METRICS
+            .session_net_connection_superseded
+            .store(46, Ordering::Relaxed);
+        METRICS
+            .session_net_connection_abandoned
+            .store(47, Ordering::Relaxed);
+        METRICS
             .session_net_connection_failure_protocol
             .store(38, Ordering::Relaxed);
         METRICS
@@ -3559,6 +3585,10 @@ mod tests {
         ));
         assert!(exported
             .contains("opc_session_net_connection_attempts_total{outcome=\"timeout\"} 37\n"));
+        assert!(exported
+            .contains("opc_session_net_connection_attempts_total{outcome=\"superseded\"} 46\n"));
+        assert!(exported
+            .contains("opc_session_net_connection_attempts_total{outcome=\"abandoned\"} 47\n"));
         assert!(exported.contains(
             "opc_session_net_connection_attempts_total{outcome=\"protocol_failure\"} 38\n"
         ));
@@ -3650,6 +3680,12 @@ mod tests {
         assert!(after.contains(
             "opc_session_net_connection_attempts_total{outcome=\"authentication_or_trust_failure\"} 0\n"
         ));
+        assert!(
+            after.contains("opc_session_net_connection_attempts_total{outcome=\"superseded\"} 0\n")
+        );
+        assert!(
+            after.contains("opc_session_net_connection_attempts_total{outcome=\"abandoned\"} 0\n")
+        );
         assert!(after.contains("opc_session_net_reconnect_events_total{outcome=\"failure\"} 0\n"));
         assert!(after.contains("opc_session_net_watch_slow_consumers_total 0\n"));
     }
@@ -3674,6 +3710,8 @@ mod tests {
             &metrics.session_net_connection_failure_transport,
             &metrics.session_net_connection_failure_authentication,
             &metrics.session_net_connection_failure_timeout,
+            &metrics.session_net_connection_superseded,
+            &metrics.session_net_connection_abandoned,
             &metrics.session_net_connection_failure_protocol,
             &metrics.session_net_connection_failure_backend,
             &metrics.session_net_reconnect_attempts,
@@ -3717,6 +3755,8 @@ mod tests {
             &metrics.session_net_connection_failure_transport,
             &metrics.session_net_connection_failure_authentication,
             &metrics.session_net_connection_failure_timeout,
+            &metrics.session_net_connection_superseded,
+            &metrics.session_net_connection_abandoned,
             &metrics.session_net_connection_failure_protocol,
             &metrics.session_net_connection_failure_backend,
             &metrics.session_net_reconnect_attempts,
