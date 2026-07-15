@@ -292,6 +292,63 @@ impl DiameterSctpSecurity {
     }
 }
 
+/// Inbound PPID compatibility policy for Diameter over SCTP.
+///
+/// Strict validation is the production default. The legacy-zero mode is an
+/// explicit interoperability escape hatch for non-conforming clear-text
+/// Diameter peers; it never changes outbound PPIDs or protected DTLS/SCTP
+/// validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiameterInboundPpidPolicy {
+    /// Require the PPID selected by [`DiameterSctpSecurity`].
+    #[default]
+    Strict,
+    /// Also accept inbound PPID 0 for clear-text Diameter.
+    AcceptLegacyZero,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiameterInboundPpidKind {
+    Standard,
+    LegacyZero,
+}
+
+impl DiameterInboundPpidPolicy {
+    const fn classify(
+        self,
+        security: DiameterSctpSecurity,
+        actual: PayloadProtocolIdentifier,
+    ) -> Option<DiameterInboundPpidKind> {
+        if actual.get() == security.ppid().get() {
+            Some(DiameterInboundPpidKind::Standard)
+        } else if matches!(self, Self::AcceptLegacyZero)
+            && matches!(security, DiameterSctpSecurity::ClearText)
+            && actual.get() == 0
+        {
+            Some(DiameterInboundPpidKind::LegacyZero)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DiameterLegacyZeroPpidObserver {
+    accepted_messages: AtomicU64,
+    warning_emitted: AtomicBool,
+}
+
+impl DiameterLegacyZeroPpidObserver {
+    fn record_accept(&self) -> bool {
+        self.accepted_messages.fetch_add(1, Ordering::Relaxed);
+        !self.warning_emitted.swap(true, Ordering::Relaxed)
+    }
+
+    fn accepted_messages(&self) -> u64 {
+        self.accepted_messages.load(Ordering::Relaxed)
+    }
+}
+
 /// Diameter SCTP peer transport intent for one resolved remote address.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DiameterSctpPeer {
@@ -301,6 +358,8 @@ pub struct DiameterSctpPeer {
     pub local_addr: Option<SocketAddr>,
     /// Diameter SCTP security profile.
     pub security: DiameterSctpSecurity,
+    /// Inbound Diameter PPID compatibility policy.
+    pub inbound_ppid_policy: DiameterInboundPpidPolicy,
     /// Maximum SCTP user payload accepted for one Diameter message.
     pub max_message_bytes: usize,
 }
@@ -311,6 +370,7 @@ impl fmt::Debug for DiameterSctpPeer {
             .field("remote_addr", &"<redacted>")
             .field("local_addr", &self.local_addr.map(|_| "<redacted>"))
             .field("security", &self.security)
+            .field("inbound_ppid_policy", &self.inbound_ppid_policy)
             .field("max_message_bytes", &self.max_message_bytes)
             .finish()
     }
@@ -325,6 +385,7 @@ impl DiameterSctpPeer {
             remote_addr,
             local_addr: None,
             security: DiameterSctpSecurity::ClearText,
+            inbound_ppid_policy: DiameterInboundPpidPolicy::Strict,
             max_message_bytes: default_config.max_message_bytes,
         }
     }
@@ -333,6 +394,17 @@ impl DiameterSctpPeer {
     #[must_use]
     pub fn with_local_addr(mut self, local_addr: SocketAddr) -> Self {
         self.local_addr = Some(local_addr);
+        self
+    }
+
+    /// Return a copy that uses the requested inbound Diameter PPID policy.
+    ///
+    /// [`DiameterInboundPpidPolicy::AcceptLegacyZero`] affects clear-text
+    /// inbound messages only. DTLS remains strict and outbound clear-text
+    /// messages continue to use [`DIAMETER_SCTP_PPID`].
+    #[must_use]
+    pub fn with_inbound_ppid_policy(mut self, policy: DiameterInboundPpidPolicy) -> Self {
+        self.inbound_ppid_policy = policy;
         self
     }
 
@@ -383,6 +455,13 @@ impl DiameterSctpPeer {
         &self,
         message: &InboundMessage,
     ) -> Result<(), DiameterSctpError> {
+        self.classify_inbound_message(message).map(|_| ())
+    }
+
+    fn classify_inbound_message(
+        &self,
+        message: &InboundMessage,
+    ) -> Result<DiameterInboundPpidKind, DiameterSctpError> {
         if message.notification {
             return Err(DiameterSctpError::Notification);
         }
@@ -390,13 +469,12 @@ impl DiameterSctpPeer {
             return Err(DiameterSctpError::Truncated);
         }
         let expected = self.security.ppid();
-        if message.ppid != expected {
-            return Err(DiameterSctpError::WrongPpid {
+        self.inbound_ppid_policy
+            .classify(self.security, message.ppid)
+            .ok_or(DiameterSctpError::WrongPpid {
                 expected: expected.get(),
                 actual: message.ppid.get(),
-            });
-        }
-        Ok(())
+            })
     }
 
     /// Return inbound payload bytes after SCTP metadata validation.
@@ -421,7 +499,12 @@ impl DiameterSctpPeer {
     /// association cannot be opened on the current platform/runtime.
     pub async fn connect_association(&self) -> Result<DiameterSctpAssociation, DiameterSctpError> {
         let config = self.sctp_connect_config()?;
-        DiameterSctpAssociation::connect_with_config(config, self.security).await
+        DiameterSctpAssociation::connect_with_config_and_inbound_ppid_policy(
+            config,
+            self.security,
+            self.inbound_ppid_policy,
+        )
+        .await
     }
 }
 
@@ -430,6 +513,7 @@ impl DiameterSctpPeer {
 pub struct DiameterSctpAssociation {
     peer: DiameterSctpPeer,
     association: SctpAssociation,
+    legacy_zero_ppid_observer: DiameterLegacyZeroPpidObserver,
 }
 
 impl DiameterSctpAssociation {
@@ -443,6 +527,10 @@ impl DiameterSctpAssociation {
     /// the primary transport intent; SCTP remains authoritative for path
     /// selection across the full validated sets.
     ///
+    /// This entry point always uses [`DiameterInboundPpidPolicy::Strict`]. Use
+    /// [`Self::connect_with_config_and_inbound_ppid_policy`] for an explicit
+    /// per-association compatibility policy.
+    ///
     /// # Errors
     ///
     /// Returns [`DiameterSctpError::SctpConfig`] when `config` is invalid, or
@@ -454,23 +542,59 @@ impl DiameterSctpAssociation {
         config: SctpConnectConfig,
         security: DiameterSctpSecurity,
     ) -> Result<Self, DiameterSctpError> {
+        Self::connect_with_config_and_inbound_ppid_policy(
+            config,
+            security,
+            DiameterInboundPpidPolicy::Strict,
+        )
+        .await
+    }
+
+    /// Open a Diameter-framed association with an explicit inbound PPID policy.
+    ///
+    /// This is the opt-in counterpart to [`Self::connect_with_config`]. It
+    /// preserves complete static-multihoming address sets and applies `policy`
+    /// only to inbound Diameter metadata. Outbound messages always use the PPID
+    /// selected by `security`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::connect_with_config`].
+    pub async fn connect_with_config_and_inbound_ppid_policy(
+        config: SctpConnectConfig,
+        security: DiameterSctpSecurity,
+        policy: DiameterInboundPpidPolicy,
+    ) -> Result<Self, DiameterSctpError> {
         config.validate().map_err(DiameterSctpError::from)?;
+        let peer = Self::peer_from_connect_config(&config, security, policy)?;
+        let association = SctpAssociation::connect(config)
+            .await
+            .map_err(DiameterSctpError::connect)?;
+        Ok(Self {
+            peer,
+            association,
+            legacy_zero_ppid_observer: DiameterLegacyZeroPpidObserver::default(),
+        })
+    }
+
+    fn peer_from_connect_config(
+        config: &SctpConnectConfig,
+        security: DiameterSctpSecurity,
+        policy: DiameterInboundPpidPolicy,
+    ) -> Result<DiameterSctpPeer, DiameterSctpError> {
         let Some(&remote_addr) = config.remote_addrs.first() else {
             return Err(DiameterSctpError::from(SctpError::InvalidConfig {
                 field: "remote_addrs",
                 reason: "must contain at least one address",
             }));
         };
-        let peer = DiameterSctpPeer {
+        Ok(DiameterSctpPeer {
             remote_addr,
             local_addr: config.local_addrs.first().copied(),
             security,
+            inbound_ppid_policy: policy,
             max_message_bytes: config.max_message_bytes,
-        };
-        let association = SctpAssociation::connect(config)
-            .await
-            .map_err(DiameterSctpError::connect)?;
-        Ok(Self { peer, association })
+        })
     }
 
     /// Return the configured Diameter SCTP peer intent.
@@ -515,7 +639,15 @@ impl DiameterSctpAssociation {
                 // `SctpError::Closed` instead of spinning here.
                 continue;
             }
-            self.peer.validate_inbound_message(&message)?;
+            let ppid_kind = self.peer.classify_inbound_message(&message)?;
+            if matches!(ppid_kind, DiameterInboundPpidKind::LegacyZero)
+                && self.legacy_zero_ppid_observer.record_accept()
+            {
+                tracing::warn!(
+                    event = "diameter_sctp_legacy_zero_ppid_accepted",
+                    "accepted legacy inbound Diameter SCTP PPID 0"
+                );
+            }
             return Ok(message.payload);
         }
     }
@@ -529,7 +661,10 @@ impl DiameterSctpAssociation {
     /// Return SDK SCTP association metrics.
     #[must_use]
     pub fn metrics(&self) -> SctpMetricsSnapshot {
-        self.association.metrics()
+        let mut snapshot = self.association.metrics();
+        snapshot.accepted_legacy_diameter_zero_ppid_messages =
+            self.legacy_zero_ppid_observer.accepted_messages();
+        snapshot
     }
 }
 
@@ -837,6 +972,10 @@ pub struct SctpMetricsSnapshot {
     pub accepted_associations: u64,
     /// I/O errors observed.
     pub io_errors: u64,
+    /// Legacy inbound Diameter PPID 0 messages accepted by this association.
+    ///
+    /// This remains zero for generic SCTP endpoints and associations.
+    pub accepted_legacy_diameter_zero_ppid_messages: u64,
 }
 
 /// Low-cardinality SCTP metrics handle.
@@ -865,6 +1004,7 @@ impl SctpMetrics {
             rx_bytes: self.inner.rx_bytes.load(Ordering::Relaxed),
             accepted_associations: self.inner.accepted_associations.load(Ordering::Relaxed),
             io_errors: self.inner.io_errors.load(Ordering::Relaxed),
+            accepted_legacy_diameter_zero_ppid_messages: 0,
         }
     }
 
@@ -1782,6 +1922,33 @@ mod tests {
     }
 
     #[test]
+    fn diameter_inbound_ppid_policy_defaults_to_strict_and_survives_peer_builder() {
+        assert_eq!(
+            DiameterInboundPpidPolicy::default(),
+            DiameterInboundPpidPolicy::Strict
+        );
+        assert_eq!(
+            diameter_peer().inbound_ppid_policy,
+            DiameterInboundPpidPolicy::Strict
+        );
+        assert_eq!(
+            diameter_peer()
+                .with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero)
+                .inbound_ppid_policy,
+            DiameterInboundPpidPolicy::AcceptLegacyZero
+        );
+    }
+
+    #[test]
+    fn diameter_legacy_zero_observer_counts_and_warns_once_per_association() {
+        let observer = DiameterLegacyZeroPpidObserver::default();
+
+        assert!(observer.record_accept());
+        assert!(!observer.record_accept());
+        assert_eq!(observer.accepted_messages(), 2);
+    }
+
+    #[test]
     fn parses_assoc_change_notification_event() {
         let mut payload = Vec::new();
         push_u16_ne(
@@ -1837,6 +2004,31 @@ mod tests {
         assert_eq!(config.local_addrs, vec![peer.local_addr.unwrap()]);
         assert_eq!(config.max_message_bytes, 4096);
         assert!(config.nodelay);
+    }
+
+    #[test]
+    fn diameter_multihomed_connect_projection_preserves_inbound_ppid_policy() {
+        let mut config = SctpConnectConfig::new("127.0.0.1:3868".parse().unwrap());
+        config.remote_addrs.push("127.0.0.2:3868".parse().unwrap());
+        config.local_addrs = vec![
+            "127.0.0.3:0".parse().unwrap(),
+            "127.0.0.4:0".parse().unwrap(),
+        ];
+        config.validate().unwrap();
+
+        let peer = DiameterSctpAssociation::peer_from_connect_config(
+            &config,
+            DiameterSctpSecurity::ClearText,
+            DiameterInboundPpidPolicy::AcceptLegacyZero,
+        )
+        .unwrap();
+
+        assert_eq!(peer.remote_addr, config.remote_addrs[0]);
+        assert_eq!(peer.local_addr, Some(config.local_addrs[0]));
+        assert_eq!(
+            peer.inbound_ppid_policy,
+            DiameterInboundPpidPolicy::AcceptLegacyZero
+        );
     }
 
     #[test]
@@ -1938,18 +2130,24 @@ mod tests {
             .with_security(DiameterSctpSecurity::Dtls)
             .outbound_message(Bytes::from_static(b"diameter"));
         assert_eq!(protected.ppid, DIAMETER_DTLS_SCTP_PPID);
+
+        let compatibility = diameter_peer()
+            .with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero)
+            .outbound_message(Bytes::from_static(b"diameter"));
+        assert_eq!(compatibility.ppid, DIAMETER_SCTP_PPID);
     }
 
     #[test]
     fn diameter_inbound_validation_rejects_non_payload_conditions() {
-        let peer = diameter_peer();
+        let peer =
+            diameter_peer().with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero);
 
-        let mut notification = diameter_inbound(DIAMETER_SCTP_PPID);
+        let mut notification = diameter_inbound(PayloadProtocolIdentifier::new(0));
         notification.notification = true;
         let error = peer.validate_inbound_message(&notification).unwrap_err();
         assert_eq!(error.as_str(), "diameter_sctp_notification");
 
-        let mut truncated = diameter_inbound(DIAMETER_SCTP_PPID);
+        let mut truncated = diameter_inbound(PayloadProtocolIdentifier::new(0));
         truncated.truncated = true;
         let error = peer.validate_inbound_message(&truncated).unwrap_err();
         assert_eq!(error.as_str(), "diameter_sctp_truncated_payload");
@@ -1975,6 +2173,77 @@ mod tests {
             }
         ));
         assert_eq!(error.as_str(), "diameter_sctp_wrong_ppid");
+    }
+
+    #[test]
+    fn diameter_strict_inbound_policy_rejects_legacy_zero_ppid() {
+        let error = diameter_peer()
+            .validate_inbound_message(&diameter_inbound(PayloadProtocolIdentifier::new(0)))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiameterSctpError::WrongPpid {
+                expected: 46,
+                actual: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn diameter_legacy_zero_policy_accepts_zero_and_standard_cleartext_ppid() {
+        let peer =
+            diameter_peer().with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero);
+        let legacy = diameter_inbound(PayloadProtocolIdentifier::new(0));
+        let standard = diameter_inbound(DIAMETER_SCTP_PPID);
+
+        assert_eq!(
+            peer.inbound_payload(&legacy).unwrap(),
+            &Bytes::from_static(b"diameter")
+        );
+        assert_eq!(
+            peer.inbound_payload(&standard).unwrap(),
+            &Bytes::from_static(b"diameter")
+        );
+    }
+
+    #[test]
+    fn diameter_legacy_zero_policy_rejects_every_other_cleartext_ppid() {
+        let peer =
+            diameter_peer().with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero);
+        let error = peer
+            .validate_inbound_message(&diameter_inbound(NGAP_PPID))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiameterSctpError::WrongPpid {
+                expected: 46,
+                actual: 60
+            }
+        ));
+        assert_eq!(error.as_str(), "diameter_sctp_wrong_ppid");
+    }
+
+    #[test]
+    fn diameter_legacy_zero_policy_keeps_dtls_strict() {
+        let peer = diameter_peer()
+            .with_security(DiameterSctpSecurity::Dtls)
+            .with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero);
+
+        peer.validate_inbound_message(&diameter_inbound(DIAMETER_DTLS_SCTP_PPID))
+            .unwrap();
+        let error = peer
+            .validate_inbound_message(&diameter_inbound(PayloadProtocolIdentifier::new(0)))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiameterSctpError::WrongPpid {
+                expected: 47,
+                actual: 0
+            }
+        ));
     }
 
     #[test]
@@ -2190,6 +2459,7 @@ mod tests {
                 rx_bytes: 13,
                 accepted_associations: 1,
                 io_errors: 1,
+                accepted_legacy_diameter_zero_ppid_messages: 0,
             }
         );
     }
@@ -2508,9 +2778,10 @@ mod tests {
         ];
         let client = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            DiameterSctpAssociation::connect_with_config(
+            DiameterSctpAssociation::connect_with_config_and_inbound_ppid_policy(
                 client_config,
                 DiameterSctpSecurity::ClearText,
+                DiameterInboundPpidPolicy::AcceptLegacyZero,
             ),
         )
         .await
@@ -2538,7 +2809,7 @@ mod tests {
             .send(OutboundMessage::ordered(
                 inbound.clone(),
                 DIAMETER_DEFAULT_STREAM_ID,
-                DIAMETER_SCTP_PPID,
+                PayloadProtocolIdentifier::new(0),
             ))
             .await
             .unwrap();
@@ -2552,6 +2823,14 @@ mod tests {
         assert_eq!(received, inbound);
         assert_eq!(client.peer().remote_addr, server_addresses[0]);
         assert_eq!(client.peer().security, DiameterSctpSecurity::ClearText);
+        assert_eq!(
+            client.peer().inbound_ppid_policy,
+            DiameterInboundPpidPolicy::AcceptLegacyZero
+        );
+        assert_eq!(
+            client.metrics().accepted_legacy_diameter_zero_ppid_messages,
+            1
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2634,6 +2913,60 @@ mod tests {
             .unwrap();
         let accepted = server.accept().await.unwrap();
         (server, client, accepted)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn loopback_diameter_legacy_zero_policy_is_inbound_only_and_counted() {
+        let server_addr: SocketAddr = "127.0.0.1:38419".parse().unwrap();
+        let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
+        let client = DiameterSctpPeer::new(server_addr)
+            .with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero)
+            .connect_association()
+            .await
+            .unwrap();
+        let accepted = server.accept().await.unwrap();
+
+        let outbound = Bytes::from_static(b"diameter-cer");
+        client
+            .send_diameter_payload(outbound.clone())
+            .await
+            .unwrap();
+        let received = recv_data(&accepted).await;
+        assert_eq!(received.payload, outbound);
+        assert_eq!(received.ppid, DIAMETER_SCTP_PPID);
+
+        for (payload, ppid) in [
+            (
+                Bytes::from_static(b"legacy-zero-cea"),
+                PayloadProtocolIdentifier::new(0),
+            ),
+            (Bytes::from_static(b"standard-diameter"), DIAMETER_SCTP_PPID),
+            (
+                Bytes::from_static(b"second-legacy-zero"),
+                PayloadProtocolIdentifier::new(0),
+            ),
+        ] {
+            accepted
+                .send(OutboundMessage::ordered(
+                    payload.clone(),
+                    DIAMETER_DEFAULT_STREAM_ID,
+                    ppid,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(client.recv_diameter_payload().await.unwrap(), payload);
+        }
+
+        assert_eq!(
+            client.peer().inbound_ppid_policy,
+            DiameterInboundPpidPolicy::AcceptLegacyZero
+        );
+        assert_eq!(
+            client.metrics().accepted_legacy_diameter_zero_ppid_messages,
+            2
+        );
     }
 
     #[cfg(target_os = "linux")]

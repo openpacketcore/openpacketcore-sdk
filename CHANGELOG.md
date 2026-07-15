@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-sctp`: an explicit, default-off `DiameterInboundPpidPolicy` escape hatch
+  can accept inbound PPID 0 from a configured legacy clear-text Diameter peer.
+  Standard PPID 46 remains accepted and is always used outbound; DTLS remains
+  strict. The policy survives single-address and static-multihoming Diameter
+  construction, while association metrics count accepted legacy messages and
+  a redaction-safe warning is emitted at most once per association.
 - **SWm emergency identity construction — `opc-proto-diameter`:** consumers
   can now obtain the canonical TS 23.003 IMEI Emergency NAI with
   `emergency_nai` and build the byte-identical RFC 3748
