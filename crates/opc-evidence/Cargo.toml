@@ -24,7 +24,7 @@ num_cpus = { workspace = true }
 opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
 
 [dev-dependencies]
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 tempfile = "3"
 

@@ -19,7 +19,8 @@ assemble and enforce the complete signed RFC 006 release artifact set.
 - Gap APIs: `Gap`, `GapOptions`, `GapSeverity`, `GapStatus`, and
   `validate_status_for_gaps`.
 - Gate APIs: `GatePolicy`, `GateEvaluator`, `PolicyMode`, and waiver-aware
-  evaluation.
+  evaluation. `bind_gate_inputs` and `gate_inputs_digest` bind the canonical
+  record, gap, and waiver inputs into signed manifest metadata.
 - Artifact APIs: `Manifest`, `ManifestEntry`, `compute_digest`,
   `generate_sbom`, `generate_provenance`, VEX validation, and environment
   capture helpers.
@@ -51,16 +52,25 @@ assert_eq!(record.status, ConformanceStatus::Tested);
 - These are library APIs, not an end-to-end release attestation. Current PR and
   release workflows do not invoke `GateEvaluator` over the complete required
   artifact set.
-- Manifest and bundle signing inputs are deterministic and domain-separated;
-  embedded blobs are digest-bound to the bundle signature. Release evaluation
-  requires the verifier's authenticated identity to match the signed manifest
-  and requires every separately supplied policy artifact to be byte-for-byte
-  identical to its signed bundle value.
+- Manifest and bundle signing inputs use explicit feature-independent canonical
+  ordering and distinct domains; embedded blobs are digest-bound to the bundle
+  signature. Release evaluation requires the verifier's authenticated identity
+  to match the signed manifest and requires every separately supplied policy
+  artifact to have a verified bundle and be byte-for-byte identical to its
+  signed value. Release decisions also require their structured record, gap,
+  and waiver inputs to match the signed manifest binding and signed conformance
+  report; configured, provenance, report, and manifest commits must agree.
 - Manifest verification rejects unsafe relative paths, duplicate paths,
   conflicting path digests, and malformed SHA-256 values before accepting a
   signature or reading an artifact.
 - Repository workflows do not wire a production external signer/verifier or
   complete bundle/policy execution.
+- Signatures created by the pre-domain-separated implementation are not
+  accepted; evidence producers must regenerate and re-sign bundles after
+  upgrading. Producers must first call `bind_gate_inputs` with the complete
+  record, gap, and waiver inputs (including three empty slices when there are
+  no structured inputs), then call `sign_bundle`. Older bundles without that
+  signed metadata binding fail release evaluation.
 - Release gate evaluation requires `BundleVerifierSecurity::Release`; test or
   mock verifiers are rejected in release mode.
 - Bundle verification checks schema version, signatures, file digests, and

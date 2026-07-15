@@ -120,6 +120,20 @@ fn tampering_an_embedded_blob_invalidates_the_signature() {
 
 #[test]
 fn signing_domains_and_manifest_order_are_deterministic() {
+    // The dev dependency deliberately enables `serde_json/preserve_order`,
+    // reproducing normal workspace feature unification. Confirm this test is
+    // exercising that representation rather than the default sorted map.
+    let mut preserve_order_probe = serde_json::Map::new();
+    preserve_order_probe.insert("z".to_string(), serde_json::Value::Null);
+    preserve_order_probe.insert("a".to_string(), serde_json::Value::Null);
+    assert_eq!(
+        preserve_order_probe
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["z", "a"]
+    );
+
     let mut left = Manifest {
         schema_version: "1.0.0".to_string(),
         sdk_version: "0.2.0".to_string(),

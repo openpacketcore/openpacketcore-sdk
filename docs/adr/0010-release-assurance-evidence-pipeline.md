@@ -44,7 +44,9 @@ It provides:
 The library primitives are implemented and tested. Signing inputs are
 deterministic and domain-separated, signer/verifier identities are bound to the
 manifest, manifest paths and digests fail closed, and `GateEvaluator` requires
-separately supplied artifacts to exactly match their signed bundle values.
+separately supplied artifacts to exactly match their signed bundle values. The
+signed manifest additionally binds the canonical record, gap, and waiver inputs
+that drive the gate, and commit identities are cross-checked without disclosure.
 Repository workflows still do not produce and enforce the complete RFC 006
 artifact set or invoke the release policy evaluator with a production external
 signer/verifier. Consequently, this ADR's end-to-end pipeline decision remains

@@ -1,4 +1,4 @@
-use crate::{EvidenceError, Manifest};
+use crate::{EvidenceError, Manifest, ManifestEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -9,52 +9,98 @@ pub const MANIFEST_SIGNING_DOMAIN: &str = "openpacketcore:rfc006:manifest:v1";
 pub const BUNDLE_SIGNING_DOMAIN: &str = "openpacketcore:rfc006:evidence-bundle:v1";
 
 #[derive(Serialize)]
-struct ManifestSigningPayload {
+struct ManifestSigningPayload<'a> {
     domain: &'static str,
-    manifest: serde_json::Value,
+    manifest: CanonicalManifest<'a>,
 }
 
 #[derive(Serialize)]
-struct BundleSigningPayload {
+struct BundleSigningPayload<'a> {
     domain: &'static str,
-    manifest: serde_json::Value,
+    manifest: CanonicalManifest<'a>,
     embedded_blob_digests: BTreeMap<&'static str, String>,
+}
+
+/// Signing-only projection with lexicographically ordered fields and maps.
+///
+/// The order is explicit so Cargo feature unification cannot change signature
+/// bytes by replacing `serde_json::Map`'s default ordered representation with
+/// its `preserve_order` representation.
+#[derive(Serialize)]
+struct CanonicalManifest<'a> {
+    artifact_digests: Vec<CanonicalManifestEntry<'a>>,
+    file_digests: Vec<CanonicalManifestEntry<'a>>,
+    generation_timestamp: &'a str,
+    generation_tool: &'a str,
+    generation_tool_version: &'a str,
+    git_commit: &'a str,
+    known_incomplete_sections: &'a [String],
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    metadata: BTreeMap<&'a str, &'a str>,
+    schema_version: &'a str,
+    sdk_version: &'a str,
+    signing_identity: &'a str,
+}
+
+#[derive(Serialize)]
+struct CanonicalManifestEntry<'a> {
+    digest: &'a str,
+    path: &'a str,
 }
 
 /// Serializes the manifest into stable bytes for signing and verification.
 ///
 /// The manifest contains maps and set-like digest lists. This function sorts
-/// the digest lists and routes the result through `serde_json::Value`, whose
-/// default map representation orders object keys. The domain-separated result
-/// is therefore stable for semantically identical manifest content.
+/// the digest lists and projects every map into an explicitly ordered signing
+/// type. The domain-separated result is therefore stable for semantically
+/// identical manifest content regardless of `serde_json` feature unification.
 pub fn manifest_signing_bytes(manifest: &Manifest) -> Result<Vec<u8>, EvidenceError> {
-    let value = canonical_manifest_value(manifest)?;
+    let canonical = canonical_manifest(manifest)?;
     serde_json::to_vec(&ManifestSigningPayload {
         domain: MANIFEST_SIGNING_DOMAIN,
-        manifest: value,
+        manifest: canonical,
     })
     .map_err(|e| {
         EvidenceError::GapGateFailed(format!("failed to serialize manifest signing bytes: {e}"))
     })
 }
 
-fn canonical_manifest_value(manifest: &Manifest) -> Result<serde_json::Value, EvidenceError> {
+fn canonical_manifest(manifest: &Manifest) -> Result<CanonicalManifest<'_>, EvidenceError> {
     validate_manifest_structure(manifest)?;
 
-    let mut canonical = manifest.clone();
-    canonical.artifact_digests.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then(left.digest.cmp(&right.digest))
-    });
-    canonical.file_digests.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then(left.digest.cmp(&right.digest))
-    });
+    Ok(CanonicalManifest {
+        artifact_digests: canonical_manifest_entries(&manifest.artifact_digests),
+        file_digests: canonical_manifest_entries(&manifest.file_digests),
+        generation_timestamp: &manifest.generation_timestamp,
+        generation_tool: &manifest.generation_tool,
+        generation_tool_version: &manifest.generation_tool_version,
+        git_commit: &manifest.git_commit,
+        known_incomplete_sections: &manifest.known_incomplete_sections,
+        metadata: manifest
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect(),
+        schema_version: &manifest.schema_version,
+        sdk_version: &manifest.sdk_version,
+        signing_identity: &manifest.signing_identity,
+    })
+}
 
-    serde_json::to_value(canonical)
-        .map_err(|e| EvidenceError::GapGateFailed(format!("failed to encode manifest: {e}")))
+fn canonical_manifest_entries(entries: &[ManifestEntry]) -> Vec<CanonicalManifestEntry<'_>> {
+    let mut canonical = entries
+        .iter()
+        .map(|entry| CanonicalManifestEntry {
+            digest: &entry.digest,
+            path: &entry.path,
+        })
+        .collect::<Vec<_>>();
+    canonical.sort_by(|left, right| {
+        left.path
+            .cmp(right.path)
+            .then(left.digest.cmp(right.digest))
+    });
+    canonical
 }
 
 /// Serializes the bytes that a bundle signature must cover: the manifest plus
@@ -65,7 +111,7 @@ fn canonical_manifest_value(manifest: &Manifest) -> Result<serde_json::Value, Ev
 /// makes any tamper detectable. The explicit domain and structured digest map
 /// also prevent a manifest signature from being replayed as a bundle signature.
 pub fn bundle_signing_bytes(bundle: &EvidenceBundle) -> Result<Vec<u8>, EvidenceError> {
-    let manifest = canonical_manifest_value(&bundle.manifest)?;
+    let manifest = canonical_manifest(&bundle.manifest)?;
     let mut embedded_blob_digests = BTreeMap::new();
     for (name, blob) in [
         ("conformance_report", &bundle.conformance_report),

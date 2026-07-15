@@ -430,11 +430,27 @@ MUST fail closed before signing or verification.
 
 Standalone manifest signatures and complete bundle signatures use distinct
 versioned domain separators. Complete bundle signing bytes deterministically
-bind the canonical manifest plus the digest of every embedded report. The
-authenticated verifier identity MUST exactly match `signing_identity`; a
-release verifier that cannot report its authenticated identity is insufficient.
-If a gate receives an artifact separately from the bundle, it MUST evaluate the
-exact signed bytes rather than a substitutable second copy.
+bind the canonical manifest plus the digest of every embedded report. Canonical
+manifest object fields, digest entries, and metadata keys use explicit lexical
+ordering that MUST NOT vary with JSON-library map features. The authenticated
+verifier identity MUST exactly match `signing_identity`; a release verifier
+that cannot report its authenticated identity is insufficient. If a release
+gate receives any artifact separately from the bundle, a verified signed bundle
+is mandatory and the gate MUST evaluate the exact signed bytes rather than a
+substitutable second copy. The signed manifest MUST also carry the
+domain-separated canonical digest of every structured record, gap, and waiver
+input used by the release gate. Raw records in a separately supplied signed
+conformance report MUST match the v1 report projection of those bound inputs,
+including gap references. Waiver references and full waiver records remain in
+the signed gate-input digest because the frozen v1 report schema does not carry
+them. A configured expected commit requires provenance, and the expected,
+provenance, conformance-report, and manifest commit identities MUST agree.
+Mismatch errors MUST NOT echo those values.
+
+The domain-separated format intentionally does not verify signatures from the
+pre-domain-separated implementation. Evidence producers upgrading to this
+format MUST regenerate and re-sign their bundles; verifiers MUST NOT fall back
+to the ambiguous legacy payload.
 
 ### 10.3 Packet-core evidence packs
 

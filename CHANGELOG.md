@@ -1083,14 +1083,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **RFC 006 signed-evidence binding — `opc-evidence`:** manifest and complete
   bundle signatures now use distinct versioned domain separators and
-  deterministic signing bytes. Bundle signing binds the configured signer
+  deterministic signing bytes whose field and map ordering cannot change under
+  Cargo feature unification. Bundle signing binds the configured signer
   identity; release verification requires an authenticated verifier identity
   matching the manifest. Unsafe, duplicate, or ambiguous manifest paths and
   malformed SHA-256 digests fail closed with redacted errors. `GateEvaluator`
-  now rejects separately supplied conformance, SBOM, VEX, provenance,
-  performance, or governance bytes unless they exactly match the verified
-  signed bundle, preventing an unsigned substitution from driving a release
-  decision. External HSM/Sigstore/Cosign custody and end-to-end release-workflow
+  now requires a verified signed bundle whenever release evaluation receives a
+  conformance, SBOM, VEX, provenance, performance, or governance artifact and
+  rejects it unless the separately supplied bytes exactly match that bundle,
+  preventing an unsigned substitution from driving a release decision. The
+  signed manifest also binds the canonical record, gap, and waiver inputs used
+  by the gate; signed conformance-report records must match those inputs, and
+  provenance, manifest, and configured commit identities must agree without
+  echoing mismatched values. Pre-change signatures are deliberately rejected
+  and must be regenerated after upgrade; no legacy-signature fallback is
+  provided. External HSM/Sigstore/Cosign custody and end-to-end release-workflow
   wiring remain open under #143; no production qualification claim is made.
 - `opc-session-store`: add the bounded, read-only
   `opc-session-store-audit identity-invariants` pre-upgrade command for existing
