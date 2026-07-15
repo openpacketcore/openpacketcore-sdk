@@ -1104,6 +1104,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- **Conditional S2b Create Session identity — `opc-proto-gtpv2c`:**
+  ProcedureAware Create Session Request decode now accepts the TS 29.274
+  UICC-less emergency identity shape (MEI instance 0 plus an instance-0
+  Indication carrying UIMSI) when IMSI is absent. IMSI-bearing requests and all
+  other required request IEs retain their existing validation, while an absent
+  IMSI without both emergency identity signals still fails closed.
 - `opc-proto-diameter`: RFC 6733 CER/CEA command metadata now marks
   Host-IP-Address, Supported-Vendor-Id, Auth-Application-Id,
   Inband-Security-Id, Acct-Application-Id, and
