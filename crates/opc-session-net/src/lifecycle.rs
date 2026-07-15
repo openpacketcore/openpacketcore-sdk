@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
 use opc_redaction::metrics::METRICS;
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Notify, OwnedSemaphorePermit, Semaphore};
@@ -385,15 +388,65 @@ pub(crate) struct ConnectionAttemptMetricGuard {
     finished: bool,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ConnectionAttemptTestAccounting {
+    attempts: AtomicU64,
+    terminals: AtomicU64,
+}
+
+#[cfg(test)]
+impl ConnectionAttemptTestAccounting {
+    pub(crate) fn snapshot(&self) -> (u64, u64) {
+        (
+            self.attempts.load(Ordering::Relaxed),
+            self.terminals.load(Ordering::Relaxed),
+        )
+    }
+
+    fn record_attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_terminal(&self) {
+        self.terminals.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static CONNECTION_ATTEMPT_TEST_ACCOUNTING: Arc<ConnectionAttemptTestAccounting>;
+}
+
+#[cfg(test)]
+fn record_test_connection_attempt() {
+    let _ = CONNECTION_ATTEMPT_TEST_ACCOUNTING.try_with(|accounting| {
+        accounting.record_attempt();
+    });
+}
+
+#[cfg(test)]
+fn record_test_connection_terminal() {
+    let _ = CONNECTION_ATTEMPT_TEST_ACCOUNTING.try_with(|accounting| {
+        accounting.record_terminal();
+    });
+}
+
 impl ConnectionAttemptMetricGuard {
     pub(crate) fn started() -> Self {
         METRICS
             .session_net_connection_attempts
             .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        record_test_connection_attempt();
         Self { finished: false }
     }
 
     pub(crate) fn finish(&mut self) {
+        #[cfg(test)]
+        if !self.finished {
+            record_test_connection_terminal();
+        }
         self.finished = true;
     }
 }
@@ -404,6 +457,8 @@ impl Drop for ConnectionAttemptMetricGuard {
             METRICS
                 .session_net_connection_failure_timeout
                 .fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            record_test_connection_terminal();
         }
     }
 }
@@ -779,17 +834,23 @@ impl ConnectionLifecycle {
         current_material_epoch: Option<opc_tls::TlsMaterialEpoch>,
         peer_key: &[u8],
     ) {
-        let reason = if current_generation != self.generation {
-            Some(RetirementReason::Explicit)
+        let retirement = if current_generation != self.generation {
+            // Explicit reauthentication is an operator command to prove a
+            // current-generation handshake now. Material publications use
+            // stable jitter to avoid a fleet-wide reconnect burst, but an
+            // explicit generation must not leave a cached lane eligible for
+            // dispatch until that jitter elapses.
+            Some((now, RetirementReason::Explicit))
         } else if current_material_epoch != self.evidence.material_epoch {
-            Some(RetirementReason::MaterialEpoch)
+            Some((
+                now.checked_add(self.policy.deterministic_jitter(peer_key))
+                    .unwrap_or(now),
+                RetirementReason::MaterialEpoch,
+            ))
         } else {
             None
         };
-        if let Some(reason) = reason {
-            let deadline = now
-                .checked_add(self.policy.deterministic_jitter(peer_key))
-                .unwrap_or(now);
+        if let Some((deadline, reason)) = retirement {
             if self
                 .rotation_retire_at
                 .is_none_or(|(current, _)| deadline < current)
@@ -1157,8 +1218,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn explicit_and_epoch_rotation_are_cooperative_and_stable() {
         let now = tokio::time::Instant::now();
+        let jittered = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Duration::from_millis(10),
+            Duration::from_millis(80),
+            Duration::from_secs(30),
+        )
+        .expect("jittered policy");
         let mut lifecycle =
-            ConnectionLifecycle::new(policy(), now, None, None, 3, None).expect("lifecycle");
+            ConnectionLifecycle::new(jittered, now, None, None, 3, None).expect("lifecycle");
         lifecycle.observe_rotation(now, 4, None, b"replica-a");
         assert_eq!(lifecycle.retirement(now), Some(RetirementReason::Explicit));
     }

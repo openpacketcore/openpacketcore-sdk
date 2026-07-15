@@ -4369,19 +4369,40 @@ mod tests {
         }
         assert_eq!(directed.len(), 2, "test requires two distinct edge jitters");
 
+        let material = crate::test_support::RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/client",
+        );
+        let tls_config = material.config();
+        let admitted_epoch = tls_config.material_status().epoch();
         let monitor = PoolLifecycleMonitor::default();
         let observed_at = tokio::time::Instant::now();
-        monitor.publish_generation(1, observed_at);
+        material.rotate();
+        let current_epoch = tls_config.material_status().epoch();
+        monitor.publish_material(Some(current_epoch), observed_at);
         // Model the task blocked behind the one-in-flight mutex while queued
-        // checkouts observe the new generation first.
+        // checkouts observe the new material epoch first.
         tokio::time::advance(Duration::from_millis(50)).await;
         let checkout_at = tokio::time::Instant::now();
-        let mut first = ConnectionLifecycle::new(policy, observed_at, None, None, 0, None)
-            .expect("first lifecycle");
-        let mut second = ConnectionLifecycle::new(policy, observed_at, None, None, 0, None)
-            .expect("second lifecycle");
-        monitor.apply_to(&mut first, 1, None, checkout_at, &directed[0].0);
-        monitor.apply_to(&mut second, 1, None, checkout_at, &directed[1].0);
+        let mut first =
+            ConnectionLifecycle::new(policy, observed_at, None, None, 0, Some(admitted_epoch))
+                .expect("first lifecycle");
+        let mut second =
+            ConnectionLifecycle::new(policy, observed_at, None, None, 0, Some(admitted_epoch))
+                .expect("second lifecycle");
+        monitor.apply_to(
+            &mut first,
+            0,
+            Some(current_epoch),
+            checkout_at,
+            &directed[0].0,
+        );
+        monitor.apply_to(
+            &mut second,
+            0,
+            Some(current_epoch),
+            checkout_at,
+            &directed[1].0,
+        );
         assert_eq!(first.retire_at(), observed_at + directed[0].1);
         assert_eq!(second.retire_at(), observed_at + directed[1].1);
         assert_ne!(first.retire_at(), second.retire_at());
@@ -4389,20 +4410,23 @@ mod tests {
         assert!(second.retirement(checkout_at).is_none());
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        monitor.publish_generation(2, tokio::time::Instant::now());
-        let mut coalesced = ConnectionLifecycle::new(policy, observed_at, None, None, 0, None)
-            .expect("coalesced lifecycle");
+        material.rotate();
+        let latest_epoch = tls_config.material_status().epoch();
+        monitor.publish_material(Some(latest_epoch), tokio::time::Instant::now());
+        let mut coalesced =
+            ConnectionLifecycle::new(policy, observed_at, None, None, 0, Some(admitted_epoch))
+                .expect("coalesced lifecycle");
         monitor.apply_to(
             &mut coalesced,
-            2,
-            None,
+            0,
+            Some(latest_epoch),
             tokio::time::Instant::now(),
             &directed[0].0,
         );
         assert_eq!(
             coalesced.retire_at(),
             observed_at + directed[0].1,
-            "a later generation publication must not postpone an existing stale connection"
+            "a later material publication must not postpone an existing stale connection"
         );
     }
 
@@ -6655,13 +6679,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_rotation_never_restarts_a_partially_consumed_frame_on_the_same_socket() {
+    async fn watch_explicit_reauthentication_discards_a_partial_frame_and_resumes_exactly() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind partial-watch listener");
         let addr = listener.local_addr().expect("partial-watch address");
         let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
-        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept watch client");
             let hello: Request = read_frame(&mut stream, DEFAULT_MAX_FRAME_SIZE)
@@ -6693,11 +6716,45 @@ mod tests {
                 .await
                 .expect("write first watch fragment");
             partial_tx.send(()).expect("publish partial frame");
-            continue_rx.await.expect("continue partial frame");
-            stream
-                .write_all(&encoded[midpoint..])
+            let mut eof = [0_u8; 1];
+            match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut eof))
                 .await
-                .expect("write final watch fragment");
+                .expect("retired partial socket close deadline")
+            {
+                Ok(0) => {}
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                result => panic!(
+                    "explicit reauthentication must close the partially consumed socket: {result:?}"
+                ),
+            }
+            drop(stream);
+
+            let (mut replacement, _) = listener
+                .accept()
+                .await
+                .expect("accept replacement watch client");
+            let hello: Request = read_frame(&mut replacement, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read replacement watch hello");
+            write_frame(&mut replacement, &successful_hello_ack(&hello))
+                .await
+                .expect("write replacement watch hello ack");
+            let request: Request = read_frame(&mut replacement, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read replacement watch request");
+            assert!(
+                matches!(request, Request::Watch { start_sequence: 1 }),
+                "a partial frame must resume from its undelivered sequence"
+            );
+            write_frame(&mut replacement, &Response::WatchStream)
+                .await
+                .expect("write replacement watch ack");
+            write_frame(
+                &mut replacement,
+                &Response::WatchEntry(Ok(valid_deadline_entry())),
+            )
+            .await
+            .expect("write complete replacement watch entry");
         });
         let control = SessionReauthenticationControl::new();
         let policy = ConnectionLifecyclePolicy::try_new(
@@ -6711,23 +6768,11 @@ mod tests {
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)))
             .with_connection_lifecycle(policy)
             .with_reauthentication_control(control.clone());
-        let edge = directed_connection_key(
-            b"direct",
-            backend.binding.local_replica_id().as_str(),
-            backend.binding.remote_replica_id().as_str(),
-        );
-        let jitter = policy.deterministic_jitter(&edge);
-        assert!(
-            jitter > Duration::from_millis(50),
-            "fixed insecure-test edge must leave a partial-frame observation window"
-        );
         let mut watch = backend.watch(1).await.expect("open partial watch");
         partial_rx.await.expect("observe partial watch frame");
         control
             .request_reauthentication()
             .expect("request partial-watch reauthentication");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        continue_tx.send(()).expect("finish partial watch frame");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), watch.next())
                 .await

@@ -507,9 +507,11 @@ one drain window remains.
 
 At TLS completion the transport retains exact monotonic deadline evidence for
 both presented chains and the coherent `TlsMaterialEpoch` admitted by
-`opc-tls`. A later material epoch, or
-`SessionReauthenticationControl::request_reauthentication`, starts cooperative
-retirement after the configured stable jitter. Configure a shared control with
+`opc-tls`. A later material epoch starts cooperative retirement after the
+configured stable jitter. An explicit
+`SessionReauthenticationControl::request_reauthentication` retires cached
+connections immediately so the caller can prove a current-generation
+handshake. Configure a shared control with
 `with_reauthentication_control`, and configure non-default finite bounds with
 `with_connection_lifecycle`, on every client/peer and listener that must rotate
 together.
@@ -523,9 +525,10 @@ matches the current local generation/material epoch and is still dispatch-usable
 resets the gate. Publishing a newer material epoch or requesting explicit
 reauthentication supersedes old cooldowns and cancels an old-epoch handshake;
 the replacement still repeats every TLS, SPIFFE, ALPN, manifest-scope, and
-contract-profile check. Cached authenticated consensus lanes honor their stable
-rotation jitter, while a fresh handshake captured from an older epoch is
-rejected before any Openraft request bytes are written. Connection-attempt
+contract-profile check. Cached authenticated consensus lanes honor stable
+jitter for material rotation; explicit reauthentication retires them
+immediately. A fresh handshake captured from an older epoch is rejected before
+any Openraft request bytes are written. Connection-attempt
 metrics count a cancelled in-flight attempt as a timeout terminal outcome, so
 started attempts remain conserved against terminal plus currently outstanding
 attempts.
@@ -678,9 +681,9 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   0-RTT. Every reconnect pays for a full mutual-TLS handshake so SVID rotation
   cannot reuse a cached peer certificate or authority decision.
 - Authenticated connections now retire at a finite age, exact earliest
-  local/peer presented-chain expiry, material-epoch change, or explicit
-  reauthentication request. Both sides stop new admission at the soft boundary,
-  bound the transport wait and
+  local/peer presented-chain expiry, a jittered material-epoch change, or an
+  immediate explicit reauthentication request. Both sides stop new admission
+  at the soft boundary, bound the transport wait and
   connection-slot lifetime by the hard deadline, and reconnect through a
   complete mutual-TLS/application handshake. An already-admitted supervised
   backend mutation may still finish later and therefore remains typed

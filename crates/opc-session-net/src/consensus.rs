@@ -2403,7 +2403,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cached_consensus_lane_honors_rotation_jitter_before_retirement() {
+    async fn cached_consensus_lane_honors_material_rotation_jitter_before_retirement() {
         let (_server_binding, client_binding) = bindings();
         let policy = ConnectionLifecyclePolicy::try_new(
             Duration::from_secs(60),
@@ -2413,9 +2413,65 @@ mod tests {
             Duration::from_secs(10),
         )
         .expect("lifecycle policy");
+        let material = crate::test_support::RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/1",
+        );
+        let tls_config = material.config();
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::pinned("127.0.0.1:9".parse().expect("test address")),
+            Some(tls_config.clone()),
+            client_binding.clone(),
+            Some(Duration::from_secs(1)),
+        )
+        .with_connection_lifecycle(policy);
+        let now = tokio::time::Instant::now();
+        let (stream, _remote) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(stream);
+        let mut connection = ConsensusConnection {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            lifecycle: ConnectionLifecycle::new(
+                policy,
+                now,
+                None,
+                None,
+                0,
+                Some(tls_config.material_status().epoch()),
+            )
+            .expect("connection lifecycle"),
+        };
+        let edge_key = directed_connection_key(
+            b"consensus",
+            client_binding.local_replica_id().as_str(),
+            client_binding.remote_replica_id().as_str(),
+        );
+        let jitter = policy.deterministic_jitter(&edge_key);
+        assert!(!jitter.is_zero(), "fixture must exercise a non-zero jitter");
+
+        material.rotate();
+        assert!(peer.connection_is_current(&mut connection, now));
+        tokio::time::advance(jitter - Duration::from_nanos(1)).await;
+        assert!(peer.connection_is_current(&mut connection, tokio::time::Instant::now()));
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert!(!peer.connection_is_current(&mut connection, tokio::time::Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_consensus_lane_retires_immediately_for_explicit_reauthentication() {
+        let (_server_binding, client_binding) = bindings();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            Duration::from_millis(80),
+            Duration::from_secs(30),
+        )
+        .expect("lifecycle policy");
         let control = SessionReauthenticationControl::new();
         let peer = RemoteSessionConsensusPeer::new_insecure(
-            client_binding.clone(),
+            client_binding,
             "127.0.0.1:9".parse().expect("test address"),
             Some(Duration::from_secs(1)),
         )
@@ -2432,56 +2488,15 @@ mod tests {
             lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
                 .expect("connection lifecycle"),
         };
-        let edge_key = directed_connection_key(
-            b"consensus",
-            client_binding.local_replica_id().as_str(),
-            client_binding.remote_replica_id().as_str(),
-        );
-        let jitter = policy.deterministic_jitter(&edge_key);
-        assert!(!jitter.is_zero(), "fixture must exercise a non-zero jitter");
 
         control
             .request_reauthentication()
             .expect("rotate generation");
-        assert!(peer.connection_is_current(&mut connection, now));
-        tokio::time::advance(jitter - Duration::from_nanos(1)).await;
-        assert!(peer.connection_is_current(&mut connection, tokio::time::Instant::now()));
-        tokio::time::advance(Duration::from_nanos(1)).await;
-        assert!(!peer.connection_is_current(&mut connection, tokio::time::Instant::now()));
-    }
-
-    #[derive(Clone, Copy)]
-    struct OutboundConnectionAccounting {
-        attempts: u64,
-        terminals: u64,
-    }
-
-    fn outbound_connection_accounting() -> OutboundConnectionAccounting {
-        let terminals = [
-            &METRICS.session_net_connection_successes,
-            &METRICS.session_net_connection_failure_transport,
-            &METRICS.session_net_connection_failure_authentication,
-            &METRICS.session_net_connection_failure_timeout,
-            &METRICS.session_net_connection_failure_protocol,
-            &METRICS.session_net_connection_failure_backend,
-        ]
-        .into_iter()
-        .map(|counter| counter.load(Ordering::Relaxed))
-        .sum();
-        OutboundConnectionAccounting {
-            attempts: METRICS
-                .session_net_connection_attempts
-                .load(Ordering::Relaxed),
-            terminals,
-        }
+        assert!(!peer.connection_is_current(&mut connection, now));
     }
 
     #[tokio::test(start_paused = true)]
     async fn consensus_epoch_supersession_conserves_connection_attempt_accounting() {
-        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
-        let before = outbound_connection_accounting();
         let (_server_binding, client_binding) = bindings();
         let control = SessionReauthenticationControl::new();
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2511,23 +2526,23 @@ mod tests {
             b"supersede-connect".to_vec(),
         )
         .expect("bounded request");
-        let call = tokio::spawn(async move { peer.call(request).await });
+        let accounting = Arc::new(crate::lifecycle::ConnectionAttemptTestAccounting::default());
+        let call = tokio::spawn(crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING.scope(
+            Arc::clone(&accounting),
+            async move { peer.call(request).await },
+        ));
 
         assert_eq!(entered_rx.recv().await, Some(0));
         control.request_reauthentication().expect("advance epoch");
         assert_eq!(entered_rx.recv().await, Some(1));
-        let during = outbound_connection_accounting();
-        assert_eq!(during.attempts - before.attempts, 2);
-        assert_eq!(during.terminals - before.terminals, 1);
+        assert_eq!(accounting.snapshot(), (2, 1));
 
         call.abort();
         assert!(call
             .await
             .expect_err("call must be cancelled")
             .is_cancelled());
-        let after = outbound_connection_accounting();
-        assert_eq!(after.attempts - before.attempts, 2);
-        assert_eq!(after.terminals - before.terminals, 2);
+        assert_eq!(accounting.snapshot(), (2, 2));
     }
 
     #[tokio::test(start_paused = true)]

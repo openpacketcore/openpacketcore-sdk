@@ -457,6 +457,11 @@ attempts, not logical request volume. A cancelled in-flight attempt is exported
 as a timeout outcome so `started = terminal + outstanding` remains the
 accounting invariant.
 
+Material-epoch retirement of an already authenticated cached lane uses the
+configured stable per-peer jitter. An explicit reauthentication request is an
+operator demand for current-generation proof and retires cached lanes
+immediately; it does not wait for material jitter.
+
 Install these alert rules for a consensus CNF. There is deliberately no fixed
 reference span. The earlier 1320-second example was unsafe because its
 300-second observation/rollback term could not contain even one member's two
@@ -3062,9 +3067,11 @@ encryption/HKMS composition above Openraft.
    `request_reauthentication()` on the controls for its affected outbound peers
    and listeners. The generation is monotonic and process-local; never set it
    back.
-5. During the deterministic jitter/drain interval, verify no new work enters
-   old connections, transport waits and connection slots end within the hard
-   deadline, replacements complete full mutual TLS/application negotiation,
+5. During the bounded retirement/drain interval, verify no new work enters old
+   connections. A material-only change may consume its deterministic jitter;
+   the explicit reauthentication in step 4 retires cached lanes immediately.
+   Verify transport waits and connection slots end within the hard deadline,
+   replacements complete full mutual TLS/application negotiation,
    drain overruns stay zero, and durable readiness remains fresh. An admitted
    supervised mutation may finish after transport closure; treat its outcome as
    ambiguous, never replay it automatically, and use authoritative readback or

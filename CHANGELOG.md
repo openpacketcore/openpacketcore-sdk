@@ -348,9 +348,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new admission at soft retirement, bound the transport wait and connection
   slot by the hard deadline, and repeat mutual TLS plus identity, nonce, ALPN,
   version, and exact profile checks on replacements.
-  `SessionReauthenticationControl` provides a
-  cooperative CNF trigger with deterministic directed-peer jitter and bounded
-  reconnect backoff. Legacy watches resume from the exact delivered successor;
+  Material-epoch changes use deterministic directed-peer jitter;
+  `SessionReauthenticationControl` provides an immediate CNF trigger for
+  current-generation proof. Both paths retain bounded reconnect backoff.
+  Legacy watches resume from the exact delivered successor;
   mutations retry only after the complete fixed `ConnectionRetiring`
   no-dispatch proof. An authenticated post-TLS rotation race before bootstrap
   acknowledgement now returns
@@ -1120,11 +1121,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certificate soft/hard expiry. Material or explicit-reauthentication epoch
   changes supersede old waits and in-flight handshakes; only a current,
   dispatch-usable authenticated connection resets the gate. Cached consensus
-  lanes now retain deterministic rotation jitter, while newly established
-  stale-epoch connections still fail before Openraft request bytes. Cancelled
-  outbound attempts publish a terminal timeout metric, preserving attempt
-  accounting. Openraft authority, HKMS/encryption/AAD boundaries, durable
-  formats, and the #164 fleet recovery SLO are unchanged.
+  lanes retain deterministic jitter for material rotation, while explicit
+  reauthentication retires them immediately for current-generation proof and
+  newly established stale-epoch connections still fail before Openraft request
+  bytes. Cancelled outbound attempts publish a terminal timeout metric,
+  preserving attempt accounting. Openraft authority, HKMS/encryption/AAD
+  boundaries, durable formats, and the #164 fleet recovery SLO are unchanged.
 - **Conditional S2b Create Session identity — `opc-proto-gtpv2c`:**
   ProcedureAware Create Session Request decode now accepts the TS 29.274
   UICC-less emergency identity shape (MEI instance 0 plus an instance-0
