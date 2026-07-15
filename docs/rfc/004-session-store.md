@@ -33,8 +33,13 @@ tests cover trust overlap/removal and one bounded synthetic
 admission-loss/malformed-last-good plus short-lived-SVID-expiry recovery slice
 under mixed lease/CAS mutation, linearizable-read, watch, complete-restore,
 readiness, and connection-recycling traffic. Only typed backend-unavailable or
-operation-outcome-unavailable terminal results may enter the qualification
-worker's same-owner, strictly-higher-fence record reconciliation. The fixed
+operation-outcome-unavailable terminal results may enter qualification
+recovery. Mutation or lease outcomes that can make authority ambiguous discard
+the prior guard, reacquire same-owner authority at a strictly higher fence, and
+validate the exact scheduled record. Read-only get, restore-scan, and readiness
+outcomes retain the already-proven guard and validate that same exact record
+without minting unnecessary fencing authority. Evidence binds this routing as
+`stage-aware-known-authority/v1`. The fixed
 schedule drops one successful release response per mutator, allows eight
 outcomes per node, 8 seconds per recovery episode, and a 50 ms retry delay;
 phase completion requires every interruption to be reconciled. Lease loss,

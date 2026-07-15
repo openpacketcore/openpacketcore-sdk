@@ -372,8 +372,13 @@ linearizable-read, watch, complete-restore, readiness, and connection-recycling
 traffic active through the exact synthetic fault/expiry slice. The
 qualification worker may reconcile only a typed backend-unavailable or
 operation-outcome-unavailable result observed after the accepted operation
-reaches a terminal checkpoint. It reacquires same-owner authority with a
-strictly higher fence and validates the exact scheduled record. The private
+reaches a terminal checkpoint. Mutation or lease outcomes that can make
+authority ambiguous discard the prior guard, reacquire same-owner authority
+with a strictly higher fence, and validate the exact scheduled record.
+Read-only get, restore-scan, and readiness outcomes retain the already-proven
+guard and validate that same exact record without minting unnecessary fencing
+authority. Evidence binds this routing as `stage-aware-known-authority/v1`.
+The private
 schedule drops one successful release response per mutator to prove this path.
 More than eight such outcomes per node, any recovery episode beyond 8 seconds,
 any retry before the fixed 50 ms delay, or phase completion with an unresolved

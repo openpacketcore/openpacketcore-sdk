@@ -134,6 +134,8 @@ pub const QUALIFICATION_TRAFFIC_TTL_MILLIS: u64 = 60 * 60 * 1_000;
 /// before the qualification run fails closed.
 pub const QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE: u64 = 8;
 /// Maximum wall-clock interval for one authority-and-record reconciliation.
+/// Ambiguous mutation outcomes advance same-owner fencing authority; read-only
+/// checkpoints retain the already-proven guard and validate its exact record.
 /// An accepted backend operation is still allowed to reach its terminal
 /// outcome; a success observed after this deadline fails the qualification.
 pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS: u64 = 8_000;
@@ -143,6 +145,9 @@ pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS: u64 = 50;
 /// exercises same-owner recovery after one successful lease release.
 pub const QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE: &str =
     "post-release-response-loss/v1";
+/// Versioned authority reconciliation algorithm bound into the schedule.
+pub const QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE: &str =
+    "stage-aware-known-authority/v1";
 /// Maximum wall-clock budget for one stopped watch's journal reconciliation.
 pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS: u64 = 25_000;
 /// Maximum journal entries one stopped watch may reconcile.
@@ -660,6 +665,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "availability_interruption_budget_per_node={}\n",
             "availability_recovery_millis={}\n",
             "availability_retry_millis={}\n",
+            "authority_reconciliation_profile={}\n",
             "synthetic_interruption_profile={}\n",
             "watch_reconciliation_millis={}\n",
             "watch_reconciliation_max_entries={}\n",
@@ -704,6 +710,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
         QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
         QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
+        QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE,
         QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES,
@@ -1477,8 +1484,10 @@ pub struct QualificationTrafficStatus {
     /// checkpoints. This never includes semantic or invariant failures.
     pub availability_interruptions: u64,
     /// Typed interruption outcomes closed by a completed authority-and-record
-    /// reconciliation. Equality with `availability_interruptions` proves no
-    /// recovery episode is still unresolved.
+    /// reconciliation. Ambiguous mutation outcomes advance the fence; read-only
+    /// checkpoints retain and revalidate the already-proven guard. Equality
+    /// with `availability_interruptions` proves no recovery episode is still
+    /// unresolved.
     pub availability_recoveries: u64,
     /// Largest uninterrupted run of typed availability outcomes before a
     /// successful reconciliation.
@@ -1805,6 +1814,10 @@ mod tests {
         assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS, 8_000);
         assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS, 50);
         assert_eq!(
+            QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE,
+            "stage-aware-known-authority/v1"
+        );
+        assert_eq!(
             QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
             "post-release-response-loss/v1"
         );
@@ -1835,8 +1848,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:19cb20d917d528a12e24da8b99afba640729fa01e07bd075dc653d33e938c874",
-                "sha256:5c7839c73d01d23ba5ecabe21a27fcc319168a8ea7a5f70f2bb539d8e3f96ecd",
+                "sha256:5feb47397403db27b62de56aca1c8528e5ec694df6dcf8a6edf2300b9b466199",
+                "sha256:e2770f91efa46e0d0cfad66e24cb89bc4af7c9643fb2087c0f70cd675a03a4d6",
             )
         );
         assert!(is_exact_sha256(&three));

@@ -404,6 +404,19 @@ fn traffic_failure_is_recoverable(failure: QualificationTrafficFailure) -> bool 
     )
 }
 
+// These checkpoints occur only after renew and CAS have returned terminal
+// success. Their availability outcome cannot make lease or record authority
+// ambiguous, so recovery must not mint a replacement fence unnecessarily.
+fn traffic_failure_retains_known_authority(failure: QualificationTrafficFailure) -> bool {
+    traffic_failure_is_recoverable(failure)
+        && matches!(
+            failure.stage,
+            QualificationTrafficFailureStage::Get
+                | QualificationTrafficFailureStage::RestoreScan
+                | QualificationTrafficFailureStage::ReadinessProbe
+        )
+}
+
 fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficErrorClass {
     match error {
         StoreError::BackendUnavailable(_) => QualificationTrafficErrorClass::BackendUnavailable,
@@ -1576,7 +1589,7 @@ async fn run_traffic_mutation_task(
                     break Some(failure);
                 }
                 let deadline = traffic_recovery_deadline(shutdown_deadline);
-                match reconcile_traffic_mutation_authority(
+                match reconcile_traffic_mutation_checkpoint(
                     &protected,
                     &key,
                     &owner,
@@ -1693,6 +1706,160 @@ async fn run_traffic_mutation_task(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_traffic_mutation_checkpoint(
+    protected: &ProtectedStore,
+    key: &SessionKey,
+    owner: &OwnerId,
+    lease: &mut Option<LeaseGuard>,
+    seed: u64,
+    member_count: usize,
+    node_index: usize,
+    initial_failure: QualificationTrafficFailure,
+    deadline: tokio::time::Instant,
+    consecutive_availability_interruptions: &mut u64,
+    observation: &QualificationTrafficObservation,
+) -> Result<(), QualificationTrafficFailure> {
+    if traffic_failure_retains_known_authority(initial_failure) {
+        return reconcile_traffic_known_authority(
+            protected,
+            key,
+            owner,
+            lease.as_ref(),
+            seed,
+            member_count,
+            node_index,
+            initial_failure,
+            deadline,
+            consecutive_availability_interruptions,
+            observation,
+        )
+        .await;
+    }
+    reconcile_traffic_mutation_authority(
+        protected,
+        key,
+        owner,
+        lease,
+        seed,
+        member_count,
+        node_index,
+        initial_failure,
+        deadline,
+        consecutive_availability_interruptions,
+        observation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_traffic_known_authority(
+    protected: &ProtectedStore,
+    key: &SessionKey,
+    owner: &OwnerId,
+    lease: Option<&LeaseGuard>,
+    seed: u64,
+    member_count: usize,
+    node_index: usize,
+    initial_failure: QualificationTrafficFailure,
+    deadline: tokio::time::Instant,
+    consecutive_availability_interruptions: &mut u64,
+    observation: &QualificationTrafficObservation,
+) -> Result<(), QualificationTrafficFailure> {
+    let Some(current_lease) = lease else {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::LeaseAcquire,
+        ));
+    };
+    let observed_generation = observation.last_generation.load(Ordering::Acquire);
+    let observed_record_fence = observation.last_record_fence.load(Ordering::Acquire);
+    if observed_generation == 0
+        || observed_record_fence == 0
+        || !lease_authority_is_preserved(
+            key,
+            owner,
+            observed_record_fence,
+            current_lease.key(),
+            current_lease.owner(),
+            current_lease.fence().get(),
+        )
+    {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::Get,
+        ));
+    }
+
+    let mut last_failure = initial_failure;
+    let stored = loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(last_failure);
+        }
+        match protected.get(key).await {
+            Ok(Some(stored)) => break stored,
+            Ok(None) => {
+                return Err(QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::Get,
+                ));
+            }
+            Err(error) => {
+                let failure = QualificationTrafficFailure::store(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    QualificationTrafficFailureStage::Get,
+                    &error,
+                );
+                last_failure = failure;
+                if !traffic_failure_is_recoverable(failure)
+                    || !observation
+                        .record_availability_interruption(consecutive_availability_interruptions)
+                    || !wait_for_traffic_recovery_retry(deadline).await
+                {
+                    return Err(failure);
+                }
+            }
+        }
+    };
+    if tokio::time::Instant::now() > deadline {
+        return Err(last_failure);
+    }
+    let Some((generation, record_fence)) = reconciled_traffic_record_identity(
+        &stored,
+        key,
+        owner,
+        seed,
+        member_count,
+        node_index,
+        observed_generation,
+        observed_record_fence,
+        None,
+        initial_failure.stage,
+    ) else {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::Get,
+        ));
+    };
+    if generation != observed_generation
+        || record_fence != observed_record_fence
+        || !lease_authority_is_preserved(
+            key,
+            owner,
+            record_fence,
+            current_lease.key(),
+            current_lease.owner(),
+            current_lease.fence().get(),
+        )
+    {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::Get,
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3039,6 +3206,43 @@ mod tests {
             )
         ));
         assert!(!traffic_failure_is_recoverable(
+            QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Get,
+            )
+        ));
+    }
+
+    #[test]
+    fn traffic_recovery_retains_authority_only_for_known_outcome_checkpoints() {
+        for stage in [
+            QualificationTrafficFailureStage::Get,
+            QualificationTrafficFailureStage::RestoreScan,
+            QualificationTrafficFailureStage::ReadinessProbe,
+        ] {
+            assert!(traffic_failure_retains_known_authority(
+                QualificationTrafficFailure::backend_unavailable(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    stage,
+                )
+            ));
+        }
+        for stage in [
+            QualificationTrafficFailureStage::LeaseRenew,
+            QualificationTrafficFailureStage::CompareAndSet,
+            QualificationTrafficFailureStage::LeaseRelease,
+            QualificationTrafficFailureStage::LeaseAcquire,
+            QualificationTrafficFailureStage::Watch,
+            QualificationTrafficFailureStage::TaskJoin,
+        ] {
+            assert!(!traffic_failure_retains_known_authority(
+                QualificationTrafficFailure::backend_unavailable(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    stage,
+                )
+            ));
+        }
+        assert!(!traffic_failure_retains_known_authority(
             QualificationTrafficFailure::fixed(
                 QualificationTrafficFailureCode::InvariantViolation,
                 QualificationTrafficFailureStage::Get,

@@ -134,9 +134,14 @@ real or deployed network partition. The cases keep bounded mixed lease/CAS
 mutation, linearizable-read, watch, complete-restore, readiness, and
 connection-recycling traffic active through the exact synthetic fault/expiry
 slice. Only typed backend-unavailable or operation-outcome-unavailable results
-at completed operation checkpoints may enter recovery. Recovery reacquires
-same-owner authority at a strictly higher fence and validates the exact
-scheduled record. The private schedule drops one successful release response
+at completed operation checkpoints may enter recovery. Mutation or lease
+outcomes that can make authority ambiguous discard the prior guard, reacquire
+same-owner authority at a strictly higher fence, and validate the exact
+scheduled record. Read-only get, restore-scan, and readiness outcomes retain
+the already-proven guard and validate that same exact record without minting
+unnecessary fencing authority. Evidence binds this routing as
+`stage-aware-known-authority/v1`. The private schedule drops one successful
+release response
 per mutator to exercise that path, and is bound to eight outcomes per node, 8
 seconds per episode, and a fixed 50 ms retry delay; all three bounds and the
 total/recovered/consecutive counters are schedule evidence. Phase completion

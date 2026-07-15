@@ -42,8 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   continues through soft retirement and hard expiry; replacement reconciles
   the stopped watch from the bounded durable journal. A mutation task may
   reconcile only typed backend-unavailable or operation-outcome-unavailable
-  terminal results: it reacquires same-owner authority at a strictly higher
-  fence and validates the exact scheduled record before continuing. The
+  terminal results. Mutation or lease outcomes that can make authority
+  ambiguous discard the prior guard, reacquire same-owner authority at a
+  strictly higher fence, and validate the exact scheduled record. Read-only
+  get, restore-scan, and readiness outcomes retain the already-proven guard and
+  validate that same exact record without minting unnecessary fencing
+  authority. This routing is bound into evidence as
+  `stage-aware-known-authority/v1`. The
   schedule deterministically drops one successful release response to exercise
   this path, permits at most eight such outcomes per node, gives each recovery
   episode 8 seconds, retries only after a fixed 50 ms delay, and exposes total,
