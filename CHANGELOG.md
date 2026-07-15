@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **SWm emergency identity construction — `opc-proto-diameter`:** consumers
+  can now obtain the canonical TS 23.003 IMEI Emergency NAI with
+  `emergency_nai` and build the byte-identical RFC 3748
+  EAP-Response/Identity required by the TS 33.402 emergency verifiers with
+  `build_eap_response_identity`. The EAP builder copies identity octets
+  verbatim, rejects bodies that exceed its two-octet packet length before
+  allocation, and reports only a stable redaction-safe error label. Existing
+  parsing, authorization evidence, and ordinary SWm wire behavior are
+  unchanged.
 - **Bounded IKE_SA_INIT error responses — `opc-proto-ikev2`:** responders can
   now build notify-only `NO_PROPOSAL_CHOSEN` and `INVALID_KE_PAYLOAD` responses
   with a zero responder SPI, canonical response flags, and Message ID zero.
