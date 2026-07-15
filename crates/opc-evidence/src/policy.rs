@@ -169,6 +169,7 @@ impl<'a> GateEvaluator<'a> {
             ));
         }
 
+        validate_json_artifact("conformance report", conformance_report)?;
         validate_json_artifact("SBOM", sbom)?;
         validate_json_artifact("VEX", vex)?;
         validate_json_artifact("provenance", provenance)?;
@@ -209,10 +210,33 @@ impl<'a> GateEvaluator<'a> {
                     "release policy requires a non-mock bundle verifier".to_string(),
                 ));
             }
+            if self.policy.mode == PolicyMode::Release && verifier.identity().is_none() {
+                return Err(EvidenceError::GapGateFailed(
+                    "release policy requires an authenticated bundle signing identity".to_string(),
+                ));
+            }
             let files = files.ok_or_else(|| {
                 EvidenceError::GapGateFailed("missing files for bundle verification".to_string())
             })?;
             crate::bundle::verify_bundle(b, verifier, files)?;
+            verify_signed_artifact_match(
+                "conformance report",
+                b.conformance_report.as_deref(),
+                conformance_report,
+            )?;
+            verify_signed_artifact_match("SBOM", b.sbom.as_deref(), sbom)?;
+            verify_signed_artifact_match("VEX", b.vex.as_deref(), vex)?;
+            verify_signed_artifact_match("provenance", b.provenance.as_deref(), provenance)?;
+            verify_signed_artifact_match(
+                "performance baseline",
+                b.performance_baseline.as_deref(),
+                performance_baseline,
+            )?;
+            verify_signed_artifact_match(
+                "data governance report",
+                b.data_governance_report.as_deref(),
+                data_governance_report,
+            )?;
         } else if verifier.is_some() || files.is_some() {
             return Err(EvidenceError::GapGateFailed(
                 "verifier/files supplied without a bundle".to_string(),
@@ -314,6 +338,19 @@ impl<'a> GateEvaluator<'a> {
 
         Ok(())
     }
+}
+
+fn verify_signed_artifact_match(
+    label: &str,
+    signed: Option<&str>,
+    evaluated: Option<&str>,
+) -> Result<(), EvidenceError> {
+    if signed == evaluated {
+        return Ok(());
+    }
+    Err(EvidenceError::GapGateFailed(format!(
+        "{label} does not exactly match the signed evidence bundle"
+    )))
 }
 
 fn validate_waived_record(

@@ -75,6 +75,25 @@ fn release_policy_rejects_mock_bundle_verifier() {
         err.to_string().contains("non-mock bundle verifier"),
         "unexpected error: {err}"
     );
+
+    let identityless_verifier = MockVerifier::new_release_capable_without_identity("policy-key");
+    let res = evaluator.evaluate(
+        &[],
+        &[],
+        Some(&bundle),
+        None,
+        Some("{}"),
+        None,
+        None,
+        None,
+        None,
+        Some(&identityless_verifier),
+        Some(&std::collections::HashMap::new()),
+    );
+    let err = res.expect_err("release verification must authenticate a signing identity");
+    assert!(err
+        .to_string()
+        .contains("authenticated bundle signing identity"));
 }
 
 #[test]
@@ -267,7 +286,7 @@ fn test_gap_006_006_gate_policy() {
         &[record.clone()],
         &[],
         Some(&bundle),
-        Some("conformance report content"),
+        Some("{}"),
         Some(sbom_json),
         Some(vex_json),
         Some(prov_json),
@@ -277,6 +296,24 @@ fn test_gap_006_006_gate_policy() {
         Some(&bundle_files),
     );
     assert!(res.is_ok());
+
+    let substituted_sbom = r#"{"bomFormat":"substituted"}"#;
+    let res = evaluator.evaluate(
+        &[record.clone()],
+        &[],
+        Some(&bundle),
+        Some("{}"),
+        Some(substituted_sbom),
+        Some(vex_json),
+        Some(prov_json),
+        Some(perf_json),
+        None,
+        Some(&verifier),
+        Some(&bundle_files),
+    );
+    let err = res.expect_err("evaluated artifacts must be the exact signed bytes");
+    assert!(err.to_string().contains("SBOM"));
+    assert!(!err.to_string().contains("substituted"));
 
     let mut bad_record = record.clone();
     bad_record.source_refs.clear();
@@ -380,11 +417,14 @@ fn test_gap_006_006_gate_policy() {
         "abcdef0123456789abcdef0123456789abcdef01",
         "wrongcommit0123456789abcdef0123456789abc",
     );
+    let mut wrong_commit_bundle = bundle.clone();
+    wrong_commit_bundle.provenance = Some(prov_wrong_commit.clone());
+    sign_bundle(&mut wrong_commit_bundle, &signer).unwrap();
     let res = evaluator.evaluate(
         &[record.clone()],
         &[],
-        Some(&bundle),
-        None,
+        Some(&wrong_commit_bundle),
+        Some("{}"),
         Some(sbom_json),
         Some(vex_json),
         Some(&prov_wrong_commit),
@@ -396,11 +436,14 @@ fn test_gap_006_006_gate_policy() {
     assert!(res.is_err());
 
     let prov_dirty = prov_json.replace("\"worktree_dirty\": false", "\"worktree_dirty\": true");
+    let mut dirty_bundle = bundle.clone();
+    dirty_bundle.provenance = Some(prov_dirty.clone());
+    sign_bundle(&mut dirty_bundle, &signer).unwrap();
     let res = evaluator.evaluate(
         &[record.clone()],
         &[],
-        Some(&bundle),
-        None,
+        Some(&dirty_bundle),
+        Some("{}"),
         Some(sbom_json),
         Some(vex_json),
         Some(&prov_dirty),
@@ -426,11 +469,15 @@ fn test_gap_006_006_gate_policy() {
     );
     assert!(res.is_err());
 
+    let unsafe_report = r#"{"token":"secret-value","endpoint":"192.0.2.10"}"#;
+    let mut unsafe_bundle = bundle.clone();
+    unsafe_bundle.conformance_report = Some(unsafe_report.to_string());
+    sign_bundle(&mut unsafe_bundle, &signer).unwrap();
     let res = evaluator.evaluate(
         &[record],
         &[],
-        Some(&bundle),
-        Some(r#"{"token":"secret-value","endpoint":"192.0.2.10"}"#),
+        Some(&unsafe_bundle),
+        Some(unsafe_report),
         Some(sbom_json),
         Some(vex_json),
         Some(prov_json),

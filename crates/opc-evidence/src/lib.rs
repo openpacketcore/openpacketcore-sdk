@@ -22,8 +22,9 @@ pub mod tag;
 pub mod vex;
 
 pub use bundle::{
-    bundle_signing_bytes, manifest_signing_bytes, verify_bundle, BundleSigner, BundleVerifier,
-    BundleVerifierSecurity, EvidenceBundle,
+    bundle_signing_bytes, manifest_signing_bytes, sign_bundle, validate_manifest_structure,
+    verify_bundle, BundleSigner, BundleVerifier, BundleVerifierSecurity, EvidenceBundle,
+    BUNDLE_SIGNING_DOMAIN, MANIFEST_SIGNING_DOMAIN,
 };
 pub use data_governance::DataGovernanceEvidenceReport;
 pub use dataplane::{

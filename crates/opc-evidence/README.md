@@ -13,7 +13,7 @@ assemble and enforce the complete signed RFC 006 release artifact set.
 
 - Bundle APIs: `EvidenceBundle`, `BundleSigner`, `BundleVerifier`,
   `BundleVerifierSecurity`, `manifest_signing_bytes`, `bundle_signing_bytes`,
-  and `verify_bundle`.
+  `sign_bundle`, `validate_manifest_structure`, and `verify_bundle`.
 - Requirement APIs: `RequirementId`, `EvidenceRecord`, `WaiverRecord`,
   `ConformanceTag`, `parse_tags`, `scan_file`, and `scan_directory`.
 - Gap APIs: `Gap`, `GapOptions`, `GapSeverity`, `GapStatus`, and
@@ -51,12 +51,16 @@ assert_eq!(record.status, ConformanceStatus::Tested);
 - These are library APIs, not an end-to-end release attestation. Current PR and
   release workflows do not invoke `GateEvaluator` over the complete required
   artifact set.
-- Embedded bundle blobs are covered by `bundle_signing_bytes` and verified with
-  their manifest digests. The SBOM, VEX, provenance, performance, and governance
-  arguments supplied separately to `GateEvaluator` are not yet cross-checked
-  against that verified bundle.
-- Repository workflows do not wire a production signer/verifier or complete
-  bundle/policy execution.
+- Manifest and bundle signing inputs are deterministic and domain-separated;
+  embedded blobs are digest-bound to the bundle signature. Release evaluation
+  requires the verifier's authenticated identity to match the signed manifest
+  and requires every separately supplied policy artifact to be byte-for-byte
+  identical to its signed bundle value.
+- Manifest verification rejects unsafe relative paths, duplicate paths,
+  conflicting path digests, and malformed SHA-256 values before accepting a
+  signature or reading an artifact.
+- Repository workflows do not wire a production external signer/verifier or
+  complete bundle/policy execution.
 - Release gate evaluation requires `BundleVerifierSecurity::Release`; test or
   mock verifiers are rejected in release mode.
 - Bundle verification checks schema version, signatures, file digests, and

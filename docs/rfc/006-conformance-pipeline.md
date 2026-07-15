@@ -423,6 +423,19 @@ evidence-bundle/
 - generation timestamp,
 - known incomplete sections.
 
+Manifest file and artifact paths MUST be normalized relative bundle paths.
+Absolute paths, parent/current-directory components, platform-specific path
+prefixes, duplicate entries, conflicting digests, and malformed SHA-256 values
+MUST fail closed before signing or verification.
+
+Standalone manifest signatures and complete bundle signatures use distinct
+versioned domain separators. Complete bundle signing bytes deterministically
+bind the canonical manifest plus the digest of every embedded report. The
+authenticated verifier identity MUST exactly match `signing_identity`; a
+release verifier that cannot report its authenticated identity is insufficient.
+If a gate receives an artifact separately from the bundle, it MUST evaluate the
+exact signed bytes rather than a substitutable second copy.
+
 ### 10.3 Packet-core evidence packs
 
 A release evidence bundle MAY include one or more packet-core evidence packs
