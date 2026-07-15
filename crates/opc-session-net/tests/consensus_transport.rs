@@ -45,7 +45,6 @@ const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
         .saturating_mul(2)
         .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
 );
-const CONSENSUS_CACHED_LANES_PER_PEER: usize = 2;
 
 // Each scenario below starts a complete Openraft fleet in its own Tokio
 // runtime. Running those fleets concurrently is artificial and can starve
@@ -865,7 +864,7 @@ impl RotatingConsensusFleet {
             let sender = self.replicas[path.0];
             async move {
                 let deadline = tokio::time::Instant::now() + DURABLE_CONSENSUS_OPERATION_TIMEOUT;
-                let mut stale_lanes_seen = 0usize;
+                let mut unavailable_attempts = 0usize;
                 let outcome = loop {
                     match peer.call(request(&manifest, sender, Vec::new())).await {
                         Ok(response) if resolver_calls.load(Ordering::SeqCst) > baseline => {
@@ -873,17 +872,16 @@ impl RotatingConsensusFleet {
                         }
                         Ok(_) => {}
                         // A remote-only material change cannot be observed by
-                        // this client's lifecycle watcher. Both fixed cached
-                        // lanes may therefore discover the peer retirement as
-                        // an EOF before the next call performs a fresh
-                        // handshake. This qualification-only empty Vote probe
-                        // may consume each stale lane once; production RPCs
-                        // must never transparently replay an uncertain call.
-                        Err(SessionConsensusPeerError::Unavailable)
-                            if resolver_calls.load(Ordering::SeqCst) == baseline
-                                && stale_lanes_seen < CONSENSUS_CACHED_LANES_PER_PEER =>
-                        {
-                            stale_lanes_seen += 1;
+                        // this client's lifecycle watcher. Cached lanes may
+                        // discover peer retirement as EOF, and resolution may
+                        // complete before the replacement TLS listener is
+                        // ready to finish a handshake. This qualification-only
+                        // empty Vote probe is idempotent, so it may retry
+                        // availability failures until the absolute deadline;
+                        // production RPCs must never transparently replay an
+                        // uncertain call.
+                        Err(SessionConsensusPeerError::Unavailable) => {
+                            unavailable_attempts += 1;
                         }
                         Err(error) => break Err(error),
                     }
@@ -897,15 +895,15 @@ impl RotatingConsensusFleet {
                     outcome,
                     baseline,
                     resolver_calls.load(Ordering::SeqCst),
-                    stale_lanes_seen,
+                    unavailable_attempts,
                 )
             }
         }))
         .await;
-        for (path, outcome, baseline, resolutions, stale_lanes_seen) in outcomes {
+        for (path, outcome, baseline, resolutions, unavailable_attempts) in outcomes {
             assert!(
                 outcome.is_ok(),
-                "fresh bidirectional rotation handshake failed: path={path:?}, outcome={outcome:?}, baseline={baseline}, resolutions={resolutions}, stale_lanes_seen={stale_lanes_seen}"
+                "fresh bidirectional rotation handshake failed: path={path:?}, outcome={outcome:?}, baseline={baseline}, resolutions={resolutions}, unavailable_attempts={unavailable_attempts}"
             );
             assert!(
                 resolutions > baseline,
