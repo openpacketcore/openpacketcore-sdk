@@ -25,12 +25,14 @@ kubeconform -strict -summary session-ha-3.json
 kubectl apply --server-side --dry-run=server -f session-ha-3.json
 ```
 
-The image boundary accepts only an explicit lower-case DNS registry (with an
-optional numeric port), normalized OCI repository components, and a lower-case
-SHA-256 digest. Tags, implicit default registries, malformed separators, and
-tag-plus-digest aliases are rejected. The immutable ConfigMap name is derived
-from the complete sorted node-configuration data, so any configuration change
-selects a new object and cannot silently reuse stale immutable data.
+The image boundary accepts only an explicit lower-case registry authority: the
+exact `localhost` name, a DNS/IP name containing `.`, or a host with an
+explicit numeric port. It also requires normalized OCI repository components
+and a lower-case SHA-256 digest. Bare first components, tags, implicit default
+registries, malformed separators, and tag-plus-digest aliases are rejected.
+The immutable ConfigMap name is derived from the complete sorted
+node-configuration data, so any configuration change selects a new object and
+cannot silently reuse stale immutable data.
 
 Before applying it, provision one Secret per member named
 `opc-session-ha-node-N-svid`. Each Secret must contain `tls.crt`, `tls.key`, and

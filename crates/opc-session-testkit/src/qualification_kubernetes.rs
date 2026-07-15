@@ -522,11 +522,13 @@ fn is_qualification_oci_registry(value: &str) -> bool {
     {
         return false;
     }
-    port.is_none_or(|port| {
-        !port.is_empty()
-            && port.bytes().all(|byte| byte.is_ascii_digit())
-            && port.parse::<u16>().is_ok_and(|port| port != 0)
-    })
+    let is_explicit_registry = host == "localhost" || host.contains('.') || port.is_some();
+    is_explicit_registry
+        && port.is_none_or(|port| {
+            !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port != 0)
+        })
 }
 
 fn is_oci_repository_component(value: &str) -> bool {
@@ -747,6 +749,10 @@ mod tests {
         let digest = "a".repeat(64);
         for repository in [
             "registry.invalid/session-node",
+            "registry:5000/team/session-node",
+            "localhost/session-node",
+            "localhost:5000/team/session-node",
+            "127.0.0.1:5000/team/session-node",
             "registry.invalid:5000/team/session_node",
             "registry.invalid/team/session__node",
             "registry.invalid/team/session---node",
@@ -758,6 +764,8 @@ mod tests {
 
         for repository in [
             "session-node",
+            "team/session-node",
+            "registry/session-node",
             "registry_invalid/session-node",
             "registry.invalid:port/session-node",
             "registry.invalid:0/session-node",
@@ -780,6 +788,12 @@ mod tests {
     fn render_rejects_mutable_or_aliased_operator_inputs() {
         let mut candidate = config(3);
         candidate.image = "registry.invalid/opc-session-quorum-node:latest".to_owned();
+        assert_eq!(
+            candidate.validate(),
+            Err(QualificationKubernetesManifestError::InvalidImage)
+        );
+        candidate = config(3);
+        candidate.image = format!("team/session-node@sha256:{}", "a".repeat(64));
         assert_eq!(
             candidate.validate(),
             Err(QualificationKubernetesManifestError::InvalidImage)

@@ -78,26 +78,30 @@ fn renderer_emits_strict_three_and_five_member_lists() {
 
 #[test]
 fn renderer_fails_closed_without_echoing_rejected_inputs() {
-    let rejected = "registry.invalid/private/session-node:latest";
-    let output = renderer()
-        .args([
-            "--members",
-            "3",
-            "--namespace",
-            "session-ha-qualification",
-            "--image",
-            rejected,
-            "--trust-domain",
-            "qualification.openpacketcore.invalid",
-        ])
-        .output()
-        .expect("run manifest renderer");
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
-    assert_eq!(
-        stderr,
-        "qualification Kubernetes manifest rendering failed\n"
-    );
-    assert!(!stderr.contains(rejected));
+    for rejected in [
+        "registry.invalid/private/session-node:latest".to_owned(),
+        format!("team/session-node@sha256:{}", "a".repeat(64)),
+    ] {
+        let output = renderer()
+            .args([
+                "--members",
+                "3",
+                "--namespace",
+                "session-ha-qualification",
+                "--image",
+                &rejected,
+                "--trust-domain",
+                "qualification.openpacketcore.invalid",
+            ])
+            .output()
+            .expect("run manifest renderer");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
+        assert_eq!(
+            stderr,
+            "qualification Kubernetes manifest rendering failed\n"
+        );
+        assert!(!stderr.contains(&rejected));
+    }
 }
