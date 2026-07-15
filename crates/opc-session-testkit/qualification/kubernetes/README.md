@@ -25,6 +25,13 @@ kubeconform -strict -summary session-ha-3.json
 kubectl apply --server-side --dry-run=server -f session-ha-3.json
 ```
 
+The image boundary accepts only an explicit lower-case DNS registry (with an
+optional numeric port), normalized OCI repository components, and a lower-case
+SHA-256 digest. Tags, implicit default registries, malformed separators, and
+tag-plus-digest aliases are rejected. The immutable ConfigMap name is derived
+from the complete sorted node-configuration data, so any configuration change
+selects a new object and cannot silently reuse stale immutable data.
+
 Before applying it, provision one Secret per member named
 `opc-session-ha-node-N-svid`. Each Secret must contain `tls.crt`, `tls.key`, and
 `ca.crt`; its leaf URI SAN must equal the exact SPIFFE ID in that member's
@@ -40,6 +47,15 @@ has the same address family as the `0.0.0.0:7443` listener. The node resolves
 only that manifest-bound endpoint for outbound connections; mTLS still
 authenticates the exact manifest SPIFFE identity. Plaintext remains unavailable
 outside the explicit loopback test feature.
+
+The egress NetworkPolicy permits DNS only to pods labelled `k8s-app=kube-dns`
+in the namespace labelled `kubernetes.io/metadata.name=kube-system`, over TCP
+or UDP port 53. A qualification cluster must provide and prove that exact DNS
+path; NodeLocal DNS or differently labelled resolvers require an explicitly
+reviewed manifest variant. Kubernetes NetworkPolicy cannot restrict DNS query
+names, so this is a resolver/port boundary, not an FQDN allow-list. Canonical
+manifest endpoints plus mTLS and exact SPIFFE membership remain the peer
+authorization boundary.
 
 The process keeps stdin open so an authenticated campaign controller can drive
 the existing strict JSON-line protocol. A real CNF `cnfctl` must still own that

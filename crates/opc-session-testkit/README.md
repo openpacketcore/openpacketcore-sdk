@@ -86,9 +86,11 @@ the command and the remaining CNF qualification responsibilities. This
 foundation does not constitute deployed evidence and does not change the
 experimental profile.
 
-Its strict private node-control schema is version 2; version 1 is rejected
-because lifecycle replies did not carry the fixed `superseded` and `abandoned`
-terminal outcomes. Node config accepts `projected_mtls` with an absolute
+Its strict private node configuration/control schema is version 3. Version 2
+is explicitly rejected because it predates the routing-aware optional
+`dial_addr` representation; version 1 is also rejected because lifecycle
+replies did not carry the fixed `superseded` and `abandoned` terminal
+outcomes. Node config accepts `projected_mtls` with an absolute
 projected volume root inside the node workspace, normalized relative
 certificate/key/bundle names, a bounded polling interval, and a finite
 validated connection lifecycle policy. The control protocol exposes only

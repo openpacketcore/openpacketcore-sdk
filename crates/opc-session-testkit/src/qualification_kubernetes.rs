@@ -11,6 +11,7 @@ use opc_session_net::{
 };
 use opc_session_store::ReplicaEndpoint;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::qualification::{
@@ -22,7 +23,7 @@ use crate::qualification::{
 
 const FLEET_NAME: &str = "opc-session-ha";
 const PEER_SERVICE_NAME: &str = "opc-session-ha-peer";
-const CONFIG_MAP_NAME: &str = "opc-session-ha-config";
+const CONFIG_MAP_NAME_PREFIX: &str = "opc-session-ha-config";
 const SERVICE_ACCOUNT_NAME: &str = "opc-session-ha";
 const CONSENSUS_PORT: u16 = 7443;
 const WORKSPACE_DIRECTORY: &str = "/var/lib/opc-session-qualification";
@@ -150,15 +151,16 @@ pub fn render_qualification_kubernetes_manifest(
         node_configs.insert(format!("node-{node_index}.json"), encoded);
     }
 
+    let config_map_name = content_addressed_config_map_name(&node_configs)?;
     items.push(json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
-        "metadata": object_metadata(CONFIG_MAP_NAME, config),
+        "metadata": object_metadata(&config_map_name, config),
         "immutable": true,
         "data": node_configs,
     }));
     for node_index in 0..config.member_count {
-        items.push(member_stateful_set(config, node_index));
+        items.push(member_stateful_set(config, node_index, &config_map_name));
     }
 
     Ok(json!({
@@ -169,6 +171,15 @@ pub fn render_qualification_kubernetes_manifest(
         },
         "items": items,
     }))
+}
+
+fn content_addressed_config_map_name(
+    node_configs: &BTreeMap<String, String>,
+) -> Result<String, QualificationKubernetesManifestError> {
+    let encoded = serde_json::to_vec(node_configs)
+        .map_err(|_| QualificationKubernetesManifestError::InvalidNodeConfiguration)?;
+    let digest = Sha256::digest(encoded);
+    Ok(format!("{CONFIG_MAP_NAME_PREFIX}-{digest:x}"))
 }
 
 fn production_lifecycle(
@@ -297,6 +308,14 @@ fn network_policy(config: &QualificationKubernetesManifestConfig) -> Value {
                     "ports": [{ "port": CONSENSUS_PORT, "protocol": "TCP" }],
                 },
                 {
+                    "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": { "kubernetes.io/metadata.name": "kube-system" },
+                        },
+                        "podSelector": {
+                            "matchLabels": { "k8s-app": "kube-dns" },
+                        },
+                    }],
                     "ports": [
                         { "port": 53, "protocol": "UDP" },
                         { "port": 53, "protocol": "TCP" },
@@ -319,7 +338,11 @@ fn disruption_budget(config: &QualificationKubernetesManifestConfig) -> Value {
     })
 }
 
-fn member_stateful_set(config: &QualificationKubernetesManifestConfig, node_index: usize) -> Value {
+fn member_stateful_set(
+    config: &QualificationKubernetesManifestConfig,
+    node_index: usize,
+    config_map_name: &str,
+) -> Value {
     let name = format!("{FLEET_NAME}-{node_index}");
     let labels = member_labels(node_index);
     let secret_name = format!("{FLEET_NAME}-node-{node_index}-svid");
@@ -408,7 +431,7 @@ fn member_stateful_set(config: &QualificationKubernetesManifestConfig, node_inde
                         {
                             "name": "config",
                             "configMap": {
-                                "name": CONFIG_MAP_NAME,
+                                "name": config_map_name,
                                 "defaultMode": 288,
                                 "items": [{ "key": config_key, "path": "node.json", "mode": 288 }],
                             },
@@ -461,32 +484,100 @@ fn is_kubernetes_dns_label(value: &str) -> bool {
 }
 
 fn is_digest_pinned_image(value: &str) -> bool {
-    let Some((repository, digest)) = value.rsplit_once("@sha256:") else {
+    let Some((repository, digest)) = value.split_once("@sha256:") else {
         return false;
     };
-    !repository.is_empty()
-        && repository.len() <= 512
-        && !repository.contains('@')
-        && repository.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'/' | b':' | b'_' | b'-')
-        })
-        && repository
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && repository
-            .as_bytes()
-            .last()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && repository
-            .split('/')
-            .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
+    is_qualification_oci_repository(repository)
         && digest.len() == 64
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_qualification_oci_repository(value: &str) -> bool {
+    // Qualification deliberately requires an explicit lower-case registry so
+    // no runtime-specific default registry or namespace can change the image.
+    const OCI_NAME_MAX_BYTES: usize = 255;
+
+    if value.is_empty() || value.len() > OCI_NAME_MAX_BYTES || value.contains('@') {
+        return false;
+    }
+    let Some((registry, path)) = value.split_once('/') else {
+        return false;
+    };
+    is_qualification_oci_registry(registry)
+        && !path.is_empty()
+        && path.split('/').all(is_oci_repository_component)
+}
+
+fn is_qualification_oci_registry(value: &str) -> bool {
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    };
+    if host.is_empty()
+        || host.len() > 253
+        || host.contains(':')
+        || !host.split('.').all(is_kubernetes_dns_label)
+    {
+        return false;
+    }
+    port.is_none_or(|port| {
+        !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port != 0)
+    })
+}
+
+fn is_oci_repository_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    if !bytes
+        .first()
+        .copied()
+        .is_some_and(is_oci_lower_alphanumeric)
+    {
+        return false;
+    }
+    while index < bytes.len() {
+        while bytes
+            .get(index)
+            .copied()
+            .is_some_and(is_oci_lower_alphanumeric)
+        {
+            index += 1;
+        }
+        if index == bytes.len() {
+            return true;
+        }
+        match bytes[index] {
+            b'.' => index += 1,
+            b'_' => {
+                index += 1;
+                if bytes.get(index) == Some(&b'_') {
+                    index += 1;
+                }
+            }
+            b'-' => {
+                while bytes.get(index) == Some(&b'-') {
+                    index += 1;
+                }
+            }
+            _ => return false,
+        }
+        if !bytes
+            .get(index)
+            .copied()
+            .is_some_and(is_oci_lower_alphanumeric)
+        {
+            return false;
+        }
+    }
+    false
+}
+
+fn is_oci_lower_alphanumeric(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit()
 }
 
 #[cfg(test)]
@@ -535,6 +626,16 @@ mod tests {
                 .iter()
                 .find(|item| item["kind"] == "ConfigMap")
                 .expect("configuration map");
+            let config_map_name = config_map["metadata"]["name"]
+                .as_str()
+                .expect("content-addressed configuration map");
+            let config_digest = config_map_name
+                .strip_prefix(&format!("{CONFIG_MAP_NAME_PREFIX}-"))
+                .expect("configuration map prefix");
+            assert_eq!(config_digest.len(), 64);
+            assert!(config_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
             let data = config_map["data"].as_object().expect("node configs");
             assert_eq!(data.len(), member_count);
             for node_index in 0..member_count {
@@ -543,6 +644,7 @@ mod tests {
                     .expect("encoded node config");
                 let node: QualificationNodeConfig =
                     serde_json::from_str(encoded).expect("strict node config");
+                assert_eq!(node.schema_version, 3);
                 assert_eq!(node.node_index, node_index);
                 assert_eq!(
                     node.configuration_generation,
@@ -564,6 +666,113 @@ mod tests {
                     Ok(())
                 );
             }
+            assert!(items
+                .iter()
+                .filter(|item| item["kind"] == "StatefulSet")
+                .all(
+                    |item| item["spec"]["template"]["spec"]["volumes"][1]["configMap"]["name"]
+                        == config_map_name
+                ));
+        }
+    }
+
+    #[test]
+    fn immutable_config_map_name_tracks_complete_node_data() {
+        let initial = render_qualification_kubernetes_manifest(&config(3)).expect("initial render");
+        let mut changed_config = config(3);
+        changed_config.trust_domain = "rotated.openpacketcore.invalid".to_owned();
+        let changed =
+            render_qualification_kubernetes_manifest(&changed_config).expect("changed render");
+
+        let config_map_name = |manifest: &Value| {
+            manifest["items"]
+                .as_array()
+                .expect("manifest items")
+                .iter()
+                .find(|item| item["kind"] == "ConfigMap")
+                .expect("configuration map")["metadata"]["name"]
+                .as_str()
+                .expect("configuration map name")
+                .to_owned()
+        };
+        assert_ne!(config_map_name(&initial), config_map_name(&changed));
+    }
+
+    #[test]
+    fn dns_egress_is_scoped_to_the_declared_cluster_resolver() {
+        let manifest = render_qualification_kubernetes_manifest(&config(3)).expect("render");
+        let policy = manifest["items"]
+            .as_array()
+            .expect("manifest items")
+            .iter()
+            .find(|item| item["kind"] == "NetworkPolicy")
+            .expect("network policy");
+        let egress = policy["spec"]["egress"].as_array().expect("egress rules");
+        let dns_rule = egress
+            .iter()
+            .find(|rule| {
+                rule["ports"].as_array().is_some_and(|ports| {
+                    ports
+                        .iter()
+                        .any(|port| port["port"] == 53 && port["protocol"] == "UDP")
+                })
+            })
+            .expect("DNS rule");
+        for protocol in ["TCP", "UDP"] {
+            assert!(dns_rule["ports"].as_array().is_some_and(|ports| {
+                ports
+                    .iter()
+                    .any(|port| port["port"] == 53 && port["protocol"] == protocol)
+            }));
+        }
+        assert_eq!(dns_rule["to"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            dns_rule["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "kube-system"
+        );
+        assert_eq!(
+            dns_rule["to"][0]["podSelector"]["matchLabels"]["k8s-app"],
+            "kube-dns"
+        );
+        assert!(egress.iter().all(|rule| {
+            let admits_dns = rule["ports"]
+                .as_array()
+                .is_some_and(|ports| ports.iter().any(|port| port["port"] == 53));
+            !admits_dns || rule["to"].as_array().is_some_and(|peers| !peers.is_empty())
+        }));
+    }
+
+    #[test]
+    fn image_validation_enforces_the_qualification_oci_subset() {
+        let digest = "a".repeat(64);
+        for repository in [
+            "registry.invalid/session-node",
+            "registry.invalid:5000/team/session_node",
+            "registry.invalid/team/session__node",
+            "registry.invalid/team/session---node",
+        ] {
+            assert!(is_digest_pinned_image(&format!(
+                "{repository}@sha256:{digest}"
+            )));
+        }
+
+        for repository in [
+            "session-node",
+            "registry_invalid/session-node",
+            "registry.invalid:port/session-node",
+            "registry.invalid:0/session-node",
+            "registry.invalid:70000/session-node",
+            "registry.invalid/session-node:release",
+            "registry.invalid/team/Session-node",
+            "registry.invalid/team//session-node",
+            "registry.invalid/team/.session-node",
+            "registry.invalid/team/session-node.",
+            "registry.invalid/team/session..node",
+            "registry.invalid/team/session___node",
+        ] {
+            assert!(!is_digest_pinned_image(&format!(
+                "{repository}@sha256:{digest}"
+            )));
         }
     }
 
@@ -595,6 +804,15 @@ mod tests {
         );
         candidate = config(3);
         candidate.image = format!("Registry.invalid/session-node@sha256:{}", "a".repeat(64));
+        assert_eq!(
+            candidate.validate(),
+            Err(QualificationKubernetesManifestError::InvalidImage)
+        );
+        candidate = config(3);
+        candidate.image = format!(
+            "registry.invalid/session-node:release@sha256:{}",
+            "a".repeat(64)
+        );
         assert_eq!(
             candidate.validate(),
             Err(QualificationKubernetesManifestError::InvalidImage)

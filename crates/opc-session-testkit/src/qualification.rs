@@ -67,8 +67,8 @@ pub const SESSION_HA_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-mtls-candidate-evidence.schema.json");
 
-/// Version of the private node-control protocol.
-pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 2;
+/// Version of the private node configuration and control protocol.
+pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 3;
 /// Maximum accepted node configuration document.
 pub const QUALIFICATION_MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Maximum accepted control request or response line.
@@ -2370,11 +2370,13 @@ mod tests {
     }
 
     #[test]
-    fn node_control_schema_rejects_pre_lifecycle_outcome_version() {
-        assert_eq!(QUALIFICATION_NODE_SCHEMA_VERSION, 2);
-        let mut config = valid_config();
-        config.schema_version = 1;
-        assert_eq!(config.validate(), Err(QualificationConfigError::Schema));
+    fn node_control_schema_rejects_incompatible_versions() {
+        assert_eq!(QUALIFICATION_NODE_SCHEMA_VERSION, 3);
+        for incompatible_version in [1, 2] {
+            let mut config = valid_config();
+            config.schema_version = incompatible_version;
+            assert_eq!(config.validate(), Err(QualificationConfigError::Schema));
+        }
     }
 
     #[test]

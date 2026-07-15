@@ -33,6 +33,14 @@ fn renderer_emits_strict_three_and_five_member_lists() {
         assert!(output.stderr.is_empty());
         let manifest: Value = serde_json::from_slice(&output.stdout).expect("Kubernetes JSON list");
         let items = manifest["items"].as_array().expect("manifest items");
+        let config_map_name = items
+            .iter()
+            .find(|item| item["kind"] == "ConfigMap")
+            .expect("configuration map")["metadata"]["name"]
+            .as_str()
+            .expect("content-addressed configuration map");
+        assert_eq!(config_map_name.len(), "opc-session-ha-config-".len() + 64);
+        assert!(config_map_name.starts_with("opc-session-ha-config-"));
         let stateful_sets = items
             .iter()
             .filter(|item| item["kind"] == "StatefulSet")
@@ -50,6 +58,10 @@ fn renderer_emits_strict_three_and_five_member_lists() {
             assert_eq!(
                 stateful_set["spec"]["template"]["spec"]["readinessGates"][0]["conditionType"],
                 "opc.openpacketcore.io/durable-quorum-ready"
+            );
+            assert_eq!(
+                stateful_set["spec"]["template"]["spec"]["volumes"][1]["configMap"]["name"],
+                config_map_name
             );
             assert_eq!(
                 stateful_set["spec"]["template"]["spec"]["volumes"][2]["projected"]["sources"][0]
