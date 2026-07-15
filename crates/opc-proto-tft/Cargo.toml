@@ -1,0 +1,24 @@
+[package]
+name = "opc-proto-tft"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Canonical 3GPP Traffic Flow Template model and codec"
+readme = "README.md"
+documentation = "https://docs.rs/opc-proto-tft"
+keywords = ["3gpp", "tft", "gtpv2-c", "ikev2", "telecom"]
+categories = ["network-programming", "encoding"]
+
+[dependencies]
+bytes = { workspace = true }
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+quickcheck = "1"
+
+[lints]
+workspace = true

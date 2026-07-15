@@ -2946,6 +2946,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-proto-tft"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-protocol",
+ "quickcheck",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opc-protocol"
 version = "0.2.0"
 dependencies = [
