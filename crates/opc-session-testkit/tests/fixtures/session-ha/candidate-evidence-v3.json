@@ -35,7 +35,7 @@
   "checker": {
     "name": "check-session-ha-concurrent-history.py",
     "version": "3",
-    "sha256": "sha256:e720083924a0df7d4a45842f8856fe96231470ae15fb78d3be5622ff93262a05"
+    "sha256": "sha256:7573648bdec6941f37c446bf3f7333ae9c0da7adc600b8b226c5cb8cff789e61"
   },
   "coverage": {
     "atomic_batch_serialization": true,

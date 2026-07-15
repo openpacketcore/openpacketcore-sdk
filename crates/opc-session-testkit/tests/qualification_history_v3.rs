@@ -259,6 +259,61 @@ fn checker_rejects_batch_watch_restore_and_readiness_violations() {
 }
 
 #[test]
+fn checker_rejects_future_batches_claimed_by_earlier_observations() {
+    let cases: [(&str, HistoryMutation); 2] = [
+        ("watch_future_commit_violation", |rows| {
+            rows[2]["started_ns"] = 800.into();
+            rows[2]["completed_ns"] = 900.into();
+            rows[4]["started_ns"] = 901.into();
+            rows[4]["completed_ns"] = 950.into();
+            for index in [6, 9, 12] {
+                rows[index]["operation"]["commit_index"] = 10.into();
+                rows[index]["operation"]["applied_index"] = 10.into();
+            }
+        }),
+        ("readiness_future_commit_violation", |rows| {
+            rows[2]["started_ns"] = 600.into();
+            rows[2]["completed_ns"] = 650.into();
+        }),
+    ];
+
+    for (expected, mutate) in cases {
+        let mut rows = fixture_rows();
+        mutate(&mut rows);
+        let output = run_mutated(&rows);
+        assert_eq!(output.status.code(), Some(1), "{expected}");
+        let result = output_json(&output);
+        assert_eq!(result["status"], "fail", "{expected}");
+        assert!(
+            result["violation_codes"]
+                .as_array()
+                .expect("violation codes")
+                .iter()
+                .any(|value| value == expected),
+            "expected {expected}, got {}",
+            result["violation_codes"]
+        );
+    }
+}
+
+#[test]
+fn checker_accepts_batch_concurrent_with_readiness_barrier() {
+    let mut rows = fixture_rows();
+    rows[2]["started_ns"] = 600.into();
+    rows[2]["completed_ns"] = 650.into();
+    for index in [6, 9, 12] {
+        rows[index]["completed_ns"] = 700.into();
+    }
+
+    let output = run_mutated(&rows);
+    assert!(output.status.success());
+    let result = output_json(&output);
+    assert_eq!(result["status"], "pass");
+    assert_eq!(result["violation_codes"], serde_json::json!([]));
+    assert_eq!(result["inconclusive_codes"], serde_json::json!([]));
+}
+
+#[test]
 fn checker_keeps_unknown_batch_outcomes_inconclusive() {
     let mut rows = fixture_rows();
     rows[2]["operation"]["outcome"] = "unavailable".into();

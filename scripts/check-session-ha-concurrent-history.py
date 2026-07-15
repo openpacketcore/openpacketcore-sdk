@@ -521,8 +521,6 @@ def validate_history(rows: list[dict[str, Any]], contract: Contract) -> list[dic
         elif kind == "restore":
             validate_restore(operation)
         elif kind == "readiness":
-            if started != completed:
-                raise InputError("readiness sample is not instantaneous")
             validate_readiness(operation)
         else:
             raise InputError("history operation kind is unsupported")
@@ -673,6 +671,13 @@ def evaluate_watches(
         if not state_known:
             continue
         complete_through = operation["complete_through_index"]
+        if any(
+            item["started_ns"] > row["completed_ns"]
+            and item["operation"]["linearization_index"] <= complete_through
+            for item in successes
+        ):
+            result.violations.add("watch_future_commit_violation")
+            continue
         acknowledged_during_watch = [
             item["operation"]["linearization_index"]
             for item in successes
@@ -773,6 +778,13 @@ def evaluate_readiness(
             term = operation["term"]
             commit_index = operation["commit_index"]
             applied_index = operation["applied_index"]
+            if any(
+                row["started_ns"] > sample["completed_ns"]
+                and row["operation"]["linearization_index"] <= commit_index
+                for row in successes
+            ):
+                result.violations.add("readiness_future_commit_violation")
+                continue
             required_commit = max(
                 (
                     row["operation"]["linearization_index"]
