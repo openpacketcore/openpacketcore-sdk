@@ -1,0 +1,56 @@
+{
+  "schema_version": "opc-session-ha-candidate-evidence/v3",
+  "profile_id": "opc-session-openraft-ha/v3-candidate",
+  "experimental": true,
+  "qualification_complete": false,
+  "counts_for_production": false,
+  "source_revision": "0000000000000000000000000000000000000000",
+  "source_tree_status": "dirty_unqualified",
+  "artifact": {
+    "name": "opc-session-quorum-node",
+    "version": "0.2.0-synthetic-fixture",
+    "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "exact_release_artifact": false
+  },
+  "execution": {
+    "history_id": "candidate-history-v3",
+    "campaign_started_ns": 0,
+    "campaign_completed_ns": 1000,
+    "topology_members": 3,
+    "process_ids": ["node-0", "node-1", "node-2"],
+    "max_readiness_gap_ns": 500,
+    "fault_schedule_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "workload": {
+    "schedule_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "isolated_digest_namespace": true,
+    "complete_write_history": true
+  },
+  "history": {
+    "schema_version": "opc-session-ha-concurrent-history/v3",
+    "sha256": "sha256:0760768b670c723546c7ba72b532b1ed4354b26acd99b537825ef9d70263f719",
+    "operation_count": 14,
+    "required_kinds": ["batch", "watch", "restore", "readiness"]
+  },
+  "checker": {
+    "name": "check-session-ha-concurrent-history.py",
+    "version": "3",
+    "sha256": "sha256:e720083924a0df7d4a45842f8856fe96231470ae15fb78d3be5622ff93262a05"
+  },
+  "coverage": {
+    "atomic_batch_serialization": true,
+    "gap_free_watch": true,
+    "exact_restore_snapshot": true,
+    "continuous_readiness_gating": true
+  },
+  "remaining_acceptance": [
+    "deployed_kubernetes_3_5",
+    "real_network_and_storage_faults",
+    "crash_point_matrix",
+    "version_migration_and_rollback",
+    "platform_resource_soak",
+    "remote_hkms_rotation",
+    "live_alert_fire_and_clear",
+    "signed_release_bundle"
+  ]
+}

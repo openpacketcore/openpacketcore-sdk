@@ -52,6 +52,17 @@ pub const SESSION_HA_SCHEDULE_SCHEMA_JSON: &str =
 /// JSON Schema for one experimental qualification evidence record.
 pub const SESSION_HA_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v2/session-ha-evidence.schema.json");
+/// Closed schema for one bounded concurrent batch/watch/restore/readiness
+/// history. This v3 candidate contract does not graduate the experimental HA
+/// profile.
+pub const SESSION_HA_CONCURRENT_HISTORY_SCHEMA_JSON: &str =
+    include_str!("../qualification/v3/session-ha-concurrent-history.schema.json");
+/// Closed schema for digest-binding one v3 concurrent-history candidate to an
+/// exact artifact, fault schedule, independent checker, and remaining
+/// production acceptance. The schema fixes both production-credit fields to
+/// false.
+pub const SESSION_HA_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
+    include_str!("../qualification/v3/session-ha-candidate-evidence.schema.json");
 /// Strict schema for one incomplete production-mTLS harness checkpoint.
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-mtls-candidate-evidence.schema.json");
