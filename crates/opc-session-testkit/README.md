@@ -326,6 +326,50 @@ It is not silently widened by the newer multiprocess rotation core. Those seven
 gaps are not an exhaustive #164 acceptance inventory, and neither checkpoint is
 deployed production evidence.
 
+## Concurrent History Candidate
+
+`qualification/v3/session-ha-candidate-evidence.schema.json` is a closed,
+immutable candidate contract for the next #143 evidence pipeline. It binds an
+exact artifact, source revision, fault schedule, isolated workload schedule,
+JSONL history, and independent checker digest. The schema fixes
+`experimental = true`, `qualification_complete = false`, and
+`counts_for_production = false`; a v3 document cannot graduate the HA profile.
+
+`scripts/check-session-ha-concurrent-history.py` uses only the Python standard
+library and imports no SDK code. It accepts overlapping operation intervals and
+checks four evidence surfaces together:
+
+- successful and conflicting multi-key batches must admit the claimed
+  Openraft-index serialization, preserve real-time order, and apply every
+  successful batch atomically;
+- each completed watch must contain the exact ordered mutation stream after its
+  requested index through its proven completion head;
+- each complete restore scan must equal the exact state at its snapshot index;
+- every configured process must have a gap-bounded readiness sample sequence;
+  a ready sample may not claim authority without expected quorum, may not
+  regress term/commit/apply state, and must include every write acknowledged
+  before the sample. Its `commit_index` is the index proven by the completed
+  Openraft linearizable barrier; `applied_index` is observed afterward and may
+  therefore be later, but never earlier.
+
+The checker rejects duplicate fields, non-integer JSON numbers, oversized
+inputs, unknown fields, digest mismatches, incomplete operation-kind coverage,
+and malformed outcome payloads. Indeterminate or unavailable batch outcomes
+remain explicitly inconclusive because watch and restore completeness cannot be
+derived through an unknown state transition. Keys, owners, and values cross the
+checker boundary only as exact domain-produced SHA-256 digests.
+
+This first v3 slice is bounded to 64 batch invocations, 16 mutations per batch,
+4,096 watch events, 4,096 restore records, and a single isolated digest
+namespace per history window. It is a contract and synthetic checker fixture,
+not deployed evidence. Kubernetes 3/5-node execution, real network/storage and
+crash-point faults, migration/rollback, platform soak, remote-HKMS rotation,
+live alert verification, and a signed release bundle remain required by #143.
+
+Run the focused contract and checker suite with:
+
+`cargo test --locked -p opc-session-testkit --test qualification_history_v3`.
+
 ## Status Notes
 
 - `publish = false`; this crate is test-only.
