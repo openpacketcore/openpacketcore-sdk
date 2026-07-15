@@ -899,6 +899,11 @@ malformed trust and retains its exact last-good TLS epoch. The survivor quorum
 must retain fresh durable readiness and advance an encrypted canary. The test
 then restarts the gated member at its exact manifest address, proves catch-up,
 repairs the malformed generation, and proves its retry counter stops. It next
+performs exactly one unclean same-disk, exact-address restart of a stable
+follower while that member's mutation and watch tasks are active. Survivors
+must advance committed canary and mixed traffic during the outage; the returned
+member must reconcile the exact bounded journal/current record and resume at a
+strictly higher same-owner fence inside 26 seconds. It then
 publishes a same-issuer leaf with a 75-second remaining-validity/expiry budget.
 With the default 30-second drain window, its fixed soft-retirement boundary is
 `not_after - 30 seconds`: every incident directed path is refreshed below the
@@ -908,13 +913,33 @@ retirement by expiry. At the hard deadline every affected connection is
 drained, the source and controller report
 `Unavailable`/`LastGoodExpired`, and the SVID expiry gauge is zero. Survivors
 again prove readiness and encrypted-canary progress before a valid long-lived
-leaf restores all paths and all-voter readiness without restarting that
-process.
+leaf advances only that member's explicit reauthentication generation and
+restores fresh bidirectional mTLS/bootstrap proofs on its incident paths. The
+other survivors' explicit and local-material-epoch retirement counters must
+remain unchanged. All lifecycle drains and every still-live survivor
+availability episode must be settled before the next traffic baseline, then
+all-voter readiness and canary progress complete without restarting that
+process. Schedule profile `member-scoped-reauth-settled-baseline/v2` makes that
+boundary explicit: the atomic projected-data rename starts the 86-second
+fail-safe and 60-second two-stage server tail, while a final 2.5-second quiet
+interval covers cold connect plus maximum reconnect backoff. A prepublication
+delta and 13-second observation checkpoints conservatively bound the worst-case
+gap between actual survivor progress events to 26 seconds. Availability counters
+may advance by at most one interruption/recovery pair per survivor while the
+expired member rejoins; the pair must settle inside the 26-second SLO, and a
+second or late episode fails closed. Fault-era attempt,
+terminal, and reconnect deltas remain within the fixed 84/160 per-node bound:
+ordinary 24/40 plus fifteen five-second refresh rounds over four/eight incident
+paths. Cancellation-classified `abandoned` outcomes, protocol/backend outcomes,
+and drain overruns remain forbidden; the subsequent scoped-reauthentication
+interval retains the zero-failure budget. Non-intrusive workload snapshots drive continuity polling; the final
+watch-head proof still uses the fail-closed authoritative replication-head
+read.
 
 The admission gate is not a real or deployed network partition. These two
 cases keep the bounded mixed lease/CAS/read, watch, restore-scan, readiness, and
 connection-recycling workload active, including exact journal reconciliation
-for the restarted watcher. They do not provide a broader restart/fault matrix,
+for both restart paths. They do not provide a broader restart/fault matrix,
 resource or soak evidence,
 remote-HKMS evidence, deployed-CNF evidence, signed release evidence, or an
 evidence-schema/profile claim. Openraft remains the sole commit authority;
@@ -929,7 +954,12 @@ durable readiness and exercise every directed peer path before old-trust
 removal. Treat `connection_retirements_total{reason="idle_timeout"}` as bounded
 authenticated connection turnover, not a transport incident. Continue paging
 on `connection_attempts_total{outcome="timeout"}`: TLS/application bootstrap
-silence and partial authenticated frames remain true timeout failures.
+silence and partial authenticated frames remain true timeout failures. A known
+material or explicit-reauthentication epoch handoff is instead `superseded`;
+caller abort or runtime teardown before explicit terminal classification is
+`abandoned`. Neither series weakens the timeout alert. Bound `superseded`
+during intentional rotation and investigate any sustained `abandoned` rate as
+local lifecycle churn.
 
 The private `opc-session-testkit` component core now runs the documented
 trust/leaf/intermediate/root forward and rollback order in separate three- and
@@ -937,9 +967,10 @@ five-process fleets on one host. It uses atomic projected `..data` swaps,
 production lifecycle defaults, separate source/controller status, affected-path
 fresh handshakes after every member, all paths at completed fleet cutovers,
 fresh all-voter readiness, and an encrypted canary. The companion cases add
-the exact synthetic admission-loss/malformed-last-good combination and bounded
-same-issuer expiry/replacement behavior above while the bounded mixed workload
-continues. This still does not qualify a CNF deployment, a real network
+the exact synthetic admission-loss/malformed-last-good combination, one
+bounded unclean active-mutator same-disk restart, and bounded same-issuer
+expiry/replacement behavior above while the bounded mixed workload continues.
+This still does not qualify a CNF deployment, a real network
 partition, a broader restart/fault matrix, resource pressure, supported
 platforms, soak, remote HKMS, or signed release evidence; keep #164/#143 gates
 closed until those campaigns pass.

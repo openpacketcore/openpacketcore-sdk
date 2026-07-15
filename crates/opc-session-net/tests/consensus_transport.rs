@@ -469,19 +469,13 @@ struct InstrumentedConsensusPeer {
     stats: Arc<TransportStats>,
 }
 
-#[async_trait]
-impl SessionConsensusPeer for InstrumentedConsensusPeer {
-    fn node_id(&self) -> opc_session_store::SessionConsensusNodeId {
-        self.inner.node_id()
-    }
-
-    async fn call(
+impl InstrumentedConsensusPeer {
+    fn record_result(
         &self,
-        request: SessionConsensusWireRequest,
-    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
-        let family = request.family.as_str();
-        let result = self.inner.call(request).await;
-        let status = match &result {
+        family: &str,
+        result: &Result<SessionConsensusWireResponse, SessionConsensusPeerError>,
+    ) {
+        let status = match result {
             Ok(response) if response.result.is_ok() => "ok",
             Ok(response) => match response.result {
                 Err(SessionConsensusPeerError::Unavailable) => "remote_unavailable",
@@ -502,6 +496,33 @@ impl SessionConsensusPeer for InstrumentedConsensusPeer {
             Err(_) => "other",
         };
         self.stats.record(format!("{family}:{status}"));
+    }
+}
+
+#[async_trait]
+impl SessionConsensusPeer for InstrumentedConsensusPeer {
+    fn node_id(&self) -> opc_session_store::SessionConsensusNodeId {
+        self.inner.node_id()
+    }
+
+    async fn call(
+        &self,
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let family = request.family.as_str();
+        let result = self.inner.call(request).await;
+        self.record_result(family, &result);
+        result
+    }
+
+    async fn call_with_timeout(
+        &self,
+        request: SessionConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let family = request.family.as_str();
+        let result = self.inner.call_with_timeout(request, timeout).await;
+        self.record_result(family, &result);
         result
     }
 }

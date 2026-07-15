@@ -382,8 +382,9 @@ pub(crate) struct ReconnectAttempt {
     finished: bool,
 }
 
-/// Conserves outbound connection-attempt accounting when a caller future is
-/// cancelled while DNS, TCP, TLS, or bootstrap work is still in flight.
+/// Conserves connection-attempt accounting when an outbound connect or an
+/// accepted inbound handler ends before it records an explicit outcome.
+#[must_use = "a started connection attempt must remain guarded until its terminal outcome"]
 pub(crate) struct ConnectionAttemptMetricGuard {
     finished: bool,
 }
@@ -393,14 +394,18 @@ pub(crate) struct ConnectionAttemptMetricGuard {
 pub(crate) struct ConnectionAttemptTestAccounting {
     attempts: AtomicU64,
     terminals: AtomicU64,
+    superseded: AtomicU64,
+    abandoned: AtomicU64,
 }
 
 #[cfg(test)]
 impl ConnectionAttemptTestAccounting {
-    pub(crate) fn snapshot(&self) -> (u64, u64) {
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64) {
         (
             self.attempts.load(Ordering::Relaxed),
             self.terminals.load(Ordering::Relaxed),
+            self.superseded.load(Ordering::Relaxed),
+            self.abandoned.load(Ordering::Relaxed),
         )
     }
 
@@ -410,6 +415,14 @@ impl ConnectionAttemptTestAccounting {
 
     fn record_terminal(&self) {
         self.terminals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_superseded(&self) {
+        self.superseded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_abandoned(&self) {
+        self.abandoned.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -432,6 +445,20 @@ fn record_test_connection_terminal() {
     });
 }
 
+#[cfg(test)]
+fn record_test_connection_superseded() {
+    let _ = CONNECTION_ATTEMPT_TEST_ACCOUNTING.try_with(|accounting| {
+        accounting.record_superseded();
+    });
+}
+
+#[cfg(test)]
+fn record_test_connection_abandoned() {
+    let _ = CONNECTION_ATTEMPT_TEST_ACCOUNTING.try_with(|accounting| {
+        accounting.record_abandoned();
+    });
+}
+
 impl ConnectionAttemptMetricGuard {
     pub(crate) fn started() -> Self {
         METRICS
@@ -449,16 +476,34 @@ impl ConnectionAttemptMetricGuard {
         }
         self.finished = true;
     }
+
+    pub(crate) fn finish_superseded(&mut self) {
+        if self.finished {
+            return;
+        }
+        METRICS
+            .session_net_connection_superseded
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            record_test_connection_terminal();
+            record_test_connection_superseded();
+        }
+        self.finished = true;
+    }
 }
 
 impl Drop for ConnectionAttemptMetricGuard {
     fn drop(&mut self) {
         if !self.finished {
             METRICS
-                .session_net_connection_failure_timeout
+                .session_net_connection_abandoned
                 .fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
-            record_test_connection_terminal();
+            {
+                record_test_connection_terminal();
+                record_test_connection_abandoned();
+            }
         }
     }
 }
@@ -1402,6 +1447,25 @@ mod tests {
             .expect("waiter task")
             .expect("waiter admission")
             .succeeded();
+    }
+
+    #[tokio::test]
+    async fn connection_attempt_guard_distinguishes_superseded_and_abandoned_terminals() {
+        let accounting = Arc::new(ConnectionAttemptTestAccounting::default());
+        CONNECTION_ATTEMPT_TEST_ACCOUNTING
+            .scope(Arc::clone(&accounting), async {
+                let mut completed = ConnectionAttemptMetricGuard::started();
+                completed.finish();
+
+                let mut superseded = ConnectionAttemptMetricGuard::started();
+                superseded.finish_superseded();
+
+                let abandoned = ConnectionAttemptMetricGuard::started();
+                drop(abandoned);
+            })
+            .await;
+
+        assert_eq!(accounting.snapshot(), (3, 3, 1, 1));
     }
 
     #[test]

@@ -1311,7 +1311,7 @@ fn verify_retained_bundle(destination: &Path, member_count: usize) -> Result<(),
 }
 
 enum ReaderMessage {
-    Reply(QualificationNodeReply),
+    Reply(Box<QualificationNodeReply>),
     Protocol,
 }
 
@@ -1371,7 +1371,7 @@ impl ChildNode {
                 let mut stdout = BufReader::new(stdout);
                 loop {
                     let message = match read_bounded_json_line(&mut stdout) {
-                        Ok(Some(reply)) => ReaderMessage::Reply(reply),
+                        Ok(Some(reply)) => ReaderMessage::Reply(Box::new(reply)),
                         Ok(None) => break,
                         Err(_) => ReaderMessage::Protocol,
                     };
@@ -1443,7 +1443,7 @@ impl ChildNode {
         timeout: Duration,
     ) -> Result<QualificationNodeReply, HarnessError> {
         match self.replies.recv_timeout(timeout) {
-            Ok(ReaderMessage::Reply(reply)) => Ok(reply),
+            Ok(ReaderMessage::Reply(reply)) => Ok(*reply),
             Ok(ReaderMessage::Protocol) => Err(self.failure(stage, HarnessFailureKind::Protocol)),
             Err(RecvTimeoutError::Timeout) => {
                 Err(self.failure(stage, HarnessFailureKind::Deadline))

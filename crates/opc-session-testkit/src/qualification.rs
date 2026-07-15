@@ -25,7 +25,7 @@ use opc_redaction::metrics::{
 };
 use opc_session_net::{
     ConnectionLifecyclePolicy, SessionClusterId, SessionConfigurationEpoch,
-    SessionConfigurationGeneration,
+    SessionConfigurationGeneration, DEFAULT_RECONNECT_BACKOFF_MAX,
 };
 use opc_session_store::{
     validate_session_ttl, OwnerId, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
@@ -57,7 +57,7 @@ pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-mtls-candidate-evidence.schema.json");
 
 /// Version of the private node-control protocol.
-pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 1;
+pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 2;
 /// Maximum accepted node configuration document.
 pub const QUALIFICATION_MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Maximum accepted control request or response line.
@@ -150,6 +150,17 @@ pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS: u64 = 50;
 /// exercises same-owner recovery after one successful lease release.
 pub const QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE: &str =
     "post-release-response-loss/v1";
+/// Process-restart policy for the qualification-only synthetic interruption.
+/// A recovered committed mutation generation proves the logical mutator
+/// already passed its first release checkpoint, so restart must not inject the
+/// once-per-mutator fault again.
+pub const QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE: &str =
+    "committed-generation-does-not-rearm/v1";
+/// Versioned terminal recovery-deadline diagnostic bound into the schedule.
+/// The fixed code, terminal operation stage, and elapsed milliseconds expose
+/// an overrun without forwarding backend or identity-bearing error text.
+pub const QUALIFICATION_TRAFFIC_RECOVERY_DEADLINE_DIAGNOSTIC_PROFILE: &str =
+    "terminal-stage-elapsed-millis/v1";
 /// Versioned authority reconciliation algorithm bound into the schedule.
 pub const QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE: &str =
     "stage-aware-known-authority/v1";
@@ -162,6 +173,64 @@ pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES: usize =
     MAX_REPLICATION_LOG_PAGE_ENTRIES;
 /// Versioned stopped-watch reconciliation algorithm bound into the schedule.
 pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE: &str = "bounded-durable-journal/v1";
+/// Versioned unclean restart scenario covered by the projected-mTLS fault
+/// campaign. This is one same-disk, exact-address active-mutator restart, not
+/// a deployed host or network-partition matrix.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE: &str =
+    "same-disk-exact-address-active-mutator/v1";
+/// Absolute bound from process termination through survivor progress,
+/// same-address restart, durable catch-up, journal reconciliation, and a
+/// strictly higher-fence mutation by the restarted member.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Versioned post-expiry recovery proof. Fault-era attempt outcomes first
+/// settle beyond the complete server/connect/backoff horizon; only then does
+/// the recovered member advance explicit reauthentication, reprove every
+/// incident directed path, and establish the next lifecycle baseline.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE: &str =
+    "member-scoped-reauth-settled-baseline/v2";
+/// Fault-attempt settlement horizon after replacement publication. One
+/// pre-admission read/handshake stage and its bounded retirement response may
+/// each consume the larger server timeout; cold connect and maximum reconnect
+/// backoff then define the required outbound-ledger quiet tail.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS: u64 = {
+    let server_timeout = if DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout_millis
+        > DURABLE_CONSENSUS_TIMING_PROFILE.server_handler_timeout_millis
+    {
+        DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout_millis
+    } else {
+        DURABLE_CONSENSUS_TIMING_PROFILE.server_handler_timeout_millis
+    };
+    server_timeout * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout_millis
+        + DEFAULT_RECONNECT_BACKOFF_MAX.as_millis() as u64
+};
+/// Absolute fail-safe for the fault-tail checkpoint. The availability
+/// recovery envelope provides bounded room for a final cold attempt to settle
+/// after the complete two-stage server tail.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS: u64 = {
+    let server_timeout = if DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout_millis
+        > DURABLE_CONSENSUS_TIMING_PROFILE.server_handler_timeout_millis
+    {
+        DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout_millis
+    } else {
+        DURABLE_CONSENSUS_TIMING_PROFILE.server_handler_timeout_millis
+    };
+    server_timeout * 2 + QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
+};
+/// Maximum interval between survivor-traffic progress observations during the
+/// recovered-member checkpoint. Requiring a semantic delta in every half-SLO
+/// interval bounds the worst-case gap between two actual progress events by
+/// the full availability-recovery SLO even though each event occurs somewhere
+/// between two observations.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS: u64 =
+    QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS / 2;
+/// Maximum recoverable workload-availability episode introduced on each
+/// survivor while one expired member rejoins. The episode must still settle
+/// inside the existing availability-recovery SLO before the clean lifecycle
+/// baseline is captured.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE: u64 = 1;
 /// Exact operation timeout pinned by the experimental profile.
 pub const QUALIFICATION_OPERATION_TIMEOUT_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
@@ -173,6 +242,11 @@ pub const QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS: u64 = 45_000;
 /// Remaining-validity budget of the same-issuer SVID used by the bounded
 /// fault/expiry campaign.
 pub const QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS: u64 = 75_000;
+/// Maximum spacing between explicit directed-path refresh rounds before the
+/// short-lived SVID soft-retirement boundary.
+pub const QUALIFICATION_FAULT_PATH_REFRESH_MILLIS: u64 = 5_000;
+/// Outbound and inbound qualification paths exercised for every remote peer.
+pub const QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR: u64 = 2;
 /// Lead between stopping all expiring-member traffic and that member's
 /// connection soft-retirement boundary.
 pub const QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS: u64 = 1_000;
@@ -638,7 +712,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v2\n",
+            "opc-session-ha/traffic-resource/v3\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -672,13 +746,25 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "availability_retry_millis={}\n",
             "authority_reconciliation_profile={}\n",
             "synthetic_interruption_profile={}\n",
+            "synthetic_interruption_restart_profile={}\n",
+            "recovery_deadline_diagnostic_profile={}\n",
             "watch_reconciliation_millis={}\n",
             "watch_reconciliation_max_entries={}\n",
             "watch_reconciliation_page_entries={}\n",
             "watch_reconciliation_profile={}\n",
+            "unclean_restart_count=1\n",
+            "unclean_restart_profile={}\n",
+            "unclean_restart_catchup_millis={}\n",
+            "member_recovery_profile={}\n",
+            "member_recovery_settlement_millis={}\n",
+            "member_recovery_settlement_deadline_millis={}\n",
+            "member_recovery_progress_checkpoint_millis={}\n",
+            "member_recovery_availability_interruption_budget_per_node={}\n",
             "operation_timeout_millis={}\n",
             "child_response_timeout_millis={}\n",
             "fault_expiry_validity_millis={}\n",
+            "fault_path_refresh_millis={}\n",
+            "fault_directed_path_factor={}\n",
             "fault_traffic_stop_lead_millis={}\n",
             "fault_mutation_shutdown_lead_millis={}\n",
             "traffic_cancellation_profile={}\n",
@@ -717,13 +803,24 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
         QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE,
         QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
+        QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
+        QUALIFICATION_TRAFFIC_RECOVERY_DEADLINE_DIAGNOSTIC_PROFILE,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
         QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
         QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
         QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
+        QUALIFICATION_FAULT_PATH_REFRESH_MILLIS,
+        QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR,
         QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
         QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
         QUALIFICATION_TRAFFIC_CANCELLATION_PROFILE,
@@ -821,6 +918,8 @@ pub enum QualificationNodeCommand {
     Probe,
     ProjectedSourceStatus,
     MaterialStatus,
+    /// Return the process-local connection reauthentication generation.
+    ReauthenticationGeneration,
     RequestReauthentication,
     /// Prove one fresh authenticated TLS connection and exact manifest-bound
     /// consensus bootstrap to a configured remote node.
@@ -857,6 +956,11 @@ pub enum QualificationNodeCommand {
     /// Return bounded, plaintext-free workload progress and the local
     /// linearizable replication head.
     TrafficStatus,
+    /// Return only the existing bounded, plaintext-free workload observation
+    /// without issuing a new backend operation. Recovery continuity polling
+    /// uses this non-intrusive view; authoritative watch-head settlement keeps
+    /// using `TrafficStatus`.
+    TrafficStatusSnapshot,
     Acquire {
         lease_handle: String,
         stable_id: String,
@@ -889,6 +993,9 @@ impl fmt::Debug for QualificationNodeCommand {
                 formatter.write_str("QualificationNodeCommand::ProjectedSourceStatus")
             }
             Self::MaterialStatus => formatter.write_str("QualificationNodeCommand::MaterialStatus"),
+            Self::ReauthenticationGeneration => {
+                formatter.write_str("QualificationNodeCommand::ReauthenticationGeneration")
+            }
             Self::RequestReauthentication => {
                 formatter.write_str("QualificationNodeCommand::RequestReauthentication")
             }
@@ -922,6 +1029,9 @@ impl fmt::Debug for QualificationNodeCommand {
                 formatter.write_str("QualificationNodeCommand::StopTrafficWatch")
             }
             Self::TrafficStatus => formatter.write_str("QualificationNodeCommand::TrafficStatus"),
+            Self::TrafficStatusSnapshot => {
+                formatter.write_str("QualificationNodeCommand::TrafficStatusSnapshot")
+            }
             Self::Acquire { .. } => formatter.write_str("QualificationNodeCommand::Acquire"),
             Self::CompareAndSet { value, .. } => formatter
                 .debug_struct("QualificationNodeCommand::CompareAndSet")
@@ -944,6 +1054,7 @@ impl QualificationNodeCommand {
             | Self::Probe
             | Self::ProjectedSourceStatus
             | Self::MaterialStatus
+            | Self::ReauthenticationGeneration
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
             | Self::SetConsensusRpcAvailability { .. }
@@ -954,6 +1065,7 @@ impl QualificationNodeCommand {
             | Self::StopTrafficMutation
             | Self::StopTrafficWatch
             | Self::TrafficStatus
+            | Self::TrafficStatusSnapshot
             | Self::Shutdown => Ok(()),
             Self::DirectedHandshake { remote_node_index } => {
                 if *remote_node_index < 5 {
@@ -1070,6 +1182,9 @@ pub enum QualificationNodeReply {
     },
     MaterialStatus {
         status: QualificationTlsMaterialStatus,
+    },
+    ReauthenticationGeneration {
+        generation: u64,
     },
     ReauthenticationRequested {
         generation: u64,
@@ -1398,6 +1513,8 @@ pub struct QualificationConnectionLifecycleMetrics {
     pub connection_failure_transport: u64,
     pub connection_failure_authentication: u64,
     pub connection_failure_timeout: u64,
+    pub connection_superseded: u64,
+    pub connection_abandoned: u64,
     pub connection_failure_protocol: u64,
     pub connection_failure_backend: u64,
     pub reconnect_attempts: u64,
@@ -1428,6 +1545,7 @@ pub enum QualificationTrafficFailureCode {
     WatchUnavailable,
     RestoreScanRejected,
     ReadinessUnavailable,
+    AvailabilityRecoveryDeadlineExceeded,
     InvariantViolation,
     TaskJoinUnavailable,
 }
@@ -1479,6 +1597,11 @@ pub struct QualificationTrafficStatus {
     pub failure: Option<QualificationTrafficFailureCode>,
     pub failure_stage: Option<QualificationTrafficFailureStage>,
     pub failure_error_class: Option<QualificationTrafficErrorClass>,
+    /// Elapsed milliseconds from the start of a bounded availability-recovery
+    /// episode when `failure` is `availability_recovery_deadline_exceeded`.
+    /// Other failures report no value. This duration is identity-free and
+    /// never contains backend error text.
+    pub failure_recovery_elapsed_millis: Option<u64>,
     pub seed: u64,
     pub owned_async_tasks: u8,
     pub mutation_cycles: u64,
@@ -1499,6 +1622,14 @@ pub struct QualificationTrafficStatus {
     pub max_consecutive_availability_interruptions: u64,
     pub complete_restore_scans: u64,
     pub durable_readiness_probes: u64,
+    /// Exact committed generation recovered before a restarted mutation task
+    /// is admitted. Zero means this process did not resume prior mutation
+    /// state.
+    pub mutation_resume_generation: u64,
+    /// Exact committed record fence recovered with
+    /// `mutation_resume_generation`. A resumed mutation must acquire and write
+    /// under a strictly higher fence.
+    pub mutation_resume_record_fence: u64,
     pub last_generation: u64,
     pub last_record_fence: u64,
     pub watch_entries: u64,
@@ -1782,6 +1913,8 @@ mod tests {
         assert_eq!(QUALIFICATION_OPERATION_TIMEOUT_MILLIS, 10_000);
         assert_eq!(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, 45_000);
         assert_eq!(QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, 75_000);
+        assert_eq!(QUALIFICATION_FAULT_PATH_REFRESH_MILLIS, 5_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR, 2);
         assert_eq!(QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, 1_000);
         assert_eq!(QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, 30_000);
         assert_eq!(
@@ -1851,6 +1984,10 @@ mod tests {
             QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
             "post-release-response-loss/v1"
         );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
+            "committed-generation-does-not-rearm/v1"
+        );
         assert_eq!(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS, 25_000);
         assert_eq!(
             QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES,
@@ -1863,6 +2000,31 @@ mod tests {
         assert_eq!(
             QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE,
             "bounded-durable-journal/v1"
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+            "same-disk-exact-address-active-mutator/v1"
+        );
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS, 26_000);
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
+            "member-scoped-reauth-settled-baseline/v2"
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
+            62_500
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
+            86_000
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
+            13_000
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
+            1
         );
         assert_eq!(
             qualification_traffic_seed(3),
@@ -1878,8 +2040,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:e596381d4c54c7789aefdbdfc2f5d695e25ef815eb9d1d7ccfdcfd0200589b7a",
-                "sha256:39c0bad8c354539d0e10a9c0acb180f47e7be13f4b4995bbab9edc2df153a640",
+                "sha256:c8e63f27d205a8ddd6dd71a3892fd2cef044db96cf5d6048003c0993d1c155d9",
+                "sha256:6201fa4a5d2d9c5c9f84266e62a12499c00d6dfd55f4dfd0e90d2229ed7a2092",
             )
         );
         assert!(is_exact_sha256(&three));
@@ -1893,6 +2055,7 @@ mod tests {
                 failure: None,
                 failure_stage: None,
                 failure_error_class: None,
+                failure_recovery_elapsed_millis: None,
                 seed: QUALIFICATION_TRAFFIC_SEED_BASE ^ 3,
                 owned_async_tasks: 2,
                 mutation_cycles: 7,
@@ -1904,6 +2067,8 @@ mod tests {
                 max_consecutive_availability_interruptions: 1,
                 complete_restore_scans: 7,
                 durable_readiness_probes: 7,
+                mutation_resume_generation: 0,
+                mutation_resume_record_fence: 0,
                 last_generation: 7,
                 last_record_fence: 8,
                 watch_entries: 43,
@@ -1992,6 +2157,14 @@ mod tests {
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
             transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         }
+    }
+
+    #[test]
+    fn node_control_schema_rejects_pre_lifecycle_outcome_version() {
+        assert_eq!(QUALIFICATION_NODE_SCHEMA_VERSION, 2);
+        let mut config = valid_config();
+        config.schema_version = 1;
+        assert_eq!(config.validate(), Err(QualificationConfigError::Schema));
     }
 
     #[test]

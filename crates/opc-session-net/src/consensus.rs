@@ -960,23 +960,27 @@ impl RemoteSessionConsensusPeer {
                         .take()
                         .expect("reconnect admission remains owned")
                         .failed();
-                    match error {
-                        SessionConsensusPeerError::Unavailable => {
-                            &METRICS.session_net_connection_failure_transport
+                    if connection_superseded {
+                        attempt_metrics.finish_superseded();
+                    } else {
+                        match error {
+                            SessionConsensusPeerError::Unavailable => {
+                                &METRICS.session_net_connection_failure_transport
+                            }
+                            SessionConsensusPeerError::Timeout => {
+                                &METRICS.session_net_connection_failure_timeout
+                            }
+                            SessionConsensusPeerError::Authentication => {
+                                &METRICS.session_net_connection_failure_authentication
+                            }
+                            SessionConsensusPeerError::Rejected => {
+                                &METRICS.session_net_connection_failure_backend
+                            }
+                            _ => &METRICS.session_net_connection_failure_protocol,
                         }
-                        SessionConsensusPeerError::Timeout => {
-                            &METRICS.session_net_connection_failure_timeout
-                        }
-                        SessionConsensusPeerError::Authentication => {
-                            &METRICS.session_net_connection_failure_authentication
-                        }
-                        SessionConsensusPeerError::Rejected => {
-                            &METRICS.session_net_connection_failure_backend
-                        }
-                        _ => &METRICS.session_net_connection_failure_protocol,
+                        .fetch_add(1, Ordering::Relaxed);
+                        attempt_metrics.finish();
                     }
-                    .fetch_add(1, Ordering::Relaxed);
-                    attempt_metrics.finish();
                     if !matches!(
                         error,
                         SessionConsensusPeerError::Unavailable | SessionConsensusPeerError::Timeout
@@ -1055,6 +1059,40 @@ impl RemoteSessionConsensusPeer {
         {
             *connection_slot = Some(connection);
         }
+        result
+    }
+
+    async fn call_with_timeout_inner(
+        &self,
+        request: SessionConsensusWireRequest,
+        call_timeout: Duration,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(call_timeout)
+            .ok_or(SessionConsensusPeerError::Protocol)?;
+        // Waiting for one of the two fixed per-peer lanes must consume the
+        // caller's logical budget, but it does not start a transport attempt.
+        // Once a lane is owned, `call_once` is the only deadline authority for
+        // the connection attempt and negotiated RPC. It classifies every
+        // deadline expiry before returning, so an outer timeout cannot cancel
+        // a live attempt guard and misreport it as abandoned.
+        let mut slot = tokio::time::timeout_at(deadline, self.connection_pool.acquire())
+            .await
+            .map_err(|_| SessionConsensusPeerError::Timeout)?;
+        let result = self.call_once(slot.connection(), request, deadline).await;
+        if slot.connection.is_some() {
+            self.connection_pool.ensure_cached_connection_reaper(
+                slot.lane,
+                self.tls_config.clone(),
+                self.reauthentication.clone(),
+                directed_connection_key(
+                    b"consensus",
+                    self.binding.local_replica_id().as_str(),
+                    self.binding.remote_replica_id().as_str(),
+                ),
+            );
+        }
+        self.connection_pool.lane(slot.lane).changed.notify_one();
         result
     }
 
@@ -1247,32 +1285,16 @@ impl SessionConsensusPeer for RemoteSessionConsensusPeer {
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         let call_timeout = self.deadline_policy.for_family(request.family);
-        let deadline = tokio::time::Instant::now()
-            .checked_add(call_timeout)
-            .ok_or(SessionConsensusPeerError::Protocol)?;
-        // The fixed pool bounds concurrent connection/TLS/frame memory per
-        // peer. Lane acquisition is covered by the same logical call deadline.
-        let call = async {
-            let mut slot = self.connection_pool.acquire().await;
-            let result = self.call_once(slot.connection(), request, deadline).await;
-            if slot.connection.is_some() {
-                self.connection_pool.ensure_cached_connection_reaper(
-                    slot.lane,
-                    self.tls_config.clone(),
-                    self.reauthentication.clone(),
-                    directed_connection_key(
-                        b"consensus",
-                        self.binding.local_replica_id().as_str(),
-                        self.binding.remote_replica_id().as_str(),
-                    ),
-                );
-            }
-            self.connection_pool.lane(slot.lane).changed.notify_one();
-            result
-        };
-        tokio::time::timeout_at(deadline, call)
-            .await
-            .unwrap_or(Err(SessionConsensusPeerError::Timeout))
+        self.call_with_timeout_inner(request, call_timeout).await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        request: SessionConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let call_timeout = timeout.min(self.deadline_policy.for_family(request.family));
+        self.call_with_timeout_inner(request, call_timeout).await
     }
 }
 
@@ -1487,9 +1509,7 @@ impl SessionConsensusServer {
                 let reauthentication = reauthentication.clone();
                 let handle = tokio::spawn(async move {
                     let _permit = permit;
-                    METRICS
-                        .session_net_connection_attempts
-                        .fetch_add(1, Ordering::Relaxed);
+                    let mut attempt_metrics = ConnectionAttemptMetricGuard::started();
                     let result = handle_consensus_connection(
                         stream,
                         tls_config,
@@ -1505,6 +1525,7 @@ impl SessionConsensusServer {
                     )
                     .await;
                     record_consensus_server_connection_outcome(&result);
+                    attempt_metrics.finish();
                 });
                 registry.handles.push(handle);
             }
@@ -2535,14 +2556,89 @@ mod tests {
         assert_eq!(entered_rx.recv().await, Some(0));
         control.request_reauthentication().expect("advance epoch");
         assert_eq!(entered_rx.recv().await, Some(1));
-        assert_eq!(accounting.snapshot(), (2, 1));
+        assert_eq!(accounting.snapshot(), (2, 1, 1, 0));
 
         call.abort();
         assert!(call
             .await
             .expect_err("call must be cancelled")
             .is_cancelled());
-        assert_eq!(accounting.snapshot(), (2, 2));
+        assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consensus_soft_timeout_classifies_pending_connect_without_abandoning() {
+        let (_server_binding, client_binding) = bindings();
+        let resolver: RemoteAddrResolver =
+            Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>()));
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding.clone(),
+            Some(Duration::from_secs(30)),
+        );
+        let request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::AppendEntries,
+            b"openraft-soft-timeout".to_vec(),
+        )
+        .expect("bounded request");
+        let accounting = Arc::new(crate::lifecycle::ConnectionAttemptTestAccounting::default());
+
+        let result = crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING
+            .scope(Arc::clone(&accounting), async move {
+                peer.call_with_timeout(request, Duration::from_millis(100))
+                    .await
+            })
+            .await;
+
+        assert_eq!(result, Err(SessionConsensusPeerError::Timeout));
+        let (attempts, terminals, superseded, abandoned) = accounting.snapshot();
+        assert!(attempts > 0, "the stalled resolver must start an attempt");
+        assert_eq!(terminals, attempts);
+        assert_eq!(superseded, 0);
+        assert_eq!(abandoned, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_ceiling_can_shorten_the_consensus_soft_timeout() {
+        let (_server_binding, client_binding) = bindings();
+        let resolver: RemoteAddrResolver =
+            Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>()));
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding.clone(),
+            Some(Duration::from_millis(50)),
+        );
+        let request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::AppendEntries,
+            b"configured-soft-ceiling".to_vec(),
+        )
+        .expect("bounded request");
+        let accounting = Arc::new(crate::lifecycle::ConnectionAttemptTestAccounting::default());
+        let started_at = tokio::time::Instant::now();
+
+        let result = crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING
+            .scope(Arc::clone(&accounting), async move {
+                peer.call_with_timeout(request, Duration::from_millis(500))
+                    .await
+            })
+            .await;
+
+        assert_eq!(result, Err(SessionConsensusPeerError::Timeout));
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started_at),
+            Duration::from_millis(50)
+        );
+        let (attempts, terminals, superseded, abandoned) = accounting.snapshot();
+        assert!(attempts > 0, "the stalled resolver must start an attempt");
+        assert_eq!(terminals, attempts);
+        assert_eq!(superseded, 0);
+        assert_eq!(abandoned, 0);
     }
 
     #[tokio::test(start_paused = true)]

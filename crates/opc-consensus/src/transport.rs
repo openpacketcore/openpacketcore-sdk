@@ -1,5 +1,7 @@
 //! Authenticated bounded transport port shared by consensus consumers.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +144,21 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
         &self,
         request: ConsensusWireRequest,
     ) -> Result<ConsensusWireResponse, ConsensusPeerError>;
+
+    /// Send one scoped call under the caller's complete logical timeout.
+    ///
+    /// The default preserves compatibility for in-process and test peers by
+    /// delegating unchanged; their caller retains its existing outer hard
+    /// deadline. Network transports should override this method and drive
+    /// their own connection, handshake, and frame deadlines to an explicit
+    /// terminal result before that outer hard deadline can cancel the future.
+    async fn call_with_timeout(
+        &self,
+        request: ConsensusWireRequest,
+        _timeout: Duration,
+    ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        self.call(request).await
+    }
 }
 
 /// Inbound consensus-only handler exposed by an authenticated server.
@@ -153,4 +170,83 @@ pub trait ConsensusRpcHandler: Send + Sync + std::fmt::Debug {
         authenticated_sender: ConsensusNodeId,
         request: ConsensusWireRequest,
     ) -> ConsensusWireResponse;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::{ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId};
+
+    #[derive(Debug)]
+    struct CompatibilityPeer {
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl ConsensusPeer for CompatibilityPeer {
+        fn node_id(&self) -> ConsensusNodeId {
+            ConsensusNodeId::new(2).expect("non-zero node ID")
+        }
+
+        async fn call(
+            &self,
+            _request: ConsensusWireRequest,
+        ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ConsensusWireResponse {
+                result: Ok(Vec::new()),
+            })
+        }
+    }
+
+    fn request() -> ConsensusWireRequest {
+        ConsensusWireRequest::try_new(
+            ConsensusIdentity::new(
+                ConsensusClusterId::from_bytes([1; 32]),
+                ConsensusConfigurationId::from_bytes([2; 32]),
+                ConsensusConfigurationEpoch::new(1).expect("positive epoch"),
+            ),
+            ConsensusNodeId::new(1).expect("non-zero node ID"),
+            ConsensusRpcFamily::Vote,
+            Vec::new(),
+        )
+        .expect("bounded request")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn compatibility_default_does_not_add_a_soft_cancellation_boundary() {
+        let peer = Arc::new(CompatibilityPeer {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let call = tokio::spawn({
+            let peer = Arc::clone(&peer);
+            async move {
+                peer.call_with_timeout(request(), Duration::from_millis(10))
+                    .await
+            }
+        });
+
+        peer.entered.notified().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !call.is_finished(),
+            "the compatibility default must leave hard cancellation to its caller"
+        );
+
+        peer.release.notify_one();
+        assert_eq!(
+            call.await.expect("compatibility peer task"),
+            Ok(ConsensusWireResponse {
+                result: Ok(Vec::new()),
+            })
+        );
+    }
 }

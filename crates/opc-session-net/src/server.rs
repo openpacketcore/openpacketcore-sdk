@@ -32,7 +32,7 @@ use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::identity::{LocalReplicaBinding, SessionClusterId};
 use crate::lifecycle::{
     directed_connection_key, material_status_matches_admission, CertificateExpiryEvidence,
-    ConnectionLifecycle, ConnectionLifecyclePolicy, RetirementReason,
+    ConnectionAttemptMetricGuard, ConnectionLifecycle, ConnectionLifecyclePolicy, RetirementReason,
     SessionReauthenticationControl,
 };
 use crate::protocol::{
@@ -1948,9 +1948,8 @@ impl SessionReplicationServer {
                                 }
                                 let conn_handle = tokio::spawn(async move {
                                     let _permit = permit;
-                                    METRICS
-                                        .session_net_connection_attempts
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    let mut attempt_metrics =
+                                        ConnectionAttemptMetricGuard::started();
                                     let result = handle_connection(
                                         backend,
                                         stream,
@@ -1960,6 +1959,7 @@ impl SessionReplicationServer {
                                     )
                                     .await;
                                     record_server_connection_outcome(&result);
+                                    attempt_metrics.finish();
                                     if let Err(error) = result {
                                         tracing::debug!(
                                             reason = connection_failure_reason(&error),

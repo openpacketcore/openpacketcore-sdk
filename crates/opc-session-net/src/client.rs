@@ -634,33 +634,37 @@ async fn open_connection(
     } else {
         reconnect_attempt.failed();
     }
-    match &result {
-        Ok(_) => &METRICS.session_net_connection_successes,
+    let terminal_counter = match &result {
+        Ok(_) => Some(&METRICS.session_net_connection_successes),
         // A complete authenticated retirement control is a successful
         // transport/control exchange, but not an admitted application
         // connection. Account for the attempt without misclassifying the
         // expected local-rotation race as a failure; the caller reconnects
         // before transmitting any application request.
-        Err(ConnectionOpenError::Retired) => &METRICS.session_net_connection_successes,
-        Err(ConnectionOpenError::Superseded) => &METRICS.session_net_connection_failure_timeout,
+        Err(ConnectionOpenError::Retired) => Some(&METRICS.session_net_connection_successes),
+        Err(ConnectionOpenError::Superseded) => None,
         Err(ConnectionOpenError::Protocol(ProtocolError::Io(error)))
             if error.kind() == io::ErrorKind::TimedOut =>
         {
-            &METRICS.session_net_connection_failure_timeout
+            Some(&METRICS.session_net_connection_failure_timeout)
         }
         Err(ConnectionOpenError::Protocol(ProtocolError::Io(_))) => {
-            &METRICS.session_net_connection_failure_transport
+            Some(&METRICS.session_net_connection_failure_transport)
         }
         Err(ConnectionOpenError::Protocol(ProtocolError::Authentication)) => {
-            &METRICS.session_net_connection_failure_authentication
+            Some(&METRICS.session_net_connection_failure_authentication)
         }
         Err(ConnectionOpenError::Protocol(ProtocolError::BackendUnavailable(_))) => {
-            &METRICS.session_net_connection_failure_backend
+            Some(&METRICS.session_net_connection_failure_backend)
         }
-        Err(_) => &METRICS.session_net_connection_failure_protocol,
+        Err(_) => Some(&METRICS.session_net_connection_failure_protocol),
+    };
+    if let Some(terminal_counter) = terminal_counter {
+        terminal_counter.fetch_add(1, Ordering::Relaxed);
+        attempt_metrics.finish();
+    } else {
+        attempt_metrics.finish_superseded();
     }
-    .fetch_add(1, Ordering::Relaxed);
-    attempt_metrics.finish();
     result
 }
 
@@ -4888,6 +4892,48 @@ mod tests {
             Err(error) => assert!(error.is_cancelled()),
             Ok(_) => panic!("watch must be cancelled"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_epoch_supersession_is_distinct_from_caller_abandonment() {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let resolver: RemoteAddrResolver = {
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move || {
+                let entered_tx = entered_tx.clone();
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    entered_tx.send(attempt).expect("report resolver entry");
+                    std::future::pending::<io::Result<SocketAddr>>().await
+                })
+            })
+        };
+        let control = SessionReauthenticationControl::new();
+        let backend = RemoteSessionBackend::new_insecure_with_resolver(
+            resolver,
+            Some(Duration::from_secs(1)),
+        )
+        .with_reauthentication_control(control.clone());
+        let accounting = Arc::new(crate::lifecycle::ConnectionAttemptTestAccounting::default());
+        let call = tokio::spawn(
+            crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING
+                .scope(Arc::clone(&accounting), async move {
+                    backend.capabilities().await
+                }),
+        );
+
+        assert_eq!(entered_rx.recv().await, Some(0));
+        control.request_reauthentication().expect("advance epoch");
+        assert_eq!(entered_rx.recv().await, Some(1));
+        assert_eq!(accounting.snapshot(), (2, 1, 1, 0));
+
+        call.abort();
+        assert!(call
+            .await
+            .expect_err("call must be cancelled")
+            .is_cancelled());
+        assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
     #[tokio::test(start_paused = true)]
