@@ -142,8 +142,9 @@ the already-proven guard and validate that same exact record without minting
 unnecessary fencing authority. Evidence binds this routing as
 `stage-aware-known-authority/v1`. The private schedule drops one successful
 release response
-per mutator to exercise that path, and is bound to eight outcomes per node, 8
-seconds per episode, and a fixed 50 ms retry delay; all three bounds and the
+per mutator to exercise that path, and is bound to eight outcomes per node, a
+fixed 26-second two-election-plus-operation transition envelope per episode,
+and a fixed 50 ms retry delay; all three bounds and the
 total/recovered/consecutive counters are schedule evidence. Phase completion
 requires every interruption to be reconciled. Lease loss, unexpected state, and invariant
 failures remain terminal. The exact-address restarted member is watcher-only before exit and
@@ -226,6 +227,9 @@ response envelope, 30-second mutation-shutdown SLO, 75-second short-lived SVID
 budget, one-second
 pre-soft traffic-stop lead, and
 `accepted-operation-terminal-checkpoints/v1` cancellation discipline. If a
+fleet starts, each already-bound child completes its process-heavy
+`Configure`/`Started` exchange before the next child is admitted, under one
+shared 45-second deadline; cluster `Initialize` remains concurrent. If a
 child response times out, is malformed, or reaches EOF, the parent reports only
 the closed pending-command kind, a harness-local monotonic sequence, and the
 elapsed send time. Command values, session/lease identities, payloads, and

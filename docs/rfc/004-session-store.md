@@ -41,11 +41,13 @@ outcomes retain the already-proven guard and validate that same exact record
 without minting unnecessary fencing authority. Evidence binds this routing as
 `stage-aware-known-authority/v1`. The fixed
 schedule drops one successful release response per mutator, allows eight
-outcomes per node, 8 seconds per recovery episode, and a 50 ms retry delay;
+outcomes per node, uses the fixed 26-second two-election-plus-operation
+transition envelope per recovery episode, and applies a 50 ms retry delay;
 phase completion requires every interruption to be reconciled. Lease loss,
-unexpected state, and invariant failures fail closed. The exact-address restarted
-member is watcher-only before exit and joins the mutator set only after bounded
-journal reconciliation, so active-mutator crash/restart remains unqualified.
+unexpected state, and invariant failures fail closed. The exact-address
+restarted member is watcher-only before exit and joins the mutator set only
+after bounded journal reconciliation, so active-mutator crash/restart remains
+unqualified.
 The tests do not cover deployed partitions, a broader restart/fault matrix,
 resource/soak, remote HKMS, deployed CNFs, or signed release evidence. Generic
 CRL/OCSP/denylist revocation is not implemented.

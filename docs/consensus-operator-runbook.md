@@ -380,10 +380,11 @@ guard and validate that same exact record without minting unnecessary fencing
 authority. Evidence binds this routing as `stage-aware-known-authority/v1`.
 The private
 schedule drops one successful release response per mutator to prove this path.
-More than eight such outcomes per node, any recovery episode beyond 8 seconds,
-any retry before the fixed 50 ms delay, or phase completion with an unresolved
-interruption fails the campaign; lease loss, unexpected state, and invariant
-failures are never masked. The
+More than eight such outcomes per node, any recovery episode beyond the fixed
+26-second two-election-plus-operation transition envelope, any retry before the
+fixed 50 ms delay, or phase completion with an unresolved interruption fails
+the campaign; lease loss, unexpected state, and invariant failures are never
+masked. The
 exact-address restarted member is watcher-only before exit and joins the
 mutator set only after bounded journal reconciliation, so active-mutator
 crash/restart is not qualified. A broader restart/fault matrix, resource/soak,
