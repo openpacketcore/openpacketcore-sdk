@@ -725,7 +725,7 @@ fn encode_component(component: &PacketFilterComponent, destination: &mut BytesMu
 }
 
 fn protocol_decode_error(error: TftError) -> DecodeError {
-    let offset = error.offset().unwrap_or(0);
+    let offset = error.offset().unwrap_or_default();
     let code = match error.kind() {
         TftErrorKind::Truncated { .. } => DecodeErrorCode::Truncated,
         TftErrorKind::LengthOverflow => DecodeErrorCode::LengthOverflow,

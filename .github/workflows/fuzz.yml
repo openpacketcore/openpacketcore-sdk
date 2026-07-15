@@ -29,6 +29,7 @@ jobs:
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap
+          - opc-proto-tft
           - opc-proto-gtpv2c
           - opc-proto-ikev2
           # Keep the Diameter CONFORMANCE.md scheduled-fuzz statement aligned.
@@ -77,6 +78,7 @@ jobs:
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap
+          - opc-proto-tft
           - opc-proto-gtpv2c
           - opc-proto-ikev2
           # Keep the Diameter CONFORMANCE.md scheduled-fuzz statement aligned.

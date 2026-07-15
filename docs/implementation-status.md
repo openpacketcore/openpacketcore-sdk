@@ -85,6 +85,24 @@ closed as SDK foundation gaps).
 
 ---
 
+## Current dedicated-bearer shared protocol foundation — 2026-07-15
+
+`opc-proto-tft` now owns the canonical product-neutral TS 24.008 V18.8.0 TFT
+value model shared by GTPv2-C and IKEv2. Its complete standalone codec scope
+includes every defined operation, E-bit and parameter form, all twenty Release
+18 packet-filter components, TS 23.060 combination validation, bounded strict
+decode, structured redaction-safe errors, deterministic encode, unknown
+parameter preservation, specification-authored fixtures, property/negative
+tests, stable corpus replay, and registered decode/round-trip fuzz targets.
+See [`crates/opc-proto-tft/CONFORMANCE.md`](../crates/opc-proto-tft/CONFORMANCE.md).
+
+This closes the shared TFT codec/model portion of the dedicated-bearer work. It
+does not claim completion of the consuming GTPv2-C or IKEv2 procedures, their
+state-dependent validation, transaction handling, Child-SA lifecycle, or any
+product policy/dataplane behavior.
+
+---
+
 ## Historical EPC/untrusted-access hardening snapshot — T-8c57ecee (2026-06-28)
 
 This snapshot records the final EPC/untrusted-access SDK readiness pass after
@@ -248,6 +266,11 @@ treated as complete.
 | 005-6 | Fuzz targets and regression corpora exist for every protocol crate. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/), [`opc-proto-gtpu`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/), [`opc-proto-pfcp`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/), [`opc-proto-nas`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/), [`opc-proto-ngap`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/), [`opc-proto-gtpv2c`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/), [`opc-proto-ikev2`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/), [`opc-proto-diameter`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-diameter/) | [`crates/opc-proto-gtpu/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/fuzz/), [`crates/opc-proto-pfcp/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/fuzz/), [`crates/opc-proto-nas/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/fuzz/), [`crates/opc-proto-ngap/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/fuzz/), [`crates/opc-proto-gtpv2c/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/fuzz/), [`crates/opc-proto-ikev2/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/fuzz/), [`crates/opc-proto-diameter/fuzz/`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-diameter/fuzz/) | **implemented** | GTP-U, PFCP, NAS-5GS, NGAP v0, the experimental `opc-proto-gtpv2c` S2b subset, and the experimental `opc-proto-diameter` scaffold include protocol-specific fuzz targets plus fixture/corpus replay; the experimental `opc-proto-ikev2` scaffold adds initial fuzz targets and seed corpus within its documented scaffold scope ([GAP-005-002](#known-gaps), [GAP-PROTO-003](#known-gaps), [GAP-PROTO-005](#known-gaps), [GAP-PROTO-006](#known-gaps), [GAP-PROTO-007](#known-gaps), [GAP-PROTO-008](#known-gaps), [GAP-PROTO-009](#known-gaps)). |
 | 005-7 | Spec traceability tags feed RFC 006 evidence. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/), [`opc-proto-gtpu`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/) | [`decode_errors.rs`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/tests/decode_errors.rs), [`lib.rs`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/src/lib.rs) | **implemented** | `SpecRef` remains in the error model and `opc-proto-gtpu` parser code carries `@spec`, `@req`, and `@conformance` tags for TS 29.281 evidence extraction ([GAP-005-004](#known-gaps)). |
 | 005-8 | Protocol modules follow the standard layout for parallel implementation. | [`opc-protocol`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-protocol/), [`opc-proto-gtpu`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/), [`opc-proto-pfcp`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/), [`opc-proto-nas`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/), [`opc-proto-ngap`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/), [`opc-proto-gtpv2c`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/), [`opc-proto-ikev2`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/), [`opc-proto-diameter`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-diameter/) | [`crates/opc-proto-gtpu/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpu/CONFORMANCE.md), [`crates/opc-proto-pfcp/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-pfcp/CONFORMANCE.md), [`crates/opc-proto-nas/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-nas/CONFORMANCE.md), [`crates/opc-proto-ngap/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ngap/CONFORMANCE.md), [`crates/opc-proto-gtpv2c/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-gtpv2c/CONFORMANCE.md), [`crates/opc-proto-ikev2/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-ikev2/CONFORMANCE.md), [`crates/opc-proto-diameter/CONFORMANCE.md`](https://github.com/openpacketcore/openpacketcore-sdk/blob/main/crates/opc-proto-diameter/CONFORMANCE.md) | **implemented** | GTP-U, PFCP, NAS-5GS, NGAP v0, the experimental `opc-proto-gtpv2c` S2b subset, the experimental `opc-proto-diameter` scaffold, and the experimental `opc-proto-ikev2` scaffold follow the concrete protocol-crate layout with crate manifest, parser implementation, tests, fuzz targets, corpus, and conformance notes ([GAP-005-005](#known-gaps), [GAP-PROTO-003](#known-gaps), [GAP-PROTO-005](#known-gaps), [GAP-PROTO-006](#known-gaps), [GAP-PROTO-007](#known-gaps), [GAP-PROTO-008](#known-gaps), [GAP-PROTO-009](#known-gaps)). |
+
+July 2026 addendum for AC 005-6 and 005-8: `opc-proto-tft` follows the same
+protocol-crate layout and adds stable corpus replay plus registered decode and
+round-trip fuzz targets. Its conformance source is
+[`crates/opc-proto-tft/CONFORMANCE.md`](../crates/opc-proto-tft/CONFORMANCE.md).
 
 ---
 

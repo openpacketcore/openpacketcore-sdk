@@ -132,10 +132,18 @@ impl PacketFilterIdentifier {
 }
 
 /// Inclusive local or remote port range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PortRange {
     low: u16,
     high: u16,
+}
+
+impl fmt::Debug for PortRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PortRange")
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PortRange {
@@ -201,7 +209,7 @@ impl fmt::Debug for Ipv6AddressPrefix {
 }
 
 /// Valid 20-bit IPv6 flow label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ipv6FlowLabel(u32);
 
 impl Ipv6FlowLabel {
@@ -219,8 +227,14 @@ impl Ipv6FlowLabel {
     }
 }
 
+impl fmt::Debug for Ipv6FlowLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Ipv6FlowLabel").field(&"<redacted>").finish()
+    }
+}
+
 /// Valid 12-bit IEEE 802.1Q VLAN identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VlanIdentifier(u16);
 
 impl VlanIdentifier {
@@ -238,11 +252,27 @@ impl VlanIdentifier {
     }
 }
 
+impl fmt::Debug for VlanIdentifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("VlanIdentifier")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
 /// IEEE 802.1Q priority-code-point and drop-eligible indication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VlanPriority {
     pcp: u8,
     drop_eligible: bool,
+}
+
+impl fmt::Debug for VlanPriority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VlanPriority")
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl VlanPriority {
@@ -822,10 +852,18 @@ impl fmt::Debug for AuthorizationToken {
 }
 
 /// Four-octet Flow Identifier parameter contents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowIdentifier {
     media_component_number: u16,
     ip_flow_number: u16,
+}
+
+impl fmt::Debug for FlowIdentifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlowIdentifier")
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl FlowIdentifier {
@@ -1056,6 +1094,21 @@ impl TrafficFlowTemplate {
         }
     }
 
+    /// Construct a delete-existing operation with an independent parameter list.
+    ///
+    /// TS 24.008 requires the packet-filter count and list to be empty for this
+    /// operation, but does not prohibit the E-bit parameter list. Use
+    /// [`Self::delete_existing`] for the common form without parameters.
+    pub fn delete_existing_with_parameters(
+        parameters: Vec<TftParameter>,
+    ) -> Result<Self, TftError> {
+        Self::new(
+            TftOperation::DeleteExisting,
+            PacketFilterList::None,
+            parameters,
+        )
+    }
+
     /// Construct an add-packet-filters operation.
     pub fn add_packet_filters(
         filters: Vec<PacketFilter>,
@@ -1122,8 +1175,10 @@ impl TrafficFlowTemplate {
     }
 
     pub(crate) fn validate(&self) -> Result<(), TftError> {
-        for filter in self.packet_filters.filters().unwrap_or(&[]) {
-            filter.validate()?;
+        if let Some(filters) = self.packet_filters.filters() {
+            for filter in filters {
+                filter.validate()?;
+            }
         }
         validate_parameter_sequence(&self.parameters)?;
 
@@ -1137,7 +1192,7 @@ impl TrafficFlowTemplate {
                 }
             }
             (TftOperation::DeleteExisting, PacketFilterList::None) => {
-                if !self.parameters.is_empty() || !self.ignored_contents.is_empty() {
+                if !self.ignored_contents.is_empty() {
                     return Err(TftErrorKind::InvalidOperationHeader {
                         operation: self.operation.code(),
                     }

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Canonical 3GPP TFT codec — `opc-proto-tft`:** one shared, bounded TS 24.008
+  V18.8.0 value model now covers every operation, parameter, and Release 18
+  packet-filter component for GTPv2-C Bearer TFT IEs and IKEv2 TFT Notify
+  payloads. Strict structured validation rejects malformed lengths, reserved
+  and conflicting components, illegal cardinality, duplicates, and invalid
+  parameter sequences; permitted unknown parameters retain byte order.
+  Specification-authored fixtures, property/negative/corpus tests, redacted
+  diagnostics, and scheduled decode/round-trip fuzz targets define the codec
+  evidence. Transport wrappers and state-dependent bearer policy remain with
+  the consuming GTPv2-C and IKEv2 procedure boundaries.
 - `opc-sctp`: an explicit, default-off `DiameterInboundPpidPolicy` escape hatch
   can accept inbound PPID 0 from a configured legacy clear-text Diameter peer.
   Standard PPID 46 remains accepted and is always used outbound; DTLS remains
