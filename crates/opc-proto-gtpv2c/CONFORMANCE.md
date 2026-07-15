@@ -33,7 +33,7 @@ validation for these S2b procedure messages:
 | Procedure | Message types | Profile requirement |
 |:---|:---|:---|
 | Echo | Request (1), Response (2) | Recovery IE decode/encode, no-TEID header shape, sequence preservation, restart-counter evidence. |
-| Create Session | Request (32), Response (33) | S2b request/response mandatory IE validation, response Cause classification, Sender F-TEID and bearer-context projection. |
+| Create Session | Request (32), Response (33) | S2b request/response required-IE validation, including the conditional request identity, response Cause classification, Sender F-TEID and bearer-context projection. |
 | Modify Bearer / S2b Modify Session | Request (34), Response (35) | Bearer Context request validation and Cause-bearing response validation. |
 | Delete Session | Request (36), Response (37) | Linked EPS Bearer ID request validation and Cause-bearing response validation. |
 | Update Bearer / S2b Update Session | Request (97), Response (98) | Bearer Context request validation and Cause-bearing response validation. |
@@ -57,9 +57,10 @@ Profile-v1 validation must separate structural decode failures from S2b profile
 failures and must cover at least these rules:
 
 - Echo messages must be no-TEID messages and must include Recovery.
-- Create Session Request must include IMSI, RAT Type, Serving Network, Sender
-  F-TEID, APN, Selection Mode, PDN Type, PAA, and Bearer Context with nested
-  EBI.
+- Create Session Request must include IMSI or, for a UICC-less emergency
+  attach, MEI instance 0 plus an instance-0 Indication carrying the UIMSI bit.
+  RAT Type, Serving Network, Sender F-TEID, APN, Selection Mode, PDN Type, PAA,
+  and Bearer Context with nested EBI remain required in either case.
 - Create Session Response must include Cause, Sender F-TEID, and Bearer Context
   for accepted responses (Cause 16/17); rejected responses may expose
   Cause-only summaries.
@@ -148,12 +149,13 @@ coverage.
      Request/Response, Modify Bearer Request/Response (the S2b Modify Session
      view), Delete Session Request/Response, and Update Bearer
      Request/Response (the S2b Update Session view).
-   - `ValidationLevel::ProcedureAware` checks the mandatory IE subset claimed
+   - `ValidationLevel::ProcedureAware` checks the required IE subset claimed
      by this crate's S2b examples: Echo Request/Response Recovery; Create
-     Session Request IMSI/RAT Type/Serving Network/Sender F-TEID/APN/Selection
-     Mode/PDN Type/PAA/Bearer Context with nested EBI; Create Session Response
-     Cause/Sender F-TEID/Bearer Context; Modify and Update request Bearer
-     Context; Delete request linked EBI; and response Cause IEs.
+     Session Request IMSI or emergency MEI plus UIMSI Indication, followed by
+     RAT Type/Serving Network/Sender F-TEID/APN/Selection Mode/PDN Type/PAA/
+     Bearer Context with nested EBI; Create Session Response Cause/Sender
+     F-TEID/Bearer Context; Modify and Update request Bearer Context; Delete
+     request linked EBI; and response Cause IEs.
    - Non-S2b message types fall back to the raw `Message` shell.
 
 5. **Echo peer helper**
@@ -229,8 +231,9 @@ coverage.
 - A full Release 18 GTPv2-C implementation or a complete S2b IE/procedure
   matrix beyond the typed subset listed above.
 - Conditional IE, cross-message state-machine, peer-role, charging, QoS policy,
-  or bearer lifecycle semantic validation beyond the ProcedureAware mandatory
-  subset and transport-neutral Echo/client-transaction helpers claimed here.
+  or bearer lifecycle semantic validation beyond the Create Session identity
+  alternative, ProcedureAware required subset, and transport-neutral
+  Echo/client-transaction helpers claimed here.
 - GTPv1-C, GTP-U, Diameter, S1AP, PMIP, or a production ePDG/PGW control plane.
 - Claims of carrier acceptance or interoperability beyond this production
   profile boundary until independent, licensed captures exist.

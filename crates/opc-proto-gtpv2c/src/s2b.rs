@@ -24,8 +24,8 @@ use crate::ie::{
     CauseValue, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation, PdnType,
     ProtocolConfigurationOptions, RatType, Recovery, SelectionMode, ServingNetwork, TbcdDigits,
     TypedIe, TypedIeValue, IE_TYPE_APN, IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_EBI,
-    IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE, IE_TYPE_RAT_TYPE,
-    IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK,
+    IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_MEI, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE,
+    IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK,
 };
 use crate::{Message, OwnedMessage};
 
@@ -2533,6 +2533,28 @@ fn contains_ie_instance(ies: &[TypedIe<'_>], ie_type: u8, instance: u8) -> bool 
         .any(|ie| ie.ie_type() == ie_type && ie.instance == instance)
 }
 
+fn contains_uimsi_indication(ies: &[TypedIe<'_>]) -> bool {
+    const UIMSI_FLAG_OCTET_INDEX: usize = 1;
+    const UIMSI_FLAG_MASK: u8 = 0x40;
+
+    ies.iter().any(|ie| {
+        ie.instance == 0
+            && matches!(
+                &ie.value,
+                TypedIeValue::Indication(indication)
+                    if indication
+                        .flags
+                        .get(UIMSI_FLAG_OCTET_INDEX)
+                        .is_some_and(|flags| flags & UIMSI_FLAG_MASK != 0)
+            )
+    })
+}
+
+fn contains_create_session_identity(ies: &[TypedIe<'_>]) -> bool {
+    contains_ie(ies, IE_TYPE_IMSI)
+        || (contains_ie_instance(ies, IE_TYPE_MEI, 0) && contains_uimsi_indication(ies))
+}
+
 fn contains_bearer_context_with_ebi(ies: &[TypedIe<'_>]) -> bool {
     ies.iter().any(|ie| match &ie.value {
         TypedIeValue::BearerContext(context) => contains_ie(&context.members, IE_TYPE_EBI),
@@ -2754,11 +2776,11 @@ fn validate_required_ies(
                     "Create Session Request must set TEID flag with TEID 0",
                 ));
             }
-            require_ie(
-                &view.ies,
-                IE_TYPE_IMSI,
-                "Create Session Request requires IMSI IE",
-            )?;
+            if !contains_create_session_identity(&view.ies) {
+                return Err(missing_ie_error(
+                    "Create Session Request requires IMSI IE or emergency MEI and UIMSI Indication IEs",
+                ));
+            }
             require_ie(
                 &view.ies,
                 IE_TYPE_RAT_TYPE,
