@@ -14,7 +14,10 @@ use std::time::Duration;
 use opc_consensus::engine::{
     EmptyNode, Entry, EntryPayload, LogId, SnapshotMeta, StoredMembership, Vote,
 };
-use opc_consensus::{ConsensusEntryDigest, ConsensusIdentity, ConsensusNodeId};
+use opc_consensus::{
+    AppendEntriesBatchAccumulator, AppendEntriesBatchDecision, ConsensusEntryDigest,
+    ConsensusIdentity, ConsensusNodeId,
+};
 use opc_types::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
@@ -286,6 +289,8 @@ pub(crate) struct ConfigConsensusCore {
     pub(crate) snapshot_binding_path: Arc<PathBuf>,
     pub(crate) durable_progress: Arc<super::storage::ConfigDurableProgress>,
     sqlite_worker_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl ConfigConsensusCore {
@@ -424,6 +429,8 @@ impl ConfigConsensusCore {
             snapshot_binding_path: Arc::new(snapshot_binding_path),
             durable_progress,
             sqlite_worker_gate: worker_gate,
+            #[cfg(test)]
+            apply_gate: Arc::clone(&backend.consensus_apply_gate),
         })
     }
 
@@ -1697,14 +1704,17 @@ fn validate_durable_log_state_sync(
                 conn,
                 identity,
                 expected_members,
-                minimum,
-                Some(
-                    maximum
-                        .checked_add(1)
-                        .ok_or_else(|| invalid_data("config consensus log range overflow"))?,
-                ),
-                None,
-                Some(cancellation),
+                LogRowRead {
+                    start: minimum,
+                    end: Some(
+                        maximum
+                            .checked_add(1)
+                            .ok_or_else(|| invalid_data("config consensus log range overflow"))?,
+                    ),
+                    limit: None,
+                    cancellation: Some(cancellation),
+                    append_entries_batch: false,
+                },
             )?;
             if entries.len()
                 != usize::try_from(expected_count)
@@ -1743,18 +1753,25 @@ fn validate_durable_pointer_relationships_sync(
     Ok((committed, applied, purged))
 }
 
+#[derive(Clone, Copy)]
+struct LogRowRead<'a> {
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+    cancellation: Option<&'a SqliteWorkCancellation>,
+    append_entries_batch: bool,
+}
+
 fn read_log_rows_unchecked_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
-    start: u64,
-    end: Option<u64>,
-    limit: Option<usize>,
-    cancellation: Option<&SqliteWorkCancellation>,
+    read: LogRowRead<'_>,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
-    let start = checked_i64(start)?;
-    let end = end.map(checked_i64).transpose()?;
-    let limit = limit
+    let start = checked_i64(read.start)?;
+    let end = read.end.map(checked_i64).transpose()?;
+    let limit = read
+        .limit
         .map(|limit| {
             i64::try_from(limit).map_err(|_| invalid_data("config consensus log limit overflow"))
         })
@@ -1776,8 +1793,11 @@ fn read_log_rows_unchecked_sync(
         })
         .map_err(db_error)?;
     let mut entries = Vec::new();
+    let mut batch = read
+        .append_entries_batch
+        .then(AppendEntriesBatchAccumulator::new);
     for row in rows {
-        if let Some(cancellation) = cancellation {
+        if let Some(cancellation) = read.cancellation {
             cancellation.check_io()?;
         }
         let (epoch, term, index, encoded) = row.map_err(db_error)?;
@@ -1794,7 +1814,22 @@ fn read_log_rows_unchecked_sync(
             return Err(invalid_data("persisted config consensus log row mismatch"));
         }
         validate_entry(&entry, identity, expected_members)?;
-        entries.push(entry);
+        let decision = batch
+            .as_mut()
+            .map(|batch| {
+                batch
+                    .consider(&entry)
+                    .map_err(|_| invalid_data("config consensus log entry cannot be sized"))
+            })
+            .transpose()?;
+        match decision {
+            Some(AppendEntriesBatchDecision::Include) | None => entries.push(entry),
+            Some(AppendEntriesBatchDecision::IncludeAndStop) => {
+                entries.push(entry);
+                break;
+            }
+            Some(AppendEntriesBatchDecision::StopBefore) => break,
+        }
     }
     for pair in entries.windows(2) {
         if pair[1].log_id.index != pair[0].log_id.index.saturating_add(1) {
@@ -1814,9 +1849,50 @@ pub(crate) fn read_log_range_sync(
     end: Option<u64>,
     limit: Option<usize>,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
+    read_log_range_with_batch_sync(conn, identity, expected_members, start, end, limit, false)
+}
+
+pub(crate) fn read_limited_log_range_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    start: u64,
+    end: u64,
+    limit: usize,
+) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
+    read_log_range_with_batch_sync(
+        conn,
+        identity,
+        expected_members,
+        start,
+        Some(end),
+        Some(limit),
+        true,
+    )
+}
+
+fn read_log_range_with_batch_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+    append_entries_batch: bool,
+) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
     let (_, _, purged) = validate_durable_pointer_relationships_sync(conn, identity)?;
-    let entries =
-        read_log_rows_unchecked_sync(conn, identity, expected_members, start, end, limit, None)?;
+    let entries = read_log_rows_unchecked_sync(
+        conn,
+        identity,
+        expected_members,
+        LogRowRead {
+            start,
+            end,
+            limit,
+            cancellation: None,
+            append_entries_batch,
+        },
+    )?;
     if limit == Some(0) {
         return Ok(entries);
     }

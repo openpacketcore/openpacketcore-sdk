@@ -1,13 +1,13 @@
 #![cfg(target_os = "linux")]
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, BufWriter};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::{symlink, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -39,15 +39,20 @@ use opc_session_testkit::qualification::{
     QualificationProjectedSvidAvailability, QualificationProjectedSvidReason,
     QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
-    QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficState,
+    QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
+    QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
     QualificationTrafficStatus, QualificationTransportConfig,
-    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_NODE_SCHEMA_VERSION,
+    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
+    QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
+    QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
+    QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE, QUALIFICATION_NODE_SCHEMA_VERSION,
     QUALIFICATION_OPERATION_TIMEOUT_MILLIS, QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS,
     QUALIFICATION_RESOLVER_PROOF_MILLIS, QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE,
     QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE, QUALIFICATION_RESOURCE_SAMPLE_MILLIS,
     QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB, QUALIFICATION_RESOURCE_SETTLE_MILLIS,
     QUALIFICATION_RESOURCE_STABLE_SAMPLES, QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE,
     QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB, QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR,
+    QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR,
     QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND, QUALIFICATION_TRAFFIC_ROTATIONS_PER_MEMBER,
@@ -64,13 +69,11 @@ const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis,
 );
-const CHILD_TIMEOUT: Duration =
-    Duration::from_millis(DURABLE_CONSENSUS_TIMING_PROFILE.server_handler_timeout_millis);
+const CHILD_TIMEOUT: Duration = Duration::from_millis(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
 const CANARY_TTL_MILLIS: u64 = 60 * 60 * 1_000;
 const CANARY_STABLE_ID: &str = "rotation-core-canary";
 const CANARY_LEASE_HANDLE: &str = "rotation-core-lease";
 const CANARY_OWNER: &str = "rotation-core-owner";
-const FAULT_EXPIRY_SECONDS: i64 = 75;
 const ROTATION_PLAINTEXT_CANARY_PREFIX: &[u8] = b"opc-rotation-plaintext-canary/";
 const TRAFFIC_PLAINTEXT_CANARY_PREFIX: &[u8] = b"opc-rotation-traffic-canary/";
 const PLAINTEXT_CANARY_PREFIXES: [&[u8]; 2] = [
@@ -243,14 +246,262 @@ fn parse_status_kib(status: &str, field: &str) -> io::Result<u64> {
     Ok(value)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficParticipantError {
+    UnsupportedMemberCount,
+    EmptyObservers,
+    EmptyMutators,
+    NodeIndexOutOfRange,
+    DuplicateNodeIndex,
+    MutatorWithoutObserver,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrafficParticipants {
+    member_count: usize,
+    observers: Vec<usize>,
+    mutators: Vec<usize>,
+}
+
+impl TrafficParticipants {
+    fn try_new(
+        member_count: usize,
+        observers: &[usize],
+        mutators: &[usize],
+    ) -> Result<Self, TrafficParticipantError> {
+        if !matches!(member_count, 3 | 5) {
+            return Err(TrafficParticipantError::UnsupportedMemberCount);
+        }
+        validate_traffic_indices(
+            member_count,
+            observers,
+            TrafficParticipantError::EmptyObservers,
+        )?;
+        validate_traffic_indices(
+            member_count,
+            mutators,
+            TrafficParticipantError::EmptyMutators,
+        )?;
+        if mutators
+            .iter()
+            .any(|node_index| !observers.contains(node_index))
+        {
+            return Err(TrafficParticipantError::MutatorWithoutObserver);
+        }
+        Ok(Self {
+            member_count,
+            observers: observers.to_vec(),
+            mutators: mutators.to_vec(),
+        })
+    }
+
+    fn is_mutator(&self, node_index: usize) -> bool {
+        self.mutators.contains(&node_index)
+    }
+}
+
+fn validate_traffic_indices(
+    member_count: usize,
+    indices: &[usize],
+    empty_error: TrafficParticipantError,
+) -> Result<(), TrafficParticipantError> {
+    if indices.is_empty() {
+        return Err(empty_error);
+    }
+    let mut seen = vec![false; member_count];
+    for node_index in indices {
+        let Some(was_seen) = seen.get_mut(*node_index) else {
+            return Err(TrafficParticipantError::NodeIndexOutOfRange);
+        };
+        if *was_seen {
+            return Err(TrafficParticipantError::DuplicateNodeIndex);
+        }
+        *was_seen = true;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct IndexedTrafficStatus {
+    node_index: usize,
+    status: QualificationTrafficStatus,
+}
+
+fn indexed_traffic_status(
+    statuses: &[IndexedTrafficStatus],
+    node_index: usize,
+) -> Option<&QualificationTrafficStatus> {
+    let mut matches = statuses
+        .iter()
+        .filter(|candidate| candidate.node_index == node_index);
+    let status = &matches.next()?.status;
+    matches.next().is_none().then_some(status)
+}
+
+fn traffic_status_snapshot_matches(
+    statuses: &[IndexedTrafficStatus],
+    participants: &TrafficParticipants,
+) -> bool {
+    statuses.len() == participants.observers.len()
+        && participants
+            .observers
+            .iter()
+            .all(|node_index| indexed_traffic_status(statuses, *node_index).is_some())
+}
+
+fn traffic_mutator_counters_advanced(
+    before: &QualificationTrafficStatus,
+    after: &QualificationTrafficStatus,
+) -> bool {
+    traffic_live_mutator_counters_are_consistent(before)
+        && traffic_live_mutator_counters_are_consistent(after)
+        && traffic_availability_recovery_is_resolved(after)
+        && after.mutation_cycles > before.mutation_cycles
+        && after.linearizable_reads > before.linearizable_reads
+        && after.lease_renewals > before.lease_renewals
+        && after.lease_reacquisitions > before.lease_reacquisitions
+        && after.complete_restore_scans > before.complete_restore_scans
+        && after.durable_readiness_probes > before.durable_readiness_probes
+        && after.last_generation > before.last_generation
+        && after.last_record_fence > before.last_record_fence
+        && after.availability_interruptions >= 1
+        && after.availability_interruptions >= before.availability_interruptions
+        && after.availability_recoveries >= before.availability_recoveries
+        && after.max_consecutive_availability_interruptions
+            >= before.max_consecutive_availability_interruptions
+}
+
+fn traffic_live_mutator_counters_are_consistent(status: &QualificationTrafficStatus) -> bool {
+    let upper = status
+        .mutation_cycles
+        .saturating_add(status.availability_interruptions)
+        .saturating_add(1);
+    let ordered_stages = [
+        status.lease_renewals,
+        status.last_generation,
+        status.linearizable_reads,
+        status.complete_restore_scans,
+        status.durable_readiness_probes,
+        status.lease_reacquisitions,
+        status.mutation_cycles,
+    ];
+    ordered_stages
+        .into_iter()
+        .all(|counter| counter >= status.mutation_cycles && counter <= upper)
+        && ordered_stages
+            .windows(2)
+            .all(|stages| stages[0] >= stages[1])
+        && status.availability_interruptions
+            <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+        && status.availability_recoveries <= status.availability_interruptions
+        && status.max_consecutive_availability_interruptions <= status.availability_interruptions
+        && ((status.availability_interruptions == 0
+            && status.max_consecutive_availability_interruptions == 0)
+            || (status.availability_interruptions > 0
+                && status.max_consecutive_availability_interruptions > 0))
+        && traffic_failure_fields_are_coherent(status)
+}
+
+fn traffic_availability_recovery_is_resolved(status: &QualificationTrafficStatus) -> bool {
+    status.availability_recoveries == status.availability_interruptions
+}
+
+fn traffic_failure_fields_are_coherent(status: &QualificationTrafficStatus) -> bool {
+    matches!(
+        (
+            status.failure,
+            status.failure_stage,
+            status.failure_error_class,
+        ),
+        (None, None, None) | (Some(_), Some(_), Some(_))
+    )
+}
+
+fn traffic_nonmutator_counters_unchanged(
+    before: &QualificationTrafficStatus,
+    after: &QualificationTrafficStatus,
+) -> bool {
+    after.mutation_cycles == before.mutation_cycles
+        && after.linearizable_reads == before.linearizable_reads
+        && after.lease_renewals == before.lease_renewals
+        && after.lease_reacquisitions == before.lease_reacquisitions
+        && after.complete_restore_scans == before.complete_restore_scans
+        && after.durable_readiness_probes == before.durable_readiness_probes
+        && after.last_generation == before.last_generation
+        && after.last_record_fence == before.last_record_fence
+        && after.availability_interruptions == before.availability_interruptions
+        && after.availability_recoveries == before.availability_recoveries
+        && after.max_consecutive_availability_interruptions
+            == before.max_consecutive_availability_interruptions
+}
+
+fn subset_traffic_made_semantic_progress(
+    before: &[IndexedTrafficStatus],
+    after: &[IndexedTrafficStatus],
+    participants: &TrafficParticipants,
+) -> bool {
+    if !traffic_status_snapshot_matches(before, participants)
+        || !traffic_status_snapshot_matches(after, participants)
+    {
+        return false;
+    }
+    participants.observers.iter().all(|node_index| {
+        let Some(before) = indexed_traffic_status(before, *node_index) else {
+            return false;
+        };
+        let Some(after) = indexed_traffic_status(after, *node_index) else {
+            return false;
+        };
+        let is_mutator = participants.is_mutator(*node_index);
+        let role_is_healthy = if is_mutator {
+            after.state == QualificationTrafficState::Running && after.owned_async_tasks == 2
+        } else {
+            matches!(
+                after.state,
+                QualificationTrafficState::WatchReady | QualificationTrafficState::MutationStopped
+            ) && after.owned_async_tasks == 1
+        };
+        role_is_healthy
+            && after.failure.is_none()
+            && traffic_failure_fields_are_coherent(after)
+            && traffic_availability_recovery_is_resolved(after)
+            && after.seed == before.seed
+            && before.watch_traffic_generations.len() == participants.member_count
+            && after.watch_traffic_generations.len() == participants.member_count
+            && after.watch_entries > before.watch_entries
+            && after.watch_applied_records > before.watch_applied_records
+            && after.watch_sequence > before.watch_sequence
+            && after.watch_reconciliations >= before.watch_reconciliations
+            && after.watch_reconciled_sequence >= before.watch_reconciled_sequence
+            && participants.mutators.iter().all(|key_index| {
+                after.watch_traffic_generations[*key_index]
+                    > before.watch_traffic_generations[*key_index]
+            })
+            && (0..participants.member_count)
+                .filter(|key_index| !participants.mutators.contains(key_index))
+                .all(|key_index| {
+                    after.watch_traffic_generations[key_index]
+                        == before.watch_traffic_generations[key_index]
+                })
+            && if is_mutator {
+                traffic_mutator_counters_advanced(before, after)
+            } else {
+                traffic_nonmutator_counters_unchanged(before, after)
+            }
+    })
+}
+
 fn assert_completed_traffic_cycles(status: &QualificationTrafficStatus) {
     assert!(status.mutation_cycles >= 1);
-    assert_eq!(status.linearizable_reads, status.mutation_cycles);
-    assert_eq!(status.lease_renewals, status.mutation_cycles);
+    assert!(traffic_live_mutator_counters_are_consistent(status));
     assert_eq!(status.lease_reacquisitions, status.mutation_cycles);
-    assert_eq!(status.complete_restore_scans, status.mutation_cycles);
-    assert_eq!(status.durable_readiness_probes, status.mutation_cycles);
-    assert_eq!(status.last_generation, status.mutation_cycles);
+    assert!(traffic_availability_recovery_is_resolved(status));
+    assert!(status.availability_interruptions >= 1);
+    assert!(
+        status.availability_interruptions
+            <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+    );
+    assert!(status.max_consecutive_availability_interruptions >= 1);
     assert!(status.last_record_fence >= 1);
     assert!(status.watch_entries >= 1);
     assert!(status.watch_applied_records >= 1);
@@ -264,7 +515,7 @@ fn traffic_status_made_semantic_progress(
 ) -> bool {
     before.watch_traffic_generations.len() == member_count
         && after.watch_traffic_generations.len() == member_count
-        && after.mutation_cycles > before.mutation_cycles
+        && traffic_mutator_counters_advanced(before, after)
         && after.watch_entries > before.watch_entries
         && after.watch_applied_records > before.watch_applied_records
         && after.watch_sequence > before.watch_sequence
@@ -465,8 +716,29 @@ fn lifecycle_counter_delta(before: u64, after: u64, node_index: usize, counter: 
 }
 
 fn lifecycle_active_connection_bound(member_count: usize) -> i64 {
-    QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR
-        .saturating_mul(i64::try_from(member_count - 1).expect("bounded member count"))
+    QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR.saturating_mul(
+        i64::try_from(member_count.saturating_sub(1)).expect("bounded member count"),
+    )
+}
+
+fn outbound_consensus_socket_bound(member_count: usize) -> usize {
+    QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER.saturating_mul(member_count.saturating_sub(1))
+}
+
+// One retiring plus one replacement generation for every inbound two-lane
+// directed peer. The listener's hard connection cap remains authoritative.
+fn server_rotation_overlap_connection_bound(member_count: usize) -> usize {
+    2_usize.saturating_mul(outbound_consensus_socket_bound(member_count))
+}
+
+fn process_file_descriptor_high_water_bound(
+    member_count: usize,
+    warmed_nontransport_file_descriptors: usize,
+) -> usize {
+    warmed_nontransport_file_descriptors
+        .saturating_add(QUALIFICATION_INBOUND_CONNECTION_SLOTS)
+        .saturating_add(outbound_consensus_socket_bound(member_count))
+        .saturating_add(QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE)
 }
 
 fn lifecycle_transition_is_settled(
@@ -631,11 +903,10 @@ fn assert_process_resource_bounds(
         warmed.iter().zip(high_water).zip(settled).enumerate()
     {
         assert!(high_water.samples >= 1);
-        let file_descriptor_bound = warmed
-            .nontransport_file_descriptors
-            .saturating_add(QUALIFICATION_INBOUND_CONNECTION_SLOTS)
-            .saturating_add(member_count - 1)
-            .saturating_add(QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE);
+        let file_descriptor_bound = process_file_descriptor_high_water_bound(
+            member_count,
+            warmed.nontransport_file_descriptors,
+        );
         assert!(
             high_water.file_descriptors <= file_descriptor_bound,
             "FD high-water bound exceeded: node={node_index}, high_water={}, bound={file_descriptor_bound}, warmed={warmed:?}",
@@ -824,7 +1095,11 @@ impl TestPki {
         let issuance_reference = time::OffsetDateTime::now_utc()
             .replace_nanosecond(0)
             .expect("second-aligned qualification issuance reference");
-        let not_after = issuance_reference + time::Duration::seconds(FAULT_EXPIRY_SECONDS);
+        let not_after = issuance_reference
+            + time::Duration::try_from(Duration::from_millis(
+                QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
+            ))
+            .expect("fault expiry validity fits time duration");
         (
             self.old_intermediate
                 .issue_workload_until(&spiffe_id(node_index), not_after),
@@ -889,6 +1164,104 @@ enum ReaderMessage {
     Invalid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCommandKind {
+    AwaitBound,
+    Configure,
+    Initialize,
+    Probe,
+    ProjectedSourceStatus,
+    MaterialStatus,
+    RequestReauthentication,
+    DirectedHandshake,
+    LifecycleMetrics,
+    SetConsensusRpcAvailability,
+    SecurityMetrics,
+    StartTrafficWatch,
+    ReconcileTrafficWatch,
+    StartTrafficMutation,
+    StopTrafficMutation,
+    StopTrafficWatch,
+    TrafficStatus,
+    Acquire,
+    CompareAndSet,
+    Get,
+    Release,
+    Shutdown,
+}
+
+impl PendingCommandKind {
+    fn from_command(command: &QualificationNodeCommand) -> Self {
+        match command {
+            QualificationNodeCommand::Configure => Self::Configure,
+            QualificationNodeCommand::Initialize => Self::Initialize,
+            QualificationNodeCommand::Probe => Self::Probe,
+            QualificationNodeCommand::ProjectedSourceStatus => Self::ProjectedSourceStatus,
+            QualificationNodeCommand::MaterialStatus => Self::MaterialStatus,
+            QualificationNodeCommand::RequestReauthentication => Self::RequestReauthentication,
+            QualificationNodeCommand::DirectedHandshake { .. } => Self::DirectedHandshake,
+            QualificationNodeCommand::LifecycleMetrics => Self::LifecycleMetrics,
+            QualificationNodeCommand::SetConsensusRpcAvailability { .. } => {
+                Self::SetConsensusRpcAvailability
+            }
+            QualificationNodeCommand::SecurityMetrics => Self::SecurityMetrics,
+            QualificationNodeCommand::StartTrafficWatch => Self::StartTrafficWatch,
+            QualificationNodeCommand::ReconcileTrafficWatch => Self::ReconcileTrafficWatch,
+            QualificationNodeCommand::StartTrafficMutation => Self::StartTrafficMutation,
+            QualificationNodeCommand::StopTrafficMutation => Self::StopTrafficMutation,
+            QualificationNodeCommand::StopTrafficWatch => Self::StopTrafficWatch,
+            QualificationNodeCommand::TrafficStatus => Self::TrafficStatus,
+            QualificationNodeCommand::Acquire { .. } => Self::Acquire,
+            QualificationNodeCommand::CompareAndSet { .. } => Self::CompareAndSet,
+            QualificationNodeCommand::Get { .. } => Self::Get,
+            QualificationNodeCommand::Release { .. } => Self::Release,
+            QualificationNodeCommand::Shutdown => Self::Shutdown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingCommand {
+    kind: PendingCommandKind,
+    sequence: u64,
+    sent_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingCommandDiagnostic {
+    kind: PendingCommandKind,
+    sequence: u64,
+    send_elapsed_millis: u128,
+}
+
+impl PendingCommand {
+    fn diagnostic_at(self, now: Instant) -> PendingCommandDiagnostic {
+        PendingCommandDiagnostic {
+            kind: self.kind,
+            sequence: self.sequence,
+            send_elapsed_millis: now
+                .checked_duration_since(self.sent_at)
+                .unwrap_or_default()
+                .as_millis(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildResponseFailure {
+    Invalid,
+    Timeout,
+    Eof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildStderrDiagnostic {
+    Unavailable,
+    Empty,
+    QualificationNodeFailed,
+    Redacted,
+}
+
 struct ChildNode {
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
@@ -896,6 +1269,8 @@ struct ChildNode {
     reader: Option<JoinHandle<()>>,
     node_index: usize,
     stderr_path: PathBuf,
+    pending: Option<PendingCommand>,
+    next_command_sequence: u64,
 }
 
 impl ChildNode {
@@ -959,6 +1334,12 @@ impl ChildNode {
             reader: Some(reader),
             node_index,
             stderr_path: stderr_path.to_path_buf(),
+            pending: Some(PendingCommand {
+                kind: PendingCommandKind::AwaitBound,
+                sequence: 0,
+                sent_at: Instant::now(),
+            }),
+            next_command_sequence: 1,
         };
         let reply = node.receive();
         let QualificationNodeReply::Bound {
@@ -974,37 +1355,90 @@ impl ChildNode {
     }
 
     fn send(&mut self, command: &QualificationNodeCommand) {
+        assert!(
+            self.pending.is_none(),
+            "qualification child already has one pending command"
+        );
         write_json_line(
             self.stdin.as_mut().expect("qualification child stdin open"),
             command,
         )
         .expect("send qualification command");
+        let sequence = self.next_command_sequence;
+        self.next_command_sequence = self
+            .next_command_sequence
+            .checked_add(1)
+            .expect("qualification command sequence exhausted");
+        self.pending = Some(PendingCommand {
+            kind: PendingCommandKind::from_command(command),
+            sequence,
+            sent_at: Instant::now(),
+        });
     }
 
     fn receive(&mut self) -> QualificationNodeReply {
+        let pending = self
+            .pending
+            .expect("qualification child response requested without a pending command");
         match self.replies.recv_timeout(CHILD_TIMEOUT) {
-            Ok(ReaderMessage::Reply(reply)) => reply,
-            Ok(ReaderMessage::Invalid) => panic!(
-                "invalid qualification child response: node={}, status={:?}, stderr={}",
-                self.node_index,
-                self.child.try_wait().ok().flatten(),
-                self.stderr_tail()
-            ),
-            Err(error) => panic!(
-                "qualification child response unavailable: node={}, error={error}, status={:?}, stderr={}",
-                self.node_index,
-                self.child.try_wait().ok().flatten(),
-                self.stderr_tail()
-            ),
+            Ok(ReaderMessage::Reply(reply)) => {
+                self.pending = None;
+                reply
+            }
+            Ok(ReaderMessage::Invalid) => {
+                self.fail_response(ChildResponseFailure::Invalid, pending)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.fail_response(ChildResponseFailure::Timeout, pending)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.fail_response(ChildResponseFailure::Eof, pending)
+            }
         }
     }
 
-    fn stderr_tail(&self) -> String {
-        let Ok(bytes) = fs::read(&self.stderr_path) else {
-            return "unavailable".to_owned();
+    fn fail_response(&mut self, failure: ChildResponseFailure, pending: PendingCommand) -> ! {
+        let pending = pending.diagnostic_at(Instant::now());
+        let status = self.child.try_wait().ok().flatten();
+        let stderr = self.stderr_diagnostic();
+        panic!(
+            "qualification child response failed: node={}, failure={failure:?}, pending={pending:?}, status={status:?}, stderr={stderr:?}",
+            self.node_index
+        )
+    }
+
+    fn stderr_diagnostic(&self) -> ChildStderrDiagnostic {
+        const MAX_STDERR_BYTES: u64 = 8 * 1024;
+
+        let Ok(mut file) = File::open(&self.stderr_path) else {
+            return ChildStderrDiagnostic::Unavailable;
         };
-        let tail = &bytes[bytes.len().saturating_sub(8 * 1024)..];
-        String::from_utf8_lossy(tail).into_owned()
+        let Ok(total_bytes) = file.metadata().map(|metadata| metadata.len()) else {
+            return ChildStderrDiagnostic::Unavailable;
+        };
+        let start = total_bytes.saturating_sub(MAX_STDERR_BYTES);
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return ChildStderrDiagnostic::Unavailable;
+        }
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(total_bytes.min(MAX_STDERR_BYTES)).unwrap_or(8 * 1024),
+        );
+        if file.take(MAX_STDERR_BYTES).read_to_end(&mut bytes).is_err() {
+            return ChildStderrDiagnostic::Unavailable;
+        }
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return ChildStderrDiagnostic::Empty;
+        }
+        if start == 0
+            && bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .all(|line| line == b"qualification node failed")
+        {
+            ChildStderrDiagnostic::QualificationNodeFailed
+        } else {
+            ChildStderrDiagnostic::Redacted
+        }
     }
 
     fn invoke(&mut self, command: &QualificationNodeCommand) -> QualificationNodeReply {
@@ -1095,6 +1529,8 @@ struct FleetReadiness {
     fresh_reachable_voters: usize,
     agreeing_voters: usize,
     required_quorum: usize,
+    committed_index: Option<u64>,
+    applied_index: Option<u64>,
 }
 
 struct Fleet {
@@ -1280,7 +1716,8 @@ impl Fleet {
                     fresh_reachable_voters,
                     agreeing_voters,
                     required_quorum,
-                    ..
+                    committed_index,
+                    applied_index,
                 } => FleetReadiness {
                     node_index: *node_index,
                     ready,
@@ -1292,6 +1729,8 @@ impl Fleet {
                     fresh_reachable_voters,
                     agreeing_voters,
                     required_quorum,
+                    committed_index,
+                    applied_index,
                 },
                 reply => panic!("unexpected readiness response: {reply:?}"),
             })
@@ -1346,6 +1785,20 @@ impl Fleet {
     }
 
     fn restart_node_at_manifest_address(&mut self, node_index: usize) {
+        let all_node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        let survivor_indices = all_node_indices
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != node_index)
+            .collect::<Vec<_>>();
+        let readiness_before = self.readiness_reports(&all_node_indices);
+        let progress_before = readiness_before
+            .iter()
+            .map(|report| (report.committed_index, report.applied_index))
+            .collect::<Vec<_>>();
+        let traffic_before = self.traffic_statuses_on(&survivor_indices);
+        let source_before = self.projected_status(node_index);
+        let material_before = self.material_status(node_index);
         let expected_address = self.members[node_index].dial_addr;
         let previous_process_id = self.nodes[node_index].process_id();
         self.nodes[node_index].kill_unclean();
@@ -1367,7 +1820,61 @@ impl Fleet {
             self.nodes[node_index].invoke(&QualificationNodeCommand::Initialize),
             QualificationNodeReply::Initialized
         ));
-        self.wait_ready();
+        assert!(matches!(
+            self.nodes[node_index].invoke(&QualificationNodeCommand::SetConsensusRpcAvailability {
+                availability: QualificationConsensusRpcAvailability::Available,
+            }),
+            QualificationNodeReply::ConsensusRpcAvailability {
+                availability: QualificationConsensusRpcAvailability::Available,
+            }
+        ));
+        let source_after = self.projected_status(node_index);
+        let material_after = self.material_status(node_index);
+        let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        loop {
+            let reports = self.readiness_reports(&all_node_indices);
+            let member_count = self.member_count();
+            let required_quorum = self.required_quorum();
+            if reports.iter().all(|report| {
+                report.ready
+                    && report.reason_code == QualificationReadinessCode::Ready
+                    && report.configured_voters == member_count
+                    && report.fresh_reachable_voters == required_quorum
+                    && report.agreeing_voters == required_quorum
+                    && report.required_quorum == required_quorum
+            }) {
+                let survivor_traffic = TrafficParticipants::try_new(
+                    member_count,
+                    &survivor_indices,
+                    &survivor_indices,
+                )
+                .expect("bounded restart survivor traffic participants");
+                let traffic_after_readiness = self.traffic_statuses_on(&survivor_indices);
+                self.wait_for_subset_traffic_progress(
+                    &traffic_after_readiness,
+                    &survivor_traffic,
+                    "exact-address-restart-survivors-post-readiness",
+                    Instant::now() + CLUSTER_TRANSITION_TIMEOUT,
+                );
+                return;
+            }
+            if Instant::now() >= deadline {
+                let progress_after = reports
+                    .iter()
+                    .map(|report| (report.committed_index, report.applied_index))
+                    .collect::<Vec<_>>();
+                let traffic_after = self.traffic_statuses_on(&survivor_indices);
+                let restarted_traffic =
+                    self.nodes[node_index].invoke(&QualificationNodeCommand::TrafficStatus);
+                let source_at_failure = self.projected_status(node_index);
+                let material_at_failure = self.material_status(node_index);
+                panic!(
+                    "exact-address restart did not regain readiness: restarted_node={node_index}, readiness_before={readiness_before:?}, progress_before={progress_before:?}, readiness_after={reports:?}, progress_after={progress_after:?}, traffic_before={traffic_before:?}, traffic_after={traffic_after:?}, restarted_traffic={restarted_traffic:?}, source_before={source_before:?}, source_after={source_after:?}, source_at_failure={source_at_failure:?}, material_before={material_before:?}, material_after={material_after:?}, material_at_failure={material_at_failure:?}, stderr={:?}",
+                    self.stderr_diagnostics()
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn wait_ready(&mut self) {
@@ -1533,14 +2040,7 @@ impl Fleet {
             .expect("rotation drain window fits time duration");
         let soft_retirement_at = not_after - drain_window;
         let early_observation_at = soft_retirement_at - time::Duration::seconds(1);
-        while time::OffsetDateTime::now_utc() < early_observation_at {
-            self.keep_member_directed_paths_alive(expiring_node_index);
-            let remaining = duration_until_wall_time(early_observation_at);
-            if remaining.is_zero() {
-                break;
-            }
-            thread::sleep(remaining.min(Duration::from_secs(5)));
-        }
+        self.keep_member_directed_paths_alive_until(expiring_node_index, early_observation_at);
         loop {
             if time::OffsetDateTime::now_utc() >= soft_retirement_at {
                 break;
@@ -1813,9 +2313,269 @@ impl Fleet {
         }
         self.nodes
             .iter_mut()
-            .map(|node| match node.receive() {
-                QualificationNodeReply::TrafficStatus { status } => status,
-                reply => panic!("unexpected traffic status response: {reply:?}"),
+            .map(|node| {
+                let status = match node.receive() {
+                    QualificationNodeReply::TrafficStatus { status } => status,
+                    reply => panic!("unexpected traffic status response: {reply:?}"),
+                };
+                assert!(traffic_failure_fields_are_coherent(&status));
+                status
+            })
+            .collect()
+    }
+
+    fn traffic_statuses_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
+        validate_traffic_indices(
+            self.member_count(),
+            node_indices,
+            TrafficParticipantError::EmptyObservers,
+        )
+        .expect("valid bounded traffic status participants");
+        for node_index in node_indices {
+            self.nodes[*node_index].send(&QualificationNodeCommand::TrafficStatus);
+        }
+        node_indices
+            .iter()
+            .map(|node_index| {
+                let status = match self.nodes[*node_index].receive() {
+                    QualificationNodeReply::TrafficStatus { status } => status,
+                    reply => panic!(
+                        "traffic status unavailable: node={node_index}, reply={reply:?}, stderr={}",
+                        self.node_stderr(*node_index)
+                    ),
+                };
+                assert!(
+                    traffic_failure_fields_are_coherent(&status),
+                    "traffic failure fields are incoherent: node={node_index}, status={status:?}"
+                );
+                IndexedTrafficStatus {
+                    node_index: *node_index,
+                    status,
+                }
+            })
+            .collect()
+    }
+
+    fn start_traffic_watches_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
+        validate_traffic_indices(
+            self.member_count(),
+            node_indices,
+            TrafficParticipantError::EmptyObservers,
+        )
+        .expect("valid bounded traffic watch participants");
+        let member_count = self.member_count();
+        let seed = qualification_traffic_seed(member_count)
+            .expect("supported traffic qualification topology");
+        for node_index in node_indices {
+            self.nodes[*node_index].send(&QualificationNodeCommand::StartTrafficWatch);
+        }
+        node_indices
+            .iter()
+            .map(|node_index| {
+                let status = match self.nodes[*node_index].receive() {
+                    QualificationNodeReply::TrafficStatus { status } => status,
+                    reply => panic!(
+                        "traffic watch did not start: node={node_index}, reply={reply:?}, stderr={}",
+                        self.node_stderr(*node_index)
+                    ),
+                };
+                assert_eq!(status.state, QualificationTrafficState::WatchReady);
+                assert_eq!(status.failure, None);
+                assert_eq!(status.seed, seed);
+                assert_eq!(status.owned_async_tasks, 1);
+                assert_eq!(status.watch_traffic_generations.len(), member_count);
+                IndexedTrafficStatus {
+                    node_index: *node_index,
+                    status,
+                }
+            })
+            .collect()
+    }
+
+    fn reconcile_traffic_watch_on(&mut self, node_index: usize) -> IndexedTrafficStatus {
+        assert!(node_index < self.member_count());
+        let member_count = self.member_count();
+        let seed = qualification_traffic_seed(member_count)
+            .expect("supported traffic qualification topology");
+        let status = match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::ReconcileTrafficWatch)
+        {
+            QualificationNodeReply::TrafficStatus { status } => status,
+            reply => panic!(
+                "traffic watch restore handoff failed: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        };
+        assert!(matches!(
+            status.state,
+            QualificationTrafficState::WatchReady | QualificationTrafficState::MutationStopped
+        ));
+        assert_eq!(status.failure, None);
+        assert_eq!(status.seed, seed);
+        assert_eq!(status.owned_async_tasks, 1);
+        assert!(status.watch_reconciliations >= 1);
+        assert!(status.watch_reconciled_sequence <= status.watch_sequence);
+        assert!(status.watch_reconciled_sequence <= status.replication_head);
+        assert_eq!(status.watch_traffic_generations.len(), member_count);
+        IndexedTrafficStatus { node_index, status }
+    }
+
+    fn start_traffic_mutations_on(&mut self, node_indices: &[usize]) {
+        validate_traffic_indices(
+            self.member_count(),
+            node_indices,
+            TrafficParticipantError::EmptyMutators,
+        )
+        .expect("valid bounded traffic mutator participants");
+        let seed = qualification_traffic_seed(self.member_count())
+            .expect("supported traffic qualification topology");
+        for node_index in node_indices {
+            self.nodes[*node_index].send(&QualificationNodeCommand::StartTrafficMutation);
+        }
+        for node_index in node_indices {
+            match self.nodes[*node_index].receive() {
+                QualificationNodeReply::TrafficStatus { status } => {
+                    assert_eq!(status.state, QualificationTrafficState::Running);
+                    assert_eq!(status.failure, None);
+                    assert!(traffic_failure_fields_are_coherent(&status));
+                    assert_eq!(status.seed, seed);
+                    assert_eq!(status.owned_async_tasks, 2);
+                }
+                reply => panic!(
+                    "traffic mutation did not start: node={node_index}, reply={reply:?}, stderr={}",
+                    self.node_stderr(*node_index)
+                ),
+            }
+        }
+    }
+
+    fn start_subset_traffic_tasks(
+        &mut self,
+        participants: &TrafficParticipants,
+        phase: &str,
+    ) -> Vec<IndexedTrafficStatus> {
+        assert_eq!(participants.member_count, self.member_count());
+        let before = self.start_traffic_watches_on(&participants.observers);
+        self.start_traffic_mutations_on(&participants.mutators);
+        self.wait_for_subset_traffic_progress(
+            &before,
+            participants,
+            phase,
+            Instant::now() + CLUSTER_TRANSITION_TIMEOUT,
+        )
+    }
+
+    fn wait_for_subset_traffic_progress(
+        &mut self,
+        before: &[IndexedTrafficStatus],
+        participants: &TrafficParticipants,
+        phase: &str,
+        deadline: Instant,
+    ) -> Vec<IndexedTrafficStatus> {
+        assert_eq!(participants.member_count, self.member_count());
+        assert!(traffic_status_snapshot_matches(before, participants));
+        loop {
+            let after = self.traffic_statuses_on(&participants.observers);
+            for indexed in &after {
+                if indexed.status.failure.is_some()
+                    || indexed.status.state == QualificationTrafficState::Failed
+                {
+                    let all_node_indices = (0..self.member_count()).collect::<Vec<_>>();
+                    let readiness = self.readiness_reports(&all_node_indices);
+                    panic!(
+                        "traffic task failed during {phase}: node={}, status={:?}, readiness={readiness:?}, stderr={}",
+                        indexed.node_index,
+                        indexed.status,
+                        self.node_stderr(indexed.node_index)
+                    );
+                }
+            }
+            if subset_traffic_made_semantic_progress(before, &after, participants) {
+                assert!(
+                    deadline_allows_completion(Instant::now(), deadline),
+                    "subset traffic progressed only after the absolute deadline: phase={phase}, participants={participants:?}, before={before:?}, after={after:?}, stderr={:?}",
+                    self.stderr_diagnostics()
+                );
+                return after;
+            }
+            assert!(
+                deadline_allows_completion(Instant::now(), deadline),
+                "subset traffic did not make semantic progress: phase={phase}, participants={participants:?}, before={before:?}, after={after:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn stop_traffic_mutations_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
+        validate_traffic_indices(
+            self.member_count(),
+            node_indices,
+            TrafficParticipantError::EmptyMutators,
+        )
+        .expect("valid bounded stopped mutator participants");
+        for node_index in node_indices {
+            self.nodes[*node_index].send(&QualificationNodeCommand::StopTrafficMutation);
+        }
+        node_indices
+            .iter()
+            .map(|node_index| {
+                let status = match self.nodes[*node_index].receive() {
+                    QualificationNodeReply::TrafficStatus { status } => status,
+                    reply => panic!(
+                        "traffic mutation did not stop: node={node_index}, reply={reply:?}, stderr={}",
+                        self.node_stderr(*node_index)
+                    ),
+                };
+                assert_eq!(
+                    status.state,
+                    QualificationTrafficState::MutationStopped,
+                    "traffic mutation stop returned an invalid state: node={node_index}, status={status:?}, stderr={}",
+                    self.node_stderr(*node_index)
+                );
+                assert_eq!(status.failure, None);
+                assert_eq!(status.owned_async_tasks, 1);
+                assert_completed_traffic_cycles(&status);
+                IndexedTrafficStatus {
+                    node_index: *node_index,
+                    status,
+                }
+            })
+            .collect()
+    }
+
+    fn stop_traffic_watches_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
+        validate_traffic_indices(
+            self.member_count(),
+            node_indices,
+            TrafficParticipantError::EmptyObservers,
+        )
+        .expect("valid bounded stopped watch participants");
+        for node_index in node_indices {
+            self.nodes[*node_index].send(&QualificationNodeCommand::StopTrafficWatch);
+        }
+        node_indices
+            .iter()
+            .map(|node_index| {
+                let status = match self.nodes[*node_index].receive() {
+                    QualificationNodeReply::TrafficStatus { status } => status,
+                    reply => panic!(
+                        "traffic watch did not stop: node={node_index}, reply={reply:?}, stderr={}",
+                        self.node_stderr(*node_index)
+                    ),
+                };
+                assert_eq!(
+                    status.state,
+                    QualificationTrafficState::Stopped,
+                    "traffic watch stop returned an invalid state: node={node_index}, status={status:?}, stderr={}",
+                    self.node_stderr(*node_index)
+                );
+                assert_eq!(status.failure, None);
+                assert_eq!(status.owned_async_tasks, 0);
+                IndexedTrafficStatus {
+                    node_index: *node_index,
+                    status,
+                }
             })
             .collect()
     }
@@ -1860,6 +2620,10 @@ impl Fleet {
             if statuses.iter().all(|status| {
                 status.state == QualificationTrafficState::Running
                     && status.failure.is_none()
+                    && traffic_failure_fields_are_coherent(status)
+                    && traffic_live_mutator_counters_are_consistent(status)
+                    && traffic_availability_recovery_is_resolved(status)
+                    && status.availability_interruptions >= 1
                     && status.owned_async_tasks == 2
                     && status.mutation_cycles >= 1
                     && status.watch_entries >= 1
@@ -2044,12 +2808,38 @@ impl Fleet {
         self.prove_all_directed_paths_parallel(&generations);
     }
 
-    fn keep_member_directed_paths_alive(&mut self, member: usize) {
+    fn keep_member_directed_paths_alive_until(
+        &mut self,
+        member: usize,
+        cutoff: time::OffsetDateTime,
+    ) {
+        while time::OffsetDateTime::now_utc() < cutoff {
+            if !self.keep_member_directed_paths_alive_before(member, cutoff) {
+                return;
+            }
+            let remaining = duration_until_wall_time(cutoff);
+            if remaining.is_zero() {
+                return;
+            }
+            thread::sleep(remaining.min(Duration::from_secs(5)));
+        }
+    }
+
+    fn keep_member_directed_paths_alive_before(
+        &mut self,
+        member: usize,
+        cutoff: time::OffsetDateTime,
+    ) -> bool {
+        let complete_call_bound =
+            Duration::from_millis(DURABLE_CONSENSUS_TIMING_PROFILE.read_barrier_timeout_millis);
         for remote in 0..self.member_count() {
             if remote == member {
                 continue;
             }
             for (source, target) in [(remote, member), (member, remote)] {
+                if duration_until_wall_time(cutoff) < complete_call_bound {
+                    return false;
+                }
                 match self.nodes[source].invoke(&QualificationNodeCommand::DirectedHandshake {
                     remote_node_index: target,
                 }) {
@@ -2066,8 +2856,13 @@ impl Fleet {
                         self.node_stderr(target)
                     ),
                 }
+                assert!(
+                    time::OffsetDateTime::now_utc() <= cutoff,
+                    "incident directed keepalive exceeded its absolute cutoff: source={source}, target={target}"
+                );
             }
         }
+        true
     }
 
     fn verify_all_traffic_records(&mut self, statuses: &[QualificationTrafficStatus]) {
@@ -3151,13 +3946,26 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
     const MALFORMED_TRUST_BUNDLE: &str =
         "-----BEGIN CERTIFICATE-----\nqualification-malformed\n-----END CERTIFICATE-----\n";
 
-    let mut fleet = Fleet::start(member_count);
+    let mut fleet = Fleet::start_traffic(member_count);
 
     // Keep node 0 in the survivor quorum because it owns the fixed canary lease.
     // A different stable follower loses consensus RPC admission while node 0
     // atomically publishes malformed trust and retains its exact last-good
     // identity. This is a test-control fault, not a network partition.
     let isolated_node_index = fleet.stable_nonzero_follower();
+    let all_node_indices = (0..member_count).collect::<Vec<_>>();
+    let survivor_node_indices = all_node_indices
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != isolated_node_index)
+        .collect::<Vec<_>>();
+    let initial_traffic =
+        TrafficParticipants::try_new(member_count, &all_node_indices, &survivor_node_indices)
+            .expect("bounded fault traffic participants");
+    fleet.start_subset_traffic_tasks(&initial_traffic, "fault-traffic-warmup");
+    let survivor_traffic =
+        TrafficParticipants::try_new(member_count, &survivor_node_indices, &survivor_node_indices)
+            .expect("bounded survivor traffic participants");
     let malformed_node_index = 0;
     let malformed_source_before = fleet.projected_status(malformed_node_index);
     let malformed_controller_before = fleet.material_status(malformed_node_index);
@@ -3187,16 +3995,50 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         malformed_security_before,
     );
     fleet.wait_for_isolated_member_and_survivors(isolated_node_index);
+    let fault_traffic_after_boundary = fleet.traffic_statuses_on(&survivor_node_indices);
     fleet.advance_canary_for_survivors(
         isolated_node_index,
         "consensus-unavailable-malformed-retained",
+    );
+    fleet.wait_for_subset_traffic_progress(
+        &fault_traffic_after_boundary,
+        &survivor_traffic,
+        "consensus-unavailable-malformed-retained",
+        Instant::now() + CLUSTER_TRANSITION_TIMEOUT,
     );
     let fault_lifecycle_after = fleet.all_lifecycle_metrics();
     assert_fault_lifecycle_failures_unchanged(&fault_lifecycle_before, &fault_lifecycle_after);
 
     fleet.restart_node_at_manifest_address(isolated_node_index);
+    let restarted_watch = fleet.reconcile_traffic_watch_on(isolated_node_index);
+    assert_eq!(
+        restarted_watch.status.state,
+        QualificationTrafficState::WatchReady
+    );
+    assert_eq!(
+        restarted_watch.status.watch_traffic_generations[isolated_node_index], 0,
+        "the unavailable watcher-only node must not acquire hidden mutation work"
+    );
+    for survivor in &survivor_node_indices {
+        assert!(
+            restarted_watch.status.watch_traffic_generations[*survivor] > 0,
+            "the exact-address restart must reconcile every survivor traffic key"
+        );
+    }
+    fleet.start_traffic_mutations_on(&[isolated_node_index]);
+    let all_traffic =
+        TrafficParticipants::try_new(member_count, &all_node_indices, &all_node_indices)
+            .expect("bounded full-fleet traffic participants");
+    let restart_traffic_before = fleet.traffic_statuses_on(&all_node_indices);
+    let restart_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     fleet.verify_canary();
     fleet.advance_canary("exact-address-restart-recovered");
+    fleet.wait_for_subset_traffic_progress(
+        &restart_traffic_before,
+        &all_traffic,
+        "exact-address-restart-reconciled",
+        restart_traffic_deadline,
+    );
 
     let repair_source_before = fleet.projected_status(malformed_node_index);
     let repair_controller_before = fleet.material_status(malformed_node_index);
@@ -3217,10 +4059,18 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
     );
     fleet.fresh_all_directed_generation();
     fleet.wait_ready();
-    fleet.advance_canary("malformed-trust-repaired");
     fleet.wait_for_malformed_retry_to_stop(
         malformed_node_index,
         malformed_security.trust_bundle.retained_last_good,
+    );
+    let repair_traffic_after_boundary = fleet.traffic_statuses_on(&all_node_indices);
+    let repair_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    fleet.advance_canary("malformed-trust-repaired");
+    fleet.wait_for_subset_traffic_progress(
+        &repair_traffic_after_boundary,
+        &all_traffic,
+        "malformed-trust-repaired-under-traffic",
+        repair_traffic_deadline,
     );
 
     // Publish a same-issuer leaf with a 75-second remaining-validity/expiry
@@ -3228,6 +4078,17 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
     // and retain the PID so recovery can prove a same-process material
     // replacement.
     let expiring_node_index = fleet.stable_nonzero_follower();
+    let expiry_survivor_indices = all_node_indices
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != expiring_node_index)
+        .collect::<Vec<_>>();
+    let expiry_survivor_traffic = TrafficParticipants::try_new(
+        member_count,
+        &expiry_survivor_indices,
+        &expiry_survivor_indices,
+    )
+    .expect("bounded expiry survivor traffic participants");
     let expiring_process_id = fleet.nodes[expiring_node_index].process_id();
     let expiring_source_before = fleet.projected_status(expiring_node_index);
     let expiring_controller_before = fleet.material_status(expiring_node_index);
@@ -3291,6 +4152,14 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         &lifecycle_before_expiry,
         remote_peers,
     );
+    let short_leaf_traffic_after_boundary = fleet.traffic_statuses_on(&all_node_indices);
+    let short_leaf_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    fleet.wait_for_subset_traffic_progress(
+        &short_leaf_traffic_after_boundary,
+        &all_traffic,
+        "short-lived-svid-published-under-traffic",
+        short_leaf_traffic_deadline,
+    );
     let soft_retirement_at = not_after
         - time::Duration::try_from(DEFAULT_ROTATION_DRAIN_WINDOW)
             .expect("rotation drain window fits time duration");
@@ -3299,7 +4168,54 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         "short-lived SVID setup did not complete before its soft-retirement deadline"
     );
 
+    let traffic_stop_at = soft_retirement_at
+        - time::Duration::try_from(Duration::from_millis(
+            QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
+        ))
+        .expect("fault traffic-stop lead fits time duration");
+    let mutation_shutdown_bound = time::Duration::try_from(Duration::from_millis(
+        QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
+    ))
+    .expect("fault mutation-shutdown lead fits time duration");
+    let mutation_shutdown_start_at = traffic_stop_at - mutation_shutdown_bound;
+    fleet.keep_member_directed_paths_alive_until(expiring_node_index, mutation_shutdown_start_at);
+    let stopped_expiring_mutation = fleet.stop_traffic_mutations_on(&[expiring_node_index]);
+    assert!(
+        time::OffsetDateTime::now_utc() <= traffic_stop_at,
+        "expiring-node mutation shutdown exceeded its fixed pre-retirement bound"
+    );
+    fleet.keep_member_directed_paths_alive_until(expiring_node_index, traffic_stop_at);
+    let stopped_expiring_watch = fleet.stop_traffic_watches_on(&[expiring_node_index]);
+    assert!(
+        time::OffsetDateTime::now_utc() < soft_retirement_at,
+        "expiring-node watch shutdown crossed the fixed soft-retirement boundary"
+    );
+    assert_eq!(
+        stopped_expiring_watch[0].status.mutation_cycles,
+        stopped_expiring_mutation[0].status.mutation_cycles
+    );
+    assert_eq!(
+        stopped_expiring_watch[0].status.last_generation,
+        stopped_expiring_mutation[0].status.last_generation
+    );
+    let stopped_expiring_status = stopped_expiring_watch[0].status.clone();
     fleet.wait_for_expiry_soft_retirement(expiring_node_index, &lifecycle_before_expiry, not_after);
+    assert!(
+        time::OffsetDateTime::now_utc() < not_after,
+        "soft retirement was not observed strictly before hard expiry"
+    );
+    let traffic_after_soft_boundary = fleet.traffic_statuses_on(&expiry_survivor_indices);
+    let soft_traffic_deadline = Instant::now() + duration_until_wall_time(not_after);
+    fleet.wait_for_subset_traffic_progress(
+        &traffic_after_soft_boundary,
+        &expiry_survivor_traffic,
+        "survivor-traffic-through-soft-retirement",
+        soft_traffic_deadline,
+    );
+    assert!(
+        time::OffsetDateTime::now_utc() < not_after,
+        "hard-expiry work cannot satisfy soft-retirement traffic progress"
+    );
     let (expired_security, _) = fleet.wait_for_expired_member_state(
         expiring_node_index,
         expiring_source.generation,
@@ -3309,7 +4225,15 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         not_after,
     );
     fleet.wait_for_isolated_member_and_survivors(expiring_node_index);
+    let traffic_after_hard_expiry_boundary = fleet.traffic_statuses_on(&expiry_survivor_indices);
+    let hard_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     fleet.advance_canary_for_survivors(expiring_node_index, "short-lived-svid-expired");
+    fleet.wait_for_subset_traffic_progress(
+        &traffic_after_hard_expiry_boundary,
+        &expiry_survivor_traffic,
+        "survivor-traffic-through-hard-expiry",
+        hard_traffic_deadline,
+    );
 
     let survivor_node_index = (0..member_count)
         .find(|node_index| *node_index != expiring_node_index)
@@ -3354,6 +4278,61 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         "short-lived SVID recovery must reload material in the same process"
     );
     fleet.complete_fleet_phase("short-lived-svid-replacement-recovered");
+    let replacement_traffic_after_boundary = fleet.traffic_statuses_on(&expiry_survivor_indices);
+    let replacement_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    fleet.wait_for_subset_traffic_progress(
+        &replacement_traffic_after_boundary,
+        &expiry_survivor_traffic,
+        "survivor-traffic-through-material-replacement",
+        replacement_traffic_deadline,
+    );
+    let reconciled_expiring_watch = fleet.reconcile_traffic_watch_on(expiring_node_index);
+    assert_eq!(
+        reconciled_expiring_watch.status.state,
+        QualificationTrafficState::MutationStopped
+    );
+    assert_eq!(
+        reconciled_expiring_watch.status.mutation_cycles,
+        stopped_expiring_status.mutation_cycles
+    );
+    assert_eq!(
+        reconciled_expiring_watch.status.last_generation,
+        stopped_expiring_status.last_generation
+    );
+    assert_eq!(
+        reconciled_expiring_watch.status.last_record_fence,
+        stopped_expiring_status.last_record_fence
+    );
+    assert_eq!(
+        reconciled_expiring_watch.status.watch_reconciliations,
+        stopped_expiring_status.watch_reconciliations + 1
+    );
+    assert!(
+        reconciled_expiring_watch.status.watch_reconciled_sequence
+            > stopped_expiring_status.watch_sequence
+    );
+    assert_eq!(
+        reconciled_expiring_watch.status.watch_traffic_generations[expiring_node_index],
+        stopped_expiring_status.last_generation
+    );
+    for survivor in &expiry_survivor_indices {
+        assert!(
+            reconciled_expiring_watch.status.watch_traffic_generations[*survivor]
+                > stopped_expiring_status.watch_traffic_generations[*survivor],
+            "reconciled watcher did not catch up the active survivor key: node={survivor}"
+        );
+    }
+    let rejoined_traffic =
+        TrafficParticipants::try_new(member_count, &all_node_indices, &expiry_survivor_indices)
+            .expect("bounded rejoined traffic participants");
+    let rejoined_traffic_before = fleet.traffic_statuses_on(&all_node_indices);
+    let rejoined_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    fleet.wait_for_subset_traffic_progress(
+        &rejoined_traffic_before,
+        &rejoined_traffic,
+        "reconciled-watch-after-material-replacement",
+        rejoined_traffic_deadline,
+    );
     let recovered_controller = fleet.material_status(expiring_node_index);
     let recovered_security = fleet.security_metrics(expiring_node_index);
     assert_security_metrics_unsaturated(expiring_node_index, &recovered_security);
@@ -3374,6 +4353,29 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         expired_security.svid.expired
     );
 
+    let final_mutation_statuses = fleet.stop_traffic_mutations_on(&expiry_survivor_indices);
+    let final_watch_statuses = fleet.wait_for_watch_heads();
+    for stopped in &final_mutation_statuses {
+        let caught_up = &final_watch_statuses[stopped.node_index];
+        assert_eq!(stopped.status.last_generation, caught_up.last_generation);
+        assert_eq!(
+            stopped.status.last_record_fence,
+            caught_up.last_record_fence
+        );
+    }
+    fleet.verify_all_traffic_records(&final_watch_statuses);
+    let expected_generations = final_watch_statuses
+        .iter()
+        .map(|status| status.last_generation)
+        .collect::<Vec<_>>();
+    for (node_index, status) in final_watch_statuses.iter().enumerate() {
+        assert_eq!(
+            status.watch_traffic_generations, expected_generations,
+            "final watch did not converge on every exact traffic generation: node={node_index}"
+        );
+    }
+    let stopped_watches = fleet.stop_traffic_watches();
+    fleet.retain_traffic_plaintext_canaries(&stopped_watches);
     fleet.shutdown();
     fleet.assert_plaintext_canaries_absent_from_sqlite();
     assert!(fleet.workspace.path().is_dir());
@@ -3945,21 +4947,302 @@ fn traffic_status_fixture(member_count: usize) -> QualificationTrafficStatus {
     QualificationTrafficStatus {
         state: QualificationTrafficState::Running,
         failure: None,
+        failure_stage: None,
+        failure_error_class: None,
         seed: 1,
         owned_async_tasks: 2,
         mutation_cycles: 10,
-        linearizable_reads: 10,
-        lease_renewals: 10,
+        linearizable_reads: 11,
+        lease_renewals: 11,
         lease_reacquisitions: 10,
-        complete_restore_scans: 10,
-        durable_readiness_probes: 10,
-        last_generation: 10,
-        last_record_fence: 10,
+        availability_interruptions: 1,
+        availability_recoveries: 1,
+        max_consecutive_availability_interruptions: 1,
+        complete_restore_scans: 11,
+        durable_readiness_probes: 11,
+        last_generation: 11,
+        last_record_fence: 11,
         watch_entries: 10,
         watch_applied_records: 10,
         watch_sequence: 10,
+        watch_reconciliations: 0,
+        watch_reconciled_sequence: 0,
         watch_traffic_generations: vec![10; member_count],
         replication_head: 10,
+    }
+}
+
+#[test]
+fn stopped_traffic_accepts_each_ordered_partial_final_cycle() {
+    let complete = traffic_status_fixture(3);
+    let mut renewed = complete.clone();
+    renewed.lease_renewals += 1;
+    let mut compared_and_set = renewed.clone();
+    compared_and_set.last_generation += 1;
+    compared_and_set.last_record_fence += 1;
+    let mut read = compared_and_set.clone();
+    read.linearizable_reads += 1;
+    let mut restored = read.clone();
+    restored.complete_restore_scans += 1;
+    let mut ready = restored.clone();
+    ready.durable_readiness_probes += 1;
+    let mut next_cycle = ready.clone();
+    next_cycle.lease_reacquisitions += 1;
+    next_cycle.mutation_cycles += 1;
+
+    for status in [
+        complete,
+        renewed,
+        compared_and_set,
+        read,
+        restored,
+        ready,
+        next_cycle,
+    ] {
+        assert!(traffic_live_mutator_counters_are_consistent(&status));
+        assert_completed_traffic_cycles(&status);
+    }
+}
+
+#[test]
+fn traffic_counter_prefix_rejects_skips_reordering_and_multiple_partial_cycles() {
+    let baseline = traffic_status_fixture(3);
+    let mut invalid = Vec::new();
+
+    let mut multiple_renewals = baseline.clone();
+    multiple_renewals.lease_renewals += 2;
+    invalid.push(multiple_renewals);
+
+    let mut cas_without_renewal = baseline.clone();
+    cas_without_renewal.last_generation += 1;
+    invalid.push(cas_without_renewal);
+
+    let mut read_without_cas = baseline.clone();
+    read_without_cas.linearizable_reads += 1;
+    invalid.push(read_without_cas);
+
+    let mut restore_without_read = baseline.clone();
+    restore_without_read.complete_restore_scans += 1;
+    invalid.push(restore_without_read);
+
+    let mut readiness_without_restore = baseline.clone();
+    readiness_without_restore.durable_readiness_probes += 1;
+    invalid.push(readiness_without_restore);
+
+    for status in invalid {
+        assert!(!traffic_live_mutator_counters_are_consistent(&status));
+    }
+}
+
+#[test]
+fn traffic_progress_rejects_unresolved_or_incoherent_availability_evidence() {
+    let before = traffic_status_fixture(3);
+    let mut after = before.clone();
+    after.mutation_cycles += 1;
+    after.linearizable_reads += 1;
+    after.lease_renewals += 1;
+    after.lease_reacquisitions += 1;
+    after.complete_restore_scans += 1;
+    after.durable_readiness_probes += 1;
+    after.last_generation += 1;
+    after.last_record_fence += 1;
+    after.watch_entries += 3;
+    after.watch_applied_records += 3;
+    after.watch_sequence += 3;
+    for generation in &mut after.watch_traffic_generations {
+        *generation += 1;
+    }
+
+    let mut unresolved = after.clone();
+    unresolved.availability_interruptions += 1;
+    unresolved.max_consecutive_availability_interruptions += 1;
+    assert!(traffic_live_mutator_counters_are_consistent(&unresolved));
+    assert!(!traffic_availability_recovery_is_resolved(&unresolved));
+    assert!(!traffic_status_made_semantic_progress(
+        &before,
+        &unresolved,
+        3
+    ));
+
+    let mut impossible = after.clone();
+    impossible.availability_interruptions = 1;
+    impossible.availability_recoveries = 1;
+    impossible.max_consecutive_availability_interruptions = 0;
+    assert!(!traffic_live_mutator_counters_are_consistent(&impossible));
+
+    let mut incoherent = after;
+    incoherent.failure = Some(QualificationTrafficFailureCode::BackendUnavailable);
+    incoherent.failure_stage = Some(QualificationTrafficFailureStage::Get);
+    incoherent.failure_error_class = None;
+    assert!(!traffic_failure_fields_are_coherent(&incoherent));
+    incoherent.failure_error_class = Some(QualificationTrafficErrorClass::BackendUnavailable);
+    assert!(traffic_failure_fields_are_coherent(&incoherent));
+}
+
+#[test]
+fn live_counter_snapshot_allows_reacquisition_before_cycle_publish() {
+    let mut status = traffic_status_fixture(3);
+    status.lease_renewals += 1;
+    status.last_generation += 1;
+    status.last_record_fence += 1;
+    status.linearizable_reads += 1;
+    status.complete_restore_scans += 1;
+    status.durable_readiness_probes += 1;
+    status.lease_reacquisitions += 1;
+
+    assert!(traffic_live_mutator_counters_are_consistent(&status));
+    let rejected = std::panic::catch_unwind(|| assert_completed_traffic_cycles(&status));
+    assert!(rejected.is_err());
+}
+
+fn subset_traffic_fixture() -> (
+    TrafficParticipants,
+    Vec<IndexedTrafficStatus>,
+    Vec<IndexedTrafficStatus>,
+) {
+    let participants =
+        TrafficParticipants::try_new(3, &[0, 1, 2], &[0, 1]).expect("traffic participants");
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for node_index in 0..3 {
+        let mut initial = traffic_status_fixture(3);
+        initial.watch_traffic_generations = vec![10, 10, 0];
+        if node_index == 2 {
+            initial.state = QualificationTrafficState::WatchReady;
+            initial.owned_async_tasks = 1;
+            initial.mutation_cycles = 0;
+            initial.linearizable_reads = 0;
+            initial.lease_renewals = 0;
+            initial.lease_reacquisitions = 0;
+            initial.complete_restore_scans = 0;
+            initial.durable_readiness_probes = 0;
+            initial.last_generation = 0;
+            initial.last_record_fence = 0;
+            initial.availability_interruptions = 0;
+            initial.availability_recoveries = 0;
+            initial.max_consecutive_availability_interruptions = 0;
+        }
+        let mut progressed = initial.clone();
+        progressed.watch_entries += 4;
+        progressed.watch_applied_records += 2;
+        progressed.watch_sequence += 4;
+        progressed.replication_head += 4;
+        progressed.watch_traffic_generations[0] += 1;
+        progressed.watch_traffic_generations[1] += 1;
+        if node_index != 2 {
+            progressed.mutation_cycles += 2;
+            progressed.linearizable_reads += 2;
+            progressed.lease_renewals += 2;
+            progressed.lease_reacquisitions += 2;
+            progressed.complete_restore_scans += 2;
+            progressed.durable_readiness_probes += 2;
+            progressed.last_generation += 2;
+            progressed.last_record_fence += 2;
+        }
+        before.push(IndexedTrafficStatus {
+            node_index,
+            status: initial,
+        });
+        after.push(IndexedTrafficStatus {
+            node_index,
+            status: progressed,
+        });
+    }
+    (participants, before, after)
+}
+
+#[test]
+fn traffic_participants_reject_invalid_or_ambiguous_indices() {
+    assert!(TrafficParticipants::try_new(3, &[0, 1, 2], &[0, 1]).is_ok());
+    assert_eq!(
+        TrafficParticipants::try_new(4, &[0, 1, 2], &[0, 1]),
+        Err(TrafficParticipantError::UnsupportedMemberCount)
+    );
+    assert_eq!(
+        TrafficParticipants::try_new(3, &[], &[0]),
+        Err(TrafficParticipantError::EmptyObservers)
+    );
+    assert_eq!(
+        TrafficParticipants::try_new(3, &[0], &[]),
+        Err(TrafficParticipantError::EmptyMutators)
+    );
+    assert_eq!(
+        TrafficParticipants::try_new(3, &[0, 3], &[0]),
+        Err(TrafficParticipantError::NodeIndexOutOfRange)
+    );
+    assert_eq!(
+        TrafficParticipants::try_new(3, &[0, 0], &[0]),
+        Err(TrafficParticipantError::DuplicateNodeIndex)
+    );
+    assert_eq!(
+        TrafficParticipants::try_new(3, &[0, 1], &[0, 0]),
+        Err(TrafficParticipantError::DuplicateNodeIndex)
+    );
+    assert_eq!(
+        TrafficParticipants::try_new(3, &[0, 1], &[2]),
+        Err(TrafficParticipantError::MutatorWithoutObserver)
+    );
+}
+
+#[test]
+fn subset_traffic_accepts_watch_only_observer_and_requires_every_active_key() {
+    let (participants, before, after) = subset_traffic_fixture();
+    assert!(subset_traffic_made_semantic_progress(
+        &before,
+        &after,
+        &participants
+    ));
+
+    let mut missing_key = after.clone();
+    missing_key[2].status.watch_traffic_generations[1] =
+        before[2].status.watch_traffic_generations[1];
+    assert!(!subset_traffic_made_semantic_progress(
+        &before,
+        &missing_key,
+        &participants
+    ));
+
+    let mut changed_inactive_key = after.clone();
+    changed_inactive_key[0].status.watch_traffic_generations[2] += 1;
+    assert!(!subset_traffic_made_semantic_progress(
+        &before,
+        &changed_inactive_key,
+        &participants
+    ));
+}
+
+#[test]
+fn subset_traffic_requires_every_mutator_operation_counter() {
+    let (participants, before, after) = subset_traffic_fixture();
+    for counter in [
+        "cycles",
+        "read",
+        "renew",
+        "reacquire",
+        "restore",
+        "readiness",
+        "generation",
+        "fence",
+    ] {
+        let mut missing = after.clone();
+        let status = &mut missing[0].status;
+        match counter {
+            "cycles" => status.mutation_cycles = before[0].status.mutation_cycles,
+            "read" => status.linearizable_reads = before[0].status.linearizable_reads,
+            "renew" => status.lease_renewals = before[0].status.lease_renewals,
+            "reacquire" => status.lease_reacquisitions = before[0].status.lease_reacquisitions,
+            "restore" => status.complete_restore_scans = before[0].status.complete_restore_scans,
+            "readiness" => {
+                status.durable_readiness_probes = before[0].status.durable_readiness_probes
+            }
+            "generation" => status.last_generation = before[0].status.last_generation,
+            "fence" => status.last_record_fence = before[0].status.last_record_fence,
+            _ => unreachable!(),
+        }
+        assert!(
+            !subset_traffic_made_semantic_progress(&before, &missing, &participants),
+            "missing mutator counter was accepted: {counter}"
+        );
     }
 }
 
@@ -4004,6 +5287,13 @@ fn traffic_progress_requires_every_observer_watch_dimension_and_key_to_advance()
     let before = traffic_status_fixture(3);
     let mut after = before.clone();
     after.mutation_cycles += 1;
+    after.linearizable_reads += 1;
+    after.lease_renewals += 1;
+    after.lease_reacquisitions += 1;
+    after.complete_restore_scans += 1;
+    after.durable_readiness_probes += 1;
+    after.last_generation += 1;
+    after.last_record_fence += 1;
     after.watch_entries += 3;
     after.watch_applied_records += 3;
     after.watch_sequence += 3;
@@ -4012,10 +5302,30 @@ fn traffic_progress_requires_every_observer_watch_dimension_and_key_to_advance()
     }
     assert!(traffic_status_made_semantic_progress(&before, &after, 3));
 
-    for stalled in ["mutation", "entries", "applied", "sequence", "key"] {
+    for stalled in [
+        "mutation",
+        "read",
+        "renew",
+        "reacquire",
+        "restore",
+        "readiness",
+        "generation",
+        "fence",
+        "entries",
+        "applied",
+        "sequence",
+        "key",
+    ] {
         let mut candidate = after.clone();
         match stalled {
             "mutation" => candidate.mutation_cycles = before.mutation_cycles,
+            "read" => candidate.linearizable_reads = before.linearizable_reads,
+            "renew" => candidate.lease_renewals = before.lease_renewals,
+            "reacquire" => candidate.lease_reacquisitions = before.lease_reacquisitions,
+            "restore" => candidate.complete_restore_scans = before.complete_restore_scans,
+            "readiness" => candidate.durable_readiness_probes = before.durable_readiness_probes,
+            "generation" => candidate.last_generation = before.last_generation,
+            "fence" => candidate.last_record_fence = before.last_record_fence,
             "entries" => candidate.watch_entries = before.watch_entries,
             "applied" => candidate.watch_applied_records = before.watch_applied_records,
             "sequence" => candidate.watch_sequence = before.watch_sequence,
@@ -4043,6 +5353,17 @@ fn transition_deadline_never_accepts_a_late_success() {
 #[test]
 fn transition_completion_requires_drained_epochs_and_bounded_live_handlers() {
     let member_count = 3;
+    assert_eq!(QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE, 8);
+    assert_eq!(outbound_consensus_socket_bound(3), 4);
+    assert_eq!(outbound_consensus_socket_bound(5), 8);
+    assert_eq!(outbound_consensus_socket_bound(31), 60);
+    assert_eq!(lifecycle_active_connection_bound(3), 8);
+    assert_eq!(lifecycle_active_connection_bound(5), 16);
+    assert_eq!(lifecycle_active_connection_bound(31), 120);
+    assert_eq!(server_rotation_overlap_connection_bound(31), 120);
+    assert!(server_rotation_overlap_connection_bound(31) <= QUALIFICATION_INBOUND_CONNECTION_SLOTS);
+    assert_eq!(process_file_descriptor_high_water_bound(3, 0), 140);
+    assert_eq!(process_file_descriptor_high_water_bound(5, 0), 144);
     let settled = lifecycle_metrics_fixture();
     assert!(lifecycle_transition_is_settled(&settled, member_count));
 
@@ -4066,6 +5387,37 @@ fn transition_completion_requires_drained_epochs_and_bounded_live_handlers() {
         &too_many_active,
         member_count
     ));
+}
+
+#[test]
+fn pending_command_diagnostic_is_deterministic_and_payload_free() {
+    let command = QualificationNodeCommand::CompareAndSet {
+        lease_handle: "secret-lease-handle".to_owned(),
+        stable_id: "secret-stable-id".to_owned(),
+        expected_generation: Some(3),
+        new_generation: 4,
+        value: "secret-payload".to_owned(),
+    };
+    let sent_at = Instant::now();
+    let pending = PendingCommand {
+        kind: PendingCommandKind::from_command(&command),
+        sequence: 7,
+        sent_at,
+    };
+    let diagnostic = pending.diagnostic_at(sent_at + Duration::from_millis(42));
+
+    assert_eq!(
+        diagnostic,
+        PendingCommandDiagnostic {
+            kind: PendingCommandKind::CompareAndSet,
+            sequence: 7,
+            send_elapsed_millis: 42,
+        }
+    );
+    assert_eq!(
+        format!("{diagnostic:?}"),
+        "PendingCommandDiagnostic { kind: CompareAndSet, sequence: 7, send_elapsed_millis: 42 }"
+    );
 }
 
 #[test]

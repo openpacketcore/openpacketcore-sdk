@@ -256,11 +256,13 @@ epoch, local leaf expiry, and effective local configured/presented-chain expiry;
 #163 separately combines the local and peer presented-chain expiries when
 retiring connections after admission.
 
-These reload, admission, and retirement mechanisms are scoped implementation
-primitives, not fleet qualification. Multi-process trust overlap/removal,
-short-lived-SVID expiry and root-cutover evidence, reconnect/resource/soak
-bounds, and the explicit unsupported generic-revocation limitation remain open
-under #164/#143.
+These reload, admission, and retirement mechanisms now have single-host
+three- and five-process trust overlap/removal, root cutover/rollback, and one
+bounded short-lived-SVID-expiry regression slice. They are not deployed fleet
+qualification. Real network/storage faults, active-mutator restart, deployed
+reconnect/resource/soak bounds, remote-HKMS and signed independent evidence,
+plus the explicit unsupported generic-revocation limitation, remain open under
+#164/#143.
 
 ## 5. Transport Security
 

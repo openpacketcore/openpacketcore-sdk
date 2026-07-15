@@ -29,6 +29,23 @@ mutation/consumer ReadBarrier and operation default 10,000 ms, and listener
 idle/handler ceilings 30,000 ms. The 1,500 ms DNS/TCP/mTLS/bootstrap cold cap is
 contained inside the selected family deadline, never added to it.
 
+`DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS` fixes both durable adapters at
+eight concurrent proposal paths. Admission is obtained inside the original
+operation deadline. Once `client_write_ff` returns an accepted-result
+receiver, a detached supervisor retains that permit until Openraft resolves
+the exact proposal, even if the caller disconnects, times out, or is cancelled.
+This bounds accepted and pre-accept work without adding a second sequencing or
+commit authority.
+
+`EnsureLinearizableSupervisor` admits every fresh read-index or mutation
+preflight through exactly one supervisor-owned Openraft check per node and at
+most 64 total callers across the active and waiting cohorts. Callers collected
+before dispatch may share that exact result; later callers await a subsequent
+check under their original deadlines.
+Once dispatched, caller cancellation or timeout cannot cancel the check or
+start an overlapping one. Openraft still supplies every quorum proof; this is
+not a cached lease or alternate authority.
+
 ## Interim source-build gate
 
 Issue #143 remains open and the HA profile remains experimental. The workspace

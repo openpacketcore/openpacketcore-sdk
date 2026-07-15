@@ -56,6 +56,18 @@ The target session-store contract includes:
 - Durable request IDs and semantic request digests. A response-loss retry,
   including after leader change, returns the original committed outcome;
   reusing an ID for different intent fails closed.
+- One shared fixed eight-slot proposal-admission pool for normal mutations and
+  finite-expiry floor commands. Admission stays inside the existing operation
+  deadline; after `client_write_ff` acceptance, a detached supervisor retains
+  the permit until the exact proposal resolves, so cancellation cannot create
+  an unbounded detached queue.
+- One shared linearizability supervisor per node admits at most 64 total
+  callers across active and waiting cohorts and owns exactly one Openraft
+  `ensure_linearizable` call at a time. Pre-dispatch callers may share that
+  exact result; later callers require a later check. Caller cancellation or
+  deadline expiry cannot cancel a dispatched check or create an overlapping
+  one. Openraft remains the sole leadership, quorum, read-index, and
+  applied-state authority.
 - Openraft log reconciliation from committed authority. The SQLite adapter
   rejects truncation at or below its persisted committed/applied floor,
   rejects stale or cross-identity snapshots, atomically installs one validated
@@ -98,13 +110,21 @@ revision 4. It carries the bounded payload-free expiry-authority preflight;
 error revision 4 adds `RecordExpiryPreflightLimitExceeded`. Older profiles
 fail before engine dispatch and require a drained full-membership upgrade.
 
-Each directed peer retains at most one single-in-flight authenticated
-connection after a correlated validated success. The shared absolute family
-deadlines are 2 seconds for AppendEntries/Openraft read-index, 5 seconds for
-Vote, and 10 seconds for InstallSnapshot, forwarded mutation, and consumer
-ReadBarrier. A fresh connection has a 1.5-second DNS/TCP/mTLS/bootstrap
-sub-bound contained inside that deadline. Every failure, cancellation, or
-uncertain stream position evicts the connection before Openraft retries.
+Each directed peer retains a fixed primary/overflow pool of at most two
+authenticated connections after correlated validated successes or typed
+semantic `Unavailable` responses, with one in-flight RPC per lane. Sequential
+calls prefer primary, a concurrent call may use overflow, and further calls
+wait for lane acquisition under the shared absolute family deadline. Those
+deadlines are 2 seconds for
+AppendEntries/Openraft read-index, 5 seconds for Vote, and 10 seconds for
+InstallSnapshot, forwarded mutation, and consumer ReadBarrier. A fresh
+connection has a 1.5-second DNS/TCP/mTLS/bootstrap sub-bound contained inside
+that deadline. A complete, correlated, authenticated, validated success or
+typed semantic `Unavailable` response may return the selected lane to its
+pool; `Unavailable` preserves a known stream position but grants no success or
+authority. Cancellation, timeout, EOF, protocol, authentication, scope
+mismatch, rejection, lifecycle evidence mismatch, or any uncertain stream
+position evicts only the selected lane before Openraft retries.
 
 TLS session caches, tickets, resumption, early data, and 0-RTT are disabled;
 every reconnect performs a full mutual-TLS certificate exchange so rotated
@@ -133,9 +153,10 @@ one persistent backing store and reject duplicate stable node-ID derivations.
 `probe_durable_readiness` supplies fresh, bounded point-in-time evidence without
 consulting cached capabilities. It calls Openraft's linearizable barrier and
 waits for local state-machine application through the returned log ID.
-Authoritative reads perform that same barrier; writes use `client_write`.
-Listener readiness therefore cannot disagree with the store merely because a
-server socket is bound.
+Authoritative reads perform that same barrier; writes use `client_write_ff`
+under the shared eight-slot supervised admission bound. Listener readiness
+therefore cannot disagree with the store merely because a server socket is
+bound.
 
 The SDK state machine, rather than a competing quorum algorithm, deterministically
 applies session commands, advances leader-selected logical time, maintains

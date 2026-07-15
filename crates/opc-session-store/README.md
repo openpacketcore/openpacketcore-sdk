@@ -469,10 +469,11 @@ rolling operation is unsupported.
 Both durable domains use the shared 10-second operation default. Transport
 families use 2 seconds for AppendEntries/Openraft read-index, 5 seconds for
 Vote, and 10 seconds for InstallSnapshot/forwarded mutation/consumer
-ReadBarrier. One absolute family deadline starts before the per-peer gate; a
-fresh DNS/TCP/mTLS/bootstrap path has a contained 1.5-second sub-bound and does
-not receive additive time. A directed peer caches at most one authenticated,
-single-in-flight connection after a correlated validated success.
+ReadBarrier. One absolute family deadline starts before per-peer lane
+acquisition; a fresh DNS/TCP/mTLS/bootstrap path has a contained 1.5-second
+sub-bound and does not receive additive time. A directed peer caches a fixed
+primary/overflow pool of at most two authenticated connections after correlated
+validated successes, with one in-flight RPC per lane.
 
 Topology admission validates the complete descriptor set, its exact local
 logical member, configuration digest, and stable derived node IDs without
@@ -517,6 +518,23 @@ idempotent request outcomes, bounded snapshots, and watch cursors. Raw
 `replicate_entry`, whole-state rebuild, and caller-selected lease sequencing
 are rejected by the production consensus adapter; those are not alternate
 ways to establish authority.
+
+Each node uses the shared fixed eight-slot proposal admission pool. Normal
+mutations and finite-expiry logical-time-floor proposals acquire from that same
+pool within the operation's existing absolute deadline. After
+`client_write_ff` accepts a command, a supervisor—not the caller future—owns
+the permit until the accepted result resolves. Caller cancellation therefore
+cannot create an unbounded detached Openraft queue. A finite-expiry preflight
+returns success only after revalidating its payload-free descriptors against
+the logical time returned by its committed floor command.
+
+All fresh linearizable reads and mutation preflights also pass through exactly
+one supervisor-owned Openraft check per node and at most 64 total callers
+across the active and waiting cohorts. The operation's original deadline
+covers admission and its wait for the result. Once a check is dispatched,
+caller cancellation or timeout cannot
+cancel it or start an overlapping check. Openraft still supplies every quorum
+proof; the supervisor is only a local resource bound.
 
 Each production mutation creates one hidden `SessionConsensusRequestId` and
 keeps it across leader-forwarding retries. Failure before local proposal

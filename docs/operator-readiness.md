@@ -739,28 +739,32 @@ sequencing. Legacy `opc-session-net/5` direct-backend networking is a
 non-default compatibility feature and must not share the production consensus
 listener.
 
-Each directed peer keeps at most one authenticated, single-in-flight
-connection. Every initial or replacement connection performs a fresh
-mutual-TLS handshake. Before an Openraft RPC is dispatched, both sides bind the
-canonical certificate SPIFFE URI, logical `ReplicaId`, derived stable node ID,
-expected opposite peer, cluster ID,
-configuration digest, configuration epoch, consensus role, exact transport
-profile, and a fresh challenge. The authenticated sender in the outer request
-must also match the sender encoded in the bounded Openraft payload. DNS, FQDN,
-short hostname, IP, and resolver aliases select only the dial route. They never
-select self, a vote, or a certificate identity.
+Each directed peer keeps a fixed primary/overflow pool of at most two
+authenticated connections, with one in-flight RPC per lane. Sequential calls
+prefer primary, a concurrent call may use overflow, and further calls wait for
+lane acquisition under the existing family deadline. Every initial or
+replacement connection performs a fresh mutual-TLS handshake. Before an
+Openraft RPC is dispatched, both sides bind the canonical certificate SPIFFE
+URI, logical `ReplicaId`, derived stable node ID, expected opposite peer,
+cluster ID, configuration digest, configuration epoch, consensus role, exact
+transport profile, and a fresh challenge. The authenticated sender in the
+outer request must also match the sender encoded in the bounded Openraft
+payload. DNS, FQDN, short hostname, IP, and resolver aliases select only the
+dial route. They never select self, a vote, or a certificate identity.
 
-Each call's absolute family deadline begins before admission/gate acquisition
-and covers bounded encoding, write, and response read. When a connection is
-needed, resolution, TCP, mTLS, identity admission, and bootstrap receive at
-most 1,500 ms inside that family deadline; they do not add time. AppendEntries
-and Openraft read-index use 2,000 ms, Vote 5,000 ms, and
-InstallSnapshot/ForwardMutation/consumer ReadBarrier 10,000 ms. Only a complete,
-correlated, validated success is cached; every uncertain stream position or
-typed failure evicts it. Authentication or identity mismatch fails before
-engine dispatch. The outer consensus frame is bounded for the shared compact
-Openraft payload; transport code does not decode commands or make consensus
-decisions.
+Each call's absolute family deadline begins before lane acquisition and covers
+bounded encoding, write, and response read. When a connection is needed,
+resolution, TCP, mTLS, identity admission, and bootstrap receive at most 1,500
+ms inside that family deadline; they do not add time. AppendEntries and
+Openraft read-index use 2,000 ms, Vote 5,000 ms, and
+InstallSnapshot/ForwardMutation/consumer ReadBarrier 10,000 ms. A complete,
+correlated, authenticated, and validated success or typed semantic
+`Unavailable` response returns the connection to its selected lane. The latter
+preserves a known stream position but grants no success or authority. Every
+other typed failure and every uncertain stream position evicts that lane.
+Authentication or identity mismatch fails before engine dispatch. The outer consensus frame is
+bounded for the shared compact Openraft payload; transport code does not decode
+commands or make consensus decisions.
 
 #161 atomic identity/trust reload, #162 bounded material epochs, and #163 finite
 peer reauthentication are implemented. Clients and listeners retain exact
@@ -908,8 +912,10 @@ leaf restores all paths and all-voter readiness without restarting that
 process.
 
 The admission gate is not a real or deployed network partition. These two
-cases deliberately omit the separate mixed mutation/watch/restore workload and
-do not provide a broader restart/fault matrix, resource or soak evidence,
+cases keep the bounded mixed lease/CAS/read, watch, restore-scan, readiness, and
+connection-recycling workload active, including exact journal reconciliation
+for the restarted watcher. They do not provide a broader restart/fault matrix,
+resource or soak evidence,
 remote-HKMS evidence, deployed-CNF evidence, signed release evidence, or an
 evidence-schema/profile claim. Openraft remains the sole commit authority;
 payload encryption, AAD, key-provider/HKMS placement, SQLite/Openraft durable
@@ -932,9 +938,9 @@ production lifecycle defaults, separate source/controller status, affected-path
 fresh handshakes after every member, all paths at completed fleet cutovers,
 fresh all-voter readiness, and an encrypted canary. The companion cases add
 the exact synthetic admission-loss/malformed-last-good combination and bounded
-same-issuer expiry/replacement behavior above. This still does not qualify a
-CNF deployment, a real network partition, mixed traffic/watch/restore under
-those faults, a broader restart/fault matrix, resource pressure, supported
+same-issuer expiry/replacement behavior above while the bounded mixed workload
+continues. This still does not qualify a CNF deployment, a real network
+partition, a broader restart/fault matrix, resource pressure, supported
 platforms, soak, remote HKMS, or signed release evidence; keep #164/#143 gates
 closed until those campaigns pass.
 

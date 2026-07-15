@@ -130,8 +130,15 @@ The production transport profile is fixed, not operator-tunable:
 For an initial or replacement connection, DNS, TCP, mTLS, identity admission,
 and bootstrap have a 1.5-second sub-bound inside the already-running family
 deadline. It is never an additional allowance. A healthy directed peer reuses
-one single-in-flight authenticated connection only after a complete correlated
-successful response; failure or uncertain stream position forces reconnect.
+a fixed primary/overflow pool of at most two authenticated connections, with
+one in-flight RPC per lane. Sequential calls prefer primary, a concurrent call
+may use overflow, and further calls wait for lane acquisition inside the same
+family deadline. A lane is reusable only after a complete, correlated,
+authenticated, validated success or typed semantic `Unavailable` response; the
+latter preserves a known stream position but grants no success or authority.
+Cancellation, timeout, EOF, protocol, authentication, scope mismatch,
+rejection, lifecycle evidence mismatch, or any uncertain stream position
+forces that lane to reconnect.
 
 Use only `probe_durable_readiness` for traffic admission. The probe exercises
 Openraft's linearizable path and current admitted membership. These are not
@@ -360,12 +367,30 @@ and source/controller `LastGoodExpired`; survivors continue canary progress and
 a valid long-lived leaf restores the affected member in the same process.
 
 This evidence does not authorize an operator to treat the admission gate as a
-real or deployed network partition. It carries no mixed traffic/watch/restore
-load, broader restart/fault matrix, resource/soak result, remote-HKMS result,
-deployed-CNF result, signed release evidence, or evidence-schema/profile claim.
-It does not alter this runbook's executable CNF campaign or alarms. Openraft
-remains the sole commit authority, and payload encryption, AAD,
-key-provider/HKMS placement, SQLite/Openraft durable formats, and
+real or deployed network partition. It keeps bounded mixed lease/CAS mutation,
+linearizable-read, watch, complete-restore, readiness, and connection-recycling
+traffic active through the exact synthetic fault/expiry slice. The
+qualification worker may reconcile only a typed backend-unavailable or
+operation-outcome-unavailable result observed after the accepted operation
+reaches a terminal checkpoint. Mutation or lease outcomes that can make
+authority ambiguous discard the prior guard, reacquire same-owner authority
+with a strictly higher fence, and validate the exact scheduled record.
+Read-only get, restore-scan, and readiness outcomes retain the already-proven
+guard and validate that same exact record without minting unnecessary fencing
+authority. Evidence binds this routing as `stage-aware-known-authority/v1`.
+The private
+schedule drops one successful release response per mutator to prove this path.
+More than eight such outcomes per node, any recovery episode beyond 8 seconds,
+any retry before the fixed 50 ms delay, or phase completion with an unresolved
+interruption fails the campaign; lease loss, unexpected state, and invariant
+failures are never masked. The
+exact-address restarted member is watcher-only before exit and joins the
+mutator set only after bounded journal reconciliation, so active-mutator
+crash/restart is not qualified. A broader restart/fault matrix, resource/soak,
+remote-HKMS, deployed-CNF, signed release, and evidence-schema/profile results
+remain open. This does not alter the runbook's executable CNF campaign or
+alarms. Openraft remains the sole commit authority, and payload encryption,
+AAD, key-provider/HKMS placement, SQLite/Openraft durable formats, and
 encryption-at-rest responsibilities remain unchanged.
 
 ### 7.1 Required CNF wiring and signals
@@ -3100,10 +3125,11 @@ checks.
 mechanism. The single-host multi-process campaigns now cover trust
 overlap/removal plus the exact synthetic fault/expiry recovery slice described
 above. #164/#143 still gate production claims on deployed trust/root cutover,
-real network/storage partition and broader restart/fault behavior, mixed
-traffic/watch/restore during faults, reconnect storms, resource/soak, remote
-HKMS, deployed CNF, and signed release evidence. These semantics do not provide
-production fleet qualification or close either issue.
+real network/storage partition, broader restart/fault behavior including
+active-mutator crash/restart, deployed mixed traffic/watch/restore under those
+real faults, reconnect storms, resource/soak, remote HKMS, deployed CNF, and
+signed release evidence. These semantics do not provide production fleet
+qualification or close either issue.
 
 ## 8. Snapshots, backups, and rollback
 

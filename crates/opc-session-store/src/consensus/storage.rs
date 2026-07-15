@@ -14,6 +14,7 @@ use opc_consensus::engine::{
     Entry, ErrorSubject, ErrorVerb, LogId, LogState, RaftLogReader, RaftSnapshotBuilder, Snapshot,
     SnapshotMeta, StorageError, StoredMembership, Vote,
 };
+use opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -29,7 +30,6 @@ const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 8 + 32;
 const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 8_192;
 const SNAPSHOT_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-const LIMITED_LOG_READ_ENTRIES: usize = 1_024;
 
 /// Fail-closed errors emitted while binding an existing SQLite database to a
 /// durable consensus identity.
@@ -247,15 +247,25 @@ impl RaftLogReader<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             return Ok(Vec::new());
         }
         let conn = self.core.conn.lock().await;
-        consensus::read_log_range_sync(
+        let entries = consensus::read_limited_log_range_sync(
             &conn,
             self.core.identity,
             &self.core.expected_members,
             start,
-            Some(end),
-            Some(LIMITED_LOG_READ_ENTRIES),
+            end,
+            DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
         )
-        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
+        if entries.is_empty() {
+            return Err(storage_error(
+                ErrorSubject::Logs,
+                ErrorVerb::Read,
+                consensus::invalid_data(
+                    "session consensus limited nonempty log range returned no entry",
+                ),
+            ));
+        }
+        Ok(entries)
     }
 }
 
@@ -1019,6 +1029,52 @@ mod tests {
         }
     }
 
+    fn sealed_cas_entry(
+        index: u64,
+        request_byte: u8,
+        opaque_bytes: usize,
+    ) -> Entry<SessionRaftTypeConfig> {
+        let key = key();
+        let owner = OwnerId::new("replica-a").expect("owner");
+        let fence = crate::model::FenceToken::new(1);
+        let lease = crate::lease::LeaseGuard::new(
+            key.clone(),
+            owner.clone(),
+            fence,
+            timestamp(1),
+            timestamp(59),
+            1,
+        );
+        let mut record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(index),
+            owner,
+            fence,
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new("bounded-log-read").expect("state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        let sealed = test_envelope(&record, &vec![request_byte; opaque_bytes]);
+        record.payload =
+            EncryptedSessionPayload::try_envelope(sealed).expect("structurally valid envelope");
+        normal_entry(
+            index,
+            SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(1),
+                request_id: SessionConsensusRequestId::from_bytes([request_byte; 16]),
+                logical_time: timestamp(request_byte),
+                intent: SessionMutationIntent::CompareAndSet(Box::new(CompareAndSet {
+                    key,
+                    lease,
+                    expected_generation: None,
+                    new_record: record,
+                })),
+            },
+        )
+    }
+
     fn advance_time_command(
         identity: SessionConsensusIdentity,
         request_byte: u8,
@@ -1041,6 +1097,60 @@ mod tests {
                 expected_members(),
             )),
         }
+    }
+
+    #[tokio::test]
+    async fn limited_log_reads_are_nonempty_gap_free_and_byte_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backend =
+            SqliteSessionBackend::open(temp.path().join("sessions.sqlite")).expect("backend");
+        let (mut log_store, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("consensus storage");
+        let entries = [
+            initial_membership_entry(),
+            sealed_cas_entry(1, 11, 600 * 1024),
+            sealed_cas_entry(2, 12, 600 * 1024),
+            sealed_cas_entry(
+                3,
+                13,
+                opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES + 64 * 1024,
+            ),
+        ];
+        {
+            let conn = log_store.core.conn.lock().await;
+            consensus::append_logs_sync(&conn, identity(1), &expected_members(), &entries)
+                .expect("append bounded-read fixtures");
+        }
+
+        let full = log_store
+            .try_get_log_entries(1..4)
+            .await
+            .expect("full read remains unbounded by replication budget");
+        assert_eq!(
+            full.iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        for (start, expected) in [(1, 1), (2, 2), (3, 3)] {
+            let page = log_store
+                .limited_get_log_entries(start, 4)
+                .await
+                .expect("nonempty limited page");
+            assert_eq!(
+                page.iter()
+                    .map(|entry| entry.log_id.index)
+                    .collect::<Vec<_>>(),
+                vec![expected]
+            );
+        }
+        assert!(log_store.limited_get_log_entries(4, 5).await.is_err());
     }
 
     #[tokio::test]

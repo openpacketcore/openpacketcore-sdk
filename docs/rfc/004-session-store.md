@@ -30,11 +30,25 @@ without becoming readiness evidence by itself. Connection reauthentication and
 retained-connection continuity are implemented under #163. Distributed fleet
 qualification (#164/#143) remains a gate. Single-host three- and five-process
 tests cover trust overlap/removal and one bounded synthetic
-admission-loss/malformed-last-good plus short-lived-SVID-expiry recovery slice;
-they do not cover deployed partitions, a broader restart/fault matrix, mixed
-traffic/watch/restore during those faults, resource/soak, remote HKMS, deployed
-CNFs, or signed release evidence. Generic CRL/OCSP/denylist revocation is not
-implemented.
+admission-loss/malformed-last-good plus short-lived-SVID-expiry recovery slice
+under mixed lease/CAS mutation, linearizable-read, watch, complete-restore,
+readiness, and connection-recycling traffic. Only typed backend-unavailable or
+operation-outcome-unavailable terminal results may enter qualification
+recovery. Mutation or lease outcomes that can make authority ambiguous discard
+the prior guard, reacquire same-owner authority at a strictly higher fence, and
+validate the exact scheduled record. Read-only get, restore-scan, and readiness
+outcomes retain the already-proven guard and validate that same exact record
+without minting unnecessary fencing authority. Evidence binds this routing as
+`stage-aware-known-authority/v1`. The fixed
+schedule drops one successful release response per mutator, allows eight
+outcomes per node, 8 seconds per recovery episode, and a 50 ms retry delay;
+phase completion requires every interruption to be reconciled. Lease loss,
+unexpected state, and invariant failures fail closed. The exact-address restarted
+member is watcher-only before exit and joins the mutator set only after bounded
+journal reconciliation, so active-mutator crash/restart remains unqualified.
+The tests do not cover deployed partitions, a broader restart/fault matrix,
+resource/soak, remote HKMS, deployed CNFs, or signed release evidence. Generic
+CRL/OCSP/denylist revocation is not implemented.
 
 ## 2. Scope
 
@@ -1140,6 +1154,26 @@ deadline expiry, or an unvalidated forwarded result MUST return
 a generic retryable availability error. Durable state-machine request outcomes
 MUST make retry of the same internal identity idempotent.
 
+The production adapter MUST use the shared fixed eight-slot proposal-admission
+pool for both normal mutations and finite-expiry logical-time-floor proposals.
+It MUST acquire a slot within the operation's original absolute deadline. Once
+`client_write_ff` returns the accepted proposal's result receiver, a detached
+supervisor MUST retain that slot until the receiver resolves; caller drop,
+peer EOF, and response timeout MUST NOT release it early. Saturation MUST fail
+closed before another proposal is submitted. A finite-expiry preflight MUST
+validate its descriptors against the logical time returned by its committed
+floor command before reporting success.
+
+Every fresh read-index and mutation preflight MUST use one shared
+linearizability supervisor per Openraft node. Exactly one supervisor-owned
+`ensure_linearizable` call may be in flight, with at most 64 total admitted
+callers across the active and waiting cohorts. Only callers collected before
+dispatch may share that exact Openraft result; later callers require a later
+check. Caller cancellation or deadline expiry MUST NOT cancel a dispatched
+check, release its admission early, or start an overlapping check. The
+supervisor is a resource bound only: Openraft remains the sole source of
+leadership, quorum, read-index, and applied-state authority.
+
 After a legacy request is transmitted, a malformed or wrong-family response,
 or a same-family response that violates request-bound key, owner, fence,
 credential, ordering, or cardinality semantics, MUST use the same typed
@@ -1247,10 +1281,14 @@ malformed trust; exact-address restart, catch-up, and repair; and a
 same-issuer leaf with a 75-second remaining-validity/expiry budget through the
 `expiry - 30 seconds` soft boundary, hard drain, source/controller
 `LastGoodExpired`, survivor durable readiness and
-encrypted-canary progress, and same-process valid replacement. This is not a
-real/deployed partition, mixed traffic/watch/restore fault qualification, a
-broader restart/fault matrix, resource/soak, remote-HKMS, deployed-CNF, signed
-release, or evidence-schema/profile claim. Generic
+encrypted-canary progress, and same-process valid replacement while bounded
+mixed lease/CAS mutation, linearizable-read, watch, complete-restore,
+readiness, and connection-recycling traffic remains active. The exact-address
+restarted member is watcher-only before exit and joins the mutator set only
+after bounded journal reconciliation; active-mutator crash/restart, a
+real/deployed partition, a broader restart/fault matrix, resource/soak,
+remote-HKMS, deployed-CNF, signed release, and evidence-schema/profile claims
+remain unqualified. Generic
 CRL/OCSP/certificate-or-identity-denylist revocation is not implemented. #177 removes
 `opc-persist`'s separate config TCP
 path and reuses the shared consensus peer/handler boundary instead of defining
@@ -1297,23 +1335,30 @@ aliases, and Kubernetes pod hostnames MUST affect only connection routing and
 MUST NOT be accepted as substitutes for any logical, stable, or certificate
 identity.
 
-One absolute family deadline MUST begin before concurrency gating and cover
+One absolute family deadline MUST begin before lane acquisition and cover
 bounded encode, write, and response read. AppendEntries/Openraft read-index
 MUST use 2,000 ms, Vote 5,000 ms, and InstallSnapshot, forwarded mutation, and
 consumer ReadBarrier 10,000 ms. If no valid cached connection exists,
 resolution, TCP connect, mutual TLS, identity admission, and bootstrap MUST use
 the lesser of the remaining family budget and a 1,500 ms cold sub-bound; cold
-time MUST NOT be added to the family deadline. Each directed peer MAY cache at
-most one single-in-flight authenticated connection. It MUST recache only after
-a complete, correctly correlated, validated successful response; cancellation,
-timeout, EOF, malformed/cross-correlated response, typed failure, or lifecycle
-evidence mismatch MUST evict it. A late connection or response after
-cancellation MUST NOT be reused. The transport MUST carry only the shared
-bounded consensus envelope; the session-store adapter compact-encodes Openraft
-RPCs, and the network layer MUST NOT interpret commands or decide leadership,
-voting, log matching, commit, or repair. An identity, authentication, schema,
-payload-bound, or sender mismatch MUST fail before Openraft dispatch with
-redaction-safe diagnostics.
+time MUST NOT be added to the family deadline. Each directed peer MAY cache a
+fixed primary/overflow pool of at most two authenticated connections, with at
+most one in-flight RPC per lane. Sequential calls MUST prefer primary; a
+concurrent call MAY use overflow; when both lanes are busy, further calls MUST
+wait for either lane under the same absolute family deadline. It MUST recache a
+selected lane only after a complete, correctly correlated, authenticated,
+validated successful response or typed semantic `Unavailable` response. The
+`Unavailable` exception preserves a known stream position but grants no
+success or authority. Cancellation, timeout, EOF, malformed/cross-correlated
+response, protocol, authentication, scope mismatch, rejection, lifecycle
+evidence mismatch, or any uncertain stream position MUST evict that lane. A
+late connection or response after cancellation MUST NOT be reused. The
+transport MUST carry only the shared bounded consensus envelope; the
+session-store adapter compact-encodes Openraft RPCs, and the network layer MUST
+NOT interpret commands or decide leadership, voting, log matching, commit, or
+repair. An
+identity, authentication, schema, payload-bound, or sender mismatch MUST fail
+before Openraft dispatch with redaction-safe diagnostics.
 
 Every authenticated client, peer, and listener MUST apply one finite
 `ConnectionLifecyclePolicy`. Its hard deadline MUST be the earliest of the
@@ -1415,7 +1460,8 @@ scoped retained-connection, request, and watch continuity evidence. Production
 rotation already has single-host multi-process trust transitions and the exact
 synthetic fault/expiry slice described above. It MUST additionally qualify
 deployed trust/root cutover, real network/storage faults and a broader restart
-matrix, mixed traffic/watch/restore under those faults, reconnect-storm bounds,
+matrix, deployed mixed traffic/watch/restore under those real faults,
+reconnect-storm bounds,
 resources, soak, remote HKMS, deployed CNFs, and signed release evidence under
 #164/#143. The lack of immediate generic CRL, OCSP, or
 certificate/identity-denylist revocation MUST remain explicit. #158 remains the
@@ -1586,12 +1632,13 @@ publication. Evidence MUST bind one invocation, live-lease binding, monotonic
 operation/nonce, exact member/checkpoint, phase/step, and fresh timestamp; it
 MUST NOT contain the lease token. Serving withdrawal MUST remain executable
 when evidence storage is unavailable. Reconnect-storm,
-deployed root cutover, real partition/restart and broader fault behavior, mixed
-traffic/watch/restore during faults, resource/soak, remote-HKMS, deployed-CNF,
-signed release, and wider distributed production evidence remain #164/#143
-under umbrella #158. The single-host tests described in §12.3 cover only their
-exact synthetic fault/expiry slice and make no evidence-schema/profile claim.
-They do not change Openraft's sole commit authority, payload encryption, AAD,
+deployed root cutover, real partition/restart including active-mutator
+crash/restart, broader fault behavior, deployed mixed traffic/watch/restore,
+resource/soak, remote-HKMS, deployed-CNF, signed release, and wider distributed
+production evidence remain #164/#143 under umbrella #158. The single-host
+tests described in §12.3 cover bounded mixed traffic only through their exact
+synthetic fault/expiry slice and make no evidence-schema/profile claim. They do
+not change Openraft's sole commit authority, payload encryption, AAD,
 key-provider/HKMS placement, durable formats, or encryption-at-rest
 responsibilities.
 
@@ -1767,7 +1814,10 @@ cargo test --locked -p opc-session-testkit --test qualification_mtls_multiproces
 ```
 
 They are synthetic regression evidence, not a deployed network partition or a
-production qualification; they run no mixed traffic/watch/restore workload.
+production qualification. The bounded lease/CAS/read, watch, restore-scan,
+readiness, and connection-recycling workload remains active throughout both
+cases, and a restarted watcher reconciles the exact committed journal prefix
+before resubscription.
 
 ### 17.3 Fault Injection
 

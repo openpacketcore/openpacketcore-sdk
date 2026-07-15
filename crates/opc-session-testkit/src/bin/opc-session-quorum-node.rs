@@ -7,8 +7,8 @@ use std::io::{self, BufReader, BufWriter, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,14 +25,15 @@ use opc_session_net::{
 };
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload,
-    EncryptingSessionBackend, Generation, LeaseError, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
-    QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
-    ReplicaTlsIdentity, ReplicationEntry, ReplicationOp, RestoreScanCursorProfile,
-    RestoreScanRequest, SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId,
-    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionKey, SessionKeyType, SessionLeaseManager, SqliteSessionBackend, StateClass, StateType,
-    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    EncryptingSessionBackend, FenceToken, Generation, LeaseError, LeaseGuard, OwnerId,
+    QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationEntry, ReplicationOp,
+    RestoreScanCursorProfile, RestoreScanRequest, SessionBackend, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
+    ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
@@ -41,11 +42,19 @@ use opc_session_testkit::qualification::{
     QualificationConsensusRpcAvailability, QualificationNodeCommand, QualificationNodeConfig,
     QualificationNodeErrorCode, QualificationNodeReply, QualificationProjectedSvidStatus,
     QualificationReadinessCode, QualificationSecurityMetricsSnapshot,
-    QualificationTlsMaterialStatus, QualificationTrafficFailureCode, QualificationTrafficState,
+    QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
+    QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
     QualificationTrafficStatus, QualificationTransportConfig,
-    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_MAX_CONFIG_BYTES,
-    QUALIFICATION_MAX_LEASE_HANDLES, QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS,
+    QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
+    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
+    QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
+    QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
+    QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
+    QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS,
     QUALIFICATION_TRAFFIC_MUTATION_DELAY_SPAN_MILLIS, QUALIFICATION_TRAFFIC_RESTORE_LIMIT,
+    QUALIFICATION_TRAFFIC_TTL_MILLIS, QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES,
+    QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
+    QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES,
 };
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder, TlsMaterialController,
@@ -59,7 +68,7 @@ const QUALIFICATION_TENANT: &str = "session-ha-qualification";
 const QUALIFICATION_KEY_ID: &str = "session-ha-qualification-key-v1";
 const QUALIFICATION_STATE_TYPE: &str = "session-ha-qualification-state";
 const QUALIFICATION_TRAFFIC_STATE_TYPE: &str = "session-ha-qualification-traffic-state";
-const QUALIFICATION_TRAFFIC_TTL: Duration = Duration::from_secs(60 * 60);
+const QUALIFICATION_TRAFFIC_TTL: Duration = Duration::from_millis(QUALIFICATION_TRAFFIC_TTL_MILLIS);
 const QUALIFICATION_KEY_BYTES: [u8; AES_256_GCM_SIV_KEY_LEN] = [0x5a; AES_256_GCM_SIV_KEY_LEN];
 
 type ProtectedStore = EncryptingSessionBackend<ConsensusSessionStore, MemoryKeyProvider>;
@@ -226,18 +235,22 @@ struct QualificationTrafficRuntime {
     seed: u64,
     observation: Arc<QualificationTrafficObservation>,
     mutation_started: bool,
-    mutation_cancel: Option<oneshot::Sender<()>>,
-    mutation_task: Option<JoinHandle<Result<(), QualificationTrafficFailureCode>>>,
+    mutation_cancel: Option<oneshot::Sender<tokio::time::Instant>>,
+    mutation_task: Option<JoinHandle<Result<(), QualificationTrafficFailure>>>,
     watch_cancel: Option<oneshot::Sender<()>>,
-    watch_task: Option<JoinHandle<Result<(), QualificationTrafficFailureCode>>>,
+    watch_task: Option<JoinHandle<Result<(), QualificationTrafficFailure>>>,
 }
 
 struct QualificationTrafficObservation {
-    failure: AtomicU8,
+    failure: OnceLock<QualificationTrafficFailure>,
     mutation_cycles: AtomicU64,
     linearizable_reads: AtomicU64,
     lease_renewals: AtomicU64,
     lease_reacquisitions: AtomicU64,
+    availability_interruptions: AtomicU64,
+    availability_recoveries: AtomicU64,
+    max_consecutive_availability_interruptions: AtomicU64,
+    synthetic_release_response_loss_pending: AtomicBool,
     complete_restore_scans: AtomicU64,
     durable_readiness_probes: AtomicU64,
     last_generation: AtomicU64,
@@ -245,17 +258,79 @@ struct QualificationTrafficObservation {
     watch_entries: AtomicU64,
     watch_applied_records: AtomicU64,
     watch_sequence: AtomicU64,
+    last_authoritative_replication_head: AtomicU64,
+    watch_reconciliations: AtomicU64,
+    watch_reconciled_sequence: AtomicU64,
     watch_traffic_generations: Vec<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QualificationTrafficFailure {
+    code: QualificationTrafficFailureCode,
+    stage: QualificationTrafficFailureStage,
+    error_class: QualificationTrafficErrorClass,
+}
+
+impl QualificationTrafficFailure {
+    const fn fixed(
+        code: QualificationTrafficFailureCode,
+        stage: QualificationTrafficFailureStage,
+    ) -> Self {
+        Self {
+            code,
+            stage,
+            error_class: QualificationTrafficErrorClass::Other,
+        }
+    }
+
+    fn store(
+        code: QualificationTrafficFailureCode,
+        stage: QualificationTrafficFailureStage,
+        error: &StoreError,
+    ) -> Self {
+        Self {
+            code,
+            stage,
+            error_class: qualification_store_error_class(error),
+        }
+    }
+
+    fn lease(
+        code: QualificationTrafficFailureCode,
+        stage: QualificationTrafficFailureStage,
+        error: &LeaseError,
+    ) -> Self {
+        Self {
+            code,
+            stage,
+            error_class: qualification_lease_error_class(error),
+        }
+    }
+
+    const fn backend_unavailable(
+        code: QualificationTrafficFailureCode,
+        stage: QualificationTrafficFailureStage,
+    ) -> Self {
+        Self {
+            code,
+            stage,
+            error_class: QualificationTrafficErrorClass::BackendUnavailable,
+        }
+    }
 }
 
 impl QualificationTrafficObservation {
     fn new(initial_watch_sequence: u64, member_count: usize) -> Self {
         Self {
-            failure: AtomicU8::new(0),
+            failure: OnceLock::new(),
             mutation_cycles: AtomicU64::new(0),
             linearizable_reads: AtomicU64::new(0),
             lease_renewals: AtomicU64::new(0),
             lease_reacquisitions: AtomicU64::new(0),
+            availability_interruptions: AtomicU64::new(0),
+            availability_recoveries: AtomicU64::new(0),
+            max_consecutive_availability_interruptions: AtomicU64::new(0),
+            synthetic_release_response_loss_pending: AtomicBool::new(true),
             complete_restore_scans: AtomicU64::new(0),
             durable_readiness_probes: AtomicU64::new(0),
             last_generation: AtomicU64::new(0),
@@ -263,42 +338,115 @@ impl QualificationTrafficObservation {
             watch_entries: AtomicU64::new(0),
             watch_applied_records: AtomicU64::new(0),
             watch_sequence: AtomicU64::new(initial_watch_sequence),
+            last_authoritative_replication_head: AtomicU64::new(initial_watch_sequence),
+            watch_reconciliations: AtomicU64::new(0),
+            watch_reconciled_sequence: AtomicU64::new(0),
             watch_traffic_generations: (0..member_count).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
-    fn record_failure(&self, failure: QualificationTrafficFailureCode) {
-        let _ = self.failure.compare_exchange(
-            0,
-            traffic_failure_code(failure),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+    fn record_failure(&self, failure: QualificationTrafficFailure) {
+        let _ = self.failure.set(failure);
     }
 
-    fn failure(&self) -> Option<QualificationTrafficFailureCode> {
-        match self.failure.load(Ordering::Acquire) {
-            0 => None,
-            1 => Some(QualificationTrafficFailureCode::BackendUnavailable),
-            2 => Some(QualificationTrafficFailureCode::LeaseRejected),
-            3 => Some(QualificationTrafficFailureCode::WatchUnavailable),
-            4 => Some(QualificationTrafficFailureCode::RestoreScanRejected),
-            5 => Some(QualificationTrafficFailureCode::ReadinessUnavailable),
-            6 => Some(QualificationTrafficFailureCode::InvariantViolation),
-            _ => Some(QualificationTrafficFailureCode::TaskJoinUnavailable),
+    fn failure(&self) -> Option<QualificationTrafficFailure> {
+        self.failure.get().copied()
+    }
+
+    fn record_authoritative_replication_head(&self, head: u64) {
+        self.last_authoritative_replication_head
+            .store(head, Ordering::Release);
+    }
+
+    fn authoritative_replication_head(&self) -> u64 {
+        self.last_authoritative_replication_head
+            .load(Ordering::Acquire)
+    }
+
+    fn record_availability_interruption(&self, consecutive: &mut u64) -> bool {
+        if self
+            .availability_interruptions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1).filter(|next| {
+                    *next <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+                })
+            })
+            .is_err()
+        {
+            return false;
         }
+        *consecutive = consecutive.saturating_add(1);
+        let _ = self
+            .max_consecutive_availability_interruptions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.max(*consecutive))
+            });
+        true
+    }
+
+    fn record_availability_recovery(&self, consecutive: &mut u64) {
+        let recovered = *consecutive;
+        let _ = self.availability_recoveries.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |value| Some(value.saturating_add(recovered)),
+        );
+        *consecutive = 0;
     }
 }
 
-const fn traffic_failure_code(failure: QualificationTrafficFailureCode) -> u8 {
-    match failure {
-        QualificationTrafficFailureCode::BackendUnavailable => 1,
-        QualificationTrafficFailureCode::LeaseRejected => 2,
-        QualificationTrafficFailureCode::WatchUnavailable => 3,
-        QualificationTrafficFailureCode::RestoreScanRejected => 4,
-        QualificationTrafficFailureCode::ReadinessUnavailable => 5,
-        QualificationTrafficFailureCode::InvariantViolation => 6,
-        QualificationTrafficFailureCode::TaskJoinUnavailable => 7,
+fn traffic_failure_is_recoverable(failure: QualificationTrafficFailure) -> bool {
+    matches!(
+        failure.error_class,
+        QualificationTrafficErrorClass::BackendUnavailable
+            | QualificationTrafficErrorClass::CasIdempotencyOutcomeUnavailable
+            | QualificationTrafficErrorClass::BackendOperationOutcomeUnavailable
+    )
+}
+
+// These checkpoints occur only after renew and CAS have returned terminal
+// success. Their availability outcome cannot make lease or record authority
+// ambiguous, so recovery must not mint a replacement fence unnecessarily.
+fn traffic_failure_retains_known_authority(failure: QualificationTrafficFailure) -> bool {
+    traffic_failure_is_recoverable(failure)
+        && matches!(
+            failure.stage,
+            QualificationTrafficFailureStage::Get
+                | QualificationTrafficFailureStage::RestoreScan
+                | QualificationTrafficFailureStage::ReadinessProbe
+        )
+}
+
+fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficErrorClass {
+    match error {
+        StoreError::BackendUnavailable(_) => QualificationTrafficErrorClass::BackendUnavailable,
+        StoreError::CasIdempotencyOutcomeUnavailable => {
+            QualificationTrafficErrorClass::CasIdempotencyOutcomeUnavailable
+        }
+        StoreError::BackendOperationOutcomeUnavailable => {
+            QualificationTrafficErrorClass::BackendOperationOutcomeUnavailable
+        }
+        StoreError::NotFound
+        | StoreError::StaleFence
+        | StoreError::InvalidKey(_)
+        | StoreError::InvalidSessionTtl
+        | StoreError::LeaseHeld
+        | StoreError::LeaseExpired => QualificationTrafficErrorClass::LeaseLostOrInvalid,
+        _ => QualificationTrafficErrorClass::Other,
+    }
+}
+
+fn qualification_lease_error_class(error: &LeaseError) -> QualificationTrafficErrorClass {
+    match error {
+        LeaseError::OperationOutcomeUnavailable => {
+            QualificationTrafficErrorClass::BackendOperationOutcomeUnavailable
+        }
+        LeaseError::Backend(_) => QualificationTrafficErrorClass::BackendUnavailable,
+        LeaseError::AlreadyHeld
+        | LeaseError::Expired
+        | LeaseError::StaleFence
+        | LeaseError::NotFound
+        | LeaseError::InvalidSessionTtl => QualificationTrafficErrorClass::LeaseLostOrInvalid,
     }
 }
 
@@ -546,6 +694,7 @@ impl QualificationNode {
                 ),
             },
             QualificationNodeCommand::StartTrafficWatch => self.start_traffic_watch().await,
+            QualificationNodeCommand::ReconcileTrafficWatch => self.reconcile_traffic_watch().await,
             QualificationNodeCommand::StartTrafficMutation => self.start_traffic_mutation().await,
             QualificationNodeCommand::StopTrafficMutation => self.stop_traffic_mutation().await,
             QualificationNodeCommand::StopTrafficWatch => self.stop_traffic_watch().await,
@@ -768,6 +917,181 @@ impl QualificationNode {
         self.traffic_status().await
     }
 
+    async fn reconcile_traffic_watch(&mut self) -> QualificationNodeReply {
+        if !self.traffic_schedule_bound
+            || self.traffic.as_ref().is_some_and(|traffic| {
+                traffic.mutation_cancel.is_some()
+                    || traffic.mutation_task.is_some()
+                    || traffic.watch_cancel.is_some()
+                    || traffic.watch_task.is_some()
+                    || traffic.observation.failure().is_some()
+            })
+        {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        }
+        let Some(seed) = qualification_traffic_seed(self.member_count) else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let traffic_keys = match (0..self.member_count)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(keys) => keys,
+            Err(()) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                }
+            }
+        };
+        let existing_observation = self
+            .traffic
+            .as_ref()
+            .map(|traffic| Arc::clone(&traffic.observation));
+        let mut reconciled_sequence = existing_observation.as_ref().map_or(0, |observation| {
+            observation.watch_sequence.load(Ordering::Acquire)
+        });
+        let mut reconciled_generations = existing_observation.as_ref().map_or_else(
+            || vec![0; self.member_count],
+            |observation| {
+                observation
+                    .watch_traffic_generations
+                    .iter()
+                    .map(|generation| generation.load(Ordering::Acquire))
+                    .collect()
+            },
+        );
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+        let mut reconciled_entries = 0_u64;
+        let (stream, watch_start, reconciled_head) = loop {
+            if tokio::time::Instant::now() >= deadline {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                };
+            }
+            let head =
+                match tokio::time::timeout_at(deadline, self.protected.max_replication_sequence())
+                    .await
+                {
+                    Ok(Ok(head)) if head >= reconciled_sequence => head,
+                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                        return QualificationNodeReply::Error {
+                            code: QualificationNodeErrorCode::TrafficUnavailable,
+                        }
+                    }
+                };
+            while reconciled_sequence < head {
+                let Ok(Some((start, limit))) =
+                    traffic_reconciliation_page_plan(reconciled_sequence, head, reconciled_entries)
+                else {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::TrafficUnavailable,
+                    };
+                };
+                let entries = match tokio::time::timeout_at(
+                    deadline,
+                    self.protected.get_replication_log(start, limit),
+                )
+                .await
+                {
+                    Ok(Ok(entries)) if entries.len() == limit => entries,
+                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                        return QualificationNodeReply::Error {
+                            code: QualificationNodeErrorCode::TrafficUnavailable,
+                        }
+                    }
+                };
+                for entry in entries {
+                    let Some(expected_sequence) = reconciled_sequence.checked_add(1) else {
+                        return QualificationNodeReply::Error {
+                            code: QualificationNodeErrorCode::TrafficUnavailable,
+                        };
+                    };
+                    if entry.sequence != expected_sequence
+                        || reconcile_applied_traffic_records(
+                            &entry.op,
+                            &traffic_keys,
+                            &mut reconciled_generations,
+                            seed,
+                            self.member_count,
+                        )
+                        .is_err()
+                    {
+                        return QualificationNodeReply::Error {
+                            code: QualificationNodeErrorCode::TrafficUnavailable,
+                        };
+                    }
+                    reconciled_sequence = entry.sequence;
+                    reconciled_entries = reconciled_entries.saturating_add(1);
+                }
+            }
+            let Some(watch_start) = head.checked_add(1) else {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::TrafficUnavailable,
+                };
+            };
+            match tokio::time::timeout_at(deadline, self.protected.watch(watch_start)).await {
+                Ok(Ok(stream)) => break (stream, watch_start, head),
+                Ok(Err(StoreError::ReplicationWatchCatchUpRequired)) => continue,
+                Ok(Err(_)) | Err(_) => {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::TrafficUnavailable,
+                    }
+                }
+            }
+        };
+
+        let observation = existing_observation.unwrap_or_else(|| {
+            Arc::new(QualificationTrafficObservation::new(
+                reconciled_head,
+                self.member_count,
+            ))
+        });
+        for (generation, reconciled) in observation
+            .watch_traffic_generations
+            .iter()
+            .zip(reconciled_generations)
+        {
+            generation.store(reconciled, Ordering::Release);
+        }
+        observation
+            .watch_sequence
+            .store(reconciled_head, Ordering::Release);
+        observation.record_authoritative_replication_head(reconciled_head);
+        observation
+            .watch_reconciled_sequence
+            .store(reconciled_head, Ordering::Release);
+        increment(&observation.watch_reconciliations);
+
+        let (watch_cancel, watch_cancel_rx) = oneshot::channel();
+        let watch_task = tokio::spawn(run_traffic_watch_task(
+            stream,
+            watch_start,
+            self.member_count,
+            watch_cancel_rx,
+            Arc::clone(&observation),
+        ));
+        if let Some(traffic) = &mut self.traffic {
+            traffic.watch_cancel = Some(watch_cancel);
+            traffic.watch_task = Some(watch_task);
+        } else {
+            self.traffic = Some(QualificationTrafficRuntime {
+                seed,
+                observation,
+                mutation_started: false,
+                mutation_cancel: None,
+                mutation_task: None,
+                watch_cancel: Some(watch_cancel),
+                watch_task: Some(watch_task),
+            });
+        }
+        self.traffic_status_snapshot()
+    }
+
     async fn start_traffic_mutation(&mut self) -> QualificationNodeReply {
         let Some(traffic) = &self.traffic else {
             return QualificationNodeReply::Error {
@@ -776,6 +1100,7 @@ impl QualificationNode {
         };
         if traffic.mutation_started
             || traffic.mutation_task.is_some()
+            || traffic.observation.failure().is_some()
             || traffic
                 .watch_task
                 .as_ref()
@@ -796,9 +1121,15 @@ impl QualificationNode {
         let owner = match OwnerId::new(format!("rotation-traffic-owner-{}", self.node_index)) {
             Ok(owner) => owner,
             Err(_) => {
+                traffic
+                    .observation
+                    .record_failure(QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::LeaseRejected,
+                        QualificationTrafficFailureStage::LeaseAcquire,
+                    ));
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::TrafficUnavailable,
-                }
+                };
             }
         };
         let lease = match self
@@ -807,10 +1138,17 @@ impl QualificationNode {
             .await
         {
             Ok(lease) => lease,
-            Err(_) => {
+            Err(error) => {
+                traffic
+                    .observation
+                    .record_failure(QualificationTrafficFailure::lease(
+                        QualificationTrafficFailureCode::LeaseRejected,
+                        QualificationTrafficFailureStage::LeaseAcquire,
+                        &error,
+                    ));
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::TrafficUnavailable,
-                }
+                };
             }
         };
         let Some(traffic) = self.traffic.as_mut() else {
@@ -854,15 +1192,18 @@ impl QualificationNode {
                 code: QualificationNodeErrorCode::TrafficUnavailable,
             };
         };
-        let _ = cancel.send(());
+        let shutdown_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS);
+        let _ = cancel.send(shutdown_deadline);
         match task.await {
             Ok(Ok(())) => {}
             Ok(Err(failure)) => observation.record_failure(failure),
-            Err(_) => {
-                observation.record_failure(QualificationTrafficFailureCode::TaskJoinUnavailable)
-            }
+            Err(_) => observation.record_failure(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::TaskJoinUnavailable,
+                QualificationTrafficFailureStage::TaskJoin,
+            )),
         }
-        self.traffic_status().await
+        self.traffic_status_snapshot()
     }
 
     async fn stop_traffic_watch(&mut self) -> QualificationNodeReply {
@@ -890,11 +1231,12 @@ impl QualificationNode {
         match task.await {
             Ok(Ok(())) => {}
             Ok(Err(failure)) => observation.record_failure(failure),
-            Err(_) => {
-                observation.record_failure(QualificationTrafficFailureCode::TaskJoinUnavailable)
-            }
+            Err(_) => observation.record_failure(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::TaskJoinUnavailable,
+                QualificationTrafficFailureStage::TaskJoin,
+            )),
         }
-        self.traffic_status().await
+        self.traffic_status_snapshot()
     }
 
     async fn traffic_status(&self) -> QualificationNodeReply {
@@ -904,13 +1246,44 @@ impl QualificationNode {
             };
         };
         let replication_head = match self.protected.max_replication_sequence().await {
-            Ok(head) => head,
-            Err(_) => {
+            Ok(head) => {
                 traffic
                     .observation
-                    .record_failure(QualificationTrafficFailureCode::BackendUnavailable);
-                traffic.observation.watch_sequence.load(Ordering::Acquire)
+                    .record_authoritative_replication_head(head);
+                head
             }
+            Err(error) => {
+                traffic
+                    .observation
+                    .record_failure(QualificationTrafficFailure::store(
+                        QualificationTrafficFailureCode::BackendUnavailable,
+                        QualificationTrafficFailureStage::Watch,
+                        &error,
+                    ));
+                traffic.observation.authoritative_replication_head()
+            }
+        };
+        self.traffic_status_with_replication_head(replication_head)
+    }
+
+    fn traffic_status_snapshot(&self) -> QualificationNodeReply {
+        let Some(traffic) = &self.traffic else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
+        };
+        let replication_head = traffic.observation.authoritative_replication_head();
+        self.traffic_status_with_replication_head(replication_head)
+    }
+
+    fn traffic_status_with_replication_head(
+        &self,
+        replication_head: u64,
+    ) -> QualificationNodeReply {
+        let Some(traffic) = &self.traffic else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
+            };
         };
         let mutation_running = traffic
             .mutation_task
@@ -937,7 +1310,9 @@ impl QualificationNode {
         QualificationNodeReply::TrafficStatus {
             status: QualificationTrafficStatus {
                 state,
-                failure,
+                failure: failure.map(|failure| failure.code),
+                failure_stage: failure.map(|failure| failure.stage),
+                failure_error_class: failure.map(|failure| failure.error_class),
                 seed: traffic.seed,
                 owned_async_tasks: u8::from(mutation_running) + u8::from(watch_running),
                 mutation_cycles: traffic.observation.mutation_cycles.load(Ordering::Acquire),
@@ -949,6 +1324,18 @@ impl QualificationNode {
                 lease_reacquisitions: traffic
                     .observation
                     .lease_reacquisitions
+                    .load(Ordering::Acquire),
+                availability_interruptions: traffic
+                    .observation
+                    .availability_interruptions
+                    .load(Ordering::Acquire),
+                availability_recoveries: traffic
+                    .observation
+                    .availability_recoveries
+                    .load(Ordering::Acquire),
+                max_consecutive_availability_interruptions: traffic
+                    .observation
+                    .max_consecutive_availability_interruptions
                     .load(Ordering::Acquire),
                 complete_restore_scans: traffic
                     .observation
@@ -969,6 +1356,14 @@ impl QualificationNode {
                     .watch_applied_records
                     .load(Ordering::Acquire),
                 watch_sequence: traffic.observation.watch_sequence.load(Ordering::Acquire),
+                watch_reconciliations: traffic
+                    .observation
+                    .watch_reconciliations
+                    .load(Ordering::Acquire),
+                watch_reconciled_sequence: traffic
+                    .observation
+                    .watch_reconciled_sequence
+                    .load(Ordering::Acquire),
                 watch_traffic_generations: traffic
                     .observation
                     .watch_traffic_generations
@@ -1156,40 +1551,520 @@ async fn run_traffic_mutation_task(
     store: Arc<ConsensusSessionStore>,
     key: SessionKey,
     owner: OwnerId,
-    mut lease: LeaseGuard,
+    lease: LeaseGuard,
     seed: u64,
     member_count: usize,
     node_index: usize,
-    mut cancellation: oneshot::Receiver<()>,
+    mut cancellation: oneshot::Receiver<tokio::time::Instant>,
     observation: Arc<QualificationTrafficObservation>,
-) -> Result<(), QualificationTrafficFailureCode> {
-    let result = run_traffic_mutation_task_inner(
-        &protected,
-        &store,
-        &key,
-        &owner,
-        &mut lease,
+) -> Result<(), QualificationTrafficFailure> {
+    // The option is the task's single source of truth for lease ownership. An
+    // explicit release takes the guard before awaiting the backend, so neither
+    // cancellation nor an error path can attempt to release the same guard a
+    // second time.
+    let mut lease = Some(lease);
+    let mut consecutive_availability_interruptions = 0_u64;
+    let mut shutdown_deadline = None;
+    let terminal_failure = loop {
+        match run_traffic_mutation_task_inner(
+            &protected,
+            &store,
+            &key,
+            &owner,
+            &mut lease,
+            seed,
+            member_count,
+            node_index,
+            &mut cancellation,
+            &mut shutdown_deadline,
+            &observation,
+        )
+        .await
+        {
+            Ok(()) => break None,
+            Err(failure) if traffic_failure_is_recoverable(failure) => {
+                if !observation
+                    .record_availability_interruption(&mut consecutive_availability_interruptions)
+                {
+                    break Some(failure);
+                }
+                let deadline = traffic_recovery_deadline(shutdown_deadline);
+                match reconcile_traffic_mutation_checkpoint(
+                    &protected,
+                    &key,
+                    &owner,
+                    &mut lease,
+                    seed,
+                    member_count,
+                    node_index,
+                    failure,
+                    deadline,
+                    &mut consecutive_availability_interruptions,
+                    &observation,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        observation.record_availability_recovery(
+                            &mut consecutive_availability_interruptions,
+                        );
+                        if traffic_cancellation_requested(&mut cancellation, &mut shutdown_deadline)
+                        {
+                            break None;
+                        }
+                    }
+                    Err(recovery_failure) => break Some(recovery_failure),
+                }
+            }
+            Err(failure) => break Some(failure),
+        }
+    };
+
+    if let Some(failure) = terminal_failure {
+        observation.record_failure(failure);
+        if shutdown_deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline) {
+            if let Some(lease) = lease.take() {
+                let _ = protected.release(lease).await;
+            }
+        }
+        return Err(failure);
+    }
+
+    // A clean stop also preserves the same no-unknown-outcome rule. If the
+    // release response is typed as ambiguous, reacquire the same-owner
+    // authority, reconcile the record, and retry release within the identical
+    // fixed budget. No accepted lease operation is cancelled mid-flight.
+    loop {
+        if traffic_shutdown_deadline_reached(shutdown_deadline, tokio::time::Instant::now()) {
+            let failure = QualificationTrafficFailure::backend_unavailable(
+                QualificationTrafficFailureCode::LeaseRejected,
+                QualificationTrafficFailureStage::LeaseRelease,
+            );
+            observation.record_failure(failure);
+            return Err(failure);
+        }
+        let Some(lease_to_release) = lease.take() else {
+            return Ok(());
+        };
+        match protected.release(lease_to_release).await {
+            Ok(()) => {
+                if traffic_shutdown_deadline_reached(shutdown_deadline, tokio::time::Instant::now())
+                {
+                    let failure = QualificationTrafficFailure::backend_unavailable(
+                        QualificationTrafficFailureCode::LeaseRejected,
+                        QualificationTrafficFailureStage::LeaseRelease,
+                    );
+                    observation.record_failure(failure);
+                    return Err(failure);
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                let failure = QualificationTrafficFailure::lease(
+                    QualificationTrafficFailureCode::LeaseRejected,
+                    QualificationTrafficFailureStage::LeaseRelease,
+                    &error,
+                );
+                if !traffic_failure_is_recoverable(failure)
+                    || !observation.record_availability_interruption(
+                        &mut consecutive_availability_interruptions,
+                    )
+                {
+                    observation.record_failure(failure);
+                    return Err(failure);
+                }
+                let deadline = traffic_recovery_deadline(shutdown_deadline);
+                match reconcile_traffic_mutation_authority(
+                    &protected,
+                    &key,
+                    &owner,
+                    &mut lease,
+                    seed,
+                    member_count,
+                    node_index,
+                    failure,
+                    deadline,
+                    &mut consecutive_availability_interruptions,
+                    &observation,
+                )
+                .await
+                {
+                    Ok(()) => observation
+                        .record_availability_recovery(&mut consecutive_availability_interruptions),
+                    Err(recovery_failure) => {
+                        observation.record_failure(recovery_failure);
+                        if shutdown_deadline
+                            .is_none_or(|deadline| tokio::time::Instant::now() < deadline)
+                        {
+                            if let Some(lease) = lease.take() {
+                                let _ = protected.release(lease).await;
+                            }
+                        }
+                        return Err(recovery_failure);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_traffic_mutation_checkpoint(
+    protected: &ProtectedStore,
+    key: &SessionKey,
+    owner: &OwnerId,
+    lease: &mut Option<LeaseGuard>,
+    seed: u64,
+    member_count: usize,
+    node_index: usize,
+    initial_failure: QualificationTrafficFailure,
+    deadline: tokio::time::Instant,
+    consecutive_availability_interruptions: &mut u64,
+    observation: &QualificationTrafficObservation,
+) -> Result<(), QualificationTrafficFailure> {
+    if traffic_failure_retains_known_authority(initial_failure) {
+        return reconcile_traffic_known_authority(
+            protected,
+            key,
+            owner,
+            lease.as_ref(),
+            seed,
+            member_count,
+            node_index,
+            initial_failure,
+            deadline,
+            consecutive_availability_interruptions,
+            observation,
+        )
+        .await;
+    }
+    reconcile_traffic_mutation_authority(
+        protected,
+        key,
+        owner,
+        lease,
         seed,
         member_count,
         node_index,
-        &mut cancellation,
-        &observation,
+        initial_failure,
+        deadline,
+        consecutive_availability_interruptions,
+        observation,
     )
-    .await;
-    match result {
-        Ok(()) => match protected.release(lease).await {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                observation.record_failure(QualificationTrafficFailureCode::LeaseRejected);
-                Err(QualificationTrafficFailureCode::LeaseRejected)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_traffic_known_authority(
+    protected: &ProtectedStore,
+    key: &SessionKey,
+    owner: &OwnerId,
+    lease: Option<&LeaseGuard>,
+    seed: u64,
+    member_count: usize,
+    node_index: usize,
+    initial_failure: QualificationTrafficFailure,
+    deadline: tokio::time::Instant,
+    consecutive_availability_interruptions: &mut u64,
+    observation: &QualificationTrafficObservation,
+) -> Result<(), QualificationTrafficFailure> {
+    let Some(current_lease) = lease else {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::LeaseAcquire,
+        ));
+    };
+    let observed_generation = observation.last_generation.load(Ordering::Acquire);
+    let observed_record_fence = observation.last_record_fence.load(Ordering::Acquire);
+    if observed_generation == 0
+        || observed_record_fence == 0
+        || !lease_authority_is_preserved(
+            key,
+            owner,
+            observed_record_fence,
+            current_lease.key(),
+            current_lease.owner(),
+            current_lease.fence().get(),
+        )
+    {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::Get,
+        ));
+    }
+
+    let mut last_failure = initial_failure;
+    let stored = loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(last_failure);
+        }
+        match protected.get(key).await {
+            Ok(Some(stored)) => break stored,
+            Ok(None) => {
+                return Err(QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::Get,
+                ));
             }
-        },
-        Err(failure) => {
-            observation.record_failure(failure);
-            let _ = protected.release(lease).await;
-            Err(failure)
+            Err(error) => {
+                let failure = QualificationTrafficFailure::store(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    QualificationTrafficFailureStage::Get,
+                    &error,
+                );
+                last_failure = failure;
+                if !traffic_failure_is_recoverable(failure)
+                    || !observation
+                        .record_availability_interruption(consecutive_availability_interruptions)
+                    || !wait_for_traffic_recovery_retry(deadline).await
+                {
+                    return Err(failure);
+                }
+            }
+        }
+    };
+    if tokio::time::Instant::now() > deadline {
+        return Err(last_failure);
+    }
+    let Some((generation, record_fence)) = reconciled_traffic_record_identity(
+        &stored,
+        key,
+        owner,
+        seed,
+        member_count,
+        node_index,
+        observed_generation,
+        observed_record_fence,
+        None,
+        initial_failure.stage,
+    ) else {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::Get,
+        ));
+    };
+    if generation != observed_generation
+        || record_fence != observed_record_fence
+        || !lease_authority_is_preserved(
+            key,
+            owner,
+            record_fence,
+            current_lease.key(),
+            current_lease.owner(),
+            current_lease.fence().get(),
+        )
+    {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::Get,
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_traffic_mutation_authority(
+    protected: &ProtectedStore,
+    key: &SessionKey,
+    owner: &OwnerId,
+    lease: &mut Option<LeaseGuard>,
+    seed: u64,
+    member_count: usize,
+    node_index: usize,
+    initial_failure: QualificationTrafficFailure,
+    deadline: tokio::time::Instant,
+    consecutive_availability_interruptions: &mut u64,
+    observation: &QualificationTrafficObservation,
+) -> Result<(), QualificationTrafficFailure> {
+    let ambiguous_lease_fence = lease.as_ref().map(|guard| guard.fence().get());
+    let observed_generation = observation.last_generation.load(Ordering::Acquire);
+    let observed_record_fence = observation.last_record_fence.load(Ordering::Acquire);
+    let previous_authority_fence = ambiguous_lease_fence
+        .unwrap_or(observed_record_fence)
+        .max(observed_record_fence);
+    // The prior guard is no longer usable after a typed ambiguous mutation
+    // outcome. Same-owner acquire is the only operation that establishes a
+    // fresh, strictly higher fencing authority for deterministic recovery.
+    *lease = None;
+
+    let mut last_failure = initial_failure;
+    let recovered_lease = loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(last_failure);
+        }
+        match protected
+            .acquire(key, owner.clone(), QUALIFICATION_TRAFFIC_TTL)
+            .await
+        {
+            Ok(recovered) => break recovered,
+            Err(error) => {
+                let failure = QualificationTrafficFailure::lease(
+                    QualificationTrafficFailureCode::LeaseRejected,
+                    QualificationTrafficFailureStage::LeaseAcquire,
+                    &error,
+                );
+                last_failure = failure;
+                if !traffic_failure_is_recoverable(failure)
+                    || !observation
+                        .record_availability_interruption(consecutive_availability_interruptions)
+                    || !wait_for_traffic_recovery_retry(deadline).await
+                {
+                    return Err(failure);
+                }
+            }
+        }
+    };
+    if !lease_authority_is_advanced(
+        key,
+        owner,
+        previous_authority_fence,
+        recovered_lease.key(),
+        recovered_lease.owner(),
+        recovered_lease.fence().get(),
+    ) {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::LeaseAcquire,
+        ));
+    }
+    let recovered_lease_fence = recovered_lease.fence().get();
+    *lease = Some(recovered_lease);
+    if tokio::time::Instant::now() > deadline {
+        return Err(last_failure);
+    }
+
+    let stored = loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(last_failure);
+        }
+        match protected.get(key).await {
+            Ok(stored) => break stored,
+            Err(error) => {
+                let failure = QualificationTrafficFailure::store(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    QualificationTrafficFailureStage::Get,
+                    &error,
+                );
+                last_failure = failure;
+                if !traffic_failure_is_recoverable(failure)
+                    || !observation
+                        .record_availability_interruption(consecutive_availability_interruptions)
+                    || !wait_for_traffic_recovery_retry(deadline).await
+                {
+                    return Err(failure);
+                }
+            }
+        }
+    };
+    if tokio::time::Instant::now() > deadline {
+        return Err(last_failure);
+    }
+
+    match stored {
+        None if observed_generation == 0
+            && matches!(
+                initial_failure.stage,
+                QualificationTrafficFailureStage::LeaseRenew
+                    | QualificationTrafficFailureStage::CompareAndSet
+            ) => {}
+        None => {
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Get,
+            ));
+        }
+        Some(stored) => {
+            let Some((generation, record_fence)) = reconciled_traffic_record_identity(
+                &stored,
+                key,
+                owner,
+                seed,
+                member_count,
+                node_index,
+                observed_generation,
+                observed_record_fence,
+                ambiguous_lease_fence,
+                initial_failure.stage,
+            ) else {
+                return Err(QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::Get,
+                ));
+            };
+            if recovered_lease_fence <= record_fence {
+                return Err(QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::LeaseAcquire,
+                ));
+            }
+            observation
+                .last_record_fence
+                .store(record_fence, Ordering::Release);
+            observation
+                .last_generation
+                .store(generation, Ordering::Release);
         }
     }
+    Ok(())
+}
+
+async fn wait_for_traffic_recovery_retry(deadline: tokio::time::Instant) -> bool {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    let delay = Duration::from_millis(QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS)
+        .min(deadline.saturating_duration_since(now));
+    tokio::time::sleep(delay).await;
+    tokio::time::Instant::now() < deadline
+}
+
+fn traffic_recovery_deadline(
+    shutdown_deadline: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let episode_deadline = tokio::time::Instant::now()
+        + Duration::from_millis(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS);
+    shutdown_deadline.map_or(episode_deadline, |deadline| deadline.min(episode_deadline))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconciled_traffic_record_identity(
+    stored: &StoredSessionRecord,
+    key: &SessionKey,
+    owner: &OwnerId,
+    seed: u64,
+    member_count: usize,
+    node_index: usize,
+    observed_generation: u64,
+    observed_record_fence: u64,
+    ambiguous_lease_fence: Option<u64>,
+    failure_stage: QualificationTrafficFailureStage,
+) -> Option<(u64, u64)> {
+    let generation = stored.generation.get();
+    let record_fence = if generation == observed_generation && generation != 0 {
+        observed_record_fence
+    } else if matches!(
+        failure_stage,
+        QualificationTrafficFailureStage::CompareAndSet
+    ) && observed_generation.checked_add(1) == Some(generation)
+    {
+        ambiguous_lease_fence?
+    } else {
+        return None;
+    };
+    let expected = StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(generation),
+        owner: owner.clone(),
+        fence: FenceToken::new(record_fence),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static(QUALIFICATION_TRAFFIC_STATE_TYPE),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(
+            qualification_traffic_value(seed, member_count, node_index, generation).as_bytes(),
+        ),
+    };
+    traffic_record_is_exact(&expected, stored).then_some((generation, record_fence))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1198,48 +2073,88 @@ async fn run_traffic_mutation_task_inner(
     store: &ConsensusSessionStore,
     key: &SessionKey,
     owner: &OwnerId,
-    lease: &mut LeaseGuard,
+    lease: &mut Option<LeaseGuard>,
     seed: u64,
     member_count: usize,
     node_index: usize,
-    cancellation: &mut oneshot::Receiver<()>,
+    cancellation: &mut oneshot::Receiver<tokio::time::Instant>,
+    shutdown_deadline: &mut Option<tokio::time::Instant>,
     observation: &QualificationTrafficObservation,
-) -> Result<(), QualificationTrafficFailureCode> {
+) -> Result<(), QualificationTrafficFailure> {
     let mut schedule_state = seed ^ (u64::try_from(node_index).unwrap_or(u64::MAX) << 32);
     loop {
-        match cancellation.try_recv() {
-            Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return Ok(()),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        if traffic_cancellation_requested(cancellation, shutdown_deadline) {
+            return Ok(());
         }
 
+        let Some(current_lease) = lease.as_ref() else {
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::LeaseRenew,
+            ));
+        };
+        let previous_fence = current_lease.fence().get();
         let renewed = protected
-            .renew(lease, QUALIFICATION_TRAFFIC_TTL)
+            .renew(current_lease, QUALIFICATION_TRAFFIC_TTL)
             .await
-            .map_err(|_| QualificationTrafficFailureCode::LeaseRejected)?;
+            .map_err(|error| {
+                QualificationTrafficFailure::lease(
+                    QualificationTrafficFailureCode::LeaseRejected,
+                    QualificationTrafficFailureStage::LeaseRenew,
+                    &error,
+                )
+            })?;
+        *lease = Some(renewed);
+        let Some(renewed) = lease.as_ref() else {
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::LeaseRenew,
+            ));
+        };
         if !lease_authority_is_preserved(
             key,
             owner,
-            lease.fence().get(),
+            previous_fence,
             renewed.key(),
             renewed.owner(),
             renewed.fence().get(),
         ) {
-            return Err(QualificationTrafficFailureCode::InvariantViolation);
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::LeaseRenew,
+            ));
         }
-        *lease = renewed;
         increment(&observation.lease_renewals);
+        // Every cancellation checkpoint follows a completed operation. The
+        // task never selects cancellation against a polled store future, whose
+        // outcome would become unknown if dropped.
+        if traffic_cancellation_requested(cancellation, shutdown_deadline) {
+            return Ok(());
+        }
 
         let generation = observation
             .last_generation
             .load(Ordering::Acquire)
             .checked_add(1)
-            .ok_or(QualificationTrafficFailureCode::InvariantViolation)?;
+            .ok_or_else(|| {
+                QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::CompareAndSet,
+                )
+            })?;
         let value = qualification_traffic_value(seed, member_count, node_index, generation);
+        let Some(current_lease) = lease.as_ref() else {
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::CompareAndSet,
+            ));
+        };
+        let record_fence = current_lease.fence().get();
         let expected_record = StoredSessionRecord {
             key: key.clone(),
             generation: Generation::new(generation),
-            owner: lease.owner().clone(),
-            fence: lease.fence(),
+            owner: current_lease.owner().clone(),
+            fence: current_lease.fence(),
             state_class: StateClass::AuthoritativeSession,
             state_type: StateType::from_static(QUALIFICATION_TRAFFIC_STATE_TYPE),
             expires_at: None,
@@ -1249,33 +2164,75 @@ async fn run_traffic_mutation_task_inner(
         match protected
             .compare_and_set(CompareAndSet {
                 key: key.clone(),
-                lease: lease.clone(),
+                lease: current_lease.clone(),
                 expected_generation: expected_generation.map(Generation::new),
                 new_record: expected_record.clone(),
             })
             .await
-            .map_err(|_| QualificationTrafficFailureCode::BackendUnavailable)?
-        {
+            .map_err(|error| {
+                QualificationTrafficFailure::store(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    QualificationTrafficFailureStage::CompareAndSet,
+                    &error,
+                )
+            })? {
             CompareAndSetResult::Success => {}
             CompareAndSetResult::Conflict { .. } => {
-                return Err(QualificationTrafficFailureCode::InvariantViolation)
+                return Err(QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::CompareAndSet,
+                ))
             }
+        }
+        // Publish the committed record identity immediately. A clean stop or
+        // later-stage failure must not hide a CAS that already succeeded.
+        observation
+            .last_record_fence
+            .store(record_fence, Ordering::Release);
+        observation
+            .last_generation
+            .store(generation, Ordering::Release);
+        if traffic_cancellation_requested(cancellation, shutdown_deadline) {
+            return Ok(());
         }
 
         let stored = protected
             .get(key)
             .await
-            .map_err(|_| QualificationTrafficFailureCode::BackendUnavailable)?
-            .ok_or(QualificationTrafficFailureCode::InvariantViolation)?;
+            .map_err(|error| {
+                QualificationTrafficFailure::store(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    QualificationTrafficFailureStage::Get,
+                    &error,
+                )
+            })?
+            .ok_or_else(|| {
+                QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::Get,
+                )
+            })?;
         if !traffic_record_is_exact(&expected_record, &stored) {
-            return Err(QualificationTrafficFailureCode::InvariantViolation);
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Get,
+            ));
         }
         increment(&observation.linearizable_reads);
+        if traffic_cancellation_requested(cancellation, shutdown_deadline) {
+            return Ok(());
+        }
 
         let page = protected
             .scan_restore_records(RestoreScanRequest::all(QUALIFICATION_TRAFFIC_RESTORE_LIMIT))
             .await
-            .map_err(|_| QualificationTrafficFailureCode::RestoreScanRejected)?;
+            .map_err(|error| {
+                QualificationTrafficFailure::store(
+                    QualificationTrafficFailureCode::RestoreScanRejected,
+                    QualificationTrafficFailureStage::RestoreScan,
+                    &error,
+                )
+            })?;
         if !page.complete
             || page.next_cursor.is_some()
             || page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
@@ -1286,25 +2243,75 @@ async fn run_traffic_mutation_task_inner(
                 .iter()
                 .any(|candidate| traffic_record_is_exact(&expected_record, candidate))
         {
-            return Err(QualificationTrafficFailureCode::RestoreScanRejected);
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::RestoreScanRejected,
+                QualificationTrafficFailureStage::RestoreScan,
+            ));
         }
         increment(&observation.complete_restore_scans);
+        if traffic_cancellation_requested(cancellation, shutdown_deadline) {
+            return Ok(());
+        }
 
         let readiness = store.probe_durable_readiness().await;
         if !readiness.is_ready() {
-            return Err(QualificationTrafficFailureCode::ReadinessUnavailable);
+            return Err(QualificationTrafficFailure::backend_unavailable(
+                QualificationTrafficFailureCode::ReadinessUnavailable,
+                QualificationTrafficFailureStage::ReadinessProbe,
+            ));
         }
         increment(&observation.durable_readiness_probes);
+        if traffic_cancellation_requested(cancellation, shutdown_deadline) {
+            return Ok(());
+        }
 
-        let record_fence = lease.fence().get();
-        protected
-            .release(lease.clone())
-            .await
-            .map_err(|_| QualificationTrafficFailureCode::LeaseRejected)?;
+        let Some(lease_to_release) = lease.take() else {
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::LeaseRelease,
+            ));
+        };
+        protected.release(lease_to_release).await.map_err(|error| {
+            QualificationTrafficFailure::lease(
+                QualificationTrafficFailureCode::LeaseRejected,
+                QualificationTrafficFailureStage::LeaseRelease,
+                &error,
+            )
+        })?;
+        // The private qualification schedule deterministically drops exactly
+        // one otherwise successful release response per mutation task. This
+        // exercises the same no-guess recovery path as a real typed ambiguous
+        // outcome without changing Openraft, the store, or production APIs.
+        if observation
+            .synthetic_release_response_loss_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(QualificationTrafficFailure {
+                code: QualificationTrafficFailureCode::LeaseRejected,
+                stage: QualificationTrafficFailureStage::LeaseRelease,
+                error_class: QualificationTrafficErrorClass::BackendOperationOutcomeUnavailable,
+            });
+        }
+        if traffic_cancellation_requested(cancellation, shutdown_deadline) {
+            return Ok(());
+        }
         let reacquired = protected
             .acquire(key, owner.clone(), QUALIFICATION_TRAFFIC_TTL)
             .await
-            .map_err(|_| QualificationTrafficFailureCode::LeaseRejected)?;
+            .map_err(|error| {
+                QualificationTrafficFailure::lease(
+                    QualificationTrafficFailureCode::LeaseRejected,
+                    QualificationTrafficFailureStage::LeaseAcquire,
+                    &error,
+                )
+            })?;
+        *lease = Some(reacquired);
+        let Some(reacquired) = lease.as_ref() else {
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::LeaseAcquire,
+            ));
+        };
         if !lease_authority_is_advanced(
             key,
             owner,
@@ -1313,16 +2320,12 @@ async fn run_traffic_mutation_task_inner(
             reacquired.owner(),
             reacquired.fence().get(),
         ) {
-            return Err(QualificationTrafficFailureCode::InvariantViolation);
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::LeaseAcquire,
+            ));
         }
-        *lease = reacquired;
         increment(&observation.lease_reacquisitions);
-        observation
-            .last_record_fence
-            .store(record_fence, Ordering::Release);
-        observation
-            .last_generation
-            .store(generation, Ordering::Release);
         increment(&observation.mutation_cycles);
 
         schedule_state = schedule_state
@@ -1331,10 +2334,52 @@ async fn run_traffic_mutation_task_inner(
         let delay = QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS
             + schedule_state % QUALIFICATION_TRAFFIC_MUTATION_DELAY_SPAN_MILLIS;
         tokio::select! {
-            _ = &mut *cancellation => return Ok(()),
+            cancellation = &mut *cancellation => {
+                let deadline = cancellation.unwrap_or_else(|_| {
+                    tokio::time::Instant::now()
+                        + Duration::from_millis(
+                            QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
+                        )
+                });
+                record_traffic_shutdown_deadline(shutdown_deadline, deadline);
+                return Ok(());
+            },
             _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
         }
     }
+}
+
+fn traffic_cancellation_requested(
+    cancellation: &mut oneshot::Receiver<tokio::time::Instant>,
+    shutdown_deadline: &mut Option<tokio::time::Instant>,
+) -> bool {
+    match cancellation.try_recv() {
+        Ok(deadline) => {
+            record_traffic_shutdown_deadline(shutdown_deadline, deadline);
+            true
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_millis(QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS);
+            record_traffic_shutdown_deadline(shutdown_deadline, deadline);
+            true
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+    }
+}
+
+fn record_traffic_shutdown_deadline(
+    shutdown_deadline: &mut Option<tokio::time::Instant>,
+    deadline: tokio::time::Instant,
+) {
+    *shutdown_deadline = Some(shutdown_deadline.map_or(deadline, |current| current.min(deadline)));
+}
+
+fn traffic_shutdown_deadline_reached(
+    shutdown_deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> bool {
+    shutdown_deadline.is_some_and(|deadline| now >= deadline)
 }
 
 fn lease_authority_is_preserved(
@@ -1363,42 +2408,99 @@ fn traffic_record_is_exact(expected: &StoredSessionRecord, actual: &StoredSessio
     actual == expected
 }
 
+fn traffic_reconciliation_page_plan(
+    reconciled_sequence: u64,
+    authoritative_head: u64,
+    reconciled_entries: u64,
+) -> Result<Option<(u64, usize)>, ()> {
+    let remaining = authoritative_head
+        .checked_sub(reconciled_sequence)
+        .ok_or(())?;
+    if remaining == 0 {
+        return Ok(None);
+    }
+    if reconciled_entries
+        .checked_add(remaining)
+        .is_none_or(|total| total > QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES)
+    {
+        return Err(());
+    }
+    let start = reconciled_sequence.checked_add(1).ok_or(())?;
+    let limit = usize::try_from(remaining)
+        .unwrap_or(usize::MAX)
+        .min(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES);
+    Ok(Some((start, limit)))
+}
+
 async fn run_traffic_watch_task(
     mut stream: BoxStream<'static, Result<ReplicationEntry, StoreError>>,
     mut expected_sequence: u64,
     member_count: usize,
     mut cancellation: oneshot::Receiver<()>,
     observation: Arc<QualificationTrafficObservation>,
-) -> Result<(), QualificationTrafficFailureCode> {
-    let traffic_keys = (0..member_count)
+) -> Result<(), QualificationTrafficFailure> {
+    let traffic_keys = match (0..member_count)
         .map(qualification_traffic_key)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|()| QualificationTrafficFailureCode::InvariantViolation)?;
+    {
+        Ok(keys) => keys,
+        Err(()) => {
+            let failure = QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Watch,
+            );
+            observation.record_failure(failure);
+            return Err(failure);
+        }
+    };
     loop {
         tokio::select! {
             biased;
             _ = &mut cancellation => return Ok(()),
             entry = stream.next() => {
                 let Some(entry) = entry else {
-                    observation.record_failure(QualificationTrafficFailureCode::WatchUnavailable);
-                    return Err(QualificationTrafficFailureCode::WatchUnavailable);
+                    let failure = QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::WatchUnavailable,
+                        QualificationTrafficFailureStage::Watch,
+                    );
+                    observation.record_failure(failure);
+                    return Err(failure);
                 };
                 let entry = match entry {
                     Ok(entry) => entry,
-                    Err(_) => {
-                        observation.record_failure(QualificationTrafficFailureCode::WatchUnavailable);
-                        return Err(QualificationTrafficFailureCode::WatchUnavailable);
+                    Err(error) => {
+                        let failure = QualificationTrafficFailure::store(
+                            QualificationTrafficFailureCode::WatchUnavailable,
+                            QualificationTrafficFailureStage::Watch,
+                            &error,
+                        );
+                        observation.record_failure(failure);
+                        return Err(failure);
                     }
                 };
                 if entry.sequence != expected_sequence {
-                    observation.record_failure(QualificationTrafficFailureCode::InvariantViolation);
-                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    let failure = QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::InvariantViolation,
+                        QualificationTrafficFailureStage::Watch,
+                    );
+                    observation.record_failure(failure);
+                    return Err(failure);
                 }
-                let applied_records = observe_applied_records(
+                let applied_records = match observe_applied_records(
                     &entry.op,
                     &traffic_keys,
                     &observation.watch_traffic_generations,
-                )?;
+                ) {
+                    Ok(applied_records) => applied_records,
+                    Err(_) => {
+                        let failure = QualificationTrafficFailure::fixed(
+                            QualificationTrafficFailureCode::InvariantViolation,
+                            QualificationTrafficFailureStage::Watch,
+                        );
+                        observation.record_failure(failure);
+                        return Err(failure);
+                    }
+                };
                 observation.watch_sequence.store(entry.sequence, Ordering::Release);
                 increment(&observation.watch_entries);
                 if applied_records != 0 {
@@ -1409,8 +2511,12 @@ async fn run_traffic_watch_task(
                     );
                 }
                 let Some(next_sequence) = expected_sequence.checked_add(1) else {
-                    observation.record_failure(QualificationTrafficFailureCode::InvariantViolation);
-                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    let failure = QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::InvariantViolation,
+                        QualificationTrafficFailureStage::Watch,
+                    );
+                    observation.record_failure(failure);
+                    return Err(failure);
                 };
                 expected_sequence = next_sequence;
             }
@@ -1447,7 +2553,7 @@ fn observe_applied_records(
                     watch_traffic_generations[node_index].store(generation, Ordering::Release);
                 }
             }
-            ReplicationOp::Batch { ops } => pending.extend(ops.iter()),
+            ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::DeleteFenced { .. }
             | ReplicationOp::RefreshTtl { .. }
             | ReplicationOp::AcquireLease { .. }
@@ -1456,6 +2562,61 @@ fn observe_applied_records(
         }
     }
     Ok(count)
+}
+
+fn reconcile_applied_traffic_records(
+    operation: &ReplicationOp,
+    traffic_keys: &[SessionKey],
+    traffic_generations: &mut [u64],
+    seed: u64,
+    member_count: usize,
+) -> Result<(), QualificationTrafficFailureCode> {
+    if traffic_keys.len() != member_count || traffic_generations.len() != member_count {
+        return Err(QualificationTrafficFailureCode::InvariantViolation);
+    }
+    let mut pending = vec![operation];
+    while let Some(operation) = pending.pop() {
+        match operation {
+            ReplicationOp::CompareAndSet {
+                key, new_record, ..
+            } => {
+                let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                else {
+                    continue;
+                };
+                let generation = new_record.generation.get();
+                let owner = OwnerId::new(format!("rotation-traffic-owner-{node_index}"))
+                    .map_err(|_| QualificationTrafficFailureCode::InvariantViolation)?;
+                let expected_record = StoredSessionRecord {
+                    key: key.clone(),
+                    generation: Generation::new(generation),
+                    owner,
+                    fence: new_record.fence,
+                    state_class: StateClass::AuthoritativeSession,
+                    state_type: StateType::from_static(QUALIFICATION_TRAFFIC_STATE_TYPE),
+                    expires_at: None,
+                    payload: EncryptedSessionPayload::new(
+                        qualification_traffic_value(seed, member_count, node_index, generation)
+                            .as_bytes(),
+                    ),
+                };
+                if new_record.fence.get() == 0
+                    || !traffic_record_is_exact(&expected_record, new_record)
+                    || traffic_generations[node_index].checked_add(1) != Some(generation)
+                {
+                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                }
+                traffic_generations[node_index] = generation;
+            }
+            ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
+            ReplicationOp::DeleteFenced { .. }
+            | ReplicationOp::RefreshTtl { .. }
+            | ReplicationOp::AcquireLease { .. }
+            | ReplicationOp::RenewLease { .. }
+            | ReplicationOp::ReleaseLease { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn qualification_traffic_key(node_index: usize) -> Result<SessionKey, ()> {
@@ -1930,6 +3091,194 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn traffic_cancellation_checkpoint_distinguishes_open_sent_and_closed_channels() {
+        let (sender, mut cancellation) = oneshot::channel();
+        let mut shutdown_deadline = None;
+        assert!(!traffic_cancellation_requested(
+            &mut cancellation,
+            &mut shutdown_deadline
+        ));
+        let expected_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        sender
+            .send(expected_deadline)
+            .expect("traffic cancellation receiver open");
+        assert!(traffic_cancellation_requested(
+            &mut cancellation,
+            &mut shutdown_deadline
+        ));
+        assert_eq!(shutdown_deadline, Some(expected_deadline));
+
+        let (sender, mut cancellation) = oneshot::channel::<tokio::time::Instant>();
+        drop(sender);
+        let mut shutdown_deadline = None;
+        assert!(traffic_cancellation_requested(
+            &mut cancellation,
+            &mut shutdown_deadline
+        ));
+        assert!(shutdown_deadline.is_some());
+    }
+
+    #[test]
+    fn traffic_shutdown_deadline_is_inclusive() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        assert!(!traffic_shutdown_deadline_reached(
+            Some(deadline),
+            deadline - Duration::from_nanos(1)
+        ));
+        assert!(traffic_shutdown_deadline_reached(Some(deadline), deadline));
+        assert!(traffic_shutdown_deadline_reached(
+            Some(deadline),
+            deadline + Duration::from_nanos(1)
+        ));
+        assert!(!traffic_shutdown_deadline_reached(None, deadline));
+    }
+
+    #[test]
+    fn traffic_observation_retains_only_the_last_proven_authoritative_head() {
+        let observation = QualificationTrafficObservation::new(41, 3);
+        assert_eq!(observation.authoritative_replication_head(), 41);
+        observation.record_authoritative_replication_head(44);
+        assert_eq!(observation.authoritative_replication_head(), 44);
+        assert_eq!(observation.watch_sequence.load(Ordering::Acquire), 41);
+    }
+
+    #[test]
+    fn traffic_failure_diagnostic_is_atomic_closed_and_redacted() {
+        let observation = QualificationTrafficObservation::new(0, 3);
+        let first = QualificationTrafficFailure::store(
+            QualificationTrafficFailureCode::BackendUnavailable,
+            QualificationTrafficFailureStage::CompareAndSet,
+            &StoreError::CasIdempotencyOutcomeUnavailable,
+        );
+        observation.record_failure(first);
+        observation.record_failure(QualificationTrafficFailure::lease(
+            QualificationTrafficFailureCode::LeaseRejected,
+            QualificationTrafficFailureStage::LeaseRenew,
+            &LeaseError::Expired,
+        ));
+        assert_eq!(observation.failure(), Some(first));
+
+        assert_eq!(
+            qualification_store_error_class(&StoreError::BackendUnavailable(
+                "must-not-cross-control-boundary".to_owned()
+            )),
+            QualificationTrafficErrorClass::BackendUnavailable
+        );
+        assert_eq!(
+            qualification_store_error_class(&StoreError::BackendOperationOutcomeUnavailable),
+            QualificationTrafficErrorClass::BackendOperationOutcomeUnavailable
+        );
+        assert_eq!(
+            qualification_store_error_class(&StoreError::StaleFence),
+            QualificationTrafficErrorClass::LeaseLostOrInvalid
+        );
+        assert_eq!(
+            qualification_store_error_class(&StoreError::Crypto(
+                "must-not-cross-control-boundary".to_owned()
+            )),
+            QualificationTrafficErrorClass::Other
+        );
+        assert_eq!(
+            qualification_lease_error_class(&LeaseError::OperationOutcomeUnavailable),
+            QualificationTrafficErrorClass::BackendOperationOutcomeUnavailable
+        );
+        assert_eq!(
+            qualification_lease_error_class(&LeaseError::Backend(
+                "must-not-cross-control-boundary".to_owned()
+            )),
+            QualificationTrafficErrorClass::BackendUnavailable
+        );
+
+        assert!(traffic_failure_is_recoverable(first));
+        assert!(traffic_failure_is_recoverable(
+            QualificationTrafficFailure::lease(
+                QualificationTrafficFailureCode::LeaseRejected,
+                QualificationTrafficFailureStage::LeaseRelease,
+                &LeaseError::OperationOutcomeUnavailable,
+            )
+        ));
+        assert!(!traffic_failure_is_recoverable(
+            QualificationTrafficFailure::lease(
+                QualificationTrafficFailureCode::LeaseRejected,
+                QualificationTrafficFailureStage::LeaseRenew,
+                &LeaseError::Expired,
+            )
+        ));
+        assert!(!traffic_failure_is_recoverable(
+            QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Get,
+            )
+        ));
+    }
+
+    #[test]
+    fn traffic_recovery_retains_authority_only_for_known_outcome_checkpoints() {
+        for stage in [
+            QualificationTrafficFailureStage::Get,
+            QualificationTrafficFailureStage::RestoreScan,
+            QualificationTrafficFailureStage::ReadinessProbe,
+        ] {
+            assert!(traffic_failure_retains_known_authority(
+                QualificationTrafficFailure::backend_unavailable(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    stage,
+                )
+            ));
+        }
+        for stage in [
+            QualificationTrafficFailureStage::LeaseRenew,
+            QualificationTrafficFailureStage::CompareAndSet,
+            QualificationTrafficFailureStage::LeaseRelease,
+            QualificationTrafficFailureStage::LeaseAcquire,
+            QualificationTrafficFailureStage::Watch,
+            QualificationTrafficFailureStage::TaskJoin,
+        ] {
+            assert!(!traffic_failure_retains_known_authority(
+                QualificationTrafficFailure::backend_unavailable(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    stage,
+                )
+            ));
+        }
+        assert!(!traffic_failure_retains_known_authority(
+            QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Get,
+            )
+        ));
+    }
+
+    #[test]
+    fn traffic_availability_interruption_budget_is_exact_and_resets_consecutive_count() {
+        let observation = QualificationTrafficObservation::new(0, 3);
+        let mut consecutive = 0;
+        for expected in 1..=QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE {
+            assert!(observation.record_availability_interruption(&mut consecutive));
+            assert_eq!(consecutive, expected);
+        }
+        assert!(!observation.record_availability_interruption(&mut consecutive));
+        assert_eq!(
+            observation
+                .availability_interruptions
+                .load(Ordering::Acquire),
+            QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+        );
+        assert_eq!(
+            observation
+                .max_consecutive_availability_interruptions
+                .load(Ordering::Acquire),
+            QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+        );
+        observation.record_availability_recovery(&mut consecutive);
+        assert_eq!(consecutive, 0);
+        assert_eq!(
+            observation.availability_recoveries.load(Ordering::Acquire),
+            QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+        );
+    }
+
     #[derive(Debug)]
     struct CountingPeer {
         node_id: SessionConsensusNodeId,
@@ -2155,6 +3504,15 @@ mod tests {
         substituted.key = qualification_key("other-traffic-record").expect("other traffic key");
         substitutions.push(substituted);
         let mut substituted = expected.clone();
+        substituted.generation = Generation::new(expected.generation.get() + 1);
+        substitutions.push(substituted);
+        let mut substituted = expected.clone();
+        substituted.owner = OwnerId::new("other-traffic-record-owner").expect("other owner");
+        substitutions.push(substituted);
+        let mut substituted = expected.clone();
+        substituted.fence = FenceToken::new(expected.fence.get() + 1);
+        substitutions.push(substituted);
+        let mut substituted = expected.clone();
         substituted.state_class = StateClass::ReplicatedDr;
         substitutions.push(substituted);
         let mut substituted = expected.clone();
@@ -2170,5 +3528,232 @@ mod tests {
         for substituted in substitutions {
             assert!(!traffic_record_is_exact(&expected, &substituted));
         }
+    }
+
+    #[test]
+    fn traffic_record_reconciliation_accepts_only_the_exact_current_or_ambiguous_cas_result() {
+        let member_count = 3;
+        let node_index = 0;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let key = qualification_traffic_key(node_index).expect("traffic key");
+        let owner = OwnerId::new("rotation-traffic-owner-0").expect("traffic owner");
+        let record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(8),
+            owner: owner.clone(),
+            fence: FenceToken::new(11),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static(QUALIFICATION_TRAFFIC_STATE_TYPE),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(
+                qualification_traffic_value(seed, member_count, node_index, 8).as_bytes(),
+            ),
+        };
+        assert_eq!(
+            reconciled_traffic_record_identity(
+                &record,
+                &key,
+                &owner,
+                seed,
+                member_count,
+                node_index,
+                7,
+                9,
+                Some(11),
+                QualificationTrafficFailureStage::CompareAndSet,
+            ),
+            Some((8, 11))
+        );
+        assert!(reconciled_traffic_record_identity(
+            &record,
+            &key,
+            &owner,
+            seed,
+            member_count,
+            node_index,
+            7,
+            9,
+            Some(11),
+            QualificationTrafficFailureStage::Get,
+        )
+        .is_none());
+
+        let mut substituted = record.clone();
+        substituted.payload = EncryptedSessionPayload::new(b"untrusted-recovery-payload");
+        assert!(reconciled_traffic_record_identity(
+            &substituted,
+            &key,
+            &owner,
+            seed,
+            member_count,
+            node_index,
+            7,
+            9,
+            Some(11),
+            QualificationTrafficFailureStage::CompareAndSet,
+        )
+        .is_none());
+
+        let current = StoredSessionRecord {
+            generation: Generation::new(7),
+            fence: FenceToken::new(9),
+            payload: EncryptedSessionPayload::new(
+                qualification_traffic_value(seed, member_count, node_index, 7).as_bytes(),
+            ),
+            ..record
+        };
+        assert_eq!(
+            reconciled_traffic_record_identity(
+                &current,
+                &key,
+                &owner,
+                seed,
+                member_count,
+                node_index,
+                7,
+                9,
+                None,
+                QualificationTrafficFailureStage::LeaseRelease,
+            ),
+            Some((7, 9))
+        );
+    }
+
+    #[test]
+    fn traffic_reconciliation_page_plan_enforces_total_and_page_boundaries() {
+        assert_eq!(traffic_reconciliation_page_plan(7, 7, 0), Ok(None));
+        assert_eq!(traffic_reconciliation_page_plan(8, 7, 0), Err(()));
+        assert_eq!(
+            traffic_reconciliation_page_plan(
+                0,
+                QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES,
+                0,
+            ),
+            Ok(Some((
+                1,
+                QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES,
+            )))
+        );
+        assert_eq!(
+            traffic_reconciliation_page_plan(
+                0,
+                QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES + 1,
+                0,
+            ),
+            Err(())
+        );
+        assert_eq!(
+            traffic_reconciliation_page_plan(
+                10,
+                11,
+                QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES - 1,
+            ),
+            Ok(Some((11, 1)))
+        );
+        assert_eq!(
+            traffic_reconciliation_page_plan(
+                10,
+                12,
+                QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES - 1,
+            ),
+            Err(())
+        );
+    }
+
+    fn reconciliation_cas(node_index: usize, generation: u64) -> ReplicationOp {
+        let key = qualification_traffic_key(node_index).expect("traffic key");
+        ReplicationOp::CompareAndSet {
+            key: key.clone(),
+            expected_generation: generation
+                .checked_sub(1)
+                .filter(|value| *value != 0)
+                .map(Generation::new),
+            credential_id: 1,
+            guard_expires_at: opc_types::Timestamp::now_utc(),
+            new_record: StoredSessionRecord {
+                key,
+                generation: Generation::new(generation),
+                owner: OwnerId::new(format!("rotation-traffic-owner-{node_index}"))
+                    .expect("traffic owner"),
+                fence: opc_session_store::FenceToken::new(generation.saturating_add(1)),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static(QUALIFICATION_TRAFFIC_STATE_TYPE),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new(
+                    qualification_traffic_value(
+                        qualification_traffic_seed(3).expect("traffic seed"),
+                        3,
+                        node_index,
+                        generation,
+                    )
+                    .as_bytes(),
+                ),
+            },
+        }
+    }
+
+    #[test]
+    fn traffic_reconciliation_requires_strict_generations_and_exact_records() {
+        let keys = (0..3)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let seed = qualification_traffic_seed(3).expect("traffic seed");
+        let mut generations = vec![0; 3];
+        assert!(reconcile_applied_traffic_records(
+            &reconciliation_cas(0, 1),
+            &keys,
+            &mut generations,
+            seed,
+            3,
+        )
+        .is_ok());
+        assert_eq!(generations, vec![1, 0, 0]);
+        assert!(reconcile_applied_traffic_records(
+            &reconciliation_cas(0, 2),
+            &keys,
+            &mut generations,
+            seed,
+            3,
+        )
+        .is_ok());
+
+        for (previous, generation) in [(0, 17), (2, 2), (2, 4), (u64::MAX, 1)] {
+            let mut candidate = vec![previous, 0, 0];
+            assert!(reconcile_applied_traffic_records(
+                &reconciliation_cas(0, generation),
+                &keys,
+                &mut candidate,
+                seed,
+                3,
+            )
+            .is_err());
+        }
+
+        let mut malformed = reconciliation_cas(1, 1);
+        let ReplicationOp::CompareAndSet { new_record, .. } = &mut malformed else {
+            unreachable!()
+        };
+        new_record.payload = EncryptedSessionPayload::new(b"wrong-reconciled-value");
+        assert!(
+            reconcile_applied_traffic_records(&malformed, &keys, &mut [0; 3], seed, 3,).is_err()
+        );
+    }
+
+    #[test]
+    fn traffic_reconciliation_preserves_batch_operation_order() {
+        let keys = (0..3)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let seed = qualification_traffic_seed(3).expect("traffic seed");
+        let mut generations = vec![0; 3];
+        let batch = ReplicationOp::Batch {
+            ops: vec![reconciliation_cas(1, 1), reconciliation_cas(1, 2)],
+        };
+        assert!(
+            reconcile_applied_traffic_records(&batch, &keys, &mut generations, seed, 3,).is_ok()
+        );
+        assert_eq!(generations, vec![0, 2, 0]);
     }
 }

@@ -138,6 +138,16 @@ pub const DURABLE_CONSENSUS_TIMING_PROFILE: DurableConsensusTimingProfile =
 pub const DURABLE_CONSENSUS_OPERATION_TIMEOUT: Duration =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout();
 
+/// Maximum number of log entries admitted to one durable AppendEntries batch.
+pub const DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES: usize = 64;
+
+/// Maximum number of accepted application proposals supervised concurrently
+/// by each durable Openraft adapter.
+///
+/// A permit remains owned until Openraft resolves the accepted proposal, even
+/// when the originating caller is cancelled or its operation deadline elapses.
+pub const DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS: usize = 8;
+
 /// The one SDK-owned runtime configuration used by durable Openraft consumers.
 pub const DURABLE_OPENRAFT_PROFILE: DurableOpenraftProfile = DurableOpenraftProfile {
     heartbeat_interval_millis: DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis,
@@ -145,7 +155,7 @@ pub const DURABLE_OPENRAFT_PROFILE: DurableOpenraftProfile = DurableOpenraftProf
     election_timeout_max_millis: DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis,
     install_snapshot_timeout_millis: DURABLE_CONSENSUS_TIMING_PROFILE
         .install_snapshot_timeout_millis,
-    max_payload_entries: 1,
+    max_payload_entries: DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES as u64,
     logs_per_snapshot: 4_096,
     snapshot_chunk_bytes: 1024 * 1024,
     retained_logs: 1_024,
@@ -257,6 +267,15 @@ mod tests {
         ] {
             let config = durable_openraft_config(domain).expect("fixed profile must validate");
             assert_eq!(config.cluster_name, cluster_name);
+            assert_eq!(
+                DURABLE_OPENRAFT_PROFILE.max_payload_entries,
+                DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES as u64
+            );
+            assert_eq!(
+                config.max_payload_entries,
+                DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES as u64
+            );
+            assert_eq!(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS, 8);
             assert_eq!(
                 config.heartbeat_interval,
                 DURABLE_OPENRAFT_PROFILE.heartbeat_interval_millis

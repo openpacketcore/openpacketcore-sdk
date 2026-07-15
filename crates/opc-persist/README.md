@@ -200,6 +200,21 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   `PersistErrorKind::RequestIdCollision` outcome and leaves the original result
   recoverable while retained. After expiry, callers must perform a fresh
   authoritative read.
+- Config and session consensus share the fixed eight-slot proposal-admission
+  profile. Config admission uses the operation's original deadline; after
+  `client_write_ff` accepts a request, a detached supervisor owns its permit
+  until Openraft resolves that exact request. Cancellation or result timeout
+  cannot release the slot early. A caller recovering an unavailable explicit
+  idempotent call must retry the same retained request ID; the state machine
+  returns the original persisted outcome rather than applying the mutation
+  twice.
+- Fresh reads and mutation preflights pass through exactly one
+  supervisor-owned Openraft linearizability check per node and at most 64 total
+  callers across the active and waiting cohorts. Callers collected before
+  dispatch may share that exact result; later callers await a subsequent check
+  under their original deadlines. Caller
+  cancellation or timeout cannot cancel a dispatched check or start an
+  overlapping one, and Openraft remains the sole quorum authority.
 - `dangerous-test-hooks` exposes fault injection only for explicitly gated
   test profiles. It is not a production feature.
 
