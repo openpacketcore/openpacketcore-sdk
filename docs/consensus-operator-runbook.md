@@ -373,9 +373,12 @@ prepublication delta plus 13-second semantic-progress observation checkpoints
 conservatively bound the worst-case gap between actual survivor progress events
 to 26 seconds. Each survivor may record at most one rejoin availability episode;
 it must recover within that 26-second SLO and settle before the clean baseline,
-and a second or late episode fails closed. Fault-era attempt, terminal, and
-reconnect deltas remain inside the fixed 84/160 per-node bound (ordinary 24/40
-plus fifteen five-second refresh rounds over four/eight incident paths).
+and a second or late episode fails closed. Fault-era new-attempt and reconnect
+deltas remain inside the fixed 84/160 per-node bound (ordinary 24/40 plus
+fifteen five-second refresh rounds over four/eight incident paths). Terminal
+outcomes may additionally contain only the exact attempts already outstanding
+at the interval baseline, and must satisfy interval conservation; Schedule v4
+binds `new-attempts-plus-baseline-outstanding/v1`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns remain forbidden throughout the fault interval. The following
 scoped-reauthentication interval again requires zero transport,

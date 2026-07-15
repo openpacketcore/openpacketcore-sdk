@@ -149,9 +149,12 @@ clean baseline. A second or late episode fails closed. The half-SLO observation
 cadence resumes immediately after recovery.
 Only after bounded fault-era transport/authentication/timeout/reconnect
 outcomes have settled does it capture the clean member-scoped reauthentication
-baseline. Fault-era attempts, terminal outcomes, and reconnects retain the
-fixed 84/160 per-node bound: the ordinary 24/40 allowance plus no more than
-fifteen five-second refresh rounds over four/eight incident directed paths.
+baseline. Fault-era new attempts and reconnects retain the fixed 84/160
+per-node bound: the ordinary 24/40 allowance plus no more than fifteen
+five-second refresh rounds over four/eight incident directed paths. Terminal
+outcomes may additionally include only the exact attempts already outstanding
+at the interval baseline, with interval conservation enforced. The schedule
+binds this accounting as `new-attempts-plus-baseline-outstanding/v1`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns retain a zero budget throughout the fault and clean intervals.
 The private schedule binds this procedure as

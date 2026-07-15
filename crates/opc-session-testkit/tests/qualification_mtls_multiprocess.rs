@@ -57,6 +57,7 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR,
+    QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE,
     QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR,
     QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
@@ -1096,6 +1097,7 @@ fn assert_recovery_fault_flush_bounds(
     assert_eq!(after.len(), member_count);
     let bound = recovery_fault_connection_bound(member_count);
     for (node_index, (before, after)) in before.iter().zip(after).enumerate() {
+        assert_connection_attempts_accounted(before, node_index);
         assert_connection_attempts_accounted(after, node_index);
         assert!(
             recovery_fault_flush_has_no_unsafe_outcomes(before, after),
@@ -1156,9 +1158,19 @@ fn assert_recovery_fault_flush_bounds(
             node_index,
             "reconnect_failures",
         );
+        let (_, baseline_outstanding, _) =
+            connection_attempt_accounting(before).expect("accounted fault-outcome baseline");
+        let terminal_bound = bound.saturating_add(baseline_outstanding);
+        assert!(
+            terminal <= attempts.saturating_add(baseline_outstanding),
+            "fault-outcome flush violated interval connection conservation: node={node_index}, attempts={attempts}, terminal_outcomes={terminal}, baseline_outstanding={baseline_outstanding}"
+        );
+        assert!(
+            terminal <= terminal_bound,
+            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}"
+        );
         for (counter, observed) in [
             ("connection_attempts", attempts),
-            ("connection_terminal_outcomes", terminal),
             ("reconnect_attempts", reconnect_attempts),
             ("reconnect_failures", reconnect_failures),
         ] {
@@ -7153,6 +7165,10 @@ fn recovery_fault_settlement_tracks_attempts_without_freezing_connection_gauges(
     assert_eq!(recovery_fault_connection_bound(5), 160);
     assert_eq!(QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR, 2);
     assert_eq!(
+        QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE,
+        "new-attempts-plus-baseline-outstanding/v1"
+    );
+    assert_eq!(
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
         13_000
     );
@@ -7210,6 +7226,51 @@ fn recovery_fault_flush_bounds_incident_failures_and_rejects_abandonment() {
     let mut incident_fleet = before_fleet.clone();
     incident_fleet[0] = incident;
     assert_recovery_fault_flush_bounds(3, &before_fleet, &incident_fleet);
+
+    // A connection accepted before the interval can finish during it. Its
+    // terminal outcome is not a new interval attempt, so admit exactly the
+    // outstanding baseline carry-in while retaining the fixed new-attempt
+    // bound and the connection conservation equation.
+    let mut carry_in_before = before;
+    carry_in_before.connection_attempts = 1;
+    carry_in_before.active_connections = 1;
+    let carry_in_before_fleet = vec![carry_in_before; 3];
+    let mut carry_in_after_fleet = carry_in_before_fleet.clone();
+    carry_in_after_fleet[0].connection_attempts = 85;
+    carry_in_after_fleet[0].connection_successes = 85;
+    carry_in_after_fleet[0].active_connections = 0;
+    assert_recovery_fault_flush_bounds(3, &carry_in_before_fleet, &carry_in_after_fleet);
+
+    let mut unaccounted_terminal = carry_in_after_fleet.clone();
+    unaccounted_terminal[0].connection_successes = 86;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &carry_in_before_fleet, &unaccounted_terminal);
+    })
+    .is_err());
+
+    let mut new_attempt_storm = carry_in_after_fleet.clone();
+    new_attempt_storm[0].connection_attempts = 86;
+    new_attempt_storm[0].connection_successes = 85;
+    new_attempt_storm[0].active_connections = 1;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &carry_in_before_fleet, &new_attempt_storm);
+    })
+    .is_err());
+
+    let mut reconnect_storm = carry_in_after_fleet.clone();
+    reconnect_storm[0].reconnect_attempts = 85;
+    reconnect_storm[0].reconnect_failures = 85;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &carry_in_before_fleet, &reconnect_storm);
+    })
+    .is_err());
+
+    let mut malformed_baseline = carry_in_before_fleet.clone();
+    malformed_baseline[0].active_connections = 0;
+    assert!(std::panic::catch_unwind(|| {
+        assert_recovery_fault_flush_bounds(3, &malformed_baseline, &carry_in_after_fleet);
+    })
+    .is_err());
 
     let mut storm = incident_fleet.clone();
     storm[0].connection_attempts = 85;

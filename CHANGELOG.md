@@ -59,9 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   availability episode while the expired member rejoins; it must recover
   inside the existing 26-second SLO and be fully settled before the clean
   baseline. A second or late episode fails closed. The complete expiry/rejoin
-  interval has an 84/160 per-node attempt, terminal-outcome, and reconnect
-  bound: the ordinary 24/40 allowance plus at most fifteen five-second refresh
-  rounds over the four/eight incident directed paths. Cancellation-classified
+  interval has an 84/160 per-node new-attempt and reconnect bound: the ordinary
+  24/40 allowance plus at most fifteen five-second refresh rounds over the
+  four/eight incident directed paths. Terminal outcomes may additionally
+  contain only the exact attempts already outstanding at the interval baseline;
+  the connection conservation equation remains mandatory. Schedule v4 binds
+  this as `new-attempts-plus-baseline-outstanding/v1`. Cancellation-classified
   `abandoned` outcomes, protocol/backend outcomes, and drain overruns remain
   forbidden throughout the fault and clean intervals. Schedule v4 retains the
   `member-scoped-reauth-settled-baseline/v2` checkpoint first bound by Schedule

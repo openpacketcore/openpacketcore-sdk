@@ -1857,9 +1857,12 @@ fencing.
   the worst-case gap between actual survivor progress events to 26 seconds.
   Each survivor may record at most one interruption/recovery pair while the
   expired member rejoins; it must settle inside the 26-second SLO, and a second
-  or late episode fails closed. Fault-era attempt, terminal, and
-  reconnect deltas retain a fixed 84/160 per-node bound: ordinary 24/40 plus
-  fifteen five-second refresh rounds over four/eight incident paths.
+  or late episode fails closed. Fault-era new-attempt and reconnect deltas
+  retain a fixed 84/160 per-node bound: ordinary 24/40 plus fifteen five-second
+  refresh rounds over four/eight incident paths. Terminal outcomes may
+  additionally include only the exact attempts already outstanding at the
+  baseline and must satisfy interval conservation; Schedule v4 binds
+  `new-attempts-plus-baseline-outstanding/v1`.
   Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
   drain overruns remain forbidden; the clean scoped-reauthentication interval
   retains a zero-failure budget.

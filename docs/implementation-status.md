@@ -418,8 +418,11 @@ A prepublication delta plus 13-second observation checkpoints conservatively
 bound actual survivor progress gaps to 26 seconds. At most one rejoin
 interruption/recovery pair per survivor may settle within that SLO; a second or
 late episode fails closed. The checkpoint also retains bounded 84/160 per-node
-fault-era attempt/reconnect evidence (ordinary 24/40 plus fifteen five-second
-refresh rounds over four/eight incident paths), and requires zero
+fault-era new-attempt/reconnect evidence (ordinary 24/40 plus fifteen
+five-second refresh rounds over four/eight incident paths). Terminal outcomes
+may additionally contain only the exact attempts already outstanding at the
+baseline, with interval conservation enforced under the schedule-bound
+`new-attempts-plus-baseline-outstanding/v1` profile. It requires zero
 cancellation-classified `abandoned`, protocol/backend, or drain-overrun
 evidence. Recovery polling is
 non-intrusive; final watch-head settlement retains its fail-closed

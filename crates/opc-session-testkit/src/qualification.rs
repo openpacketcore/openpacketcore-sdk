@@ -272,6 +272,12 @@ pub const QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS: u64 = 75_000;
 pub const QUALIFICATION_FAULT_PATH_REFRESH_MILLIS: u64 = 5_000;
 /// Outbound and inbound qualification paths exercised for every remote peer.
 pub const QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR: u64 = 2;
+/// Versioned interval-accounting rule for the fault-era connection ledger.
+/// New attempts and reconnects use the fixed topology bound; terminal outcomes
+/// additionally admit only the exact attempts already outstanding at the
+/// baseline, as required by the connection conservation equation.
+pub const QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE: &str =
+    "new-attempts-plus-baseline-outstanding/v1";
 /// Lead between stopping all expiring-member traffic and that member's
 /// connection soft-retirement boundary.
 pub const QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS: u64 = 1_000;
@@ -795,6 +801,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "fault_expiry_validity_millis={}\n",
             "fault_path_refresh_millis={}\n",
             "fault_directed_path_factor={}\n",
+            "fault_connection_accounting_profile={}\n",
             "fault_traffic_stop_lead_millis={}\n",
             "fault_mutation_shutdown_lead_millis={}\n",
             "traffic_cancellation_profile={}\n",
@@ -856,6 +863,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
         QUALIFICATION_FAULT_PATH_REFRESH_MILLIS,
         QUALIFICATION_TRAFFIC_FAULT_DIRECTED_PATH_FACTOR,
+        QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE,
         QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
         QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
         QUALIFICATION_TRAFFIC_CANCELLATION_PROFILE,
@@ -2061,6 +2069,10 @@ mod tests {
             );
         }
         assert_eq!(
+            QUALIFICATION_TRAFFIC_FAULT_CONNECTION_ACCOUNTING_PROFILE,
+            "new-attempts-plus-baseline-outstanding/v1"
+        );
+        assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
             "member-scoped-reauth-settled-baseline/v2"
         );
@@ -2094,8 +2106,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:5af6a9eb10a034fc5fedbbfc160be693b9c404aa86872d1f72db1bf6cb095d37",
-                "sha256:6d949427f1d5d459afa408424af5b6ee995f15945759f3f9b8a4be093d3f6ec3",
+                "sha256:50f76c629eab650352308ef1ce93d6a22ba0b7fee7e34ca8eeb73061169822d3",
+                "sha256:b7d11362e8d8b908cd858192ad0edef16399cfa447dc2c542230a0a0415fa757",
             )
         );
         assert!(is_exact_sha256(&three));

@@ -936,10 +936,13 @@ delta and 13-second observation checkpoints conservatively bound the worst-case
 gap between actual survivor progress events to 26 seconds. Availability counters
 may advance by at most one interruption/recovery pair per survivor while the
 expired member rejoins; the pair must settle inside the 26-second SLO, and a
-second or late episode fails closed. Fault-era attempt,
-terminal, and reconnect deltas remain within the fixed 84/160 per-node bound:
-ordinary 24/40 plus fifteen five-second refresh rounds over four/eight incident
-paths. Cancellation-classified `abandoned` outcomes, protocol/backend outcomes,
+second or late episode fails closed. Fault-era new-attempt and reconnect deltas
+remain within the fixed 84/160 per-node bound: ordinary 24/40 plus fifteen
+five-second refresh rounds over four/eight incident paths. Terminal outcomes
+may additionally include only the exact attempts already outstanding at the
+baseline and must satisfy interval conservation; Schedule v4 binds this as
+`new-attempts-plus-baseline-outstanding/v1`. Cancellation-classified
+`abandoned` outcomes, protocol/backend outcomes,
 and drain overruns remain forbidden; the subsequent scoped-reauthentication
 interval retains the zero-failure budget. Non-intrusive workload snapshots drive continuity polling; the final
 watch-head proof still uses the fail-closed authoritative replication-head
