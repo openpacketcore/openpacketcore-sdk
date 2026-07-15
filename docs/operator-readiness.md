@@ -899,6 +899,11 @@ malformed trust and retains its exact last-good TLS epoch. The survivor quorum
 must retain fresh durable readiness and advance an encrypted canary. The test
 then restarts the gated member at its exact manifest address, proves catch-up,
 repairs the malformed generation, and proves its retry counter stops. It next
+performs exactly one unclean same-disk, exact-address restart of a stable
+follower while that member's mutation and watch tasks are active. Survivors
+must advance committed canary and mixed traffic during the outage; the returned
+member must reconcile the exact bounded journal/current record and resume at a
+strictly higher same-owner fence inside 26 seconds. It then
 publishes a same-issuer leaf with a 75-second remaining-validity/expiry budget.
 With the default 30-second drain window, its fixed soft-retirement boundary is
 `not_after - 30 seconds`: every incident directed path is refreshed below the
@@ -908,13 +913,18 @@ retirement by expiry. At the hard deadline every affected connection is
 drained, the source and controller report
 `Unavailable`/`LastGoodExpired`, and the SVID expiry gauge is zero. Survivors
 again prove readiness and encrypted-canary progress before a valid long-lived
-leaf restores all paths and all-voter readiness without restarting that
+leaf advances only that member's explicit reauthentication generation and
+restores fresh bidirectional mTLS/bootstrap proofs on its incident paths. The
+other survivors' explicit and local-material-epoch retirement counters must
+remain unchanged. All lifecycle drains and every still-live survivor
+availability episode must be settled before the next traffic baseline, then
+all-voter readiness and canary progress complete without restarting that
 process.
 
 The admission gate is not a real or deployed network partition. These two
 cases keep the bounded mixed lease/CAS/read, watch, restore-scan, readiness, and
 connection-recycling workload active, including exact journal reconciliation
-for the restarted watcher. They do not provide a broader restart/fault matrix,
+for both restart paths. They do not provide a broader restart/fault matrix,
 resource or soak evidence,
 remote-HKMS evidence, deployed-CNF evidence, signed release evidence, or an
 evidence-schema/profile claim. Openraft remains the sole commit authority;
@@ -937,9 +947,10 @@ five-process fleets on one host. It uses atomic projected `..data` swaps,
 production lifecycle defaults, separate source/controller status, affected-path
 fresh handshakes after every member, all paths at completed fleet cutovers,
 fresh all-voter readiness, and an encrypted canary. The companion cases add
-the exact synthetic admission-loss/malformed-last-good combination and bounded
-same-issuer expiry/replacement behavior above while the bounded mixed workload
-continues. This still does not qualify a CNF deployment, a real network
+the exact synthetic admission-loss/malformed-last-good combination, one
+bounded unclean active-mutator same-disk restart, and bounded same-issuer
+expiry/replacement behavior above while the bounded mixed workload continues.
+This still does not qualify a CNF deployment, a real network
 partition, a broader restart/fault matrix, resource pressure, supported
 platforms, soak, remote HKMS, or signed release evidence; keep #164/#143 gates
 closed until those campaigns pass.

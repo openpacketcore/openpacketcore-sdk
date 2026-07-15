@@ -56,7 +56,9 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE,
     QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR,
     QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND, QUALIFICATION_TRAFFIC_ROTATIONS_PER_MEMBER,
-    QUALIFICATION_TRAFFIC_TRANSITION_MILLIS,
+    QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
+    QUALIFICATION_TRAFFIC_TRANSITION_MILLIS, QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
 };
 use opc_types::Timestamp;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, SanType};
@@ -364,7 +366,7 @@ fn traffic_mutator_counters_advanced(
         && after.durable_readiness_probes > before.durable_readiness_probes
         && after.last_generation > before.last_generation
         && after.last_record_fence > before.last_record_fence
-        && after.availability_interruptions >= 1
+        && (after.mutation_resume_generation != 0 || after.availability_interruptions >= 1)
         && after.availability_interruptions >= before.availability_interruptions
         && after.availability_recoveries >= before.availability_recoveries
         && after.max_consecutive_availability_interruptions
@@ -372,22 +374,30 @@ fn traffic_mutator_counters_advanced(
 }
 
 fn traffic_live_mutator_counters_are_consistent(status: &QualificationTrafficStatus) -> bool {
+    let Some(process_generations) = status
+        .last_generation
+        .checked_sub(status.mutation_resume_generation)
+    else {
+        return false;
+    };
     let upper = status
         .mutation_cycles
         .saturating_add(status.availability_interruptions)
         .saturating_add(1);
     let ordered_stages = [
         status.lease_renewals,
-        status.last_generation,
+        process_generations,
         status.linearizable_reads,
         status.complete_restore_scans,
         status.durable_readiness_probes,
         status.lease_reacquisitions,
         status.mutation_cycles,
     ];
-    ordered_stages
-        .into_iter()
-        .all(|counter| counter >= status.mutation_cycles && counter <= upper)
+    (status.mutation_resume_generation == 0) == (status.mutation_resume_record_fence == 0)
+        && status.last_record_fence >= status.mutation_resume_record_fence
+        && ordered_stages
+            .into_iter()
+            .all(|counter| counter >= status.mutation_cycles && counter <= upper)
         && ordered_stages
             .windows(2)
             .all(|stages| stages[0] >= stages[1])
@@ -406,15 +416,96 @@ fn traffic_availability_recovery_is_resolved(status: &QualificationTrafficStatus
     status.availability_recoveries == status.availability_interruptions
 }
 
+fn subset_traffic_availability_is_settled(
+    statuses: &[IndexedTrafficStatus],
+    participants: &TrafficParticipants,
+) -> bool {
+    traffic_status_snapshot_matches(statuses, participants)
+        && statuses.iter().all(|indexed| {
+            let status = &indexed.status;
+            let live_task_shape = if participants.is_mutator(indexed.node_index) {
+                status.state == QualificationTrafficState::Running
+                    && status.owned_async_tasks == 2
+                    && traffic_live_mutator_counters_are_consistent(status)
+            } else {
+                matches!(
+                    status.state,
+                    QualificationTrafficState::WatchReady
+                        | QualificationTrafficState::MutationStopped
+                ) && status.owned_async_tasks == 1
+            };
+            live_task_shape
+                && status.failure.is_none()
+                && traffic_failure_fields_are_coherent(status)
+                && traffic_availability_recovery_is_resolved(status)
+        })
+}
+
+fn member_reauthentication_generations_are_scoped(
+    before: &[u64],
+    after: &[u64],
+    member: usize,
+) -> bool {
+    before.len() == after.len()
+        && member < before.len()
+        && before
+            .iter()
+            .zip(after)
+            .enumerate()
+            .all(|(node_index, (before, after))| {
+                if node_index == member {
+                    before.checked_add(1) == Some(*after)
+                } else {
+                    before == after
+                }
+            })
+}
+
+fn member_incident_directed_paths(member_count: usize, member: usize) -> Vec<(usize, usize)> {
+    assert!(member < member_count);
+    (0..member_count)
+        .flat_map(|source| (0..member_count).map(move |target| (source, target)))
+        .filter(|(source, target)| source != target && (*source == member || *target == member))
+        .collect()
+}
+
+fn unrelated_survivor_reauthentication_retirements_are_unchanged(
+    before: &[QualificationConnectionLifecycleMetrics],
+    after: &[QualificationConnectionLifecycleMetrics],
+    member: usize,
+) -> bool {
+    before.len() == after.len()
+        && member < before.len()
+        && before
+            .iter()
+            .zip(after)
+            .enumerate()
+            .filter(|(node_index, _)| *node_index != member)
+            .all(|(_, (before, after))| {
+                after.retirement_explicit == before.retirement_explicit
+                    && after.retirement_material_epoch == before.retirement_material_epoch
+            })
+}
+
 fn traffic_failure_fields_are_coherent(status: &QualificationTrafficStatus) -> bool {
-    matches!(
+    match (
+        status.failure,
+        status.failure_stage,
+        status.failure_error_class,
+        status.failure_recovery_elapsed_millis,
+    ) {
+        (None, None, None, None) => true,
         (
-            status.failure,
-            status.failure_stage,
-            status.failure_error_class,
-        ),
-        (None, None, None) | (Some(_), Some(_), Some(_))
-    )
+            Some(QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded),
+            Some(_),
+            Some(_),
+            Some(_),
+        ) => true,
+        (Some(code), Some(_), Some(_), None) => {
+            code != QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+        }
+        _ => false,
+    }
 }
 
 fn traffic_nonmutator_counters_unchanged(
@@ -427,6 +518,8 @@ fn traffic_nonmutator_counters_unchanged(
         && after.lease_reacquisitions == before.lease_reacquisitions
         && after.complete_restore_scans == before.complete_restore_scans
         && after.durable_readiness_probes == before.durable_readiness_probes
+        && after.mutation_resume_generation == before.mutation_resume_generation
+        && after.mutation_resume_record_fence == before.mutation_resume_record_fence
         && after.last_generation == before.last_generation
         && after.last_record_fence == before.last_record_fence
         && after.availability_interruptions == before.availability_interruptions
@@ -440,8 +533,20 @@ fn subset_traffic_made_semantic_progress(
     after: &[IndexedTrafficStatus],
     participants: &TrafficParticipants,
 ) -> bool {
+    subset_traffic_made_semantic_progress_with_crashed_tail(before, after, participants, None)
+}
+
+fn subset_traffic_made_semantic_progress_with_crashed_tail(
+    before: &[IndexedTrafficStatus],
+    after: &[IndexedTrafficStatus],
+    participants: &TrafficParticipants,
+    crashed_node_index: Option<usize>,
+) -> bool {
     if !traffic_status_snapshot_matches(before, participants)
         || !traffic_status_snapshot_matches(after, participants)
+        || crashed_node_index.is_some_and(|node_index| {
+            node_index >= participants.member_count || participants.mutators.contains(&node_index)
+        })
     {
         return false;
     }
@@ -480,8 +585,13 @@ fn subset_traffic_made_semantic_progress(
             && (0..participants.member_count)
                 .filter(|key_index| !participants.mutators.contains(key_index))
                 .all(|key_index| {
-                    after.watch_traffic_generations[key_index]
-                        == before.watch_traffic_generations[key_index]
+                    if Some(key_index) == crashed_node_index {
+                        after.watch_traffic_generations[key_index]
+                            >= before.watch_traffic_generations[key_index]
+                    } else {
+                        after.watch_traffic_generations[key_index]
+                            == before.watch_traffic_generations[key_index]
+                    }
                 })
             && if is_mutator {
                 traffic_mutator_counters_advanced(before, after)
@@ -496,13 +606,18 @@ fn assert_completed_traffic_cycles(status: &QualificationTrafficStatus) {
     assert!(traffic_live_mutator_counters_are_consistent(status));
     assert_eq!(status.lease_reacquisitions, status.mutation_cycles);
     assert!(traffic_availability_recovery_is_resolved(status));
-    assert!(status.availability_interruptions >= 1);
+    assert!(status.mutation_resume_generation != 0 || status.availability_interruptions >= 1);
     assert!(
         status.availability_interruptions
             <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
     );
-    assert!(status.max_consecutive_availability_interruptions >= 1);
+    assert!(
+        status.mutation_resume_generation != 0
+            || status.max_consecutive_availability_interruptions >= 1
+    );
     assert!(status.last_record_fence >= 1);
+    assert!(status.last_generation > status.mutation_resume_generation);
+    assert!(status.last_record_fence > status.mutation_resume_record_fence);
     assert!(status.watch_entries >= 1);
     assert!(status.watch_applied_records >= 1);
     assert!(matches!(status.watch_traffic_generations.len(), 3 | 5));
@@ -1160,7 +1275,7 @@ impl TestPki {
 }
 
 enum ReaderMessage {
-    Reply(QualificationNodeReply),
+    Reply(Box<QualificationNodeReply>),
     Invalid,
 }
 
@@ -1172,6 +1287,7 @@ enum PendingCommandKind {
     Probe,
     ProjectedSourceStatus,
     MaterialStatus,
+    ReauthenticationGeneration,
     RequestReauthentication,
     DirectedHandshake,
     LifecycleMetrics,
@@ -1198,6 +1314,9 @@ impl PendingCommandKind {
             QualificationNodeCommand::Probe => Self::Probe,
             QualificationNodeCommand::ProjectedSourceStatus => Self::ProjectedSourceStatus,
             QualificationNodeCommand::MaterialStatus => Self::MaterialStatus,
+            QualificationNodeCommand::ReauthenticationGeneration => {
+                Self::ReauthenticationGeneration
+            }
             QualificationNodeCommand::RequestReauthentication => Self::RequestReauthentication,
             QualificationNodeCommand::DirectedHandshake { .. } => Self::DirectedHandshake,
             QualificationNodeCommand::LifecycleMetrics => Self::LifecycleMetrics,
@@ -1316,7 +1435,7 @@ impl ChildNode {
                 let mut stdout = BufReader::new(stdout);
                 loop {
                     let message = match read_bounded_json_line(&mut stdout) {
-                        Ok(Some(reply)) => ReaderMessage::Reply(reply),
+                        Ok(Some(reply)) => ReaderMessage::Reply(Box::new(reply)),
                         Ok(None) => break,
                         Err(_) => ReaderMessage::Invalid,
                     };
@@ -1383,7 +1502,7 @@ impl ChildNode {
         match self.replies.recv_timeout(CHILD_TIMEOUT) {
             Ok(ReaderMessage::Reply(reply)) => {
                 self.pending = None;
-                reply
+                *reply
             }
             Ok(ReaderMessage::Invalid) => {
                 self.fail_response(ChildResponseFailure::Invalid, pending)
@@ -1784,25 +1903,20 @@ impl Fleet {
         ));
     }
 
-    fn restart_node_at_manifest_address(&mut self, node_index: usize) {
-        let all_node_indices = (0..self.member_count()).collect::<Vec<_>>();
-        let survivor_indices = all_node_indices
-            .iter()
-            .copied()
-            .filter(|candidate| *candidate != node_index)
-            .collect::<Vec<_>>();
-        let readiness_before = self.readiness_reports(&all_node_indices);
-        let progress_before = readiness_before
-            .iter()
-            .map(|report| (report.committed_index, report.applied_index))
-            .collect::<Vec<_>>();
-        let traffic_before = self.traffic_statuses_on(&survivor_indices);
-        let source_before = self.projected_status(node_index);
-        let material_before = self.material_status(node_index);
+    fn kill_node_unclean(&mut self, node_index: usize) -> (SocketAddr, u32) {
         let expected_address = self.members[node_index].dial_addr;
         let previous_process_id = self.nodes[node_index].process_id();
         self.nodes[node_index].kill_unclean();
         wait_for_bind_address_release(expected_address);
+        (expected_address, previous_process_id)
+    }
+
+    fn spawn_node_at_manifest_address(
+        &mut self,
+        node_index: usize,
+        expected_address: SocketAddr,
+        previous_process_id: u32,
+    ) {
         let (node, actual_address) = ChildNode::spawn_bound(
             &self.config_paths[node_index],
             node_index,
@@ -1828,6 +1942,25 @@ impl Fleet {
                 availability: QualificationConsensusRpcAvailability::Available,
             }
         ));
+    }
+
+    fn restart_node_at_manifest_address(&mut self, node_index: usize) {
+        let all_node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        let survivor_indices = all_node_indices
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != node_index)
+            .collect::<Vec<_>>();
+        let readiness_before = self.readiness_reports(&all_node_indices);
+        let progress_before = readiness_before
+            .iter()
+            .map(|report| (report.committed_index, report.applied_index))
+            .collect::<Vec<_>>();
+        let traffic_before = self.traffic_statuses_on(&survivor_indices);
+        let source_before = self.projected_status(node_index);
+        let material_before = self.material_status(node_index);
+        let (expected_address, previous_process_id) = self.kill_node_unclean(node_index);
+        self.spawn_node_at_manifest_address(node_index, expected_address, previous_process_id);
         let source_after = self.projected_status(node_index);
         let material_after = self.material_status(node_index);
         let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
@@ -1875,6 +2008,163 @@ impl Fleet {
             }
             thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    fn restart_active_mutator_at_manifest_address(&mut self, node_index: usize) {
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+            "same-disk-exact-address-active-mutator/v1"
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
+            "committed-generation-does-not-rearm/v1"
+        );
+        assert_ne!(
+            node_index, 0,
+            "the fixed canary writer must survive restart"
+        );
+        let all_node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        let survivor_indices = all_node_indices
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != node_index)
+            .collect::<Vec<_>>();
+        let survivor_traffic =
+            TrafficParticipants::try_new(self.member_count(), &survivor_indices, &survivor_indices)
+                .expect("bounded active-restart survivor traffic participants");
+        let all_traffic =
+            TrafficParticipants::try_new(self.member_count(), &all_node_indices, &all_node_indices)
+                .expect("bounded active-restart full-fleet traffic participants");
+        let restart_deadline = Instant::now()
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS);
+
+        let pre_restart = self
+            .traffic_statuses_on(&[node_index])
+            .into_iter()
+            .next()
+            .expect("active restart traffic status");
+        assert_eq!(pre_restart.status.state, QualificationTrafficState::Running);
+        assert_eq!(pre_restart.status.owned_async_tasks, 2);
+        assert_eq!(pre_restart.status.failure, None);
+        assert_completed_traffic_cycles(&pre_restart.status);
+
+        let (expected_address, previous_process_id) = self.kill_node_unclean(node_index);
+        // Sample only after SIGKILL has completed and the exact manifest
+        // address is released. Every subsequent survivor delta is therefore
+        // committed while the selected process is actually absent.
+        let survivor_before = self.traffic_statuses_on(&survivor_indices);
+        self.advance_canary_for_survivors(node_index, "active-mutator-restart-outage");
+        let survivor_progress = self.wait_for_subset_traffic_progress_with_crashed_tail(
+            &survivor_before,
+            &survivor_traffic,
+            "active-mutator-restart-survivor-progress",
+            restart_deadline,
+            Some(node_index),
+        );
+        assert!(
+            deadline_allows_completion(Instant::now(), restart_deadline),
+            "survivor progress exceeded the active-mutator restart bound"
+        );
+
+        self.spawn_node_at_manifest_address(node_index, expected_address, previous_process_id);
+        loop {
+            let reports = self.readiness_reports(&all_node_indices);
+            let required_quorum = self.required_quorum();
+            if reports.iter().all(|report| {
+                report.ready
+                    && report.reason_code == QualificationReadinessCode::Ready
+                    && report.configured_voters == self.member_count()
+                    && report.fresh_reachable_voters == required_quorum
+                    && report.agreeing_voters == required_quorum
+                    && report.required_quorum == required_quorum
+            }) {
+                break;
+            }
+            assert!(
+                deadline_allows_completion(Instant::now(), restart_deadline),
+                "active-mutator restart did not regain all-voter readiness: reports={reports:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let reconciled = self.reconcile_traffic_watch_on(node_index);
+        assert!(
+            deadline_allows_completion(Instant::now(), restart_deadline),
+            "active-mutator journal reconciliation exceeded the restart bound"
+        );
+        assert_eq!(
+            reconciled.status.state,
+            QualificationTrafficState::WatchReady
+        );
+        assert!(
+            reconciled.status.mutation_resume_generation >= pre_restart.status.last_generation,
+            "restart lost an acknowledged committed generation"
+        );
+        assert!(
+            reconciled.status.mutation_resume_record_fence >= pre_restart.status.last_record_fence,
+            "restart regressed the committed record fence"
+        );
+        assert_eq!(
+            reconciled.status.last_generation,
+            reconciled.status.mutation_resume_generation
+        );
+        assert_eq!(
+            reconciled.status.last_record_fence,
+            reconciled.status.mutation_resume_record_fence
+        );
+        assert_eq!(
+            reconciled.status.watch_traffic_generations[node_index],
+            reconciled.status.mutation_resume_generation
+        );
+        for survivor in &survivor_progress {
+            assert!(
+                reconciled.status.watch_traffic_generations[survivor.node_index]
+                    >= survivor.status.last_generation,
+                "restarted watch did not catch up a survivor's outage mutation"
+            );
+        }
+
+        self.start_traffic_mutations_on(&[node_index]);
+        let resumed_before = self.traffic_statuses_on(&all_node_indices);
+        let resumed = self.wait_for_subset_traffic_progress(
+            &resumed_before,
+            &all_traffic,
+            "active-mutator-restart-higher-fence-progress",
+            restart_deadline,
+        );
+        let resumed_node = indexed_traffic_status(&resumed, node_index)
+            .expect("resumed active-mutator traffic status");
+        assert_eq!(
+            resumed_node.mutation_resume_generation,
+            reconciled.status.mutation_resume_generation
+        );
+        assert_eq!(
+            resumed_node.mutation_resume_record_fence,
+            reconciled.status.mutation_resume_record_fence
+        );
+        assert!(
+            resumed_node.last_generation > resumed_node.mutation_resume_generation,
+            "restarted mutator did not advance the exact committed generation"
+        );
+        assert!(
+            resumed_node.last_record_fence > resumed_node.mutation_resume_record_fence,
+            "restarted mutator did not write under strictly higher fencing authority"
+        );
+        assert_eq!(
+            (
+                resumed_node.availability_interruptions,
+                resumed_node.availability_recoveries,
+                resumed_node.max_consecutive_availability_interruptions,
+            ),
+            (0, 0, 0),
+            "a recovered committed generation rearmed the once-per-mutator synthetic response-loss fault"
+        );
+        assert!(
+            deadline_allows_completion(Instant::now(), restart_deadline),
+            "active-mutator recovery completed after its absolute catch-up bound"
+        );
+        self.verify_canary();
     }
 
     fn wait_ready(&mut self) {
@@ -2472,6 +2762,23 @@ impl Fleet {
         phase: &str,
         deadline: Instant,
     ) -> Vec<IndexedTrafficStatus> {
+        self.wait_for_subset_traffic_progress_with_crashed_tail(
+            before,
+            participants,
+            phase,
+            deadline,
+            None,
+        )
+    }
+
+    fn wait_for_subset_traffic_progress_with_crashed_tail(
+        &mut self,
+        before: &[IndexedTrafficStatus],
+        participants: &TrafficParticipants,
+        phase: &str,
+        deadline: Instant,
+        crashed_node_index: Option<usize>,
+    ) -> Vec<IndexedTrafficStatus> {
         assert_eq!(participants.member_count, self.member_count());
         assert!(traffic_status_snapshot_matches(before, participants));
         loop {
@@ -2482,15 +2789,26 @@ impl Fleet {
                 {
                     let all_node_indices = (0..self.member_count()).collect::<Vec<_>>();
                     let readiness = self.readiness_reports(&all_node_indices);
+                    let material = all_node_indices
+                        .iter()
+                        .map(|node_index| self.material_status(*node_index))
+                        .collect::<Vec<_>>();
+                    let lifecycle = self.all_lifecycle_metrics();
+                    let observed_at = Timestamp::now_utc();
                     panic!(
-                        "traffic task failed during {phase}: node={}, status={:?}, readiness={readiness:?}, stderr={}",
+                        "traffic task failed during {phase}: observed_at={observed_at:?}, node={}, status={:?}, readiness={readiness:?}, material={material:?}, lifecycle={lifecycle:?}, stderr={}",
                         indexed.node_index,
                         indexed.status,
                         self.node_stderr(indexed.node_index)
                     );
                 }
             }
-            if subset_traffic_made_semantic_progress(before, &after, participants) {
+            if subset_traffic_made_semantic_progress_with_crashed_tail(
+                before,
+                &after,
+                participants,
+                crashed_node_index,
+            ) {
                 assert!(
                     deadline_allows_completion(Instant::now(), deadline),
                     "subset traffic progressed only after the absolute deadline: phase={phase}, participants={participants:?}, before={before:?}, after={after:?}, stderr={:?}",
@@ -2501,6 +2819,63 @@ impl Fleet {
             assert!(
                 deadline_allows_completion(Instant::now(), deadline),
                 "subset traffic did not make semantic progress: phase={phase}, participants={participants:?}, before={before:?}, after={after:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_member_recovery_settlement(
+        &mut self,
+        participants: &TrafficParticipants,
+        phase: &str,
+        deadline: Instant,
+    ) -> (
+        Vec<QualificationConnectionLifecycleMetrics>,
+        Vec<IndexedTrafficStatus>,
+    ) {
+        assert_eq!(participants.member_count, self.member_count());
+        loop {
+            let traffic = self.traffic_statuses_on(&participants.observers);
+            // TrafficStatus performs a protected backend observation and may
+            // exercise consensus transport. Sample lifecycle only after those
+            // calls so a drain or classified failure they trigger cannot be
+            // hidden behind a stale pre-status snapshot.
+            let lifecycle = self.all_lifecycle_metrics();
+            for indexed in &traffic {
+                assert_ne!(
+                    indexed.status.state,
+                    QualificationTrafficState::Failed,
+                    "survivor traffic failed while settling recovered-member paths: phase={phase}, node={}, status={:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                    indexed.node_index,
+                    indexed.status,
+                    self.stderr_diagnostics()
+                );
+                assert_eq!(
+                    indexed.status.failure,
+                    None,
+                    "survivor traffic recorded a terminal failure while settling recovered-member paths: phase={phase}, node={}, status={:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                    indexed.node_index,
+                    indexed.status,
+                    self.stderr_diagnostics()
+                );
+            }
+            let completed = lifecycle
+                .iter()
+                .all(|metrics| lifecycle_transition_is_settled(metrics, self.member_count()))
+                && subset_traffic_availability_is_settled(&traffic, participants);
+            let now = Instant::now();
+            if completed {
+                assert!(
+                    deadline_allows_completion(now, deadline),
+                    "recovered-member lifecycle and survivor availability settled only after the absolute transition deadline: phase={phase}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                    self.stderr_diagnostics()
+                );
+                return (lifecycle, traffic);
+            }
+            assert!(
+                deadline_allows_completion(now, deadline),
+                "recovered-member lifecycle or survivor availability remained unsettled: phase={phase}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
                 self.stderr_diagnostics()
             );
             thread::sleep(Duration::from_millis(20));
@@ -3124,14 +3499,95 @@ impl Fleet {
         generations
     }
 
+    fn all_reauthentication_generations(&mut self) -> Vec<u64> {
+        for node in &mut self.nodes {
+            node.send(&QualificationNodeCommand::ReauthenticationGeneration);
+        }
+        self.nodes
+            .iter_mut()
+            .map(|node| match node.receive() {
+                QualificationNodeReply::ReauthenticationGeneration { generation } => generation,
+                reply => panic!("unexpected reauthentication generation response: {reply:?}"),
+            })
+            .collect()
+    }
+
     fn reauthenticate_and_prove_member_paths(&mut self, member: usize) {
         let generations = self.request_fleet_reauthentication();
-        let paths = (0..self.member_count())
-            .flat_map(|source| (0..self.member_count()).map(move |target| (source, target)))
-            .filter(|(source, target)| source != target && (*source == member || *target == member))
-            .collect::<Vec<_>>();
+        let paths = member_incident_directed_paths(self.member_count(), member);
         assert_eq!(paths.len(), 2 * (self.member_count() - 1));
         self.prove_directed_paths(&generations, paths);
+    }
+
+    fn reauthenticate_recovered_member_and_prove_paths(&mut self, member: usize) {
+        assert!(member < self.member_count());
+        let generations_before = self.all_reauthentication_generations();
+        let member_generation = match self.nodes[member]
+            .invoke(&QualificationNodeCommand::RequestReauthentication)
+        {
+            QualificationNodeReply::ReauthenticationRequested { generation } => generation,
+            reply => panic!(
+                "failed to request recovered-member reauthentication: member={member}, reply={reply:?}"
+            ),
+        };
+        assert_eq!(
+            generations_before[member].checked_add(1),
+            Some(member_generation),
+            "recovered-member reauthentication generation did not advance exactly once"
+        );
+
+        for (source, target) in member_incident_directed_paths(self.member_count(), member) {
+            let expected_generation = if source == member {
+                member_generation
+            } else {
+                // The hard-expiry checkpoint already proved every incident
+                // connection retired and fully drained. A successful
+                // survivor-to-member call after replacement therefore uses a
+                // new TLS/bootstrap connection even though that survivor's
+                // process-local explicit generation intentionally did not
+                // advance.
+                generations_before[source]
+            };
+            self.wait_for_directed_handshake(source, target, expected_generation);
+        }
+        let generations_after = self.all_reauthentication_generations();
+        assert!(
+            member_reauthentication_generations_are_scoped(
+                &generations_before,
+                &generations_after,
+                member,
+            ),
+            "member recovery advanced an unrelated survivor reauthentication generation: member={member}, before={generations_before:?}, after={generations_after:?}"
+        );
+    }
+
+    fn complete_recovered_member_phase_under_traffic(
+        &mut self,
+        member: usize,
+        participants: &TrafficParticipants,
+        phase: &str,
+    ) -> Vec<IndexedTrafficStatus> {
+        assert!(!participants.observers.contains(&member));
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(QUALIFICATION_TRAFFIC_TRANSITION_MILLIS);
+        let lifecycle_before = self.all_lifecycle_metrics();
+        self.assert_all_material_ready();
+        self.reauthenticate_recovered_member_and_prove_paths(member);
+        self.wait_ready();
+        self.advance_canary(phase);
+        let (lifecycle_after, traffic_after) =
+            self.wait_for_member_recovery_settlement(participants, phase, deadline);
+        assert_lifecycle_delta_bounds(self.member_count(), &lifecycle_before, &lifecycle_after, 0);
+        assert!(
+            unrelated_survivor_reauthentication_retirements_are_unchanged(
+                &lifecycle_before,
+                &lifecycle_after,
+                member,
+            ),
+            "member recovery retired unrelated survivor connections: member={member}, before={lifecycle_before:?}, after={lifecycle_after:?}"
+        );
+        assert_transition_completed_by(started, deadline, phase);
+        traffic_after
     }
 
     fn complete_fleet_phase(&mut self, phase: &str) {
@@ -4073,6 +4529,14 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         repair_traffic_deadline,
     );
 
+    // Exercise exactly one unclean, same-disk, exact-address restart while the
+    // selected follower owns an active mutation and watch task. The survivor
+    // majority must commit during the outage; the restarted process may resume
+    // only from its exact bounded journal plus linearizable record proof and
+    // must then mutate under a strictly higher fence.
+    let active_restart_node_index = fleet.stable_nonzero_follower();
+    fleet.restart_active_mutator_at_manifest_address(active_restart_node_index);
+
     // Publish a same-issuer leaf with a 75-second remaining-validity/expiry
     // budget to a stable nonzero follower, establish fresh authenticated paths,
     // and retain the PID so recovery can prove a same-process material
@@ -4277,13 +4741,19 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         expiring_process_id,
         "short-lived SVID recovery must reload material in the same process"
     );
-    fleet.complete_fleet_phase("short-lived-svid-replacement-recovered");
-    let replacement_traffic_after_boundary = fleet.traffic_statuses_on(&expiry_survivor_indices);
+    let replacement_traffic_after_boundary = fleet.complete_recovered_member_phase_under_traffic(
+        expiring_node_index,
+        &expiry_survivor_traffic,
+        "short-lived-svid-replacement-recovered",
+    );
     let replacement_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    let replacement_phase = format!(
+        "survivor-traffic-through-material-replacement/active-restart-{active_restart_node_index}/expiring-{expiring_node_index}"
+    );
     fleet.wait_for_subset_traffic_progress(
         &replacement_traffic_after_boundary,
         &expiry_survivor_traffic,
-        "survivor-traffic-through-material-replacement",
+        &replacement_phase,
         replacement_traffic_deadline,
     );
     let reconciled_expiring_watch = fleet.reconcile_traffic_watch_on(expiring_node_index);
@@ -4949,6 +5419,7 @@ fn traffic_status_fixture(member_count: usize) -> QualificationTrafficStatus {
         failure: None,
         failure_stage: None,
         failure_error_class: None,
+        failure_recovery_elapsed_millis: None,
         seed: 1,
         owned_async_tasks: 2,
         mutation_cycles: 10,
@@ -4960,6 +5431,8 @@ fn traffic_status_fixture(member_count: usize) -> QualificationTrafficStatus {
         max_consecutive_availability_interruptions: 1,
         complete_restore_scans: 11,
         durable_readiness_probes: 11,
+        mutation_resume_generation: 0,
+        mutation_resume_record_fence: 0,
         last_generation: 11,
         last_record_fence: 11,
         watch_entries: 10,
@@ -5077,6 +5550,72 @@ fn traffic_progress_rejects_unresolved_or_incoherent_availability_evidence() {
     assert!(!traffic_failure_fields_are_coherent(&incoherent));
     incoherent.failure_error_class = Some(QualificationTrafficErrorClass::BackendUnavailable);
     assert!(traffic_failure_fields_are_coherent(&incoherent));
+    incoherent.failure_recovery_elapsed_millis = Some(8_123);
+    assert!(!traffic_failure_fields_are_coherent(&incoherent));
+    incoherent.failure =
+        Some(QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded);
+    assert!(traffic_failure_fields_are_coherent(&incoherent));
+    incoherent.failure_recovery_elapsed_millis = None;
+    assert!(!traffic_failure_fields_are_coherent(&incoherent));
+}
+
+#[test]
+fn member_recovery_scope_preserves_unrelated_survivor_generations_and_retirements() {
+    let member = 1;
+    let generations_before = vec![4, 7, 9, 11, 13];
+    let mut generations_after = generations_before.clone();
+    generations_after[member] += 1;
+    assert!(member_reauthentication_generations_are_scoped(
+        &generations_before,
+        &generations_after,
+        member,
+    ));
+    generations_after[3] += 1;
+    assert!(!member_reauthentication_generations_are_scoped(
+        &generations_before,
+        &generations_after,
+        member,
+    ));
+
+    let paths = member_incident_directed_paths(5, member);
+    assert_eq!(paths.len(), 8);
+    assert!(paths
+        .iter()
+        .all(|(source, target)| { source != target && (*source == member || *target == member) }));
+    assert!(!paths
+        .iter()
+        .any(|(source, target)| *source == 0 && *target == 2));
+
+    let before = vec![lifecycle_metrics_fixture(); 5];
+    let mut after = before.clone();
+    after[member].retirement_explicit += 1;
+    after[member].retirement_material_epoch += 1;
+    assert!(
+        unrelated_survivor_reauthentication_retirements_are_unchanged(&before, &after, member,)
+    );
+    after[4].retirement_explicit += 1;
+    assert!(
+        !unrelated_survivor_reauthentication_retirements_are_unchanged(&before, &after, member,)
+    );
+}
+
+#[test]
+fn member_recovery_settlement_rejects_an_unresolved_survivor_episode() {
+    let (participants, _before, mut settled) = subset_traffic_fixture();
+    assert!(subset_traffic_availability_is_settled(
+        &settled,
+        &participants,
+    ));
+
+    settled[0].status.availability_interruptions += 1;
+    settled[0].status.max_consecutive_availability_interruptions += 1;
+    assert!(traffic_live_mutator_counters_are_consistent(
+        &settled[0].status
+    ));
+    assert!(!subset_traffic_availability_is_settled(
+        &settled,
+        &participants,
+    ));
 }
 
 #[test]
@@ -5149,6 +5688,71 @@ fn subset_traffic_fixture() -> (
         });
     }
     (participants, before, after)
+}
+
+#[test]
+fn restarted_mutator_counters_are_relative_to_exact_committed_resume_state() {
+    let mut resumed = traffic_status_fixture(3);
+    resumed.mutation_resume_generation = 100;
+    resumed.mutation_resume_record_fence = 200;
+    resumed.last_generation = 111;
+    resumed.last_record_fence = 211;
+    resumed.availability_interruptions = 0;
+    resumed.availability_recoveries = 0;
+    resumed.max_consecutive_availability_interruptions = 0;
+    assert!(traffic_live_mutator_counters_are_consistent(&resumed));
+    assert_completed_traffic_cycles(&resumed);
+
+    let mut generation_regressed = resumed.clone();
+    generation_regressed.last_generation = 99;
+    assert!(!traffic_live_mutator_counters_are_consistent(
+        &generation_regressed
+    ));
+
+    let mut fence_regressed = resumed;
+    fence_regressed.last_record_fence = 199;
+    assert!(!traffic_live_mutator_counters_are_consistent(
+        &fence_regressed
+    ));
+}
+
+#[test]
+fn unclean_restart_allows_only_monotonic_crashed_process_tail() {
+    let (participants, mut before, mut after) = subset_traffic_fixture();
+    for status in &mut before {
+        status.status.watch_traffic_generations[2] = 10;
+    }
+    for status in &mut after {
+        status.status.watch_traffic_generations[2] = 10;
+    }
+    assert!(subset_traffic_made_semantic_progress_with_crashed_tail(
+        &before,
+        &after,
+        &participants,
+        Some(2),
+    ));
+
+    let mut committed_tail = after.clone();
+    for status in &mut committed_tail {
+        status.status.watch_traffic_generations[2] += 7;
+    }
+    assert!(subset_traffic_made_semantic_progress_with_crashed_tail(
+        &before,
+        &committed_tail,
+        &participants,
+        Some(2),
+    ));
+
+    let mut regressed_tail = after;
+    for status in &mut regressed_tail {
+        status.status.watch_traffic_generations[2] = 9;
+    }
+    assert!(!subset_traffic_made_semantic_progress_with_crashed_tail(
+        &before,
+        &regressed_tail,
+        &participants,
+        Some(2),
+    ));
 }
 
 #[test]

@@ -126,8 +126,15 @@ connections with every started drain completed, both projected source and TLS
 controller must report `Unavailable`/`LastGoodExpired`, the SVID expiry gauge
 must be zero, and exactly one SVID expiry outcome must be recorded. The
 survivors must remain durably ready and advance the encrypted canary. Publishing
-a valid long-lived leaf then restores every directed path, all-voter readiness,
-and canary progress without changing that process's PID.
+a valid long-lived leaf then advances only the recovered member's explicit
+reauthentication generation, proves a fresh resolver/TLS/bootstrap path in both
+directions on every edge incident to that member, and restores all-voter
+readiness and canary progress without changing that process's PID. Unrelated
+survivors must not record an explicit or local-material-epoch retirement from
+this member-only recovery. The harness waits for every lifecycle drain and
+every still-live survivor availability episode to settle before it captures
+the next traffic baseline. The private schedule binds this procedure as
+`member-scoped-reauth-settled-baseline/v1`.
 
 These controls are qualification-only. Consensus-RPC admission loss is not a
 real or deployed network partition. The cases keep bounded mixed lease/CAS
@@ -145,10 +152,19 @@ release response
 per mutator to exercise that path, and is bound to eight outcomes per node, 8
 seconds per episode, and a fixed 50 ms retry delay; all three bounds and the
 total/recovered/consecutive counters are schedule evidence. Phase completion
-requires every interruption to be reconciled. Lease loss, unexpected state, and invariant
-failures remain terminal. The exact-address restarted member is watcher-only before exit and
-joins the mutator set only after bounded journal reconciliation, so
-active-mutator crash/restart is not qualified. They do not provide a broader
+requires every interruption to be reconciled. A committed generation recovered
+after process restart does not rearm that once-per-logical-mutator synthetic
+fault. Lease loss, unexpected state, and invariant failures remain terminal.
+After repairing malformed material,
+the campaign performs exactly one unclean restart of a stable follower while
+its mutation and watch tasks are active. Survivors advance the encrypted
+canary and mixed workload during the outage. The same-disk, exact-address
+process must then reconcile at most 262,144 committed journal entries, prove
+the exact latest generation/owner/fence/payload with a linearizable read, catch
+its watch up without a gap, and resume mutation at a strictly higher same-owner
+fence inside one absolute 26-second bound. Schedule v3 binds the count, bound, and
+`same-disk-exact-address-active-mutator/v1` profile so old results cannot
+masquerade as this evidence. This does not provide a broader
 restart/fault matrix, resource or soak qualification, remote-HKMS evidence,
 deployed-CNF evidence, signed release evidence, or a new
 evidence-schema/profile claim. They change neither Openraft's sole commit
@@ -221,7 +237,7 @@ The workload schedule digest also binds the shared `opc-consensus` admission
 limit of eight in-flight proposal tasks per Openraft node. Those slots bound
 task/memory pipelines; they create no additional connection, socket, or FD
 allowance, so the transport resource formulas above remain unchanged. Its
-versioned v2 input also binds the 10-second operation timeout, 45-second child
+versioned v3 input also binds the 10-second operation timeout, 45-second child
 response envelope, 30-second mutation-shutdown SLO, 75-second short-lived SVID
 budget, one-second
 pre-soft traffic-stop lead, and
@@ -235,6 +251,12 @@ the last successfully proven linearizable replication head and perform no new
 backend operation after joining their owned task. Normal status commands remain
 authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
+
+Schedule v3 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
+recovery operation finishes after its fixed deadline, the campaign remains
+failed and reports only the closed deadline code, the terminal operation stage,
+and elapsed milliseconds. It does not replace the failure with the earlier
+ambiguous outcome or expose backend text, peer/session identity, or payload.
 
 `qualification/v1/session-mtls-candidate-evidence.schema.json` deliberately
 requires `experimental = true`, `qualification_complete = false`,

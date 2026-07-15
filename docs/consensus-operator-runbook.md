@@ -382,11 +382,19 @@ The private
 schedule drops one successful release response per mutator to prove this path.
 More than eight such outcomes per node, any recovery episode beyond 8 seconds,
 any retry before the fixed 50 ms delay, or phase completion with an unresolved
-interruption fails the campaign; lease loss, unexpected state, and invariant
-failures are never masked. The
-exact-address restarted member is watcher-only before exit and joins the
-mutator set only after bounded journal reconciliation, so active-mutator
-crash/restart is not qualified. A broader restart/fault matrix, resource/soak,
+interruption fails the campaign. A terminal operation observed after that
+deadline reports the closed operation stage and elapsed milliseconds and stays
+failed; raw backend text and identity-bearing values do not enter the control
+protocol. A restarted process that recovers a committed
+generation does not rearm that once-per-logical-mutator fault; lease loss, unexpected state, and invariant
+failures are never masked. After malformed-material repair, exactly one stable
+follower is killed uncleanly with active mutation and watch tasks. Survivor
+commits must advance during the outage, and the same-disk, exact-address
+restart must reconcile the bounded committed journal, prove the exact current
+record, catch its watch up, and resume under a strictly higher same-owner fence
+inside 26 seconds. Schedule v3 binds this one
+`same-disk-exact-address-active-mutator/v1` scenario. A broader restart/fault
+matrix, resource/soak,
 remote-HKMS, deployed-CNF, signed release, and evidence-schema/profile results
 remain open. This does not alter the runbook's executable CNF campaign or
 alarms. Openraft remains the sole commit authority, and payload encryption,
@@ -3125,8 +3133,9 @@ checks.
 mechanism. The single-host multi-process campaigns now cover trust
 overlap/removal plus the exact synthetic fault/expiry recovery slice described
 above. #164/#143 still gate production claims on deployed trust/root cutover,
-real network/storage partition, broader restart/fault behavior including
-active-mutator crash/restart, deployed mixed traffic/watch/restore under those
+real network/storage partition, broader restart/fault behavior beyond the one
+bounded same-disk active-mutator scenario, deployed mixed
+traffic/watch/restore under those
 real faults, reconnect storms, resource/soak, remote HKMS, deployed CNF, and
 signed release evidence. These semantics do not provide production fleet
 qualification or close either issue.

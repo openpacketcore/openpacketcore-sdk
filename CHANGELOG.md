@@ -33,8 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `expiry - 30 seconds` soft boundary, then requires retirement, complete
   hard-deadline drain, source/controller `LastGoodExpired`, a zero SVID-expiry
   gauge, one expiry outcome, survivor readiness, and encrypted-canary progress.
-  A valid long-lived leaf restores every directed path and all-voter readiness
-  in the same process. Deterministic encrypted lease/renew/CAS/read/complete-
+  A valid long-lived leaf advances only the recovered process's explicit
+  reauthentication generation, restores fresh bidirectional proofs for every
+  path incident to that member, and restores all-voter readiness in the same
+  process. Unrelated survivor explicit/material-epoch retirement counters must
+  not advance. The next workload phase starts only after every connection
+  drain has settled and every still-live survivor availability episode is
+  resolved, so work already recovering during replacement cannot be attributed
+  to the following checkpoint. Schedule v3 binds this as
+  `member-scoped-reauth-settled-baseline/v1`. Deterministic encrypted
+  lease/renew/CAS/read/complete-
   restore/readiness mutations and applied-state watches run through admission
   loss, retained-last-good trust, exact-address restart, repair, and the
   short-lived publication. The expiring member drains its accepted mutation
@@ -53,10 +61,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this path, permits at most eight such outcomes per node, gives each recovery
   episode 8 seconds, retries only after a fixed 50 ms delay, and exposes total,
   recovered, and maximum-consecutive counters. Phase completion requires every
-  interruption to be reconciled; lease loss, unexpected state, and invariant
-  failures still fail immediately. The exact-address
-  restarted member is watcher-only before exit and enters the mutator set only
-  after that reconciliation, so active-mutator crash/restart is not qualified.
+  interruption to be reconciled; a resumed committed generation does not rearm
+  that once-per-logical-mutator synthetic fault. Lease loss, unexpected state,
+  and invariant failures still fail immediately. After malformed-material repair, exactly
+  one stable follower is killed uncleanly while its mutation and watch tasks
+  are active. The survivor majority advances both the encrypted canary and
+  mixed traffic during the outage. Inside one absolute 26-second bound the
+  member restarts from the same disk and manifest address, reconciles at most
+  262,144 exact journal entries, proves its latest generation, owner, fence,
+  and payload through a linearizable read, catches its watch up without a gap,
+  and resumes mutation only after same-owner acquire returns a strictly higher
+  fence. Schedule v3 binds this as
+  `same-disk-exact-address-active-mutator/v1`, including the count and bound, so
+  earlier evidence cannot satisfy the new assertions. Recovery operations that
+  finish after the unchanged 8-second episode deadline now fail with a closed
+  terminal-stage plus elapsed-millisecond diagnostic rather than preserving an
+  earlier ambiguous error that hides where the overrun occurred; schedule v3
+  binds this as `terminal-stage-elapsed-millis/v1`.
   These are synthetic regression scenarios, not a real or deployed network
   partition, and provide no broader restart/fault matrix, resource/soak,
   remote-HKMS, deployed-CNF, signed-release, evidence-schema, or profile claim.
@@ -166,9 +187,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expiring member stops before soft retirement while survivors continue
   through hard expiry and the stopped watch reconciles after replacement. It
   does not cover a real network partition or a broader restart/fault matrix.
-  The exact-address restarted member is watcher-only before exit and joins the
-  mutator set only after bounded journal reconciliation, so active-mutator
-  crash/restart remains unqualified.
+  It now covers exactly one same-disk, exact-address unclean active-mutator
+  restart with bounded journal/record reconciliation and higher-fence resume;
+  this is not a broader process, host, storage, or deployed restart matrix.
   Resource/soak, remote-HKMS, deployed-CNF,
   supported-platform, and signed candidate evidence remain open under
   #164/#158/#143. Session payload encryption, AAD, key-provider/HKMS

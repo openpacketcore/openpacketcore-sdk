@@ -42,10 +42,16 @@ without minting unnecessary fencing authority. Evidence binds this routing as
 `stage-aware-known-authority/v1`. The fixed
 schedule drops one successful release response per mutator, allows eight
 outcomes per node, 8 seconds per recovery episode, and a 50 ms retry delay;
-phase completion requires every interruption to be reconciled. Lease loss,
-unexpected state, and invariant failures fail closed. The exact-address restarted
-member is watcher-only before exit and joins the mutator set only after bounded
-journal reconciliation, so active-mutator crash/restart remains unqualified.
+phase completion requires every interruption to be reconciled. Recovering a
+committed generation does not rearm the once-per-logical-mutator injection. Lease loss,
+unexpected state, and invariant failures fail closed. One additional
+schedule-v3 phase kills a stable follower uncleanly while its mutation and
+watch tasks are active. Survivors advance committed canary and mixed traffic;
+the same-disk, exact-address restart must reconcile a bounded gap-free journal,
+prove the exact generation/owner/fence/payload, and resume at a strictly higher
+same-owner fence inside 26 seconds. This qualifies only the versioned
+`same-disk-exact-address-active-mutator/v1` scenario, not a broader restart
+matrix.
 The tests do not cover deployed partitions, a broader restart/fault matrix,
 resource/soak, remote HKMS, deployed CNFs, or signed release evidence. Generic
 CRL/OCSP/denylist revocation is not implemented.
@@ -1283,10 +1289,12 @@ same-issuer leaf with a 75-second remaining-validity/expiry budget through the
 `LastGoodExpired`, survivor durable readiness and
 encrypted-canary progress, and same-process valid replacement while bounded
 mixed lease/CAS mutation, linearizable-read, watch, complete-restore,
-readiness, and connection-recycling traffic remains active. The exact-address
-restarted member is watcher-only before exit and joins the mutator set only
-after bounded journal reconciliation; active-mutator crash/restart, a
-real/deployed partition, a broader restart/fault matrix, resource/soak,
+readiness, and connection-recycling traffic remains active. After repair, one
+stable follower is also killed uncleanly with active mutation/watch tasks;
+survivors commit during the outage and its same-disk, exact-address restart
+must reconcile the exact record/watch state and resume at a higher fence inside
+26 seconds. Other active-mutator restart patterns, a real/deployed partition, a
+broader restart/fault matrix, resource/soak,
 remote-HKMS, deployed-CNF, signed release, and evidence-schema/profile claims
 remain unqualified. Generic
 CRL/OCSP/certificate-or-identity-denylist revocation is not implemented. #177 removes
@@ -1804,7 +1812,12 @@ fencing.
   repair. They separately drive a same-issuer leaf with a 75-second
   remaining-validity/expiry budget through its fixed 30-second soft-retirement
   window, hard drain, `LastGoodExpired`,
-  survivor progress, and same-process valid replacement.
+  survivor progress, and same-process valid replacement. Replacement advances
+  only the recovered member's explicit reauthentication generation, proves
+  fresh bidirectional mTLS/bootstrap paths on every incident edge, leaves
+  unrelated survivor explicit/material-epoch retirement counters unchanged,
+  and settles all lifecycle drains plus survivor availability episodes before
+  the next traffic baseline.
 
 Run those two exact cases serially:
 

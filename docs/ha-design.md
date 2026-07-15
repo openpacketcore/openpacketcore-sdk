@@ -767,8 +767,10 @@ remains `experimental` and `qualification_complete = false`. A single-host
 three- and five-process component core now exercises atomic projected-SVID
 trust/leaf/intermediate/root rotation and rollback with production lifecycle
 defaults, affected-path reauthentication, all-path fleet cutovers, durable
-canaries, and stale old-root client rejection. It is not deployed Kubernetes
-or independent release evidence. Crash-point/partition and expiry matrices,
+canaries, stale old-root client rejection, and one bounded same-disk,
+exact-address unclean active-mutator restart with survivor progress, exact
+journal/record catch-up, and higher-fence resume. It is not deployed Kubernetes
+or independent release evidence. Broader crash-point/partition/restart and expiry matrices,
 concurrent batch/watch/restore histories, drain/reconnect deadlines, resource
 limits, soak, production payload-key operation, supported platforms, and signed
 candidate-release evidence remain under #164/#143 and related gates.

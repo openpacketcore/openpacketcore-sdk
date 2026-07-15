@@ -145,6 +145,17 @@ pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS: u64 = 50;
 /// exercises same-owner recovery after one successful lease release.
 pub const QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE: &str =
     "post-release-response-loss/v1";
+/// Process-restart policy for the qualification-only synthetic interruption.
+/// A recovered committed mutation generation proves the logical mutator
+/// already passed its first release checkpoint, so restart must not inject the
+/// once-per-mutator fault again.
+pub const QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE: &str =
+    "committed-generation-does-not-rearm/v1";
+/// Versioned terminal recovery-deadline diagnostic bound into the schedule.
+/// The fixed code, terminal operation stage, and elapsed milliseconds expose
+/// an overrun without forwarding backend or identity-bearing error text.
+pub const QUALIFICATION_TRAFFIC_RECOVERY_DEADLINE_DIAGNOSTIC_PROFILE: &str =
+    "terminal-stage-elapsed-millis/v1";
 /// Versioned authority reconciliation algorithm bound into the schedule.
 pub const QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE: &str =
     "stage-aware-known-authority/v1";
@@ -157,6 +168,22 @@ pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES: usize =
     MAX_REPLICATION_LOG_PAGE_ENTRIES;
 /// Versioned stopped-watch reconciliation algorithm bound into the schedule.
 pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE: &str = "bounded-durable-journal/v1";
+/// Versioned unclean restart scenario covered by the projected-mTLS fault
+/// campaign. This is one same-disk, exact-address active-mutator restart, not
+/// a deployed host or network-partition matrix.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE: &str =
+    "same-disk-exact-address-active-mutator/v1";
+/// Absolute bound from process termination through survivor progress,
+/// same-address restart, durable catch-up, journal reconciliation, and a
+/// strictly higher-fence mutation by the restarted member.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Versioned post-expiry recovery proof. Only the recovered member advances
+/// explicit reauthentication, every incident directed path is reproved, and
+/// lifecycle plus survivor availability settle before the next baseline.
+pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE: &str =
+    "member-scoped-reauth-settled-baseline/v1";
 /// Exact operation timeout pinned by the experimental profile.
 pub const QUALIFICATION_OPERATION_TIMEOUT_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
@@ -633,7 +660,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v2\n",
+            "opc-session-ha/traffic-resource/v3\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -667,10 +694,16 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "availability_retry_millis={}\n",
             "authority_reconciliation_profile={}\n",
             "synthetic_interruption_profile={}\n",
+            "synthetic_interruption_restart_profile={}\n",
+            "recovery_deadline_diagnostic_profile={}\n",
             "watch_reconciliation_millis={}\n",
             "watch_reconciliation_max_entries={}\n",
             "watch_reconciliation_page_entries={}\n",
             "watch_reconciliation_profile={}\n",
+            "unclean_restart_count=1\n",
+            "unclean_restart_profile={}\n",
+            "unclean_restart_catchup_millis={}\n",
+            "member_recovery_profile={}\n",
             "operation_timeout_millis={}\n",
             "child_response_timeout_millis={}\n",
             "fault_expiry_validity_millis={}\n",
@@ -712,10 +745,15 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
         QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE,
         QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
+        QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
+        QUALIFICATION_TRAFFIC_RECOVERY_DEADLINE_DIAGNOSTIC_PROFILE,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
+        QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
         QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
         QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
         QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
@@ -816,6 +854,8 @@ pub enum QualificationNodeCommand {
     Probe,
     ProjectedSourceStatus,
     MaterialStatus,
+    /// Return the process-local connection reauthentication generation.
+    ReauthenticationGeneration,
     RequestReauthentication,
     /// Prove one fresh authenticated TLS connection and exact manifest-bound
     /// consensus bootstrap to a configured remote node.
@@ -884,6 +924,9 @@ impl fmt::Debug for QualificationNodeCommand {
                 formatter.write_str("QualificationNodeCommand::ProjectedSourceStatus")
             }
             Self::MaterialStatus => formatter.write_str("QualificationNodeCommand::MaterialStatus"),
+            Self::ReauthenticationGeneration => {
+                formatter.write_str("QualificationNodeCommand::ReauthenticationGeneration")
+            }
             Self::RequestReauthentication => {
                 formatter.write_str("QualificationNodeCommand::RequestReauthentication")
             }
@@ -939,6 +982,7 @@ impl QualificationNodeCommand {
             | Self::Probe
             | Self::ProjectedSourceStatus
             | Self::MaterialStatus
+            | Self::ReauthenticationGeneration
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
             | Self::SetConsensusRpcAvailability { .. }
@@ -1065,6 +1109,9 @@ pub enum QualificationNodeReply {
     },
     MaterialStatus {
         status: QualificationTlsMaterialStatus,
+    },
+    ReauthenticationGeneration {
+        generation: u64,
     },
     ReauthenticationRequested {
         generation: u64,
@@ -1423,6 +1470,7 @@ pub enum QualificationTrafficFailureCode {
     WatchUnavailable,
     RestoreScanRejected,
     ReadinessUnavailable,
+    AvailabilityRecoveryDeadlineExceeded,
     InvariantViolation,
     TaskJoinUnavailable,
 }
@@ -1474,6 +1522,11 @@ pub struct QualificationTrafficStatus {
     pub failure: Option<QualificationTrafficFailureCode>,
     pub failure_stage: Option<QualificationTrafficFailureStage>,
     pub failure_error_class: Option<QualificationTrafficErrorClass>,
+    /// Elapsed milliseconds from the start of a bounded availability-recovery
+    /// episode when `failure` is `availability_recovery_deadline_exceeded`.
+    /// Other failures report no value. This duration is identity-free and
+    /// never contains backend error text.
+    pub failure_recovery_elapsed_millis: Option<u64>,
     pub seed: u64,
     pub owned_async_tasks: u8,
     pub mutation_cycles: u64,
@@ -1494,6 +1547,14 @@ pub struct QualificationTrafficStatus {
     pub max_consecutive_availability_interruptions: u64,
     pub complete_restore_scans: u64,
     pub durable_readiness_probes: u64,
+    /// Exact committed generation recovered before a restarted mutation task
+    /// is admitted. Zero means this process did not resume prior mutation
+    /// state.
+    pub mutation_resume_generation: u64,
+    /// Exact committed record fence recovered with
+    /// `mutation_resume_generation`. A resumed mutation must acquire and write
+    /// under a strictly higher fence.
+    pub mutation_resume_record_fence: u64,
     pub last_generation: u64,
     pub last_record_fence: u64,
     pub watch_entries: u64,
@@ -1821,6 +1882,10 @@ mod tests {
             QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
             "post-release-response-loss/v1"
         );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
+            "committed-generation-does-not-rearm/v1"
+        );
         assert_eq!(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS, 25_000);
         assert_eq!(
             QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES,
@@ -1833,6 +1898,15 @@ mod tests {
         assert_eq!(
             QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE,
             "bounded-durable-journal/v1"
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+            "same-disk-exact-address-active-mutator/v1"
+        );
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS, 26_000);
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
+            "member-scoped-reauth-settled-baseline/v1"
         );
         assert_eq!(
             qualification_traffic_seed(3),
@@ -1848,8 +1922,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:5feb47397403db27b62de56aca1c8528e5ec694df6dcf8a6edf2300b9b466199",
-                "sha256:e2770f91efa46e0d0cfad66e24cb89bc4af7c9643fb2087c0f70cd675a03a4d6",
+                "sha256:ee8869ed40794daa515d946ffd00b54aa59edcd15831647f7823b646a96095b1",
+                "sha256:439fd4a1a50b6143348f3260913d115134f7a420aea96e6bbf02624a9b8ccc76",
             )
         );
         assert!(is_exact_sha256(&three));
@@ -1863,6 +1937,7 @@ mod tests {
                 failure: None,
                 failure_stage: None,
                 failure_error_class: None,
+                failure_recovery_elapsed_millis: None,
                 seed: QUALIFICATION_TRAFFIC_SEED_BASE ^ 3,
                 owned_async_tasks: 2,
                 mutation_cycles: 7,
@@ -1874,6 +1949,8 @@ mod tests {
                 max_consecutive_availability_interruptions: 1,
                 complete_restore_scans: 7,
                 durable_readiness_probes: 7,
+                mutation_resume_generation: 0,
+                mutation_resume_record_fence: 0,
                 last_generation: 7,
                 last_record_fence: 8,
                 watch_entries: 43,

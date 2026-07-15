@@ -404,9 +404,15 @@ immutable v1 candidate schema and the broader profile deliberately retain
 `counts_for_seamless_tls_rotation = false` and `qualification_complete = false`.
 The non-ignored single-host 3/5-process slice now covers one unavailable member
 plus a different member's malformed retained-last-good reload, short-lived-SVID
-expiry/hard drain, exact-address watcher restart/catch-up, and bounded mixed
-mutation/read/watch/restore/readiness traffic. Real network/storage partitions,
-active-mutator crash/restart, broader fault and reconnect-storm matrices,
+expiry/hard drain, exact-address watcher restart/catch-up, one unclean
+same-disk active-mutator restart with survivor commits and higher-fence resume,
+and bounded mixed mutation/read/watch/restore/readiness traffic. The valid
+post-expiry replacement advances only the recovered member's explicit
+reauthentication generation, proves fresh bidirectional incident paths, leaves
+unrelated survivor explicit/material-epoch retirement counters unchanged, and
+settles lifecycle plus survivor availability before the next phase baseline. Real
+network/storage partitions, broader active-mutator restart, fault, and
+reconnect-storm matrices,
 deployed resource/soak, remote-HKMS, deployed-network, and signed independent
 evidence remain open under #164/#143.
 #159 implements ordinary
