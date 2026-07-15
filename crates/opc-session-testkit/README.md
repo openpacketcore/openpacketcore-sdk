@@ -194,14 +194,23 @@ canary and mixed workload during the outage. The same-disk, exact-address
 process must then reconcile at most 262,144 committed journal entries, prove
 the exact latest generation/owner/fence/payload with a linearizable read, catch
 its watch up without a gap, and resume mutation at a strictly higher same-owner
-fence inside one absolute 26-second bound. Schedule v3 binds the count, bound, and
-`same-disk-exact-address-active-mutator/v1` profile so old results cannot
-masquerade as this evidence. This does not provide a broader
+fence under the `same-disk-exact-address-active-mutator/v2` stage-bounded
+profile. Its independent bounds are 5 seconds for termination/reaping, 26
+seconds for outage/survivor progress, 45 seconds for replacement-child startup,
+26 seconds for Openraft readiness/catch-up, 25 seconds for journal
+reconciliation, and 26 seconds for higher-fence mutation resume. Those
+sequential stages compose to a 153-second crash-to-resume ceiling; each stage
+still fails at its own bound and cannot borrow from the total. Schedule v4
+binds the count, profile, six bounds, and total so old results cannot masquerade
+as this evidence. This fixes the under-composed v1 qualification deadline that
+incorrectly placed all six stages inside one 26-second clock. This scenario
+does not provide a broader
 restart/fault matrix, resource or soak qualification, remote-HKMS evidence,
-deployed-CNF evidence, signed release evidence, or a new
-evidence-schema/profile claim. They change neither Openraft's sole commit
-authority nor payload encryption, AAD, key-provider/HKMS placement,
-SQLite/Openraft durable formats, or encryption-at-rest responsibilities.
+deployed-CNF evidence, deployed production readiness, signed release evidence,
+or a new evidence-schema/production-profile claim. These cases change neither
+Openraft's sole commit authority nor payload encryption, AAD,
+key-provider/HKMS placement, SQLite/Openraft durable formats, or
+encryption-at-rest responsibilities.
 
 The deliberate stale-root negative probe is isolated to exactly one connection
 attempt: its qualification-only reconnect minimum and maximum equal the whole
@@ -292,7 +301,7 @@ backend operation after joining their owned task. Normal status commands remain
 authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
 
-Schedule v3 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
+Schedule v4 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
 recovery operation finishes after its fixed deadline, the campaign remains
 failed and reports only the closed deadline code, the terminal operation stage,
 and elapsed milliseconds. It does not replace the failure with the earlier

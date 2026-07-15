@@ -63,8 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bound: the ordinary 24/40 allowance plus at most fifteen five-second refresh
   rounds over the four/eight incident directed paths. Cancellation-classified
   `abandoned` outcomes, protocol/backend outcomes, and drain overruns remain
-  forbidden throughout the fault and clean intervals. Schedule v3 binds this as
-  `member-scoped-reauth-settled-baseline/v2`. Recovery continuity polls use a
+  forbidden throughout the fault and clean intervals. Schedule v4 retains the
+  `member-scoped-reauth-settled-baseline/v2` checkpoint first bound by Schedule
+  v3. Recovery continuity polls use a
   non-intrusive workload snapshot; authoritative watch-head settlement keeps
   the fail-closed linearizable head observation. Deterministic encrypted
   lease/renew/CAS/read/complete-
@@ -94,27 +95,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail immediately. Separately, after malformed-material repair, exactly one
   stable follower is killed uncleanly while its mutation and watch tasks are
   active. The survivor majority advances both the encrypted canary and mixed
-  traffic during the outage. Inside one absolute 26-second bound the member
-  restarts from the same disk and manifest address, reconciles at most 262,144
-  exact journal entries, proves its latest generation, owner, fence, and
-  payload through a linearizable read, catches its watch up without a gap, and
-  resumes mutation only after same-owner acquire returns a strictly higher
-  fence. Schedule v3 binds this as
-  `same-disk-exact-address-active-mutator/v1`, including the count and bound, so
-  earlier evidence cannot satisfy the new assertions. Recovery operations that
-  finish after the fixed 26-second episode deadline now fail with a closed
-  terminal-stage plus elapsed-millisecond diagnostic rather than preserving an
-  earlier ambiguous error that hides where the overrun occurred; schedule v3
-  binds this as `terminal-stage-elapsed-millis/v1`. A child that exits during
-  restart configuration now reports only the fixed `transport`, `sqlite`,
-  `consensus`, or `listener` startup stage; underlying errors, paths, and
-  identities remain redacted.
+  traffic during the outage. The corrected
+  `same-disk-exact-address-active-mutator/v2` profile checks six sequential
+  stages independently: termination and process reaping within 5 seconds,
+  outage/survivor progress within 26 seconds, replacement-child startup within
+  45 seconds, Openraft readiness/catch-up within 26 seconds, reconciliation of
+  at most 262,144 exact journal entries within 25 seconds, and mutation resume
+  under a strictly higher same-owner fence within 26 seconds. The composed
+  crash-to-resume ceiling is 153 seconds, but no stage may borrow unused time
+  from another stage or substitute that total for its own bound. Schedule v4
+  binds the scenario, count, six bounds, and total, so v1 evidence cannot
+  satisfy the new assertions. This corrects the under-composed v1
+  qualification deadline, which incorrectly charged termination, outage work,
+  startup, Raft catch-up, journal reconciliation, and higher-fence resume to
+  one 26-second clock. A stage that finishes after its fixed deadline fails
+  with a closed terminal-stage plus elapsed-millisecond diagnostic rather than
+  preserving an earlier ambiguous error that hides where the overrun occurred;
+  Schedule v4 binds this as `terminal-stage-elapsed-millis/v1`. A child that
+  exits during restart configuration now reports only the fixed `transport`,
+  `sqlite`, `consensus`, or `listener` startup stage; underlying errors, paths,
+  and identities remain redacted.
   These are synthetic regression scenarios, not a real or deployed network
-  partition, and provide no broader restart/fault matrix, resource/soak,
-  remote-HKMS, deployed-CNF, signed-release, evidence-schema, or profile claim.
-  Openraft remains the sole commit authority, and payload encryption, AAD,
-  key-provider/HKMS boundaries, SQLite/Openraft durable formats, and
-  encryption-at-rest responsibilities are unchanged.
+  partition, and do not prove deployed production readiness or provide a
+  broader restart/fault matrix, resource/soak,
+  remote-HKMS, deployed-CNF, signed-release, evidence-schema, or
+  production-profile claim. Openraft remains the sole commit authority, and
+  payload encryption, AAD, key-provider/HKMS boundaries, SQLite/Openraft
+  durable formats, and encryption-at-rest responsibilities are unchanged.
 - **Experimental projected-mTLS traffic/resource qualification —
   `opc-session-testkit`:** the real 3/5-process rotation harness now registers
   every encrypted applied-state watch before starting deterministic

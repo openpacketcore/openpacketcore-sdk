@@ -903,7 +903,16 @@ performs exactly one unclean same-disk, exact-address restart of a stable
 follower while that member's mutation and watch tasks are active. Survivors
 must advance committed canary and mixed traffic during the outage; the returned
 member must reconcile the exact bounded journal/current record and resume at a
-strictly higher same-owner fence inside 26 seconds. It then
+strictly higher same-owner fence. Schedule v4 binds
+`same-disk-exact-address-active-mutator/v2`. The independently checked stages
+are termination/reaping (5 seconds), outage/survivor progress (26 seconds),
+replacement-child startup (45 seconds), Openraft readiness/catch-up (26
+seconds), journal reconciliation (25 seconds), and higher-fence resume (26
+seconds). The composed crash-to-resume ceiling is 153 seconds; it is not a
+shared timer, and each stage fails at its own deadline. This corrects the
+under-composed v1 qualification deadline, which charged all six sequential
+stages to one 26-second clock, rather than relaxing any separate 26-second
+survivor-availability or operation-recovery SLO. It then
 publishes a same-issuer leaf with a 75-second remaining-validity/expiry budget.
 With the default 30-second drain window, its fixed soft-retirement boundary is
 `not_after - 30 seconds`: every incident directed path is refreshed below the
@@ -942,7 +951,8 @@ connection-recycling workload active, including exact journal reconciliation
 for both restart paths. They do not provide a broader restart/fault matrix,
 resource or soak evidence,
 remote-HKMS evidence, deployed-CNF evidence, signed release evidence, or an
-evidence-schema/profile claim. Openraft remains the sole commit authority;
+evidence-schema/production-profile claim, and do not prove deployed production
+readiness. Openraft remains the sole commit authority;
 payload encryption, AAD, key-provider/HKMS placement, SQLite/Openraft durable
 formats, and encryption-at-rest responsibilities do not change.
 

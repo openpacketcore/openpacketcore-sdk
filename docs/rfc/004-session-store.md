@@ -48,13 +48,20 @@ unexpected state, and invariant failures fail closed. The admission-loss
 exact-address restart is watcher-only before exit and joins the mutator set
 only after bounded journal reconciliation. Recovering a committed generation
 does not rearm the once-per-logical-mutator injection. One additional
-schedule-v3 phase kills a stable follower uncleanly while its mutation and
+schedule-v4 phase kills a stable follower uncleanly while its mutation and
 watch tasks are active. Survivors advance committed canary and mixed traffic;
 the same-disk, exact-address restart must reconcile a bounded gap-free journal,
 prove the exact generation/owner/fence/payload, and resume at a strictly higher
-same-owner fence inside 26 seconds. This qualifies only the versioned
-`same-disk-exact-address-active-mutator/v1` scenario, not a broader restart
-matrix.
+same-owner fence under the versioned
+`same-disk-exact-address-active-mutator/v2` profile. That profile independently
+bounds termination/reaping at 5 seconds, outage/survivor progress at 26
+seconds, replacement-child startup at 45 seconds, Openraft
+readiness/catch-up at 26 seconds, journal reconciliation at 25 seconds, and
+higher-fence mutation resume at 26 seconds. The sequential stages compose to a
+153-second crash-to-resume ceiling, but each stage fails at its own deadline.
+This corrects the under-composed v1 qualification clock, which charged all six
+stages to one 26-second deadline; it does not qualify a broader restart matrix
+or deployed production readiness.
 The tests do not cover deployed partitions, a broader restart/fault matrix,
 resource/soak, remote HKMS, deployed CNFs, or signed release evidence. Generic
 CRL/OCSP/denylist revocation is not implemented.
@@ -1295,11 +1302,13 @@ mixed lease/CAS mutation, linearizable-read, watch, complete-restore,
 readiness, and connection-recycling traffic remains active. After repair, one
 stable follower is also killed uncleanly with active mutation/watch tasks;
 survivors commit during the outage and its same-disk, exact-address restart
-must reconcile the exact record/watch state and resume at a higher fence inside
-26 seconds. Other active-mutator restart patterns, a real/deployed partition, a
-broader restart/fault matrix, resource/soak,
-remote-HKMS, deployed-CNF, signed release, and evidence-schema/profile claims
-remain unqualified. Generic
+must reconcile the exact record/watch state and resume at a higher fence under
+the v2 stage bounds described above. The six sequential stage bounds compose
+to a 153-second crash-to-resume ceiling; the total does not replace any
+individual stage deadline. Other active-mutator restart patterns, a
+real/deployed partition, a broader restart/fault matrix, resource/soak,
+remote-HKMS, deployed-CNF, signed release, and
+evidence-schema/production-profile claims remain unqualified. Generic
 CRL/OCSP/certificate-or-identity-denylist revocation is not implemented. #177 removes
 `opc-persist`'s separate config TCP
 path and reuses the shared consensus peer/handler boundary instead of defining
@@ -1865,7 +1874,10 @@ cargo test --locked -p opc-session-testkit --test qualification_mtls_multiproces
 ```
 
 They are synthetic regression evidence, not a deployed network partition or a
-production qualification. The bounded lease/CAS/read, watch, restore-scan,
+production qualification. The v2 stage correction does not relax Openraft's
+sole commit authority or change HKMS/provider placement, payload encryption,
+AAD, SQLite/Openraft durable formats, or encryption-at-rest responsibilities.
+The bounded lease/CAS/read, watch, restore-scan,
 readiness, and connection-recycling workload remains active throughout both
 cases, and a restarted watcher reconciles the exact committed journal prefix
 before resubscription.

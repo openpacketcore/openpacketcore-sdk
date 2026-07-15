@@ -177,13 +177,38 @@ pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE: &str = "bounded-du
 /// campaign. This is one same-disk, exact-address active-mutator restart, not
 /// a deployed host or network-partition matrix.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE: &str =
-    "same-disk-exact-address-active-mutator/v1";
-/// Absolute bound from process termination through survivor progress,
-/// same-address restart, durable catch-up, journal reconciliation, and a
-/// strictly higher-fence mutation by the restarted member.
+    "same-disk-exact-address-active-mutator/v2";
+/// Maximum time for SIGKILL and process reaping before the exact manifest
+/// address is reused.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS: u64 = 5_000;
+/// Maximum time for the survivor majority to commit and expose semantic
+/// traffic progress while the selected member is absent.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Maximum time for one replacement child to bind, open its durable state,
+/// initialize its existing membership, and enable its consensus RPC path.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS: u64 =
+    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS;
+/// Maximum time after replacement startup for Openraft to regain all-voter
+/// readiness and apply the committed state on the restarted member.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Maximum time after journal reconciliation for the restarted mutator to
+/// commit under a strictly higher same-owner fence.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Composed crash-to-resume ceiling. Each constituent stage is checked
+/// independently; this total must never be used as a substitute stage timer.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS: u64 =
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS
+        + QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS;
 /// Versioned post-expiry recovery proof. Fault-era attempt outcomes first
 /// settle beyond the complete server/connect/backoff horizon; only then does
 /// the recovered member advance explicit reauthentication, reprove every
@@ -712,7 +737,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v3\n",
+            "opc-session-ha/traffic-resource/v4\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -754,7 +779,12 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "watch_reconciliation_profile={}\n",
             "unclean_restart_count=1\n",
             "unclean_restart_profile={}\n",
+            "unclean_restart_termination_millis={}\n",
+            "unclean_restart_outage_millis={}\n",
+            "unclean_restart_startup_millis={}\n",
             "unclean_restart_catchup_millis={}\n",
+            "unclean_restart_resume_millis={}\n",
+            "unclean_restart_total_millis={}\n",
             "member_recovery_profile={}\n",
             "member_recovery_settlement_millis={}\n",
             "member_recovery_settlement_deadline_millis={}\n",
@@ -810,7 +840,12 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES,
         QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE,
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS,
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
@@ -2003,9 +2038,28 @@ mod tests {
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
-            "same-disk-exact-address-active-mutator/v1"
+            "same-disk-exact-address-active-mutator/v2"
         );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
+            5_000
+        );
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS, 26_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS, 45_000);
         assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS, 26_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS, 26_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS, 153_000);
+        const {
+            assert!(
+                QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS
+                    == QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS
+                        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS
+                        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS
+                        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS
+                        + QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS
+                        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS
+            );
+        }
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
             "member-scoped-reauth-settled-baseline/v2"
@@ -2040,8 +2094,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:c8e63f27d205a8ddd6dd71a3892fd2cef044db96cf5d6048003c0993d1c155d9",
-                "sha256:6201fa4a5d2d9c5c9f84266e62a12499c00d6dfd55f4dfd0e90d2229ed7a2092",
+                "sha256:5af6a9eb10a034fc5fedbbfc160be693b9c404aa86872d1f72db1bf6cb095d37",
+                "sha256:6d949427f1d5d459afa408424af5b6ee995f15945759f3f9b8a4be093d3f6ec3",
             )
         );
         assert!(is_exact_sha256(&three));

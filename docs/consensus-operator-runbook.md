@@ -413,14 +413,31 @@ exactly one stable follower is killed uncleanly with active mutation and watch
 tasks. Survivor commits must advance during the outage, and the same-disk,
 exact-address restart must reconcile the bounded committed journal, prove the
 exact current record, catch its watch up, and resume under a strictly higher
-same-owner fence inside 26 seconds. Schedule v3 binds this one
-`same-disk-exact-address-active-mutator/v1` scenario. A broader restart/fault
-matrix, resource/soak,
-remote-HKMS, deployed-CNF, signed release, and evidence-schema/profile results
-remain open. This does not alter the runbook's executable CNF campaign or
-alarms. Openraft remains the sole commit authority, and payload encryption,
-AAD, key-provider/HKMS placement, SQLite/Openraft durable formats, and
-encryption-at-rest responsibilities remain unchanged.
+same-owner fence. Schedule v4 binds this one
+`same-disk-exact-address-active-mutator/v2` profile and independently enforces
+the following stage deadlines:
+
+| Restart stage | Bound |
+| --- | ---: |
+| SIGKILL termination and process reaping | 5 seconds |
+| Outage work and survivor progress | 26 seconds |
+| Replacement-child startup | 45 seconds |
+| Openraft all-voter readiness and catch-up | 26 seconds |
+| Bounded journal reconciliation | 25 seconds |
+| Higher-fence mutation resume | 26 seconds |
+
+The sequential stages compose to a 153-second crash-to-resume ceiling. Each
+stage fails independently and cannot borrow unused time from another stage or
+use the total as its timer. This fixes an under-composed v1 qualification
+deadline that placed termination, outage work, startup, Raft catch-up, journal
+reconciliation, and higher-fence resume inside one 26-second clock. A broader
+restart/fault matrix, resource/soak, remote-HKMS, deployed-CNF, signed release,
+and evidence-schema/production-profile results remain open; the correction
+does not prove deployed production readiness. This does not alter the
+runbook's executable CNF campaign or alarms. Openraft remains the sole commit
+authority, and payload encryption, AAD, key-provider/HKMS placement,
+SQLite/Openraft durable formats, and encryption-at-rest responsibilities
+remain unchanged.
 
 ### 7.1 Required CNF wiring and signals
 

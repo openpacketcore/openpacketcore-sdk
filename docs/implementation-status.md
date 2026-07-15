@@ -423,7 +423,18 @@ refresh rounds over four/eight incident paths), and requires zero
 cancellation-classified `abandoned`, protocol/backend, or drain-overrun
 evidence. Recovery polling is
 non-intrusive; final watch-head settlement retains its fail-closed
-authoritative replication-head read. Real
+authoritative replication-head read. Schedule v4 now binds the active-mutator
+scenario as
+`same-disk-exact-address-active-mutator/v2`: independent 5-second termination,
+26-second outage/survivor-progress, 45-second startup, 26-second Openraft
+readiness/catch-up, 25-second journal-reconciliation, and 26-second
+higher-fence-resume deadlines compose to a 153-second crash-to-resume ceiling.
+Each stage fails independently; the total is not a shared timer. This fixes an
+under-composed v1 qualification deadline that charged all six stages to one
+26-second clock without changing the separate 26-second survivor-availability
+and operation-recovery SLOs. It does not change Openraft's sole commit
+authority, HKMS/provider placement, encryption, AAD, or durable formats, and it
+does not prove deployed production readiness. Real
 network/storage partitions, broader active-mutator restart, fault, and
 reconnect-storm matrices,
 deployed resource/soak, remote-HKMS, deployed-network, and signed independent

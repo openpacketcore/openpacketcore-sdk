@@ -65,7 +65,13 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND, QUALIFICATION_TRAFFIC_ROTATIONS_PER_MEMBER,
     QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
     QUALIFICATION_TRAFFIC_TRANSITION_MILLIS, QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
+    QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
 };
 use opc_types::Timestamp;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, SanType};
@@ -1754,6 +1760,22 @@ impl ChildNode {
         stderr_path: &Path,
         bind_addr: SocketAddr,
     ) -> (Self, SocketAddr) {
+        Self::spawn_bound_until(
+            config,
+            node_index,
+            stderr_path,
+            bind_addr,
+            Instant::now() + CHILD_TIMEOUT,
+        )
+    }
+
+    fn spawn_bound_until(
+        config: &Path,
+        node_index: usize,
+        stderr_path: &Path,
+        bind_addr: SocketAddr,
+        deadline: Instant,
+    ) -> (Self, SocketAddr) {
         let stderr = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1806,7 +1828,7 @@ impl ChildNode {
             }),
             next_command_sequence: 1,
         };
-        let reply = node.receive();
+        let reply = node.receive_until(deadline);
         let QualificationNodeReply::Bound {
             node_index: actual,
             bind_addr,
@@ -1957,7 +1979,7 @@ impl ChildNode {
         self.child.id()
     }
 
-    fn kill_unclean(&mut self) {
+    fn kill_unclean_by(&mut self, deadline: Instant) {
         if let Some(status) = self
             .child
             .try_wait()
@@ -1968,7 +1990,6 @@ impl ChildNode {
             );
         }
         self.child.kill().expect("kill qualification child");
-        let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = self.child.try_wait().expect("poll killed child") {
                 break status;
@@ -2216,40 +2237,50 @@ impl Fleet {
     }
 
     fn readiness_reports(&mut self, node_indices: &[usize]) -> Vec<FleetReadiness> {
+        self.readiness_reports_by(node_indices, Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn readiness_reports_by(
+        &mut self,
+        node_indices: &[usize],
+        deadline: Instant,
+    ) -> Vec<FleetReadiness> {
         for node_index in node_indices {
             self.nodes[*node_index].send(&QualificationNodeCommand::Probe);
         }
         node_indices
             .iter()
-            .map(|node_index| match self.nodes[*node_index].receive() {
-                QualificationNodeReply::Readiness {
-                    ready,
-                    reason_code,
-                    node_id,
-                    term,
-                    leader_id,
-                    configured_voters,
-                    fresh_reachable_voters,
-                    agreeing_voters,
-                    required_quorum,
-                    committed_index,
-                    applied_index,
-                } => FleetReadiness {
-                    node_index: *node_index,
-                    ready,
-                    reason_code,
-                    node_id,
-                    term,
-                    leader_id,
-                    configured_voters,
-                    fresh_reachable_voters,
-                    agreeing_voters,
-                    required_quorum,
-                    committed_index,
-                    applied_index,
+            .map(
+                |node_index| match self.nodes[*node_index].receive_until(deadline) {
+                    QualificationNodeReply::Readiness {
+                        ready,
+                        reason_code,
+                        node_id,
+                        term,
+                        leader_id,
+                        configured_voters,
+                        fresh_reachable_voters,
+                        agreeing_voters,
+                        required_quorum,
+                        committed_index,
+                        applied_index,
+                    } => FleetReadiness {
+                        node_index: *node_index,
+                        ready,
+                        reason_code,
+                        node_id,
+                        term,
+                        leader_id,
+                        configured_voters,
+                        fresh_reachable_voters,
+                        agreeing_voters,
+                        required_quorum,
+                        committed_index,
+                        applied_index,
+                    },
+                    reply => panic!("unexpected readiness response: {reply:?}"),
                 },
-                reply => panic!("unexpected readiness response: {reply:?}"),
-            })
+            )
             .collect()
     }
 
@@ -2301,10 +2332,18 @@ impl Fleet {
     }
 
     fn kill_node_unclean(&mut self, node_index: usize) -> (SocketAddr, u32) {
+        self.kill_node_unclean_by(
+            node_index,
+            Instant::now()
+                + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS),
+        )
+    }
+
+    fn kill_node_unclean_by(&mut self, node_index: usize, deadline: Instant) -> (SocketAddr, u32) {
         let expected_address = self.members[node_index].dial_addr;
         let previous_process_id = self.nodes[node_index].process_id();
-        self.nodes[node_index].kill_unclean();
-        wait_for_bind_address_release(expected_address);
+        self.nodes[node_index].kill_unclean_by(deadline);
+        wait_for_bind_address_release_by(expected_address, deadline);
         (expected_address, previous_process_id)
     }
 
@@ -2314,27 +2353,46 @@ impl Fleet {
         expected_address: SocketAddr,
         previous_process_id: u32,
     ) {
-        let (node, actual_address) = ChildNode::spawn_bound(
+        self.spawn_node_at_manifest_address_by(
+            node_index,
+            expected_address,
+            previous_process_id,
+            Instant::now() + CHILD_TIMEOUT,
+        );
+    }
+
+    fn spawn_node_at_manifest_address_by(
+        &mut self,
+        node_index: usize,
+        expected_address: SocketAddr,
+        previous_process_id: u32,
+        deadline: Instant,
+    ) {
+        let (node, actual_address) = ChildNode::spawn_bound_until(
             &self.config_paths[node_index],
             node_index,
             &self.stderr_paths[node_index],
             expected_address,
+            deadline,
         );
         assert_eq!(actual_address, expected_address);
         self.nodes[node_index] = node;
         assert_ne!(self.nodes[node_index].process_id(), previous_process_id);
+        self.nodes[node_index].send(&QualificationNodeCommand::Configure);
         assert!(matches!(
-            self.nodes[node_index].invoke(&QualificationNodeCommand::Configure),
+            self.nodes[node_index].receive_until(deadline),
             QualificationNodeReply::Started { node_index: actual } if actual == node_index
         ));
+        self.nodes[node_index].send(&QualificationNodeCommand::Initialize);
         assert!(matches!(
-            self.nodes[node_index].invoke(&QualificationNodeCommand::Initialize),
+            self.nodes[node_index].receive_until(deadline),
             QualificationNodeReply::Initialized
         ));
+        self.nodes[node_index].send(&QualificationNodeCommand::SetConsensusRpcAvailability {
+            availability: QualificationConsensusRpcAvailability::Available,
+        });
         assert!(matches!(
-            self.nodes[node_index].invoke(&QualificationNodeCommand::SetConsensusRpcAvailability {
-                availability: QualificationConsensusRpcAvailability::Available,
-            }),
+            self.nodes[node_index].receive_until(deadline),
             QualificationNodeReply::ConsensusRpcAvailability {
                 availability: QualificationConsensusRpcAvailability::Available,
             }
@@ -2410,7 +2468,7 @@ impl Fleet {
     fn restart_active_mutator_at_manifest_address(&mut self, node_index: usize) {
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
-            "same-disk-exact-address-active-mutator/v1"
+            "same-disk-exact-address-active-mutator/v2"
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
@@ -2432,8 +2490,7 @@ impl Fleet {
         let all_traffic =
             TrafficParticipants::try_new(self.member_count(), &all_node_indices, &all_node_indices)
                 .expect("bounded active-restart full-fleet traffic participants");
-        let restart_deadline = Instant::now()
-            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS);
+        let readiness_before = self.readiness_reports(&all_node_indices);
 
         let pre_restart = self
             .traffic_statuses_on(&[node_index])
@@ -2445,27 +2502,61 @@ impl Fleet {
         assert_eq!(pre_restart.status.failure, None);
         assert_completed_traffic_cycles(&pre_restart.status);
 
-        let (expected_address, previous_process_id) = self.kill_node_unclean(node_index);
+        let restart_started_at = Instant::now();
+        let restart_total_deadline = restart_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS);
+        let termination_deadline = restart_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS);
+        let (expected_address, previous_process_id) =
+            self.kill_node_unclean_by(node_index, termination_deadline);
+        let termination_completed_at = Instant::now();
+        assert!(
+            termination_completed_at.duration_since(restart_started_at)
+                <= Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,),
+            "active-mutator process termination exceeded its stage bound"
+        );
         // Sample only after SIGKILL has completed and the exact manifest
         // address is released. Every subsequent survivor delta is therefore
         // committed while the selected process is actually absent.
-        let survivor_before = self.traffic_statuses_on(&survivor_indices);
-        self.advance_canary_for_survivors(node_index, "active-mutator-restart-outage");
+        let outage_deadline = termination_completed_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS);
+        let survivor_before = self.traffic_statuses_on_by(&survivor_indices, outage_deadline);
+        self.advance_canary_for_survivors_by(
+            node_index,
+            "active-mutator-restart-outage",
+            outage_deadline,
+        );
         let survivor_progress = self.wait_for_subset_traffic_progress_with_crashed_tail(
             &survivor_before,
             &survivor_traffic,
             "active-mutator-restart-survivor-progress",
-            restart_deadline,
+            outage_deadline,
             Some(node_index),
         );
         assert!(
-            deadline_allows_completion(Instant::now(), restart_deadline),
-            "survivor progress exceeded the active-mutator restart bound"
+            deadline_allows_completion(Instant::now(), outage_deadline),
+            "survivor progress exceeded the active-mutator outage bound"
         );
 
-        self.spawn_node_at_manifest_address(node_index, expected_address, previous_process_id);
+        let startup_started_at = Instant::now();
+        let startup_deadline = startup_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS);
+        self.spawn_node_at_manifest_address_by(
+            node_index,
+            expected_address,
+            previous_process_id,
+            startup_deadline,
+        );
+        assert!(
+            deadline_allows_completion(Instant::now(), startup_deadline),
+            "active-mutator replacement startup exceeded its stage bound"
+        );
+
+        let catchup_started_at = Instant::now();
+        let catchup_deadline = catchup_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS);
         loop {
-            let reports = self.readiness_reports(&all_node_indices);
+            let reports = self.readiness_reports_by(&all_node_indices, catchup_deadline);
             let required_quorum = self.required_quorum();
             if reports.iter().all(|report| {
                 report.ready
@@ -2475,20 +2566,30 @@ impl Fleet {
                     && report.agreeing_voters == required_quorum
                     && report.required_quorum == required_quorum
             }) {
+                assert!(
+                    deadline_allows_completion(Instant::now(), catchup_deadline),
+                    "active-mutator all-voter readiness completed after its catch-up bound"
+                );
                 break;
             }
-            assert!(
-                deadline_allows_completion(Instant::now(), restart_deadline),
-                "active-mutator restart did not regain all-voter readiness: reports={reports:?}, stderr={:?}",
-                self.stderr_diagnostics()
-            );
+            if !deadline_allows_completion(Instant::now(), catchup_deadline) {
+                panic!(
+                    "active-mutator restart did not regain all-voter readiness: node={node_index}, total_elapsed_millis={}, catchup_elapsed_millis={}, readiness_before={readiness_before:?}, reports={reports:?}, stderr={:?}",
+                    restart_started_at.elapsed().as_millis(),
+                    catchup_started_at.elapsed().as_millis(),
+                    self.stderr_diagnostics()
+                );
+            }
             thread::sleep(Duration::from_millis(100));
         }
 
-        let reconciled = self.reconcile_traffic_watch_on(node_index);
+        let reconciliation_started_at = Instant::now();
+        let reconciliation_deadline = reconciliation_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+        let reconciled = self.reconcile_traffic_watch_on_by(node_index, reconciliation_deadline);
         assert!(
-            deadline_allows_completion(Instant::now(), restart_deadline),
-            "active-mutator journal reconciliation exceeded the restart bound"
+            deadline_allows_completion(Instant::now(), reconciliation_deadline),
+            "active-mutator journal reconciliation exceeded its stage bound"
         );
         assert_eq!(
             reconciled.status.state,
@@ -2522,13 +2623,15 @@ impl Fleet {
             );
         }
 
-        self.start_traffic_mutations_on(&[node_index]);
-        let resumed_before = self.traffic_statuses_on(&all_node_indices);
+        let resume_deadline = Instant::now()
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS);
+        self.start_traffic_mutations_on_by(&[node_index], resume_deadline);
+        let resumed_before = self.traffic_statuses_on_by(&all_node_indices, resume_deadline);
         let resumed = self.wait_for_subset_traffic_progress(
             &resumed_before,
             &all_traffic,
             "active-mutator-restart-higher-fence-progress",
-            restart_deadline,
+            resume_deadline,
         );
         let resumed_node = indexed_traffic_status(&resumed, node_index)
             .expect("resumed active-mutator traffic status");
@@ -2558,8 +2661,12 @@ impl Fleet {
             "a recovered committed generation rearmed the once-per-mutator synthetic response-loss fault"
         );
         assert!(
-            deadline_allows_completion(Instant::now(), restart_deadline),
-            "active-mutator recovery completed after its absolute catch-up bound"
+            deadline_allows_completion(Instant::now(), resume_deadline),
+            "active-mutator higher-fence resume exceeded its stage bound"
+        );
+        assert!(
+            deadline_allows_completion(Instant::now(), restart_total_deadline),
+            "active-mutator recovery exceeded its composed crash-to-resume bound"
         );
         self.verify_canary();
     }
@@ -3222,6 +3329,14 @@ impl Fleet {
     }
 
     fn traffic_statuses_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
+        self.traffic_statuses_on_by(node_indices, Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn traffic_statuses_on_by(
+        &mut self,
+        node_indices: &[usize],
+        deadline: Instant,
+    ) -> Vec<IndexedTrafficStatus> {
         validate_traffic_indices(
             self.member_count(),
             node_indices,
@@ -3234,7 +3349,7 @@ impl Fleet {
         node_indices
             .iter()
             .map(|node_index| {
-                let status = match self.nodes[*node_index].receive() {
+                let status = match self.nodes[*node_index].receive_until(deadline) {
                     QualificationNodeReply::TrafficStatus { status } => status,
                     reply => panic!(
                         "traffic status unavailable: node={node_index}, reply={reply:?}, stderr={}",
@@ -3322,13 +3437,20 @@ impl Fleet {
     }
 
     fn reconcile_traffic_watch_on(&mut self, node_index: usize) -> IndexedTrafficStatus {
+        self.reconcile_traffic_watch_on_by(node_index, Instant::now() + CHILD_TIMEOUT)
+    }
+
+    fn reconcile_traffic_watch_on_by(
+        &mut self,
+        node_index: usize,
+        deadline: Instant,
+    ) -> IndexedTrafficStatus {
         assert!(node_index < self.member_count());
         let member_count = self.member_count();
         let seed = qualification_traffic_seed(member_count)
             .expect("supported traffic qualification topology");
-        let status = match self.nodes[node_index]
-            .invoke(&QualificationNodeCommand::ReconcileTrafficWatch)
-        {
+        self.nodes[node_index].send(&QualificationNodeCommand::ReconcileTrafficWatch);
+        let status = match self.nodes[node_index].receive_until(deadline) {
             QualificationNodeReply::TrafficStatus { status } => status,
             reply => panic!(
                 "traffic watch restore handoff failed: node={node_index}, reply={reply:?}, stderr={}",
@@ -3350,6 +3472,10 @@ impl Fleet {
     }
 
     fn start_traffic_mutations_on(&mut self, node_indices: &[usize]) {
+        self.start_traffic_mutations_on_by(node_indices, Instant::now() + CHILD_TIMEOUT);
+    }
+
+    fn start_traffic_mutations_on_by(&mut self, node_indices: &[usize], deadline: Instant) {
         validate_traffic_indices(
             self.member_count(),
             node_indices,
@@ -3362,7 +3488,7 @@ impl Fleet {
             self.nodes[*node_index].send(&QualificationNodeCommand::StartTrafficMutation);
         }
         for node_index in node_indices {
-            match self.nodes[*node_index].receive() {
+            match self.nodes[*node_index].receive_until(deadline) {
                 QualificationNodeReply::TrafficStatus { status } => {
                     assert_eq!(status.state, QualificationTrafficState::Running);
                     assert_eq!(status.failure, None);
@@ -3515,7 +3641,7 @@ impl Fleet {
         assert_eq!(participants.member_count, self.member_count());
         assert!(traffic_status_snapshot_matches(before, participants));
         loop {
-            let after = self.traffic_statuses_on(&participants.observers);
+            let after = self.traffic_statuses_on_by(&participants.observers, deadline);
             for indexed in &after {
                 if indexed.status.failure.is_some()
                     || indexed.status.state == QualificationTrafficState::Failed
@@ -4597,6 +4723,24 @@ impl Fleet {
     }
 
     fn advance_canary_for_survivors(&mut self, isolated_node_index: usize, phase: &str) {
+        self.advance_canary_for_survivors_with_deadline(isolated_node_index, phase, None);
+    }
+
+    fn advance_canary_for_survivors_by(
+        &mut self,
+        isolated_node_index: usize,
+        phase: &str,
+        deadline: Instant,
+    ) {
+        self.advance_canary_for_survivors_with_deadline(isolated_node_index, phase, Some(deadline));
+    }
+
+    fn advance_canary_for_survivors_with_deadline(
+        &mut self,
+        isolated_node_index: usize,
+        phase: &str,
+        deadline: Option<Instant>,
+    ) {
         assert_ne!(
             isolated_node_index, 0,
             "the fixed canary writer must remain in the survivor quorum"
@@ -4604,7 +4748,7 @@ impl Fleet {
         let survivors = (0..self.member_count())
             .filter(|node_index| *node_index != isolated_node_index)
             .collect::<Vec<_>>();
-        self.advance_canary_on_nodes(0, &survivors, phase);
+        self.advance_canary_on_nodes_with_deadline(0, &survivors, phase, deadline);
     }
 
     fn advance_canary_on_nodes(
@@ -4612,6 +4756,21 @@ impl Fleet {
         writer_node_index: usize,
         reader_node_indices: &[usize],
         phase: &str,
+    ) {
+        self.advance_canary_on_nodes_with_deadline(
+            writer_node_index,
+            reader_node_indices,
+            phase,
+            None,
+        );
+    }
+
+    fn advance_canary_on_nodes_with_deadline(
+        &mut self,
+        writer_node_index: usize,
+        reader_node_indices: &[usize],
+        phase: &str,
+        deadline: Option<Instant>,
     ) {
         assert!(reader_node_indices.contains(&writer_node_index));
         let expected_generation = (self.canary_generation != 0).then_some(self.canary_generation);
@@ -4621,13 +4780,18 @@ impl Fleet {
             self.member_count(),
             self.canary_generation
         );
-        match self.nodes[writer_node_index].invoke(&QualificationNodeCommand::CompareAndSet {
+        self.nodes[writer_node_index].send(&QualificationNodeCommand::CompareAndSet {
             lease_handle: CANARY_LEASE_HANDLE.to_owned(),
             stable_id: CANARY_STABLE_ID.to_owned(),
             expected_generation,
             new_generation: self.canary_generation,
             value: value.clone(),
-        }) {
+        });
+        let reply = match deadline {
+            Some(deadline) => self.nodes[writer_node_index].receive_until(deadline),
+            None => self.nodes[writer_node_index].receive(),
+        };
+        match reply {
             QualificationNodeReply::CompareAndSet {
                 applied: true,
                 current_generation: Some(actual),
@@ -4636,7 +4800,7 @@ impl Fleet {
         }
 
         self.canary_values.push(value);
-        self.verify_canary_on_nodes(reader_node_indices);
+        self.verify_canary_on_nodes_with_deadline(reader_node_indices, deadline);
     }
 
     fn verify_canary(&mut self) {
@@ -4645,6 +4809,14 @@ impl Fleet {
     }
 
     fn verify_canary_on_nodes(&mut self, node_indices: &[usize]) {
+        self.verify_canary_on_nodes_with_deadline(node_indices, None);
+    }
+
+    fn verify_canary_on_nodes_with_deadline(
+        &mut self,
+        node_indices: &[usize],
+        deadline: Option<Instant>,
+    ) {
         assert!(!node_indices.is_empty());
         let expected_owner = qualification_owner_sha256(CANARY_OWNER);
         let expected_value = qualification_value_sha256(
@@ -4659,7 +4831,11 @@ impl Fleet {
             });
         }
         for node_index in node_indices {
-            match self.nodes[*node_index].receive() {
+            let reply = match deadline {
+                Some(deadline) => self.nodes[*node_index].receive_until(deadline),
+                None => self.nodes[*node_index].receive(),
+            };
+            match reply {
                 QualificationNodeReply::Record {
                     present: true,
                     generation: Some(actual_generation),
@@ -5117,8 +5293,7 @@ fn duration_until_wall_time(deadline: time::OffsetDateTime) -> Duration {
     )
 }
 
-fn wait_for_bind_address_release(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+fn wait_for_bind_address_release_by(address: SocketAddr, deadline: Instant) {
     loop {
         match TcpListener::bind(address) {
             Ok(listener) => {
