@@ -22,8 +22,9 @@ pub mod tag;
 pub mod vex;
 
 pub use bundle::{
-    bundle_signing_bytes, manifest_signing_bytes, verify_bundle, BundleSigner, BundleVerifier,
-    BundleVerifierSecurity, EvidenceBundle,
+    bundle_signing_bytes, manifest_signing_bytes, sign_bundle, validate_manifest_structure,
+    verify_bundle, BundleSigner, BundleVerifier, BundleVerifierSecurity, EvidenceBundle,
+    BUNDLE_SIGNING_DOMAIN, MANIFEST_SIGNING_DOMAIN,
 };
 pub use data_governance::DataGovernanceEvidenceReport;
 pub use dataplane::{
@@ -45,7 +46,10 @@ pub use performance::{
     capture_environment, evaluate_threshold, redact_secrets_and_paths, EnvironmentMetadata,
     PerformanceBaseline, PerformanceMetric, RegressionStatus,
 };
-pub use policy::{GateEvaluator, GatePolicy, PolicyMode};
+pub use policy::{
+    bind_gate_inputs, gate_inputs_digest, GateEvaluator, GatePolicy, PolicyMode,
+    GATE_INPUTS_DIGEST_METADATA_KEY, GATE_INPUTS_SIGNING_DOMAIN,
+};
 pub use provenance::{
     generate_provenance, BuildMetadata, BuilderIdentity, InvocationDetails, InvocationEnvironment,
     ProvenanceDigest, ProvenanceMaterial, ProvenancePredicate, ProvenanceStatement,

@@ -23,6 +23,7 @@ pub struct EvidenceRecord {
     pub reviewed_by: Vec<String>,
     #[serde(
         with = "time::serde::rfc3339::option",
+        default,
         skip_serializing_if = "Option::is_none"
     )]
     pub last_updated: Option<OffsetDateTime>,

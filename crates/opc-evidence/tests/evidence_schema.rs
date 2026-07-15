@@ -32,6 +32,16 @@ fn evidence_fixture_matches_versioned_schema() {
 }
 
 #[test]
+fn evidence_record_accepts_schema_optional_last_updated() {
+    let record: EvidenceRecord = serde_json::from_value(serde_json::json!({
+        "requirement_id": "REQ-IETF-RFC7951-V1-4.2-102",
+        "status": "not-applicable"
+    }))
+    .expect("schema-optional last_updated must deserialize as None");
+    assert!(record.last_updated.is_none());
+}
+
+#[test]
 fn gap_fixture_matches_versioned_schema() {
     schema_support::validate_json_str_against_schema(
         GAP_RECORD_SCHEMA,

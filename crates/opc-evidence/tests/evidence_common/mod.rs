@@ -28,20 +28,33 @@ impl BundleSigner for MockSigner {
 
 pub struct MockVerifier {
     key: String,
+    identity: Option<String>,
     security: BundleVerifierSecurity,
 }
 
 impl MockVerifier {
     pub fn new(key: impl Into<String>) -> Self {
+        let key = key.into();
         Self {
-            key: key.into(),
+            identity: Some(format!("mock-identity-{key}")),
+            key,
             security: BundleVerifierSecurity::TestOnly,
         }
     }
 
     pub fn new_release_capable(key: impl Into<String>) -> Self {
+        let key = key.into();
+        Self {
+            identity: Some(format!("mock-identity-{key}")),
+            key,
+            security: BundleVerifierSecurity::Release,
+        }
+    }
+
+    pub fn new_release_capable_without_identity(key: impl Into<String>) -> Self {
         Self {
             key: key.into(),
+            identity: None,
             security: BundleVerifierSecurity::Release,
         }
     }
@@ -59,6 +72,10 @@ impl BundleVerifier for MockVerifier {
 
     fn security(&self) -> BundleVerifierSecurity {
         self.security
+    }
+
+    fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
     }
 }
 

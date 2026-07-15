@@ -54,7 +54,7 @@ impl Manifest {
         for entry in &self.file_digests {
             let expected = expected_digests
                 .get(&entry.path)
-                .ok_or_else(|| EvidenceError::MissingArtifact(entry.path.clone()))?;
+                .ok_or_else(|| EvidenceError::MissingArtifact("<manifest entry>".to_string()))?;
 
             if *expected != entry.digest {
                 return Err(EvidenceError::ManifestTampered);
