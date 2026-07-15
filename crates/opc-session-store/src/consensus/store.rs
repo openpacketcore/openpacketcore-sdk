@@ -18,7 +18,8 @@ use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError}
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
     decode_bounded, durable_openraft_config, encode_bounded, DurableOpenraftDomain,
-    DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    EnsureLinearizableOutcome, EnsureLinearizableSupervisor, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
@@ -34,7 +35,7 @@ use super::{
     SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
     SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
     SessionConsensusWireResponse, SessionMutationIntent, SessionMutationOutcome, SessionRaft,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionRaftTypeConfig, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::backend::{
     record_expiry_preflights, validate_record_expiry_preflights_at,
@@ -262,7 +263,8 @@ struct ConsensusSessionStoreInner {
     clock: Arc<dyn Clock>,
     operation_timeout: Duration,
     admitted: AtomicBool,
-    proposal_gate: Arc<tokio::sync::Mutex<()>>,
+    linearizability: EnsureLinearizableSupervisor<SessionRaftTypeConfig>,
+    proposal_admission: Arc<tokio::sync::Semaphore>,
 }
 
 /// SQLite session state coordinated by the SDK's single Openraft engine.
@@ -390,6 +392,7 @@ impl ConsensusSessionStore {
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
         let raft_handler = SessionRaftRpcHandler::new(raft.clone(), identity, local_node_id);
+        let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
         let topology_summary = topology.summary().clone();
 
         Ok(Self {
@@ -405,7 +408,10 @@ impl ConsensusSessionStore {
                 clock,
                 operation_timeout,
                 admitted: AtomicBool::new(false),
-                proposal_gate: Arc::new(tokio::sync::Mutex::new(())),
+                linearizability,
+                proposal_admission: Arc::new(tokio::sync::Semaphore::new(
+                    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+                )),
             }),
         })
     }
@@ -929,39 +935,36 @@ impl ConsensusSessionStore {
                 error,
             )));
         }
-        let proposal_guard = match tokio::time::timeout_at(
+        let proposal_permit = match tokio::time::timeout_at(
             deadline,
-            Arc::clone(&self.inner.proposal_gate).lock_owned(),
+            Arc::clone(&self.inner.proposal_admission).acquire_owned(),
         )
         .await
         {
-            Ok(guard) => guard,
-            Err(_) => return ForwardMutationReply::Unavailable,
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
         };
 
-        match tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await {
-            Err(_) => return ForwardMutationReply::Unavailable,
-            Ok(Ok(log_id)) => {
-                if let Some(log_id) = log_id {
-                    if self
-                        .wait_for_local_apply(log_id.index, deadline)
-                        .await
-                        .is_err()
-                    {
-                        return ForwardMutationReply::Unavailable;
-                    }
-                }
+        match self
+            .inner
+            .linearizability
+            .ensure_linearizable(deadline)
+            .await
+        {
+            EnsureLinearizableOutcome::Ready { .. } => {
                 if self.require_exact_membership_admission().is_err() {
                     return ForwardMutationReply::Unavailable;
                 }
             }
-            Ok(Err(error)) => {
+            EnsureLinearizableOutcome::Retry { leader_hint } => {
                 return ForwardMutationReply::NotLeader {
-                    leader: error
-                        .forward_to_leader()
-                        .and_then(|forward| forward.leader_id),
+                    leader: leader_hint,
                 };
             }
+            EnsureLinearizableOutcome::Unavailable => {
+                return ForwardMutationReply::Unavailable;
+            }
+            _ => return ForwardMutationReply::Unavailable,
         }
 
         let logical_time = match tokio::time::timeout_at(
@@ -978,7 +981,7 @@ impl ConsensusSessionStore {
             ),
             Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
         };
-        self.propose_on_local_leader(request, logical_time, proposal_guard, deadline)
+        self.propose_on_local_leader(request, logical_time, proposal_permit, deadline)
             .await
     }
 
@@ -986,7 +989,7 @@ impl ConsensusSessionStore {
         &self,
         request: ForwardMutationRequest,
         logical_time: Timestamp,
-        proposal_guard: tokio::sync::OwnedMutexGuard<()>,
+        proposal_permit: tokio::sync::OwnedSemaphorePermit,
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
         let outcome_unavailable = consensus_outcome_unavailable(&request.intent);
@@ -1049,7 +1052,7 @@ impl ConsensusSessionStore {
                 }
             };
             let _ = completion_tx.send(reply);
-            drop(proposal_guard);
+            drop(proposal_permit);
         });
         match tokio::time::timeout_at(deadline, completion_rx).await {
             Err(_) | Ok(Err(_)) => ForwardMutationReply::Applied(Box::new(
@@ -1084,38 +1087,35 @@ impl ConsensusSessionStore {
         if recovery_pending {
             return ForwardMutationReply::Unavailable;
         }
-        let proposal_guard = match tokio::time::timeout_at(
+        let proposal_permit = match tokio::time::timeout_at(
             deadline,
-            Arc::clone(&self.inner.proposal_gate).lock_owned(),
+            Arc::clone(&self.inner.proposal_admission).acquire_owned(),
         )
         .await
         {
-            Ok(guard) => guard,
-            Err(_) => return ForwardMutationReply::Unavailable,
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
         };
-        match tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await {
-            Err(_) => return ForwardMutationReply::Unavailable,
-            Ok(Ok(log_id)) => {
-                if let Some(log_id) = log_id {
-                    if self
-                        .wait_for_local_apply(log_id.index, deadline)
-                        .await
-                        .is_err()
-                    {
-                        return ForwardMutationReply::Unavailable;
-                    }
-                }
+        match self
+            .inner
+            .linearizability
+            .ensure_linearizable(deadline)
+            .await
+        {
+            EnsureLinearizableOutcome::Ready { .. } => {
                 if self.require_exact_membership_admission().is_err() {
                     return ForwardMutationReply::Unavailable;
                 }
             }
-            Ok(Err(error)) => {
+            EnsureLinearizableOutcome::Retry { leader_hint } => {
                 return ForwardMutationReply::NotLeader {
-                    leader: error
-                        .forward_to_leader()
-                        .and_then(|forward| forward.leader_id),
+                    leader: leader_hint,
                 };
             }
+            EnsureLinearizableOutcome::Unavailable => {
+                return ForwardMutationReply::Unavailable;
+            }
+            _ => return ForwardMutationReply::Unavailable,
         }
         let persisted = match tokio::time::timeout_at(
             deadline,
@@ -1156,20 +1156,14 @@ impl ConsensusSessionStore {
                     intent: intent.clone(),
                 },
                 authority_time,
-                proposal_guard,
+                proposal_permit,
                 deadline,
             )
             .await;
         match reply {
-            ForwardMutationReply::Applied(response)
-                if committed_response_matches_intent(&intent, &response)
-                    && matches!(response.result, Ok(SessionMutationOutcome::Unit)) =>
-            {
-                ForwardMutationReply::RecordExpiryPreflight(Ok(()))
-            }
-            ForwardMutationReply::Applied(_) => {
-                ForwardMutationReply::RecordExpiryPreflight(Err(consensus_unavailable()))
-            }
+            ForwardMutationReply::Applied(response) => ForwardMutationReply::RecordExpiryPreflight(
+                validate_committed_record_expiry_preflight(&preflights, &intent, &response),
+            ),
             other => other,
         }
     }
@@ -1241,8 +1235,11 @@ impl ConsensusSessionStore {
             None => return false,
         };
         if !matches!(
-            tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await,
-            Ok(Ok(_))
+            self.inner
+                .linearizability
+                .ensure_linearizable(deadline)
+                .await,
+            EnsureLinearizableOutcome::Ready { .. }
         ) {
             return false;
         }
@@ -1359,17 +1356,24 @@ impl ConsensusSessionStore {
         if recovery_pending {
             return ReadBarrierReply::Unavailable;
         }
-        match tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable()).await {
-            Err(_) => ReadBarrierReply::Unavailable,
-            Ok(Ok(log_id)) if self.exact_membership_is_admitted() => {
-                ReadBarrierReply::Ready(log_id)
+        match self
+            .inner
+            .linearizability
+            .ensure_linearizable(deadline)
+            .await
+        {
+            EnsureLinearizableOutcome::Ready { read_log_id }
+                if self.exact_membership_is_admitted() =>
+            {
+                ReadBarrierReply::Ready(read_log_id)
             }
-            Ok(Ok(_)) => ReadBarrierReply::Unavailable,
-            Ok(Err(error)) => ReadBarrierReply::NotLeader {
-                leader: error
-                    .forward_to_leader()
-                    .and_then(|forward| forward.leader_id),
+            EnsureLinearizableOutcome::Ready { .. } | EnsureLinearizableOutcome::Unavailable => {
+                ReadBarrierReply::Unavailable
+            }
+            EnsureLinearizableOutcome::Retry { leader_hint } => ReadBarrierReply::NotLeader {
+                leader: leader_hint,
             },
+            _ => ReadBarrierReply::Unavailable,
         }
     }
 
@@ -1502,6 +1506,20 @@ fn consensus_outcome_unavailable(intent: &SessionMutationIntent) -> StoreError {
     } else {
         StoreError::BackendOperationOutcomeUnavailable
     }
+}
+
+fn validate_committed_record_expiry_preflight(
+    preflights: &[RecordExpiryPreflight],
+    intent: &SessionMutationIntent,
+    response: &SessionConsensusResponse,
+) -> Result<(), StoreError> {
+    if !committed_response_matches_intent(intent, response)
+        || !matches!(&response.result, Ok(SessionMutationOutcome::Unit))
+    {
+        return Err(consensus_unavailable());
+    }
+    let committed_logical_time = response.logical_time.ok_or_else(consensus_unavailable)?;
+    validate_record_expiry_preflights_at(preflights, committed_logical_time)
 }
 
 fn committed_response_matches_intent(
@@ -2218,6 +2236,64 @@ mod membership_tests {
     }
 
     #[test]
+    fn expiry_preflight_uses_committed_logical_time_and_fails_closed_when_absent() {
+        let proposed_time = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let expires_at = checked_session_deadline(proposed_time, crate::MAX_SESSION_TTL)
+            .expect("maximum expiry");
+        let record = StoredSessionRecord {
+            key: SessionKey {
+                tenant: TenantId::new("concurrent-expiry-floor").expect("tenant"),
+                nf_kind: NetworkFunctionKind::smf(),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from_static(b"concurrent-expiry-floor")
+                    .try_into()
+                    .expect("stable ID"),
+            },
+            generation: Generation::new(1),
+            owner: OwnerId::new("concurrent-expiry-owner").expect("owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("concurrent-expiry-floor"),
+            expires_at: Some(expires_at),
+            payload: EncryptedSessionPayload::new(b"payload-free-preflight"),
+        };
+        let preflights = [RecordExpiryPreflight::from_record(&record)];
+        let intent = SessionMutationIntent::AdvanceLogicalTime;
+        let response = |logical_time| SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::Unit),
+            sequence: 1,
+            digest: Some(crate::consensus::SessionConsensusEntryDigest::from_bytes(
+                [0x4d; 32],
+            )),
+            logical_time: Some(logical_time),
+            raft_log_index: 1,
+        };
+
+        validate_committed_record_expiry_preflight(&preflights, &intent, &response(proposed_time))
+            .expect("proposal-time verdict remains valid at the same committed time");
+
+        let concurrently_advanced = Timestamp::from_offset_datetime(
+            proposed_time
+                .as_offset_datetime()
+                .checked_add(time::Duration::nanoseconds(1))
+                .expect("one nanosecond later"),
+        );
+        validate_committed_record_expiry_preflight(
+            &preflights,
+            &intent,
+            &response(concurrently_advanced),
+        )
+        .expect("a newer committed floor preserves the maximum-TTL upper bound");
+
+        let mut missing_authority = response(concurrently_advanced);
+        missing_authority.logical_time = None;
+        assert!(matches!(
+            validate_committed_record_expiry_preflight(&preflights, &intent, &missing_authority,),
+            Err(StoreError::BackendUnavailable(_))
+        ));
+    }
+
+    #[test]
     fn forwarded_mutation_responses_are_bound_to_the_exact_intent() {
         let key = |stable_id: &'static [u8]| SessionKey {
             tenant: TenantId::new("forward-response-binding").expect("tenant"),
@@ -2649,19 +2725,37 @@ mod membership_tests {
             .await
             .expect("proposal reaches the real Openraft log");
         };
-        let wait_for_supervisor = |store: ConsensusSessionStore| async move {
-            let guard = tokio::time::timeout(
+        let wait_for_available = |store: ConsensusSessionStore,
+                                  expected: usize,
+                                  context: &'static str| async move {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if store.inner.proposal_admission.available_permits() == expected {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("proposal admission did not reach {expected}: {context}"));
+        };
+        let wait_for_all_supervisors = |store: ConsensusSessionStore| async move {
+            let permits = tokio::time::timeout(
                 Duration::from_secs(1),
-                Arc::clone(&store.inner.proposal_gate).lock_owned(),
+                Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
+                    u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                        .expect("proposal slot count fits u32"),
+                ),
             )
             .await
-            .expect("proposal supervisor releases admission after apply");
-            drop(guard);
+            .expect("proposal supervisors release admission after apply")
+            .expect("proposal admission remains open");
+            drop(permits);
         };
 
         // Dropping the original caller after Openraft accepted its proposal
-        // must not release admission or permit a disconnect flood to enqueue
-        // more detached commands.
+        // must not release its slot. Saturating the other seven slots proves a
+        // disconnect flood cannot enqueue behind that supervised proposal.
         let held_apply = Arc::clone(&apply_gate)
             .acquire_owned()
             .await
@@ -2680,15 +2774,31 @@ mod membership_tests {
                 .await
         });
         wait_for_submission(store.clone(), before).await;
+        wait_for_available(
+            store.clone(),
+            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1,
+            "first accepted proposal",
+        )
+        .await;
         cancelled.abort();
         let _ = cancelled.await;
-        assert!(
-            Arc::clone(&store.inner.proposal_gate)
-                .try_lock_owned()
-                .is_err(),
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store.inner.proposal_admission.available_permits(),
+            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1,
             "accepted proposal admission must outlive its cancelled caller"
         );
-        let flood = (0..16)
+
+        let held_saturation = Arc::clone(&store.inner.proposal_admission)
+            .acquire_many_owned(
+                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1)
+                    .expect("remaining proposal slots fit u32"),
+            )
+            .await
+            .expect("saturate remaining proposal admission");
+        assert_eq!(store.inner.proposal_admission.available_permits(), 0);
+
+        let rejected_overflow = (0..16)
             .map(|_| {
                 let store = store.clone();
                 tokio::spawn(async move {
@@ -2698,19 +2808,25 @@ mod membership_tests {
                 })
             })
             .collect::<Vec<_>>();
-        for attempt in flood {
+        for attempt in rejected_overflow {
             assert!(matches!(
-                attempt.await.expect("queued flood task"),
+                attempt.await.expect("bounded overflow task"),
                 Err(StoreError::BackendUnavailable(_))
             ));
         }
         assert_eq!(
             store.inner.raft.metrics().borrow().last_log_index,
             Some(before + 1),
-            "cancelled callers cannot build an unbounded Openraft queue"
+            "saturated admission cannot append another Openraft proposal"
+        );
+        drop(held_saturation);
+        assert_eq!(
+            store.inner.proposal_admission.available_permits(),
+            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1,
+            "the cancelled accepted proposal still owns its slot"
         );
         drop(held_apply);
-        wait_for_supervisor(store.clone()).await;
+        wait_for_all_supervisors(store.clone()).await;
 
         // A live non-CAS caller that crosses the same post-submit boundary
         // receives typed ambiguity while the supervisor continues to own
@@ -2737,11 +2853,12 @@ mod membership_tests {
             mutation.await.expect("non-CAS task"),
             Err(StoreError::BackendOperationOutcomeUnavailable)
         );
-        assert!(Arc::clone(&store.inner.proposal_gate)
-            .try_lock_owned()
-            .is_err());
+        assert_eq!(
+            store.inner.proposal_admission.available_permits(),
+            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1
+        );
         drop(held_apply);
-        wait_for_supervisor(store.clone()).await;
+        wait_for_all_supervisors(store.clone()).await;
 
         // Lease APIs must translate that same committed-unknown boundary to
         // their lease-specific non-retryable outcome.
@@ -2779,11 +2896,12 @@ mod membership_tests {
             lease.await.expect("lease task"),
             Err(LeaseError::OperationOutcomeUnavailable)
         );
-        assert!(Arc::clone(&store.inner.proposal_gate)
-            .try_lock_owned()
-            .is_err());
+        assert_eq!(
+            store.inner.proposal_admission.available_permits(),
+            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1
+        );
         drop(held_apply);
-        wait_for_supervisor(store).await;
+        wait_for_all_supervisors(store).await;
     }
 }
 

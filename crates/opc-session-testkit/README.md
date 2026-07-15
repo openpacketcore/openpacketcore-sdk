@@ -130,14 +130,25 @@ a valid long-lived leaf then restores every directed path, all-voter readiness,
 and canary progress without changing that process's PID.
 
 These controls are qualification-only. Consensus-RPC admission loss is not a
-real or deployed network partition, and these cases intentionally do not run
-the mixed mutation/watch/restore workload from the separate traffic/resource
-campaign. They do not provide a broader restart/fault matrix, resource or soak
-qualification, remote-HKMS evidence, deployed-CNF evidence, signed release
-evidence, or a new evidence-schema/profile claim. They change neither
-Openraft's sole commit authority nor payload encryption, AAD,
-key-provider/HKMS placement, SQLite/Openraft durable formats, or
-encryption-at-rest responsibilities.
+real or deployed network partition. The cases keep bounded mixed lease/CAS
+mutation, linearizable-read, watch, complete-restore, readiness, and
+connection-recycling traffic active through the exact synthetic fault/expiry
+slice. Only typed backend-unavailable or operation-outcome-unavailable results
+at completed operation checkpoints may enter recovery. Recovery reacquires
+same-owner authority at a strictly higher fence and validates the exact
+scheduled record. The private schedule drops one successful release response
+per mutator to exercise that path, and is bound to eight outcomes per node, 8
+seconds per episode, and a fixed 50 ms retry delay; all three bounds and the
+total/recovered/consecutive counters are schedule evidence. Phase completion
+requires every interruption to be reconciled. Lease loss, unexpected state, and invariant
+failures remain terminal. The exact-address restarted member is watcher-only before exit and
+joins the mutator set only after bounded journal reconciliation, so
+active-mutator crash/restart is not qualified. They do not provide a broader
+restart/fault matrix, resource or soak qualification, remote-HKMS evidence,
+deployed-CNF evidence, signed release evidence, or a new
+evidence-schema/profile claim. They change neither Openraft's sole commit
+authority nor payload encryption, AAD, key-provider/HKMS placement,
+SQLite/Openraft durable formats, or encryption-at-rest responsibilities.
 
 The deliberate stale-root negative probe is isolated to exactly one connection
 attempt: its qualification-only reconnect minimum and maximum equal the whole
@@ -182,22 +193,43 @@ fixed `idle_timeout` lifecycle-retirement reason, never as a failed attempt.
 Resource evidence is intentionally explicit and Linux-specific. A warmed
 `/proc/<pid>` baseline is sampled every 25 ms through the campaign. The checks
 bound the sampled total-FD and OS-thread maxima by the configured 128 inbound
-slots, remote-peer routes, and fixed allowances; `VmHWM` supplies the kernel's
-process high-water value. These are sampled regression maxima, not a claim that
-every instantaneous FD/thread peak was observed. Completion waits for every
-started connection drain to complete and
-for eight consecutive equal FD/socket/thread samples, then bounds settled total
-FDs, socket FDs, and `VmRSS` relative to the warmed process. The control status
-also proves the two qualification-owned async tasks reach zero. It does not
-claim to enumerate Tokio/Openraft internal tasks, and debug-build single-host
-RSS/FD values are regression ceilings rather than CNF resource requests or
-deployed-platform capacity evidence. Openraft heartbeat connections
+slots, two outbound primary/overflow sockets per remote peer, and the unchanged
+fixed allowances; `VmHWM` supplies the kernel's process high-water value. These
+are sampled regression maxima, not a claim that every instantaneous FD/thread
+peak was observed. Completion waits for every started connection drain to
+complete and for eight consecutive equal FD/socket/thread samples, then bounds
+settled total FDs, socket FDs, and `VmRSS` relative to the warmed process. The
+control status also proves the two qualification-owned async tasks reach zero.
+It does not claim to enumerate Tokio/Openraft internal tasks, and debug-build
+single-host RSS/FD values are regression ceilings rather than CNF resource
+requests or deployed-platform capacity evidence. Openraft heartbeat connections
 intentionally remain live: connection accounting derives the non-overlapping
 `outstanding = attempts - terminal_successes - fixed_failures`, rejects
 overflow/underflow, and requires `outstanding <= active + draining`. Requiring
 equality against the mixed-direction gauges would double-count successful live
-outbound connections. Final settle requires zero draining connections and
-bounds the active connections that cover any persistent inbound handlers.
+outbound connections. Final settle requires zero draining connections. The
+lifecycle gauge counts both sides, so its hard settled bound is four per remote
+member: two outbound primary/overflow lanes plus the corresponding two inbound
+server lifecycles.
+
+The workload schedule digest also binds the shared `opc-consensus` admission
+limit of eight in-flight proposal tasks per Openraft node. Those slots bound
+task/memory pipelines; they create no additional connection, socket, or FD
+allowance, so the transport resource formulas above remain unchanged. Its
+versioned v2 input also binds the 10-second operation timeout, 45-second child
+response envelope, 30-second mutation-shutdown SLO, 75-second short-lived SVID
+budget, one-second
+pre-soft traffic-stop lead, and
+`accepted-operation-terminal-checkpoints/v1` cancellation discipline. If a
+child response times out, is malformed, or reaches EOF, the parent reports only
+the closed pending-command kind, a harness-local monotonic sequence, and the
+elapsed send time. Command values, session/lease identities, payloads, and
+filesystem paths never enter that diagnostic, and child stderr is reduced to a
+closed redacted classification. Cooperative mutation/watch stop replies reuse
+the last successfully proven linearizable replication head and perform no new
+backend operation after joining their owned task. Normal status commands remain
+authoritative, and a recovered watcher must still reconcile the bounded durable
+journal before subscribing at `head + 1`.
 
 `qualification/v1/session-mtls-candidate-evidence.schema.json` deliberately
 requires `experimental = true`, `qualification_complete = false`,
@@ -234,9 +266,12 @@ deployed production evidence.
   repair, and a same-issuer leaf with a 75-second remaining-validity/expiry
   budget through soft retirement, hard drain,
   `LastGoodExpired`, survivor progress, and same-process replacement.
+  The same bounded continuous lease/CAS/read, watch, restore-scan, readiness,
+  and connection-recycling workload remains active through both scenarios;
+  restarted watchers reconcile an exact committed journal prefix before
+  resubscribing.
   They do not cover a real/deployed network partition, deployed
-  Kubernetes/network/storage behavior, mixed traffic/watch/restore during
-  those two scenarios, a broader restart/fault matrix, external resource
+  Kubernetes/network/storage behavior, a broader restart/fault matrix, external resource
   pressure, supported-platform sizing, soak, remote HKMS, or signed candidate
   evidence. Those cases remain required before #164/#158 can be closed.
 - Long-running network, resource, and soak qualification remains #143. Watch

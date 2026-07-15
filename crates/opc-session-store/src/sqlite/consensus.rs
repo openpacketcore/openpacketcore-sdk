@@ -13,6 +13,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, StoredMembership, Vote};
+use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -1337,6 +1338,68 @@ pub(crate) fn read_log_range_sync(
     end: Option<u64>,
     limit: Option<usize>,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    read_log_range_with_batch_sync(conn, identity, expected_members, start, end, limit, false)
+}
+
+pub(crate) fn read_limited_log_range_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    start: u64,
+    end: u64,
+    limit: usize,
+) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    let entries = read_log_range_with_batch_sync(
+        conn,
+        identity,
+        expected_members,
+        start,
+        Some(end),
+        Some(limit),
+        true,
+    )?;
+    let purged = read_purged_sync(conn, identity)?;
+    let expected_start = match purged {
+        Some(purged) if start <= purged.index => purged.index.checked_add(1),
+        _ => Some(start),
+    };
+    if let Some(expected_start) = expected_start {
+        let range_can_contain_expected = expected_start < end;
+        if range_can_contain_expected {
+            if let Some(first) = entries.first() {
+                if first.log_id.index != expected_start {
+                    return Err(invalid_data(
+                        "persisted session consensus log contains a hole",
+                    ));
+                }
+            } else {
+                let later_exists: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM consensus_log WHERE log_index > ?1 AND log_index < ?2)",
+                        params![checked_i64(expected_start)?, checked_i64(end)?],
+                        |row| row.get(0),
+                    )
+                    .map_err(db_error)?;
+                if later_exists {
+                    return Err(invalid_data(
+                        "persisted session consensus log contains a hole",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn read_log_range_with_batch_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+    append_entries_batch: bool,
+) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
     let start = checked_i64(start)?;
     let end = end.map(checked_i64).transpose()?;
     let limit = limit
@@ -1360,6 +1423,7 @@ pub(crate) fn read_log_range_sync(
         (None, None) => stmt.query(params![start]),
     }
     .map_err(db_error)?;
+    let mut batch = append_entries_batch.then(AppendEntriesBatchAccumulator::new);
     while let Some(row) = rows.next().map_err(db_error)? {
         let epoch: i64 = row.get(0).map_err(db_error)?;
         let term: i64 = row.get(1).map_err(db_error)?;
@@ -1373,7 +1437,22 @@ pub(crate) fn read_log_range_sync(
             return Err(invalid_data("persisted session consensus log row mismatch"));
         }
         validate_entry_for_fixed_membership(&entry, identity, expected_members)?;
-        entries.push(entry);
+        let decision = batch
+            .as_mut()
+            .map(|batch| {
+                batch
+                    .consider(&entry)
+                    .map_err(|_| invalid_data("session consensus log entry cannot be sized"))
+            })
+            .transpose()?;
+        match decision {
+            Some(AppendEntriesBatchDecision::Include) | None => entries.push(entry),
+            Some(AppendEntriesBatchDecision::IncludeAndStop) => {
+                entries.push(entry);
+                break;
+            }
+            Some(AppendEntriesBatchDecision::StopBefore) => break,
+        }
     }
     for pair in entries.windows(2) {
         if pair[1].log_id.index != pair[0].log_id.index.saturating_add(1) {
@@ -2767,6 +2846,102 @@ mod tests {
                 expected_members(),
             )),
         }
+    }
+
+    fn blank_entry(index: u64) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    async fn backend_with_blank_logs(last_index: u64) -> SqliteSessionBackend {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        {
+            let conn = backend.conn.lock().await;
+            initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+            let mut entries = vec![membership_entry()];
+            entries.extend((1..=last_index).map(blank_entry));
+            append_logs_sync(&conn, identity(), &expected_members(), &entries)
+                .expect("append log fixtures");
+        }
+        backend
+    }
+
+    #[tokio::test]
+    async fn limited_log_read_rejects_a_missing_leading_row() {
+        let backend = backend_with_blank_logs(2).await;
+        let conn = backend.conn.lock().await;
+        conn.execute("DELETE FROM consensus_log WHERE log_index = 1", [])
+            .expect("inject leading hole");
+
+        let error = read_limited_log_range_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            1,
+            3,
+            opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
+        )
+        .expect_err("missing leading row must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn limited_log_read_rejects_an_internal_hole() {
+        let backend = backend_with_blank_logs(3).await;
+        let conn = backend.conn.lock().await;
+        conn.execute("DELETE FROM consensus_log WHERE log_index = 2", [])
+            .expect("inject internal hole");
+
+        let error = read_limited_log_range_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            1,
+            4,
+            opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
+        )
+        .expect_err("internal hole must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn limited_log_read_crossing_purged_floor_starts_after_the_floor() {
+        let backend = backend_with_blank_logs(3).await;
+        let conn = backend.conn.lock().await;
+        let applied = vec![
+            membership_entry(),
+            blank_entry(1),
+            blank_entry(2),
+            blank_entry(3),
+        ];
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            &backend.caps,
+            applied,
+        )
+        .expect("apply log fixtures");
+        purge_logs_sync(&conn, identity(), &log_id(1)).expect("purge applied prefix");
+
+        let entries = read_limited_log_range_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            0,
+            4,
+            opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
+        )
+        .expect("range crosses purged floor");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     fn acquire_entry(

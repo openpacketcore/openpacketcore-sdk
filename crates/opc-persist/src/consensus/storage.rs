@@ -15,7 +15,7 @@ use opc_consensus::engine::{
     Entry, ErrorSubject, ErrorVerb, LogId, LogState, RaftLogReader, RaftSnapshotBuilder, Snapshot,
     SnapshotMeta, StorageError, StoredMembership, Vote,
 };
-use opc_consensus::{ConsensusIdentity, ConsensusNodeId};
+use opc_consensus::{ConsensusIdentity, ConsensusNodeId, DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -27,7 +27,6 @@ use crate::backend::SqliteBackend;
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCCFG01";
 const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 2 + 8 + 32;
 const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-const LIMITED_LOG_READ_ENTRIES: usize = 1_024;
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 8_192;
 const SNAPSHOT_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -625,14 +624,20 @@ impl RaftLogReader<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         let members = self.core.expected_members.clone();
         self.core
             .run_sqlite(move |conn| {
-                sqlite::read_log_range_sync(
+                let entries = sqlite::read_limited_log_range_sync(
                     conn,
                     identity,
                     &members,
                     start,
-                    Some(end),
-                    Some(LIMITED_LOG_READ_ENTRIES),
-                )
+                    end,
+                    DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
+                )?;
+                if entries.is_empty() {
+                    return Err(sqlite::invalid_data(
+                        "config consensus limited nonempty log range returned no entry",
+                    ));
+                }
+                Ok(entries)
             })
             .await
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
@@ -811,6 +816,14 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         I: IntoIterator<Item = Entry<ConfigRaftTypeConfig>> + Send,
         I::IntoIter: Send,
     {
+        #[cfg(test)]
+        let _apply_permit = self.core.apply_gate.acquire().await.map_err(|_| {
+            storage_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                io::Error::other("config consensus test apply gate closed"),
+            )
+        })?;
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let entries = collect_bounded_entries(entries)
@@ -1421,14 +1434,21 @@ mod tests {
     use std::time::Duration;
 
     use opc_consensus::engine::{CommittedLeaderId, EntryPayload, Membership, RaftSnapshotBuilder};
+    use opc_crypto::CryptoEnvelopeV1;
+    use opc_key::{
+        serialize_bound_aad, AeadAlgorithm, ConfigAad, EnvelopeAad, KeyId, AEAD_TAG_LEN,
+        AES_256_GCM_SIV_NONCE_LEN,
+    };
+    use opc_types::{ConfigVersion, SchemaDigest, TenantId};
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     use super::*;
     use crate::consensus::{
         ConfigConsensusClusterId, ConfigConsensusCommand, ConfigConsensusConfigurationEpoch,
         ConfigConsensusConfigurationId, ConfigConsensusRequestId, ConfigMutationIntent,
-        CONFIG_CONSENSUS_COMMAND_VERSION,
+        PreparedConfigCommit, CONFIG_CONSENSUS_COMMAND_VERSION,
     };
+    use crate::{CommitRecord, CommitSource};
 
     fn identity() -> ConsensusIdentity {
         ConsensusIdentity::new(
@@ -1500,6 +1520,129 @@ mod tests {
                 },
             }),
         }
+    }
+
+    fn large_mutation_entry(
+        index: u64,
+        request_byte: u8,
+        opaque_bytes: usize,
+    ) -> Entry<ConfigRaftTypeConfig> {
+        let tx_id = opc_types::TxId::new();
+        let version = ConfigVersion::new(index);
+        let committed_at = opc_types::Timestamp::now_utc();
+        let principal = "spiffe://test.example/tenant/tenant-a/ns/core/sa/config".to_owned();
+        let schema_digest = SchemaDigest::from_bytes([request_byte; 32]);
+        let key_id = KeyId::new("config-bounded-log-read").expect("key ID");
+        let aad = EnvelopeAad::config(
+            TenantId::from_static("tenant-a"),
+            version.get(),
+            ConfigAad::new(
+                tx_id,
+                None,
+                committed_at,
+                &principal,
+                schema_digest,
+                "running",
+            )
+            .expect("config AAD"),
+        );
+        let mut ciphertext_and_tag = vec![request_byte; opaque_bytes];
+        ciphertext_and_tag.extend_from_slice(&[0xa5; AEAD_TAG_LEN]);
+        let encrypted_blob = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![0x42; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag,
+        }
+        .encode()
+        .expect("config envelope");
+        let record = CommitRecord {
+            tx_id,
+            parent_tx_id: None,
+            version,
+            committed_at,
+            principal,
+            source: CommitSource::Gnmi,
+            schema_digest,
+            plaintext_digest: vec![request_byte; 32],
+            encrypted_blob,
+            rollback_point: false,
+            confirmed_deadline: None,
+        };
+        let prepared = PreparedConfigCommit::prepare(record, Vec::new(), &shared_audit_key())
+            .expect("prepared config commit");
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(ConfigConsensusCommand {
+                schema_version: CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity: identity(),
+                request_id: ConfigConsensusRequestId::from_bytes([request_byte; 16]),
+                logical_time: committed_at,
+                intent: ConfigMutationIntent::AppendCommit(Box::new(prepared)),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn limited_log_reads_are_nonempty_gap_free_and_byte_bounded() {
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let backend = SqliteBackend::open_with_audit_key(
+            temp.path().join("config.sqlite"),
+            true,
+            0,
+            shared_audit_key(),
+        )
+        .await
+        .expect("config backend");
+        let (mut log_store, _, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("config consensus storage");
+        let entries = [
+            membership_entry(),
+            large_mutation_entry(1, 11, 600 * 1024),
+            large_mutation_entry(2, 12, 600 * 1024),
+            large_mutation_entry(
+                3,
+                13,
+                opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES + 64 * 1024,
+            ),
+        ];
+        {
+            let conn = backend.conn();
+            let conn = conn.lock().await;
+            sqlite::append_logs_sync(&conn, identity(), &members(), &entries)
+                .expect("append bounded-read fixtures");
+        }
+
+        let full = log_store
+            .try_get_log_entries(1..4)
+            .await
+            .expect("full read remains unbounded by replication budget");
+        assert_eq!(
+            full.iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        for (start, expected) in [(1, 1), (2, 2), (3, 3)] {
+            let page = log_store
+                .limited_get_log_entries(start, 4)
+                .await
+                .expect("nonempty limited page");
+            assert_eq!(
+                page.iter()
+                    .map(|entry| entry.log_id.index)
+                    .collect::<Vec<_>>(),
+                vec![expected]
+            );
+        }
+        assert!(log_store.limited_get_log_entries(4, 5).await.is_err());
     }
 
     async fn snapshot_file_name(backend: &SqliteBackend) -> String {

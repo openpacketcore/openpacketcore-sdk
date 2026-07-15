@@ -402,9 +402,13 @@ and the exact test canary bytes remain absent from SQLite/WAL/SHM. This is
 MemoryKeyProvider wrapper evidence, not remote-HKMS or deployed evidence. The
 immutable v1 candidate schema and the broader profile deliberately retain
 `counts_for_seamless_tls_rotation = false` and `qualification_complete = false`.
-Unavailable-member plus malformed reload, expiry, partition/restart, concurrent
-mixed traffic/watch/restore, drain-deadline/reconnect-storm/resource/soak,
-deployed-network, and signed independent evidence remain open under #164/#143.
+The non-ignored single-host 3/5-process slice now covers one unavailable member
+plus a different member's malformed retained-last-good reload, short-lived-SVID
+expiry/hard drain, exact-address watcher restart/catch-up, and bounded mixed
+mutation/read/watch/restore/readiness traffic. Real network/storage partitions,
+active-mutator crash/restart, broader fault and reconnect-storm matrices,
+deployed resource/soak, remote-HKMS, deployed-network, and signed independent
+evidence remain open under #164/#143.
 #159 implements ordinary
 response/watch frame and write-deadline enforcement plus transaction-ID wire
 containment. #167 now supplies the production `StableId` model, bounded Serde,

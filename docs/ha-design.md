@@ -33,11 +33,20 @@ freshly from `[5,000 ms, 8,000 ms)`; InstallSnapshot, forwarded mutation,
 consumer ReadBarrier, and the operation default are 10,000 ms. Listener
 idle/handler ceilings are 30,000 ms. A fresh connection has a contained
 1,500 ms DNS/TCP/mTLS/bootstrap cap inside its already-running family deadline,
-never in addition to it. The engine profile also uses one-entry replication
-payloads, a 4,096-log snapshot trigger, 1 MiB snapshot chunks, and 1,024 retained
-applied logs. Domain adapters select only their cluster label. These are
-code-path constants, not operator tuning knobs and not proof that the
-experimental profile meets #143 under deployed load.
+never in addition to it. The engine profile admits at most 64 log entries per
+replication payload. Limited readers retain the longest ordered entry prefix
+within a 1 MiB soft entry-section target; the first entry is retained alone
+when it exceeds that soft target so replication can still make progress,
+provided the complete singleton remains within the 2 MiB hard codec ceiling.
+Every complete private consensus RPC remains subject to that hard ceiling.
+The profile also uses a 4,096-log snapshot trigger, 1 MiB snapshot chunks, and
+1,024 retained applied logs. Both domain adapters also share one fixed
+eight-slot proposal-admission profile. A slot is acquired within the original
+operation deadline; after `client_write_ff` accepts a proposal, a detached
+supervisor holds its slot until the exact result resolves across caller
+cancellation or timeout. Domain adapters select only their cluster label.
+These are code-path constants, not operator tuning knobs and not proof that
+the experimental profile meets #143 under deployed load.
 
 The workspace temporarily exact-pins `openpacketcore/openraft` revision
 `f607e636406b16bd0ad7925dbb631da1b7a4cd96`. Registry 0.9.24 reuses a sampled
@@ -257,8 +266,9 @@ admission evidence only. `QuorumSessionStore::probe_durable_readiness` bypasses
 cached capabilities and invokes Openraft's bounded linearizable-read barrier,
 then waits until the local state machine has applied through that log ID.
 `Ready` therefore proves the same fresh quorum path required by real reads, not
-merely that a listener was bound. Writes use bounded `client_write`; reads use
-the barrier every time and never trust a prior readiness result.
+merely that a listener was bound. Writes use `client_write_ff` under the shared
+eight-slot supervised admission bound; reads use the barrier every time and
+never trust a prior readiness result.
 
 The report remains point-in-time evidence rather than an ownership lease.
 Products must continuously close ownership publication and traffic

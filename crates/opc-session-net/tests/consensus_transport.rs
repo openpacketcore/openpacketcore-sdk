@@ -45,6 +45,7 @@ const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
         .saturating_mul(2)
         .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
 );
+const CONSENSUS_CACHED_LANES_PER_PEER: usize = 2;
 
 // Each scenario below starts a complete Openraft fleet in its own Tokio
 // runtime. Running those fleets concurrently is artificial and can starve
@@ -864,15 +865,25 @@ impl RotatingConsensusFleet {
             let sender = self.replicas[path.0];
             async move {
                 let deadline = tokio::time::Instant::now() + DURABLE_CONSENSUS_OPERATION_TIMEOUT;
-                let mut unavailable_seen = false;
+                let mut stale_lanes_seen = 0usize;
                 let outcome = loop {
                     match peer.call(request(&manifest, sender, Vec::new())).await {
                         Ok(response) if resolver_calls.load(Ordering::SeqCst) > baseline => {
                             break Ok(response);
                         }
                         Ok(_) => {}
-                        Err(SessionConsensusPeerError::Unavailable) if !unavailable_seen => {
-                            unavailable_seen = true;
+                        // A remote-only material change cannot be observed by
+                        // this client's lifecycle watcher. Both fixed cached
+                        // lanes may therefore discover the peer retirement as
+                        // an EOF before the next call performs a fresh
+                        // handshake. This qualification-only empty Vote probe
+                        // may consume each stale lane once; production RPCs
+                        // must never transparently replay an uncertain call.
+                        Err(SessionConsensusPeerError::Unavailable)
+                            if resolver_calls.load(Ordering::SeqCst) == baseline
+                                && stale_lanes_seen < CONSENSUS_CACHED_LANES_PER_PEER =>
+                        {
+                            stale_lanes_seen += 1;
                         }
                         Err(error) => break Err(error),
                     }
@@ -886,15 +897,15 @@ impl RotatingConsensusFleet {
                     outcome,
                     baseline,
                     resolver_calls.load(Ordering::SeqCst),
-                    unavailable_seen,
+                    stale_lanes_seen,
                 )
             }
         }))
         .await;
-        for (path, outcome, baseline, resolutions, unavailable_seen) in outcomes {
+        for (path, outcome, baseline, resolutions, stale_lanes_seen) in outcomes {
             assert!(
                 outcome.is_ok(),
-                "fresh bidirectional rotation handshake failed: path={path:?}, outcome={outcome:?}, baseline={baseline}, resolutions={resolutions}, unavailable_seen={unavailable_seen}"
+                "fresh bidirectional rotation handshake failed: path={path:?}, outcome={outcome:?}, baseline={baseline}, resolutions={resolutions}, stale_lanes_seen={stale_lanes_seen}"
             );
             assert!(
                 resolutions > baseline,
@@ -1183,6 +1194,22 @@ impl SessionConsensusRpcHandler for EchoHandler {
     }
 }
 
+#[derive(Debug)]
+struct UnavailableHandler;
+
+#[async_trait]
+impl SessionConsensusRpcHandler for UnavailableHandler {
+    async fn handle(
+        &self,
+        _authenticated_sender: opc_session_store::SessionConsensusNodeId,
+        _request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        SessionConsensusWireResponse {
+            result: Err(SessionConsensusPeerError::Unavailable),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct CountingEchoHandler {
     calls: AtomicUsize,
@@ -1230,6 +1257,141 @@ impl SessionConsensusRpcHandler for LifecycleEchoHandler {
             result: Ok(request.payload),
         }
     }
+}
+
+#[derive(Debug)]
+struct StallEveryCallHandler {
+    calls: AtomicUsize,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+impl Default for StallEveryCallHandler {
+    fn default() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for StallEveryCallHandler {
+    async fn handle(
+        &self,
+        _authenticated_sender: opc_session_store::SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        self.release
+            .acquire()
+            .await
+            .expect("test release semaphore remains open")
+            .forget();
+        SessionConsensusWireResponse {
+            result: Ok(request.payload),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SelectiveStallHandler {
+    calls: AtomicUsize,
+    cancelled_started: tokio::sync::Notify,
+    cancelled_release: tokio::sync::Semaphore,
+    primary_hold_started: tokio::sync::Notify,
+    primary_hold_release: tokio::sync::Semaphore,
+}
+
+impl Default for SelectiveStallHandler {
+    fn default() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            cancelled_started: tokio::sync::Notify::new(),
+            cancelled_release: tokio::sync::Semaphore::new(0),
+            primary_hold_started: tokio::sync::Notify::new(),
+            primary_hold_release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for SelectiveStallHandler {
+    async fn handle(
+        &self,
+        _authenticated_sender: opc_session_store::SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match request.payload.as_slice() {
+            b"cancel-primary" => {
+                self.cancelled_started.notify_one();
+                self.cancelled_release
+                    .acquire()
+                    .await
+                    .expect("test release semaphore remains open")
+                    .forget();
+            }
+            b"hold-primary" => {
+                self.primary_hold_started.notify_one();
+                self.primary_hold_release
+                    .acquire()
+                    .await
+                    .expect("test release semaphore remains open")
+                    .forget();
+            }
+            _ => {}
+        }
+        SessionConsensusWireResponse {
+            result: Ok(request.payload),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PairBarrierHandler {
+    calls: AtomicUsize,
+    barrier: tokio::sync::Barrier,
+}
+
+impl PairBarrierHandler {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            barrier: tokio::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for PairBarrierHandler {
+    async fn handle(
+        &self,
+        _authenticated_sender: opc_session_store::SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.barrier.wait().await;
+        SessionConsensusWireResponse {
+            result: Ok(request.payload),
+        }
+    }
+}
+
+async fn wait_for_handler_calls(
+    calls: &AtomicUsize,
+    started: &tokio::sync::Notify,
+    expected: usize,
+) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) < expected {
+            started.notified().await;
+        }
+    })
+    .await
+    .expect("expected consensus handler calls");
 }
 
 async fn start_server(
@@ -1292,8 +1454,85 @@ fn request_for_family(
     .expect("bounded request")
 }
 
+async fn assert_consensus_call_pair(
+    peer: &RemoteSessionConsensusPeer,
+    manifest: &Arc<SessionReplicationManifest>,
+    first_payload: &'static [u8],
+    second_payload: &'static [u8],
+) {
+    let first = peer.call(request_for_family(
+        manifest,
+        1,
+        SessionConsensusRpcFamily::AppendEntries,
+        first_payload.to_vec(),
+    ));
+    let second = peer.call(request_for_family(
+        manifest,
+        1,
+        SessionConsensusRpcFamily::AppendEntries,
+        second_payload.to_vec(),
+    ));
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(
+        first,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(first_payload.to_vec()),
+        })
+    );
+    assert_eq!(
+        second,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(second_payload.to_vec()),
+        })
+    );
+}
+
+type ConsensusCallTask =
+    tokio::task::JoinHandle<Result<SessionConsensusWireResponse, SessionConsensusPeerError>>;
+
+fn spawn_consensus_call_pair(
+    peer: &RemoteSessionConsensusPeer,
+    manifest: &Arc<SessionReplicationManifest>,
+    first_payload: &'static [u8],
+    second_payload: &'static [u8],
+) -> (ConsensusCallTask, ConsensusCallTask) {
+    let spawn = |payload: &'static [u8]| {
+        let peer = peer.clone();
+        let request = request_for_family(
+            manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            payload.to_vec(),
+        );
+        tokio::spawn(async move { peer.call(request).await })
+    };
+    (spawn(first_payload), spawn(second_payload))
+}
+
+async fn assert_consensus_call_tasks(
+    first: tokio::task::JoinHandle<Result<SessionConsensusWireResponse, SessionConsensusPeerError>>,
+    second: tokio::task::JoinHandle<
+        Result<SessionConsensusWireResponse, SessionConsensusPeerError>,
+    >,
+    first_payload: &'static [u8],
+    second_payload: &'static [u8],
+) {
+    assert_eq!(
+        first.await.expect("first consensus call join"),
+        Ok(SessionConsensusWireResponse {
+            result: Ok(first_payload.to_vec()),
+        })
+    );
+    assert_eq!(
+        second.await.expect("second consensus call join"),
+        Ok(SessionConsensusWireResponse {
+            result: Ok(second_payload.to_vec()),
+        })
+    );
+}
+
 #[tokio::test]
-async fn authenticated_consensus_calls_reuse_one_manifest_bound_connection() {
+async fn authenticated_consensus_calls_reuse_the_primary_pool_lane() {
     let pki = TestPki::new();
     let manifest = manifest("cluster-a", 7, 1);
     let (handle, addr) = start_server(&pki, &manifest, Duration::ZERO).await;
@@ -1334,10 +1573,297 @@ async fn authenticated_consensus_calls_reuse_one_manifest_bound_connection() {
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
         1,
-        "the second validated RPC must reuse the sole resolver/TCP/mTLS/bootstrap path"
+        "sequential validated RPCs must reuse the primary resolver/TCP/mTLS/bootstrap path"
     );
 
     handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn stalled_append_entries_uses_the_overflow_pool_lane() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-overflow-lane", 7, 1);
+    let handler = Arc::new(LifecycleEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("consensus overflow listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("server binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(2)),
+    );
+
+    let primary = tokio::spawn({
+        let peer = peer.clone();
+        let request = request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"stalled-primary".to_vec(),
+        );
+        async move { peer.call(request).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), handler.first_started.notified())
+        .await
+        .expect("primary AppendEntries entered handler");
+
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            peer.call(request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::AppendEntries,
+                b"overflow-completes".to_vec(),
+            )),
+        )
+        .await
+        .expect("overflow AppendEntries completed before primary release"),
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"overflow-completes".to_vec()),
+        })
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+
+    handler.first_release.notify_one();
+    assert_eq!(
+        primary.await.expect("primary call join"),
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"stalled-primary".to_vec()),
+        })
+    );
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn two_stalled_pool_lanes_bound_a_third_call_before_dispatch() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-two-lane-bound", 7, 1);
+    let handler = Arc::new(StallEveryCallHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("consensus two-lane listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("server binding"),
+        counted_resolver,
+        pki.client_config(1),
+    );
+    let stalled_call = |payload: &'static [u8]| {
+        let peer = peer.clone();
+        let request = request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::Vote,
+            payload.to_vec(),
+        );
+        tokio::spawn(async move { peer.call(request).await })
+    };
+    let primary = stalled_call(b"stalled-primary");
+    let overflow = stalled_call(b"stalled-overflow");
+    wait_for_handler_calls(&handler.calls, &handler.started, 2).await;
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+
+    assert_eq!(
+        peer.call(request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"must-not-dispatch".to_vec(),
+        ))
+        .await,
+        Err(SessionConsensusPeerError::Timeout)
+    );
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "waiting for a bounded lane must not resolve or open a third connection"
+    );
+
+    handler.release.add_permits(2);
+    assert!(primary.await.expect("primary call join").is_ok());
+    assert!(overflow.await.expect("overflow call join").is_ok());
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_lane_waiter_does_not_lose_released_capacity() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-cancelled-lane-waiter", 7, 1);
+    let handler = Arc::new(StallEveryCallHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("cancelled lane waiter listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("server binding"),
+        counted_resolver,
+        pki.client_config(1),
+    );
+    let stalled_call = |payload: &'static [u8]| {
+        let peer = peer.clone();
+        let request = request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::Vote,
+            payload.to_vec(),
+        );
+        tokio::spawn(async move { peer.call(request).await })
+    };
+    let mut first = stalled_call(b"first-occupied-lane");
+    let mut second = stalled_call(b"second-occupied-lane");
+    wait_for_handler_calls(&handler.calls, &handler.started, 2).await;
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+
+    let waiter_queued = Arc::new(tokio::sync::Notify::new());
+    let queued = tokio::spawn({
+        let peer = peer.clone();
+        let manifest = Arc::clone(&manifest);
+        let waiter_queued = Arc::clone(&waiter_queued);
+        async move {
+            let mut call = Box::pin(peer.call(request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::Vote,
+                b"cancelled-while-queued".to_vec(),
+            )));
+            futures_util::future::poll_fn(|context| {
+                match std::future::Future::poll(call.as_mut(), context) {
+                    std::task::Poll::Pending => std::task::Poll::Ready(()),
+                    std::task::Poll::Ready(outcome) => {
+                        panic!("queued waiter completed before a lane was available: {outcome:?}")
+                    }
+                }
+            })
+            .await;
+            waiter_queued.notify_one();
+            call.await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), waiter_queued.notified())
+        .await
+        .expect("third call entered the lane wait queue");
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    queued.abort();
+    assert!(queued
+        .await
+        .expect_err("queued waiter must be cancelled")
+        .is_cancelled());
+
+    handler.release.add_permits(1);
+    let first_finished = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            outcome = &mut first => {
+                assert_eq!(outcome.expect("first lane join"), Ok(SessionConsensusWireResponse {
+                    result: Ok(b"first-occupied-lane".to_vec()),
+                }));
+                true
+            }
+            outcome = &mut second => {
+                assert_eq!(outcome.expect("second lane join"), Ok(SessionConsensusWireResponse {
+                    result: Ok(b"second-occupied-lane".to_vec()),
+                }));
+                false
+            }
+        }
+    })
+    .await
+    .expect("exactly one occupied lane was released");
+
+    let recovered = tokio::spawn({
+        let peer = peer.clone();
+        let request = request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::Vote,
+            b"after-queued-cancellation".to_vec(),
+        );
+        async move { peer.call(request).await }
+    });
+    wait_for_handler_calls(&handler.calls, &handler.started, 3).await;
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "the recovered call must reuse the released lane without opening a third socket"
+    );
+
+    handler.release.add_permits(2);
+    assert_eq!(
+        recovered.await.expect("recovered call join"),
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"after-queued-cancellation".to_vec()),
+        })
+    );
+    if first_finished {
+        assert_eq!(
+            second.await.expect("remaining second lane join"),
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"second-occupied-lane".to_vec()),
+            })
+        );
+    } else {
+        assert_eq!(
+            first.await.expect("remaining first lane join"),
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"first-occupied-lane".to_vec()),
+            })
+        );
+    }
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    server.abort_and_wait().await;
 }
 
 #[tokio::test]
@@ -1462,6 +1988,11 @@ async fn profiled_long_rpc_families_are_not_truncated_by_the_append_deadline() {
             }),
             "{family:?} must retain its family deadline above two seconds"
         );
+        assert_eq!(
+            resolutions.load(Ordering::SeqCst),
+            2,
+            "{family:?} unexpectedly replaced the authenticated connection"
+        );
     }
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
@@ -1473,10 +2004,18 @@ async fn profiled_long_rpc_families_are_not_truncated_by_the_append_deadline() {
 }
 
 #[tokio::test]
-async fn consensus_reauthentication_and_material_epochs_each_replace_the_cached_connection_once() {
+async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lanes() {
     let pki = TestPki::new();
     let manifest = manifest("consensus-cached-rotation", 8, 1);
-    let (handle, addr) = start_server(&pki, &manifest, Duration::ZERO).await;
+    let handler = Arc::new(PairBarrierHandler::new());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (handle, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("rotating two-lane consensus listener");
     let (client_tx, client_rx) = tokio::sync::watch::channel(Some(pki.identity_state(1)));
     let client_config = TlsConfigBuilder::new(client_rx)
         .allow_any_trusted_peer()
@@ -1503,58 +2042,267 @@ async fn consensus_reauthentication_and_material_epochs_each_replace_the_cached_
     )
     .with_reauthentication_control(reauthentication.clone());
 
-    for payload in [b"initial".as_slice(), b"initial-reuse"] {
-        assert_eq!(
-            peer.call(request(&manifest, 1, payload.to_vec())).await,
-            Ok(SessionConsensusWireResponse {
-                result: Ok(payload.to_vec()),
-            })
-        );
-    }
-    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+    assert_consensus_call_pair(&peer, &manifest, b"initial-primary", b"initial-overflow").await;
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
 
     reauthentication
         .request_reauthentication()
         .expect("request explicit consensus reauthentication");
-    for payload in [b"after-explicit".as_slice(), b"explicit-reuse"] {
-        assert_eq!(
-            peer.call(request(&manifest, 1, payload.to_vec())).await,
-            Ok(SessionConsensusWireResponse {
-                result: Ok(payload.to_vec()),
-            })
-        );
-    }
+    assert_consensus_call_pair(&peer, &manifest, b"explicit-primary", b"explicit-overflow").await;
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
-        2,
-        "one explicit generation change must create exactly one replacement"
+        4,
+        "one explicit generation change must replace both established lanes"
     );
 
     let previous_epoch = client_config.material_status().epoch();
     client_tx.send_replace(Some(pki.identity_state(1)));
     wait_for_material_epoch_change(|| client_config.material_status(), previous_epoch).await;
-    for payload in [b"after-material".as_slice(), b"material-reuse"] {
-        assert_eq!(
-            peer.call(request(&manifest, 1, payload.to_vec())).await,
-            Ok(SessionConsensusWireResponse {
-                result: Ok(payload.to_vec()),
-            })
-        );
-    }
+    assert_consensus_call_pair(&peer, &manifest, b"material-primary", b"material-overflow").await;
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
-        3,
-        "one admitted material epoch change must create exactly one replacement"
+        6,
+        "one admitted material epoch change must replace both established lanes"
     );
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 6);
 
     handle.abort_and_wait().await;
 }
 
 #[tokio::test]
-async fn cancelled_consensus_rpc_drops_its_taken_connection_before_the_next_call() {
+async fn both_consensus_lanes_rotate_across_real_mtls_trust_cutover() {
+    let manifest = manifest("consensus-two-lane-trust-cutover", 8, 1);
+    let old_root = RotationRoot::new("two-lane old");
+    let new_root = RotationRoot::new("two-lane new");
+    let old_intermediate = old_root.issue_intermediate("two-lane old");
+    let new_intermediate = new_root.issue_intermediate("two-lane new");
+    let old_client_leaf = old_intermediate.issue_leaf(1);
+    let old_server_leaf = old_intermediate.issue_leaf(SERVER_REPLICA);
+    let new_client_leaf = new_intermediate.issue_leaf(1);
+    let new_server_leaf = new_intermediate.issue_leaf(SERVER_REPLICA);
+    let old_only = [&old_root];
+    let overlap = [&old_root, &new_root];
+    let new_only = [&new_root];
+
+    let old_client_with_overlap = old_client_leaf.identity_state(&old_intermediate, &overlap);
+    let old_server_with_overlap = old_server_leaf.identity_state(&old_intermediate, &overlap);
+    let client_material =
+        RotatingNodeMaterial::new(old_client_leaf.identity_state(&old_intermediate, &old_only));
+    let server_material =
+        RotatingNodeMaterial::new(old_server_leaf.identity_state(&old_intermediate, &old_only));
+    let lifecycle = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        Duration::from_millis(1),
+        Duration::from_millis(20),
+        Duration::ZERO,
+    )
+    .expect("two-lane rotation lifecycle policy");
+    let handler = Arc::new(StallEveryCallHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), server_material.server.clone(), binding)
+            .with_connection_lifecycle(lifecycle)
+            .with_reauthentication_control(server_material.reauthentication.clone())
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("two-lane trust cutover listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let remote_binding = manifest
+        .bind_local(replica_id(1))
+        .expect("client binding")
+        .bind_remote(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        remote_binding.clone(),
+        counted_resolver,
+        client_material.client.clone(),
+        Some(Duration::from_secs(2)),
+    )
+    .with_connection_lifecycle(lifecycle)
+    .with_reauthentication_control(client_material.reauthentication.clone());
+
+    let (old_primary, old_overflow) =
+        spawn_consensus_call_pair(&peer, &manifest, b"old-primary", b"old-overflow");
+    wait_for_handler_calls(&handler.calls, &handler.started, 2).await;
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+
+    tokio::join!(
+        client_material.publish(old_client_with_overlap.clone()),
+        server_material.publish(old_server_with_overlap.clone()),
+    );
+    handler.release.add_permits(2);
+    assert_consensus_call_tasks(old_primary, old_overflow, b"old-primary", b"old-overflow").await;
+
+    let (overlap_old_primary, overlap_old_overflow) = spawn_consensus_call_pair(
+        &peer,
+        &manifest,
+        b"overlap-old-primary",
+        b"overlap-old-overflow",
+    );
+    wait_for_handler_calls(&handler.calls, &handler.started, 4).await;
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        4,
+        "adding overlap trust must retire and replace both old-only lanes"
+    );
+    handler.release.add_permits(2);
+    assert_consensus_call_tasks(
+        overlap_old_primary,
+        overlap_old_overflow,
+        b"overlap-old-primary",
+        b"overlap-old-overflow",
+    )
+    .await;
+
+    tokio::join!(
+        client_material.publish(new_client_leaf.identity_state(&new_intermediate, &overlap)),
+        server_material.publish(new_server_leaf.identity_state(&new_intermediate, &overlap)),
+    );
+    let (new_chain_primary, new_chain_overflow) = spawn_consensus_call_pair(
+        &peer,
+        &manifest,
+        b"new-chain-primary",
+        b"new-chain-overflow",
+    );
+    wait_for_handler_calls(&handler.calls, &handler.started, 6).await;
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        6,
+        "both replacement lanes must authenticate the new chain during overlap"
+    );
+    handler.release.add_permits(2);
+    assert_consensus_call_tasks(
+        new_chain_primary,
+        new_chain_overflow,
+        b"new-chain-primary",
+        b"new-chain-overflow",
+    )
+    .await;
+
+    tokio::join!(
+        client_material.publish(new_client_leaf.identity_state(&new_intermediate, &new_only)),
+        server_material.publish(new_server_leaf.identity_state(&new_intermediate, &new_only)),
+    );
+    let (new_only_primary, new_only_overflow) =
+        spawn_consensus_call_pair(&peer, &manifest, b"new-only-primary", b"new-only-overflow");
+    wait_for_handler_calls(&handler.calls, &handler.started, 8).await;
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        8,
+        "both lanes must remain available after old trust is removed"
+    );
+    handler.release.add_permits(2);
+    assert_consensus_call_tasks(
+        new_only_primary,
+        new_only_overflow,
+        b"new-only-primary",
+        b"new-only-overflow",
+    )
+    .await;
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 8);
+
+    let old_client_config =
+        TlsConfigBuilder::new(tokio::sync::watch::channel(Some(old_client_with_overlap)).1)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("old-chain probe client");
+    let old_client_resolutions = Arc::new(AtomicUsize::new(0));
+    let old_client_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&old_client_resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let old_client_peer = RemoteSessionConsensusPeer::new_with_resolver(
+        remote_binding.clone(),
+        old_client_resolver,
+        old_client_config,
+        Some(Duration::from_secs(1)),
+    )
+    .with_connection_lifecycle(single_attempt_removed_root_probe_lifecycle());
+    let dispatches_before = handler.calls.load(Ordering::SeqCst);
+    let old_client_outcome = old_client_peer
+        .call(request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::Vote,
+            b"removed-old-client-chain".to_vec(),
+        ))
+        .await;
+    assert!(
+        matches!(
+            old_client_outcome,
+            Err(SessionConsensusPeerError::Authentication | SessionConsensusPeerError::Timeout)
+        ),
+        "new-only server trust must reject the removed old client chain: {old_client_outcome:?}"
+    );
+    assert_eq!(old_client_resolutions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        dispatches_before,
+        "the removed old client chain must fail before consensus dispatch"
+    );
+
+    let old_server_config =
+        TlsConfigBuilder::new(tokio::sync::watch::channel(Some(old_server_with_overlap)).1)
+            .allow_any_trusted_peer()
+            .build_authenticated_server_config()
+            .expect("old-chain probe server");
+    let old_server_handler = Arc::new(CountingEchoHandler::default());
+    let (old_server, old_server_addr) = SessionConsensusServer::new(
+        old_server_handler.clone(),
+        old_server_config,
+        manifest
+            .bind_local(replica_id(SERVER_REPLICA))
+            .expect("old-chain server binding"),
+    )
+    .listen("127.0.0.1:0".parse().expect("old-chain listen address"))
+    .await
+    .expect("old-chain probe listener");
+    let old_server_peer = RemoteSessionConsensusPeer::new_with_resolver(
+        remote_binding,
+        resolver(old_server_addr),
+        client_material.client.clone(),
+        Some(Duration::from_secs(1)),
+    );
+    assert_eq!(
+        old_server_peer
+            .call(request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::Vote,
+                b"removed-old-server-chain".to_vec(),
+            ))
+            .await,
+        Err(SessionConsensusPeerError::Authentication),
+        "new-only client trust must reject the removed old server chain"
+    );
+    assert_eq!(
+        old_server_handler.calls.load(Ordering::SeqCst),
+        0,
+        "the removed old server chain must fail before consensus dispatch"
+    );
+
+    old_server.abort_and_wait().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn cancelled_consensus_lane_is_replaced_without_evicting_the_other_lane() {
     let pki = TestPki::new();
     let manifest = manifest("consensus-cancelled-call", 9, 1);
-    let handler = Arc::new(LifecycleEchoHandler::default());
+    let handler = Arc::new(SelectiveStallHandler::default());
     let binding = manifest
         .bind_local(replica_id(SERVER_REPLICA))
         .expect("server binding");
@@ -1584,12 +2332,32 @@ async fn cancelled_consensus_rpc_drops_its_taken_connection_before_the_next_call
 
     let cancelled = tokio::spawn({
         let peer = peer.clone();
-        let request = request(&manifest, 1, b"cancelled".to_vec());
+        let request = request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"cancel-primary".to_vec(),
+        );
         async move { peer.call(request).await }
     });
-    tokio::time::timeout(Duration::from_secs(1), handler.first_started.notified())
+    tokio::time::timeout(Duration::from_secs(1), handler.cancelled_started.notified())
         .await
         .expect("cancelled call entered the handler");
+
+    assert_eq!(
+        peer.call(request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"establish-overflow".to_vec(),
+        ))
+        .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"establish-overflow".to_vec()),
+        })
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+
     cancelled.abort();
     assert!(cancelled
         .await
@@ -1597,18 +2365,61 @@ async fn cancelled_consensus_rpc_drops_its_taken_connection_before_the_next_call
         .is_cancelled());
 
     assert_eq!(
-        peer.call(request(&manifest, 1, b"after-cancel".to_vec()))
-            .await,
+        peer.call(request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"replace-primary".to_vec(),
+        ))
+        .await,
         Ok(SessionConsensusWireResponse {
-            result: Ok(b"after-cancel".to_vec()),
+            result: Ok(b"replace-primary".to_vec()),
         })
     );
     assert_eq!(
         resolutions.load(Ordering::SeqCst),
-        2,
-        "a cancelled in-flight RPC must not return its ambiguous socket to the slot"
+        3,
+        "only the cancelled primary lane must perform a replacement handshake"
     );
-    handler.first_release.notify_one();
+
+    let held_primary = tokio::spawn({
+        let peer = peer.clone();
+        let request = request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"hold-primary".to_vec(),
+        );
+        async move { peer.call(request).await }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        handler.primary_hold_started.notified(),
+    )
+    .await
+    .expect("replacement primary entered handler");
+    assert_eq!(
+        peer.call(request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"reuse-overflow".to_vec(),
+        ))
+        .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"reuse-overflow".to_vec()),
+        })
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        3,
+        "the unaffected overflow lane must remain reusable without reconnect"
+    );
+
+    handler.primary_hold_release.add_permits(1);
+    assert!(held_primary.await.expect("held primary join").is_ok());
+    handler.cancelled_release.add_permits(1);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 5);
     server.abort_and_wait().await;
 }
 
@@ -1887,6 +2698,57 @@ async fn cached_consensus_connection_retires_at_the_finite_soft_lifecycle_bound(
         resolutions.load(Ordering::SeqCst),
         2,
         "the replacement remains the only cached connection after the original hard bound"
+    );
+
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn correlated_unavailable_response_reuses_the_authenticated_connection() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-correlated-unavailable", 12, 1);
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) = SessionConsensusServer::new(
+        Arc::new(UnavailableHandler),
+        pki.server_config(SERVER_REPLICA),
+        binding,
+    )
+    .listen("127.0.0.1:0".parse().expect("listen address"))
+    .await
+    .expect("consensus unavailable listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(2)),
+    );
+
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        assert_eq!(
+            peer.call(request(&manifest, 1, payload.to_vec())).await,
+            Ok(SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Unavailable),
+            })
+        );
+    }
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "a complete correlated Unavailable response must not create a TLS reconnect storm"
     );
 
     server.abort_and_wait().await;

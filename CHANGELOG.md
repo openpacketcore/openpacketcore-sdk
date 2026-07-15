@@ -34,11 +34,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hard-deadline drain, source/controller `LastGoodExpired`, a zero SVID-expiry
   gauge, one expiry outcome, survivor readiness, and encrypted-canary progress.
   A valid long-lived leaf restores every directed path and all-voter readiness
-  in the same process. These are synthetic regression scenarios, not a real or
-  deployed network partition; they run no mixed traffic/watch/restore workload
-  and provide no broader restart/fault matrix, resource/soak, remote-HKMS,
-  deployed-CNF, signed-release, evidence-schema, or profile claim. Openraft
-  remains the sole commit authority, and payload encryption, AAD,
+  in the same process. Deterministic encrypted lease/renew/CAS/read/complete-
+  restore/readiness mutations and applied-state watches run through admission
+  loss, retained-last-good trust, exact-address restart, repair, and the
+  short-lived publication. The expiring member drains its accepted mutation
+  work and stops its watch before soft retirement while the survivor workload
+  continues through soft retirement and hard expiry; replacement reconciles
+  the stopped watch from the bounded durable journal. A mutation task may
+  reconcile only typed backend-unavailable or operation-outcome-unavailable
+  terminal results: it reacquires same-owner authority at a strictly higher
+  fence and validates the exact scheduled record before continuing. The
+  schedule deterministically drops one successful release response to exercise
+  this path, permits at most eight such outcomes per node, gives each recovery
+  episode 8 seconds, retries only after a fixed 50 ms delay, and exposes total,
+  recovered, and maximum-consecutive counters. Phase completion requires every
+  interruption to be reconciled; lease loss, unexpected state, and invariant
+  failures still fail immediately. The exact-address
+  restarted member is watcher-only before exit and enters the mutator set only
+  after that reconciliation, so active-mutator crash/restart is not qualified.
+  These are synthetic regression scenarios, not a real or deployed network
+  partition, and provide no broader restart/fault matrix, resource/soak,
+  remote-HKMS, deployed-CNF, signed-release, evidence-schema, or profile claim.
+  Openraft remains the sole commit authority, and payload encryption, AAD,
   key-provider/HKMS boundaries, SQLite/Openraft durable formats, and
   encryption-at-rest responsibilities are unchanged.
 - **Experimental projected-mTLS traffic/resource qualification —
@@ -63,29 +80,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounds, alongside connection/drain/reconnect and qualification-owned async
   task bounds. Authenticated next-request idle expiry is a fixed lifecycle
   retirement reason rather than a false timeout failure; real timeout and all
-  other connection failures retain a zero budget. The 90-second transition
-  value is only a hard fail-safe;
+  other connection failures retain a zero budget. The exact schedule digest
+  additionally binds the shared eight-slot per-node Openraft proposal-admission
+  limit, exactly one supervisor-owned fresh-linearizability check per node,
+  and at most 64 total admitted callers across its active and waiting cohorts.
+  Proposal slots and the linearizability
+  supervisor bound task/memory pipelines, not connections;
+  neither enlarges the explicit socket/FD formulas. Parent-side timeout,
+  malformed-response, and EOF diagnostics retain only a closed pending-command
+  kind, harness-local sequence, elapsed send time, and closed stderr category;
+  command values, session/lease identities, payloads, and filesystem paths are
+  omitted. Cooperative task-stop replies reuse the last successfully proven
+  linearizable replication head instead of launching a new backend operation
+  after task join; subsequent recovery still requires fresh bounded journal
+  reconciliation. The 90-second transition value is only a hard fail-safe;
   semantic completion ends each transition. These single-host synthetic bounds
   are regression evidence, not deployed Kubernetes/platform sizing, soak, or
   signed release evidence. Openraft remains the sole commit authority, and the
   `EncryptingSessionBackend`/key-provider/HKMS boundary and durable formats are
   unchanged.
 - **Experimental HA transport hardening — `opc-session-net`:** each directed
-  `RemoteSessionConsensusPeer` now retains at most one authenticated connection
-  behind its existing one-call gate. A socket returns to that sole slot only
-  after a complete, correctly correlated, validated successful consensus
-  response; a typed failed response, cancellation, timeout, EOF, bad
-  framing/protocol/authentication, lifecycle
-  retirement, or admitted generation/material mismatch leaves it evicted.
-  Healthy Openraft heartbeats therefore reuse one DNS/TCP/mTLS/bootstrap path
-  without adding multiplexing or another authority, while every replacement
-  repeats the complete admission sequence. `opc-consensus` now owns the one
-  fixed complete-call timing profile used by session and configuration
-  consensus: AppendEntries/Openraft read-index 2 s, Vote 5 s,
-  InstallSnapshot/forwarded mutation/consumer ReadBarrier 10 s, election
-  `[5 s, 8 s)`, the shared operation default 10 s, and server idle/handler
-  ceilings 30 s. A cold DNS/TCP/mTLS/bootstrap phase is capped at 1.5 s inside
-  the already-running family deadline, never added to it. `None` on the
+  `RemoteSessionConsensusPeer` now retains a fixed primary/overflow pool of at
+  most two authenticated connections, with one in-flight RPC per lane.
+  Sequential calls prefer primary, a concurrent call may use overflow, and
+  further calls wait for lane acquisition under the same family deadline. A
+  socket returns to its selected lane only after a complete, correctly
+  correlated, authenticated, and validated successful response or typed
+  semantic `Unavailable` response. The latter preserves a known stream
+  position but grants no success or authority. Cancellation, timeout, EOF,
+  framing, protocol, authentication, scope mismatch, rejection, lifecycle
+  retirement, admitted generation/material mismatch, or any uncertain stream
+  position leaves the lane evicted.
+  Healthy sequential Openraft heartbeats therefore reuse the primary
+  DNS/TCP/mTLS/bootstrap path without adding multiplexing or another authority,
+  while every replacement repeats the complete admission sequence.
+  `opc-consensus` now owns the one fixed complete-call timing profile used by
+  session and configuration consensus: AppendEntries/Openraft read-index 2 s,
+  Vote 5 s, InstallSnapshot/forwarded mutation/consumer ReadBarrier 10 s,
+  election `[5 s, 8 s)`, the shared operation default 10 s, and server
+  idle/handler ceilings 30 s. A cold DNS/TCP/mTLS/bootstrap phase is capped at
+  1.5 s inside the already-running family deadline, never added to it. `None` on the
   source-compatible remote constructors selects this profile; an explicit
   fixed override remains test/compatibility-only and cannot enlarge the cold
   cap. Real mTLS tests prove the family boundaries and same-leader/same-term
@@ -122,9 +156,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This bounded single-host core is experimental and non-deployed. The later
   fault/expiry slice above covers one exact synthetic admission-loss plus
   malformed-last-good combination and a same-issuer leaf with a 75-second
-  remaining-validity/expiry budget, but not a
-  real network partition, mixed traffic/watch/restore during those faults, or a
-  broader restart/fault matrix. Resource/soak, remote-HKMS, deployed-CNF,
+  remaining-validity/expiry budget under deterministic mixed mutation,
+  linearizable-read, complete-restore, readiness, and watch traffic. The
+  expiring member stops before soft retirement while survivors continue
+  through hard expiry and the stopped watch reconciles after replacement. It
+  does not cover a real network partition or a broader restart/fault matrix.
+  The exact-address restarted member is watcher-only before exit and joins the
+  mutator set only after bounded journal reconciliation, so active-mutator
+  crash/restart remains unqualified.
+  Resource/soak, remote-HKMS, deployed-CNF,
   supported-platform, and signed candidate evidence remain open under
   #164/#158/#143. Session payload encryption, AAD, key-provider/HKMS
   boundaries, durable formats, and Openraft's sole authority are unchanged.

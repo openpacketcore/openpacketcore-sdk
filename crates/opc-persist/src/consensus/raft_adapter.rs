@@ -168,11 +168,15 @@ impl ConfigRaftNetwork {
         let entry_count = request.entries.len();
         let payload = match encode_config_wire(request) {
             Ok(payload) => payload,
-            Err(ConsensusCodecError::TooLarge) if entry_count > 0 => {
-                let entries_hint = u64::try_from((entry_count / 2).max(1)).unwrap_or(u64::MAX);
-                return Err(EngineRpcError::PayloadTooLarge(
-                    PayloadTooLarge::new_entries_hint(entries_hint),
-                ));
+            Err(ConsensusCodecError::TooLarge) => {
+                if let Some(entries_hint) = append_entries_split_hint(entry_count) {
+                    return Err(EngineRpcError::PayloadTooLarge(
+                        PayloadTooLarge::new_entries_hint(entries_hint),
+                    ));
+                }
+                return Err(EngineRpcError::Unreachable(Unreachable::new(
+                    &CodecTransportError(ConsensusCodecError::TooLarge),
+                )));
             }
             Err(error) => {
                 return Err(EngineRpcError::Unreachable(Unreachable::new(
@@ -188,6 +192,10 @@ impl ConfigRaftNetwork {
         )
         .await
     }
+}
+
+fn append_entries_split_hint(entry_count: usize) -> Option<u64> {
+    (entry_count > 1).then(|| u64::try_from((entry_count / 2).max(1)).unwrap_or(u64::MAX))
 }
 
 impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
@@ -419,3 +427,16 @@ struct PeerIdentityChanged;
 #[derive(Debug, Error)]
 #[error("consensus codec rejected engine payload")]
 struct CodecTransportError(#[source] ConsensusCodecError);
+
+#[cfg(test)]
+mod tests {
+    use super::append_entries_split_hint;
+
+    #[test]
+    fn append_entries_split_hint_never_retries_a_singleton_as_payload_too_large() {
+        assert_eq!(append_entries_split_hint(0), None);
+        assert_eq!(append_entries_split_hint(1), None);
+        assert_eq!(append_entries_split_hint(2), Some(1));
+        assert_eq!(append_entries_split_hint(64), Some(32));
+    }
+}

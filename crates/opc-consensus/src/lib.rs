@@ -11,6 +11,7 @@
 
 pub mod codec;
 pub mod identity;
+pub mod linearizability;
 pub mod profile;
 pub mod transport;
 
@@ -20,7 +21,10 @@ pub mod transport;
 /// fully qualified.
 pub use openraft as engine;
 
-pub use codec::{decode_bounded, encode_bounded, ConsensusCodecError};
+pub use codec::{
+    decode_bounded, encode_bounded, AppendEntriesBatchAccumulator, AppendEntriesBatchDecision,
+    ConsensusCodecError, DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES,
+};
 
 pub use identity::{
     derive_configuration_id, derive_node_id, ConsensusClusterId, ConsensusConfigurationEpoch,
@@ -28,12 +32,18 @@ pub use identity::{
     ConsensusNodeId, ConsensusRequestId, CONSENSUS_CLUSTER_ID_MAX_BYTES,
     CONSENSUS_MEMBER_ID_MAX_BYTES, CONSENSUS_NODE_ID_MAX,
 };
+pub use linearizability::{
+    EnsureLinearizableOutcome, EnsureLinearizableSupervisor,
+    DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY,
+    DURABLE_OPENRAFT_LINEARIZABILITY_WORKER_COUNT,
+};
 pub use profile::{
     durable_openraft_config, validate_durable_consensus_timing_profile,
     DurableConsensusTimingProfile, DurableConsensusTimingProfileError, DurableOpenraftDomain,
     DurableOpenraftProfile, DurableOpenraftProfileError, DurableOpenraftRuntime,
     DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_CONSENSUS_TIMING_PROFILE,
-    DURABLE_OPENRAFT_PROFILE,
+    DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES, DURABLE_OPENRAFT_PROFILE,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 pub use transport::{
     ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler,

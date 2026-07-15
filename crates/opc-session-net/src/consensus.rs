@@ -23,7 +23,7 @@ use opc_session_store::{
 use opc_types::SpiffeId;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, MutexGuard, Notify, Semaphore, SemaphorePermit};
 
 use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::identity::{LocalReplicaBinding, RemoteReplicaBinding};
@@ -270,6 +270,222 @@ struct ConsensusConnection {
     lifecycle: ConnectionLifecycle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsensusConnectionLane {
+    Primary,
+    Overflow,
+}
+
+struct ConsensusConnectionLaneState {
+    connection: Mutex<Option<ConsensusConnection>>,
+    changed: Arc<Notify>,
+    reaper_started: AtomicBool,
+    in_flight: Semaphore,
+}
+
+impl ConsensusConnectionLaneState {
+    fn new() -> Self {
+        Self {
+            connection: Mutex::new(None),
+            changed: Arc::new(Notify::new()),
+            reaper_started: AtomicBool::new(false),
+            in_flight: Semaphore::new(1),
+        }
+    }
+}
+
+struct ConsensusConnectionPool {
+    primary: ConsensusConnectionLaneState,
+    overflow: ConsensusConnectionLaneState,
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl ConsensusConnectionPool {
+    fn new() -> Self {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        Self {
+            primary: ConsensusConnectionLaneState::new(),
+            overflow: ConsensusConnectionLaneState::new(),
+            shutdown,
+        }
+    }
+
+    async fn acquire(&self) -> ConsensusConnectionSlot<'_> {
+        if let Ok(permit) = self.primary.in_flight.try_acquire() {
+            let connection = self.primary.connection.lock().await;
+            return self.slot(ConsensusConnectionLane::Primary, connection, permit);
+        }
+        if let Ok(permit) = self.overflow.in_flight.try_acquire() {
+            let connection = self.overflow.connection.lock().await;
+            return self.slot(ConsensusConnectionLane::Overflow, connection, permit);
+        }
+
+        let (lane, permit) = tokio::select! {
+            biased;
+            permit = self.primary.in_flight.acquire() => {
+                (
+                    ConsensusConnectionLane::Primary,
+                    permit.expect("fixed primary lane remains open"),
+                )
+            },
+            permit = self.overflow.in_flight.acquire() => {
+                (
+                    ConsensusConnectionLane::Overflow,
+                    permit.expect("fixed overflow lane remains open"),
+                )
+            },
+        };
+        let connection = self.lane(lane).connection.lock().await;
+        self.slot(lane, connection, permit)
+    }
+
+    fn slot<'a>(
+        &'a self,
+        lane: ConsensusConnectionLane,
+        connection: MutexGuard<'a, Option<ConsensusConnection>>,
+        permit: SemaphorePermit<'a>,
+    ) -> ConsensusConnectionSlot<'a> {
+        ConsensusConnectionSlot {
+            lane,
+            connection,
+            _permit: permit,
+        }
+    }
+
+    fn lane(&self, lane: ConsensusConnectionLane) -> &ConsensusConnectionLaneState {
+        match lane {
+            ConsensusConnectionLane::Primary => &self.primary,
+            ConsensusConnectionLane::Overflow => &self.overflow,
+        }
+    }
+
+    fn ensure_cached_connection_reaper(
+        self: &Arc<Self>,
+        lane: ConsensusConnectionLane,
+        tls_config: Option<opc_tls::AuthenticatedClientConfig>,
+        reauthentication: SessionReauthenticationControl,
+        edge_key: [u8; 32],
+    ) {
+        let lane_state = self.lane(lane);
+        if lane_state
+            .reaper_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        tokio::spawn(reap_cached_consensus_connection(
+            Arc::downgrade(self),
+            lane,
+            Arc::clone(&lane_state.changed),
+            self.shutdown.subscribe(),
+            tls_config,
+            reauthentication,
+            edge_key,
+        ));
+    }
+}
+
+impl Drop for ConsensusConnectionPool {
+    fn drop(&mut self) {
+        self.shutdown.send_replace(true);
+    }
+}
+
+struct ConsensusConnectionSlot<'a> {
+    lane: ConsensusConnectionLane,
+    connection: MutexGuard<'a, Option<ConsensusConnection>>,
+    _permit: SemaphorePermit<'a>,
+}
+
+impl ConsensusConnectionSlot<'_> {
+    fn connection(&mut self) -> &mut Option<ConsensusConnection> {
+        &mut self.connection
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reap_cached_consensus_connection(
+    pool: std::sync::Weak<ConsensusConnectionPool>,
+    lane: ConsensusConnectionLane,
+    changed: Arc<Notify>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
+    reauthentication: SessionReauthenticationControl,
+    edge_key: [u8; 32],
+) {
+    let mut reauthentication_rx = reauthentication.subscribe();
+    let mut material_rx = tls_config
+        .as_ref()
+        .map(opc_tls::AuthenticatedClientConfig::subscribe_material_changes);
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        // Register before inspecting the lane so an insertion between the
+        // inspection and the select cannot lose its wake-up.
+        let lane_changed = changed.notified();
+        tokio::pin!(lane_changed);
+        let retire_at = {
+            let Some(pool) = pool.upgrade() else {
+                return;
+            };
+            let lane_state = pool.lane(lane);
+            let mut cached = lane_state.connection.lock().await;
+            if let Some(connection) = cached.as_mut() {
+                let now = tokio::time::Instant::now();
+                connection.lifecycle.observe_rotation(
+                    now,
+                    reauthentication.generation(),
+                    tls_config
+                        .as_ref()
+                        .map(|config| config.material_status().epoch()),
+                    &edge_key,
+                );
+                if connection.lifecycle.retirement(now).is_some() {
+                    let retired = cached.take();
+                    drop(cached);
+                    drop(retired);
+                    continue;
+                }
+                Some(connection.lifecycle.retire_at())
+            } else {
+                None
+            }
+        };
+
+        match retire_at {
+            Some(retire_at) => {
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                    _ = &mut lane_changed => {}
+                    _ = reauthentication_rx.changed() => {}
+                    _ = wait_consensus_material_change(&mut material_rx) => {}
+                    _ = tokio::time::sleep_until(retire_at) => {}
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                    _ = &mut lane_changed => {}
+                    _ = reauthentication_rx.changed() => {}
+                    _ = wait_consensus_material_change(&mut material_rx) => {}
+                }
+            }
+        }
+    }
+}
+
 /// Authenticated outbound peer implementing only the session consensus port.
 #[derive(Clone)]
 pub struct RemoteSessionConsensusPeer {
@@ -278,7 +494,7 @@ pub struct RemoteSessionConsensusPeer {
     binding: RemoteReplicaBinding,
     deadline_policy: ConsensusDeadlinePolicy,
     max_frame_size: usize,
-    call_gate: Arc<Mutex<Option<ConsensusConnection>>>,
+    connection_pool: Arc<ConsensusConnectionPool>,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
 }
@@ -366,7 +582,7 @@ impl RemoteSessionConsensusPeer {
             // The bounded inner consensus payload needs the maximum profile
             // frame in its worst-case JSON byte-array expansion.
             max_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
-            call_gate: Arc::new(Mutex::new(None)),
+            connection_pool: Arc::new(ConsensusConnectionPool::new()),
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
             reauthentication: SessionReauthenticationControl::new(),
         }
@@ -378,7 +594,7 @@ impl RemoteSessionConsensusPeer {
         self.max_frame_size = max_frame_size;
         // A clone-local wire budget cannot reuse a connection negotiated by a
         // differently configured clone.
-        self.call_gate = Arc::new(Mutex::new(None));
+        self.connection_pool = Arc::new(ConsensusConnectionPool::new());
         self
     }
 
@@ -386,7 +602,7 @@ impl RemoteSessionConsensusPeer {
     #[must_use]
     pub fn with_connection_lifecycle(mut self, policy: ConnectionLifecyclePolicy) -> Self {
         self.lifecycle_policy = policy;
-        self.call_gate = Arc::new(Mutex::new(None));
+        self.connection_pool = Arc::new(ConsensusConnectionPool::new());
         self
     }
 
@@ -397,7 +613,7 @@ impl RemoteSessionConsensusPeer {
         control: SessionReauthenticationControl,
     ) -> Self {
         self.reauthentication = control;
-        self.call_gate = Arc::new(Mutex::new(None));
+        self.connection_pool = Arc::new(ConsensusConnectionPool::new());
         self
     }
 
@@ -424,7 +640,7 @@ impl RemoteSessionConsensusPeer {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
 
-        // The sole connection is owned by this call until a complete response
+        // The selected connection lane is owned by this call until a complete response
         // has passed every correlation and payload validation check. If this
         // future is cancelled after any request bytes may have been written,
         // the taken socket is dropped rather than exposing a late response to
@@ -436,7 +652,7 @@ impl RemoteSessionConsensusPeer {
                     .await;
                 if result
                     .as_ref()
-                    .is_ok_and(|response| response.result.is_ok())
+                    .is_ok_and(consensus_response_allows_connection_reuse)
                     && self.connection_is_current(&mut connection, tokio::time::Instant::now())
                 {
                     *connection_slot = Some(connection);
@@ -698,7 +914,7 @@ impl RemoteSessionConsensusPeer {
             .await;
         if result
             .as_ref()
-            .is_ok_and(|response| response.result.is_ok())
+            .is_ok_and(consensus_response_allows_connection_reuse)
             && self.connection_is_current(&mut connection, tokio::time::Instant::now())
         {
             *connection_slot = Some(connection);
@@ -869,6 +1085,13 @@ impl RemoteSessionConsensusPeer {
     }
 }
 
+fn consensus_response_allows_connection_reuse(response: &SessionConsensusWireResponse) -> bool {
+    matches!(
+        &response.result,
+        Ok(_) | Err(SessionConsensusPeerError::Unavailable)
+    )
+}
+
 #[async_trait]
 impl SessionConsensusPeer for RemoteSessionConsensusPeer {
     fn node_id(&self) -> SessionConsensusNodeId {
@@ -883,11 +1106,25 @@ impl SessionConsensusPeer for RemoteSessionConsensusPeer {
         let deadline = tokio::time::Instant::now()
             .checked_add(call_timeout)
             .ok_or(SessionConsensusPeerError::Protocol)?;
-        // The gate bounds concurrent connection/TLS/frame memory per peer. It
-        // is acquired under the same logical call deadline.
+        // The fixed pool bounds concurrent connection/TLS/frame memory per
+        // peer. Lane acquisition is covered by the same logical call deadline.
         let call = async {
-            let mut guard = self.call_gate.lock().await;
-            self.call_once(&mut guard, request, deadline).await
+            let mut slot = self.connection_pool.acquire().await;
+            let result = self.call_once(slot.connection(), request, deadline).await;
+            if slot.connection.is_some() {
+                self.connection_pool.ensure_cached_connection_reaper(
+                    slot.lane,
+                    self.tls_config.clone(),
+                    self.reauthentication.clone(),
+                    directed_connection_key(
+                        b"consensus",
+                        self.binding.local_replica_id().as_str(),
+                        self.binding.remote_replica_id().as_str(),
+                    ),
+                );
+            }
+            self.connection_pool.lane(slot.lane).changed.notify_one();
+            result
         };
         tokio::time::timeout_at(deadline, call)
             .await
@@ -2888,6 +3125,273 @@ mod tests {
         assert!(request.validate().is_ok());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn idle_cached_consensus_connection_is_reaped_at_its_soft_lifecycle_bound() {
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(40),
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("cached connection lifecycle policy");
+        let established_at = tokio::time::Instant::now();
+        let lifecycle = ConnectionLifecycle::new(policy, established_at, None, None, 0, None)
+            .expect("cached connection lifecycle");
+        let (stream, _remote) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(stream);
+        let pool = Arc::new(ConsensusConnectionPool::new());
+        {
+            let mut primary = pool.primary.connection.lock().await;
+            *primary = Some(ConsensusConnection {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                lifecycle,
+            });
+        }
+        pool.ensure_cached_connection_reaper(
+            ConsensusConnectionLane::Primary,
+            None,
+            SessionReauthenticationControl::new(),
+            [0; 32],
+        );
+        pool.primary.changed.notify_one();
+        tokio::task::yield_now().await;
+        assert!(pool.primary.connection.lock().await.is_some());
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            pool.primary.connection.lock().await.is_none(),
+            "an idle cached connection must not survive its soft lifecycle bound"
+        );
+    }
+
+    fn cached_consensus_connection(lifecycle: ConnectionLifecycle) -> ConsensusConnection {
+        let (stream, _remote) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(stream);
+        ConsensusConnection {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            lifecycle,
+        }
+    }
+
+    async fn wait_for_cached_lane_to_empty(
+        pool: &ConsensusConnectionPool,
+        lane: ConsensusConnectionLane,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pool.lane(lane).connection.lock().await.is_none() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cached consensus lane retirement");
+    }
+
+    #[tokio::test]
+    async fn idle_cached_consensus_connection_reacts_to_explicit_reauthentication() {
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(40),
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("explicit reauthentication lifecycle policy");
+        let lifecycle =
+            ConnectionLifecycle::new(policy, tokio::time::Instant::now(), None, None, 0, None)
+                .expect("explicit reauthentication lifecycle");
+        let pool = Arc::new(ConsensusConnectionPool::new());
+        *pool.primary.connection.lock().await = Some(cached_consensus_connection(lifecycle));
+        let reauthentication = SessionReauthenticationControl::new();
+        pool.ensure_cached_connection_reaper(
+            ConsensusConnectionLane::Primary,
+            None,
+            reauthentication.clone(),
+            [1; 32],
+        );
+        pool.primary.changed.notify_one();
+        tokio::task::yield_now().await;
+
+        reauthentication
+            .request_reauthentication()
+            .expect("request cached consensus reauthentication");
+        wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
+    }
+
+    #[tokio::test]
+    async fn idle_cached_consensus_connection_reacts_to_material_epoch_change() {
+        let material = crate::test_support::RotatableClientMaterial::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/client",
+        );
+        let tls_config = material.config();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(40),
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("material epoch lifecycle policy");
+        let lifecycle = ConnectionLifecycle::new(
+            policy,
+            tokio::time::Instant::now(),
+            None,
+            None,
+            0,
+            Some(tls_config.material_status().epoch()),
+        )
+        .expect("material epoch lifecycle");
+        let pool = Arc::new(ConsensusConnectionPool::new());
+        *pool.primary.connection.lock().await = Some(cached_consensus_connection(lifecycle));
+        pool.ensure_cached_connection_reaper(
+            ConsensusConnectionLane::Primary,
+            Some(tls_config),
+            SessionReauthenticationControl::new(),
+            [2; 32],
+        );
+        pool.primary.changed.notify_one();
+        tokio::task::yield_now().await;
+
+        material.rotate();
+        wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_consensus_reaper_never_races_an_in_flight_lane() {
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(40),
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("in-flight exclusion lifecycle policy");
+        let lifecycle =
+            ConnectionLifecycle::new(policy, tokio::time::Instant::now(), None, None, 0, None)
+                .expect("in-flight exclusion lifecycle");
+        let pool = Arc::new(ConsensusConnectionPool::new());
+        *pool.primary.connection.lock().await = Some(cached_consensus_connection(lifecycle));
+        let in_flight = pool.primary.connection.lock().await;
+        pool.ensure_cached_connection_reaper(
+            ConsensusConnectionLane::Primary,
+            None,
+            SessionReauthenticationControl::new(),
+            [3; 32],
+        );
+        pool.primary.changed.notify_one();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            in_flight.is_some(),
+            "the reaper must wait for the in-flight lane owner"
+        );
+        drop(in_flight);
+        wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
+    }
+
+    #[tokio::test]
+    async fn reaper_inspection_never_redirects_sequential_work_to_overflow() {
+        let pool = Arc::new(ConsensusConnectionPool::new());
+        let inspection = pool.primary.connection.lock().await;
+        assert_eq!(pool.primary.in_flight.available_permits(), 1);
+
+        let waiting_pool = Arc::clone(&pool);
+        let waiter = tokio::spawn(async move { waiting_pool.acquire().await.lane });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "an idle-lane inspection must make sequential work wait for primary"
+        );
+        assert_eq!(pool.primary.in_flight.available_permits(), 0);
+        assert_eq!(pool.overflow.in_flight.available_permits(), 1);
+
+        drop(inspection);
+        assert!(matches!(
+            waiter.await.expect("sequential lane acquisition"),
+            ConsensusConnectionLane::Primary
+        ));
+        assert_eq!(pool.primary.in_flight.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_work_uses_overflow_while_reaper_inspects_primary() {
+        let pool = Arc::new(ConsensusConnectionPool::new());
+        let inspection = pool.primary.connection.lock().await;
+
+        let primary_pool = Arc::clone(&pool);
+        let primary = tokio::spawn(async move { primary_pool.acquire().await.lane });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.primary.in_flight.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first caller reserves the inspected primary lane");
+
+        let overflow_pool = Arc::clone(&pool);
+        let overflow = tokio::spawn(async move { overflow_pool.acquire().await.lane });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), overflow)
+                .await
+                .expect("concurrent caller must not queue behind inspected primary")
+                .expect("overflow lane acquisition"),
+            ConsensusConnectionLane::Overflow
+        ));
+
+        drop(inspection);
+        assert!(matches!(
+            primary.await.expect("primary lane acquisition"),
+            ConsensusConnectionLane::Primary
+        ));
+        assert_eq!(pool.primary.in_flight.available_permits(), 1);
+        assert_eq!(pool.overflow.in_flight.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_consensus_reapers_are_fixed_to_two_and_do_not_retain_the_pool() {
+        let pool = Arc::new(ConsensusConnectionPool::new());
+        let reauthentication = SessionReauthenticationControl::new();
+        for _ in 0..16 {
+            pool.ensure_cached_connection_reaper(
+                ConsensusConnectionLane::Primary,
+                None,
+                reauthentication.clone(),
+                [4; 32],
+            );
+            pool.ensure_cached_connection_reaper(
+                ConsensusConnectionLane::Overflow,
+                None,
+                reauthentication.clone(),
+                [5; 32],
+            );
+        }
+        assert!(pool.primary.reaper_started.load(Ordering::Acquire));
+        assert!(pool.overflow.reaper_started.load(Ordering::Acquire));
+        assert_eq!(
+            pool.shutdown.receiver_count(),
+            2,
+            "one and only one reaper may exist for each fixed lane"
+        );
+
+        let weak = Arc::downgrade(&pool);
+        drop(pool);
+        tokio::task::yield_now().await;
+        assert!(
+            weak.upgrade().is_none(),
+            "reaper tasks must hold only weak pool ownership"
+        );
+    }
+
     #[test]
     fn clone_local_consensus_builders_detach_incompatible_connection_state() {
         let (_server_binding, client_binding) = bindings();
@@ -2905,24 +3409,30 @@ mod tests {
             None,
         );
         let shared = peer.clone();
-        assert!(Arc::ptr_eq(&peer.call_gate, &shared.call_gate));
+        assert!(Arc::ptr_eq(&peer.connection_pool, &shared.connection_pool));
 
         let different_frame = peer
             .clone()
             .with_max_frame_size(MIN_SESSION_CONSENSUS_FRAME_SIZE);
-        assert!(!Arc::ptr_eq(&peer.call_gate, &different_frame.call_gate));
+        assert!(!Arc::ptr_eq(
+            &peer.connection_pool,
+            &different_frame.connection_pool
+        ));
 
         let different_lifecycle = peer
             .clone()
             .with_connection_lifecycle(ConnectionLifecyclePolicy::default());
         assert!(!Arc::ptr_eq(
-            &peer.call_gate,
-            &different_lifecycle.call_gate
+            &peer.connection_pool,
+            &different_lifecycle.connection_pool
         ));
 
         let different_control = peer
             .clone()
             .with_reauthentication_control(SessionReauthenticationControl::new());
-        assert!(!Arc::ptr_eq(&peer.call_gate, &different_control.call_gate));
+        assert!(!Arc::ptr_eq(
+            &peer.connection_pool,
+            &different_control.connection_pool
+        ));
     }
 }

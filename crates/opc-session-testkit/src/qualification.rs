@@ -12,7 +12,10 @@ use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
+use opc_consensus::{
+    DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY,
+    DURABLE_OPENRAFT_LINEARIZABILITY_WORKER_COUNT, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+};
 use opc_identity::projected_svid::{
     ProjectedSvidAvailability, ProjectedSvidReloadReason, ProjectedSvidReloadStatus,
     MAX_PROJECTED_SVID_BUNDLE_FILES, MIN_PROJECTED_SVID_POLL_INTERVAL,
@@ -26,7 +29,7 @@ use opc_session_net::{
 };
 use opc_session_store::{
     validate_session_ttl, OwnerId, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, STABLE_ID_MAX_BYTES,
+    ReplicaId, ReplicaTlsIdentity, MAX_REPLICATION_LOG_PAGE_ENTRIES, STABLE_ID_MAX_BYTES,
 };
 use opc_tls::{TlsMaterialAvailability, TlsMaterialReloadReason, TlsMaterialStatus};
 use opc_types::{SpiffeId, Timestamp};
@@ -98,8 +101,23 @@ pub const QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB: u64 = 32 * 1024;
 pub const QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR: u64 = 8;
 /// Fixed per-round connection/reconnect allowance after the peer coefficient.
 pub const QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE: u64 = 8;
-/// Final active connection bound coefficient over configured remote peers.
-pub const QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR: i64 = 2;
+/// Fixed authenticated consensus client lanes per configured remote peer.
+pub const QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER: usize = 2;
+/// Maximum admitted Openraft proposal tasks per node. This is a task/memory
+/// pipeline bound and does not add a socket or file-descriptor allowance.
+pub const QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE: usize =
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS;
+/// Maximum concurrent fresh Openraft linearizability checks per node.
+pub const QUALIFICATION_MAX_CONCURRENT_LINEARIZABILITY_CHECKS_PER_OPENRAFT_NODE: usize =
+    DURABLE_OPENRAFT_LINEARIZABILITY_WORKER_COUNT;
+/// Maximum total callers admitted to the fixed Openraft linearizability
+/// supervisor, including the active cohort and the queued cohort.
+pub const QUALIFICATION_LINEARIZABILITY_ADMISSION_CAPACITY_PER_OPENRAFT_NODE: usize =
+    DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY;
+/// Final lifecycle-gauge bound coefficient over configured remote peers: two
+/// client lanes plus the corresponding two inbound server lifecycles.
+pub const QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR: i64 =
+    2 * QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER as i64;
 /// Real-mTLS completion upper bound for the isolated resolver retry proof.
 pub const QUALIFICATION_RESOLVER_PROOF_MILLIS: u64 = 1_500;
 /// Exact exponential reconnect lower bounds proved after three failures.
@@ -110,9 +128,52 @@ pub const QUALIFICATION_TRAFFIC_RESTORE_LIMIT: usize = 16;
 pub const QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS: u64 = 5;
 /// Number of deterministic millisecond values above the minimum.
 pub const QUALIFICATION_TRAFFIC_MUTATION_DELAY_SPAN_MILLIS: u64 = 11;
+/// Lease TTL used by the deterministic mutation workload.
+pub const QUALIFICATION_TRAFFIC_TTL_MILLIS: u64 = 60 * 60 * 1_000;
+/// Maximum typed availability interruptions one mutation task may reconcile
+/// before the qualification run fails closed.
+pub const QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE: u64 = 8;
+/// Maximum wall-clock interval for one authority-and-record reconciliation.
+/// An accepted backend operation is still allowed to reach its terminal
+/// outcome; a success observed after this deadline fails the qualification.
+pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS: u64 = 8_000;
+/// Fixed retry delay between terminal recoverable backend outcomes.
+pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS: u64 = 50;
+/// Versioned, qualification-only response-loss injection that deterministically
+/// exercises same-owner recovery after one successful lease release.
+pub const QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE: &str =
+    "post-release-response-loss/v1";
+/// Maximum wall-clock budget for one stopped watch's journal reconciliation.
+pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS: u64 = 25_000;
+/// Maximum journal entries one stopped watch may reconcile.
+pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES: u64 = 262_144;
+/// Maximum entries requested in one journal reconciliation page.
+pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES: usize =
+    MAX_REPLICATION_LOG_PAGE_ENTRIES;
+/// Versioned stopped-watch reconciliation algorithm bound into the schedule.
+pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE: &str = "bounded-durable-journal/v1";
 /// Exact operation timeout pinned by the experimental profile.
 pub const QUALIFICATION_OPERATION_TIMEOUT_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Parent-side bound for one child command response. Mutation shutdown retains
+/// a stricter 30-second campaign SLO; this additional 15 seconds lets the
+/// parent receive a typed terminal failure after one already-accepted backend
+/// operation reaches its fixed 10-second terminal bound.
+pub const QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS: u64 = 45_000;
+/// Remaining-validity budget of the same-issuer SVID used by the bounded
+/// fault/expiry campaign.
+pub const QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS: u64 = 75_000;
+/// Lead between stopping all expiring-member traffic and that member's
+/// connection soft-retirement boundary.
+pub const QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS: u64 = 1_000;
+/// Mutation-shutdown lead and campaign SLO. The parent response timeout is
+/// deliberately larger, so an SLO miss still returns typed terminal evidence.
+pub const QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS: u64 = 30_000;
+/// Versioned cancellation discipline covered by the traffic schedule digest.
+/// Accepted backend operations run to completion; cancellation is observed at
+/// the next terminal operation checkpoint.
+pub const QUALIFICATION_TRAFFIC_CANCELLATION_PROFILE: &str =
+    "accepted-operation-terminal-checkpoints/v1";
 /// Largest accepted finite lifecycle field in the private harness config.
 pub const QUALIFICATION_MAX_LIFECYCLE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 
@@ -567,7 +628,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v1\n",
+            "opc-session-ha/traffic-resource/v2\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -577,6 +638,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "resource_sample_millis={}\n",
             "resource_settle_millis={}\n",
             "resource_stable_samples={}\n",
+            "inbound_connection_slots={}\n",
             "resource_fd_misc_allowance={}\n",
             "resource_final_fd_allowance={}\n",
             "resource_thread_growth_allowance={}\n",
@@ -584,12 +646,31 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "resource_settled_rss_growth_kib={}\n",
             "connection_bound_factor={}\n",
             "connection_bound_allowance={}\n",
+            "consensus_connection_lanes_per_peer={}\n",
             "active_connection_factor={}\n",
+            "max_in_flight_proposals_per_openraft_node={}\n",
+            "max_concurrent_linearizability_checks_per_openraft_node={}\n",
+            "linearizability_admission_capacity_per_openraft_node={}\n",
             "resolver_proof_millis={}\n",
             "resolver_backoff_lower_bounds_millis=50,100,200\n",
             "restore_limit={}\n",
             "mutation_delay_min_millis={}\n",
             "mutation_delay_span_millis={}\n",
+            "traffic_ttl_millis={}\n",
+            "availability_interruption_budget_per_node={}\n",
+            "availability_recovery_millis={}\n",
+            "availability_retry_millis={}\n",
+            "synthetic_interruption_profile={}\n",
+            "watch_reconciliation_millis={}\n",
+            "watch_reconciliation_max_entries={}\n",
+            "watch_reconciliation_page_entries={}\n",
+            "watch_reconciliation_profile={}\n",
+            "operation_timeout_millis={}\n",
+            "child_response_timeout_millis={}\n",
+            "fault_expiry_validity_millis={}\n",
+            "fault_traffic_stop_lead_millis={}\n",
+            "fault_mutation_shutdown_lead_millis={}\n",
+            "traffic_cancellation_profile={}\n",
             "owned_mutation_tasks_per_node=1\n",
             "owned_watch_tasks_per_node=1\n",
             "rotation_order=seed_mod_member_count_then_round_robin\n",
@@ -602,6 +683,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_RESOURCE_SAMPLE_MILLIS,
         QUALIFICATION_RESOURCE_SETTLE_MILLIS,
         QUALIFICATION_RESOURCE_STABLE_SAMPLES,
+        QUALIFICATION_INBOUND_CONNECTION_SLOTS,
         QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE,
         QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE,
         QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE,
@@ -609,11 +691,30 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB,
         QUALIFICATION_TRAFFIC_CONNECTION_BOUND_FACTOR,
         QUALIFICATION_TRAFFIC_CONNECTION_BOUND_ALLOWANCE,
+        QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
         QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR,
+        QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE,
+        QUALIFICATION_MAX_CONCURRENT_LINEARIZABILITY_CHECKS_PER_OPENRAFT_NODE,
+        QUALIFICATION_LINEARIZABILITY_ADMISSION_CAPACITY_PER_OPENRAFT_NODE,
         QUALIFICATION_RESOLVER_PROOF_MILLIS,
         QUALIFICATION_TRAFFIC_RESTORE_LIMIT,
         QUALIFICATION_TRAFFIC_MUTATION_DELAY_MIN_MILLIS,
         QUALIFICATION_TRAFFIC_MUTATION_DELAY_SPAN_MILLIS,
+        QUALIFICATION_TRAFFIC_TTL_MILLIS,
+        QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
+        QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
+        QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
+        QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
+        QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
+        QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES,
+        QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES,
+        QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE,
+        QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+        QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
+        QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
+        QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
+        QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
+        QUALIFICATION_TRAFFIC_CANCELLATION_PROFILE,
         member_count = member_count,
         seed = seed,
     );
@@ -731,6 +832,9 @@ pub enum QualificationNodeCommand {
     /// configuration digest; this frame intentionally carries no free-form
     /// workload input.
     StartTrafficWatch,
+    /// Reconcile a stopped or process-restarted traffic watch through an exact
+    /// bounded application-journal prefix, then subscribe at `head + 1`.
+    ReconcileTrafficWatch,
     /// Start exactly one deterministic mutation task after every fleet member
     /// has registered its watch.
     StartTrafficMutation,
@@ -793,6 +897,9 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::StartTrafficWatch => {
                 formatter.write_str("QualificationNodeCommand::StartTrafficWatch")
             }
+            Self::ReconcileTrafficWatch => {
+                formatter.write_str("QualificationNodeCommand::ReconcileTrafficWatch")
+            }
             Self::StartTrafficMutation => {
                 formatter.write_str("QualificationNodeCommand::StartTrafficMutation")
             }
@@ -830,6 +937,7 @@ impl QualificationNodeCommand {
             | Self::SetConsensusRpcAvailability { .. }
             | Self::SecurityMetrics
             | Self::StartTrafficWatch
+            | Self::ReconcileTrafficWatch
             | Self::StartTrafficMutation
             | Self::StopTrafficMutation
             | Self::StopTrafficWatch
@@ -1312,6 +1420,41 @@ pub enum QualificationTrafficFailureCode {
     TaskJoinUnavailable,
 }
 
+/// Fixed operation stage at which background qualification work first failed.
+///
+/// The values intentionally contain no key, owner, peer, request, or payload
+/// identity. Together with [`QualificationTrafficErrorClass`], this preserves
+/// actionable failure evidence without forwarding backend error text across the
+/// child-process control boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationTrafficFailureStage {
+    LeaseRenew,
+    CompareAndSet,
+    Get,
+    RestoreScan,
+    ReadinessProbe,
+    LeaseRelease,
+    LeaseAcquire,
+    Watch,
+    TaskJoin,
+}
+
+/// Redaction-safe closed classification of the first traffic-task error.
+///
+/// Raw `StoreError`/`LeaseError` strings never enter this model. `Other` is the
+/// fixed fail-closed bucket for invariant, stream-closure, and unclassified
+/// errors and does not carry source data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationTrafficErrorClass {
+    BackendUnavailable,
+    CasIdempotencyOutcomeUnavailable,
+    BackendOperationOutcomeUnavailable,
+    LeaseLostOrInvalid,
+    Other,
+}
+
 /// Plaintext-free progress from one node's deterministic traffic workload.
 ///
 /// `owned_async_tasks` counts only the watch and mutation tasks created by the
@@ -1322,12 +1465,24 @@ pub enum QualificationTrafficFailureCode {
 pub struct QualificationTrafficStatus {
     pub state: QualificationTrafficState,
     pub failure: Option<QualificationTrafficFailureCode>,
+    pub failure_stage: Option<QualificationTrafficFailureStage>,
+    pub failure_error_class: Option<QualificationTrafficErrorClass>,
     pub seed: u64,
     pub owned_async_tasks: u8,
     pub mutation_cycles: u64,
     pub linearizable_reads: u64,
     pub lease_renewals: u64,
     pub lease_reacquisitions: u64,
+    /// Typed, recoverable availability outcomes observed at terminal backend
+    /// checkpoints. This never includes semantic or invariant failures.
+    pub availability_interruptions: u64,
+    /// Typed interruption outcomes closed by a completed authority-and-record
+    /// reconciliation. Equality with `availability_interruptions` proves no
+    /// recovery episode is still unresolved.
+    pub availability_recoveries: u64,
+    /// Largest uninterrupted run of typed availability outcomes before a
+    /// successful reconciliation.
+    pub max_consecutive_availability_interruptions: u64,
     pub complete_restore_scans: u64,
     pub durable_readiness_probes: u64,
     pub last_generation: u64,
@@ -1335,9 +1490,19 @@ pub struct QualificationTrafficStatus {
     pub watch_entries: u64,
     pub watch_applied_records: u64,
     pub watch_sequence: u64,
-    /// Last gap-free generation observed for each topology-ordered synthetic
-    /// traffic key. The vector is bounded to the validated 3/5-member fleet.
+    /// Number of bounded application-journal reconciliations used before an
+    /// exact watch resubscription.
+    pub watch_reconciliations: u64,
+    /// Applied head bound to the most recent reconciliation, or zero when the
+    /// initial watch has never required reconciliation.
+    pub watch_reconciled_sequence: u64,
+    /// Last generation either observed gap-free or restored at a proven
+    /// reconciliation handoff for each topology-ordered synthetic traffic
+    /// key. The vector is bounded to the validated 3/5-member fleet.
     pub watch_traffic_generations: Vec<u64>,
+    /// Most recent successfully proven linearizable replication head. Stop
+    /// replies reuse this cached proof and do not launch a new backend
+    /// operation after their owned task has joined.
     pub replication_head: u64,
 }
 
@@ -1600,6 +1765,62 @@ mod tests {
 
     #[test]
     fn traffic_schedule_is_topology_bound_and_status_is_strict() {
+        assert_eq!(QUALIFICATION_OPERATION_TIMEOUT_MILLIS, 10_000);
+        assert_eq!(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, 45_000);
+        assert_eq!(QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, 75_000);
+        assert_eq!(QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, 1_000);
+        assert_eq!(QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, 30_000);
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_CANCELLATION_PROFILE,
+            "accepted-operation-terminal-checkpoints/v1"
+        );
+        assert_eq!(QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER, 2);
+        assert_eq!(QUALIFICATION_TRAFFIC_ACTIVE_CONNECTION_FACTOR, 4);
+        assert_eq!(
+            QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE,
+            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS
+        );
+        assert_eq!(QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE, 8);
+        assert_eq!(
+            QUALIFICATION_MAX_CONCURRENT_LINEARIZABILITY_CHECKS_PER_OPENRAFT_NODE,
+            DURABLE_OPENRAFT_LINEARIZABILITY_WORKER_COUNT
+        );
+        assert_eq!(
+            QUALIFICATION_MAX_CONCURRENT_LINEARIZABILITY_CHECKS_PER_OPENRAFT_NODE,
+            1
+        );
+        assert_eq!(
+            QUALIFICATION_LINEARIZABILITY_ADMISSION_CAPACITY_PER_OPENRAFT_NODE,
+            DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY
+        );
+        assert_eq!(
+            QUALIFICATION_LINEARIZABILITY_ADMISSION_CAPACITY_PER_OPENRAFT_NODE,
+            64
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
+            8
+        );
+        assert_eq!(QUALIFICATION_TRAFFIC_TTL_MILLIS, 3_600_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS, 8_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS, 50);
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_PROFILE,
+            "post-release-response-loss/v1"
+        );
+        assert_eq!(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS, 25_000);
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES,
+            262_144
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES,
+            MAX_REPLICATION_LOG_PAGE_ENTRIES
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE,
+            "bounded-durable-journal/v1"
+        );
         assert_eq!(
             qualification_traffic_seed(3),
             Some(QUALIFICATION_TRAFFIC_SEED_BASE ^ 3)
@@ -1611,6 +1832,13 @@ mod tests {
         assert_eq!(qualification_traffic_seed(4), None);
         let three = qualification_traffic_schedule_sha256(3).expect("three-voter schedule");
         let five = qualification_traffic_schedule_sha256(5).expect("five-voter schedule");
+        assert_eq!(
+            (three.as_str(), five.as_str()),
+            (
+                "sha256:19cb20d917d528a12e24da8b99afba640729fa01e07bd075dc653d33e938c874",
+                "sha256:5c7839c73d01d23ba5ecabe21a27fcc319168a8ea7a5f70f2bb539d8e3f96ecd",
+            )
+        );
         assert!(is_exact_sha256(&three));
         assert!(is_exact_sha256(&five));
         assert_ne!(three, five);
@@ -1620,12 +1848,17 @@ mod tests {
             status: QualificationTrafficStatus {
                 state: QualificationTrafficState::Running,
                 failure: None,
+                failure_stage: None,
+                failure_error_class: None,
                 seed: QUALIFICATION_TRAFFIC_SEED_BASE ^ 3,
                 owned_async_tasks: 2,
                 mutation_cycles: 7,
                 linearizable_reads: 7,
                 lease_renewals: 7,
                 lease_reacquisitions: 7,
+                availability_interruptions: 1,
+                availability_recoveries: 1,
+                max_consecutive_availability_interruptions: 1,
                 complete_restore_scans: 7,
                 durable_readiness_probes: 7,
                 last_generation: 7,
@@ -1633,6 +1866,8 @@ mod tests {
                 watch_entries: 43,
                 watch_applied_records: 21,
                 watch_sequence: 44,
+                watch_reconciliations: 0,
+                watch_reconciled_sequence: 0,
                 watch_traffic_generations: vec![7, 8, 9],
                 replication_head: 44,
             },

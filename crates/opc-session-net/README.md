@@ -37,26 +37,36 @@ reordering, addition, removal, and epoch changes. Derived collisions are
 rejected during admission. The legacy `try_new` constructor is deprecated and
 fixes the epoch to 1 only for source compatibility with protocol-v5 callers.
 
-Each directed consensus peer retains at most one authenticated connection and
-allows at most one in-flight RPC on it. Establishment performs a fresh
+Each directed consensus peer retains a fixed primary/overflow pool of at most
+two authenticated connections and allows at most one in-flight RPC on each.
+Sequential calls prefer the primary lane; a concurrent call may use overflow,
+and further calls wait for either lane under their existing absolute deadline.
+Establishment performs a fresh
 mutual-TLS handshake and binds the certificate SPIFFE identity, logical replica
 ID, stable node ID, expected server, cluster/configuration/epoch, exact
 transport profile, and a fresh handshake nonce. Each call carries a fresh
-correlation ID; only a complete, correctly correlated, fully validated
-successful response returns the connection to the sole slot. A typed failed
-response, cancellation, timeout, EOF, framing,
-protocol, authentication, evidence mismatch, or lifecycle retirement drops it,
-so a late or partial response cannot be consumed by another Openraft RPC. The
-client applies one absolute logical deadline to gate acquisition and, when a
+correlation ID. A complete, correctly correlated, authenticated, and fully
+validated successful response or typed semantic `Unavailable` response returns
+the connection to its selected lane; `Unavailable` preserves a known stream
+position but grants no success or authority. Cancellation, timeout, EOF,
+framing, `Protocol`, `Authentication`, `ScopeMismatch`, `Rejected`, evidence
+mismatch, lifecycle retirement, or any uncertain stream position drops it, so
+a late or partial response cannot be consumed by another Openraft RPC. The
+client applies one absolute logical deadline to lane acquisition and, when a
 connection is required, DNS, TCP, TLS, bootstrap, bounded encoding, write, and
 response read.
 
 This cache removes repeated handshakes from a healthy steady-state heartbeat
 path. A first call, dead cached socket, or replacement still performs DNS, TCP,
 mutual TLS, identity admission, and bootstrap. One absolute family deadline
-starts before gate acquisition. A fresh connection receives the lesser of the
+starts before lane acquisition. A fresh connection receives the lesser of the
 remaining family budget and a 1,500 ms cold-phase cap; response work keeps only
 the original remaining budget, so cold time is contained and never additive.
+At the 31-member ceiling, one node has at most 30 remote peers: 60 steady-state
+outbound lanes. During one bounded retirement step, at most one retiring
+generation per lane may overlap its replacement, for up to 120 server-side
+connections. Repeated churn remains governed by the listener's unchanged hard
+cap of 128 rather than that planning estimate.
 
 | RPC family | Complete deadline |
 |:---|---:|
@@ -97,7 +107,7 @@ mutation or rebuild authority beside Openraft.
   production client binding for an admitted peer.
 - `RemoteSessionConsensusPeer::new` and `new_with_resolver` create the
   authenticated outbound consensus-only port. Unmodified clones share one
-  bounded connection slot and one call gate per directed peer; clone-local
+  fixed two-slot connection pool per directed peer; clone-local
   frame, lifecycle, or reauthentication builders detach incompatible cached
   state. `None` selects the shared family profile. `Some(duration)` remains a
   source-compatible fixed complete-call test/compatibility override, but cannot
@@ -532,9 +542,10 @@ Retirement has these invariants:
   use its operation-bound idempotency/fencing contract;
 - a replacement repeats TCP resolution, mutual TLS, canonical SPIFFE identity,
   nonce/challenge, ALPN, version, and exact contract-profile checks;
-- a consensus connection is cached only after a complete correlated successful
-  response passes wire validation; a typed failed response, cancellation, or
-  every uncertain stream position leaves the slot empty, and a subsequent
+- a consensus connection is cached only after a complete, correlated,
+  authenticated, validated success or typed semantic `Unavailable` response;
+  cancellation, timeout, EOF, protocol/authentication/scope/rejection failure,
+  or every uncertain stream position leaves the slot empty, and a subsequent
   Openraft retry reconnects without an implicit transport replay;
 - after mutual TLS and before acknowledgement, a complete generic
   `BootstrapResponse::ConnectionRetiring` result proves server admission did
@@ -601,9 +612,10 @@ survivor durable readiness, and encrypted-canary progress. They also qualify a
 same-issuer leaf with a 75-second remaining-validity/expiry budget: the fixed
 soft boundary is expiry minus the 30-second drain window, hard expiry completely
 drains the affected member and produces source/controller `LastGoodExpired`,
-and a valid leaf restores the fleet in the same process. This is not a real or
-deployed network partition, and those cases run no mixed
-traffic/watch/restore workload. Remaining
+and a valid leaf restores the fleet in the same process. The bounded mixed
+lease/CAS/read, watch, restore-scan, readiness, and connection-recycling
+workload remains active across those cases. This is not a real or deployed
+network partition. Remaining
 #164/#143 gates include the broader deployed partition/restart/fault matrix,
 deployed-network/platform-pressure evidence, resource/soak, remote HKMS, and
 signed release evidence. They make no evidence-schema or production-profile
@@ -669,10 +681,12 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   different member's malformed retained-last-good state, exact-address restart
   and repair, and same-issuer leaf expiry with a 75-second
   remaining-validity/expiry budget through soft retirement,
-  hard drain, survivor progress, and same-process replacement. #164 and #143
-  still own real/deployed partitions, the broader restart/fault matrix,
-  continuous mixed traffic/watch/restore during faults, reconnect storms,
-  resource, soak, remote-HKMS, deployed-network, and signed release evidence.
+  hard drain, survivor progress, and same-process replacement. A bounded mixed
+  lease/CAS/read, watch, restore-scan, readiness, and connection-recycling
+  workload remains active through those faults and exact-address restart. #164
+  and #143 still own real/deployed partitions, the broader restart/fault matrix,
+  reconnect storms, resource, soak, remote-HKMS, deployed-network, and signed
+  release evidence.
   Any production acceptance criteria must explicitly acknowledge that
   immediate generic revocation remains unsupported. The 365-day session TTL
   remains unrelated to certificate lifetime, trust-bundle lifetime, or
@@ -854,7 +868,8 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   and full-handshake reauthentication are implemented. The exact single-host
   multi-process trust and synthetic fault/expiry slices above are covered;
   deployed trust-bundle/root cutover, real network/storage faults, broader
-  restart/recovery, mixed traffic/watch/restore under faults, reconnect storms,
+  restart/recovery, deployed mixed traffic/watch/restore under real faults,
+  reconnect storms,
   resource/soak, remote-HKMS, payload-protection-key, signed-release, and
   production qualification evidence remain under #164/#143. Close those
   evidence gates before treating this as production transport.

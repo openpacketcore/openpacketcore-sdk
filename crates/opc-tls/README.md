@@ -228,8 +228,10 @@ under umbrella #158.
 
 ## Roadmap
 
-- Qualify projected-material rotation, expiry, rollback, and bounded reconnect
-  behavior in three- and five-member fleets under #164.
+- Complete deployed-CNF projected-material rotation, expiry, rollback, real
+  fault/restart, resource/soak, remote-HKMS, and signed independent evidence
+  for three- and five-member fleets under #164/#143. Single-host 3/5-process
+  rotation and bounded synthetic fault/expiry regression slices are present.
 - Add policy dimensions only when encoded in workload identity metadata.
 - Keep compatibility mode explicit so TLS 1.2 is never enabled accidentally.
 
