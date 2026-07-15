@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,13 +40,14 @@ use opc_session_testkit::qualification::{
     qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
     write_json_line, QualificationConnectionLifecycleMetrics,
     QualificationConsensusRpcAvailability, QualificationNodeCommand, QualificationNodeConfig,
-    QualificationNodeErrorCode, QualificationNodeReply, QualificationProjectedSvidStatus,
-    QualificationReadinessCode, QualificationSecurityMetricsSnapshot,
-    QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
-    QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
-    QualificationTrafficStatus, QualificationTransportConfig,
-    QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
-    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
+    QualificationNodeErrorCode, QualificationNodeReply, QualificationPeerRouting,
+    QualificationProjectedSvidStatus, QualificationReadinessCode,
+    QualificationSecurityMetricsSnapshot, QualificationTlsMaterialStatus,
+    QualificationTrafficErrorClass, QualificationTrafficFailureCode,
+    QualificationTrafficFailureStage, QualificationTrafficState, QualificationTrafficStatus,
+    QualificationTransportConfig, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
+    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_MAX_CONFIG_BYTES,
+    QUALIFICATION_MAX_LEASE_HANDLES,
     QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
@@ -616,10 +617,9 @@ impl QualificationNode {
         listener: TcpListener,
     ) -> Result<Self, NodeFailure> {
         secure_qualification_paths(config)?;
-        let expected_addr = config.members[config.node_index].dial_addr;
-        if listener.local_addr().map_err(|_| NodeFailure)? != expected_addr {
-            return Err(NodeFailure);
-        }
+        config
+            .validate_bind_addr(listener.local_addr().map_err(|_| NodeFailure)?)
+            .map_err(|_| NodeFailure)?;
         let descriptors = config
             .members
             .iter()
@@ -709,7 +709,7 @@ impl QualificationNode {
             .listen_on(listener)
             .await
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Listener))?;
-        if actual_addr != expected_addr {
+        if config.validate_bind_addr(actual_addr).is_err() {
             server.abort_and_wait().await;
             return Err(NodeFailure);
         }
@@ -2976,6 +2976,31 @@ fn lifecycle_metrics(empty_vote_dispatches: u64) -> QualificationConnectionLifec
     }
 }
 
+const QUALIFICATION_MAX_ENDPOINT_ADDRESSES: usize = 16;
+
+async fn resolve_canonical_endpoint(
+    endpoint_host: String,
+    endpoint_port: u16,
+) -> io::Result<SocketAddr> {
+    let mut addresses = tokio::net::lookup_host((endpoint_host.as_str(), endpoint_port)).await?;
+    addresses
+        .by_ref()
+        .take(QUALIFICATION_MAX_ENDPOINT_ADDRESSES)
+        .find(|address| is_admissible_peer_address(*address))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "peer endpoint unavailable"))
+}
+
+fn is_admissible_peer_address(address: SocketAddr) -> bool {
+    if address.port() == 0 || address.ip().is_unspecified() {
+        return false;
+    }
+    let ip = address.ip();
+    if ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    !matches!(ip, IpAddr::V4(value) if value == Ipv4Addr::BROADCAST)
+}
+
 async fn prepare_transport(
     config: &QualificationNodeConfig,
     local_binding: &LocalReplicaBinding,
@@ -3004,8 +3029,9 @@ async fn prepare_transport(
                         )
                         .map_err(|_| NodeFailure)?;
                     let node_id = binding.remote_consensus_node_id();
+                    let dial_addr = member.dial_addr.ok_or(NodeFailure)?;
                     let peer: Arc<dyn SessionConsensusPeer> = Arc::new(
-                        RemoteSessionConsensusPeer::new_insecure(binding, member.dial_addr, None),
+                        RemoteSessionConsensusPeer::new_insecure(binding, dial_addr, None),
                     );
                     peers.insert(
                         node_id,
@@ -3073,18 +3099,38 @@ async fn prepare_transport(
                     )
                     .map_err(|_| NodeFailure)?;
                 let node_id = binding.remote_consensus_node_id();
-                let dial_addr = member.dial_addr;
                 let resolver_evidence = QualificationResolverEvidence::new();
                 let resolver_evidence_for_call = resolver_evidence.clone();
                 let reauthentication_for_resolver = reauthentication.clone();
-                let resolver: RemoteAddrResolver = Arc::new(move || {
-                    let resolver_evidence = resolver_evidence_for_call.clone();
-                    let reauthentication = reauthentication_for_resolver.clone();
-                    Box::pin(async move {
-                        resolver_evidence.record_resolution(reauthentication.generation());
-                        Ok(dial_addr)
-                    })
-                });
+                let resolver: RemoteAddrResolver = match projected.peer_routing {
+                    QualificationPeerRouting::PinnedLoopbackTestOnly => {
+                        let dial_addr = member.dial_addr.ok_or(NodeFailure)?;
+                        Arc::new(move || {
+                            let resolver_evidence = resolver_evidence_for_call.clone();
+                            let reauthentication = reauthentication_for_resolver.clone();
+                            Box::pin(async move {
+                                resolver_evidence.record_resolution(reauthentication.generation());
+                                Ok(dial_addr)
+                            })
+                        })
+                    }
+                    QualificationPeerRouting::CanonicalEndpointDns => {
+                        let endpoint_host = member.endpoint_host.clone();
+                        let endpoint_port = member.endpoint_port;
+                        Arc::new(move || {
+                            let resolver_evidence = resolver_evidence_for_call.clone();
+                            let reauthentication = reauthentication_for_resolver.clone();
+                            let endpoint_host = endpoint_host.clone();
+                            Box::pin(async move {
+                                let address =
+                                    resolve_canonical_endpoint(endpoint_host, endpoint_port)
+                                        .await?;
+                                resolver_evidence.record_resolution(reauthentication.generation());
+                                Ok(address)
+                            })
+                        })
+                    }
+                };
                 let remote_peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
                     binding,
                     resolver,
@@ -3265,7 +3311,6 @@ fn arguments() -> Result<NodeArguments, NodeFailure> {
         .next()
         .and_then(|value| value.into_string().ok())
         .and_then(|value| value.parse::<SocketAddr>().ok())
-        .filter(|value| value.ip().is_loopback())
         .ok_or(NodeFailure)?;
     if args.next().is_some() || !config_path.is_absolute() {
         return Err(NodeFailure);
@@ -3308,9 +3353,7 @@ fn run() -> Result<(), NodeFailure> {
         return Err(NodeFailure);
     }
     let config = load_config(&arguments.config_path)?;
-    if config.node_index != arguments.node_index
-        || config.members[config.node_index].dial_addr != bind_addr
-    {
+    if config.node_index != arguments.node_index || config.validate_bind_addr(bind_addr).is_err() {
         return Err(NodeFailure);
     }
     let mut node = runtime.block_on(QualificationNode::open(&config, listener))?;
@@ -3371,6 +3414,31 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_dns_resolution_rejects_local_or_non_routable_results() {
+        for address in [
+            "127.0.0.1:7443",
+            "[::1]:7443",
+            "0.0.0.0:7443",
+            "[::]:7443",
+            "224.0.0.1:7443",
+            "255.255.255.255:7443",
+            "192.0.2.10:0",
+        ] {
+            assert!(!is_admissible_peer_address(
+                address.parse().expect("test socket address")
+            ));
+        }
+        assert!(is_admissible_peer_address(
+            "192.0.2.10:7443".parse().expect("test peer address")
+        ));
+        assert!(is_admissible_peer_address(
+            "[2001:db8::10]:7443"
+                .parse()
+                .expect("test IPv6 peer address")
+        ));
+    }
 
     #[test]
     fn traffic_cancellation_checkpoint_distinguishes_open_sent_and_closed_channels() {

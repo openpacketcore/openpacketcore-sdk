@@ -35,9 +35,9 @@ use opc_session_testkit::qualification::{
     write_json_line, QualificationConnectionLifecycleConfig,
     QualificationConnectionLifecycleMetrics, QualificationConsensusRpcAvailability,
     QualificationMember, QualificationNodeCommand, QualificationNodeConfig,
-    QualificationNodeErrorCode, QualificationNodeReply, QualificationProjectedMtlsConfig,
-    QualificationProjectedSvidAvailability, QualificationProjectedSvidReason,
-    QualificationProjectedSvidStatus, QualificationReadinessCode,
+    QualificationNodeErrorCode, QualificationNodeReply, QualificationPeerRouting,
+    QualificationProjectedMtlsConfig, QualificationProjectedSvidAvailability,
+    QualificationProjectedSvidReason, QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
     QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
     QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
@@ -2303,7 +2303,7 @@ impl Fleet {
                 replica_id: format!("node-{node_index}"),
                 endpoint_host: format!("node-{node_index}.qualification.invalid"),
                 endpoint_port: dial_addr.port(),
-                dial_addr: *dial_addr,
+                dial_addr: Some(*dial_addr),
                 tls_identity: spiffe_id(node_index),
                 failure_domain: format!("zone-{node_index}"),
                 backing_identity: format!("disk-{node_index}"),
@@ -2347,6 +2347,7 @@ impl Fleet {
                         trust_bundle_files: vec![PathBuf::from("ca.crt")],
                         poll_interval_millis: duration_millis(MIN_PROJECTED_SVID_POLL_INTERVAL),
                         lifecycle: production_lifecycle_config(),
+                        peer_routing: QualificationPeerRouting::PinnedLoopbackTestOnly,
                     },
                 ),
             };
@@ -2528,7 +2529,9 @@ impl Fleet {
     }
 
     fn kill_node_unclean_by(&mut self, node_index: usize, deadline: Instant) -> (SocketAddr, u32) {
-        let expected_address = self.members[node_index].dial_addr;
+        let expected_address = self.members[node_index]
+            .dial_addr
+            .expect("projected-mTLS test route");
         let previous_process_id = self.nodes[node_index].process_id();
         self.nodes[node_index].kill_unclean_by(deadline);
         wait_for_bind_address_release_by(expected_address, deadline);
@@ -5202,7 +5205,9 @@ impl Fleet {
                         .expect("old-chain remote replica"),
                 )
                 .expect("old-chain remote binding");
-            let address = self.members[target].dial_addr;
+            let address = self.members[target]
+                .dial_addr
+                .expect("projected-mTLS test route");
             let resolver_calls = Arc::new(AtomicUsize::new(0));
             let resolver_calls_for_probe = Arc::clone(&resolver_calls);
             let resolver: RemoteAddrResolver = Arc::new(move || {
@@ -5341,7 +5346,9 @@ impl Fleet {
             .expect("resolver proof client config");
         let calls = Arc::new(AtomicUsize::new(0));
         let timestamps = Arc::new(Mutex::new(Vec::<Instant>::with_capacity(4)));
-        let address = self.members[1].dial_addr;
+        let address = self.members[1]
+            .dial_addr
+            .expect("projected-mTLS test route");
         let resolver: RemoteAddrResolver = {
             let calls = Arc::clone(&calls);
             let timestamps = Arc::clone(&timestamps);

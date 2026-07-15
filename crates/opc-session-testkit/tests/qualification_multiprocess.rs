@@ -1658,7 +1658,7 @@ impl CanonicalConfigurationManifest {
                 replica_id: format!("node-{node_index}"),
                 endpoint_host: format!("node-{node_index}.qualification.invalid"),
                 endpoint_port: address.port(),
-                dial_addr: *address,
+                dial_addr: Some(*address),
                 tls_identity: format!(
                     "spiffe://qualification.invalid/tenant/test/ns/test/sa/session/nf/test/instance/{node_index}"
                 ),
@@ -2498,7 +2498,7 @@ impl Fleet {
             .configuration_manifest
             .as_ref()
             .and_then(|manifest| manifest.members.get(node_index))
-            .map(|member| member.dial_addr)
+            .and_then(|member| member.dial_addr)
             .ok_or(HarnessError::Evidence)?;
         let actual_addr = self.spawn_node_bound(node_index, bind_addr, bind_stage)?;
         if actual_addr != bind_addr {
