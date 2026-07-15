@@ -12,8 +12,8 @@ use opc_ipsec_xfrm::{
     IKEV2_SECURITY_PROTOCOL_ID_ESP,
 };
 use opc_proto_diameter::apps::swm::{
-    build_swm_diameter_eap_answer_for, build_swm_diameter_eap_request,
-    derive_unauthenticated_emergency_msk, parse_swm_diameter_eap_answer_envelope,
+    build_eap_response_identity, build_swm_diameter_eap_answer_for, build_swm_diameter_eap_request,
+    derive_unauthenticated_emergency_msk, emergency_nai, parse_swm_diameter_eap_answer_envelope,
     parse_swm_diameter_eap_request, parse_swm_diameter_eap_request_envelope, AuthRequestType,
     SwmDiameterEapAnswer, SwmDiameterEapRequest, SwmDiameterResult,
     SwmEmergencyAuthorizationEvidence, SwmEmergencyAuthorizationPath, SwmEmergencyServices,
@@ -330,11 +330,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
 ) -> Result<(), Box<dyn Error>> {
     let imei = Imei15::new("490154203237518")?;
     let emergency_imsi_nai = "0234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org";
-    let eap_identity_len = u16::try_from(5 + emergency_imsi_nai.len())?;
-    let mut eap_identity = vec![0x02, 0x17];
-    eap_identity.extend_from_slice(&eap_identity_len.to_be_bytes());
-    eap_identity.push(0x01);
-    eap_identity.extend_from_slice(emergency_imsi_nai.as_bytes());
+    let eap_identity = build_eap_response_identity(0x17, emergency_imsi_nai.as_bytes())?;
     let mut initial_request = SwmDiameterEapRequest {
         session_id: "sess;swm;emergency".into(),
         auth_application_id: SWM_APPLICATION_ID.get(),
@@ -449,7 +445,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         service_selection: None,
         default_context_identifier: None,
         apn_configurations: Vec::new(),
-        mobile_node_identifier: Some(format!("imei{}@sos.invalid", imei.as_str()).into()),
+        mobile_node_identifier: Some(emergency_nai(&imei).into()),
         eap_payload: Some(vec![0x03, 0x17, 0x00, 0x04].into()),
         eap_reissued_payload: None,
         error_message: None,
@@ -497,7 +493,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
     )?;
     let identity_body = build_ike_auth_identification_payload(&Ikev2IdentificationPayloadBuild {
         id_type: 2,
-        id_data: format!("imei{}@sos.invalid", imei.as_str()).into_bytes(),
+        id_data: emergency_nai(&imei).into_bytes(),
     })?;
     let auth_data = compute_ike_auth_shared_key_mic(
         profile,

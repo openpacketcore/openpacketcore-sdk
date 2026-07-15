@@ -76,6 +76,11 @@ pub const EMERGENCY_SERVICES_EMERGENCY_INDICATION: u32 = 1 << 0;
 pub const DIAMETER_ERROR_USER_UNKNOWN: u32 = 5001;
 /// Width of the TS 33.402 Annex A.4 unauthenticated-emergency MSK.
 pub const UNAUTHENTICATED_EMERGENCY_MSK_LEN: usize = 32;
+/// Largest identity body that fits an RFC 3748 EAP-Response/Identity packet.
+///
+/// The five-octet fixed packet prefix (Code, Identifier, Length, and Type) is
+/// included in EAP's two-octet packet length.
+pub const EAP_RESPONSE_IDENTITY_MAX_IDENTITY_LEN: usize = u16::MAX as usize - 5;
 
 /// APN-Configuration grouped AVP code (3GPP TS 29.272 §7.3.35).
 pub const AVP_APN_CONFIGURATION: AvpCode = AvpCode::new(1430);
@@ -3015,9 +3020,72 @@ fn eap_success_identifier(payload: &[u8]) -> Option<u8> {
         .then_some(payload[1])
 }
 
-fn emergency_nai(imei: &Imei15) -> String {
+/// Build the canonical TS 23.003 IMEI Emergency NAI used by TS 33.402.
+///
+/// The returned string contains the equipment identity and must be handled as
+/// sensitive subscriber data. Pass its exact bytes to
+/// [`build_eap_response_identity`] and use the same string as the SWm
+/// `User-Name`; emergency authorization compares both values byte-for-byte.
+#[must_use]
+pub fn emergency_nai(imei: &Imei15) -> String {
     format!("imei{}@sos.invalid", imei.as_str())
 }
+
+/// Build an exact RFC 3748 EAP-Response/Identity packet.
+///
+/// `identity` is copied verbatim into the Type-Data field. Callers building a
+/// SWm emergency DER must also place those exact bytes in `User-Name` (normally
+/// by passing [`emergency_nai`] for the direct IMEI path or the canonical IMSI
+/// Emergency NAI for identity recovery). The helper accepts an empty identity,
+/// as RFC 3748 permits, but the SWm emergency verifier rejects it because it
+/// cannot match a required emergency identity.
+///
+/// # Errors
+///
+/// Returns [`SwmEapResponseIdentityBuildError::IdentityTooLong`] before
+/// allocation when the identity plus the five-octet fixed prefix cannot fit
+/// EAP's two-octet packet-length field.
+pub fn build_eap_response_identity(
+    identifier: u8,
+    identity: &[u8],
+) -> Result<Vec<u8>, SwmEapResponseIdentityBuildError> {
+    let packet_len = 5_usize
+        .checked_add(identity.len())
+        .filter(|length| *length <= usize::from(u16::MAX))
+        .ok_or(SwmEapResponseIdentityBuildError::IdentityTooLong)?;
+    let packet_len =
+        u16::try_from(packet_len).map_err(|_| SwmEapResponseIdentityBuildError::IdentityTooLong)?;
+    let mut payload = Vec::with_capacity(usize::from(packet_len));
+    payload.extend_from_slice(&[2, identifier]);
+    payload.extend_from_slice(&packet_len.to_be_bytes());
+    payload.push(1);
+    payload.extend_from_slice(identity);
+    Ok(payload)
+}
+
+/// Fail-closed error returned by [`build_eap_response_identity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwmEapResponseIdentityBuildError {
+    /// The identity cannot fit EAP's two-octet packet-length field.
+    IdentityTooLong,
+}
+
+impl SwmEapResponseIdentityBuildError {
+    /// Stable redaction-safe label suitable for metrics and audit events.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdentityTooLong => "swm_eap_response_identity_too_long",
+        }
+    }
+}
+
+impl fmt::Display for SwmEapResponseIdentityBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Error for SwmEapResponseIdentityBuildError {}
 
 fn is_imsi_emergency_nai(identity: &str) -> bool {
     let Some((username, realm)) = identity.split_once('@') else {

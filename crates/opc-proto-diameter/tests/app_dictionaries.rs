@@ -95,13 +95,8 @@ fn emergency_imsi_nai() -> &'static str {
 
 #[cfg(feature = "app-swm")]
 fn eap_response_identity(identifier: u8, identity: &str) -> Vec<u8> {
-    let length = u16::try_from(5 + identity.len()).expect("bounded test EAP identity");
-    let mut payload = Vec::with_capacity(usize::from(length));
-    payload.extend_from_slice(&[2, identifier]);
-    payload.extend_from_slice(&length.to_be_bytes());
-    payload.push(1);
-    payload.extend_from_slice(identity.as_bytes());
-    payload
+    apps::swm::build_eap_response_identity(identifier, identity.as_bytes())
+        .expect("bounded test EAP identity")
 }
 
 #[cfg(feature = "app-swm")]
@@ -581,11 +576,42 @@ fn swm_unauthenticated_emergency_msk_matches_annex_a4_vector() {
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_emergency_identity_builders_match_wire_contract_and_fail_closed() {
+    let imei = emergency_imei();
+    let identity = apps::swm::emergency_nai(&imei);
+    assert_eq!(identity, "imei490154203237518@sos.invalid");
+
+    let payload = apps::swm::build_eap_response_identity(0x17, identity.as_bytes())
+        .expect("canonical emergency identity fits EAP");
+    assert_eq!(
+        payload,
+        b"\x02\x17\x00\x24\x01imei490154203237518@sos.invalid"
+    );
+
+    let maximum_identity = vec![b'x'; apps::swm::EAP_RESPONSE_IDENTITY_MAX_IDENTITY_LEN];
+    let maximum_payload = apps::swm::build_eap_response_identity(0xff, &maximum_identity)
+        .expect("maximum EAP identity must fit");
+    assert_eq!(maximum_payload.len(), usize::from(u16::MAX));
+    assert_eq!(&maximum_payload[..5], &[0x02, 0xff, 0xff, 0xff, 0x01]);
+
+    let oversized_identity = vec![b'x'; apps::swm::EAP_RESPONSE_IDENTITY_MAX_IDENTITY_LEN + 1];
+    let error = apps::swm::build_eap_response_identity(0x17, &oversized_identity)
+        .expect_err("oversized EAP identity must fail before wire construction");
+    assert_eq!(
+        error,
+        apps::swm::SwmEapResponseIdentityBuildError::IdentityTooLong
+    );
+    assert_eq!(error.as_str(), "swm_eap_response_identity_too_long");
+    assert_eq!(error.to_string(), error.as_str());
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_direct_emergency_evidence_requires_correlated_exact_success() {
     let imei = emergency_imei();
     let mut request = sample_swm_request();
     request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
-    let direct_identity = format!("imei{}@sos.invalid", imei.as_str());
+    let direct_identity = apps::swm::emergency_nai(&imei);
     request.user_name = Some(direct_identity.clone().into());
     request.eap_payload = eap_response_identity(0x17, &direct_identity).into();
     let answer = sample_final_emergency_answer(&imei);
@@ -851,7 +877,7 @@ fn swm_identity_recovery_evidence_fails_closed_at_every_boundary() {
         SwmEmergencyAuthorizationError::IdentityRecoveryInitialIdentityInvalid
     );
     let mut changed_initial = initial.clone();
-    let direct_identity = format!("imei{}@sos.invalid", imei.as_str());
+    let direct_identity = apps::swm::emergency_nai(&imei);
     changed_initial.user_name = Some(direct_identity.clone().into());
     changed_initial.eap_payload = eap_response_identity(0x17, &direct_identity).into();
     let changed_initial = request_envelope(&changed_initial, 1, 2);
@@ -1579,7 +1605,7 @@ fn sample_final_emergency_answer(imei: &Imei15) -> SwmDiameterEapAnswer {
             .to_vec()
             .into(),
     );
-    answer.mobile_node_identifier = Some(format!("imei{}@sos.invalid", imei.as_str()).into());
+    answer.mobile_node_identifier = Some(apps::swm::emergency_nai(imei).into());
     answer
 }
 

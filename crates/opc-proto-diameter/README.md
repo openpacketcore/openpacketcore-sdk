@@ -42,8 +42,11 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   also models the TS 33.402 unauthenticated-emergency identity-recovery
   exchange: 3GPP Experimental-Result 5001, retry DER Terminal-Information,
   final DEA Mobile-Node-Identifier and IMEI-derived MSK, and correlated,
-  fail-closed authorization evidence. The top-level `Service-Selection`
-  remains a distinct AVP and is not treated as that default pointer.
+  fail-closed authorization evidence. Public `emergency_nai` and bounded
+  `build_eap_response_identity` helpers construct the exact matching
+  User-Name and EAP identity contract without consumer-owned wire formatting.
+  The top-level `Service-Selection` remains a distinct AVP and is not treated
+  as that default pointer.
 - `app-gx`, `app-s6a`, `app-s6b`, and `app-swx` currently provide dictionary
   slots rather than full typed application APIs.
 
@@ -120,9 +123,20 @@ requests TS 33.402 device-identity recovery; it is not authorization. After
 the UE returns a TS 24.302 `DEVICE_IDENTITY`, the retry DER carries the
 recovered exact 15-digit IMEI in `Terminal-Information`. The recovery branch
 accepts only the TS 23.003 IMSI emergency NAI forms for AKA/AKA-prime and an
-exact EAP-Response/Identity whose bytes equal User-Name. Emergency
-authorization consumes request/answer envelopes that retain both Diameter
-transaction identifiers; the final DEA must have exact base
+exact EAP-Response/Identity whose bytes equal User-Name.
+
+Emergency DER builders should use `emergency_nai(&imei)` for the direct IMEI
+path and pass the exact resulting bytes to `build_eap_response_identity`;
+recovery DER builders use the same EAP helper with their canonical IMSI
+Emergency NAI. The returned IMEI NAI is sensitive equipment identity and must
+not be logged.
+Identity octets are copied verbatim, including an RFC-permitted empty body, and
+only inputs that cannot fit EAP's two-octet packet length are rejected before
+allocation. The emergency verifier still rejects empty or mismatched identity
+material.
+
+Emergency authorization consumes request/answer envelopes that retain both
+Diameter transaction identifiers; the final DEA must have exact base
 `DIAMETER_SUCCESS` (2001), an exact EAP Success with the matching Response
 identifier, a nonempty TS 33.402 Annex A.4 MSK derived from the exact received
 IMEI digits, and the same permanent identity in `Mobile-Node-Identifier`. A
