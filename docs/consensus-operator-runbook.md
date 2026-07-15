@@ -380,10 +380,11 @@ guard and validate that same exact record without minting unnecessary fencing
 authority. Evidence binds this routing as `stage-aware-known-authority/v1`.
 The private
 schedule drops one successful release response per mutator to prove this path.
-More than eight such outcomes per node, any recovery episode beyond 8 seconds,
-any retry before the fixed 50 ms delay, or phase completion with an unresolved
-interruption fails the campaign; lease loss, unexpected state, and invariant
-failures are never masked. The
+More than eight such outcomes per node, any recovery episode beyond the fixed
+26-second two-election-plus-operation transition envelope, any retry before the
+fixed 50 ms delay, or phase completion with an unresolved interruption fails
+the campaign; lease loss, unexpected state, and invariant failures are never
+masked. The
 exact-address restarted member is watcher-only before exit and joins the
 mutator set only after bounded journal reconciliation, so active-mutator
 crash/restart is not qualified. A broader restart/fault matrix, resource/soak,
@@ -446,6 +447,21 @@ lifecycle expiry of a coherent source publication was observed, whether before
 pairing, while controller-active, or after controller rejection. Supersession
 alone does not synthesize expiry. Peer authentication or trust failures remain
 `opc_session_net_connection_attempts_total{outcome="authentication_or_trust_failure"}`.
+
+Reconnect admission is serialized and exponentially bounded per directed peer,
+not per RPC: both consensus lanes share the same cooldown, and legacy direct
+requests and watches share the backend's cooldown. A newly published local TLS
+material epoch or explicit reauthentication generation supersedes an old-epoch
+wait or handshake immediately; it does not bypass fresh mutual-TLS, SPIFFE,
+manifest-scope, ALPN, or contract checks. Alert on sustained real connection
+attempts, not logical request volume. A cancelled in-flight attempt is exported
+as a timeout outcome so `started = terminal + outstanding` remains the
+accounting invariant.
+
+Material-epoch retirement of an already authenticated cached lane uses the
+configured stable per-peer jitter. An explicit reauthentication request is an
+operator demand for current-generation proof and retires cached lanes
+immediately; it does not wait for material jitter.
 
 Install these alert rules for a consensus CNF. There is deliberately no fixed
 reference span. The earlier 1320-second example was unsafe because its
@@ -3052,9 +3068,11 @@ encryption/HKMS composition above Openraft.
    `request_reauthentication()` on the controls for its affected outbound peers
    and listeners. The generation is monotonic and process-local; never set it
    back.
-5. During the deterministic jitter/drain interval, verify no new work enters
-   old connections, transport waits and connection slots end within the hard
-   deadline, replacements complete full mutual TLS/application negotiation,
+5. During the bounded retirement/drain interval, verify no new work enters old
+   connections. A material-only change may consume its deterministic jitter;
+   the explicit reauthentication in step 4 retires cached lanes immediately.
+   Verify transport waits and connection slots end within the hard deadline,
+   replacements complete full mutual TLS/application negotiation,
    drain overruns stay zero, and durable readiness remains fresh. An admitted
    supervised mutation may finish after transport closure; treat its outcome as
    ambiguous, never replay it automatically, and use authoritative readback or

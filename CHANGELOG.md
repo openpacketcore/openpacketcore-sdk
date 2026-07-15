@@ -60,8 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stage-aware-known-authority/v1`. The
   schedule deterministically drops one successful release response to exercise
   this path, permits at most eight such outcomes per node, gives each recovery
-  episode 8 seconds, retries only after a fixed 50 ms delay, and exposes total,
-  recovered, and maximum-consecutive counters. Phase completion requires every
+  episode the fixed 26-second two-election-plus-operation transition envelope,
+  retries only after a fixed 50 ms delay, and exposes total, recovered, and
+  maximum-consecutive counters. Phase completion requires every
   interruption to be reconciled; lease loss, unexpected state, and invariant
   failures still fail immediately. The exact-address
   restarted member is watcher-only before exit and enters the mutator set only
@@ -104,8 +105,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed-response, and EOF diagnostics retain only a closed pending-command
   kind, harness-local sequence, elapsed send time, and closed stderr category;
   command values, session/lease identities, payloads, and filesystem paths are
-  omitted. Cooperative task-stop replies reuse the last successfully proven
-  linearizable replication head instead of launching a new backend operation
+  omitted. Initial process-heavy `Configure`/`Started` exchanges are admitted
+  one child at a time under one shared 45-second fleet deadline, while cluster
+  `Initialize` remains concurrent. Cooperative task-stop replies reuse the last
+  successfully proven linearizable replication head instead of launching a new
+  backend operation
   after task join; subsequent recovery still requires fresh bounded journal
   reconciliation. The 90-second transition value is only a hard fail-safe;
   semantic completion ends each transition. These single-host synthetic bounds
@@ -348,9 +352,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new admission at soft retirement, bound the transport wait and connection
   slot by the hard deadline, and repeat mutual TLS plus identity, nonce, ALPN,
   version, and exact profile checks on replacements.
-  `SessionReauthenticationControl` provides a
-  cooperative CNF trigger with deterministic directed-peer jitter and bounded
-  reconnect backoff. Legacy watches resume from the exact delivered successor;
+  Material-epoch changes use deterministic directed-peer jitter;
+  `SessionReauthenticationControl` provides an immediate CNF trigger for
+  current-generation proof. Both paths retain bounded reconnect backoff.
+  Legacy watches resume from the exact delivered successor;
   mutations retry only after the complete fixed `ConnectionRetiring`
   no-dispatch proof. An authenticated post-TLS rotation race before bootstrap
   acknowledgement now returns
@@ -1113,6 +1118,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- **Bounded reconnect admission — `opc-session-net`:** reconnect cooldown and
+  exponential backoff now live in per-client, per-peer gates: one is shared
+  across sequential calls and concurrent consensus lanes, and another is
+  shared by the legacy direct/watch paths. This
+  prevents logical RPC boundaries from resetting retry pressure during
+  certificate soft/hard expiry. Material or explicit-reauthentication epoch
+  changes supersede old waits and in-flight handshakes; only a current,
+  dispatch-usable authenticated connection resets the gate. Cached consensus
+  lanes retain deterministic jitter for material rotation, while explicit
+  reauthentication retires them immediately for current-generation proof and
+  newly established stale-epoch connections still fail before Openraft request
+  bytes. Cancelled outbound attempts publish a terminal timeout metric,
+  preserving attempt accounting. Openraft authority, HKMS/encryption/AAD
+  boundaries, and durable formats are unchanged. The #164 synthetic fleet
+  recovery envelope correction is documented separately above.
 - **Conditional S2b Create Session identity — `opc-proto-gtpv2c`:**
   ProcedureAware Create Session Request decode now accepts the TS 29.274
   UICC-less emergency identity shape (MEI instance 0 plus an instance-0

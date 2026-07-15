@@ -2019,6 +2019,17 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
         .allow_any_trusted_peer()
         .build_authenticated_client_config()
         .expect("rotating consensus client config");
+    // This case verifies that both lanes are replaced by each epoch. Cached
+    // jitter is covered separately with paused time; keep it at zero here so
+    // the replacement assertion has no wall-clock sampling race.
+    let immediate_rotation = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        Duration::from_millis(1),
+        Duration::from_millis(20),
+        Duration::ZERO,
+    )
+    .expect("immediate rotation lifecycle");
     let reauthentication = SessionReauthenticationControl::new();
     let resolutions = Arc::new(AtomicUsize::new(0));
     let counted_resolver: RemoteAddrResolver = {
@@ -2038,6 +2049,7 @@ async fn consensus_reauthentication_and_material_epochs_replace_both_cached_lane
         client_config.clone(),
         Some(Duration::from_secs(2)),
     )
+    .with_connection_lifecycle(immediate_rotation)
     .with_reauthentication_control(reauthentication.clone());
 
     assert_consensus_call_pair(&peer, &manifest, b"initial-primary", b"initial-overflow").await;

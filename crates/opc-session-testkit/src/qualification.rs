@@ -136,9 +136,14 @@ pub const QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE: u64 =
 /// Maximum wall-clock interval for one authority-and-record reconciliation.
 /// Ambiguous mutation outcomes advance same-owner fencing authority; read-only
 /// checkpoints retain the already-proven guard and validate its exact record.
-/// An accepted backend operation is still allowed to reach its terminal
-/// outcome; a success observed after this deadline fails the qualification.
-pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS: u64 = 8_000;
+/// The bound covers the fixed two-election cluster transition plus one complete
+/// consensus operation and remains large enough for the reconciliation's
+/// sequential acquire and linearizable get plus one retry delay. An accepted
+/// backend operation is still allowed to reach its terminal outcome; a success
+/// observed after this deadline fails the qualification.
+pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
 /// Fixed retry delay between terminal recoverable backend outcomes.
 pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS: u64 = 50;
 /// Versioned, qualification-only response-loss injection that deterministically
@@ -1811,7 +1816,32 @@ mod tests {
             8
         );
         assert_eq!(QUALIFICATION_TRAFFIC_TTL_MILLIS, 3_600_000);
-        assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS, 8_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS, 26_000);
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
+            DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+                + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis
+        );
+        const {
+            assert!(
+                QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
+                    >= DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis
+            );
+            assert!(
+                QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
+                    >= DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis * 2
+                        + QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS
+            );
+            assert!(
+                QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
+                    < QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS
+            );
+            assert!(
+                QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS
+                    + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis
+                    <= QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS
+            );
+        }
         assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS, 50);
         assert_eq!(
             QUALIFICATION_TRAFFIC_AUTHORITY_RECONCILIATION_PROFILE,
@@ -1848,8 +1878,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:5feb47397403db27b62de56aca1c8528e5ec694df6dcf8a6edf2300b9b466199",
-                "sha256:e2770f91efa46e0d0cfad66e24cb89bc4af7c9643fb2087c0f70cd675a03a4d6",
+                "sha256:e596381d4c54c7789aefdbdfc2f5d695e25ef815eb9d1d7ccfdcfd0200589b7a",
+                "sha256:39c0bad8c354539d0e10a9c0acb180f47e7be13f4b4995bbab9edc2df153a640",
             )
         );
         assert!(is_exact_sha256(&three));

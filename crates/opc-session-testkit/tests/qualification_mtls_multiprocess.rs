@@ -1377,10 +1377,18 @@ impl ChildNode {
     }
 
     fn receive(&mut self) -> QualificationNodeReply {
+        self.receive_with_timeout(CHILD_TIMEOUT)
+    }
+
+    fn receive_until(&mut self, deadline: Instant) -> QualificationNodeReply {
+        self.receive_with_timeout(deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn receive_with_timeout(&mut self, timeout: Duration) -> QualificationNodeReply {
         let pending = self
             .pending
             .expect("qualification child response requested without a pending command");
-        match self.replies.recv_timeout(CHILD_TIMEOUT) {
+        match self.replies.recv_timeout(timeout) {
             Ok(ReaderMessage::Reply(reply)) => {
                 self.pending = None;
                 reply
@@ -1644,12 +1652,21 @@ impl Fleet {
             database_paths.push(database_path);
         }
 
-        for node in &mut nodes {
-            node.send(&QualificationNodeCommand::Configure);
-        }
+        // Bound the process-heavy store/transport startup to one child at a
+        // time. All listeners are already bound and all immutable
+        // configuration/material has already been published, so serializing
+        // only Configure/Started removes the startup fan-out without changing
+        // the concurrent cluster-initialization proof below. One shared
+        // deadline establishes one fixed fleet-wide failure bound.
+        let configure_deadline = Instant::now() + CHILD_TIMEOUT;
         for (node_index, node) in nodes.iter_mut().enumerate() {
+            assert!(
+                Instant::now() < configure_deadline,
+                "qualification fleet Configure deadline exhausted before node={node_index}"
+            );
+            node.send(&QualificationNodeCommand::Configure);
             assert!(matches!(
-                node.receive(),
+                node.receive_until(configure_deadline),
                 QualificationNodeReply::Started { node_index: actual } if actual == node_index
             ));
         }
