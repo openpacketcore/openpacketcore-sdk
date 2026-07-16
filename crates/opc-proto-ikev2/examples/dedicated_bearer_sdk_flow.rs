@@ -12,11 +12,11 @@ use opc_proto_gtpv2c::{
     s2b_create_bearer_response, s2b_delete_bearer_request, s2b_delete_bearer_response, BearerQos,
     CauseValue, ChargingId, EpsBearerId, FullyQualifiedTeid, Gtpv2cMonotonicMillis,
     Gtpv2cPeerToken, Gtpv2cTriggeredCompletion, Gtpv2cTriggeredRequestDisposition,
-    Gtpv2cTriggeredTransactionKey, Gtpv2cTriggeredTransactions, OwnedMessage,
-    S2bCreateBearerRequest, S2bCreateBearerRequestContext, S2bCreateBearerResponse,
-    S2bCreateBearerResult, S2bDeleteBearerRequest, S2bDeleteBearerResponse,
-    S2bDeleteBearerResponseBody, S2bDeleteBearerResult, S2bDeleteBearerTarget, S2bMessage,
-    INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    Gtpv2cTriggeredTransactions, Gtpv2cTriggeredWorkToken, OwnedMessage, S2bCreateBearerRequest,
+    S2bCreateBearerRequestContext, S2bCreateBearerResponse, S2bCreateBearerResult,
+    S2bDeleteBearerRequest, S2bDeleteBearerResponse, S2bDeleteBearerResponseBody,
+    S2bDeleteBearerResult, S2bDeleteBearerTarget, S2bMessage, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
+    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_proto_ikev2::{
     build_ikev2_dedicated_bearer_create_child_sa_request,
@@ -65,6 +65,7 @@ fn create_dedicated_bearer(
     let request_message = s2b_create_bearer_request(S2bCreateBearerRequest {
         sequence_number: GTP_SEQUENCE,
         teid: GTP_REQUEST_TEID,
+        message_priority: None,
         linked_ebi: EpsBearerId { value: 5 },
         bearer_contexts: vec![S2bCreateBearerRequestContext {
             tft,
@@ -164,6 +165,7 @@ fn create_dedicated_bearer(
     let response = S2bCreateBearerResponse {
         sequence_number: request.sequence_number,
         teid: GTP_RESPONSE_TEID,
+        message_priority: request.message_priority,
         cause: CauseValue::RequestAccepted,
         bearer_contexts: vec![S2bCreateBearerResult::Accepted {
             ebi: DEDICATED_EBI,
@@ -196,6 +198,7 @@ fn delete_dedicated_bearer(
     let request_message = s2b_delete_bearer_request(S2bDeleteBearerRequest {
         sequence_number: GTP_SEQUENCE.wrapping_add(1),
         teid: GTP_REQUEST_TEID,
+        message_priority: None,
         target: S2bDeleteBearerTarget::Dedicated(vec![DEDICATED_EBI]),
         cause: None,
         additional_ies: Vec::new(),
@@ -243,6 +246,7 @@ fn delete_dedicated_bearer(
     let response = S2bDeleteBearerResponse {
         sequence_number: request.sequence_number,
         teid: GTP_RESPONSE_TEID,
+        message_priority: request.message_priority,
         cause: CauseValue::RequestAccepted,
         body: S2bDeleteBearerResponseBody::Dedicated(vec![S2bDeleteBearerResult {
             ebi: DEDICATED_EBI,
@@ -331,7 +335,7 @@ fn observe_dispatch(
     peer: Gtpv2cPeerToken,
     request: Bytes,
     now: u64,
-) -> Result<Gtpv2cTriggeredTransactionKey, Box<dyn Error>> {
+) -> Result<Gtpv2cTriggeredWorkToken, Box<dyn Error>> {
     match transactions.observe_request(
         peer,
         request,

@@ -317,7 +317,7 @@ impl Ikev2ApnAmbrMapping {
     ///
     /// A rate above 65,280 Mbps uses the normal sentinel plus Extended
     /// APN-AMBR. If only one direction exceeds that threshold, the other
-    /// direction's extended unit and multiplier are both zero.
+    /// direction uses canonical unit 3 with a zero multiplier.
     ///
     /// # Errors
     ///

@@ -40,6 +40,7 @@ fn gtp_bearer_tft_and_ike_tft_notify_embed_identical_value_bytes() {
     let gtp_message = must_ok(s2b_create_bearer_request(S2bCreateBearerRequest {
         sequence_number: 0x12_3456,
         teid: 0x0102_0304,
+        message_priority: None,
         linked_ebi: EpsBearerId { value: 5 },
         bearer_contexts: vec![S2bCreateBearerRequestContext {
             tft: canonical.clone(),
