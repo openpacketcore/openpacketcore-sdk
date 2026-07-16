@@ -1000,9 +1000,14 @@ fn project_create_bearer_response<'a>(
 }
 
 fn valid_delete_request_cause(cause: CauseValue) -> bool {
+    // TS 29.274 Table 7.2.9.2-1 calls the S2a/S2b procedure reason "Local
+    // release", while Table 8.4-1 assigns its wire value 2 the initial-Cause
+    // name "Local Detach". `LocalDetach` is therefore the typed representation
+    // of that S2b local-release request reason.
     matches!(
         cause,
-        CauseValue::RatChangedFrom3gppToNon3gpp
+        CauseValue::LocalDetach
+            | CauseValue::RatChangedFrom3gppToNon3gpp
             | CauseValue::IsrDeactivation
             | CauseValue::ReactivationRequested
             | CauseValue::PdnReconnectionDisallowed

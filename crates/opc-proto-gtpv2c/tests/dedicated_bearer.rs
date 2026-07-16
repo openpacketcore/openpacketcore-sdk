@@ -302,6 +302,17 @@ fn delete_bearer_linked_and_dedicated_forms_round_trip_and_correlate() {
     correlate_delete_bearer_response(&linked_actual, &linked_response)
         .expect("linked response correlation");
 
+    // Table 7.2.9.2-1 says "Local release" for this S2b request; Table 8.4-1
+    // names the encoded initial Cause 2 "Local Detach".
+    assert_eq!(CauseValue::LocalDetach.as_u8(), 2);
+    let local_release_request = S2bDeleteBearerRequest {
+        cause: Some(CauseValue::LocalDetach),
+        additional_ies: Vec::new(),
+        ..linked_request
+    };
+    s2b_delete_bearer_request(local_release_request)
+        .expect("S2b local-release request cause must be accepted");
+
     let dedicated_request = S2bDeleteBearerRequest {
         sequence_number: SEQUENCE,
         teid: REQUEST_TEID,
@@ -547,8 +558,15 @@ fn triggered_transactions_dispatch_pending_commit_and_exactly_replay() {
         bearer_contexts: vec![accepted_result(1)],
         additional_ies: Vec::new(),
     };
-    let response_bytes =
-        encode(&s2b_create_bearer_response(response).expect("valid Create Bearer Response"));
+    let response_bytes = encode(
+        &s2b_create_bearer_response(response.clone()).expect("valid Create Bearer Response"),
+    );
+    let mut wrong_routing_response = response;
+    wrong_routing_response.teid = RESPONSE_TEID.wrapping_add(1);
+    let wrong_routing_bytes = encode(
+        &s2b_create_bearer_response(wrong_routing_response)
+            .expect("internally valid response with wrong routing"),
+    );
     let peer = Gtpv2cPeerToken::new(7);
     let now = Gtpv2cMonotonicMillis::new(1_000);
     let mut transactions = Gtpv2cTriggeredTransactions::default();
@@ -557,7 +575,7 @@ fn triggered_transactions_dispatch_pending_commit_and_exactly_replay() {
         .observe_request(
             peer,
             request_bytes.clone(),
-            Some(RESPONSE_TEID),
+            RESPONSE_TEID,
             now,
             DecodeContext::default(),
         )
@@ -571,18 +589,29 @@ fn triggered_transactions_dispatch_pending_commit_and_exactly_replay() {
             .observe_request(
                 peer,
                 request_bytes.clone(),
-                Some(RESPONSE_TEID),
+                RESPONSE_TEID,
                 Gtpv2cMonotonicMillis::new(1_001),
                 DecodeContext::default(),
             )
             .expect("pending retransmission"),
         Gtpv2cTriggeredRequestDisposition::Pending(pending) if pending == key
     ));
+    assert_eq!(
+        transactions
+            .commit_response(
+                key,
+                Gtpv2cTriggeredCompletion::Accepted(wrong_routing_bytes),
+                Gtpv2cMonotonicMillis::new(1_002),
+                DecodeContext::default(),
+            )
+            .expect_err("response header TEID must match the required route"),
+        Gtpv2cTriggeredTransactionError::ResponseMismatch
+    );
     transactions
         .commit_response(
             key,
             Gtpv2cTriggeredCompletion::Accepted(response_bytes.clone()),
-            Gtpv2cMonotonicMillis::new(1_002),
+            Gtpv2cMonotonicMillis::new(1_003),
             DecodeContext::default(),
         )
         .expect("response commit");
@@ -590,8 +619,8 @@ fn triggered_transactions_dispatch_pending_commit_and_exactly_replay() {
         .observe_request(
             peer,
             request_bytes,
-            Some(RESPONSE_TEID),
-            Gtpv2cMonotonicMillis::new(1_003),
+            RESPONSE_TEID,
+            Gtpv2cMonotonicMillis::new(1_004),
             DecodeContext::default(),
         )
         .expect("committed retransmission")
@@ -610,7 +639,7 @@ fn triggered_transactions_dispatch_pending_commit_and_exactly_replay() {
             .commit_response(
                 key,
                 Gtpv2cTriggeredCompletion::Accepted(Bytes::new()),
-                Gtpv2cMonotonicMillis::new(1_004),
+                Gtpv2cMonotonicMillis::new(1_005),
                 DecodeContext::default(),
             )
             .expect_err("a committed response cannot be replaced"),
@@ -626,11 +655,24 @@ fn triggered_transactions_reject_conflict_timeout_and_exhausted_capacity() {
     let peer = Gtpv2cPeerToken::new(8);
     let request =
         encode(&s2b_create_bearer_request(create_request(1, SEQUENCE)).expect("valid request"));
+    assert_eq!(
+        transactions
+            .observe_request(
+                peer,
+                request.clone(),
+                0,
+                Gtpv2cMonotonicMillis::new(0),
+                DecodeContext::default(),
+            )
+            .expect_err("response routing must never accept a zero TEID"),
+        Gtpv2cTriggeredTransactionError::ZeroExpectedResponseTeid
+    );
+    assert!(transactions.is_empty());
     let key = match transactions
         .observe_request(
             peer,
             request.clone(),
-            Some(RESPONSE_TEID),
+            RESPONSE_TEID,
             Gtpv2cMonotonicMillis::new(0),
             DecodeContext::default(),
         )
@@ -649,7 +691,7 @@ fn triggered_transactions_reject_conflict_timeout_and_exhausted_capacity() {
             .observe_request(
                 peer,
                 changed,
-                Some(RESPONSE_TEID.wrapping_add(1)),
+                RESPONSE_TEID.wrapping_add(1),
                 Gtpv2cMonotonicMillis::new(1),
                 DecodeContext::default(),
             )
@@ -665,7 +707,7 @@ fn triggered_transactions_reject_conflict_timeout_and_exhausted_capacity() {
             .observe_request(
                 peer,
                 second,
-                Some(RESPONSE_TEID),
+                RESPONSE_TEID,
                 Gtpv2cMonotonicMillis::new(2),
                 DecodeContext::default(),
             )
@@ -701,7 +743,7 @@ fn triggered_transaction_commit_correlates_each_bearer_with_cached_request() {
         .observe_request(
             peer,
             request_bytes,
-            Some(RESPONSE_TEID),
+            RESPONSE_TEID,
             Gtpv2cMonotonicMillis::new(0),
             DecodeContext::default(),
         )
@@ -755,7 +797,7 @@ fn triggered_transaction_keys_are_safe_across_sequence_wrap() {
                 .observe_request(
                     peer,
                     request,
-                    Some(RESPONSE_TEID),
+                    RESPONSE_TEID,
                     Gtpv2cMonotonicMillis::new(index as u64),
                     DecodeContext::default(),
                 )

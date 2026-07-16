@@ -48,7 +48,9 @@ control-plane stack.
 - `Gtpv2cTriggeredTransactions` provides a bounded, transport-neutral inbound
   transaction boundary for Create Bearer and Delete Bearer. First observations
   dispatch application work once, pending duplicates do not dispatch again,
-  and committed duplicates replay the exact retained response bytes.
+  and committed duplicates replay the exact retained response bytes. Every
+  observation requires the non-zero remote response TEID; response routing
+  correlation cannot be disabled.
 
 ## Example
 

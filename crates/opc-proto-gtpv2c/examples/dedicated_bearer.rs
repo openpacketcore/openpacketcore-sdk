@@ -39,7 +39,7 @@ fn handle_create(
     let key = match transactions.observe_request(
         peer,
         encoded_request.clone(),
-        Some(RESPONSE_TEID),
+        RESPONSE_TEID,
         Gtpv2cMonotonicMillis::new(1_000),
         DecodeContext::default(),
     )? {
@@ -89,7 +89,7 @@ fn handle_create(
     match transactions.observe_request(
         peer,
         encoded_request,
-        Some(RESPONSE_TEID),
+        RESPONSE_TEID,
         Gtpv2cMonotonicMillis::new(1_002),
         DecodeContext::default(),
     )? {
@@ -110,7 +110,7 @@ fn handle_delete(
     let key = match transactions.observe_request(
         peer,
         encoded_request.clone(),
-        Some(RESPONSE_TEID),
+        RESPONSE_TEID,
         Gtpv2cMonotonicMillis::new(2_000),
         DecodeContext::default(),
     )? {
@@ -156,7 +156,7 @@ fn handle_delete(
     match transactions.observe_request(
         peer,
         encoded_request,
-        Some(RESPONSE_TEID),
+        RESPONSE_TEID,
         Gtpv2cMonotonicMillis::new(2_002),
         DecodeContext::default(),
     )? {

@@ -88,6 +88,9 @@ failures and must cover at least these rules:
   instance 0, or one to fifteen dedicated EBIs at instance 1. Responses must
   use the corresponding linked or grouped per-bearer form and account for
   every requested EBI exactly once.
+- The Delete Bearer request reason called "Local release" by Table 7.2.9.2-1
+  is represented by `CauseValue::LocalDetach`, the Table 8.4-1 name for its
+  exact initial-Cause wire value 2.
 - Dedicated-bearer correlation checks sequence number, list cardinality,
   request PGW F-TEID or EBI identity, response shape, and bearer Cause/F-TEID
   hierarchy. Malformed contexts are rejected rather than skipped.
@@ -113,9 +116,10 @@ failures and must cover at least these rules:
   repeatable Bearer Context and dedicated-EBI keys are cardinality-aware.
 - `Gtpv2cTriggeredTransactions` keys requests by peer token, request TEID,
   24-bit sequence number, message type, and procedure. It retains bounded
-  request/response bytes, rejects conflicting identity reuse, expires pending
-  and committed state on caller-supplied monotonic deadlines, and never
-  invokes application work itself. Its state is not crash-persistent.
+  request/response bytes, requires a non-zero remote response TEID, rejects
+  conflicting identity reuse, expires pending and committed state on
+  caller-supplied monotonic deadlines, and never invokes application work
+  itself. Its state is not crash-persistent.
 
 ### Graduation status
 
@@ -202,8 +206,9 @@ coverage.
      after a correlated response is committed, it returns the exact retained
      bytes in `Replay` without re-running the application side effect.
    - Commit validates procedure, direction, message type, sequence number,
-     configured response TEID, message Cause, response form, every requested
-     bearer, and PGW F-TEID correlation before retaining the response.
+     required non-zero response TEID, message Cause, response form, every
+     requested bearer, and PGW F-TEID correlation before retaining the
+     response.
    - Conflicting identity reuse, invalid completion/Cause declarations,
      oversized retained bytes, capacity exhaustion, and expired transactions
      return stable redaction-safe errors. Sequence 0 and `0x00ff_ffff` are

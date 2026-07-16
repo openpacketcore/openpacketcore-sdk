@@ -325,6 +325,8 @@ pub struct Gtpv2cTriggeredCommit {
 /// Stable, redaction-safe triggered transaction failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gtpv2cTriggeredTransactionError {
+    /// The caller did not provide a usable remote response TEID.
+    ZeroExpectedResponseTeid,
     /// Request exceeds the configured retained-byte bound.
     RequestTooLarge,
     /// Request did not decode as one complete procedure-aware GTPv2-C message.
@@ -364,6 +366,7 @@ impl Gtpv2cTriggeredTransactionError {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ZeroExpectedResponseTeid => "gtpv2c_triggered_response_teid_zero",
             Self::RequestTooLarge => "gtpv2c_triggered_request_too_large",
             Self::MalformedRequest => "gtpv2c_triggered_request_malformed",
             Self::TrailingRequestBytes => "gtpv2c_triggered_request_trailing_bytes",
@@ -417,7 +420,7 @@ impl fmt::Debug for TriggeredEntryState {
 #[derive(Clone)]
 struct TriggeredEntry {
     request: Bytes,
-    expected_response_teid: Option<u32>,
+    expected_response_teid: u32,
     expires_at: Gtpv2cMonotonicMillis,
     state: TriggeredEntryState,
 }
@@ -427,10 +430,7 @@ impl fmt::Debug for TriggeredEntry {
         formatter
             .debug_struct("TriggeredEntry")
             .field("request_len", &self.request.len())
-            .field(
-                "expected_response_teid_present",
-                &self.expected_response_teid.is_some(),
-            )
+            .field("expected_response_teid_present", &true)
             .field("expires_at", &self.expires_at)
             .field("state", &self.state)
             .finish()
@@ -493,11 +493,9 @@ impl Gtpv2cTriggeredTransactions {
 
     /// Observe one complete encoded Create Bearer or Delete Bearer request.
     ///
-    /// `expected_response_teid` is the remote control-plane TEID that the
-    /// eventual response must carry. `None` disables that correlation only for
-    /// deployments where the remote TEID is genuinely unavailable; procedure,
-    /// direction, message type, sequence number, and request identity remain
-    /// mandatory.
+    /// `expected_response_teid` is the non-zero remote control-plane TEID that
+    /// the eventual response must carry. The registry never disables response
+    /// routing correlation.
     ///
     /// # Errors
     ///
@@ -507,11 +505,14 @@ impl Gtpv2cTriggeredTransactions {
         &mut self,
         peer: Gtpv2cPeerToken,
         encoded_request: Bytes,
-        expected_response_teid: Option<u32>,
+        expected_response_teid: u32,
         now: Gtpv2cMonotonicMillis,
         ctx: DecodeContext,
     ) -> Result<Gtpv2cTriggeredRequestDisposition, Gtpv2cTriggeredTransactionError> {
         let _expired = self.cleanup_expired(now);
+        if expected_response_teid == 0 {
+            return Err(Gtpv2cTriggeredTransactionError::ZeroExpectedResponseTeid);
+        }
         if encoded_request.len() > self.policy.max_request_bytes {
             return Err(Gtpv2cTriggeredTransactionError::RequestTooLarge);
         }
@@ -671,7 +672,7 @@ fn procedure_context(mut ctx: DecodeContext) -> DecodeContext {
 
 fn response_matches(
     key: Gtpv2cTriggeredTransactionKey,
-    expected_response_teid: Option<u32>,
+    expected_response_teid: u32,
     view: &S2bProcedureMessage<'_>,
 ) -> bool {
     view.procedure == key.procedure
@@ -679,7 +680,7 @@ fn response_matches(
         && view.message_type() == key.procedure.response_message_type()
         && view.header.sequence_number <= MAX_SEQUENCE_NUMBER
         && view.header.sequence_number == key.sequence_number
-        && expected_response_teid.is_none_or(|expected| view.header.teid == Some(expected))
+        && view.header.teid == Some(expected_response_teid)
 }
 
 fn correlate_response_to_request(
