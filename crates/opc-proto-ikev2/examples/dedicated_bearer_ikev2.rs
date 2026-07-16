@@ -1,4 +1,4 @@
-//! Minimal opened-payload dedicated-bearer establishment and deletion flow.
+//! Minimal IKEv2 opened-payload dedicated-bearer establishment and deletion flow.
 
 use std::error::Error;
 

@@ -106,7 +106,7 @@ Modification uses
 `INFORMATIONAL` responses must be decoded and checked with the corresponding
 `validate_..._response_correlation` helper before application state changes.
 The complete compilable establishment-and-deletion flow is in
-[`examples/dedicated_bearer.rs`](examples/dedicated_bearer.rs).
+[`examples/dedicated_bearer_ikev2.rs`](examples/dedicated_bearer_ikev2.rs).
 
 ## Example
 
