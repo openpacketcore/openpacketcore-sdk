@@ -1392,6 +1392,13 @@ fn deadline_allows_completion(now: Instant, deadline: Instant) -> bool {
     now <= deadline
 }
 
+fn deadline_admits_complete_operation(now: Instant, deadline: Instant) -> bool {
+    now.checked_add(Duration::from_millis(
+        QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    ))
+    .is_some_and(|operation_deadline| operation_deadline <= deadline)
+}
+
 fn assert_transition_completed_by(started: Instant, deadline: Instant, phase: &str) {
     let now = Instant::now();
     assert!(
@@ -2746,7 +2753,15 @@ impl Fleet {
         let catchup_started_at = Instant::now();
         let catchup_deadline = catchup_started_at
             + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS);
+        let mut last_complete_reports: Option<Vec<FleetReadiness>> = None;
         loop {
+            assert!(
+                deadline_admits_complete_operation(Instant::now(), catchup_deadline),
+                "active-mutator restart exhausted readiness-probe admission budget: node={node_index}, total_elapsed_millis={}, catchup_elapsed_millis={}, readiness_before={readiness_before:?}, last_complete_reports={last_complete_reports:?}, stderr={:?}",
+                restart_started_at.elapsed().as_millis(),
+                catchup_started_at.elapsed().as_millis(),
+                self.stderr_diagnostics()
+            );
             let reports = self.readiness_reports_by(&all_node_indices, catchup_deadline);
             let required_quorum = self.required_quorum();
             if reports.iter().all(|report| {
@@ -2763,9 +2778,10 @@ impl Fleet {
                 );
                 break;
             }
+            last_complete_reports = Some(reports);
             if !deadline_allows_completion(Instant::now(), catchup_deadline) {
                 panic!(
-                    "active-mutator restart did not regain all-voter readiness: node={node_index}, total_elapsed_millis={}, catchup_elapsed_millis={}, readiness_before={readiness_before:?}, reports={reports:?}, stderr={:?}",
+                    "active-mutator restart did not regain all-voter readiness: node={node_index}, total_elapsed_millis={}, catchup_elapsed_millis={}, readiness_before={readiness_before:?}, last_complete_reports={last_complete_reports:?}, stderr={:?}",
                     restart_started_at.elapsed().as_millis(),
                     catchup_started_at.elapsed().as_millis(),
                     self.stderr_diagnostics()
@@ -7873,6 +7889,16 @@ fn transition_deadline_never_accepts_a_late_success() {
     assert!(!deadline_allows_completion(
         deadline + Duration::from_nanos(1),
         deadline
+    ));
+
+    let operation_timeout = Duration::from_millis(QUALIFICATION_OPERATION_TIMEOUT_MILLIS);
+    assert!(deadline_admits_complete_operation(
+        started,
+        started + operation_timeout
+    ));
+    assert!(!deadline_admits_complete_operation(
+        started,
+        started + operation_timeout - Duration::from_nanos(1)
     ));
 }
 
