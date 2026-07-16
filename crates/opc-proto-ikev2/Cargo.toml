@@ -28,6 +28,7 @@ bytes = { workspace = true }
 crypto-bigint = { version = "0.7.5", features = ["getrandom", "zeroize"] }
 hmac = { workspace = true }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+opc-proto-tft = { path = "../opc-proto-tft", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 p256 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
 p384 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
@@ -41,6 +42,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 opc-proto-ikev2 = { path = ".", version = "0.2.0", features = ["testkit"] }
+opc-proto-gtpv2c = { path = "../opc-proto-gtpv2c", version = "0.2.0" }
+quickcheck = "1"
 
 [lints]
 workspace = true

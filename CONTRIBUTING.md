@@ -134,7 +134,7 @@ are Cargo-publishable; packages with `publish = false` are held.
 required version keys, but it does not require every manifest to declare an
 explicit boolean.
 
-At this revision, the workspace contains 46 Cargo-publishable packages and 29
+At this revision, the workspace contains 32 Cargo-publishable packages and 46
 held packages. The authoritative current publication list is generated rather
 than duplicated here:
 
@@ -160,7 +160,7 @@ eligibility.
 | `opc-key-vault` | experimental | A production-readiness review covering Vault policy scoping, secret-zero handling, lease rotation, and an integration test against a real or containerized Vault Transit instance. |
 | `opc-proto-nas` | experimental | Structured parsing of the remaining 5GMM and 5GSM message bodies listed as out-of-scope in `crates/opc-proto-nas/CONFORMANCE.md`, with spec-byte fixtures for each message. |
 | `opc-proto-ngap` | experimental | A working canonical (typed) APER encoder path, verified by external fixtures for `NGSetupResponse` and `NGSetupFailure`, after the upstream `rasn` APER encoder misalignment is resolved or replaced. See `crates/opc-proto-ngap/CONFORMANCE.md`. |
-| `opc-proto-gtpv2c` | experimental S2b subset | Correct MP-flag/priority handling, independent-peer interoperability, and completion of the declared compatibility and negative-evidence matrix. Any future coverage expansion must also add mandatory-IE validation and spec-authored fixtures. See `crates/opc-proto-gtpv2c/CONFORMANCE.md`. |
+| `opc-proto-gtpv2c` | experimental S2b subset | Independent-peer interoperability and completion of the declared compatibility and negative-evidence matrix. Any future coverage expansion must also add mandatory-IE validation and spec-authored fixtures. See `crates/opc-proto-gtpv2c/CONFORMANCE.md`. |
 | `opc-proto-diameter` | experimental base + Rf/SWm dictionaries | ADR 0015 conformance claim for the base header/AVP layer, typed helpers and independently sourced fixtures for at least the remaining `app-gx`, `app-s6a`, `app-s6b`, and `app-swx` skeleton dictionaries, and downstream product integration evidence. See `crates/opc-proto-diameter/CONFORMANCE.md`. |
 | `opc-proto-ikev2` | experimental header/payload-chain scaffold | Typed cleartext payload-body coverage, RFC 7383 fragmentation framing checks, independent fixture provenance where used, and downstream product integration evidence for the IKE SA/EAP-AKA/Child SA policy boundary. See `crates/opc-proto-ikev2/CONFORMANCE.md`. |
 | `opc-api-nnrf` | experimental | Client/server stub generation and expanded OpenAPI operation coverage, plus generator stability across regenerated `types.rs` from the same pinned 3GPP YAML. See `crates/opc-api-nnrf/CONFORMANCE.md`. |

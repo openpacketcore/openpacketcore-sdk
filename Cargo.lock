@@ -2889,6 +2889,7 @@ name = "opc-proto-gtpv2c"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "opc-proto-tft",
  "opc-protocol",
 ]
 
@@ -2900,12 +2901,15 @@ dependencies = [
  "bytes",
  "crypto-bigint",
  "hmac 0.12.1",
+ "opc-proto-gtpv2c",
  "opc-proto-ikev2",
+ "opc-proto-tft",
  "opc-protocol",
  "opc-types",
  "p256",
  "p384",
  "p521",
+ "quickcheck",
  "rsa",
  "sha1",
  "sha2 0.10.9",
@@ -2937,6 +2941,16 @@ dependencies = [
 
 [[package]]
 name = "opc-proto-pfcp"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-protocol",
+ "quickcheck",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "opc-proto-tft"
 version = "0.2.0"
 dependencies = [
  "bytes",

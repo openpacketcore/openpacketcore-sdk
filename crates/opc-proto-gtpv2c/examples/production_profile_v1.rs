@@ -3,13 +3,15 @@ use opc_proto_gtpv2c::{
     s2b_create_session_accepted_response, s2b_create_session_rejected_response,
     s2b_create_session_request, s2b_delete_session_request, s2b_delete_session_response,
     s2b_echo_request, s2b_echo_response, s2b_modify_bearer_request, s2b_modify_bearer_response,
-    s2b_update_bearer_request, s2b_update_bearer_response, AccessPointName, BearerContext,
-    CauseValue, EpsBearerId, FullyQualifiedTeid, MessageDirection, MessageType, OwnedMessage,
-    PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId, RatType, RatTypeValue, Recovery,
-    S2bCreateSessionAcceptedResponse, S2bCreateSessionRejectedResponse, S2bCreateSessionRequest,
-    S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerRequest,
-    S2bModifyBearerResponse, S2bUpdateBearerRequest, S2bUpdateBearerResponse, SelectionMode,
-    SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue,
+    s2b_update_bearer_request, s2b_update_bearer_response, AccessPointName,
+    AggregateMaximumBitRate, BearerContext, CauseValue, EpsBearerId, FullyQualifiedTeid,
+    MessageDirection, MessageType, OwnedMessage, PdnAddressAllocation, PdnType, PdnTypeValue,
+    PlmnId, RatType, RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse,
+    S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bDeleteSessionRequest,
+    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerRequest, S2bModifyBearerResponse,
+    S2bUpdateBearerRequest, S2bUpdateBearerRequestContext, S2bUpdateBearerResponse,
+    S2bUpdateBearerResult, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe,
+    TypedIeValue,
 };
 use opc_protocol::{DecodeContext, DuplicateIePolicy, Encode, EncodeContext, ValidationLevel};
 use std::io::{Error as IoError, ErrorKind};
@@ -126,7 +128,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         s2b_update_bearer_request(S2bUpdateBearerRequest {
             sequence_number: 0x010209,
             teid: 0x0102_0304,
-            bearer_context: bearer_context(7),
+            message_priority: None,
+            apn_ambr: AggregateMaximumBitRate {
+                uplink: 64_000,
+                downlink: 128_000,
+            },
+            bearer_contexts: vec![S2bUpdateBearerRequestContext {
+                ebi: EpsBearerId { value: 7 },
+                tft: None,
+                bearer_qos: None,
+                additional_ies: Vec::new(),
+            }],
             additional_ies: Vec::new(),
         })?,
         MessageType::UpdateBearerRequest,
@@ -136,7 +148,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         s2b_update_bearer_response(S2bUpdateBearerResponse {
             sequence_number: 0x01020a,
             teid: 0x0102_0304,
+            message_priority: None,
             cause: CauseValue::RequestAccepted,
+            bearer_contexts: vec![S2bUpdateBearerResult {
+                ebi: EpsBearerId { value: 7 },
+                cause: CauseValue::RequestAccepted,
+                additional_ies: Vec::new(),
+            }],
             additional_ies: Vec::new(),
         })?,
         MessageType::UpdateBearerResponse,

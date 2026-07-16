@@ -8,6 +8,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Canonical 3GPP TFT codec — `opc-proto-tft`:** one shared, bounded TS 24.008
+  V18.8.0 value model now covers every operation, parameter, and Release 18
+  packet-filter component for GTPv2-C Bearer TFT IEs and IKEv2 TFT Notify
+  payloads. Strict structured validation rejects malformed lengths, reserved
+  and conflicting components, illegal cardinality, duplicates, and invalid
+  parameter sequences; permitted unknown parameters retain byte order.
+  Specification-authored fixtures, property/negative/corpus tests, redacted
+  diagnostics, and scheduled decode/round-trip fuzz targets define the codec
+  evidence. Transport wrappers and state-dependent bearer policy remain with
+  the consuming GTPv2-C and IKEv2 procedure boundaries.
+- **S2b dedicated-bearer GTPv2-C — `opc-proto-gtpv2c`:** typed and
+  procedure-aware Create Bearer (95/96), Update Bearer (97/98), and Delete
+  Bearer (99/100) support now validates mandatory nested IEs, APN-AMBR,
+  canonical shared Create-new/uplink TFT semantics, typed Bearer QoS/ARP and
+  standardized QCI rate rules, S2b-U F-TEID roles, mutually exclusive Delete
+  forms, partial results, Message Priority propagation, exact request/response
+  bearer correlation, bounded ordered request-only Load/Overload/PGW Change
+  IEs, and precise TFT syntax/semantic rejection Causes. The bounded
+  transport-neutral triggered transaction registry uses generation-bound work
+  tokens, fences timed-out side effects until explicit cancellation
+  acknowledgement, prevents duplicate application dispatch, and replays exact
+  committed response bytes across retransmissions.
+- **3GPP dedicated-bearer IKEv2 primitives — `opc-proto-ikev2`:** typed TS
+  24.302 R17 multiple-bearer QoS, TFT, modified-bearer, AMBR, and private-error
+  Notify codecs now compose with strict opened-payload builders/views for new
+  non-rekey `CREATE_CHILD_SA`, bearer-modification `INFORMATIONAL`, and
+  Child-SA deletion exchanges. The boundary enforces payload cardinality,
+  supported ESP algorithm, AEAD/INTEG, ESN, SPI, and KE/proposal relationships;
+  response proposal/transform and traffic-selector correlation; an
+  uplink-applicable create TFT; directional paired-SPI Delete responses; the
+  explicit RFC 7296 crossed-delete exception; canonical shared TS 24.008 TFT
+  exact error/success separation. A checked integer-kbps bridge maps typed
+  GBR/non-GBR bearer QoS and APN-AMBR onto the complete TS 24.301 normal and
+  extended rate grids with explicit exact/ceiling quantization and reports the
+  values represented on the wire. Strict decoding applies the TS 24.301
+  receiver interpretation for compact-rate and extended-unit aliases and
+  stores their canonical equivalents. Every production Notify/exchange builder
+  rejects those aliases when supplied manually, along with reserved network
+  values, QCI/resource mismatches, invalid tier saturation, GBR ordering, and
+  inconsistent external-rate sentinels. Admission, SPI allocation,
+  retransmission timers, cryptographic sealing, and dataplane installation
+  remain with the product.
+- `opc-proto-gtpv2c`: TEID-present EPC headers now expose the TS 29.274 R18
+  Message Priority flag and a bounded `MessagePriority` value (`0` highest,
+  `15` lowest). Strict decode accepts valid MP-bearing headers while rejecting
+  spare bits and MP/value inconsistency; canonical encode emits the typed
+  priority, and raw-preserving encode retains ignored/spare wire bits.
 - `opc-sctp`: an explicit, default-off `DiameterInboundPpidPolicy` escape hatch
   can accept inbound PPID 0 from a configured legacy clear-text Diameter peer.
   Standard PPID 46 remains accepted and is always used outbound; DTLS remains

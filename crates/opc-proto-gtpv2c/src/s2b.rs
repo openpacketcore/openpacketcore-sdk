@@ -1,7 +1,7 @@
 //! S2b-oriented GTPv2-C message views.
 //!
 //! The S2b surface in this crate is intentionally a typed subset: it decodes
-//! Echo plus Create/Modify/Delete/Update Session-oriented GTPv2-C messages,
+//! Echo plus Create/Modify/Delete Session and triggered bearer GTPv2-C messages,
 //! exposes mandatory S2b IE examples through typed values, and keeps
 //! unsupported IEs as raw-preserving fallbacks. It is not a full ePDG or PGW
 //! control-plane implementation.
@@ -19,6 +19,7 @@ use opc_protocol::{
 
 use crate::header::Header;
 pub use crate::header::MessageType;
+use crate::ie::typed::decode_pgw_triggered_request_ie_sequence;
 use crate::ie::{
     decode_typed_ie_sequence, encode_typed_ie_sequence, AccessPointName, BearerContext, Cause,
     CauseValue, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation, PdnType,
@@ -53,11 +54,23 @@ pub const DELETE_SESSION_REQUEST: u8 = 36;
 /// Delete Session Response message type.
 pub const DELETE_SESSION_RESPONSE: u8 = 37;
 
-/// Update Bearer Request message type used by the S2b Update Session view.
+/// Create Bearer Request message type.
+pub const CREATE_BEARER_REQUEST: u8 = 95;
+
+/// Create Bearer Response message type.
+pub const CREATE_BEARER_RESPONSE: u8 = 96;
+
+/// Update Bearer Request message type.
 pub const UPDATE_BEARER_REQUEST: u8 = 97;
 
-/// Update Bearer Response message type used by the S2b Update Session view.
+/// Update Bearer Response message type.
 pub const UPDATE_BEARER_RESPONSE: u8 = 98;
+
+/// Delete Bearer Request message type.
+pub const DELETE_BEARER_REQUEST: u8 = 99;
+
+/// Delete Bearer Response message type.
+pub const DELETE_BEARER_RESPONSE: u8 = 100;
 
 /// GTPv2-C interface type for S2b ePDG GTP-C from 3GPP TS 29.274
 /// Table 8.22-1.
@@ -218,32 +231,6 @@ pub struct S2bDeleteSessionRequest<'a> {
 /// Input for building an S2b Production Profile v1 Delete Session Response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S2bDeleteSessionResponse<'a> {
-    /// GTPv2-C sequence number.
-    pub sequence_number: u32,
-    /// TEID carried in the response common header.
-    pub teid: u32,
-    /// Cause value.
-    pub cause: CauseValue,
-    /// Additional typed IEs to append after Cause.
-    pub additional_ies: Vec<TypedIe<'a>>,
-}
-
-/// Input for building an S2b Production Profile v1 Update Bearer Request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct S2bUpdateBearerRequest<'a> {
-    /// GTPv2-C sequence number.
-    pub sequence_number: u32,
-    /// TEID carried in the request common header.
-    pub teid: u32,
-    /// Bearer Context IE.
-    pub bearer_context: BearerContext<'a>,
-    /// Additional typed IEs to append after Bearer Context.
-    pub additional_ies: Vec<TypedIe<'a>>,
-}
-
-/// Input for building an S2b Production Profile v1 Update Bearer Response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct S2bUpdateBearerResponse<'a> {
     /// GTPv2-C sequence number.
     pub sequence_number: u32,
     /// TEID carried in the response common header.
@@ -434,42 +421,6 @@ pub fn s2b_delete_session_response(
     )
 }
 
-/// Build an S2b Production Profile v1 Update Bearer Request.
-///
-/// # Errors
-///
-/// Returns [`S2bProfileBuildError`] when Bearer Context cannot encode or the
-/// constructed request fails procedure-aware validation.
-pub fn s2b_update_bearer_request(
-    request: S2bUpdateBearerRequest<'_>,
-) -> S2bProfileBuildResult<OwnedMessage> {
-    build_bearer_context_request(
-        UPDATE_BEARER_REQUEST,
-        request.sequence_number,
-        request.teid,
-        request.bearer_context,
-        request.additional_ies,
-    )
-}
-
-/// Build an S2b Production Profile v1 Update Bearer Response.
-///
-/// # Errors
-///
-/// Returns [`S2bProfileBuildError`] when Cause cannot encode or the response
-/// fails procedure-aware validation.
-pub fn s2b_update_bearer_response(
-    response: S2bUpdateBearerResponse<'_>,
-) -> S2bProfileBuildResult<OwnedMessage> {
-    build_cause_response(
-        UPDATE_BEARER_RESPONSE,
-        response.sequence_number,
-        response.teid,
-        response.cause,
-        response.additional_ies,
-    )
-}
-
 fn build_bearer_context_request<'a>(
     message_type: u8,
     sequence_number: u32,
@@ -494,11 +445,11 @@ fn build_cause_response<'a>(
     build_s2b_profile_message(Header::with_teid(message_type, teid, sequence_number), ies)
 }
 
-fn typed_ie<'a>(instance: u8, value: TypedIeValue<'a>) -> TypedIe<'a> {
+pub(crate) fn typed_ie<'a>(instance: u8, value: TypedIeValue<'a>) -> TypedIe<'a> {
     TypedIe { instance, value }
 }
 
-fn cause(value: CauseValue) -> Cause {
+pub(crate) fn cause(value: CauseValue) -> Cause {
     Cause {
         value,
         flags_octet: 0,
@@ -510,7 +461,7 @@ fn accepted_cause() -> Cause {
     cause(CauseValue::RequestAccepted)
 }
 
-fn profile_decode_context() -> DecodeContext {
+pub(crate) fn profile_decode_context() -> DecodeContext {
     DecodeContext {
         duplicate_ie_policy: DuplicateIePolicy::Reject,
         validation_level: ValidationLevel::ProcedureAware,
@@ -518,7 +469,7 @@ fn profile_decode_context() -> DecodeContext {
     }
 }
 
-fn build_s2b_profile_message<'a>(
+pub(crate) fn build_s2b_profile_message<'a>(
     header: Header,
     ies: Vec<TypedIe<'a>>,
 ) -> S2bProfileBuildResult<OwnedMessage> {
@@ -2071,8 +2022,15 @@ pub enum Procedure {
     ModifyBearer,
     /// Delete Session request/response exchange.
     DeleteSession,
-    /// Update Bearer request/response exchange, exposed as the S2b Update Session view.
+    /// PGW-triggered Create Bearer request/response exchange.
+    CreateBearer,
+    /// Update Bearer request/response exchange.
+    ///
+    /// The `UpdateSession` variant name is retained for source compatibility;
+    /// the wire procedure is the PGW-triggered Update Bearer exchange.
     UpdateSession,
+    /// PGW-triggered Delete Bearer request/response exchange.
+    DeleteBearer,
 }
 
 impl Procedure {
@@ -2083,7 +2041,9 @@ impl Procedure {
             Self::CreateSession => CREATE_SESSION_REQUEST,
             Self::ModifyBearer => MODIFY_BEARER_REQUEST,
             Self::DeleteSession => DELETE_SESSION_REQUEST,
+            Self::CreateBearer => CREATE_BEARER_REQUEST,
             Self::UpdateSession => UPDATE_BEARER_REQUEST,
+            Self::DeleteBearer => DELETE_BEARER_REQUEST,
         }
     }
 
@@ -2094,7 +2054,9 @@ impl Procedure {
             Self::CreateSession => CREATE_SESSION_RESPONSE,
             Self::ModifyBearer => MODIFY_BEARER_RESPONSE,
             Self::DeleteSession => DELETE_SESSION_RESPONSE,
+            Self::CreateBearer => CREATE_BEARER_RESPONSE,
             Self::UpdateSession => UPDATE_BEARER_RESPONSE,
+            Self::DeleteBearer => DELETE_BEARER_RESPONSE,
         }
     }
 
@@ -2136,11 +2098,23 @@ fn procedure_and_direction(message_type: MessageType) -> Option<(Procedure, Mess
         MessageType::DeleteSessionResponse => {
             Some((Procedure::DeleteSession, MessageDirection::Response))
         }
+        MessageType::CreateBearerRequest => {
+            Some((Procedure::CreateBearer, MessageDirection::Request))
+        }
+        MessageType::CreateBearerResponse => {
+            Some((Procedure::CreateBearer, MessageDirection::Response))
+        }
         MessageType::UpdateBearerRequest => {
             Some((Procedure::UpdateSession, MessageDirection::Request))
         }
         MessageType::UpdateBearerResponse => {
             Some((Procedure::UpdateSession, MessageDirection::Response))
+        }
+        MessageType::DeleteBearerRequest => {
+            Some((Procedure::DeleteBearer, MessageDirection::Request))
+        }
+        MessageType::DeleteBearerResponse => {
+            Some((Procedure::DeleteBearer, MessageDirection::Response))
         }
         MessageType::Unknown(_) => None,
     }
@@ -2288,10 +2262,18 @@ pub enum S2bMessage<'a> {
     DeleteSessionRequest(S2bProcedureMessage<'a>),
     /// Delete Session Response view.
     DeleteSessionResponse(S2bProcedureMessage<'a>),
-    /// Update Bearer / S2b Update Session Request view.
+    /// PGW-triggered Create Bearer Request view.
+    CreateBearerRequest(S2bProcedureMessage<'a>),
+    /// PGW-triggered Create Bearer Response view.
+    CreateBearerResponse(S2bProcedureMessage<'a>),
+    /// Update Bearer Request view (legacy `UpdateSessionRequest` variant name).
     UpdateSessionRequest(S2bProcedureMessage<'a>),
-    /// Update Bearer / S2b Update Session Response view.
+    /// Update Bearer Response view (legacy `UpdateSessionResponse` variant name).
     UpdateSessionResponse(S2bProcedureMessage<'a>),
+    /// PGW-triggered Delete Bearer Request view.
+    DeleteBearerRequest(S2bProcedureMessage<'a>),
+    /// PGW-triggered Delete Bearer Response view.
+    DeleteBearerResponse(S2bProcedureMessage<'a>),
     /// Non-S2b or unsupported message preserved as the raw shell.
     Raw(Message<'a>),
 }
@@ -2319,11 +2301,23 @@ impl fmt::Debug for S2bMessage<'_> {
             Self::DeleteSessionResponse(view) => {
                 f.debug_tuple("DeleteSessionResponse").field(view).finish()
             }
+            Self::CreateBearerRequest(view) => {
+                f.debug_tuple("CreateBearerRequest").field(view).finish()
+            }
+            Self::CreateBearerResponse(view) => {
+                f.debug_tuple("CreateBearerResponse").field(view).finish()
+            }
             Self::UpdateSessionRequest(view) => {
                 f.debug_tuple("UpdateSessionRequest").field(view).finish()
             }
             Self::UpdateSessionResponse(view) => {
                 f.debug_tuple("UpdateSessionResponse").field(view).finish()
+            }
+            Self::DeleteBearerRequest(view) => {
+                f.debug_tuple("DeleteBearerRequest").field(view).finish()
+            }
+            Self::DeleteBearerResponse(view) => {
+                f.debug_tuple("DeleteBearerResponse").field(view).finish()
             }
             Self::Raw(message) => f
                 .debug_struct("Raw")
@@ -2348,7 +2342,22 @@ impl<'a> S2bMessage<'a> {
             return Ok(Self::Raw(message));
         };
 
-        let ies = decode_typed_ie_sequence(message.raw_ies, ctx, 0)?;
+        let mut typed_ctx = ctx;
+        if is_procedure_aware(ctx.validation_level) {
+            // Procedure tables, not a blanket first/last policy, define which
+            // IE type/instance pairs are lists. The typed decoder preserves
+            // those known lists and raw extension lists while rejecting a
+            // second occurrence of every known singleton.
+            typed_ctx.duplicate_ie_policy = DuplicateIePolicy::Reject;
+        }
+        let ies = if matches!(
+            message_type.as_u8(),
+            CREATE_BEARER_REQUEST | UPDATE_BEARER_REQUEST | DELETE_BEARER_REQUEST
+        ) {
+            decode_pgw_triggered_request_ie_sequence(message.raw_ies, typed_ctx)?
+        } else {
+            decode_typed_ie_sequence(message.raw_ies, typed_ctx, 0)?
+        };
         let view = S2bProcedureMessage {
             header: message.header,
             procedure,
@@ -2380,11 +2389,19 @@ impl<'a> S2bMessage<'a> {
             (Procedure::DeleteSession, MessageDirection::Response) => {
                 Self::DeleteSessionResponse(view)
             }
+            (Procedure::CreateBearer, MessageDirection::Request) => Self::CreateBearerRequest(view),
+            (Procedure::CreateBearer, MessageDirection::Response) => {
+                Self::CreateBearerResponse(view)
+            }
             (Procedure::UpdateSession, MessageDirection::Request) => {
                 Self::UpdateSessionRequest(view)
             }
             (Procedure::UpdateSession, MessageDirection::Response) => {
                 Self::UpdateSessionResponse(view)
+            }
+            (Procedure::DeleteBearer, MessageDirection::Request) => Self::DeleteBearerRequest(view),
+            (Procedure::DeleteBearer, MessageDirection::Response) => {
+                Self::DeleteBearerResponse(view)
             }
         })
     }
@@ -2400,8 +2417,12 @@ impl<'a> S2bMessage<'a> {
             | Self::ModifySessionResponse(view)
             | Self::DeleteSessionRequest(view)
             | Self::DeleteSessionResponse(view)
+            | Self::CreateBearerRequest(view)
+            | Self::CreateBearerResponse(view)
             | Self::UpdateSessionRequest(view)
-            | Self::UpdateSessionResponse(view) => Some(view),
+            | Self::UpdateSessionResponse(view)
+            | Self::DeleteBearerRequest(view)
+            | Self::DeleteBearerResponse(view) => Some(view),
             Self::Raw(_) => None,
         }
     }
@@ -2441,8 +2462,12 @@ impl<'a> S2bMessage<'a> {
             | Self::ModifySessionResponse(view)
             | Self::DeleteSessionRequest(view)
             | Self::DeleteSessionResponse(view)
+            | Self::CreateBearerRequest(view)
+            | Self::CreateBearerResponse(view)
             | Self::UpdateSessionRequest(view)
-            | Self::UpdateSessionResponse(view) => view.message_type(),
+            | Self::UpdateSessionResponse(view)
+            | Self::DeleteBearerRequest(view)
+            | Self::DeleteBearerResponse(view) => view.message_type(),
             Self::Raw(message) => message.message_type(),
         }
     }
@@ -2494,8 +2519,12 @@ impl Encode for S2bMessage<'_> {
             | Self::ModifySessionResponse(view)
             | Self::DeleteSessionRequest(view)
             | Self::DeleteSessionResponse(view)
+            | Self::CreateBearerRequest(view)
+            | Self::CreateBearerResponse(view)
             | Self::UpdateSessionRequest(view)
-            | Self::UpdateSessionResponse(view) => view.encode(dst, ctx),
+            | Self::UpdateSessionResponse(view)
+            | Self::DeleteBearerRequest(view)
+            | Self::DeleteBearerResponse(view) => view.encode(dst, ctx),
             Self::Raw(message) => message.encode(dst, ctx),
         }
     }
@@ -2510,8 +2539,12 @@ impl Encode for S2bMessage<'_> {
             | Self::ModifySessionResponse(view)
             | Self::DeleteSessionRequest(view)
             | Self::DeleteSessionResponse(view)
+            | Self::CreateBearerRequest(view)
+            | Self::CreateBearerResponse(view)
             | Self::UpdateSessionRequest(view)
-            | Self::UpdateSessionResponse(view) => view.wire_len(ctx),
+            | Self::UpdateSessionResponse(view)
+            | Self::DeleteBearerRequest(view)
+            | Self::DeleteBearerResponse(view) => view.wire_len(ctx),
             Self::Raw(message) => message.wire_len(ctx),
         }
     }
@@ -2875,16 +2908,9 @@ fn validate_required_ies(
             IE_TYPE_CAUSE,
             "Delete Session Response requires Cause IE",
         ),
-        (Procedure::UpdateSession, MessageDirection::Request) => require_ie(
-            &view.ies,
-            IE_TYPE_BEARER_CONTEXT,
-            "Update Bearer Request requires Bearer Context IE",
-        ),
-        (Procedure::UpdateSession, MessageDirection::Response) => require_ie(
-            &view.ies,
-            IE_TYPE_CAUSE,
-            "Update Bearer Response requires Cause IE",
-        ),
+        (Procedure::CreateBearer, _)
+        | (Procedure::UpdateSession, _)
+        | (Procedure::DeleteBearer, _) => crate::dedicated_bearer::validate_procedure_message(view),
     }
 }
 

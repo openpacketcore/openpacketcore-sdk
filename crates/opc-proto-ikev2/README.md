@@ -1,6 +1,6 @@
 # opc-proto-ikev2
 
-Experimental IKEv2 mechanism scaffold for OpenPacketCore untrusted-access work.
+Transport-neutral IKEv2 mechanisms for OpenPacketCore untrusted-access work.
 
 ## Purpose
 
@@ -8,12 +8,15 @@ Experimental IKEv2 mechanism scaffold for OpenPacketCore untrusted-access work.
 to expose as SDK primitives today: header decode/encode, unencrypted payload
 walking, protected-payload boundaries, selected SA_INIT and IKE_AUTH helpers,
 NAT detection, NAT-T datagram classification, and product-neutral Child SA
-negotiation intent.
+negotiation intent. It also provides strict opened-payload primitives for the
+TS 24.302 multiple-bearer profile: typed QoS/TFT/AMBR notifications, new
+non-rekey dedicated-bearer Child SA establishment, bearer modification, and
+bearer deletion.
 
 It does not implement an IKE SA state machine, EAP-AKA, retransmission policy,
-cookie policy, Child SA lifecycle, XFRM/IPsec programming, 3GPP ePDG profile
-validation, carrier acceptance evidence, or a production ePDG control-plane
-stack.
+cookie policy, Child SA lifecycle, XFRM/IPsec programming, bearer admission or
+allocation policy, carrier acceptance evidence, or a production ePDG
+control-plane stack.
 
 ## API Shape
 
@@ -40,8 +43,132 @@ stack.
   responses using the redaction-safe exact-15-digit `Imei15` and `Imeisv`
   types. TBCD decoding preserves the received fifteenth IMEI digit (including
   a spare zero or non-Luhn digit) and enforces the terminal filler nibble.
+- `dedicated_bearer` implements the TS 24.302 multiple-bearer Notify values and
+  strict opened-payload views/builders for dedicated-bearer `CREATE_CHILD_SA`
+  and `INFORMATIONAL` modification/deletion exchanges. TFT values use the
+  canonical `opc-proto-tft` TS 24.008 codec shared with GTPv2-C. Response
+  correlation checks the IKE SPIs, Message ID, exchange/flags, selected offered
+  proposal/transforms, optional KE group, and traffic-selector narrowing.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
+
+## Dedicated-bearer integration
+
+The dedicated-bearer API consumes and emits the cleartext payload chain inside
+an authenticated `SK` payload. The application remains responsible for IKE SA
+state, message-ID allocation, encryption/authentication, timer policy, and
+installing or deleting the resulting Child SA.
+
+```rust
+use opc_proto_ikev2::{
+    build_ikev2_dedicated_bearer_create_child_sa_request,
+    decode_ikev2_dedicated_bearer_create_child_sa_response,
+    validate_ikev2_dedicated_bearer_create_child_sa_response_correlation,
+    Header, Ikev2DedicatedBearerCreateChildSaRequest,
+    Ikev2DedicatedBearerCreateChildSaRequestBuild,
+    Ikev2DedicatedBearerCreateChildSaResponse, PayloadType,
+};
+
+fn encode_new_bearer(
+    input: &Ikev2DedicatedBearerCreateChildSaRequestBuild,
+) -> Result<(PayloadType, bytes::Bytes), Box<dyn std::error::Error>> {
+    let cleartext = build_ikev2_dedicated_bearer_create_child_sa_request(input)?;
+    // Seal these exact bytes once, then cache the complete encrypted request
+    // for retransmission; do not reseal retransmissions with a new IV.
+    Ok(cleartext.into_parts())
+}
+
+fn accept_new_bearer_response<'a>(
+    request_header: &Header,
+    request: &Ikev2DedicatedBearerCreateChildSaRequest<'_>,
+    response_header: &Header,
+    first_payload: PayloadType,
+    opened_payloads: &'a [u8],
+) -> Result<Ikev2DedicatedBearerCreateChildSaResponse<'a>, Box<dyn std::error::Error>> {
+    let response = decode_ikev2_dedicated_bearer_create_child_sa_response(
+        response_header,
+        first_payload,
+        opened_payloads,
+    )?;
+    validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+        request_header,
+        response_header,
+        request,
+        &response,
+    )?;
+    Ok(response)
+}
+```
+
+Modification uses
+`build_ikev2_dedicated_bearer_modification_request`; deletion uses
+`build_ikev2_dedicated_bearer_delete_request`. A normal Delete response is
+built/decoded with `build_ikev2_dedicated_bearer_delete_response` and
+`decode_ikev2_dedicated_bearer_delete_response`: the ePDG request names its
+inbound ESP SPI, while the UE response names the paired UE inbound ESP SPI.
+Pass both values through `Ikev2DedicatedBearerDeleteResponseExpectation::PairedSa`
+to `validate_ikev2_dedicated_bearer_delete_response_correlation` before changing
+application state. An empty response is accepted only with the explicit
+`SimultaneousDelete` expectation when RFC 7296 crossed Delete requests apply.
+Modification responses remain empty or typed-error INFORMATIONAL responses and
+use their corresponding decoder/correlation helper.
+The IKE-only establishment-and-deletion flow is in
+[`examples/dedicated_bearer_ikev2.rs`](examples/dedicated_bearer_ikev2.rs).
+The complete SDK composition from a triggered GTPv2-C Create Bearer request,
+through a correlated IKEv2 Child-SA exchange and GTP response commit, followed
+by Delete Bearer and Child-SA deletion, is executable as
+[`examples/dedicated_bearer_sdk_flow.rs`](examples/dedicated_bearer_sdk_flow.rs).
+That example makes the application-owned admission, allocation, and dataplane
+boundaries explicit and proves exact GTP retransmission replay.
+
+Integer-kbps bearer QoS must be mapped onto the discrete TS 24.301 NAS grid
+before building `EPS_QOS`/`EXTENDED_EPS_QOS`. The checked mapping API makes the
+operator-QCI GBR classification and quantization policy explicit and returns
+the rate actually represented on the wire:
+
+```rust
+use opc_proto_ikev2::{
+    Ikev2EpsBearerBitRatesKbps, Ikev2EpsQosKbps, Ikev2EpsQosMapping,
+    Ikev2QosQuantization,
+};
+
+let mapped = Ikev2EpsQosMapping::from_kbps(
+    Ikev2EpsQosKbps::Gbr {
+        qci: 200, // Operator-specific: the variant supplies its GBR type.
+        rates: Ikev2EpsBearerBitRatesKbps {
+            maximum_uplink: 10_000_001,
+            maximum_downlink: 9_900_000,
+            guaranteed_uplink: 9_000_000,
+            guaranteed_downlink: 9_000_000,
+        },
+    },
+    Ikev2QosQuantization::Ceiling,
+)?;
+
+assert_eq!(
+    mapped.represented_rates().map(|rates| rates.maximum_uplink),
+    Some(10_000_200),
+);
+# Ok::<(), opc_proto_ikev2::Ikev2QosMappingError>(())
+```
+
+`Exact` rejects rates between grid points. `Ceiling` is a documented SDK
+policy that selects the smallest representation not below the requested rate;
+TS 24.301 requires mapping to an explicit value but does not mandate that
+rounding direction. `Ikev2ApnAmbrMapping` provides the same checked boundary
+for APN-AMBR, including Extended APN-AMBR above 65,280 Mbps. See
+[`examples/dedicated_bearer_qos_mapping.rs`](examples/dedicated_bearer_qos_mapping.rs).
+
+The compact-code constructors remain available for lossless compatibility, but
+they are not a way around the production profile. Strict decoders apply the TS
+24.301 receiver interpretation for APN-AMBR compact aliases and extended-unit
+aliases, then expose and re-encode their canonical equivalents. Reserved base
+code 0 and inconsistent profiles still fail closed. Typed Notify builders and
+`CREATE_CHILD_SA`/`INFORMATIONAL` builders accept manually supplied canonical
+values but reject raw aliases, QCI resource mismatches, lower-tier saturation
+errors, invalid maximum/guaranteed relationships, non-canonical units,
+extension-threshold misuse, and inconsistent compact sentinels before any
+payload bytes are returned.
 
 ## Example
 
@@ -72,10 +199,11 @@ assert_eq!(message.payloads().count(), 1);
 
 ## Status And Limits
 
-The crate is experimental and `publish = false`. It has structural coverage and
-targeted crypto/helper tests for the documented scaffold, but it is not a full
-IKEv2 implementation. Certificate-chain, validity-period, name, and key-usage
-validation are caller responsibilities when using signature AUTH helpers.
+The crate is experimental and `publish = false`. The dedicated-bearer wire
+boundary has typed, fail-closed validation and specification-authored tests,
+but this crate is not a full IKEv2 implementation. Certificate-chain,
+validity-period, name, and key-usage validation are caller responsibilities
+when using signature AUTH helpers.
 
 IKE_SA_INIT error responses are unauthenticated. The product owns source
 validation, response rate limiting, retransmission behavior, and other
@@ -96,8 +224,9 @@ explicit non-goals.
 - Add independent-peer fixtures before claiming interoperability.
 - Continue adding typed cleartext payload bodies with octet-level fixture
   evidence.
-- Keep SA state machines, retransmission queues, cookie policy, EAP-AKA, Child
-  SA installation, and ePDG product decisions outside this crate.
+- Keep SA state machines, retransmission queues, cookie policy, EAP-AKA, SPI
+  allocation, Child SA installation, and ePDG product decisions outside this
+  crate.
 
 ## Verification
 
@@ -105,5 +234,8 @@ explicit non-goals.
 cargo check -p opc-proto-ikev2 --all-targets --all-features
 cargo test -p opc-proto-ikev2 --all-features
 cargo clippy -p opc-proto-ikev2 --all-targets -- -D warnings
+cargo run -p opc-proto-ikev2 --example dedicated_bearer_sdk_flow
+cargo run -p opc-proto-ikev2 --example dedicated_bearer_qos_mapping
 (cd crates/opc-proto-ikev2 && cargo +nightly fuzz list)
+(cd crates/opc-proto-ikev2 && cargo +nightly fuzz run dedicated_bearer -- -runs=1000)
 ```

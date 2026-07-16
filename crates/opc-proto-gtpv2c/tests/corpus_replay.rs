@@ -457,7 +457,7 @@ fn fixture_corpus_is_split_by_provenance() {
             "missing fixture provenance directory {subdir}"
         );
     }
-    assert_eq!(fixture_files(FixtureClass::Spec).len(), 10);
+    assert_eq!(fixture_files(FixtureClass::Spec).len(), 14);
     assert!(fixture_files(FixtureClass::EpdgParity).len() >= 3);
     assert!(fixture_files(FixtureClass::Malformed).len() >= 16);
     assert!(
@@ -768,6 +768,18 @@ fn assert_malformed_fixture_rejection(path: &Path, data: &[u8]) {
             data,
             |code| matches!(code, DecodeErrorCode::Structural { .. }),
             "ProcedureAware Update Bearer Response Cause rejection",
+        ),
+        "profile_create_bearer_request_missing_tft.bin" => assert_s2b_profile_error(
+            path,
+            data,
+            |code| matches!(code, DecodeErrorCode::Structural { .. }),
+            "ProcedureAware Create Bearer Request TFT rejection",
+        ),
+        "profile_delete_bearer_request_conflicting_targets.bin" => assert_s2b_profile_error(
+            path,
+            data,
+            |code| matches!(code, DecodeErrorCode::Structural { .. }),
+            "ProcedureAware Delete Bearer mutually exclusive target rejection",
         ),
         name => panic!("unclassified malformed fixture {name}: {}", path.display()),
     }

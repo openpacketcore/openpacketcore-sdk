@@ -22,9 +22,12 @@ claim.
 | IKE_AUTH signature AUTH (`RFC 7296` §2.15 method 1; `RFC 7427` method 14) | Experimental transcript-bound helper coverage | `src/ike_auth_signature.rs` and `tests/ike_auth_signature.rs` sign and verify the RFC 7296 signed octets with RSASSA-PKCS1-v1_5 SHA-256 (methods 1 and 14) and DER-encoded ECDSA P-256/P-384 (method 14), including RFC 7427 AlgorithmIdentifier framing, against a caller-supplied pinned SPKI or a caller-trusted certificate's SubjectPublicKeyInfo. No certificate-chain, validity-period, name, or key-usage validation is performed; the product layer owns certificate trust. RSA signing is compiled only with the opt-in `rsa-signing` feature, so default builds perform no RSA private-key operations and ECDSA responder certificates are the recommended deployment; RSA verification is always available. |
 | EAP_ONLY_AUTHENTICATION notify (`RFC 5998`) | Experimental structural coverage | `src/notify.rs`, `src/ike_auth.rs`, and `tests/ike_auth_certificate.rs` decode the status notify from IKE_AUTH cleartext chains, expose a request accessor, and build the notify body. EAP-only policy decisions stay with the caller. |
 | Child SA negotiation helpers | Product-neutral selection intent only | `src/ike_auth.rs` and `tests/ike_auth_payloads.rs` select a proposal and traffic selectors against caller-supplied protocol/transform/selector policy and build response SA/TS payload entries once the product supplies a responder SPI. The helper does not allocate SPIs, own Child SA lifecycle, install XFRM state, or decide product traffic readiness. |
+| 3GPP multiple-bearer Notify values (`TS 24.302` R17 §8.1.2.2, §8.2.9.9-§8.2.9.14) | Typed wire-mechanism coverage | `src/dedicated_bearer.rs` decodes/builds `IKEV2_MULTIPLE_BEARER_PDN_CONNECTIVITY` (42011), `EPS_QOS` (42014), `EXTENDED_EPS_QOS` (42015), `TFT` (42017), `MODIFIED_BEARER` (42020), `APN_AMBR` (42094), `EXTENDED_APN_AMBR` (42095), and private TFT/packet-filter errors 8241/8242/8244/8245. `src/dedicated_bearer/qos.rs` maps neutral integer-kbps GBR/non-GBR and APN-AMBR inputs onto the TS 24.301 normal/extended grids with explicit `Exact` or documented ceiling quantization, returns represented rates, checks standardized versus operator-specific QCI resource types and GBR relationships, shares the required Extended EPS QoS unit across each pair, and emits zero companion multipliers at the 10 Gbps and 65,280 Mbps extension thresholds. Strict receive decode normalizes the TS 24.301 APN-AMBR compact aliases (extended 251-255 to 250; extended-2 255 to zero), Extended EPS QoS unit aliases (zero to one; values above 21 to 21), and Extended APN-AMBR unit aliases (zero through two to three; values above 21 to 21). Typed Notify/exchange builders emit only canonical values and reject aliases supplied through raw constructors. Network-reserved base code 0, QCI resource shape, lower-tier saturation, GBR ordering, threshold use, and compact sentinels still fail closed. Boundary, alias-normalization, grid-gap, shared-unit, forged-value, and `u16` rollover tests define the evidence. TFT delegates to the shared `opc-proto-tft` TS 24.008 value codec. Debug output omits SPI and unrecognized bytes. |
+| New dedicated-bearer Child SA (`TS 24.302` R17 §7.2.7, §7.4.6.3; `RFC 7296` §1.3, §2.8, §3.3) | Strict opened-payload boundary | `src/dedicated_bearer/exchange.rs` builds/decodes a non-rekey `CREATE_CHILD_SA` payload chain with SA, Nonce, optional KE, TSi, TSr, EPS QoS, TFT, and optional extended QoS/AMBR. It rejects `REKEY_SA`, duplicate or missing payloads, non-ESP/zero-or-wrong-sized SPIs, PRF/unknown ESP transform types, exact duplicate transforms/attributes, unsupported algorithms, mixed AEAD/non-AEAD offers, inconsistent DH/KE, and create TFTs without an uplink-applicable filter. Same-type request alternatives remain valid. Selected responses contain exactly one ENCR, optional single DH/ESN, and INTEG exactly when the selected supported encryption is non-AEAD; omitted ESN means `NO_ESN`. Response correlation verifies the selected algorithms/attributes, optional `NONE` semantics, KE group, IKE header, and selector narrowing. Existing Child-SA key derivation consumes the decoded nonces. |
+| Dedicated-bearer modification/deletion (`TS 24.302` R17 §7.4.6.3; `RFC 7296` §1.4.1) | Strict opened-payload boundary | `src/dedicated_bearer/exchange.rs` builds/decodes `INFORMATIONAL` modification requests containing a typed four-octet ESP `MODIFIED_BEARER` SPI and optional QoS/TFT/AMBR updates. A normal deletion request names the local/ePDG inbound ESP SPI and its typed response must name exactly one paired peer/UE inbound ESP SPI; correlation checks both against application-supplied SA-pair state. An empty Delete response is accepted only through the explicit simultaneous-delete expectation required when crossed Delete requests already removed the paired SAs. Wrong protocol, SPI size/count, duplicate Delete payloads, and mismatched expected SPIs fail closed. |
 | NAT detection Notify semantics (`RFC 7296` §2.23) | Boundary semantic coverage | `src/nat_detection.rs` and `tests/nat_detection.rs` compute NAT-D SHA-1 hashes, collect multiple source hashes plus one destination hash from typed Notify payloads, and evaluate no-NAT/source-NAT/destination-NAT/both/unknown outcomes from caller-supplied observed UDP endpoints. |
 | Hostile input safety | Initial regression coverage | `tests/malformed.rs` replays prefixes and malformed shapes through borrowed, owned, and iterator paths to assert structured errors without panic. |
-| Fuzz target registration | Scheduled smoke coverage | `fuzz/fuzz_targets/decode_message.rs` and `roundtrip.rs` are registered in `.github/workflows/fuzz.yml` so the crate receives the same scheduled fuzz-list and smoke-run coverage as the other protocol crates. |
+| Fuzz target registration | Scheduled smoke coverage | `fuzz/fuzz_targets/decode_message.rs`, `roundtrip.rs`, and `dedicated_bearer.rs` cover the message codec, raw-preserving encode, typed 3GPP Notify decoder, and every dedicated-bearer opened-payload decoder. The crate is registered in `.github/workflows/fuzz.yml` for scheduled fuzz-list and smoke-run coverage. |
 | `opc-protocol` integration | Implemented for scaffold | `Message` and `OwnedMessage` implement `BorrowDecode`, `OwnedDecode`, `Encode`, and `ToOwnedPdu`; errors use structured `opc-protocol` types and `SpecRef` references. |
 
 ## Payload-chain parser plan
@@ -57,9 +60,10 @@ changing the product boundary:
 
 ## Explicitly out of scope
 
-- IKE SA state machines, retransmission timers, cookie policy, peer policy,
+- IKE SA state machines, retransmission timers, exact-response caches, cookie policy, peer policy,
   NAT traversal policy beyond NAT-T datagram classification and NAT-D semantic
-  evaluation, or message correlation beyond structural Message ID parsing.
+  evaluation, or message correlation outside the dedicated-bearer response
+  validators.
 - EAP-AKA, 3GPP ePDG profile enforcement, emergency authorization policy,
   subscriber/session lifecycle, Child SA lifecycle management, XFRM/IPsec
   programming, or key-management policy.
@@ -100,3 +104,28 @@ Future fixtures must follow ADR 0015: spec-authored or independently captured
 bytes, octet-level comments, raw preservation for unknown payloads, negative
 malformed cases, and clear separation between conformance, parity, and fuzz
 corpus provenance.
+
+`tests/dedicated_bearer.rs` contains specification-authored payload values from
+TS 24.302 R17 §8.2.9.9-§8.2.9.14 and composes generic RFC 7296 payload builders
+for complete opened `CREATE_CHILD_SA` and `INFORMATIONAL` chains. It proves the
+exact Notify numbers and inner lengths, every typed Notify round trip, strict
+negative cardinality/shape/correlation cases, supported ESP algorithm and
+AEAD/INTEG relationship validation, exact duplicate rejection, ESN omission,
+same-type offer alternatives, positive PFS and DH-NONE request/response
+correlation, typed paired-SPI and crossed-request Delete responses, rejection of mixed success/error
+response payloads, response selector narrowing, Child-SA key-derivation
+compatibility, and byte identity between a canonical TS 24.008 TFT value
+embedded in IKEv2 and the shared codec.
+`tests/dedicated_bearer_cross_protocol.rs` additionally builds and
+procedure-aware decodes a typed GTPv2-C Create Bearer Request, extracts the raw
+nested Bearer TFT IE value, extracts the inner value from the typed IKEv2 TFT
+Notify, and asserts literal byte identity. These vectors are
+specification-derived rather than independent-peer captures.
+
+`examples/dedicated_bearer_sdk_flow.rs` is the executable product-boundary
+composition. It processes a triggered Create Bearer request exactly once,
+passes the decoded canonical TFT and QoS into a non-rekey IKEv2 Child-SA
+exchange, correlates both protocol responses, commits the GTP response for
+exact replay, and then performs the corresponding Delete Bearer and IKEv2
+Child-SA deletion flow. Admission, identifier allocation, key installation,
+and dataplane programming remain explicit application responsibilities.
