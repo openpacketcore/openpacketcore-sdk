@@ -224,6 +224,32 @@ async fn wait_for_metric(
     .expect("security metric deadline");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn initial_identity_wait_is_an_immediate_controller_readiness_barrier() {
+    const ITERATIONS: usize = 32;
+
+    let valid = valid_material();
+    for _ in 0..ITERATIONS {
+        let directory = TestDirectory::new();
+        write_generation(directory.path(), "..valid", &valid);
+        switch_generation(directory.path(), "..valid");
+        let (metrics, _reader) = SecurityMetricsAuthority::isolated();
+        let source = source_with_metrics(&directory, MIN_PROJECTED_SVID_POLL_INTERVAL, metrics);
+
+        source
+            .wait_for_initial_identity(Duration::from_secs(5))
+            .await
+            .expect("initial projected identity and controller publication");
+        let controller = TlsMaterialController::new_from_projected_source(&source)
+            .expect("immediate paired controller");
+        assert_eq!(
+            controller.status().availability(),
+            TlsMaterialAvailability::Ready,
+            "the initial identity barrier must not expose an empty controller feed"
+        );
+    }
+}
+
 #[tokio::test]
 async fn recovery_before_pairing_cannot_replay_rejection_over_ready_gauges() {
     let directory = TestDirectory::new();

@@ -601,21 +601,26 @@ impl ProjectedSvidSource {
 
     /// Wait for the first valid identity, retaining the existing file-source
     /// timeout behavior.
+    ///
+    /// A successful return also guarantees that the paired TLS-material
+    /// controller feed contains the same initial publication. Callers may
+    /// therefore construct the controller immediately without racing the
+    /// source's compatibility and controller channels.
     pub async fn wait_for_initial_identity(
         &self,
         timeout: Duration,
     ) -> Result<IdentityState, IdentityReloadError> {
-        let mut rx = self.state_rx.clone();
-        if let Some(state) = rx.borrow().clone() {
-            return Ok(state);
+        let mut rx = self.controller_rx.clone();
+        if let Some(publication) = rx.borrow().clone() {
+            return Ok(publication.identity_state().clone());
         }
         match tokio::time::timeout(timeout, async {
             loop {
                 rx.changed()
                     .await
                     .map_err(|_| IdentityReloadError::IoError)?;
-                if let Some(state) = rx.borrow().clone() {
-                    return Ok(state);
+                if let Some(publication) = rx.borrow().clone() {
+                    return Ok(publication.identity_state().clone());
                 }
             }
         })
