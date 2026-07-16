@@ -73,6 +73,10 @@ use opc_session_testkit::qualification::{
 use opc_session_testkit::qualification::{
     QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_MAX_CONTROL_LINE_BYTES,
 };
+use opc_session_testkit::qualification_kubernetes::{
+    QualificationKubernetesReadinessExpectation,
+    QUALIFICATION_KUBERNETES_READINESS_CLIENT_TIMEOUT_MILLIS,
+};
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder, TlsMaterialController,
 };
@@ -290,6 +294,7 @@ struct QualificationNode {
     leases: HashMap<String, QualificationLease>,
     node_index: usize,
     member_count: usize,
+    configured_voter_ids: Vec<u64>,
     traffic_schedule_bound: bool,
     traffic: Option<QualificationTrafficRuntime>,
     empty_vote_dispatches: Arc<AtomicU64>,
@@ -687,6 +692,19 @@ impl QualificationNode {
         let local_binding = manifest
             .bind_local(local_replica.clone())
             .map_err(|_| NodeFailure)?;
+        let mut configured_voter_ids = config
+            .members
+            .iter()
+            .map(|member| {
+                let replica_id =
+                    ReplicaId::new(member.replica_id.clone()).map_err(|_| NodeFailure)?;
+                local_binding
+                    .consensus_node_id(&replica_id)
+                    .map(SessionConsensusNodeId::get)
+                    .ok_or(NodeFailure)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        configured_voter_ids.sort_unstable();
         let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
             local_replica,
             descriptors,
@@ -770,6 +788,7 @@ impl QualificationNode {
             leases: HashMap::new(),
             node_index: config.node_index,
             member_count: config.members.len(),
+            configured_voter_ids,
             traffic_schedule_bound: qualification_traffic_schedule_sha256(config.members.len())
                 .is_some_and(|digest| digest == config.workload_schedule_sha256),
             traffic: None,
@@ -1728,6 +1747,7 @@ impl QualificationNode {
             term: status.term,
             leader_id: status.leader_id.map(|node_id| node_id.get()),
             configured_voters: report.configured_voters(),
+            configured_voter_ids: self.configured_voter_ids.clone(),
             fresh_reachable_voters: report.fresh_reachable_voters(),
             agreeing_voters: report.agreeing_voters(),
             required_quorum: report.required_quorum(),
@@ -3326,6 +3346,10 @@ struct NodeArguments {
 enum NodeInvocation {
     Server(NodeArguments),
     ControlClient(PathBuf),
+    ReadinessClient {
+        control_socket: PathBuf,
+        expectation: QualificationKubernetesReadinessExpectation,
+    },
 }
 
 fn arguments() -> Result<NodeInvocation, NodeFailure> {
@@ -3338,6 +3362,33 @@ fn arguments() -> Result<NodeInvocation, NodeFailure> {
             return Err(NodeFailure);
         }
         return Ok(NodeInvocation::ControlClient(control_socket));
+    }
+    if first == std::ffi::OsStr::new("--readiness-client") {
+        let control_socket = PathBuf::from(args.next().ok_or(NodeFailure)?);
+        if args.next().as_deref() != Some(std::ffi::OsStr::new("--expected-node-id")) {
+            return Err(NodeFailure);
+        }
+        let expected_node_id = args
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(NodeFailure)?;
+        if args.next().as_deref() != Some(std::ffi::OsStr::new("--expected-voter-ids")) {
+            return Err(NodeFailure);
+        }
+        let expected_voter_ids = parse_expected_voter_ids(args.next().ok_or(NodeFailure)?)?;
+        if args.next().is_some() || !is_control_socket_cli_path(&control_socket) {
+            return Err(NodeFailure);
+        }
+        let expectation = QualificationKubernetesReadinessExpectation::try_new(
+            expected_node_id,
+            expected_voter_ids,
+        )
+        .map_err(|_| NodeFailure)?;
+        return Ok(NodeInvocation::ReadinessClient {
+            control_socket,
+            expectation,
+        });
     }
     if first != std::ffi::OsStr::new("--config") {
         return Err(NodeFailure);
@@ -3380,6 +3431,17 @@ fn arguments() -> Result<NodeInvocation, NodeFailure> {
         bind_addr,
         control_socket,
     }))
+}
+
+fn parse_expected_voter_ids(encoded: std::ffi::OsString) -> Result<Vec<u64>, NodeFailure> {
+    let encoded = encoded.into_string().map_err(|_| NodeFailure)?;
+    if encoded.is_empty() || encoded.len() > 5 * 20 + 4 {
+        return Err(NodeFailure);
+    }
+    encoded
+        .split(',')
+        .map(|value| value.parse::<u64>().map_err(|_| NodeFailure))
+        .collect()
 }
 
 fn is_control_socket_cli_path(path: &Path) -> bool {
@@ -3865,8 +3927,25 @@ fn run_control_client(control_socket: &Path) -> Result<(), NodeFailure> {
     let mut stdin_reader = BufReader::new(stdin.lock());
     let command = read_single_control_command(&mut stdin_reader)?;
 
-    let deadline =
-        Instant::now() + Duration::from_millis(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
+    let reply = invoke_control_command(
+        control_socket,
+        socket_identity,
+        command,
+        Duration::from_millis(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS),
+    )?;
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    write_json_line(&mut writer, &reply).map_err(|_| NodeFailure)
+}
+
+#[cfg(unix)]
+fn invoke_control_command(
+    control_socket: &Path,
+    socket_identity: ControlSocketIdentity,
+    command: QualificationNodeCommand,
+    timeout: Duration,
+) -> Result<QualificationNodeReply, NodeFailure> {
+    let deadline = Instant::now() + timeout;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -3890,10 +3969,26 @@ fn run_control_client(control_socket: &Path) -> Result<(), NodeFailure> {
     write_json_line(&mut stream, &command).map_err(|_| NodeFailure)?;
     stream.shutdown_write().map_err(|_| NodeFailure)?;
     let mut reader = BufReader::new(stream);
-    let reply = read_single_control_reply(&mut reader)?;
-    let stdout = io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
-    write_json_line(&mut writer, &reply).map_err(|_| NodeFailure)
+    read_single_control_reply(&mut reader)
+}
+
+#[cfg(unix)]
+fn run_readiness_client(
+    control_socket: &Path,
+    expectation: &QualificationKubernetesReadinessExpectation,
+) -> Result<(), NodeFailure> {
+    let socket_identity = validate_control_client_socket(control_socket)?;
+    let reply = invoke_control_command(
+        control_socket,
+        socket_identity,
+        QualificationNodeCommand::Probe,
+        Duration::from_millis(QUALIFICATION_KUBERNETES_READINESS_CLIENT_TIMEOUT_MILLIS),
+    )?;
+    if expectation.accepts_ready_reply(&reply) {
+        Ok(())
+    } else {
+        Err(NodeFailure)
+    }
 }
 
 #[cfg(not(unix))]
@@ -3909,10 +4004,22 @@ fn run_control_client(_control_socket: &Path) -> Result<(), NodeFailure> {
     Err(NodeFailure)
 }
 
+#[cfg(not(unix))]
+fn run_readiness_client(
+    _control_socket: &Path,
+    _expectation: &QualificationKubernetesReadinessExpectation,
+) -> Result<(), NodeFailure> {
+    Err(NodeFailure)
+}
+
 fn run() -> Result<(), NodeFailure> {
     match arguments()? {
         NodeInvocation::Server(arguments) => run_server(arguments),
         NodeInvocation::ControlClient(control_socket) => run_control_client(&control_socket),
+        NodeInvocation::ReadinessClient {
+            control_socket,
+            expectation,
+        } => run_readiness_client(&control_socket, &expectation),
     }
 }
 

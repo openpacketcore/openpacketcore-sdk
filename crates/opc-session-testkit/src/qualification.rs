@@ -2813,6 +2813,8 @@ pub enum QualificationNodeReply {
         term: u64,
         leader_id: Option<u64>,
         configured_voters: usize,
+        /// Exact sorted stable node IDs in the admitted voter set.
+        configured_voter_ids: Vec<u64>,
         /// Minimum distinct voters proven reachable by the successful
         /// Openraft barrier, or zero when no barrier succeeded.
         fresh_reachable_voters: usize,

@@ -38,7 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   candidate-only external runner drives the private same-binary control client
   with direct, time/output-bounded `kubectl` processes, continuously updates
   the custom Pod condition only from strict fresh Openraft barrier replies,
-  and clears every condition on bounded failure, cancellation, or completion.
+  resets all conditions before sampling, latches the first failure, and
+  attempts all-false cleanup. A kubelet exec probe independently validates the
+  exact local and fleet identities over the private UDS with layered deadlines,
+  so readiness self-expires on quorum loss, a hung probe, or process exit even
+  if the external evidence condition becomes stale.
   It atomically publishes private digest-bound command/reply and readiness-v3
   fragment artifacts without adding a port, token, or RBAC to the fleet. The
   fragment intentionally omits v1 workload and v3 batch/watch/restore evidence,

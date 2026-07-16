@@ -2661,6 +2661,7 @@ impl Fleet {
                         term,
                         leader_id,
                         configured_voters,
+                        configured_voter_ids: _,
                         fresh_reachable_voters,
                         agreeing_voters,
                         required_quorum,

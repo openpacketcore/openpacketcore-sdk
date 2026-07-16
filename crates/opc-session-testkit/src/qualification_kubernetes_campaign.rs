@@ -4,9 +4,13 @@
 //! This module drives the private same-binary control client merged for #143.
 //! It does not implement consensus, infer readiness from a listener, grant
 //! Kubernetes authority, or claim production qualification. A sample is ready
-//! only when the node returns a fresh, internally consistent Openraft durable
-//! barrier report. Every bounded campaign clears its custom Pod readiness
-//! conditions before returning.
+//! only when the exact rendered node and voter identities return a fresh,
+//! internally consistent Openraft durable-barrier report. The external custom
+//! condition is an AND-only evidence gate: kubelet independently invokes the
+//! local UDS readiness client so readiness self-expires on quorum loss, a hung
+//! probe, or process termination even if an external condition becomes stale.
+//! Every bounded campaign first resets all custom conditions, latches and
+//! aborts on its first failure, and attempts a final all-false cleanup.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -33,7 +37,8 @@ use crate::qualification::{
     QUALIFICATION_MAX_CONTROL_LINE_BYTES, SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4,
 };
 use crate::qualification_kubernetes::{
-    is_kubernetes_dns_label, QUALIFICATION_KUBERNETES_CONTAINER_NAME,
+    is_kubernetes_dns_label, qualification_kubernetes_readiness_expectations,
+    QualificationKubernetesReadinessExpectation, QUALIFICATION_KUBERNETES_CONTAINER_NAME,
     QUALIFICATION_KUBERNETES_CONTROL_SOCKET_PATH,
     QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION, QUALIFICATION_KUBERNETES_FLEET_NAME,
 };
@@ -104,6 +109,8 @@ impl QualificationKubernetesCampaignConfig {
         if !is_kubernetes_dns_label(&self.namespace) {
             return Err(QualificationKubernetesCampaignConfigError::InvalidNamespace);
         }
+        qualification_kubernetes_readiness_expectations(self.member_count)
+            .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidIdentityContract)?;
         let sample_count = self
             .rounds
             .checked_mul(self.member_count)
@@ -147,6 +154,9 @@ pub enum QualificationKubernetesCampaignConfigError {
     /// History identifier is outside the closed identifier alphabet or bound.
     #[error("qualification Kubernetes campaign history identifier is invalid")]
     InvalidHistoryId,
+    /// The fixed cluster/member names did not derive one exact voter set.
+    #[error("qualification Kubernetes readiness identity contract is invalid")]
+    InvalidIdentityContract,
 }
 
 /// Fixed error classes from the Kubernetes command boundary.
@@ -311,6 +321,8 @@ pub enum QualificationKubernetesCampaignStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualificationKubernetesCampaignAction {
+    /// Initial all-member false publication before the first sample.
+    Reset,
     /// One private control-client `Probe` followed by a status update.
     Probe,
     /// Final fail-closed status cleanup without a node command.
@@ -337,6 +349,10 @@ pub enum QualificationKubernetesCampaignRecordOutcome {
     CleanupPublished,
     /// Final fail-closed cleanup could not be published.
     CleanupFailed,
+    /// Initial fail-closed condition reset was published.
+    ResetPublished,
+    /// Initial fail-closed condition reset could not be published.
+    ResetFailed,
 }
 
 /// One deterministic, redaction-safe command/reply transcript row.
@@ -458,19 +474,38 @@ where
     C: QualificationKubernetesCampaignClock,
 {
     config.validate()?;
-    let mut transcript = Vec::with_capacity(config.sample_count() + config.member_count);
+    let expectations = qualification_kubernetes_readiness_expectations(config.member_count)
+        .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidIdentityContract)?;
+    let mut transcript =
+        Vec::with_capacity(config.sample_count() + config.member_count.saturating_mul(2));
     let mut readiness_history = Vec::with_capacity(config.sample_count());
     let mut status = QualificationKubernetesCampaignStatus::Passed;
     let mut completed_rounds = 0;
-    let mut abort = false;
+    let mut abort = !publish_fail_closed_conditions(
+        config,
+        port,
+        clock,
+        0,
+        FailClosedPhase::Reset,
+        &mut transcript,
+    )
+    .await;
+    if abort {
+        status = QualificationKubernetesCampaignStatus::Failed;
+    }
     let mut last_started_ns = vec![None; config.member_count];
 
     for round in 0..config.rounds {
+        if abort {
+            break;
+        }
         if cancelled.load(Ordering::Acquire) {
             status = QualificationKubernetesCampaignStatus::Cancelled;
             break;
         }
-        for (member_index, last_started_ns) in last_started_ns.iter_mut().enumerate() {
+        for (member_index, (last_started_ns, expectation)) in
+            last_started_ns.iter_mut().zip(&expectations).enumerate()
+        {
             if cancelled.load(Ordering::Acquire) {
                 status = QualificationKubernetesCampaignStatus::Cancelled;
                 abort = true;
@@ -488,7 +523,7 @@ where
                     QualificationKubernetesCampaignRecordOutcome::CampaignCancelled,
                 )
             } else {
-                classify_probe(reply.as_ref().ok(), config.member_count)
+                classify_probe(reply.as_ref().ok(), expectation)
             };
             classified.history.sample_sequence = round + 1;
             let mut record_outcome = classified.outcome;
@@ -506,6 +541,7 @@ where
                 abort = true;
             } else if !classified.ready {
                 status = QualificationKubernetesCampaignStatus::Failed;
+                abort = true;
             }
             if cancelled.load(Ordering::Acquire) {
                 if status == QualificationKubernetesCampaignStatus::Passed {
@@ -560,8 +596,15 @@ where
         record.history_operation_count = history_operation_count;
     }
 
-    let cleanup_complete =
-        cleanup_readiness_conditions(config, port, clock, completed_rounds, &mut transcript).await;
+    let cleanup_complete = publish_fail_closed_conditions(
+        config,
+        port,
+        clock,
+        completed_rounds,
+        FailClosedPhase::Cleanup,
+        &mut transcript,
+    )
+    .await;
     if !cleanup_complete {
         status = QualificationKubernetesCampaignStatus::Failed;
     }
@@ -575,11 +618,36 @@ where
     })
 }
 
-async fn cleanup_readiness_conditions<P, C>(
+#[derive(Clone, Copy)]
+enum FailClosedPhase {
+    Reset,
+    Cleanup,
+}
+
+impl FailClosedPhase {
+    const fn action(self) -> QualificationKubernetesCampaignAction {
+        match self {
+            Self::Reset => QualificationKubernetesCampaignAction::Reset,
+            Self::Cleanup => QualificationKubernetesCampaignAction::Cleanup,
+        }
+    }
+
+    const fn outcome(self, published: bool) -> QualificationKubernetesCampaignRecordOutcome {
+        match (self, published) {
+            (Self::Reset, true) => QualificationKubernetesCampaignRecordOutcome::ResetPublished,
+            (Self::Reset, false) => QualificationKubernetesCampaignRecordOutcome::ResetFailed,
+            (Self::Cleanup, true) => QualificationKubernetesCampaignRecordOutcome::CleanupPublished,
+            (Self::Cleanup, false) => QualificationKubernetesCampaignRecordOutcome::CleanupFailed,
+        }
+    }
+}
+
+async fn publish_fail_closed_conditions<P, C>(
     config: &QualificationKubernetesCampaignConfig,
     port: &P,
     clock: &C,
     round: usize,
+    phase: FailClosedPhase,
     transcript: &mut Vec<QualificationKubernetesCampaignRecord>,
 ) -> bool
 where
@@ -604,7 +672,7 @@ where
             round,
             member_index,
             pod_name,
-            action: QualificationKubernetesCampaignAction::Cleanup,
+            action: phase.action(),
             started_ns,
             completed_ns: clock.elapsed_ns().max(started_ns),
             command: None,
@@ -612,11 +680,7 @@ where
             control_error: None,
             readiness_update_error,
             condition,
-            outcome: if published {
-                QualificationKubernetesCampaignRecordOutcome::CleanupPublished
-            } else {
-                QualificationKubernetesCampaignRecordOutcome::CleanupFailed
-            },
+            outcome: phase.outcome(published),
         });
     }
     complete
@@ -629,8 +693,12 @@ struct ClassifiedProbe {
     ready: bool,
 }
 
-fn classify_probe(reply: Option<&QualificationNodeReply>, member_count: usize) -> ClassifiedProbe {
-    let required_quorum = member_count / 2 + 1;
+fn classify_probe(
+    reply: Option<&QualificationNodeReply>,
+    expectation: &QualificationKubernetesReadinessExpectation,
+) -> ClassifiedProbe {
+    let member_count = expectation.voter_count();
+    let required_quorum = expectation.required_quorum();
     let Some(reply) = reply else {
         return not_ready_probe(
             QualificationKubernetesReadinessReason::ControlUnavailable,
@@ -644,6 +712,7 @@ fn classify_probe(reply: Option<&QualificationNodeReply>, member_count: usize) -
         term,
         leader_id,
         configured_voters,
+        configured_voter_ids,
         fresh_reachable_voters,
         agreeing_voters,
         required_quorum: reported_quorum,
@@ -657,20 +726,7 @@ fn classify_probe(reply: Option<&QualificationNodeReply>, member_count: usize) -
         );
     };
 
-    let strict_ready = *ready
-        && *reason_code == QualificationReadinessCode::Ready
-        && *node_id != 0
-        && *term != 0
-        && leader_id.is_some_and(|leader| leader != 0)
-        && *configured_voters == member_count
-        && *reported_quorum == required_quorum
-        && *fresh_reachable_voters == required_quorum
-        && *agreeing_voters == required_quorum
-        && committed_index.is_some()
-        && applied_index
-            .zip(*committed_index)
-            .is_some_and(|(applied, committed)| applied >= committed);
-    if strict_ready {
+    if expectation.accepts_ready_reply(reply) {
         return ClassifiedProbe {
             condition: QualificationKubernetesReadinessCondition::ready(),
             history: QualificationKubernetesReadinessOperationV3 {
@@ -689,11 +745,13 @@ fn classify_probe(reply: Option<&QualificationNodeReply>, member_count: usize) -
 
     let valid_not_ready = !*ready
         && *reason_code != QualificationReadinessCode::Ready
-        && *node_id != 0
+        && *node_id == expectation.expected_node_id()
+        && leader_id.is_none_or(|leader| expectation.contains_voter(leader))
         && *configured_voters == member_count
+        && configured_voter_ids == expectation.expected_voter_ids()
         && *reported_quorum == required_quorum
         && *fresh_reachable_voters <= member_count
-        && *agreeing_voters <= member_count;
+        && *agreeing_voters <= *fresh_reachable_voters;
     if valid_not_ready {
         let reason = match reason_code {
             QualificationReadinessCode::NoQuorum => {
@@ -760,17 +818,37 @@ fn is_bounded_identifier(value: &str) -> bool {
 }
 
 /// Production port that invokes `kubectl` directly without a shell.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct KubectlQualificationKubernetesCampaignPort {
+    executable: OsString,
     command_timeout: Duration,
+}
+
+impl fmt::Debug for KubectlQualificationKubernetesCampaignPort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KubectlQualificationKubernetesCampaignPort")
+            .field("executable", &"<redacted>")
+            .field("command_timeout", &self.command_timeout)
+            .finish()
+    }
 }
 
 impl KubectlQualificationKubernetesCampaignPort {
     /// Construct the fixed production kubectl adapter.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
+            executable: OsString::from("kubectl"),
             command_timeout: QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_executable(executable: OsString, command_timeout: Duration) -> Self {
+        Self {
+            executable,
+            command_timeout,
         }
     }
 }
@@ -792,6 +870,7 @@ impl QualificationKubernetesCampaignPort for KubectlQualificationKubernetesCampa
         write_json_line(&mut input, &QualificationNodeCommand::Probe)
             .map_err(|_| QualificationKubernetesPortError::Unavailable)?;
         let output = run_kubectl(
+            &self.executable,
             &control_client_arguments(namespace, pod_name),
             &input,
             self.command_timeout,
@@ -826,6 +905,7 @@ impl QualificationKubernetesCampaignPort for KubectlQualificationKubernetesCampa
         }))
         .map_err(|_| QualificationKubernetesPortError::Unavailable)?;
         let output = run_kubectl(
+            &self.executable,
             &status_patch_arguments(namespace, pod_name, &patch),
             &[],
             self.command_timeout,
@@ -883,13 +963,14 @@ struct KubectlOutput {
 }
 
 async fn run_kubectl(
+    executable: &std::ffi::OsStr,
     arguments: &[OsString],
     stdin_bytes: &[u8],
     timeout: Duration,
     stdout_max_bytes: usize,
     stderr_max_bytes: usize,
 ) -> Result<KubectlOutput, QualificationKubernetesPortError> {
-    let mut child = Command::new("kubectl")
+    let mut child = Command::new(executable)
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -945,10 +1026,7 @@ async fn run_kubectl(
         tokio::pin!(wait);
         tokio::select! {
             result = &mut wait => Terminal::Exited(result),
-            value = overflow_rx.recv() => {
-                let _ = value;
-                Terminal::Overflow
-            }
+            Some(()) = overflow_rx.recv() => Terminal::Overflow,
             () = tokio::time::sleep_until(deadline) => Terminal::Timeout,
         }
     };
@@ -1350,11 +1428,18 @@ mod tests {
     }
 
     impl FakePort {
-        fn ready(sample_count: usize, member_count: usize) -> Self {
+        fn ready(rounds: usize, member_count: usize) -> Self {
+            let expectations = qualification_kubernetes_readiness_expectations(member_count)
+                .expect("fixed readiness expectations");
+            let leader_id = expectations[0].expected_node_id();
             Self {
                 replies: Mutex::new(
-                    (0..sample_count)
-                        .map(|_| Ok(ready_reply(member_count)))
+                    (0..rounds)
+                        .flat_map(|_| {
+                            expectations
+                                .iter()
+                                .map(|expectation| Ok(ready_reply(expectation, leader_id)))
+                        })
                         .collect(),
                 ),
                 published: Mutex::new(Vec::new()),
@@ -1441,20 +1526,51 @@ mod tests {
         }
     }
 
-    fn ready_reply(member_count: usize) -> QualificationNodeReply {
+    fn readiness_expectation(
+        member_count: usize,
+        member_index: usize,
+    ) -> QualificationKubernetesReadinessExpectation {
+        qualification_kubernetes_readiness_expectations(member_count)
+            .expect("fixed readiness expectations")[member_index]
+            .clone()
+    }
+
+    fn ready_reply(
+        expectation: &QualificationKubernetesReadinessExpectation,
+        leader_id: u64,
+    ) -> QualificationNodeReply {
         QualificationNodeReply::Readiness {
             ready: true,
             reason_code: QualificationReadinessCode::Ready,
-            node_id: 1,
+            node_id: expectation.expected_node_id(),
             term: 2,
-            leader_id: Some(1),
-            configured_voters: member_count,
-            fresh_reachable_voters: member_count / 2 + 1,
-            agreeing_voters: member_count / 2 + 1,
-            required_quorum: member_count / 2 + 1,
+            leader_id: Some(leader_id),
+            configured_voters: expectation.voter_count(),
+            configured_voter_ids: expectation.expected_voter_ids().to_vec(),
+            fresh_reachable_voters: expectation.required_quorum(),
+            agreeing_voters: expectation.required_quorum(),
+            required_quorum: expectation.required_quorum(),
             committed_index: Some(7),
             applied_index: Some(7),
         }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_kubectl(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().expect("fake kubectl directory");
+        let executable = directory.path().join("kubectl");
+        fs::write(&executable, format!("#!/bin/sh\nset -eu\n{body}\n"))
+            .expect("write fake kubectl");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("make fake kubectl executable");
+        (directory, executable)
+    }
+
+    #[cfg(unix)]
+    fn appended_path(path: &Path, suffix: &str) -> std::path::PathBuf {
+        let mut encoded = path.as_os_str().to_os_string();
+        encoded.push(suffix);
+        encoded.into()
     }
 
     #[test]
@@ -1503,6 +1619,143 @@ mod tests {
         assert!(!patch.contains("identity"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn kubectl_timeout_kills_and_reaps_the_exact_process() {
+        let (_directory, executable) = write_fake_kubectl(
+            r#"printf '%s\n' "$$" > "${0}.pid"
+exec sleep 30"#,
+        );
+        let result = run_kubectl(
+            executable.as_os_str(),
+            &[],
+            &[],
+            Duration::from_millis(250),
+            1_024,
+            1_024,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(QualificationKubernetesPortError::Timeout)
+        ));
+        let pid = fs::read_to_string(appended_path(&executable, ".pid"))
+            .expect("fake kubectl PID")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric fake kubectl PID");
+        assert!(
+            !std::path::PathBuf::from(format!("/proc/{pid}")).exists(),
+            "timed-out kubectl must be reaped before return"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kubectl_output_overflow_and_nonzero_exit_fail_closed() {
+        let oversized = "x".repeat(2_049);
+        let (_overflow_directory, overflow_executable) =
+            write_fake_kubectl(&format!("printf '%s' '{oversized}'"));
+        let overflow = run_kubectl(
+            overflow_executable.as_os_str(),
+            &[],
+            &[],
+            Duration::from_secs(2),
+            2_048,
+            1_024,
+        )
+        .await;
+        assert!(matches!(
+            overflow,
+            Err(QualificationKubernetesPortError::OutputTooLarge)
+        ));
+
+        let (_failure_directory, failure_executable) = write_fake_kubectl("exit 9");
+        let failure = run_kubectl(
+            failure_executable.as_os_str(),
+            &[],
+            &[],
+            Duration::from_secs(2),
+            1_024,
+            1_024,
+        )
+        .await;
+        assert!(matches!(
+            failure,
+            Err(QualificationKubernetesPortError::Failed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kubectl_probe_rejects_malformed_and_duplicate_replies() {
+        let (_malformed_directory, malformed_executable) =
+            write_fake_kubectl("printf '%s\\n' 'not-json'");
+        let malformed = KubectlQualificationKubernetesCampaignPort::with_executable(
+            malformed_executable.into_os_string(),
+            Duration::from_secs(2),
+        )
+        .invoke_probe("qualification", "opc-session-ha-0-0")
+        .await;
+        assert!(matches!(
+            malformed,
+            Err(QualificationKubernetesPortError::InvalidReply)
+        ));
+
+        let (_duplicate_directory, duplicate_executable) = write_fake_kubectl(
+            "printf '%s\\n%s\\n' '{\"reply\":\"initialized\"}' '{\"reply\":\"initialized\"}'",
+        );
+        let duplicate = KubectlQualificationKubernetesCampaignPort::with_executable(
+            duplicate_executable.into_os_string(),
+            Duration::from_secs(2),
+        )
+        .invoke_probe("qualification", "opc-session-ha-0-0")
+        .await;
+        assert!(matches!(
+            duplicate,
+            Err(QualificationKubernetesPortError::InvalidReply)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kubectl_status_adapter_uses_only_the_status_subresource_command() {
+        let (_directory, executable) = write_fake_kubectl(r#"printf '%s\n' "$@" > "${0}.args""#);
+        let port = KubectlQualificationKubernetesCampaignPort::with_executable(
+            executable.clone().into_os_string(),
+            Duration::from_secs(2),
+        );
+        let debug = format!("{port:?}");
+        assert!(!debug.contains(&executable.to_string_lossy().into_owned()));
+        let condition = QualificationKubernetesReadinessCondition::ready();
+        port.publish_readiness("qualification", "opc-session-ha-0-0", &condition)
+            .await
+            .expect("publish fake readiness");
+
+        let patch = serde_json::to_string(&json!({
+            "status": { "conditions": [&condition] },
+        }))
+        .expect("serialize expected patch");
+        let expected = status_patch_arguments("qualification", "opc-session-ha-0-0", &patch)
+            .into_iter()
+            .map(|value| value.into_string().expect("UTF-8 test argument"))
+            .collect::<Vec<_>>();
+        let actual = fs::read_to_string(appended_path(&executable, ".args"))
+            .expect("fake kubectl arguments")
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|argument| argument.as_str() == "--subresource=status")
+                .count(),
+            1
+        );
+        assert!(!actual.iter().any(|argument| argument.contains("exec")));
+    }
+
     #[test]
     fn config_is_bounded_and_debug_redacts_operator_values() {
         let config = QualificationKubernetesCampaignConfig {
@@ -1545,26 +1798,29 @@ mod tests {
 
     #[test]
     fn readiness_requires_the_complete_fresh_barrier_contract() {
-        let ready = classify_probe(Some(&ready_reply(3)), 3);
+        let expectation = readiness_expectation(3, 0);
+        let leader_id = expectation.expected_voter_ids()[1];
+        let valid_ready = ready_reply(&expectation, leader_id);
+        let ready = classify_probe(Some(&valid_ready), &expectation);
         assert!(ready.ready);
         assert_eq!(
             ready.condition.status,
             QualificationKubernetesConditionStatus::True
         );
 
-        let mut zero_leader = ready_reply(3);
+        let mut zero_leader = ready_reply(&expectation, leader_id);
         if let QualificationNodeReply::Readiness { leader_id, .. } = &mut zero_leader {
             *leader_id = Some(0);
         }
-        let rejected = classify_probe(Some(&zero_leader), 3);
+        let rejected = classify_probe(Some(&zero_leader), &expectation);
         assert!(!rejected.ready);
         assert_eq!(rejected.history.term, None);
 
-        let mut stale_apply = ready_reply(3);
+        let mut stale_apply = ready_reply(&expectation, leader_id);
         if let QualificationNodeReply::Readiness { applied_index, .. } = &mut stale_apply {
             *applied_index = Some(6);
         }
-        let rejected = classify_probe(Some(&stale_apply), 3);
+        let rejected = classify_probe(Some(&stale_apply), &expectation);
         assert!(!rejected.ready);
         assert_eq!(
             rejected.outcome,
@@ -1574,17 +1830,18 @@ mod tests {
         let no_quorum = QualificationNodeReply::Readiness {
             ready: false,
             reason_code: QualificationReadinessCode::NoQuorum,
-            node_id: 1,
+            node_id: expectation.expected_node_id(),
             term: 2,
             leader_id: None,
             configured_voters: 3,
+            configured_voter_ids: expectation.expected_voter_ids().to_vec(),
             fresh_reachable_voters: 0,
             agreeing_voters: 0,
             required_quorum: 2,
             committed_index: None,
             applied_index: Some(5),
         };
-        let unavailable = classify_probe(Some(&no_quorum), 3);
+        let unavailable = classify_probe(Some(&no_quorum), &expectation);
         assert!(!unavailable.ready);
         assert_eq!(
             unavailable.condition.reason,
@@ -1596,7 +1853,7 @@ mod tests {
     #[tokio::test]
     async fn complete_campaign_publishes_only_fresh_readiness_then_clears_it() {
         let config = campaign_config(2);
-        let port = FakePort::ready(6, 3);
+        let port = FakePort::ready(2, 3);
         let outcome = run_qualification_kubernetes_probe_campaign(
             &config,
             &port,
@@ -1612,7 +1869,7 @@ mod tests {
         );
         assert_eq!(outcome.completed_rounds, 2);
         assert!(outcome.cleanup_complete);
-        assert_eq!(outcome.transcript.len(), 9);
+        assert_eq!(outcome.transcript.len(), 12);
         assert_eq!(outcome.readiness_history.len(), 6);
         for (index, row) in outcome.readiness_history.iter().enumerate() {
             assert_eq!(row.history_operation_count, 6);
@@ -1621,10 +1878,13 @@ mod tests {
             assert_eq!(row.operation.term, Some(2));
         }
         let published = port.published.lock().expect("published lock");
-        assert!(published[..6]
+        assert!(published[..3]
+            .iter()
+            .all(|condition| condition.status == QualificationKubernetesConditionStatus::False));
+        assert!(published[3..9]
             .iter()
             .all(|condition| condition.status == QualificationKubernetesConditionStatus::True));
-        assert!(published[6..]
+        assert!(published[9..]
             .iter()
             .all(|condition| condition.status == QualificationKubernetesConditionStatus::False));
     }
@@ -1632,14 +1892,17 @@ mod tests {
     #[tokio::test]
     async fn contradictory_reply_fails_closed_without_authority_fields() {
         let config = campaign_config(1);
-        let mut port = FakePort::ready(3, 3);
+        let mut port = FakePort::ready(1, 3);
+        let first_expectation = readiness_expectation(3, 0);
+        let second_expectation = readiness_expectation(3, 1);
+        let leader_id = first_expectation.expected_voter_ids()[0];
         port.replies = Mutex::new(VecDeque::from([
             Ok(QualificationNodeReply::Bound {
                 node_index: 0,
                 bind_addr: "127.0.0.1:7443".parse().expect("socket address"),
             }),
-            Ok(ready_reply(3)),
-            Ok(ready_reply(3)),
+            Ok(ready_reply(&second_expectation, leader_id)),
+            Ok(ready_reply(&first_expectation, leader_id)),
         ]));
         let outcome = run_qualification_kubernetes_probe_campaign(
             &config,
@@ -1658,16 +1921,27 @@ mod tests {
         assert_eq!(outcome.readiness_history[0].operation.term, None);
         assert_eq!(outcome.readiness_history[0].operation.commit_index, None);
         assert_eq!(
-            outcome.transcript[0].outcome,
+            outcome.transcript[3].outcome,
             QualificationKubernetesCampaignRecordOutcome::InvalidReply
         );
-        assert!(outcome.transcript[0].reply.is_none());
+        assert!(outcome.transcript[3].reply.is_none());
+        assert_eq!(
+            port.replies.lock().expect("reply lock").len(),
+            2,
+            "failure must latch before later ready replies can be published"
+        );
+        assert!(port
+            .published
+            .lock()
+            .expect("published lock")
+            .iter()
+            .all(|condition| condition.status == QualificationKubernetesConditionStatus::False));
     }
 
     #[tokio::test]
     async fn cancellation_returns_partial_artifacts_and_clears_every_member() {
         let config = campaign_config(2);
-        let port = FakePort::ready(6, 3);
+        let port = FakePort::ready(2, 3);
         let cancelled = Arc::new(AtomicBool::new(false));
         let clock = FakeClock {
             elapsed: std::sync::atomic::AtomicU64::new(0),
@@ -1685,16 +1959,18 @@ mod tests {
         assert_eq!(outcome.completed_rounds, 1);
         assert_eq!(outcome.readiness_history.len(), 3);
         assert!(outcome.cleanup_complete);
-        assert_eq!(port.published.lock().expect("published lock").len(), 6);
+        assert_eq!(port.published.lock().expect("published lock").len(), 9);
     }
 
     #[tokio::test]
     async fn status_update_failure_aborts_and_still_attempts_complete_cleanup() {
         let config = campaign_config(2);
+        let expectation = readiness_expectation(3, 0);
+        let leader_id = expectation.expected_voter_ids()[0];
         let port = FakePort {
-            replies: Mutex::new(VecDeque::from([Ok(ready_reply(3))])),
+            replies: Mutex::new(VecDeque::from([Ok(ready_reply(&expectation, leader_id))])),
             published: Mutex::new(Vec::new()),
-            fail_publish_at: Some(0),
+            fail_publish_at: Some(3),
             cancel_on_probe: None,
         };
         let outcome = run_qualification_kubernetes_probe_campaign(
@@ -1711,17 +1987,60 @@ mod tests {
             QualificationKubernetesCampaignStatus::Failed
         );
         assert_eq!(outcome.completed_rounds, 0);
-        assert_eq!(outcome.transcript.len(), 4);
+        assert_eq!(outcome.transcript.len(), 7);
         assert!(outcome.cleanup_complete);
-        assert_eq!(port.published.lock().expect("published lock").len(), 4);
+        assert_eq!(port.published.lock().expect("published lock").len(), 7);
+    }
+
+    #[tokio::test]
+    async fn incomplete_initial_reset_never_invokes_or_publishes_a_ready_probe() {
+        let config = campaign_config(2);
+        let port = FakePort::ready(2, 3);
+        let port = FakePort {
+            fail_publish_at: Some(0),
+            ..port
+        };
+        let outcome = run_qualification_kubernetes_probe_campaign(
+            &config,
+            &port,
+            &FakeClock::new(),
+            &AtomicBool::new(false),
+        )
+        .await
+        .expect("bounded campaign");
+
+        assert_eq!(
+            outcome.status,
+            QualificationKubernetesCampaignStatus::Failed
+        );
+        assert_eq!(outcome.completed_rounds, 0);
+        assert!(outcome.readiness_history.is_empty());
+        assert_eq!(outcome.transcript.len(), 6);
+        assert_eq!(
+            outcome.transcript[0].outcome,
+            QualificationKubernetesCampaignRecordOutcome::ResetFailed
+        );
+        assert_eq!(
+            port.replies.lock().expect("reply lock").len(),
+            6,
+            "failed reset must abort before any probe"
+        );
+        assert!(port
+            .published
+            .lock()
+            .expect("published lock")
+            .iter()
+            .all(|condition| condition.status == QualificationKubernetesConditionStatus::False));
     }
 
     #[tokio::test]
     async fn cancellation_during_probe_never_authorizes_its_ready_reply() {
         let config = campaign_config(1);
         let cancelled = Arc::new(AtomicBool::new(false));
+        let expectation = readiness_expectation(3, 0);
+        let leader_id = expectation.expected_voter_ids()[0];
         let port = FakePort {
-            replies: Mutex::new(VecDeque::from([Ok(ready_reply(3))])),
+            replies: Mutex::new(VecDeque::from([Ok(ready_reply(&expectation, leader_id))])),
             published: Mutex::new(Vec::new()),
             fail_publish_at: None,
             cancel_on_probe: Some(Arc::clone(&cancelled)),
@@ -1742,11 +2061,11 @@ mod tests {
         assert_eq!(outcome.readiness_history.len(), 1);
         assert_eq!(outcome.readiness_history[0].operation.state, "not_ready");
         assert_eq!(
-            outcome.transcript[0].outcome,
+            outcome.transcript[3].outcome,
             QualificationKubernetesCampaignRecordOutcome::CampaignCancelled
         );
         assert_eq!(
-            port.published.lock().expect("published lock")[0].status,
+            port.published.lock().expect("published lock")[3].status,
             QualificationKubernetesConditionStatus::False
         );
     }
@@ -1758,7 +2077,7 @@ mod tests {
         let canonical_root = fs::canonicalize(root.path()).expect("canonical root");
         let output = canonical_root.join("campaign-1");
         let config = campaign_config(1);
-        let port = FakePort::ready(3, 3);
+        let port = FakePort::ready(1, 3);
         let outcome = run_qualification_kubernetes_probe_campaign(
             &config,
             &port,

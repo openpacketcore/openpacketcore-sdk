@@ -97,10 +97,25 @@ runner writes a private, atomically published
 `transcript.jsonl`, `readiness-v3-fragment.jsonl`, and digest-binding
 `summary.json`; it never overwrites a prior run. Each sample invokes the
 same-binary client through `kubectl exec`, admits only the exact typed
-Openraft barrier report for the rendered voter count, and patches only the
-custom Pod condition through the status subresource. A listener, successful
-exec, or process liveness is never sufficient. Any missing, malformed,
-contradictory, oversized, timed-out, or failed reply clears readiness.
+Openraft barrier report for that Pod's stable local identity and the complete
+rendered voter-ID set, and patches only the custom Pod condition through the
+status subresource. A listener, successful exec, or process liveness is never
+sufficient. The runner resets all conditions before the first sample, latches
+and aborts on the first missing, malformed, contradictory, oversized,
+timed-out, or failed reply, then attempts an all-false final cleanup. A later
+sample can never republish `True` after a failure.
+
+The custom condition is an external evidence gate, not the freshness
+authority. Kubernetes combines it with the container's generated exec
+readiness probe. Every five seconds kubelet runs the same binary as a silent
+`--readiness-client` against the private UDS, with the Pod's exact stable
+Openraft ID and full voter-ID set rendered as arguments. The store operation,
+client, and kubelet deadlines are respectively 10, 11, and 12 seconds;
+`failureThreshold` and `successThreshold` are both one. A quorum loss, hung
+probe, missing socket, invalid identity set, or terminated container therefore
+makes the Pod unready locally even if an uncatchable runner/host failure leaves
+the external condition stale. A stale custom `True` cannot override a failed
+container readiness probe.
 
 The caller must have narrowly audited `get` access for `pods`, `create` access
 for `pods/exec`, and `patch` access for `pods/status` in the qualification
@@ -111,8 +126,9 @@ token, ClusterRole, or ClusterRoleBinding.
 Normal completion, failure, and Ctrl-C all attempt to set the custom condition
 to `False` on every member. Each subprocess, output stream, round count, and
 artifact is bounded. An uncatchable process or host failure can interrupt that
-final cleanup, so a separate deployment owner must treat the condition as a
-short-lived observation and clear it before reusing a fleet.
+final cleanup, so a deployment owner must still reset the external evidence
+gate before reusing a fleet; safety does not depend on that cleanup because
+kubelet's local UDS probe independently self-expires container readiness.
 
 The v3 file is deliberately a readiness-only fragment. It must be combined
 with real batch, watch, and restore operations from the same campaign and have
@@ -129,10 +145,11 @@ the protocol includes fault, initialization, mutation, reauthentication, and
 shutdown operations. Limit and audit that authority outside this manifest. A
 real CNF `cnfctl` must still own durable-readiness gating, fault injection,
 rotation ordering, history/evidence collection, and clean shutdown. Pods fail
-closed behind the custom `opc.openpacketcore.io/durable-quorum-ready` readiness
-gate; `cnfctl` must continuously set or clear that Pod condition from a fresh
-durable barrier, not merely from listener availability. Release qualification
-must also prove the real cluster's node and volume failure-domain identities,
+closed behind the AND of kubelet's locally fresh UDS barrier and the custom
+`opc.openpacketcore.io/durable-quorum-ready` evidence gate; `cnfctl` must set or
+clear that Pod condition from a fresh durable barrier, not merely from listener
+availability. Release qualification must also prove the real cluster's node and
+volume failure-domain identities,
 projected-Secret update behavior, DNS behavior, storage class durability,
 NetworkPolicy enforcement, alert firing/clearing, and three/five-node fault and
 rotation schedules. The current qualification node still uses its documented
