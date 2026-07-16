@@ -123,12 +123,14 @@ namespace. Those grants remain outside the rendered tokenless ServiceAccount
 and manifest. The runner does not add a network control port, controller
 token, ClusterRole, or ClusterRoleBinding.
 
-Normal completion, failure, and Ctrl-C all attempt to set the custom condition
-to `False` on every member. Each subprocess, output stream, round count, and
-artifact is bounded. An uncatchable process or host failure can interrupt that
-final cleanup, so a deployment owner must still reset the external evidence
-gate before reusing a fleet; safety does not depend on that cleanup because
-kubelet's local UDS probe independently self-expires container readiness.
+Normal completion, failure, Ctrl-C, and Unix SIGTERM all attempt to set the
+custom condition to `False` on every member. Cancellation wakes interval waits
+and terminates and reaps an active local `kubectl` before bounded final cleanup.
+Each subprocess, output stream, cleanup command, round count, and artifact is
+bounded. An uncatchable process or host failure can interrupt that final
+cleanup, so a deployment owner must still reset the external evidence gate
+before reusing a fleet; safety does not depend on that cleanup because kubelet's
+local UDS probe independently self-expires container readiness.
 
 The v3 file is deliberately a readiness-only fragment. It must be combined
 with real batch, watch, and restore operations from the same campaign and have

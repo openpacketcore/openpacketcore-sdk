@@ -2814,7 +2814,12 @@ pub enum QualificationNodeReply {
         leader_id: Option<u64>,
         configured_voters: usize,
         /// Exact sorted stable node IDs in the admitted voter set.
-        configured_voter_ids: Vec<u64>,
+        ///
+        /// Older qualification-node replies omit this additive field. They
+        /// remain decodable, but callers that require exact voter correlation
+        /// must reject `None` rather than inferring the set from its count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_voter_ids: Option<Vec<u64>>,
         /// Minimum distinct voters proven reachable by the successful
         /// Openraft barrier, or zero when no barrier succeeded.
         fresh_reachable_voters: usize,

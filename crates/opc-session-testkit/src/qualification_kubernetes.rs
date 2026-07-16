@@ -150,7 +150,7 @@ impl QualificationKubernetesReadinessExpectation {
             && *term != 0
             && leader_id.is_some_and(|leader| self.contains_voter(leader))
             && *configured_voters == self.voter_count()
-            && configured_voter_ids == &self.expected_voter_ids
+            && configured_voter_ids.as_deref() == Some(self.expected_voter_ids.as_slice())
             && *required_quorum == self.required_quorum()
             && *fresh_reachable_voters == self.required_quorum()
             && *agreeing_voters == self.required_quorum()
@@ -955,7 +955,7 @@ mod tests {
             term: 2,
             leader_id: Some(leader_id),
             configured_voters: 3,
-            configured_voter_ids: expectation.expected_voter_ids().to_vec(),
+            configured_voter_ids: Some(expectation.expected_voter_ids().to_vec()),
             fresh_reachable_voters: 2,
             agreeing_voters: 2,
             required_quorum: 2,
@@ -976,7 +976,9 @@ mod tests {
             ..
         } = &mut wrong_voter_set
         {
-            configured_voter_ids[2] = outsider;
+            configured_voter_ids
+                .as_mut()
+                .expect("ready reply voter IDs")[2] = outsider;
         }
         assert!(!expectation.accepts_ready_reply(&wrong_voter_set));
         assert!(QualificationKubernetesReadinessExpectation::try_new(
@@ -990,6 +992,34 @@ mod tests {
         .is_err());
         let debug = format!("{expectation:?}");
         assert!(!debug.contains(&expectation.expected_node_id().to_string()));
+    }
+
+    #[test]
+    fn legacy_readiness_reply_decodes_but_cannot_authorize_without_voter_ids() {
+        let expectation = qualification_kubernetes_readiness_expectations(3)
+            .expect("fixed expectations")
+            .remove(0);
+        let legacy = json!({
+            "reply": "readiness",
+            "ready": true,
+            "reason_code": "ready",
+            "node_id": expectation.expected_node_id(),
+            "term": 2,
+            "leader_id": expectation.expected_voter_ids()[0],
+            "configured_voters": 3,
+            "fresh_reachable_voters": 2,
+            "agreeing_voters": 2,
+            "required_quorum": 2,
+            "committed_index": 7,
+            "applied_index": 7,
+        });
+        let reply: QualificationNodeReply =
+            serde_json::from_value(legacy).expect("decode legacy readiness reply");
+        assert!(!expectation.accepts_ready_reply(&reply));
+        assert!(serde_json::to_value(reply)
+            .expect("re-encode legacy readiness reply")
+            .get("configured_voter_ids")
+            .is_none());
     }
 
     #[test]

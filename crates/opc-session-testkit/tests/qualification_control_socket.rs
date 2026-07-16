@@ -423,7 +423,7 @@ fn readiness_client_is_silent_and_requires_exact_uds_barrier_identity() {
         term: 2,
         leader_id: Some(22),
         configured_voters: 3,
-        configured_voter_ids: vec![11, 22, 33],
+        configured_voter_ids: Some(vec![11, 22, 33]),
         fresh_reachable_voters: 2,
         agreeing_voters: 2,
         required_quorum: 2,
@@ -439,6 +439,19 @@ fn readiness_client_is_silent_and_requires_exact_uds_barrier_identity() {
     assert!(!wrong_local.status.success());
     assert!(wrong_local.stdout.is_empty());
     assert_eq!(wrong_local.stderr, b"qualification node failed\n");
+
+    let mut legacy_without_voter_ids = ready_reply(11);
+    if let QualificationNodeReply::Readiness {
+        configured_voter_ids,
+        ..
+    } = &mut legacy_without_voter_ids
+    {
+        *configured_voter_ids = None;
+    }
+    let missing_voters = invoke_fake_readiness_client(legacy_without_voter_ids, 11, "11,22,33");
+    assert!(!missing_voters.status.success());
+    assert!(missing_voters.stdout.is_empty());
+    assert_eq!(missing_voters.stderr, b"qualification node failed\n");
 
     let mut outsider_leader = ready_reply(11);
     if let QualificationNodeReply::Readiness { leader_id, .. } = &mut outsider_leader {

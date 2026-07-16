@@ -3,15 +3,15 @@
 
 use std::env;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use opc_session_testkit::qualification_kubernetes_campaign::{
     persist_qualification_kubernetes_campaign, run_qualification_kubernetes_probe_campaign,
     validate_qualification_kubernetes_campaign_artifact_destination,
-    KubectlQualificationKubernetesCampaignPort, QualificationKubernetesCampaignConfig,
-    QualificationKubernetesCampaignStatus, QualificationKubernetesSystemClock,
+    KubectlQualificationKubernetesCampaignPort, QualificationKubernetesCampaignCancellation,
+    QualificationKubernetesCampaignConfig, QualificationKubernetesCampaignStatus,
+    QualificationKubernetesSystemClock,
 };
 
 const USAGE: &str = "usage: opc-session-kubernetes-campaign --namespace <dns-label> --members <3|5> --rounds <count> --interval-ms <250..60000> --history-id <id> --output-directory <new-absolute-path>";
@@ -30,19 +30,20 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let signal_cancelled = Arc::clone(&cancelled);
-    let signal_task = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancelled.store(true, Ordering::Release);
+    let cancellation = Arc::new(QualificationKubernetesCampaignCancellation::new());
+    let signal_task = match spawn_signal_task(Arc::clone(&cancellation)) {
+        Ok(task) => task,
+        Err(()) => {
+            eprintln!("qualification Kubernetes campaign signal registration failed");
+            std::process::exit(1);
         }
-    });
+    };
 
     let outcome = run_qualification_kubernetes_probe_campaign(
         &arguments.config,
         &KubectlQualificationKubernetesCampaignPort::new(),
         &QualificationKubernetesSystemClock::new(),
-        cancelled.as_ref(),
+        cancellation.as_ref(),
     )
     .await;
     signal_task.abort();
@@ -77,6 +78,39 @@ async fn main() {
             std::process::exit(130);
         }
     }
+}
+
+#[cfg(unix)]
+fn spawn_signal_task(
+    cancellation: Arc<QualificationKubernetesCampaignCancellation>,
+) -> Result<tokio::task::JoinHandle<()>, ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| ())?;
+    let mut terminate = signal(SignalKind::terminate()).map_err(|_| ())?;
+    Ok(tokio::spawn(async move {
+        loop {
+            let received = tokio::select! {
+                signal = interrupt.recv() => signal,
+                signal = terminate.recv() => signal,
+            };
+            if received.is_none() {
+                break;
+            }
+            cancellation.cancel();
+        }
+    }))
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_task(
+    cancellation: Arc<QualificationKubernetesCampaignCancellation>,
+) -> Result<tokio::task::JoinHandle<()>, ()> {
+    Ok(tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancellation.cancel();
+        }
+    }))
 }
 
 fn parse_arguments() -> Result<Arguments, ()> {
@@ -146,6 +180,30 @@ fn parse_u64(value: std::ffi::OsString) -> Result<u64, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_requests_campaign_cancellation() {
+        let cancellation = Arc::new(QualificationKubernetesCampaignCancellation::new());
+        let signal_task =
+            spawn_signal_task(Arc::clone(&cancellation)).expect("register campaign signals");
+        let signal_status = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(std::process::id().to_string())
+            .status()
+            .expect("send SIGTERM");
+        assert!(signal_status.success());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !cancellation.is_cancelled() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "SIGTERM did not request cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        signal_task.abort();
+        let _ = signal_task.await;
+    }
 
     #[test]
     fn usage_never_advertises_a_network_control_endpoint() {

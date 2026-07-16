@@ -1747,7 +1747,7 @@ impl QualificationNode {
             term: status.term,
             leader_id: status.leader_id.map(|node_id| node_id.get()),
             configured_voters: report.configured_voters(),
-            configured_voter_ids: self.configured_voter_ids.clone(),
+            configured_voter_ids: Some(self.configured_voter_ids.clone()),
             fresh_reachable_voters: report.fresh_reachable_voters(),
             agreeing_voters: report.agreeing_voters(),
             required_quorum: report.required_quorum(),

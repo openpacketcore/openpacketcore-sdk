@@ -42,7 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempts all-false cleanup. A kubelet exec probe independently validates the
   exact local and fleet identities over the private UDS with layered deadlines,
   so readiness self-expires on quorum loss, a hung probe, or process exit even
-  if the external evidence condition becomes stale.
+  if the external evidence condition becomes stale. Ctrl-C and SIGTERM wake
+  interval waits, terminate and reap an active local `kubectl`, and enter
+  bounded all-false cleanup. Exact voter IDs are additive and optional on
+  decode: legacy readiness replies remain readable but cannot authorize the
+  exact-ID Kubernetes gates.
   It atomically publishes private digest-bound command/reply and readiness-v3
   fragment artifacts without adding a port, token, or RBAC to the fleet. The
   fragment intentionally omits v1 workload and v3 batch/watch/restore evidence,

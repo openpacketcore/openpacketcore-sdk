@@ -104,8 +104,10 @@ batch/watch/restore evidence, so it remains candidate-only and cannot claim a
 completed #143 campaign. See the Kubernetes qualification README for the
 exact invocation and gate contract.
 
-The node's original stdin/stdout JSON-line mode remains available unchanged for
-the single-host harnesses. Deployed manifests instead add
+The node's original stdin/stdout JSON-line transport remains available for the
+single-host harnesses. Readiness replies add optional-on-decode exact voter IDs;
+legacy replies without them still decode, but cannot authorize either exact-ID
+Kubernetes readiness path. Deployed manifests instead add
 `--control-socket /var/lib/opc-session-qualification/control/node.sock`. The
 node creates that socket in a private `0700` child of the existing ephemeral
 workspace and exposes it as `0600`; it replaces only a refused stale socket
