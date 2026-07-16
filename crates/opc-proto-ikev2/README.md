@@ -1,6 +1,6 @@
 # opc-proto-ikev2
 
-Experimental IKEv2 mechanism scaffold for OpenPacketCore untrusted-access work.
+Transport-neutral IKEv2 mechanisms for OpenPacketCore untrusted-access work.
 
 ## Purpose
 
@@ -8,12 +8,15 @@ Experimental IKEv2 mechanism scaffold for OpenPacketCore untrusted-access work.
 to expose as SDK primitives today: header decode/encode, unencrypted payload
 walking, protected-payload boundaries, selected SA_INIT and IKE_AUTH helpers,
 NAT detection, NAT-T datagram classification, and product-neutral Child SA
-negotiation intent.
+negotiation intent. It also provides strict opened-payload primitives for the
+TS 24.302 multiple-bearer profile: typed QoS/TFT/AMBR notifications, new
+non-rekey dedicated-bearer Child SA establishment, bearer modification, and
+bearer deletion.
 
 It does not implement an IKE SA state machine, EAP-AKA, retransmission policy,
-cookie policy, Child SA lifecycle, XFRM/IPsec programming, 3GPP ePDG profile
-validation, carrier acceptance evidence, or a production ePDG control-plane
-stack.
+cookie policy, Child SA lifecycle, XFRM/IPsec programming, bearer admission or
+allocation policy, carrier acceptance evidence, or a production ePDG
+control-plane stack.
 
 ## API Shape
 
@@ -40,8 +43,70 @@ stack.
   responses using the redaction-safe exact-15-digit `Imei15` and `Imeisv`
   types. TBCD decoding preserves the received fifteenth IMEI digit (including
   a spare zero or non-Luhn digit) and enforces the terminal filler nibble.
+- `dedicated_bearer` implements the TS 24.302 multiple-bearer Notify values and
+  strict opened-payload views/builders for dedicated-bearer `CREATE_CHILD_SA`
+  and `INFORMATIONAL` modification/deletion exchanges. TFT values use the
+  canonical `opc-proto-tft` TS 24.008 codec shared with GTPv2-C. Response
+  correlation checks the IKE SPIs, Message ID, exchange/flags, selected offered
+  proposal/transforms, optional KE group, and traffic-selector narrowing.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
+
+## Dedicated-bearer integration
+
+The dedicated-bearer API consumes and emits the cleartext payload chain inside
+an authenticated `SK` payload. The application remains responsible for IKE SA
+state, message-ID allocation, encryption/authentication, timer policy, and
+installing or deleting the resulting Child SA.
+
+```rust
+use opc_proto_ikev2::{
+    build_ikev2_dedicated_bearer_create_child_sa_request,
+    decode_ikev2_dedicated_bearer_create_child_sa_response,
+    validate_ikev2_dedicated_bearer_create_child_sa_response_correlation,
+    Header, Ikev2DedicatedBearerCreateChildSaRequest,
+    Ikev2DedicatedBearerCreateChildSaRequestBuild,
+    Ikev2DedicatedBearerCreateChildSaResponse, PayloadType,
+};
+
+fn encode_new_bearer(
+    input: &Ikev2DedicatedBearerCreateChildSaRequestBuild,
+) -> Result<(PayloadType, bytes::Bytes), Box<dyn std::error::Error>> {
+    let cleartext = build_ikev2_dedicated_bearer_create_child_sa_request(input)?;
+    // Seal these exact bytes once, then cache the complete encrypted request
+    // for retransmission; do not reseal retransmissions with a new IV.
+    Ok(cleartext.into_parts())
+}
+
+fn accept_new_bearer_response<'a>(
+    request_header: &Header,
+    request: &Ikev2DedicatedBearerCreateChildSaRequest<'_>,
+    response_header: &Header,
+    first_payload: PayloadType,
+    opened_payloads: &'a [u8],
+) -> Result<Ikev2DedicatedBearerCreateChildSaResponse<'a>, Box<dyn std::error::Error>> {
+    let response = decode_ikev2_dedicated_bearer_create_child_sa_response(
+        response_header,
+        first_payload,
+        opened_payloads,
+    )?;
+    validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+        request_header,
+        response_header,
+        request,
+        &response,
+    )?;
+    Ok(response)
+}
+```
+
+Modification uses
+`build_ikev2_dedicated_bearer_modification_request`; deletion uses
+`build_ikev2_dedicated_bearer_delete_request`. Their empty or typed-error
+`INFORMATIONAL` responses must be decoded and checked with the corresponding
+`validate_..._response_correlation` helper before application state changes.
+The complete compilable establishment-and-deletion flow is in
+[`examples/dedicated_bearer.rs`](examples/dedicated_bearer.rs).
 
 ## Example
 
@@ -72,10 +137,11 @@ assert_eq!(message.payloads().count(), 1);
 
 ## Status And Limits
 
-The crate is experimental and `publish = false`. It has structural coverage and
-targeted crypto/helper tests for the documented scaffold, but it is not a full
-IKEv2 implementation. Certificate-chain, validity-period, name, and key-usage
-validation are caller responsibilities when using signature AUTH helpers.
+The crate is experimental and `publish = false`. The dedicated-bearer wire
+boundary has typed, fail-closed validation and specification-authored tests,
+but this crate is not a full IKEv2 implementation. Certificate-chain,
+validity-period, name, and key-usage validation are caller responsibilities
+when using signature AUTH helpers.
 
 IKE_SA_INIT error responses are unauthenticated. The product owns source
 validation, response rate limiting, retransmission behavior, and other
@@ -96,8 +162,9 @@ explicit non-goals.
 - Add independent-peer fixtures before claiming interoperability.
 - Continue adding typed cleartext payload bodies with octet-level fixture
   evidence.
-- Keep SA state machines, retransmission queues, cookie policy, EAP-AKA, Child
-  SA installation, and ePDG product decisions outside this crate.
+- Keep SA state machines, retransmission queues, cookie policy, EAP-AKA, SPI
+  allocation, Child SA installation, and ePDG product decisions outside this
+  crate.
 
 ## Verification
 
@@ -106,4 +173,5 @@ cargo check -p opc-proto-ikev2 --all-targets --all-features
 cargo test -p opc-proto-ikev2 --all-features
 cargo clippy -p opc-proto-ikev2 --all-targets -- -D warnings
 (cd crates/opc-proto-ikev2 && cargo +nightly fuzz list)
+(cd crates/opc-proto-ikev2 && cargo +nightly fuzz run dedicated_bearer -- -runs=1000)
 ```

@@ -2,7 +2,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![deny(missing_docs)]
 
-//! Experimental IKEv2 codec scaffold for OpenPacketCore.
+//! Transport-neutral IKEv2 protocol mechanisms for OpenPacketCore.
 //!
 //! This crate intentionally covers only the transport-neutral IKEv2 wire
 //! mechanism that is safe to expose as an SDK primitive today: fixed-header
@@ -14,10 +14,11 @@
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
 //! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY
-//! notifications, and product-neutral Child SA negotiation intent. It does not
-//! implement an IKE SA state machine, EAP-AKA, retransmission policy, cookie
-//! policy, Child SA installation, XFRM programming, or any 3GPP ePDG profile
-//! decisions.
+//! notifications, product-neutral Child SA negotiation intent, and strict
+//! opened-payload helpers for 3GPP TS 24.302 dedicated-bearer establishment,
+//! modification, and deletion. It does not implement an IKE SA state machine,
+//! EAP-AKA, retransmission policy, cookie policy, Child SA installation, XFRM
+//! programming, or any product-specific 3GPP ePDG policy.
 //!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
@@ -26,6 +27,7 @@
 use opc_protocol::ValidationLevel;
 
 pub mod crypto;
+pub mod dedicated_bearer;
 pub mod device_identity;
 pub mod exchange;
 pub mod fragmentation;
@@ -46,6 +48,40 @@ pub mod testkit;
 pub use crypto::{
     open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,
     ProtectedPayloadKind, ProtectedPayloadOpenError, ProtectedPayloadOpenFailure,
+};
+pub use dedicated_bearer::{
+    build_ikev2_dedicated_bearer_create_child_sa_error_response,
+    build_ikev2_dedicated_bearer_create_child_sa_request,
+    build_ikev2_dedicated_bearer_create_child_sa_response,
+    build_ikev2_dedicated_bearer_delete_request,
+    build_ikev2_dedicated_bearer_informational_error_response,
+    build_ikev2_dedicated_bearer_informational_success_response,
+    build_ikev2_dedicated_bearer_modification_request, build_ikev2_dedicated_bearer_notify,
+    decode_ikev2_dedicated_bearer_create_child_sa_request,
+    decode_ikev2_dedicated_bearer_create_child_sa_request_with_context,
+    decode_ikev2_dedicated_bearer_create_child_sa_response,
+    decode_ikev2_dedicated_bearer_delete_request,
+    decode_ikev2_dedicated_bearer_informational_response,
+    decode_ikev2_dedicated_bearer_modification_request, decode_ikev2_dedicated_bearer_notify,
+    validate_ikev2_dedicated_bearer_create_child_sa_response_correlation,
+    validate_ikev2_dedicated_bearer_delete_response_correlation,
+    validate_ikev2_dedicated_bearer_modification_response_correlation,
+    validate_ikev2_dedicated_bearer_response_correlation, Ikev2ApnAmbr, Ikev2ApnAmbrRateCodes,
+    Ikev2DedicatedBearerCleartextPayloads, Ikev2DedicatedBearerCreateChildSaRequest,
+    Ikev2DedicatedBearerCreateChildSaRequestBuild, Ikev2DedicatedBearerCreateChildSaResponse,
+    Ikev2DedicatedBearerCreateChildSaResponseBuild, Ikev2DedicatedBearerDeleteRequest,
+    Ikev2DedicatedBearerError, Ikev2DedicatedBearerEspSpi, Ikev2DedicatedBearerExchangeError,
+    Ikev2DedicatedBearerInformationalResponse, Ikev2DedicatedBearerModificationRequest,
+    Ikev2DedicatedBearerModificationRequestBuild, Ikev2DedicatedBearerNotify,
+    Ikev2DedicatedBearerPayloadRole, Ikev2DedicatedBearerPeerErrorNotify,
+    Ikev2DedicatedBearerProtocolError, Ikev2DedicatedBearerResponseError, Ikev2EpsQos,
+    Ikev2EpsQosRateCodes, Ikev2ExtendedApnAmbr, Ikev2ExtendedBitRateUnit, Ikev2ExtendedEpsQos,
+    Ikev2UnknownNonCriticalPayload, IKEV2_NOTIFY_APN_AMBR, IKEV2_NOTIFY_EPS_QOS,
+    IKEV2_NOTIFY_EXTENDED_APN_AMBR, IKEV2_NOTIFY_EXTENDED_EPS_QOS, IKEV2_NOTIFY_MODIFIED_BEARER,
+    IKEV2_NOTIFY_MULTIPLE_BEARER_PDN_CONNECTIVITY, IKEV2_NOTIFY_SEMANTIC_ERRORS_IN_PACKET_FILTERS,
+    IKEV2_NOTIFY_SEMANTIC_ERROR_IN_THE_TFT_OPERATION,
+    IKEV2_NOTIFY_SYNTACTICAL_ERRORS_IN_PACKET_FILTERS,
+    IKEV2_NOTIFY_SYNTACTICAL_ERROR_IN_THE_TFT_OPERATION, IKEV2_NOTIFY_TFT,
 };
 pub use device_identity::{
     build_ikev2_device_identity_request, build_ikev2_device_identity_response,
