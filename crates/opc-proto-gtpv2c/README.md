@@ -14,8 +14,10 @@ control-plane stack.
 
 ## API Shape
 
-- `header` exposes `Header`, `MessageType`, `decode_header`, and
-  `encode_header`.
+- `header` exposes `Header`, the bounded `MessagePriority` value,
+  `MessageType`, `decode_header`, and `encode_header`. TEID-present EPC
+  headers accept the TS 29.274 MP flag and four-bit priority; no-TEID headers
+  keep bit 3 as spare.
 - `ie` exposes `RawIe`, `OwnedRawIe`, `RawIeIterator`, `validate_ie_region`,
   `TypedIe`, `TypedIeValue`, and typed S2b IE structs such as `Cause`,
   `Recovery`, `AccessPointName`, `BearerContext`, `FullyQualifiedTeid`, and
@@ -83,6 +85,28 @@ additionally invokes the real typed IKEv2 Child-SA create/delete APIs between
 the GTP request and response. The SDK does not allocate EBIs, TEIDs, or SPIs
 and does not program XFRM/eBPF state.
 
+Applications can attach scheduling metadata to a TEID-present EPC header
+without assembling flag or octet-12 bits manually:
+
+```rust
+use opc_proto_gtpv2c::{Header, MessagePriority};
+
+let priority = MessagePriority::new(3)?;
+let header = Header::with_teid(32, 0x0102_0304, 0x000102)
+    .with_message_priority(priority);
+assert!(header.message_priority_flag);
+assert_eq!(header.message_priority().map(MessagePriority::get), Some(3));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Zero is the highest relative priority and 15 is the lowest. Constructors
+remain priority-free by default. Strict and `ProcedureAware` decode accept a
+well-formed priority while rejecting non-zero header spare bits and an octet-12
+priority without MP. Canonical encode emits the typed value and zero spare
+bits; raw-preserving encode retains ignored/spare wire bits without changing
+the typed priority. Priority validation errors contain scheduling metadata
+only and never include payloads, subscriber identifiers, TEIDs, or addresses.
+
 ## Relationships
 
 This crate depends on `opc-protocol` for decode/encode contracts. GTP-U user
@@ -101,15 +125,10 @@ interoperability claim, and no product bearer-policy/dataplane state machine.
 The triggered transaction helper is in-memory and transport-neutral; callers
 own UDP I/O, persistence across process loss, and the monotonic clock. The PCO inner codec is
 limited to DNS/P-CSCF address projection and safely skips other well-formed
-containers. `CONFORMANCE.md` also
-calls out that strict-mode support for priority-bearing MP-flag messages is a
-future fix because the current common header folds low flag bits into a spare
-field.
+containers.
 
 ## Roadmap
 
-- Add explicit MP-flag handling before claiming priority-bearing message
-  support.
 - Expand typed IE/procedure coverage only with matching constructor,
   ProcedureAware validation, malformed fixtures, examples, and fuzz seeds.
 - Add licensed independent captures before claiming interoperability evidence.

@@ -6,9 +6,10 @@
 - **Crate status:** Experimental S2b-focused typed subset with a raw-preserving
   message/IE shell. `S2b Production Profile v1` is the retained candidate
   identifier for the documented boundary, not a maturity attestation.
-- **Implemented evidence:** common-header structural parsing, raw TLIV IE
-  boundary validation, raw-preserving encode/decode, provenance-labeled fixture
-  corpus replay, independent-capture intake checks, malformed-input replay,
+- **Implemented evidence:** common-header structural parsing including typed
+  EPC Message Priority, raw TLIV IE boundary validation, raw-preserving
+  encode/decode, provenance-labeled fixture corpus replay, independent-capture
+  intake checks, malformed-input replay,
   profile-critical negative fixture replay, typed S2b IE examples, and typed S2b
   views for Echo, Create/Modify/Delete/Update Session-oriented procedures, and
   PGW-triggered Create Bearer/Delete Bearer procedures.
@@ -129,9 +130,9 @@ failures and must cover at least these rules:
 
 ### Graduation status
 
-Open graduation blockers include correct MP-flag/priority handling, independent
-peer interoperability, and completion of the declared compatibility and
-negative-evidence matrix. Future expansion of this boundary must add the same
+Open graduation blockers include independent peer interoperability and
+completion of the declared compatibility and negative-evidence matrix. Future
+expansion of this boundary must add the same
 constructor, `ProcedureAware` validation, positive fixture, malformed negative
 fixture, example, and fuzz-seed mirror evidence before claiming additional
 coverage.
@@ -142,10 +143,17 @@ coverage.
    - Version field must be GTPv2-C version 2.
    - TEID-present and no-TEID header layouts are parsed.
    - The Length field is interpreted as excluding the first four octets.
-   - Strict validation rejects non-zero spare bits in the flags octet and
-     sequence spare octet.
-   - Raw-preserving encode keeps decoded spare bits and message boundaries;
-     canonical encode zeroes common-header spare fields.
+   - TEID-present EPC headers model the MP flag separately from their two flag
+     spare bits and expose a bounded four-bit Message Priority (`0` highest,
+     `15` lowest) from octet 12.
+   - No-TEID headers continue to treat all three low flag bits and their final
+     sequence octet as spare.
+   - Strict validation accepts valid MP-bearing headers and rejects non-zero
+     spare bits, MP/value inconsistency, and a priority nibble while MP is
+     clear.
+   - Raw-preserving encode keeps decoded ignored/spare bits and message
+     boundaries while honoring the typed priority; canonical encode retains
+     the typed MP value and zeroes common-header spare fields.
 
 2. **Raw IE region**
    - IE type, length, instance, spare bits, and value bytes are preserved.
@@ -284,15 +292,6 @@ coverage.
      compatibility and are replayed by the never-panic corpus test.
    - The repository fuzz workflow includes this crate in its scheduled matrix.
 
-## Known limitations
-
-- The common-header flags octet bit 3 is the Message Priority (MP) flag in
-  TS 29.274 R18, but this scaffold folds the low three bits into a single
-  `spare` field. Strict-mode decode rejects non-zero values there, so
-  otherwise-valid GTPv2-C messages that set MP=1 will fail strict validation.
-  Future typed S2b work must add explicit MP-flag handling before claiming
-  support for priority-bearing messages.
-
 ## Explicitly out of scope
 
 - A full Release 18 GTPv2-C implementation or a complete S2b IE/procedure
@@ -306,9 +305,10 @@ coverage.
 
 ## Canonicalization policy
 
-Raw-preserving encoding keeps the decoded header spare bits and raw IE bytes.
-Canonical encoding recomputes the Length field, emits version 2 with header and
-IE spare bits zeroed for typed IEs, encodes TBCD/APN/PLMN/PAA/F-TEID/Bearer QoS
+Raw-preserving encoding keeps decoded header ignored/spare bits and raw IE
+bytes while emitting the selected typed Message Priority. Canonical encoding
+recomputes the Length field, emits version 2 with the typed MP flag/priority and
+header and IE spare bits zeroed, encodes TBCD/APN/PLMN/PAA/F-TEID/Bearer QoS
 fields in canonical form, preserves opaque PCO/APCO/Indication bytes, and still
 carries unsupported IEs through the raw fallback.
 Use the raw `Message` layer or `EncodeContext { raw_preserving: true, .. }` on a
@@ -366,10 +366,12 @@ The committed fixture corpus is split by provenance class:
   asserts those target-specific mirrors match the provenance source bytes.
 
 Header, raw IE, malformed-input, corpus-replay, and S2b integration tests under
-`tests/` exercise raw-preserving spare-bit round trips, multi-IE unknown TLIV
-preservation, truncation/count-limit errors, prefix/malformed input no-panic
-regressions, typed decode → encode fixtures, missing-mandatory-IE rejection, and
-malformed profile-critical F-TEID/PAA rejection.
+`tests/` exercise strict Message Priority decoding across its full range,
+MP/value inconsistency, canonical and raw-preserving spare-bit round trips,
+multi-IE unknown TLIV preservation, truncation/count-limit errors,
+prefix/malformed input no-panic regressions, typed decode → encode fixtures,
+missing-mandatory-IE rejection, and malformed profile-critical F-TEID/PAA
+rejection.
 
 `examples/production_profile_v1.rs` exercises the downstream constructor path
 for Echo, Create Session, Modify Bearer, Delete Session, and Update Bearer S2b

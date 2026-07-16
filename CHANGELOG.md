@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values represented on the wire. Admission, SPI allocation, retransmission
   timers, cryptographic sealing, and dataplane installation remain with the
   product.
+- `opc-proto-gtpv2c`: TEID-present EPC headers now expose the TS 29.274 R18
+  Message Priority flag and a bounded `MessagePriority` value (`0` highest,
+  `15` lowest). Strict decode accepts valid MP-bearing headers while rejecting
+  spare bits and MP/value inconsistency; canonical encode emits the typed
+  priority, and raw-preserving encode retains ignored/spare wire bits.
 - `opc-sctp`: an explicit, default-off `DiameterInboundPpidPolicy` escape hatch
   can accept inbound PPID 0 from a configured legacy clear-text Diameter peer.
   Standard PPID 46 remains accepted and is always used outbound; DTLS remains

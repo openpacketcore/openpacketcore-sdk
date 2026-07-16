@@ -45,7 +45,10 @@ pub use dedicated_bearer::{
     S2bDeleteBearerResult, S2bDeleteBearerTarget, MAX_DEDICATED_BEARER_CONTEXTS,
 };
 
-pub use header::{decode_header, encode_header, Header, MessageType, GTPV2C_VERSION};
+pub use header::{
+    decode_header, encode_header, Header, InvalidMessagePriority, MessagePriority, MessageType,
+    GTPV2C_VERSION, MAX_MESSAGE_PRIORITY,
+};
 pub use ie::{
     decode_typed_ie_sequence, encode_typed_ie_sequence, validate_ie_region, AccessPointName,
     AdditionalProtocolConfigurationOptions, AggregateMaximumBitRate, ApnRestriction, BearerContext,

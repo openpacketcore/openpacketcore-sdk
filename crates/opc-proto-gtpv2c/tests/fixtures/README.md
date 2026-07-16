@@ -32,6 +32,29 @@ Clause abbreviations used in the tables: IMSI §8.3.2, Cause §8.4, Recovery
 §8.28, Charging ID §8.29, PDN Type §8.34, Selection Mode §8.58, Bearer TFT
 §8.28 plus TS 24.008 §10.5.6.12, and APCO §8.104.
 
+The two header-only `.hex` fixtures below are decoded directly by
+`tests/header.rs`; each whitespace-separated octet is a counted conformance
+byte. They are kept textual so their complete normative construction remains
+reviewable without a binary viewer.
+
+### `message_priority_highest_header.hex`
+
+| Offset | Octets | Field and spec basis |
+| --- | --- | --- |
+| 0 | `4c` | Version 2, T=1, MP=1, two spare bits zero (§5.4, §5.5.1). |
+| 1 | `20` | Message Type 32 used as an EPC-header example (§5.5.1). |
+| 2..3 | `00 08` | Length of the TEID, sequence, and priority fields, excluding the first four octets (§5.5.1). |
+| 4..7 | `01 02 03 04` | Synthetic TEID used only to demonstrate the TEID-present EPC header (§5.5.1). |
+| 8..10 | `00 ab cd` | 24-bit sequence number (§5.5.1). |
+| 11 | `00` | Message Priority 0 (highest); low spare nibble zero (§5.5.1). |
+
+### `message_priority_lowest_header.hex`
+
+| Offset | Octets | Field and spec basis |
+| --- | --- | --- |
+| 0..10 | `4c 20 00 08 01 02 03 04 00 ab cd` | Same TEID-present MP header and synthetic identifiers as the highest-priority fixture (§5.4, §5.5.1). |
+| 11 | `f0` | Message Priority 15 (lowest); low spare nibble zero (§5.5.1). |
+
 ### `echo_request_recovery.bin`
 
 | Offset | Octets | Field and spec basis |
