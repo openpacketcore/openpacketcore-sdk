@@ -2901,6 +2901,7 @@ dependencies = [
  "bytes",
  "crypto-bigint",
  "hmac 0.12.1",
+ "opc-proto-gtpv2c",
  "opc-proto-ikev2",
  "opc-proto-tft",
  "opc-protocol",
