@@ -30,6 +30,7 @@ const WORKSPACE_DIRECTORY: &str = "/var/lib/opc-session-qualification";
 const DATABASE_PATH: &str = "/var/lib/opc-session-qualification/state/session.sqlite";
 const SNAPSHOT_DIRECTORY: &str = "/var/lib/opc-session-qualification/state/snapshots";
 const PROJECTED_IDENTITY_ROOT: &str = "/var/lib/opc-session-qualification/identity";
+const CONTROL_SOCKET_PATH: &str = "/var/lib/opc-session-qualification/control/node.sock";
 
 /// Fixed-input request for one deterministic Kubernetes fleet manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,7 +348,8 @@ fn member_stateful_set(
     let labels = member_labels(node_index);
     let secret_name = format!("{FLEET_NAME}-node-{node_index}-svid");
     let config_key = format!("node-{node_index}.json");
-    json!({
+    let linux_node_selector = json!({ "kubernetes.io/os": "linux" });
+    let mut stateful_set = json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
         "metadata": object_metadata(&name, config),
@@ -398,10 +400,9 @@ fn member_stateful_set(
                             node_index.to_string(),
                             "--bind-addr",
                             format!("0.0.0.0:{CONSENSUS_PORT}"),
+                            "--control-socket",
+                            CONTROL_SOCKET_PATH,
                         ],
-                        "stdin": true,
-                        "stdinOnce": false,
-                        "tty": false,
                         "ports": [{
                             "name": "consensus-mtls",
                             "containerPort": CONSENSUS_PORT,
@@ -464,7 +465,9 @@ fn member_stateful_set(
                 },
             }],
         },
-    })
+    });
+    stateful_set["spec"]["template"]["spec"]["nodeSelector"] = linux_node_selector;
+    stateful_set
 }
 
 fn is_kubernetes_dns_label(value: &str) -> bool {

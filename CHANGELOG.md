@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain a separate namespace; and a disjoint generic mark can compose with
   fixed outer DSCP while overlapping output windows fail closed. Existing
   `SaParameters` literals must initialize `output_mark`, normally to `None`.
+- **Private qualification-node control socket — `opc-session-testkit`:** the
+  existing JSON-line node protocol can now run over a `0700` workspace control
+  directory and `0600` Unix socket, with one bounded command and reply per
+  connection and a same-binary one-shot client. The Kubernetes foundation uses
+  the socket from its existing ephemeral workspace volume, removes interactive
+  container stdin, and retains a tokenless ServiceAccount without adding RBAC,
+  ports, identities, or controller authority. Kubernetes `pods/exec` access to
+  the client is node-administrator-equivalent qualification authority.
 - **Canonical 3GPP TFT codec — `opc-proto-tft`:** one shared, bounded TS 24.008
   V18.8.0 value model now covers every operation, parameter, and Release 18
   packet-filter component for GTPv2-C Bearer TFT IEs and IKEv2 TFT Notify

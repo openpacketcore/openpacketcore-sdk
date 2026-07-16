@@ -3,13 +3,25 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File};
+#[cfg(unix)]
+use std::fs::{DirBuilder, Permissions};
 use std::io::{self, BufReader, BufWriter, Read};
+#[cfg(unix)]
+use std::io::{BufRead, Write};
+#[cfg(unix)]
+use std::net::Shutdown;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
@@ -57,10 +69,24 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
     QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PAGE_ENTRIES,
 };
+#[cfg(unix)]
+use opc_session_testkit::qualification::{
+    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_MAX_CONTROL_LINE_BYTES,
+};
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder, TlsMaterialController,
 };
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+#[cfg(unix)]
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
+#[cfg(unix)]
+use rustix::fs::{fchmod, fcntl_setfl, fstat, open, FileType, Mode, OFlags};
+#[cfg(unix)]
+use rustix::io::{fcntl_setfd, Errno, FdFlags};
+#[cfg(unix)]
+use rustix::net::sockopt::socket_error;
+#[cfg(unix)]
+use rustix::net::{connect, socket, AddressFamily, SocketAddrUnix, SocketType};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -71,6 +97,14 @@ const QUALIFICATION_STATE_TYPE: &str = "session-ha-qualification-state";
 const QUALIFICATION_TRAFFIC_STATE_TYPE: &str = "session-ha-qualification-traffic-state";
 const QUALIFICATION_TRAFFIC_TTL: Duration = Duration::from_millis(QUALIFICATION_TRAFFIC_TTL_MILLIS);
 const QUALIFICATION_KEY_BYTES: [u8; AES_256_GCM_SIV_KEY_LEN] = [0x5a; AES_256_GCM_SIV_KEY_LEN];
+const QUALIFICATION_CONTROL_DIRECTORY_NAME: &str = "control";
+const QUALIFICATION_CONTROL_SOCKET_NAME: &str = "node.sock";
+#[cfg(unix)]
+const QUALIFICATION_CONTROL_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
+const QUALIFICATION_CONTROL_SOCKET_MODE: u32 = 0o600;
+#[cfg(unix)]
+const QUALIFICATION_CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 type ProtectedStore = EncryptingSessionBackend<ConsensusSessionStore, MemoryKeyProvider>;
 
@@ -3286,12 +3320,26 @@ struct NodeArguments {
     config_path: PathBuf,
     node_index: usize,
     bind_addr: SocketAddr,
+    control_socket: Option<PathBuf>,
 }
 
-fn arguments() -> Result<NodeArguments, NodeFailure> {
+enum NodeInvocation {
+    Server(NodeArguments),
+    ControlClient(PathBuf),
+}
+
+fn arguments() -> Result<NodeInvocation, NodeFailure> {
     let mut args = env::args_os();
     let _program = args.next().ok_or(NodeFailure)?;
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("--config")) {
+    let first = args.next().ok_or(NodeFailure)?;
+    if first == std::ffi::OsStr::new("--control-client") {
+        let control_socket = PathBuf::from(args.next().ok_or(NodeFailure)?);
+        if args.next().is_some() || !is_control_socket_cli_path(&control_socket) {
+            return Err(NodeFailure);
+        }
+        return Ok(NodeInvocation::ControlClient(control_socket));
+    }
+    if first != std::ffi::OsStr::new("--config") {
         return Err(NodeFailure);
     }
     let config_path = PathBuf::from(args.next().ok_or(NodeFailure)?);
@@ -3312,18 +3360,57 @@ fn arguments() -> Result<NodeArguments, NodeFailure> {
         .and_then(|value| value.into_string().ok())
         .and_then(|value| value.parse::<SocketAddr>().ok())
         .ok_or(NodeFailure)?;
-    if args.next().is_some() || !config_path.is_absolute() {
+    let control_socket = match args.next() {
+        None => None,
+        Some(flag) if flag == std::ffi::OsStr::new("--control-socket") => {
+            let path = PathBuf::from(args.next().ok_or(NodeFailure)?);
+            if args.next().is_some() || !is_control_socket_cli_path(&path) {
+                return Err(NodeFailure);
+            }
+            Some(path)
+        }
+        Some(_) => return Err(NodeFailure),
+    };
+    if !config_path.is_absolute() {
         return Err(NodeFailure);
     }
-    Ok(NodeArguments {
+    Ok(NodeInvocation::Server(NodeArguments {
         config_path,
         node_index,
         bind_addr,
-    })
+        control_socket,
+    }))
 }
 
-fn run() -> Result<(), NodeFailure> {
-    let arguments = arguments()?;
+fn is_control_socket_cli_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.file_name() == Some(std::ffi::OsStr::new(QUALIFICATION_CONTROL_SOCKET_NAME))
+        && path.parent().and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new(QUALIFICATION_CONTROL_DIRECTORY_NAME))
+        && path.components().enumerate().all(|(index, component)| {
+            matches!(
+                (index, component),
+                (0, Component::RootDir) | (_, Component::Normal(_))
+            )
+        })
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, NodeFailure> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .map_err(|_| NodeFailure)
+}
+
+fn run_server(arguments: NodeArguments) -> Result<(), NodeFailure> {
+    match arguments.control_socket.clone() {
+        Some(control_socket) => run_control_server(arguments, &control_socket),
+        None => run_stdio_server(arguments),
+    }
+}
+
+fn run_stdio_server(arguments: NodeArguments) -> Result<(), NodeFailure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -3401,6 +3488,434 @@ fn run() -> Result<(), NodeFailure> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct ControlSocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl ControlSocketIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+    }
+}
+
+#[cfg(unix)]
+struct ControlSocketGuard {
+    path: PathBuf,
+    identity: ControlSocketIdentity,
+}
+
+#[cfg(unix)]
+impl Drop for ControlSocketGuard {
+    fn drop(&mut self) {
+        if fs::symlink_metadata(&self.path)
+            .ok()
+            .is_some_and(|metadata| self.identity.matches(&metadata))
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn validate_control_socket_path(
+    workspace_directory: &Path,
+    control_socket: &Path,
+) -> Result<PathBuf, NodeFailure> {
+    if !is_control_socket_cli_path(control_socket) {
+        return Err(NodeFailure);
+    }
+    let control_directory = workspace_directory.join(QUALIFICATION_CONTROL_DIRECTORY_NAME);
+    if control_socket.parent() != Some(control_directory.as_path()) {
+        return Err(NodeFailure);
+    }
+    Ok(control_directory)
+}
+
+#[cfg(unix)]
+fn prepare_control_directory(control_directory: &Path) -> Result<(), NodeFailure> {
+    let mut builder = DirBuilder::new();
+    builder.mode(QUALIFICATION_CONTROL_DIRECTORY_MODE);
+    let created = match builder.create(control_directory) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(_) => return Err(NodeFailure),
+    };
+    let descriptor = open(
+        control_directory,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| NodeFailure)?;
+    if created {
+        fchmod(
+            &descriptor,
+            Mode::from_raw_mode(QUALIFICATION_CONTROL_DIRECTORY_MODE),
+        )
+        .map_err(|_| NodeFailure)?;
+    }
+    let metadata = fstat(&descriptor).map_err(|_| NodeFailure)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_dir()
+        || Mode::from_raw_mode(metadata.st_mode).bits() & 0o777
+            != QUALIFICATION_CONTROL_DIRECTORY_MODE
+    {
+        return Err(NodeFailure);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+enum ControlSocketLiveness {
+    Active,
+    Refused,
+}
+
+#[cfg(unix)]
+fn probe_control_socket_liveness(
+    control_socket: &Path,
+) -> Result<ControlSocketLiveness, NodeFailure> {
+    let address = SocketAddrUnix::new(control_socket).map_err(|_| NodeFailure)?;
+    let socket = socket(AddressFamily::UNIX, SocketType::STREAM, None).map_err(|_| NodeFailure)?;
+    fcntl_setfd(&socket, FdFlags::CLOEXEC).map_err(|_| NodeFailure)?;
+    fcntl_setfl(&socket, OFlags::NONBLOCK).map_err(|_| NodeFailure)?;
+    match connect(&socket, &address) {
+        Ok(()) => Ok(ControlSocketLiveness::Active),
+        Err(Errno::CONNREFUSED) => Ok(ControlSocketLiveness::Refused),
+        Err(Errno::INPROGRESS) => {
+            let timeout =
+                Timespec::try_from(QUALIFICATION_CONTROL_PROBE_TIMEOUT).map_err(|_| NodeFailure)?;
+            let mut descriptors = [PollFd::new(&socket, PollFlags::OUT)];
+            if poll(&mut descriptors, Some(&timeout)).map_err(|_| NodeFailure)? == 0 {
+                return Err(NodeFailure);
+            }
+            match socket_error(&socket).map_err(|_| NodeFailure)? {
+                Ok(()) => Ok(ControlSocketLiveness::Active),
+                Err(Errno::CONNREFUSED) => Ok(ControlSocketLiveness::Refused),
+                Err(_) => Err(NodeFailure),
+            }
+        }
+        Err(_) => Err(NodeFailure),
+    }
+}
+
+#[cfg(unix)]
+fn remove_stale_control_socket(control_socket: &Path) -> Result<(), NodeFailure> {
+    let metadata = match fs::symlink_metadata(control_socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(NodeFailure),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(NodeFailure);
+    }
+    match probe_control_socket_liveness(control_socket)? {
+        ControlSocketLiveness::Active => return Err(NodeFailure),
+        ControlSocketLiveness::Refused => {}
+    }
+    let identity = ControlSocketIdentity::from_metadata(&metadata);
+    let current = fs::symlink_metadata(control_socket).map_err(|_| NodeFailure)?;
+    if !identity.matches(&current) {
+        return Err(NodeFailure);
+    }
+    fs::remove_file(control_socket).map_err(|_| NodeFailure)
+}
+
+#[cfg(unix)]
+fn bind_control_socket(
+    workspace_directory: &Path,
+    control_socket: &Path,
+) -> Result<(UnixListener, ControlSocketGuard), NodeFailure> {
+    let control_directory = validate_control_socket_path(workspace_directory, control_socket)?;
+    let workspace = fs::canonicalize(workspace_directory).map_err(|_| NodeFailure)?;
+    if workspace != workspace_directory {
+        return Err(NodeFailure);
+    }
+    prepare_control_directory(&control_directory)?;
+    let canonical_control = fs::canonicalize(&control_directory).map_err(|_| NodeFailure)?;
+    if canonical_control != workspace.join(QUALIFICATION_CONTROL_DIRECTORY_NAME) {
+        return Err(NodeFailure);
+    }
+    remove_stale_control_socket(control_socket)?;
+    let listener = UnixListener::bind(control_socket).map_err(|_| NodeFailure)?;
+    let metadata = fs::symlink_metadata(control_socket).map_err(|_| NodeFailure)?;
+    let guard = ControlSocketGuard {
+        path: control_socket.to_path_buf(),
+        identity: ControlSocketIdentity::from_metadata(&metadata),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(NodeFailure);
+    }
+    fs::set_permissions(
+        control_socket,
+        Permissions::from_mode(QUALIFICATION_CONTROL_SOCKET_MODE),
+    )
+    .map_err(|_| NodeFailure)?;
+    let metadata = fs::symlink_metadata(control_socket).map_err(|_| NodeFailure)?;
+    if !guard.identity.matches(&metadata)
+        || metadata.permissions().mode() & 0o777 != QUALIFICATION_CONTROL_SOCKET_MODE
+    {
+        return Err(NodeFailure);
+    }
+    Ok((listener, guard))
+}
+
+#[cfg(unix)]
+fn remaining_control_time(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "qualification control timed out"))
+}
+
+#[cfg(unix)]
+struct DeadlineStream {
+    stream: UnixStream,
+    deadline: Instant,
+}
+
+#[cfg(unix)]
+impl DeadlineStream {
+    fn new(stream: UnixStream, deadline: Instant) -> Self {
+        Self { stream, deadline }
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self::new(self.stream.try_clone()?, self.deadline))
+    }
+
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.stream.shutdown(Shutdown::Write)
+    }
+}
+
+#[cfg(unix)]
+impl Read for DeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = remaining_control_time(self.deadline)?;
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buffer)
+    }
+}
+
+#[cfg(unix)]
+impl Write for DeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let remaining = remaining_control_time(self.deadline)?;
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let remaining = remaining_control_time(self.deadline)?;
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.flush()
+    }
+}
+
+#[cfg(unix)]
+fn invalid_request_reply() -> QualificationNodeReply {
+    QualificationNodeReply::Error {
+        code: QualificationNodeErrorCode::InvalidRequest,
+    }
+}
+
+#[cfg(unix)]
+fn read_bounded_trailing_whitespace<R: BufRead>(reader: &mut R) -> Result<(), NodeFailure> {
+    let mut trailing_bytes = 0_usize;
+    loop {
+        let available = reader.fill_buf().map_err(|_| NodeFailure)?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        trailing_bytes = trailing_bytes
+            .checked_add(available.len())
+            .filter(|size| *size <= QUALIFICATION_MAX_CONTROL_LINE_BYTES)
+            .ok_or(NodeFailure)?;
+        if available.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            return Err(NodeFailure);
+        }
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
+
+#[cfg(unix)]
+fn read_single_control_command<R: BufRead>(
+    reader: &mut R,
+) -> Result<QualificationNodeCommand, NodeFailure> {
+    let command = read_bounded_json_line::<_, QualificationNodeCommand>(reader)
+        .map_err(|_| NodeFailure)?
+        .ok_or(NodeFailure)?;
+    command.validate().map_err(|_| NodeFailure)?;
+    read_bounded_trailing_whitespace(reader)?;
+    Ok(command)
+}
+
+#[cfg(unix)]
+fn read_single_control_reply<R: BufRead>(
+    reader: &mut R,
+) -> Result<QualificationNodeReply, NodeFailure> {
+    let reply = read_bounded_json_line::<_, QualificationNodeReply>(reader)
+        .map_err(|_| NodeFailure)?
+        .ok_or(NodeFailure)?;
+    read_bounded_trailing_whitespace(reader)?;
+    Ok(reply)
+}
+
+#[cfg(unix)]
+fn serve_control_connection(
+    runtime: &tokio::runtime::Runtime,
+    node: &mut QualificationNode,
+    stream: UnixStream,
+    node_index: usize,
+) -> bool {
+    let deadline =
+        Instant::now() + Duration::from_millis(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
+    let stream = DeadlineStream::new(stream, deadline);
+    let reader_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let mut reader = BufReader::new(reader_stream);
+    let mut writer = BufWriter::new(stream);
+    let command = match read_single_control_command(&mut reader) {
+        Ok(command) => command,
+        _ => {
+            let _ = write_json_line(&mut writer, &invalid_request_reply());
+            return false;
+        }
+    };
+    let shutdown = matches!(command, QualificationNodeCommand::Shutdown);
+    let reply = if matches!(command, QualificationNodeCommand::Configure) {
+        QualificationNodeReply::Started { node_index }
+    } else {
+        // Accepted backend and traffic operations must reach their typed
+        // terminal outcome. An outer timeout would cancel handlers that move
+        // lease or task ownership before awaiting it; only connection I/O is
+        // cut off at the absolute response deadline.
+        runtime.block_on(node.handle(command))
+    };
+    let _ = write_json_line(&mut writer, &reply);
+    shutdown
+}
+
+#[cfg(unix)]
+fn run_control_server(arguments: NodeArguments, control_socket: &Path) -> Result<(), NodeFailure> {
+    let runtime = runtime()?;
+    let listener = runtime
+        .block_on(TcpListener::bind(arguments.bind_addr))
+        .map_err(|_| NodeFailure)?;
+    let bind_addr = listener.local_addr().map_err(|_| NodeFailure)?;
+    let config = load_config(&arguments.config_path)?;
+    if config.node_index != arguments.node_index || config.validate_bind_addr(bind_addr).is_err() {
+        return Err(NodeFailure);
+    }
+    let (control_listener, _control_guard) =
+        bind_control_socket(&config.workspace_directory, control_socket)?;
+    let mut node = runtime.block_on(QualificationNode::open(&config, listener))?;
+    loop {
+        let (stream, _) = control_listener.accept().map_err(|_| NodeFailure)?;
+        if serve_control_connection(&runtime, &mut node, stream, config.node_index) {
+            break;
+        }
+    }
+    runtime.block_on(node.stop_server());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_control_client_socket(
+    control_socket: &Path,
+) -> Result<ControlSocketIdentity, NodeFailure> {
+    if !is_control_socket_cli_path(control_socket) {
+        return Err(NodeFailure);
+    }
+    let control_directory = control_socket.parent().ok_or(NodeFailure)?;
+    let canonical_control = fs::canonicalize(control_directory).map_err(|_| NodeFailure)?;
+    let directory_metadata = fs::symlink_metadata(control_directory).map_err(|_| NodeFailure)?;
+    let socket_metadata = fs::symlink_metadata(control_socket).map_err(|_| NodeFailure)?;
+    if canonical_control != control_directory
+        || directory_metadata.file_type().is_symlink()
+        || !directory_metadata.is_dir()
+        || directory_metadata.permissions().mode() & 0o777 != QUALIFICATION_CONTROL_DIRECTORY_MODE
+        || !socket_metadata.file_type().is_socket()
+        || socket_metadata.permissions().mode() & 0o777 != QUALIFICATION_CONTROL_SOCKET_MODE
+    {
+        return Err(NodeFailure);
+    }
+    Ok(ControlSocketIdentity::from_metadata(&socket_metadata))
+}
+
+#[cfg(unix)]
+fn run_control_client(control_socket: &Path) -> Result<(), NodeFailure> {
+    let socket_identity = validate_control_client_socket(control_socket)?;
+    let stdin = io::stdin();
+    let mut stdin_reader = BufReader::new(stdin.lock());
+    let command = read_single_control_command(&mut stdin_reader)?;
+
+    let deadline =
+        Instant::now() + Duration::from_millis(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| NodeFailure)?;
+    let timeout = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(NodeFailure)?;
+    let stream = runtime
+        .block_on(async {
+            tokio::time::timeout(timeout, tokio::net::UnixStream::connect(control_socket)).await
+        })
+        .map_err(|_| NodeFailure)?
+        .map_err(|_| NodeFailure)?;
+    let stream = stream.into_std().map_err(|_| NodeFailure)?;
+    stream.set_nonblocking(false).map_err(|_| NodeFailure)?;
+    let current_metadata = fs::symlink_metadata(control_socket).map_err(|_| NodeFailure)?;
+    if !socket_identity.matches(&current_metadata) {
+        return Err(NodeFailure);
+    }
+    let mut stream = DeadlineStream::new(stream, deadline);
+    write_json_line(&mut stream, &command).map_err(|_| NodeFailure)?;
+    stream.shutdown_write().map_err(|_| NodeFailure)?;
+    let mut reader = BufReader::new(stream);
+    let reply = read_single_control_reply(&mut reader)?;
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    write_json_line(&mut writer, &reply).map_err(|_| NodeFailure)
+}
+
+#[cfg(not(unix))]
+fn run_control_server(
+    _arguments: NodeArguments,
+    _control_socket: &Path,
+) -> Result<(), NodeFailure> {
+    Err(NodeFailure)
+}
+
+#[cfg(not(unix))]
+fn run_control_client(_control_socket: &Path) -> Result<(), NodeFailure> {
+    Err(NodeFailure)
+}
+
+fn run() -> Result<(), NodeFailure> {
+    match arguments()? {
+        NodeInvocation::Server(arguments) => run_server(arguments),
+        NodeInvocation::ControlClient(control_socket) => run_control_client(&control_socket),
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -3414,6 +3929,150 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io::Cursor;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_cli_path_is_absolute_normalized_and_exact() {
+        let expected = Path::new("/var/lib/opc-session-qualification/control/node.sock");
+        assert!(is_control_socket_cli_path(expected));
+        for rejected in [
+            "control/node.sock",
+            "/var/lib/opc-session-qualification/control/other.sock",
+            "/var/lib/opc-session-qualification/other/node.sock",
+            "/var/lib/opc-session-qualification/control/../control/node.sock",
+        ] {
+            assert!(!is_control_socket_cli_path(Path::new(rejected)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_readers_accept_one_frame_only() {
+        let mut one = BufReader::new(Cursor::new(b"{\"command\":\"probe\"}\n \t\n"));
+        assert!(matches!(
+            read_single_control_command(&mut one),
+            Ok(QualificationNodeCommand::Probe)
+        ));
+
+        let mut duplicate = BufReader::new(Cursor::new(
+            b"{\"command\":\"probe\"}\n{\"command\":\"configure\"}\n",
+        ));
+        assert!(read_single_control_command(&mut duplicate).is_err());
+
+        let mut excessive_trailing = Vec::from(b"{\"command\":\"probe\"}\n".as_slice());
+        excessive_trailing.extend(std::iter::repeat_n(
+            b' ',
+            QUALIFICATION_MAX_CONTROL_LINE_BYTES + 1,
+        ));
+        assert!(
+            read_single_control_command(&mut BufReader::new(Cursor::new(excessive_trailing)))
+                .is_err()
+        );
+
+        let mut one_reply =
+            BufReader::new(Cursor::new(b"{\"reply\":\"started\",\"node_index\":0}\n\n"));
+        assert!(matches!(
+            read_single_control_reply(&mut one_reply),
+            Ok(QualificationNodeReply::Started { node_index: 0 })
+        ));
+        let mut duplicate_reply = BufReader::new(Cursor::new(
+            b"{\"reply\":\"started\",\"node_index\":0}\n{\"reply\":\"shutting_down\"}\n",
+        ));
+        assert!(read_single_control_reply(&mut duplicate_reply).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_is_private_active_safe_and_stale_recoverable() {
+        let workspace = tempfile::tempdir().expect("control workspace");
+        let control_directory = workspace.path().join(QUALIFICATION_CONTROL_DIRECTORY_NAME);
+        let socket = control_directory.join(QUALIFICATION_CONTROL_SOCKET_NAME);
+        let (listener, guard) =
+            bind_control_socket(workspace.path(), &socket).expect("bind private control socket");
+        assert_eq!(
+            fs::metadata(&control_directory)
+                .expect("control directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            QUALIFICATION_CONTROL_DIRECTORY_MODE
+        );
+        assert_eq!(
+            fs::metadata(&socket)
+                .expect("control socket metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            QUALIFICATION_CONTROL_SOCKET_MODE
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(bind_control_socket(workspace.path(), &socket).is_err());
+
+        #[cfg(target_os = "linux")]
+        {
+            rustix::net::listen(&listener, 0).expect("minimize control listener backlog");
+            let _queued = UnixStream::connect(&socket).expect("fill control listener backlog");
+            let identity = fs::symlink_metadata(&socket).expect("active socket identity");
+            let started_at = Instant::now();
+            assert!(probe_control_socket_liveness(&socket).is_err());
+            assert!(bind_control_socket(workspace.path(), &socket).is_err());
+            assert!(started_at.elapsed() < Duration::from_secs(2));
+            assert!(ControlSocketIdentity::from_metadata(&identity).matches(
+                &fs::symlink_metadata(&socket).expect("saturated active socket identity")
+            ));
+        }
+
+        drop(listener);
+        std::mem::forget(guard);
+        let (restarted_listener, restarted_guard) = bind_control_socket(workspace.path(), &socket)
+            .expect("replace exact stale control socket");
+        drop(restarted_listener);
+        drop(restarted_guard);
+        assert!(!socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_rejects_broad_directory_non_socket_and_symlink() {
+        let workspace = tempfile::tempdir().expect("control workspace");
+        let control_directory = workspace.path().join(QUALIFICATION_CONTROL_DIRECTORY_NAME);
+        fs::create_dir(&control_directory).expect("broad control directory");
+        fs::set_permissions(&control_directory, Permissions::from_mode(0o755))
+            .expect("set broad control mode");
+        let socket = control_directory.join(QUALIFICATION_CONTROL_SOCKET_NAME);
+        assert!(bind_control_socket(workspace.path(), &socket).is_err());
+        assert_eq!(
+            fs::metadata(&control_directory)
+                .expect("broad control metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+
+        fs::set_permissions(
+            &control_directory,
+            Permissions::from_mode(QUALIFICATION_CONTROL_DIRECTORY_MODE),
+        )
+        .expect("set private control mode");
+        fs::write(&socket, b"not-a-socket").expect("write non-socket target");
+        assert!(bind_control_socket(workspace.path(), &socket).is_err());
+        assert_eq!(
+            fs::read(&socket).expect("read non-socket target"),
+            b"not-a-socket"
+        );
+
+        fs::remove_file(&socket).expect("remove non-socket target");
+        let victim = workspace.path().join("victim");
+        fs::write(&victim, b"unchanged").expect("write symlink victim");
+        symlink(&victim, &socket).expect("create socket symlink");
+        assert!(bind_control_socket(workspace.path(), &socket).is_err());
+        assert_eq!(fs::read(victim).expect("read symlink victim"), b"unchanged");
+    }
 
     #[test]
     fn canonical_dns_resolution_rejects_local_or_non_routable_results() {

@@ -34,11 +34,18 @@ zeroize = { workspace = true }
 [dev-dependencies]
 opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 rcgen = { workspace = true }
-rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["event", "fs", "net"] }
 
 [[test]]
 name = "qualification_multiprocess"
 path = "tests/qualification_multiprocess.rs"
+required-features = ["foundation-insecure"]
+
+[[test]]
+name = "qualification_control_socket"
+path = "tests/qualification_control_socket.rs"
 required-features = ["foundation-insecure"]
 
 [lints]

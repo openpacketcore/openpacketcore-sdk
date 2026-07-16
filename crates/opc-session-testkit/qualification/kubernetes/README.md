@@ -59,14 +59,36 @@ names, so this is a resolver/port boundary, not an FQDN allow-list. Canonical
 manifest endpoints plus mTLS and exact SPIFFE membership remain the peer
 authorization boundary.
 
-The process keeps stdin open so an authenticated campaign controller can drive
-the existing strict JSON-line protocol. A real CNF `cnfctl` must still own that
-control channel, durable-readiness gating, fault injection, rotation ordering,
-history/evidence collection, and clean shutdown. Pods fail closed behind the
-custom `opc.openpacketcore.io/durable-quorum-ready` readiness gate; `cnfctl`
-must continuously set or clear that Pod condition from a fresh durable barrier,
-not merely from listener availability. Release qualification must also prove
-the real cluster's node and volume failure-domain identities,
+The process does not request interactive stdin. It listens at the exact private
+`/var/lib/opc-session-qualification/control/node.sock` path instead. The node
+creates `control` as a `0700` child of the existing workspace `emptyDir`,
+publishes the socket as `0600`, accepts one bounded typed command and reply per
+connection, removes its exact socket on clean shutdown, and replaces only a
+refused stale socket after an unclean exit. The socket is neither a container
+port nor part of the state PVC or projected identity volume.
+The StatefulSets select `kubernetes.io/os: linux`, which is the scheduling
+constraint required for this Unix-domain control transport in mixed-OS
+clusters.
+
+An authorized operator can invoke the same image as a one-shot client:
+
+```console
+printf '%s\n' '{"command":"probe"}' | kubectl exec -i POD -- \
+  opc-session-quorum-node --control-client \
+  /var/lib/opc-session-qualification/control/node.sock
+```
+
+The rendered ServiceAccount remains tokenless and the manifest grants no RBAC
+or controller identity. Kubernetes authorization to use `pods/exec` for this
+client is nevertheless node-administrator-equivalent qualification authority:
+the protocol includes fault, initialization, mutation, reauthentication, and
+shutdown operations. Limit and audit that authority outside this manifest. A
+real CNF `cnfctl` must still own durable-readiness gating, fault injection,
+rotation ordering, history/evidence collection, and clean shutdown. Pods fail
+closed behind the custom `opc.openpacketcore.io/durable-quorum-ready` readiness
+gate; `cnfctl` must continuously set or clear that Pod condition from a fresh
+durable barrier, not merely from listener availability. Release qualification
+must also prove the real cluster's node and volume failure-domain identities,
 projected-Secret update behavior, DNS behavior, storage class durability,
 NetworkPolicy enforcement, alert firing/clearing, and three/five-node fault and
 rotation schedules. The current qualification node still uses its documented

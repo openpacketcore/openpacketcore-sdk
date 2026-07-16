@@ -86,6 +86,22 @@ the command and the remaining CNF qualification responsibilities. This
 foundation does not constitute deployed evidence and does not change the
 experimental profile.
 
+The node's original stdin/stdout JSON-line mode remains available unchanged for
+the single-host harnesses. Deployed manifests instead add
+`--control-socket /var/lib/opc-session-qualification/control/node.sock`. The
+node creates that socket in a private `0700` child of the existing ephemeral
+workspace and exposes it as `0600`; it replaces only a refused stale socket
+left by an unclean exit. The same binary's `--control-client <absolute-path>`
+mode reads exactly one validated stdin command, forwards it once, and emits
+exactly one typed reply. It does not reconnect or retry mutations or
+reauthentication requests. Malformed and oversized connections receive the
+fixed `invalid_request` reply without stopping the server. A connection
+deadline can discard its reply, but never cancels already accepted backend or
+traffic work before that work reaches its typed terminal outcome. Possession of
+local socket access, including Kubernetes `pods/exec` access used to launch
+the client, is node-administrator-equivalent qualification authority and must
+be restricted and audited accordingly.
+
 Its strict private node configuration/control schema is version 3. Version 2
 is explicitly rejected because it predates the routing-aware optional
 `dial_addr` representation; version 1 is also rejected because lifecycle
