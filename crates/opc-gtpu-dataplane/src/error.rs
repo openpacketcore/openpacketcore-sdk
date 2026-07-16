@@ -44,6 +44,13 @@ pub enum GtpuError {
     /// The requested device or PDP context was not found.
     #[error("GTP-U state not found")]
     NotFound,
+    /// A safe recovery step completed, but the requested mutation was not
+    /// applied and must be retried as a new operation.
+    #[error("GTP-U {operation} must be retried")]
+    RetryRequired {
+        /// Stable operation label identifying the retriable boundary.
+        operation: &'static str,
+    },
     /// Configuration failed validation.
     #[error("invalid GTP-U config field '{field}': {reason}")]
     InvalidConfig {
@@ -135,6 +142,24 @@ mod tests {
     fn non_io_variants_have_no_raw_os_error() {
         assert_eq!(GtpuError::NotFound.raw_os_error(), None);
         assert_eq!(GtpuError::AlreadyExists.raw_os_error(), None);
+        assert_eq!(
+            GtpuError::RetryRequired {
+                operation: "install_pdp_context"
+            }
+            .raw_os_error(),
+            None
+        );
         assert_eq!(GtpuError::UnsupportedPlatform.raw_os_error(), None);
+    }
+
+    #[test]
+    fn retry_required_uses_only_the_stable_operation_label() {
+        let error = GtpuError::RetryRequired {
+            operation: "install_pdp_context",
+        };
+        assert_eq!(
+            error.to_string(),
+            "GTP-U install_pdp_context must be retried"
+        );
     }
 }
