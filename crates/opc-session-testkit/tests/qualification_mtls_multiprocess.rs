@@ -3401,8 +3401,14 @@ impl Fleet {
 
             let member_count = self.member_count();
             let required_quorum = self.required_quorum();
-            let readiness =
-                self.readiness_reports_by(&node_indices, traffic_progress.next_deadline(deadline));
+            let readiness_deadline = self.recovery_readiness_probe_deadline(
+                traffic_before,
+                &mut traffic_progress,
+                participants,
+                phase,
+                deadline,
+            );
+            let readiness = self.readiness_reports_by(&node_indices, readiness_deadline);
             assert!(
                 readiness.iter().all(|report| {
                     report.ready
@@ -3931,6 +3937,85 @@ impl Fleet {
                 self.stderr_diagnostics()
             );
             thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn recovery_readiness_probe_deadline(
+        &mut self,
+        availability_baseline: &[IndexedTrafficStatus],
+        progress: &mut RecoveryTrafficProgressTracker,
+        participants: &TrafficParticipants,
+        phase: &str,
+        absolute_deadline: Instant,
+    ) -> Instant {
+        loop {
+            let now = Instant::now();
+            assert!(
+                deadline_admits_complete_operation(now, absolute_deadline),
+                "recovered-member readiness exhausted its absolute operation budget: phase={phase}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            let probe_deadline = progress.next_deadline(absolute_deadline);
+            if deadline_admits_complete_operation(now, probe_deadline) {
+                return probe_deadline;
+            }
+            self.wait_for_recovery_traffic_progress(
+                availability_baseline,
+                progress,
+                participants,
+                phase,
+                absolute_deadline,
+            );
+        }
+    }
+
+    fn wait_for_recovery_readiness(
+        &mut self,
+        availability_baseline: &[IndexedTrafficStatus],
+        progress: &mut RecoveryTrafficProgressTracker,
+        participants: &TrafficParticipants,
+        phase: &str,
+        absolute_deadline: Instant,
+    ) {
+        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        loop {
+            let member_count = self.member_count();
+            let required_quorum = self.required_quorum();
+            let probe_deadline = self.recovery_readiness_probe_deadline(
+                availability_baseline,
+                progress,
+                participants,
+                phase,
+                absolute_deadline,
+            );
+            let reports = self.readiness_reports_by(&node_indices, probe_deadline);
+            if reports.iter().all(|report| {
+                report.ready
+                    && report.reason_code == QualificationReadinessCode::Ready
+                    && report.configured_voters == member_count
+                    && report.fresh_reachable_voters == required_quorum
+                    && report.agreeing_voters == required_quorum
+                    && report.required_quorum == required_quorum
+            }) {
+                assert!(
+                    deadline_allows_completion(Instant::now(), probe_deadline),
+                    "recovered-member readiness completed after its admitted operation deadline: phase={phase}, reports={reports:?}, stderr={:?}",
+                    self.stderr_diagnostics()
+                );
+                return;
+            }
+            assert!(
+                deadline_allows_completion(Instant::now(), absolute_deadline),
+                "recovered-member readiness crossed its absolute deadline: phase={phase}, reports={reports:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            self.wait_for_recovery_traffic_progress(
+                availability_baseline,
+                progress,
+                participants,
+                phase,
+                absolute_deadline,
+            );
         }
     }
 
@@ -4848,7 +4933,13 @@ impl Fleet {
             &mut traffic_progress,
             recovery_deadline,
         );
-        self.wait_ready_by(traffic_progress.next_deadline(recovery_deadline));
+        self.wait_for_recovery_readiness(
+            traffic_availability_baseline,
+            &mut traffic_progress,
+            participants,
+            "replacement-all-voter-readiness",
+            recovery_deadline,
+        );
         self.wait_for_recovery_traffic_progress(
             traffic_availability_baseline,
             &mut traffic_progress,
@@ -7655,6 +7746,26 @@ fn recovery_fault_settlement_tracks_attempts_without_freezing_connection_gauges(
     assert_eq!(
         progress.next_deadline(absolute_deadline),
         observed_at + Duration::from_millis(26_000)
+    );
+    let operation_timeout = Duration::from_millis(QUALIFICATION_OPERATION_TIMEOUT_MILLIS);
+    assert!(
+        !deadline_admits_complete_operation(
+            observed_at + Duration::from_millis(20_000),
+            progress.next_deadline(absolute_deadline),
+        ),
+        "a refreshed pulse must not hide the residual independent coverage deadline"
+    );
+    progress.record_coverage(Vec::new(), observed_at + Duration::from_millis(20_000));
+    assert!(deadline_admits_complete_operation(
+        observed_at + Duration::from_millis(20_000),
+        progress.next_deadline(absolute_deadline),
+    ));
+    assert_eq!(
+        progress.next_deadline(absolute_deadline),
+        observed_at
+            + Duration::from_millis(20_000)
+            + operation_timeout
+            + Duration::from_millis(3_000)
     );
 
     let baseline = lifecycle_metrics_fixture();
