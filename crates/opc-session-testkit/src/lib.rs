@@ -4,6 +4,7 @@
 //! This is an internal testkit crate and is not published.
 
 pub mod qualification;
+pub mod qualification_kubernetes;
 
 use std::collections::BTreeMap;
 use std::fmt;

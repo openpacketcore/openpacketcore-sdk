@@ -68,9 +68,29 @@ cargo build -p opc-session-testkit --bin opc-session-quorum-node --no-default-fe
 cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features
 ```
 
-Its strict private node-control schema is version 2; version 1 is rejected
-because lifecycle replies did not carry the fixed `superseded` and `abandoned`
-terminal outcomes. Node config accepts `projected_mtls` with an absolute
+Projected mTLS can use either exact loopback sockets for the existing
+single-host tests or `canonical_endpoint_dns` for a deployed fleet. The DNS
+profile omits every `dial_addr`, requires each manifest endpoint to already be
+its canonical lower-case FQDN, resolves that endpoint for each fresh
+connection, and rejects loopback, wildcard, multicast, and broadcast DNS
+results. A deployed listener may bind its declared service port on a wildcard
+or non-loopback address. The plaintext profile and pinned mTLS test profile
+remain exact-loopback only.
+
+`opc-session-kubernetes-manifest` renders a deterministic three- or five-node
+Kubernetes foundation with a headless peer Service, required host
+anti-affinity, one retained RWO PVC and one distinct projected-SVID Secret
+reference per member, and an immutable digest-pinned release image. See
+[`qualification/kubernetes/README.md`](qualification/kubernetes/README.md) for
+the command and the remaining CNF qualification responsibilities. This
+foundation does not constitute deployed evidence and does not change the
+experimental profile.
+
+Its strict private node configuration/control schema is version 3. Version 2
+is explicitly rejected because it predates the routing-aware optional
+`dial_addr` representation; version 1 is also rejected because lifecycle
+replies did not carry the fixed `superseded` and `abandoned` terminal
+outcomes. Node config accepts `projected_mtls` with an absolute
 projected volume root inside the node workspace, normalized relative
 certificate/key/bundle names, a bounded polling interval, and a finite
 validated connection lifecycle policy. The control protocol exposes only

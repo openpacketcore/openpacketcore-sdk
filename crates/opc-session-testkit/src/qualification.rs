@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, BufRead, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -67,8 +67,8 @@ pub const SESSION_HA_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-mtls-candidate-evidence.schema.json");
 
-/// Version of the private node-control protocol.
-pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 2;
+/// Version of the private node configuration and control protocol.
+pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 3;
 /// Maximum accepted node configuration document.
 pub const QUALIFICATION_MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Maximum accepted control request or response line.
@@ -546,24 +546,73 @@ impl QualificationNodeConfig {
                 .map_err(|_| QualificationConfigError::Member)?;
             if member.node_index != expected_index
                 || member.endpoint_port == 0
-                || member.dial_addr.port() == 0
-                || !member.dial_addr.ip().is_loopback()
                 || member.replica_id.is_empty()
                 || member.endpoint_host.is_empty()
                 || member.tls_identity.is_empty()
                 || member.failure_domain.is_empty()
                 || member.backing_identity.is_empty()
                 || !replica_ids.insert(replica_id)
-                || !endpoints.insert(endpoint)
-                || !routes.insert(member.dial_addr)
+                || !endpoints.insert(endpoint.clone())
                 || !tls_identities.insert(tls_identity)
                 || !failure_domains.insert(failure_domain)
                 || !backing_identities.insert(backing_identity)
             {
                 return Err(QualificationConfigError::Member);
             }
+            match self.transport.peer_routing() {
+                QualificationPeerRouting::PinnedLoopbackTestOnly => {
+                    let Some(dial_addr) = member.dial_addr else {
+                        return Err(QualificationConfigError::Member);
+                    };
+                    if !dial_addr.ip().is_loopback() || !routes.insert(dial_addr) {
+                        return Err(QualificationConfigError::Member);
+                    }
+                }
+                QualificationPeerRouting::CanonicalEndpointDns => {
+                    if member.dial_addr.is_some()
+                        || member.endpoint_host != endpoint.host()
+                        || !is_canonical_dns_fqdn(endpoint.host())
+                    {
+                        return Err(QualificationConfigError::Member);
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Validate the process listener independently from its canonical peer
+    /// routing identity.
+    ///
+    /// The plaintext and pinned test profiles remain exact-loopback only.
+    /// Canonical endpoint DNS permits only a wildcard or non-loopback unicast
+    /// listener on the local member's declared service port.
+    pub fn validate_bind_addr(
+        &self,
+        bind_addr: SocketAddr,
+    ) -> Result<(), QualificationConfigError> {
+        let member = self
+            .members
+            .get(self.node_index)
+            .ok_or(QualificationConfigError::Member)?;
+        match self.transport.peer_routing() {
+            QualificationPeerRouting::PinnedLoopbackTestOnly => {
+                if member.dial_addr == Some(bind_addr) && bind_addr.ip().is_loopback() {
+                    Ok(())
+                } else {
+                    Err(QualificationConfigError::Bind)
+                }
+            }
+            QualificationPeerRouting::CanonicalEndpointDns => {
+                if bind_addr.port() == member.endpoint_port
+                    && is_admissible_deployed_bind_ip(bind_addr.ip())
+                {
+                    Ok(())
+                } else {
+                    Err(QualificationConfigError::Bind)
+                }
+            }
+        }
     }
 }
 
@@ -628,6 +677,24 @@ impl QualificationTransportConfig {
             }
         }
     }
+
+    fn peer_routing(&self) -> QualificationPeerRouting {
+        match self {
+            Self::LoopbackPlaintextTestOnly => QualificationPeerRouting::PinnedLoopbackTestOnly,
+            Self::ProjectedMtls(config) => config.peer_routing,
+        }
+    }
+}
+
+/// Routing authority used by the qualification transport.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationPeerRouting {
+    /// Exact loopback sockets for single-host tests only.
+    #[default]
+    PinnedLoopbackTestOnly,
+    /// Resolve each canonical manifest endpoint for deployed mTLS peers.
+    CanonicalEndpointDns,
 }
 
 /// Bounded projected-SVID and connection-lifecycle settings for mTLS.
@@ -640,6 +707,8 @@ pub struct QualificationProjectedMtlsConfig {
     pub trust_bundle_files: Vec<PathBuf>,
     pub poll_interval_millis: u64,
     pub lifecycle: QualificationConnectionLifecycleConfig,
+    #[serde(default)]
+    pub peer_routing: QualificationPeerRouting,
 }
 
 impl fmt::Debug for QualificationProjectedMtlsConfig {
@@ -652,6 +721,7 @@ impl fmt::Debug for QualificationProjectedMtlsConfig {
             .field("trust_bundle_file_count", &self.trust_bundle_files.len())
             .field("poll_interval_millis", &self.poll_interval_millis)
             .field("lifecycle", &self.lifecycle)
+            .field("peer_routing", &self.peer_routing)
             .finish()
     }
 }
@@ -954,7 +1024,12 @@ pub struct QualificationMember {
     pub replica_id: String,
     pub endpoint_host: String,
     pub endpoint_port: u16,
-    pub dial_addr: SocketAddr,
+    /// Exact route used only by the pinned loopback test profile.
+    ///
+    /// Deployed mTLS configuration must omit this value and resolves the
+    /// canonical `endpoint_host`/`endpoint_port` pair instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial_addr: Option<SocketAddr>,
     pub tls_identity: String,
     pub failure_domain: String,
     pub backing_identity: String,
@@ -984,6 +1059,25 @@ pub enum QualificationConfigError {
     Member,
     #[error("qualification transport configuration is invalid")]
     Transport,
+    #[error("qualification listener address is invalid")]
+    Bind,
+}
+
+fn is_canonical_dns_fqdn(host: &str) -> bool {
+    host.contains('.')
+        && host.parse::<IpAddr>().is_err()
+        && host != "localhost"
+        && !host.ends_with(".localhost")
+}
+
+fn is_admissible_deployed_bind_ip(ip: IpAddr) -> bool {
+    if ip.is_unspecified() {
+        return true;
+    }
+    if ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    !matches!(ip, IpAddr::V4(address) if address == Ipv4Addr::BROADCAST)
 }
 
 /// Bounded commands accepted by one qualification child process.
@@ -2211,9 +2305,11 @@ mod tests {
                 replica_id: format!("node-{node_index}"),
                 endpoint_host: format!("node-{node_index}.qualification.invalid"),
                 endpoint_port: 7443 + node_index as u16,
-                dial_addr: format!("192.0.2.1:{}", 7443 + node_index as u16)
-                    .parse()
-                    .expect("test address"),
+                dial_addr: Some(
+                    format!("192.0.2.1:{}", 7443 + node_index as u16)
+                        .parse()
+                        .expect("test address"),
+                ),
                 tls_identity: format!("spiffe://qualification.invalid/node/{node_index}"),
                 failure_domain: format!("zone-{node_index}"),
                 backing_identity: format!("disk-{node_index}"),
@@ -2244,9 +2340,11 @@ mod tests {
                 replica_id: format!("node-{node_index}"),
                 endpoint_host: format!("node-{node_index}.qualification.invalid"),
                 endpoint_port: 7443 + node_index as u16,
-                dial_addr: format!("127.0.0.1:{}", 7443 + node_index as u16)
-                    .parse()
-                    .expect("test address"),
+                dial_addr: Some(
+                    format!("127.0.0.1:{}", 7443 + node_index as u16)
+                        .parse()
+                        .expect("test address"),
+                ),
                 tls_identity: format!(
                     "spiffe://qualification.invalid/tenant/test/ns/test/sa/session/nf/test/instance/{node_index}"
                 ),
@@ -2272,11 +2370,13 @@ mod tests {
     }
 
     #[test]
-    fn node_control_schema_rejects_pre_lifecycle_outcome_version() {
-        assert_eq!(QUALIFICATION_NODE_SCHEMA_VERSION, 2);
-        let mut config = valid_config();
-        config.schema_version = 1;
-        assert_eq!(config.validate(), Err(QualificationConfigError::Schema));
+    fn node_control_schema_rejects_incompatible_versions() {
+        assert_eq!(QUALIFICATION_NODE_SCHEMA_VERSION, 3);
+        for incompatible_version in [1, 2] {
+            let mut config = valid_config();
+            config.schema_version = incompatible_version;
+            assert_eq!(config.validate(), Err(QualificationConfigError::Schema));
+        }
     }
 
     #[test]
@@ -2367,6 +2467,7 @@ mod tests {
                     reconnect_backoff_max_millis: 250,
                     rotation_jitter_millis: 1_000,
                 },
+                peer_routing: QualificationPeerRouting::PinnedLoopbackTestOnly,
             });
         assert_eq!(config.validate(), Ok(()));
         let rendered = format!("{config:?}");
@@ -2381,6 +2482,89 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err(QualificationConfigError::Configuration)
+        );
+    }
+
+    #[test]
+    fn canonical_endpoint_dns_admits_only_unaliased_mtls_members() {
+        let mut config = valid_config();
+        for member in &mut config.members {
+            member.endpoint_host = format!(
+                "session-ha-{}-0.session-ha-peer.qualification.svc.cluster.local",
+                member.node_index
+            );
+            member.endpoint_port = 7443;
+            member.dial_addr = None;
+        }
+        config.transport =
+            QualificationTransportConfig::ProjectedMtls(QualificationProjectedMtlsConfig {
+                projected_volume_root: PathBuf::from("/qualification/projected"),
+                certificate_file: PathBuf::from("tls.crt"),
+                private_key_file: PathBuf::from("tls.key"),
+                trust_bundle_files: vec![PathBuf::from("ca.crt")],
+                poll_interval_millis: 100,
+                lifecycle: QualificationConnectionLifecycleConfig {
+                    maximum_authentication_age_millis: 60_000,
+                    rotation_drain_window_millis: 5_000,
+                    reconnect_backoff_min_millis: 25,
+                    reconnect_backoff_max_millis: 250,
+                    rotation_jitter_millis: 1_000,
+                },
+                peer_routing: QualificationPeerRouting::CanonicalEndpointDns,
+            });
+
+        assert_eq!(config.validate(), Ok(()));
+        assert_eq!(
+            config.validate_bind_addr("0.0.0.0:7443".parse().expect("wildcard bind")),
+            Ok(())
+        );
+        assert_eq!(
+            config.validate_bind_addr("192.0.2.10:7443".parse().expect("pod bind")),
+            Ok(())
+        );
+        assert_eq!(
+            config.validate_bind_addr("127.0.0.1:7443".parse().expect("loopback bind")),
+            Err(QualificationConfigError::Bind)
+        );
+        assert_eq!(
+            config.validate_bind_addr("0.0.0.0:7444".parse().expect("wrong port")),
+            Err(QualificationConfigError::Bind)
+        );
+
+        let mut aliased = config.clone();
+        aliased.members[0].endpoint_host = aliased.members[0].endpoint_host.to_uppercase();
+        assert_eq!(aliased.validate(), Err(QualificationConfigError::Member));
+
+        let mut pinned_alias = config.clone();
+        pinned_alias.members[0].dial_addr = Some(
+            "192.0.2.10:7443"
+                .parse()
+                .expect("non-loopback pinned alias"),
+        );
+        assert_eq!(
+            pinned_alias.validate(),
+            Err(QualificationConfigError::Member)
+        );
+
+        let mut ip_literal = config;
+        ip_literal.members[0].endpoint_host = "192.0.2.10".to_owned();
+        assert_eq!(ip_literal.validate(), Err(QualificationConfigError::Member));
+    }
+
+    #[test]
+    fn plaintext_listener_admission_remains_exact_loopback_only() {
+        let config = valid_config();
+        assert_eq!(
+            config.validate_bind_addr("127.0.0.1:7443".parse().expect("exact route")),
+            Ok(())
+        );
+        assert_eq!(
+            config.validate_bind_addr("0.0.0.0:7443".parse().expect("wildcard route")),
+            Err(QualificationConfigError::Bind)
+        );
+        assert_eq!(
+            config.validate_bind_addr("127.0.0.1:7444".parse().expect("wrong route")),
+            Err(QualificationConfigError::Bind)
         );
     }
 
