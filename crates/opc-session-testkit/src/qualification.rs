@@ -99,6 +99,11 @@ pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
 /// completed qualification or seamless-rotation production credit.
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON: &str =
     include_str!("../qualification/v2/session-mtls-candidate-evidence.schema.json");
+/// Maximum accepted size of one v2 projected-mTLS candidate evidence document.
+///
+/// [`SessionMtlsCandidateEvidenceV2::from_json`] applies this bound before
+/// deserializing any untrusted JSON.
+pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES: usize = 64 * 1024;
 
 /// Version of the private node configuration and control protocol.
 pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 3;
@@ -883,6 +888,12 @@ impl fmt::Debug for SessionMtlsCandidateEvidenceV2 {
 /// Stable candidate-evidence validation failures that never echo input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SessionMtlsCandidateEvidenceError {
+    /// The encoded document exceeded its fixed pre-decode size bound.
+    #[error("mTLS candidate evidence document exceeds the supported size")]
+    DocumentTooLarge,
+    /// The document is not valid closed JSON for the typed v2 contract.
+    #[error("mTLS candidate evidence document is invalid")]
+    InvalidDocument,
     /// Schema version is unsupported.
     #[error("mTLS candidate evidence schema is unsupported")]
     Schema,
@@ -913,6 +924,20 @@ pub enum SessionMtlsCandidateEvidenceError {
 }
 
 impl SessionMtlsCandidateEvidenceV2 {
+    /// Decode and validate one bounded, closed v2 candidate evidence document.
+    ///
+    /// The byte-size limit is enforced before JSON parsing. Decode and
+    /// validation failures are stable and never include input bytes.
+    pub fn from_json(document: &[u8]) -> Result<Self, SessionMtlsCandidateEvidenceError> {
+        if document.len() > SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES {
+            return Err(SessionMtlsCandidateEvidenceError::DocumentTooLarge);
+        }
+        let evidence: Self = serde_json::from_slice(document)
+            .map_err(|_| SessionMtlsCandidateEvidenceError::InvalidDocument)?;
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
     /// Immutable schema-version label carried by the decoded record.
     pub fn schema_version(&self) -> &str {
         &self.schema_version

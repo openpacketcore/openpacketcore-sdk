@@ -367,9 +367,22 @@ redacts source and digest bindings.
 Successful campaigns construct and validate this record in a private temporary
 directory through a harness-private successful construction path, so evidence
 is ephemeral by default. Public API supports bounded decode, validation, and
-read-only inspection, not manufacturing all-success records. Setting the existing absolute
-`OPC_SESSION_HA_EVIDENCE_DIR` contract preserves only `evidence.json` and the
-matching schema. Source files are opened no-follow and read through a hard
+read-only inspection, not manufacturing all-success records. Untrusted bytes
+must enter through the pre-decode size bound:
+
+```rust
+use opc_session_testkit::qualification::SessionMtlsCandidateEvidenceV2;
+
+let evidence = SessionMtlsCandidateEvidenceV2::from_json(document_bytes)?;
+```
+
+`from_json` rejects documents larger than
+`SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES` before JSON parsing, rejects
+unknown fields or trailing non-whitespace content, and applies the cross-field
+validator before returning. Its errors never include input bytes. Setting the
+existing absolute `OPC_SESSION_HA_EVIDENCE_DIR` contract preserves only
+`evidence.json` and the matching schema. Source files are opened no-follow and
+read through a hard
 bound; output is written as `0600` files in a held-descriptor `0700` sibling
 staging directory, fsynced, and atomically renamed without replacement to the
 final campaign name. An error before publication cannot expose a partial final

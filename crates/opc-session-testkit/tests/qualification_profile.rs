@@ -23,7 +23,7 @@ use opc_session_testkit::qualification::{
     SessionMtlsCandidateEvidenceV2, SESSION_HA_EVIDENCE_SCHEMA_JSON,
     SESSION_HA_HISTORY_SCHEMA_JSON, SESSION_HA_PROFILE_JSON, SESSION_HA_PROFILE_SCHEMA_JSON,
     SESSION_HA_SCHEDULE_SCHEMA_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON,
-    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
+    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use serde_json::Value;
 
@@ -147,12 +147,9 @@ fn validate_mtls_candidate_evidence_v2(
     evidence: &Value,
 ) -> Result<SessionMtlsCandidateEvidenceV2, String> {
     validate_structural_schema(schema, evidence)?;
-    let decoded: SessionMtlsCandidateEvidenceV2 =
-        serde_json::from_value(evidence.clone()).map_err(|_| "invalid typed v2 evidence")?;
-    decoded
-        .validate()
-        .map_err(|_| "invalid v2 evidence binding")?;
-    Ok(decoded)
+    let encoded = serde_json::to_vec(evidence).map_err(|_| "invalid typed v2 evidence")?;
+    SessionMtlsCandidateEvidenceV2::from_json(&encoded)
+        .map_err(|_| "invalid v2 evidence binding".to_owned())
 }
 
 fn is_lower_hex(value: &str, width: usize) -> bool {
@@ -1316,12 +1313,60 @@ fn mtls_candidate_v2_fixture_is_typed_and_exactly_digest_bound() {
     assert_eq!(decoded.topology().members(), 3);
     assert_eq!(decoded.source().revision().len(), 40);
     assert!(!decoded.artifact().insecure_test_enabled());
+    let encoded = serde_json::to_vec(&decoded).expect("encode typed candidate evidence");
     assert_eq!(
-        serde_json::from_value::<SessionMtlsCandidateEvidenceV2>(
-            serde_json::to_value(&decoded).expect("encode typed candidate evidence")
-        )
-        .expect("decode typed candidate evidence"),
+        SessionMtlsCandidateEvidenceV2::from_json(&encoded)
+            .expect("bounded decode typed candidate evidence"),
         decoded
+    );
+}
+
+#[test]
+fn mtls_candidate_v2_public_decoder_is_bounded_closed_and_validating() {
+    let fixture = MTLS_CANDIDATE_V2_FIXTURE.as_bytes();
+    assert!(fixture.len() < SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES);
+    SessionMtlsCandidateEvidenceV2::from_json(fixture)
+        .expect("bounded decoder accepts the canonical fixture");
+
+    let mut exact_limit = fixture.to_vec();
+    exact_limit.resize(SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES, b' ');
+    SessionMtlsCandidateEvidenceV2::from_json(&exact_limit)
+        .expect("bounded decoder accepts valid JSON at the exact limit");
+
+    let mut oversized = exact_limit;
+    oversized.push(b' ');
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&oversized),
+        Err(SessionMtlsCandidateEvidenceError::DocumentTooLarge)
+    );
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(b"{"),
+        Err(SessionMtlsCandidateEvidenceError::InvalidDocument)
+    );
+
+    let mut trailing = fixture.to_vec();
+    trailing.push(b'x');
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&trailing),
+        Err(SessionMtlsCandidateEvidenceError::InvalidDocument)
+    );
+
+    let mut unknown: Value =
+        serde_json::from_slice(fixture).expect("v2 mTLS candidate fixture JSON");
+    unknown["unreviewed"] = true.into();
+    let encoded = serde_json::to_vec(&unknown).expect("encode unknown-field mutation");
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&encoded),
+        Err(SessionMtlsCandidateEvidenceError::InvalidDocument)
+    );
+
+    let mut invalid_claim: Value =
+        serde_json::from_slice(fixture).expect("v2 mTLS candidate fixture JSON");
+    invalid_claim["qualification_complete"] = true.into();
+    let encoded = serde_json::to_vec(&invalid_claim).expect("encode invalid claim mutation");
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&encoded),
+        Err(SessionMtlsCandidateEvidenceError::Claim)
     );
 }
 
@@ -1571,7 +1616,11 @@ fn mtls_candidate_v2_schema_excludes_sensitive_or_unbounded_fields() {
         let mut changed = fixture.clone();
         changed[container][field] = "must-not-be-admitted".into();
         assert!(validate_structural_schema(&schema, &changed).is_err());
-        assert!(serde_json::from_value::<SessionMtlsCandidateEvidenceV2>(changed).is_err());
+        let encoded = serde_json::to_vec(&changed).expect("encode unknown-field mutation");
+        assert_eq!(
+            SessionMtlsCandidateEvidenceV2::from_json(&encoded),
+            Err(SessionMtlsCandidateEvidenceError::InvalidDocument)
+        );
     }
 }
 

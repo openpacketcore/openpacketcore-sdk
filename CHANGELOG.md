@@ -316,7 +316,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest, exact declared orchestration schedule, 3/5-member topology,
   directed-path count, and ordered coverage. Pre-execution bindings are
   rechecked after the campaign. Records are ephemeral unless the existing
-  absolute evidence-output contract is set; the opt-in bundle uses bounded
+  absolute evidence-output contract is set. The public decoder enforces a fixed
+  byte cap before parsing closed JSON and applies all cross-field validation
+  before returning a typed record; the opt-in bundle uses bounded
   no-follow reads and a private staged, fsynced, atomic no-replace publication.
   Candidate emission is rejected when `foundation-insecure` is compiled, and
   successful record construction remains private to the validated harness.

@@ -444,11 +444,13 @@ configuration, ordered public certificate/trust publication manifest, exact
 declared orchestration schedule, 3/5-member topology, directed-path count, and
 ordered coverage. The pre-execution bindings are verified unchanged after the
 campaign. Emission is rejected with insecure test support compiled, and it is
-ephemeral unless the existing evidence-output contract is explicitly set. The
-preserved bundle contains only the bounded typed record and immutable schema,
-published from a private fsynced staging directory with atomic no-replace
-rename. It cannot carry material, private-key digests, identities, addresses,
-paths, payloads, or backend text. Its production-credit fields remain fixed false; deployed
+ephemeral unless the existing evidence-output contract is explicitly set. Its
+public decoder rejects over-limit bytes before closed-JSON parsing and applies
+the cross-field validator before returning. The preserved bundle contains only
+the bounded typed record and immutable schema, published from a private fsynced
+staging directory with atomic no-replace rename. It cannot carry material,
+private-key digests, identities, addresses, paths, payloads, or backend text.
+Its production-credit fields remain fixed false; deployed
 network/storage faults, CNF/Kubernetes execution, supported-platform soak,
 remote-HKMS, live metrics/alerts, independently signed evidence, and HA-profile
 graduation remain explicit gates, so #164/#158 stay open.
