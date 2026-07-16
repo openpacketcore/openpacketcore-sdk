@@ -14,6 +14,9 @@ use zeroize::Zeroizing;
 use crate::preflight::PersistCapabilities;
 use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
 
+/// Maximum UTF-8 byte length of a durable named rollback point.
+pub const CONFIG_ROLLBACK_LABEL_MAX_BYTES: usize = 128;
+
 /// Source of a configuration commit request.
 ///
 /// Mirrors the management substrate's `RequestSource` to avoid a cycle back to
@@ -445,6 +448,8 @@ struct ConfigPrincipalMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     replay_lookup_digest: Option<String>,
     recovery_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollback_label: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -457,6 +462,8 @@ struct ConfigPrincipalMetadataProbe {
     replay_lookup_digest: Option<String>,
     saw_recovery_required: bool,
     recovery_required: Option<bool>,
+    saw_rollback_label: bool,
+    rollback_label: Option<String>,
     duplicate_reserved_field: bool,
     unknown_field: bool,
     invalid_field_type: bool,
@@ -529,6 +536,21 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                                 _ => probe.invalid_field_type = true,
                             }
                         }
+                        "rollback_label" => {
+                            probe.saw_reserved_field = true;
+                            if probe.saw_rollback_label {
+                                probe.duplicate_reserved_field = true;
+                            }
+                            probe.saw_rollback_label = true;
+                            let value = map.next_value::<serde_json::Value>()?;
+                            match value {
+                                serde_json::Value::Null => probe.rollback_label = None,
+                                serde_json::Value::String(label) => {
+                                    probe.rollback_label = Some(label);
+                                }
+                                _ => probe.invalid_field_type = true,
+                            }
+                        }
                         _ => {
                             probe.unknown_field = true;
                             map.next_value::<IgnoredAny>()?;
@@ -575,6 +597,10 @@ fn parse_config_principal(stored: &str) -> ParsedConfigPrincipal {
             .replay_lookup_digest
             .as_deref()
             .is_some_and(|digest| validate_replay_lookup_digest(digest).is_err())
+        || probe
+            .rollback_label
+            .as_deref()
+            .is_some_and(|label| validate_rollback_label(label).is_err())
     {
         return ParsedConfigPrincipal::Invalid;
     }
@@ -582,6 +608,7 @@ fn parse_config_principal(stored: &str) -> ParsedConfigPrincipal {
         principal,
         replay_lookup_digest: probe.replay_lookup_digest,
         recovery_required,
+        rollback_label: probe.rollback_label,
     })
 }
 
@@ -627,6 +654,16 @@ pub(crate) fn config_replay_lookup_digest(stored: &str) -> Result<Option<String>
     }
 }
 
+/// Extract and validate the optional named rollback point carried by an
+/// encrypted config record's clear lifecycle metadata.
+pub(crate) fn config_rollback_label(stored: &str) -> Result<Option<String>, PersistError> {
+    match parse_config_principal(stored) {
+        ParsedConfigPrincipal::Legacy => Ok(None),
+        ParsedConfigPrincipal::Wrapped(metadata) => Ok(metadata.rollback_label),
+        ParsedConfigPrincipal::Invalid => Err(PersistError::corrupt_blob()),
+    }
+}
+
 pub(crate) fn clear_config_recovery_required(stored: &str) -> Result<Option<String>, PersistError> {
     let ParsedConfigPrincipal::Wrapped(mut metadata) = parse_config_principal(stored) else {
         return Err(PersistError::corrupt_blob());
@@ -648,6 +685,19 @@ pub(crate) fn validate_replay_lookup_digest(digest: &str) -> Result<(), PersistE
     {
         return Err(PersistError::constraint_violation(
             "config replay lookup digest is invalid",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_rollback_label(label: &str) -> Result<(), PersistError> {
+    if label.is_empty()
+        || label.len() > CONFIG_ROLLBACK_LABEL_MAX_BYTES
+        || label.trim() != label
+        || label.chars().any(char::is_control)
+    {
+        return Err(PersistError::constraint_violation(
+            "rollback label is not canonically representable",
         ));
     }
     Ok(())
@@ -1009,6 +1059,7 @@ mod config_principal_metadata_tests {
             "principal": PRINCIPAL,
             "replay_lookup_digest": "a".repeat(64),
             "recovery_required": true,
+            "rollback_label": "release-candidate",
         })
         .to_string();
         assert!(config_principal_metadata_is_valid(&encoded));
@@ -1024,6 +1075,10 @@ mod config_principal_metadata_tests {
         assert_eq!(
             Some("a".repeat(64)),
             config_replay_lookup_digest(&encoded).expect("valid replay digest")
+        );
+        assert_eq!(
+            Some("release-candidate".to_owned()),
+            config_rollback_label(&encoded).expect("valid rollback label")
         );
 
         let cleared = clear_config_recovery_required(&encoded)
@@ -1056,10 +1111,18 @@ mod config_principal_metadata_tests {
             format!(
                 "{{\"principal\":{PRINCIPAL:?},\"recovery_required\":true,\"recovery_required\":false}}"
             ),
+            format!(
+                "{{\"principal\":{PRINCIPAL:?},\"recovery_required\":false,\"rollback_label\":\"one\",\"rollback_label\":\"two\"}}"
+            ),
+            format!(
+                "{{\"principal\":{PRINCIPAL:?},\"recovery_required\":false,\"rollback_label\":{:?}}}",
+                "x".repeat(CONFIG_ROLLBACK_LABEL_MAX_BYTES + 1)
+            ),
         ];
         for encoded in malformed {
             assert!(!config_principal_metadata_is_valid(&encoded));
             assert!(config_replay_lookup_digest(&encoded).is_err());
+            assert!(config_rollback_label(&encoded).is_err());
             assert!(clear_config_recovery_required(&encoded).is_err());
         }
     }
@@ -1070,6 +1133,10 @@ mod config_principal_metadata_tests {
         assert_eq!(
             None,
             config_replay_lookup_digest(PRINCIPAL).expect("legacy principal")
+        );
+        assert_eq!(
+            None,
+            config_rollback_label(PRINCIPAL).expect("legacy principal")
         );
         assert!(config_principal_matches_aad(PRINCIPAL, PRINCIPAL));
     }

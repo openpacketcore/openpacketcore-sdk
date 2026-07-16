@@ -190,16 +190,18 @@ that later proves committed remains success even if the caller's local deadline 
 and failure to clear the post-publication recovery marker does not rewrite that
 durable success as failure; it fences later writes and requires recovery.
 
-This config-consensus change advances both its command and config-specific RPC
-payload revisions to 2. Drain config writers, stop every config-consensus
-member, upgrade the complete voter set, and restart it as one coordinated
-operation. Cross-revision paths in a rolling deployment of mixed
-revision-1/revision-2 binaries fail closed at the exact formation probe or RPC
-revision check before a revision-2 node admits writes; there is no wire
-downgrade. Do not rely on that rejection to drain an already-running
-revision-1 majority. Existing revision-1 persisted commands remain replayable
-for the original append, confirm, and rollback-point intents, but revision-1
-commands carrying either new intent are rejected as corrupt state.
+The shared config-bus adapter and atomic named rollback points advance both the
+config command and config-specific RPC payload revisions to 3. Drain config
+writers, stop every config-consensus member, upgrade the complete voter set,
+and restart it as one coordinated operation. Cross-revision paths in a rolling
+deployment of mixed
+revision-1/revision-2/revision-3 binaries fail closed at the exact formation
+probe or RPC revision check before a revision-3 node admits writes; there is no
+wire downgrade. Do not rely on that rejection to drain an already-running older
+majority. Existing revision-1 and revision-2 persisted commands remain
+replayable with their original semantics, but neither older revision may claim
+the inline named-rollback behavior. Revision-1 commands carrying either
+revision-2 atomic intent remain rejected as corrupt state.
 
 After the Openraft authority marker exists, direct mutation through
 `SqliteBackend` is fenced, including through clones freshly opened or retained

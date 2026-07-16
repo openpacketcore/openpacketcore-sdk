@@ -2231,6 +2231,13 @@ fn append_prepared_commit_sync(
         return Ok(Err(ConfigMutationFailure::InvalidInput));
     }
     let record = &commit.record;
+    let rollback_label = match crate::types::config_rollback_label(&record.principal) {
+        Ok(label) => label,
+        Err(_) => return Ok(Err(ConfigMutationFailure::InvalidInput)),
+    };
+    if rollback_label.is_some() && !record.rollback_point {
+        return Ok(Err(ConfigMutationFailure::InvalidInput));
+    }
     let tx_id = record.tx_id.as_uuid().as_bytes().as_slice();
     let duplicate: bool = conn
         .query_row(
@@ -2258,6 +2265,18 @@ fn append_prepared_commit_sync(
                              END = ?1
                    )"#,
                 [&digest],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if duplicate {
+            return Ok(Err(ConfigMutationFailure::Conflict));
+        }
+    }
+    if let Some(label) = rollback_label.as_deref() {
+        let duplicate: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM rollback_labels WHERE label = ?1)",
+                [label],
                 |row| row.get(0),
             )
             .map_err(db_error)?;
@@ -2309,8 +2328,8 @@ fn append_prepared_commit_sync(
         r#"INSERT INTO config_history
             (tx_id, parent_tx_id, version, committed_at, principal, source,
              schema_digest, plaintext_digest, encrypted_blob, rollback_point,
-             confirmed_deadline, audit_count, audit_terminal_hash)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+             rollback_label, confirmed_deadline, audit_count, audit_terminal_hash)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
         params![
             tx_id,
             record
@@ -2324,6 +2343,7 @@ fn append_prepared_commit_sync(
             &record.plaintext_digest,
             &record.encrypted_blob,
             i32::from(record.rollback_point),
+            rollback_label.as_deref(),
             record.confirmed_deadline.map(|value| value.to_string()),
             i64::try_from(commit.audit.len())
                 .map_err(|_| invalid_data("config audit count overflow"))?,
@@ -2331,6 +2351,13 @@ fn append_prepared_commit_sync(
         ],
     )
     .map_err(db_error)?;
+    if let Some(label) = rollback_label {
+        conn.execute(
+            "INSERT INTO rollback_labels (label, tx_id, created_at) VALUES (?1, ?2, ?3)",
+            params![label, tx_id, record.committed_at.to_string()],
+        )
+        .map_err(db_error)?;
+    }
     for entry in &commit.audit {
         cancellation.check_io()?;
         let mut audit_identity = tx_id.to_vec();
@@ -3556,25 +3583,42 @@ mod tests {
         }
     }
 
-    fn metadata_append_entry(
+    struct MetadataAppendEntry<'a> {
         index: u64,
         request_id: [u8; 16],
         tx_id: TxId,
         parent_tx_id: Option<TxId>,
         version: u64,
         replay_lookup_digest: char,
+        rollback_label: Option<&'a str>,
+    }
+
+    fn metadata_append_entry(
+        spec: MetadataAppendEntry<'_>,
         audit_key: &AuditKey,
     ) -> Entry<ConfigRaftTypeConfig> {
+        let MetadataAppendEntry {
+            index,
+            request_id,
+            tx_id,
+            parent_tx_id,
+            version,
+            replay_lookup_digest,
+            rollback_label,
+        } = spec;
         let committed_at =
             Timestamp::from_str("2026-01-01T00:00:00Z").expect("fixed committed time");
         let aad_principal =
             "spiffe://qualification.invalid/tenant/test/ns/test/sa/config/nf/test/instance/0";
-        let principal = serde_json::json!({
+        let mut principal = serde_json::json!({
             "principal": aad_principal,
             "replay_lookup_digest": replay_lookup_digest.to_string().repeat(64),
             "recovery_required": false,
-        })
-        .to_string();
+        });
+        if let Some(label) = rollback_label {
+            principal["rollback_label"] = serde_json::Value::String(label.to_owned());
+        }
+        let principal = principal.to_string();
         let schema_digest = SchemaDigest::from_bytes([request_id[0]; 32]);
         let key_id = KeyId::new("metadata-replay-config-key").expect("key ID");
         let aad = EnvelopeAad::config(
@@ -3609,7 +3653,7 @@ mod tests {
             schema_digest,
             plaintext_digest: vec![request_id[0]; 32],
             encrypted_blob,
-            rollback_point: false,
+            rollback_point: rollback_label.is_some(),
             confirmed_deadline: None,
         };
         let prepared = PreparedConfigCommit::prepare(record, Vec::new(), audit_key)
@@ -3823,30 +3867,39 @@ mod tests {
         let entries = vec![
             membership_entry(),
             metadata_append_entry(
-                1,
-                [0xB1; 16],
-                first_tx_id,
-                None,
-                1,
-                'a',
+                MetadataAppendEntry {
+                    index: 1,
+                    request_id: [0xB1; 16],
+                    tx_id: first_tx_id,
+                    parent_tx_id: None,
+                    version: 1,
+                    replay_lookup_digest: 'a',
+                    rollback_label: None,
+                },
                 backend.audit_key(),
             ),
             metadata_append_entry(
-                2,
-                [0xB2; 16],
-                TxId::new(),
-                Some(first_tx_id),
-                2,
-                'a',
+                MetadataAppendEntry {
+                    index: 2,
+                    request_id: [0xB2; 16],
+                    tx_id: TxId::new(),
+                    parent_tx_id: Some(first_tx_id),
+                    version: 2,
+                    replay_lookup_digest: 'a',
+                    rollback_label: None,
+                },
                 backend.audit_key(),
             ),
             metadata_append_entry(
-                3,
-                [0xB3; 16],
-                successor_tx_id,
-                Some(first_tx_id),
-                2,
-                'b',
+                MetadataAppendEntry {
+                    index: 3,
+                    request_id: [0xB3; 16],
+                    tx_id: successor_tx_id,
+                    parent_tx_id: Some(first_tx_id),
+                    version: 2,
+                    replay_lookup_digest: 'b',
+                    rollback_label: None,
+                },
                 backend.audit_key(),
             ),
         ];
@@ -3864,6 +3917,49 @@ mod tests {
             )
             .expect("latest config head");
         assert_eq!(successor_tx_id.as_uuid().as_bytes(), latest.as_slice());
+    }
+
+    #[tokio::test]
+    async fn inline_named_rollback_point_is_applied_atomically() {
+        let backend = initialized_backend().await;
+        let shared_conn = backend.conn();
+        let conn = shared_conn.lock().await;
+        let tx_id = TxId::new();
+        let entries = vec![
+            membership_entry(),
+            metadata_append_entry(
+                MetadataAppendEntry {
+                    index: 1,
+                    request_id: [0xC5; 16],
+                    tx_id,
+                    parent_tx_id: None,
+                    version: 1,
+                    replay_lookup_digest: 'c',
+                    rollback_label: Some("release-candidate"),
+                },
+                backend.audit_key(),
+            ),
+        ];
+
+        let responses = apply_entries_sync(&conn, identity(), &expected_members(), entries)
+            .expect("apply named rollback point");
+        assert_eq!(Ok(()), responses[1].result);
+        let stored: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT rollback_point, rollback_label FROM config_history WHERE tx_id = ?1",
+                [tx_id.as_uuid().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("stored rollback metadata");
+        assert_eq!((1, Some("release-candidate".to_owned())), stored);
+        let indexed_tx: Vec<u8> = conn
+            .query_row(
+                "SELECT tx_id FROM rollback_labels WHERE label = 'release-candidate'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("atomic rollback label index");
+        assert_eq!(tx_id.as_uuid().as_bytes(), indexed_tx.as_slice());
     }
 
     #[test]
@@ -4415,8 +4511,7 @@ mod tests {
 
     #[tokio::test]
     async fn preproposal_label_bound_is_stricter_than_log_storage_ceiling() {
-        let accepted =
-            rollback_label_entry(crate::consensus::types::CONFIG_ROLLBACK_LABEL_MAX_BYTES);
+        let accepted = rollback_label_entry(crate::CONFIG_ROLLBACK_LABEL_MAX_BYTES);
         assert!(
             encode_json(&accepted).expect("bounded encoding").len()
                 < CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES
@@ -4435,8 +4530,7 @@ mod tests {
         drop(shared_conn);
         drop(backend);
 
-        let rejected =
-            rollback_label_entry(crate::consensus::types::CONFIG_ROLLBACK_LABEL_MAX_BYTES + 1);
+        let rejected = rollback_label_entry(crate::CONFIG_ROLLBACK_LABEL_MAX_BYTES + 1);
         let backend = initialized_backend().await;
         let shared_conn = backend.conn();
         let conn = shared_conn.lock().await;

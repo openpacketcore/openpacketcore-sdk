@@ -20,6 +20,7 @@ flowchart TB
   subgraph L4["Layer 4 — adapters (async)"]
     netconf["opc-netconf-server (SSH/russh)"]
     gnmi["opc-gnmi-server (tonic, mTLS)"]
+    cfgconsensus["opc-config-bus-consensus (sealed config adapter)"]
     persist[opc-persist]
     tls["opc-tls / opc-identity (SPIFFE)"]
   end
@@ -34,6 +35,8 @@ flowchart TB
   gnmi --> bus
   bus --> ports
   bus --> cfgmodel
+  bus --> cfgconsensus
+  cfgconsensus --> persist
   persist --> ports
   ports --> types
   cfgmodel --> types

@@ -35,6 +35,7 @@ SOURCE_BUILD_ONLY = {
     "opc-amf-lite",
     "opc-amf-lite-testkit",
     "opc-config-bus",
+    "opc-config-bus-consensus",
     "opc-consensus",
     "opc-gnmi-server",
     "opc-ipsec-lb",

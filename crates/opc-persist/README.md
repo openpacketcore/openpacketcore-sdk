@@ -68,7 +68,10 @@ application -> HKMS-backed encryption -> ConsensusConfigStore
 ```
 
 The application protection layer seals configuration before calling the
-consensus adapter. A successful `opc-crypto` encryption mints a one-shot
+`opc-config-bus-consensus::RaftManagedDatastore` adapter. Production callers
+place `opc-config-bus::EncryptingManagedDatastore` outside that adapter; the
+adapter implements only the sealed-config datastore port and cannot receive a
+plaintext config or a key provider. A successful `opc-crypto` encryption mints a one-shot
 capability; the config-bus adapter consumes it at the consensus proposal seam
 and binds the exact ciphertext plus plaintext digest. Raw ciphertext cannot use
 the consensus append API. The capability, provider, and key handle are erased
@@ -84,6 +87,12 @@ vote/term state, log matching, quorum commit, membership, linearizable barriers,
 and snapshot lineage. The removed custom Raft implementation, majority config
 wrapper, TCP peer/server, and standalone consensus-node binary are not
 alternative authority paths.
+
+Config command and config-specific RPC revision 3 add an inline named rollback
+point to the same deterministic state-machine mutation as its encrypted
+commit. Revisions 1 and 2 remain replayable only with their original semantics.
+Mixed config-consensus revisions do not negotiate: drain config writers, stop
+the complete voter set, upgrade every member, and restart the set together.
 
 Creating the `config_raft_identity` table claims the database for Openraft in
 the same immediate SQLite transaction that checks or imports legacy state.

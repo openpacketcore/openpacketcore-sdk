@@ -27,22 +27,24 @@ pub use opc_consensus::{
 };
 
 pub(crate) const LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 1;
+pub(crate) const ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 2;
 /// Current config command revision. This is deliberately independent of the
 /// shared transport, durable-storage, and snapshot revisions.
 ///
-/// Revision 2 adds atomic commit-confirmed resolution and recovery-fence
-/// clearing. Revision-1 commands remain readable only for their original
-/// three intents so existing durable logs can be replayed after upgrade.
-pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 2;
+/// Revision 2 added atomic commit-confirmed resolution and recovery-fence
+/// clearing. Revision 3 adds an inline named rollback point to an appended
+/// encrypted record. Older commands remain readable under their original
+/// semantics so existing durable logs can be replayed after upgrade.
+pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 3;
 /// Current SQLite authority schema revision.
 pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 1;
 /// Current config snapshot envelope revision.
 pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 1;
 /// Current config-specific RPC payload revision.
 ///
-/// Revision 2 carries the revision-2 command admission contract. Peers require
+/// Revision 3 carries the revision-3 command admission contract. Peers require
 /// an exact match and do not negotiate a downgrade.
-pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 2;
+pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 3;
 
 /// Maximum configured voter count admitted by the config consensus adapter.
 pub const CONFIG_CONSENSUS_MAX_MEMBERS: usize = 9;
@@ -55,7 +57,6 @@ const AUDIT_PATH_TOKEN_PREFIX: &str = "hmac-sha256:";
 pub(crate) const CONFIG_PRINCIPAL_MAX_BYTES: usize = 16 * 1024;
 pub(crate) const CONFIG_AUDIT_RECORDS_MAX: usize = 16_384;
 pub(crate) const CONFIG_AUDIT_PATH_MAX_BYTES: usize = 8 * 1024;
-pub(crate) const CONFIG_ROLLBACK_LABEL_MAX_BYTES: usize = 128;
 
 /// Immutable scope and exact voter set for one config consensus node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,8 +347,19 @@ impl ConfigMutationIntent {
             | Self::MarkConfirmed { .. }
             | Self::CreateRollbackPoint { .. } => LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
             Self::ResolveConfirmedAndAppend { .. } | Self::ClearRecoveryRequired { .. } => {
-                CONFIG_CONSENSUS_COMMAND_VERSION
+                ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
             }
+        }
+    }
+
+    fn inline_rollback_label(&self) -> Result<Option<String>, PersistError> {
+        match self {
+            Self::AppendCommit(commit) | Self::ResolveConfirmedAndAppend { commit, .. } => {
+                crate::types::config_rollback_label(&commit.record.principal)
+            }
+            Self::MarkConfirmed { .. }
+            | Self::CreateRollbackPoint { .. }
+            | Self::ClearRecoveryRequired { .. } => Ok(None),
         }
     }
 }
@@ -358,15 +370,7 @@ pub(crate) struct ValidatedRollbackLabel(pub(crate) String);
 
 impl ValidatedRollbackLabel {
     pub(crate) fn try_new(value: String) -> Result<Self, PersistError> {
-        if value.is_empty()
-            || value.len() > CONFIG_ROLLBACK_LABEL_MAX_BYTES
-            || value.trim() != value
-            || value.chars().any(char::is_control)
-        {
-            return Err(PersistError::constraint_violation(
-                "rollback label is not canonically representable",
-            ));
-        }
+        crate::types::validate_rollback_label(&value)?;
         Ok(Self(value))
     }
 
@@ -395,7 +399,7 @@ impl ConfigConsensusCommand {
     pub(crate) fn payload_digest(&self) -> Result<[u8; 32], PersistError> {
         // Legacy intents retain their revision-1 digest across the coordinated
         // upgrade. A caller that lost the old leader's response can therefore
-        // resubmit the same durable request ID through a revision-2 binary and
+        // resubmit the same durable request ID through a newer binary and
         // receive the stored outcome instead of a false collision.
         let semantic_revision = self.intent.minimum_command_version();
         let bytes = serde_json::to_vec(&(semantic_revision, self.identity, &self.intent))
@@ -423,9 +427,15 @@ impl ConfigConsensusCommand {
 
     /// Validate scope, schema, and encrypted command contents.
     pub(crate) fn validate(&self, identity: ConsensusIdentity) -> Result<(), PersistError> {
+        let has_inline_rollback_label = self.intent.inline_rollback_label()?.is_some();
         let supported_revision = match self.schema_version {
             LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION => {
                 self.intent.minimum_command_version() == LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION
+                    && !has_inline_rollback_label
+            }
+            ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION => {
+                self.intent.minimum_command_version() <= ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
+                    && !has_inline_rollback_label
             }
             CONFIG_CONSENSUS_COMMAND_VERSION => true,
             _ => false,
@@ -775,18 +785,19 @@ mod tests {
             tokenize_audit_path(sensitive, &key).expect("deterministic token")
         );
         assert!(tokenize_audit_path("/interfaces/interface[name='unterminated]", &key).is_err());
-        assert!(
-            ValidatedRollbackLabel::try_new("x".repeat(CONFIG_ROLLBACK_LABEL_MAX_BYTES)).is_ok()
-        );
-        assert!(
-            ValidatedRollbackLabel::try_new("x".repeat(CONFIG_ROLLBACK_LABEL_MAX_BYTES + 1))
-                .is_err()
-        );
+        assert!(ValidatedRollbackLabel::try_new(
+            "x".repeat(crate::CONFIG_ROLLBACK_LABEL_MAX_BYTES)
+        )
+        .is_ok());
+        assert!(ValidatedRollbackLabel::try_new(
+            "x".repeat(crate::CONFIG_ROLLBACK_LABEL_MAX_BYTES + 1)
+        )
+        .is_err());
     }
 
     #[test]
     fn config_wire_revision_is_independent_and_exact() {
-        assert_eq!(2, CONFIG_CONSENSUS_WIRE_VERSION);
+        assert_eq!(3, CONFIG_CONSENSUS_WIRE_VERSION);
         let current = encode_config_wire(&7_u64).expect("current wire");
         assert_eq!(
             7,
@@ -821,8 +832,8 @@ mod tests {
     }
 
     #[test]
-    fn revision_one_persisted_commands_decode_but_cannot_claim_revision_two_intents() {
-        assert_eq!(2, CONFIG_CONSENSUS_COMMAND_VERSION);
+    fn older_persisted_commands_decode_but_cannot_claim_newer_intents() {
+        assert_eq!(3, CONFIG_CONSENSUS_COMMAND_VERSION);
         let identity = ConfigConsensusIdentity::new(
             ConfigConsensusClusterId::new("config-command-v1-replay-test").expect("cluster"),
             ConfigConsensusConfigurationId::from_bytes([0xB1; 32]),
@@ -841,14 +852,14 @@ mod tests {
         let replayed: ConfigConsensusCommand =
             serde_json::from_slice(&encoded).expect("current reader decodes revision-one command");
         assert!(replayed.validate(identity).is_ok());
-        let mut revision_two_retry = replayed.clone();
-        revision_two_retry.schema_version = CONFIG_CONSENSUS_COMMAND_VERSION;
-        assert!(revision_two_retry.validate(identity).is_ok());
+        let mut current_retry = replayed.clone();
+        current_retry.schema_version = CONFIG_CONSENSUS_COMMAND_VERSION;
+        assert!(current_retry.validate(identity).is_ok());
         assert_eq!(
             replayed.payload_digest().expect("revision-one digest"),
-            revision_two_retry
+            current_retry
                 .payload_digest()
-                .expect("revision-two retry digest")
+                .expect("current retry digest")
         );
 
         let legacy_clear = ConfigConsensusCommand {
@@ -859,7 +870,7 @@ mod tests {
             intent: ConfigMutationIntent::ClearRecoveryRequired { tx_id },
         };
         assert_eq!(
-            CONFIG_CONSENSUS_COMMAND_VERSION,
+            ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION,
             legacy_clear.intent.minimum_command_version()
         );
         assert!(legacy_clear.validate(identity).is_err());
@@ -892,7 +903,7 @@ mod tests {
             },
         };
         assert_eq!(
-            CONFIG_CONSENSUS_COMMAND_VERSION,
+            ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION,
             legacy_resolution.intent.minimum_command_version()
         );
         assert!(legacy_resolution.validate(identity).is_err());

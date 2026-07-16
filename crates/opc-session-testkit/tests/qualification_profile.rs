@@ -493,6 +493,7 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
             "opc-amf-lite",
             "opc-amf-lite-testkit",
             "opc-config-bus",
+            "opc-config-bus-consensus",
             "opc-consensus",
             "opc-gnmi-server",
             "opc-ipsec-lb",
@@ -835,6 +836,7 @@ fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     ));
     for manifest in [
         include_str!("../../opc-alarm/Cargo.toml"),
+        include_str!("../../opc-config-bus-consensus/Cargo.toml"),
         include_str!("../../opc-consensus/Cargo.toml"),
         include_str!("../../opc-persist/Cargo.toml"),
         include_str!("../../opc-sdk/Cargo.toml"),
@@ -923,6 +925,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         "opc-amf-lite",
         "opc-amf-lite-testkit",
         "opc-config-bus",
+        "opc-config-bus-consensus",
         "opc-consensus",
         "opc-gnmi-server",
         "opc-ipsec-lb",

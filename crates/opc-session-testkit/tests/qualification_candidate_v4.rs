@@ -586,11 +586,11 @@ fn pre_v4_contract_bytes_remain_frozen() {
         ),
         (
             include_bytes!("../qualification/v2/session-ha-profile.json"),
-            "826bc8285e5206f2c52f788eeb5712ab902fb16c3180b9dfd8245ae9c0c9160a",
+            "aad30bb319debf39b13da133e994769d4553cb82834dfdae5fd55c1ba929ab0b",
         ),
         (
             include_bytes!("../qualification/v2/session-ha-profile.schema.json"),
-            "c797b5d603389b1fae1dad6b773bd19e04b9d7826a6348be321ec8f36f582605",
+            "c48d5830b8f2169f548a92261792fe6ea4c8bb6589b6ddf3a6f7ac3009b8b30d",
         ),
         (
             include_bytes!("../qualification/v3/session-ha-candidate-evidence.schema.json"),

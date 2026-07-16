@@ -106,6 +106,22 @@ impl MockConfigStore {
                 }
             }
         }
+        if let Some(label) = super::types::config_rollback_label(&record.principal)? {
+            if !record.rollback_point {
+                return Err(PersistError::constraint_violation(
+                    "named rollback commit is not marked as a rollback point",
+                ));
+            }
+            for stored in commits.values() {
+                if super::types::config_rollback_label(&stored.record.principal)?.as_deref()
+                    == Some(label.as_str())
+                {
+                    return Err(PersistError::constraint_violation(
+                        "rollback label is not unique",
+                    ));
+                }
+            }
+        }
         let current = latest.as_ref().and_then(|key| commits.get(key));
         match (current, record.parent_tx_id) {
             (None, None) => {}
@@ -171,25 +187,57 @@ impl ConfigStore for MockConfigStore {
     }
 
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError> {
-        let key = match target {
-            RollbackTarget::ByTxId(tx_id) => tx_id.as_uuid().as_bytes().to_vec(),
-            _ => {
-                // For non-txid targets, the mock does not track state — fail gracefully
-                return Err(PersistError::rollback_not_found());
-            }
-        };
+        let latest = self.latest_tx_id.read().unwrap();
         let commits = self.commits.read().unwrap();
-        let config = commits
-            .get(&key)
-            .cloned()
-            .ok_or_else(PersistError::rollback_not_found)?;
+        let confirmed = self.confirmed_tx_ids.read().unwrap();
+        let config = match target {
+            RollbackTarget::ByTxId(tx_id) => {
+                commits.get(tx_id.as_uuid().as_bytes().as_slice()).cloned()
+            }
+            RollbackTarget::ByVersion(version) => commits
+                .values()
+                .find(|stored| stored.record.version == version)
+                .cloned(),
+            RollbackTarget::ByLabel(label) => {
+                let mut matched = None;
+                for stored in commits.values() {
+                    if super::types::config_rollback_label(&stored.record.principal)?.as_deref()
+                        == Some(label.as_str())
+                    {
+                        if matched.is_some() {
+                            return Err(PersistError::inconsistent_state(
+                                "rollback label is not unique",
+                            ));
+                        }
+                        matched = Some(stored.clone());
+                    }
+                }
+                matched
+            }
+            RollbackTarget::Previous => {
+                let latest_version = latest
+                    .as_ref()
+                    .and_then(|key| commits.get(key))
+                    .map(|stored| stored.record.version);
+                commits
+                    .values()
+                    .filter(|stored| Some(stored.record.version) < latest_version)
+                    .filter(|stored| {
+                        stored.record.confirmed_deadline.is_none()
+                            || confirmed
+                                .contains(stored.record.tx_id.as_uuid().as_bytes().as_slice())
+                    })
+                    .max_by_key(|stored| stored.record.version)
+                    .cloned()
+            }
+        }
+        .ok_or_else(PersistError::rollback_not_found)?;
 
         // Reject if target is a pending commit
-        if config.record.confirmed_deadline.is_some() {
-            let confirmed = self.confirmed_tx_ids.read().unwrap();
-            if !confirmed.contains(&key) {
-                return Err(PersistError::rollback_not_found());
-            }
+        if config.record.confirmed_deadline.is_some()
+            && !confirmed.contains(config.record.tx_id.as_uuid().as_bytes().as_slice())
+        {
+            return Err(PersistError::rollback_not_found());
         }
 
         Ok(config)

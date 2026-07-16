@@ -5,6 +5,9 @@ use thiserror::Error;
 /// Persistent error kinds that survive serialization to logs and telemetry.
 #[derive(Debug, Clone, Error)]
 pub enum PersistErrorKind {
+    /// The durable backend is temporarily unable to serve the operation.
+    #[error("persistence backend is unavailable")]
+    Unavailable,
     /// Storage preflight failed — deployment does not meet durability requirements.
     #[error("preflight failed: {0}")]
     PreflightFailed(String),
@@ -206,6 +209,11 @@ impl PersistError {
 
     pub fn preflight_failed(msg: impl Into<String>) -> Self {
         Self::new(PersistErrorKind::PreflightFailed(msg.into()))
+    }
+
+    /// Construct a retryable backend-availability failure.
+    pub fn unavailable() -> Self {
+        Self::new(PersistErrorKind::Unavailable)
     }
 
     pub fn rollback_not_found() -> Self {
