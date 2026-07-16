@@ -164,7 +164,7 @@ enum ForwardMutationReply {
     Unavailable,
     Rejected(ForwardMutationRejection),
     // Keep additive variants after the original discriminants so their
-    // postcard shapes remain stable inside the exact revision-2 payload.
+    // postcard shapes remain stable inside the current exact-revision payload.
     OutcomeUnknown,
 }
 
@@ -1219,7 +1219,7 @@ fn maximum_encoded_config_timestamp() -> Option<opc_types::Timestamp> {
 }
 
 fn consensus_unavailable() -> PersistError {
-    PersistError::io("config consensus quorum is unavailable")
+    PersistError::unavailable()
 }
 
 fn derive_durable_request_id(
@@ -2127,7 +2127,7 @@ mod tests {
                 .await
                 .expect("bounded config overflow task")
                 .expect_err("overflow must fail before acceptance");
-            assert!(matches!(error.kind(), crate::PersistErrorKind::Io(_)));
+            assert!(matches!(error.kind(), crate::PersistErrorKind::Unavailable));
         }
         assert_eq!(
             store.inner.raft.metrics().borrow().last_log_index,

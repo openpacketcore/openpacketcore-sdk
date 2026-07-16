@@ -84,6 +84,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | Crate | Purpose | Reference |
 | :--- | :--- | :--- |
 | [`opc-config-bus`](crates/opc-config-bus/) | Transactional config bus supporting schema validation, tenant segregation, AAD-bound envelope encryption, and admission control. | [RFC 001](docs/rfc/001-management-substrate.md) |
+| [`opc-config-bus-consensus`](crates/opc-config-bus-consensus/) | Source-build-only sealed-config adapter from the config bus to the existing `ConsensusConfigStore`; it delegates consensus wholesale to Openraft and keeps HKMS/plaintext outside the Raft boundary. Multi-group production qualification remains open. | [ADR 0002](docs/adr/0002-config-store-consensus-ha.md), [ADR 0019](docs/adr/0019-one-openraft-consensus-engine.md) |
 | [`opc-config-model`](crates/opc-config-model/) | Shared config-model request, result, identity, and error types. | [RFC 001](docs/rfc/001-management-substrate.md) |
 | [`opc-persist`](crates/opc-persist/) | Tamper-evident SQLite datastores and a `ConsensusConfigStore` on the shared Openraft engine, with atomic authority fencing, sealed/redacted commands, and exact offline legacy recovery. Production HA qualification remains conditional. | [RFC 001](docs/rfc/001-management-substrate.md), [ADR 0002](docs/adr/0002-config-store-consensus-ha.md), [ADR 0019](docs/adr/0019-one-openraft-consensus-engine.md) |
 | [`opc-nacm`](crates/opc-nacm/) | Normalized YANG path parsing and NACM authorization evaluation. | [RFC 001](docs/rfc/001-management-substrate.md) |

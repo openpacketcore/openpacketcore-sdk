@@ -372,7 +372,7 @@ impl SqliteBackend {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|_| PersistError::io("config authority fence is unavailable"))?;
+            .map_err(|_| PersistError::unavailable())?;
         if claimed {
             return Err(PersistError::inconsistent_state(
                 "direct config mutation is disabled after Openraft authority claim",
@@ -499,6 +499,17 @@ impl SqliteBackend {
         // Insert commit record
         let tx_id_bytes = record.tx_id.as_uuid().as_bytes().to_vec();
         let parent_tx_id_bytes = record.parent_tx_id.map(|t| t.as_uuid().as_bytes().to_vec());
+        // The ordinary append path validates metadata before reaching this
+        // raw helper. Preserve the helper's ability to seed externally
+        // malformed rows for recovery-integrity tests.
+        let rollback_label = crate::types::config_rollback_label(&record.principal)
+            .ok()
+            .flatten();
+        if rollback_label.is_some() && !record.rollback_point {
+            return Err(PersistError::constraint_violation(
+                "named rollback commit is not marked as a rollback point",
+            ));
+        }
 
         let source_str = match record.source {
             CommitSource::Gnmi => "gnmi",
@@ -514,8 +525,8 @@ impl SqliteBackend {
             INSERT INTO config_history
                 (tx_id, parent_tx_id, version, committed_at, principal, source,
                  schema_digest, plaintext_digest, encrypted_blob, rollback_point,
-                 confirmed_deadline, audit_count, audit_terminal_hash)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, zeroblob(32))
+                 rollback_label, confirmed_deadline, audit_count, audit_terminal_hash)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, zeroblob(32))
             "#,
             params![
                 &tx_id_bytes,
@@ -528,10 +539,19 @@ impl SqliteBackend {
                 &record.plaintext_digest,
                 &record.encrypted_blob,
                 record.rollback_point as i32,
+                rollback_label.as_deref(),
                 record.confirmed_deadline.map(|t| t.to_string()),
             ],
         )
         .map_err(PersistError::from)?;
+
+        if let Some(label) = rollback_label {
+            conn.execute(
+                "INSERT INTO rollback_labels (label, tx_id, created_at) VALUES (?1, ?2, ?3)",
+                params![label, &tx_id_bytes, record.committed_at.to_string()],
+            )
+            .map_err(PersistError::from)?;
+        }
 
         let tenant = crate::types::extract_tenant(&record.principal);
         let mut prev_hash = [0u8; 32];

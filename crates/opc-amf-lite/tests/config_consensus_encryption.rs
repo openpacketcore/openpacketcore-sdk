@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use opc_amf_lite::{AmfConfig, PersistDatastore};
+use opc_amf_lite::AmfConfig;
 use opc_config_bus::{
     CommitWrite, EncryptingManagedDatastore, ManagedDatastore, StoreErrorCode, StoredConfig,
     StoredRequestFingerprint, StoredRequestMode,
 };
+use opc_config_bus_consensus::RaftManagedDatastore;
 use opc_config_model::{
     ApplyPlan, ConfigOperation, IdempotencyKey, RequestId, RequestSource, RollbackTarget,
     TransportType, TrustedPrincipal, WorkloadIdentity, YangPath,
@@ -185,7 +186,7 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
     let tenant = TenantId::new("tenant-a").expect("tenant");
     let provider = Arc::new(CountingKeyProvider::new());
     provider.insert_active_key("config-key-a", &tenant, FIRST_KEY_MATERIAL);
-    let raw = Arc::new(PersistDatastore::<AmfConfig, _>::new(Arc::new(
+    let raw = Arc::new(RaftManagedDatastore::<AmfConfig>::new(Arc::new(
         cluster.stores[0].clone(),
     )));
     let encrypted = EncryptingManagedDatastore::new(raw.clone(), provider.clone());
@@ -387,7 +388,7 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
         missing_provider.call_count(),
         "Openraft recovery must not consult an unrelated provider"
     );
-    let restarted_raw = Arc::new(PersistDatastore::<AmfConfig, _>::new(Arc::new(
+    let restarted_raw = Arc::new(RaftManagedDatastore::<AmfConfig>::new(Arc::new(
         restarted.stores[0].clone(),
     )));
     let restarted_encrypted = EncryptingManagedDatastore::new(restarted_raw, Arc::clone(&provider));

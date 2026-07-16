@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use opc_amf_lite::{AmfConfig, PersistDatastore, AMF_SCHEMA_DIGEST};
+use opc_amf_lite::{AmfConfig, AMF_SCHEMA_DIGEST};
 use opc_config_bus::{
     CommitWrite, ConfigBus, EncryptingManagedDatastore, ManagedDatastore, SealedConfig,
     StoreErrorCode, StoredConfig as BusStoredConfig,
 };
+use opc_config_bus_consensus::PersistManagedDatastore as PersistDatastore;
 use opc_config_model::{
     CommitRequest, ConfigOperation, IdempotencyKey, RequestId, RequestSource, TransportType,
     TrustedPrincipal, WorkloadIdentity, YangPath,

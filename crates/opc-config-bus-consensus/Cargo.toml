@@ -1,0 +1,30 @@
+[package]
+name = "opc-config-bus-consensus"
+version.workspace = true
+publish = false # source-build only until issue #250 qualification is complete
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Ciphertext-only persistence adapters from opc-config-bus to opc-persist config consensus"
+readme = "README.md"
+documentation = "https://docs.rs/opc-config-bus-consensus"
+keywords = ["5g", "cnf", "config", "consensus", "openraft"]
+categories = ["network-programming", "data-structures"]
+
+[dependencies]
+async-trait = { workspace = true }
+opc-config-bus = { path = "../opc-config-bus", version = "0.2.0" }
+opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-persist = { path = "../opc-persist", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+opc-key = { path = "../opc-key", version = "0.2.0" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

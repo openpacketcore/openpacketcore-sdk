@@ -27,7 +27,7 @@ OPENRAFT_GIT_SOURCE = (
     "git+https://github.com/openpacketcore/openraft"
     "?rev=f607e636406b16bd0ad7925dbb631da1b7a4cd96"
 )
-SOURCE_BUILD_ONLY = {
+FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY = {
     "opc-alarm",
     "opc-alarm-k8s",
     "opc-alarm-testkit",
@@ -55,6 +55,10 @@ SOURCE_BUILD_ONLY = {
     "operator-lifecycle",
     "operator-lifecycle-cli",
 }
+POST_V2_SOURCE_BUILD_ONLY_ADDITIONS = {"opc-config-bus-consensus"}
+SOURCE_BUILD_ONLY = (
+    FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY | POST_V2_SOURCE_BUILD_ONLY_ADDITIONS
+)
 SOURCE_BUILD_REMOVAL_CONDITION = (
     "official stable Openraft release containing the fix, registry pin and "
     "checksum, and full issue #143 requalification"
@@ -136,8 +140,11 @@ def main() -> int:
     profile_path = Path("crates/opc-session-testkit/qualification/v2/session-ha-profile.json")
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     source_gate = profile.get("source_build_gate", {})
-    if set(source_gate.get("affected_workspace_crates", [])) != SOURCE_BUILD_ONLY:
-        errors.append("session HA profile source-build crate closure is not exact")
+    if (
+        set(source_gate.get("affected_workspace_crates", []))
+        != FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY
+    ):
+        errors.append("frozen v2 session HA profile source-build crate closure drifted")
     if source_gate.get("openraft_rev") != OPENRAFT_GIT_SOURCE.rsplit("=", 1)[-1]:
         errors.append("session HA profile Openraft revision is not exact")
     if source_gate.get("removal_condition") != SOURCE_BUILD_REMOVAL_CONDITION:
