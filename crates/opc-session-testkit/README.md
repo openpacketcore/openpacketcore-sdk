@@ -86,6 +86,18 @@ the command and the remaining CNF qualification responsibilities. This
 foundation does not constitute deployed evidence and does not change the
 experimental profile.
 
+`opc-session-kubernetes-campaign` is the bounded external companion for the
+first deployed vertical: it drives each private same-binary control socket via
+direct `kubectl exec`, updates only the custom Pod readiness-gate condition
+from a freshly validated Openraft barrier report, clears that condition on
+termination, and atomically retains a private command/reply transcript plus a
+digest-bound readiness-only v3 history fragment. It uses caller-owned,
+externally audited `pods/exec` and `pods/status` authority; the rendered fleet
+still receives no token or RBAC. This fragment omits the v1 workload and v3
+batch/watch/restore evidence, so it remains candidate-only and cannot claim a
+completed #143 campaign. See the Kubernetes qualification README for the
+exact invocation and cleanup contract.
+
 The node's original stdin/stdout JSON-line mode remains available unchanged for
 the single-host harnesses. Deployed manifests instead add
 `--control-socket /var/lib/opc-session-qualification/control/node.sock`. The

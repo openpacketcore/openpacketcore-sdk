@@ -21,7 +21,18 @@ use crate::qualification::{
     QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
 };
 
-const FLEET_NAME: &str = "opc-session-ha";
+/// Stable Kubernetes name prefix for every deployed qualification member.
+pub const QUALIFICATION_KUBERNETES_FLEET_NAME: &str = "opc-session-ha";
+/// Container that owns the private qualification control socket.
+pub const QUALIFICATION_KUBERNETES_CONTAINER_NAME: &str = "session-quorum";
+/// Exact local-only control socket path shared with the same-binary client.
+pub const QUALIFICATION_KUBERNETES_CONTROL_SOCKET_PATH: &str =
+    "/var/lib/opc-session-qualification/control/node.sock";
+/// Custom Pod readiness condition derived only from a fresh durable barrier.
+pub const QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION: &str =
+    "opc.openpacketcore.io/durable-quorum-ready";
+
+const FLEET_NAME: &str = QUALIFICATION_KUBERNETES_FLEET_NAME;
 const PEER_SERVICE_NAME: &str = "opc-session-ha-peer";
 const CONFIG_MAP_NAME_PREFIX: &str = "opc-session-ha-config";
 const SERVICE_ACCOUNT_NAME: &str = "opc-session-ha";
@@ -30,7 +41,7 @@ const WORKSPACE_DIRECTORY: &str = "/var/lib/opc-session-qualification";
 const DATABASE_PATH: &str = "/var/lib/opc-session-qualification/state/session.sqlite";
 const SNAPSHOT_DIRECTORY: &str = "/var/lib/opc-session-qualification/state/snapshots";
 const PROJECTED_IDENTITY_ROOT: &str = "/var/lib/opc-session-qualification/identity";
-const CONTROL_SOCKET_PATH: &str = "/var/lib/opc-session-qualification/control/node.sock";
+const CONTROL_SOCKET_PATH: &str = QUALIFICATION_KUBERNETES_CONTROL_SOCKET_PATH;
 
 /// Fixed-input request for one deterministic Kubernetes fleet manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +260,7 @@ fn qualification_annotations() -> Value {
     json!({
         "opc.openpacketcore.io/qualification-status": "experimental",
         "opc.openpacketcore.io/production-evidence": "false",
+        "opc.openpacketcore.io/durable-readiness-source": "fresh-openraft-barrier-external-campaign",
     })
 }
 
@@ -372,7 +384,7 @@ fn member_stateful_set(
                     "serviceAccountName": SERVICE_ACCOUNT_NAME,
                     "automountServiceAccountToken": false,
                     "readinessGates": [{
-                        "conditionType": "opc.openpacketcore.io/durable-quorum-ready",
+                        "conditionType": QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION,
                     }],
                     "terminationGracePeriodSeconds": 90,
                     "securityContext": {
@@ -390,7 +402,7 @@ fn member_stateful_set(
                         },
                     },
                     "containers": [{
-                        "name": "session-quorum",
+                        "name": QUALIFICATION_KUBERNETES_CONTAINER_NAME,
                         "image": config.image,
                         "imagePullPolicy": "IfNotPresent",
                         "args": [
@@ -470,7 +482,7 @@ fn member_stateful_set(
     stateful_set
 }
 
-fn is_kubernetes_dns_label(value: &str) -> bool {
+pub(crate) fn is_kubernetes_dns_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
         && value
@@ -615,6 +627,11 @@ mod tests {
             assert_eq!(
                 manifest["metadata"]["annotations"]["opc.openpacketcore.io/qualification-status"],
                 "experimental"
+            );
+            assert_eq!(
+                manifest["metadata"]["annotations"]
+                    ["opc.openpacketcore.io/durable-readiness-source"],
+                "fresh-openraft-barrier-external-campaign"
             );
             let items = manifest["items"].as_array().expect("manifest items");
             assert_eq!(items.len(), member_count + 5);

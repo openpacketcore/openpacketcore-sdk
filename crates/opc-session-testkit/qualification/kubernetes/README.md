@@ -78,6 +78,50 @@ printf '%s\n' '{"command":"probe"}' | kubectl exec -i POD -- \
   /var/lib/opc-session-qualification/control/node.sock
 ```
 
+The bounded external runner automates only the fresh readiness-probe slice:
+
+```console
+cargo run --locked -p opc-session-testkit \
+  --bin opc-session-kubernetes-campaign -- \
+  --namespace session-ha-qualification \
+  --members 3 \
+  --rounds 120 \
+  --interval-ms 1000 \
+  --history-id candidate-readiness-001 \
+  --output-directory /var/lib/opc-qualification/candidate-readiness-001
+```
+
+The destination must be a new absolute direct child of an existing canonical
+directory and use the same bounded identifier alphabet for its final name. The
+runner writes a private, atomically published
+`transcript.jsonl`, `readiness-v3-fragment.jsonl`, and digest-binding
+`summary.json`; it never overwrites a prior run. Each sample invokes the
+same-binary client through `kubectl exec`, admits only the exact typed
+Openraft barrier report for the rendered voter count, and patches only the
+custom Pod condition through the status subresource. A listener, successful
+exec, or process liveness is never sufficient. Any missing, malformed,
+contradictory, oversized, timed-out, or failed reply clears readiness.
+
+The caller must have narrowly audited `get` access for `pods`, `create` access
+for `pods/exec`, and `patch` access for `pods/status` in the qualification
+namespace. Those grants remain outside the rendered tokenless ServiceAccount
+and manifest. The runner does not add a network control port, controller
+token, ClusterRole, or ClusterRoleBinding.
+
+Normal completion, failure, and Ctrl-C all attempt to set the custom condition
+to `False` on every member. Each subprocess, output stream, round count, and
+artifact is bounded. An uncatchable process or host failure can interrupt that
+final cleanup, so a separate deployment owner must treat the condition as a
+short-lived observation and clear it before reusing a fleet.
+
+The v3 file is deliberately a readiness-only fragment. It must be combined
+with real batch, watch, and restore operations from the same campaign and have
+its full operation count rebound before the independent v3 checker is run.
+The runner produces no v1 sequential workload history and its summary keeps
+`experimental`, `qualification_complete`, and `counts_for_production` fixed to
+`true`, `false`, and `false`. It therefore closes no #143 acceptance gate by
+itself.
+
 The rendered ServiceAccount remains tokenless and the manifest grants no RBAC
 or controller identity. Kubernetes authorization to use `pods/exec` for this
 client is nevertheless node-administrator-equivalent qualification authority:
