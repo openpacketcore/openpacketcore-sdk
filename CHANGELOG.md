@@ -1248,6 +1248,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- **Projected-mTLS restart readiness — `opc-identity` and
+  `opc-session-testkit`:** waiting for an initial projected SVID now also
+  guarantees that the paired TLS-controller publication is ready, preventing
+  an immediate restart-time controller from observing an empty feed. The
+  qualification harness also starts a blocking readiness round only when its
+  complete consensus-operation budget remains, preserving bounded failure
+  diagnostics instead of reporting a residual child-response timeout.
 - **Bounded reconnect admission — `opc-session-net`:** reconnect cooldown and
   exponential backoff now live in per-client, per-peer gates: one is shared
   across sequential calls and concurrent consensus lanes, and another is
