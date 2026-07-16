@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gates advertisement on an exact consumer projection rebuild. Session-store
   now uses the shared full-round/apply gate without changing its membership,
   recovery, routing, wire, or encryption behavior.
+- **Leadership-fenced VIP ownership — `opc-ipsec-lb`:** a protocol-neutral
+  `VipOwnershipCoordinator` now turns caller-supplied leader, quorum, listener
+  health, and deployment-unique monotonic-fence intent into idempotent
+  advertise/withdraw operations. Missing, stale, and ABA-reused fences fail
+  closed, and the default intent is not-owner. The new `ExternalLb` advertiser
+  tier performs intentional route-mutation no-ops while the coordinator keeps
+  the same ownership bookkeeping for externally delivered management or
+  dataplane VIPs. Typed provider-unknown state safely recovers ambiguous or
+  cancelled mutations by converging to a known withdrawal before retry, while
+  signal loss revokes the pending epoch. Fresh coordinators also withdraw once
+  before claiming provider state, and raw `AlreadyExists` remains unproven
+  rather than being accepted without readback.
 - **Generic XFRM SA output marks — `opc-ipsec-xfrm`:** callers can set an
   independent typed `SaParameters::output_mark` value/mask pair for Linux
   `XFRMA_SET_MARK`, including on inbound/decrypt SAs, and recover the exact

@@ -12,19 +12,21 @@ use opc_types::{NetworkFunctionKind, TenantId};
 use opc_ipsec_lb::{
     classify_swu_packet, measure_disruption, AntiReplayResume, BgpRouteVipAdvertiser,
     BgpRouteVipAdvertiserConfig, ClusterNode, CookieKey, CookieSlot, EspFragmentPosture,
-    FixedEntropy, ForwardingProof, IkeCookie, IkeCookieDecision, IkeCookieGate, IkeCookiePolicy,
-    IkeCookieRequest, IpAddress, IpFragment, IpsecLbError, IvResumeDecision, MockOwnershipFencer,
-    MockOwnershipSource, MockRePinAuditSink, MockSteeringBackend, MockSteeringOperation,
-    NicOffloadSecurityPosture, OwnershipFenceGrant, OwnershipFenceRequest, OwnershipFencer,
-    OwnershipRetryProof, OwnershipSource, OwnershipTransitionFingerprint, OwnershipTransitionId,
-    RePinAuditEvent, RePinAuditEventKind, RePinAuditSink, RePinCoordinator, RePinError,
-    RePinRequest, RePinRetryStage, RekeyRequest, RendezvousSelector, ResumeKeySource, SaId,
-    SameSpiResume, SelectionKey, SendIvCounter, SendIvCounterMode, SendIvForwardJump,
+    ExternalLbVipAdvertiser, FixedEntropy, ForwardingProof, IkeCookie, IkeCookieDecision,
+    IkeCookieGate, IkeCookiePolicy, IkeCookieRequest, IpAddress, IpFragment, IpsecLbError,
+    IvResumeDecision, LeadershipFence, MockOwnershipFencer, MockOwnershipSource,
+    MockRePinAuditSink, MockSteeringBackend, MockSteeringOperation, MockVipAdvertiser,
+    MockVipOperation, NicOffloadSecurityPosture, OwnershipFenceGrant, OwnershipFenceRequest,
+    OwnershipFencer, OwnershipRetryProof, OwnershipSource, OwnershipTransitionFingerprint,
+    OwnershipTransitionId, RePinAuditEvent, RePinAuditEventKind, RePinAuditSink, RePinCoordinator,
+    RePinError, RePinRequest, RePinRetryStage, RekeyRequest, RendezvousSelector, ResumeKeySource,
+    SaId, SameSpiResume, SelectionKey, SendIvCounter, SendIvCounterMode, SendIvForwardJump,
     SessionOwnershipKeyResolver, SessionOwnershipKeyspace, SessionStoreOwnershipSource, ShardId,
     ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind, SteerKey, SteeringBackend,
     SteeringBackendKind, SteeringProbe, SteeringRule, SwuClassification, SwuClassifierConfig,
     SwuPacket, TaggedSpiAllocator, TaggedSpiLayout, VipAdvertisement, VipAdvertiser,
-    MAX_ESP_SEND_IV_FORWARD_JUMP, MIN_SEND_IV_FORWARD_JUMP,
+    VipAdvertiserKind, VipOwnershipCoordinator, VipOwnershipIntent, MAX_ESP_SEND_IV_FORWARD_JUMP,
+    MIN_SEND_IV_FORWARD_JUMP,
 };
 
 const IKE_HEADER_LEN: usize = 28;
@@ -40,6 +42,182 @@ fn vip_delivered_probe_distinguishes_converged_production_from_mock_steering() {
     assert!(probe
         .details
         .is_some_and(|details| { details.contains("floating VIP") && details.contains("no-ops") }));
+}
+
+fn management_vip() -> VipAdvertisement {
+    VipAdvertisement {
+        vip: IpAddress::V4([192, 0, 2, 40]),
+        node: ClusterNode::new("control-a"),
+    }
+}
+
+fn owner_intent(fence: u64) -> VipOwnershipIntent {
+    VipOwnershipIntent {
+        leader: true,
+        quorum_available: true,
+        healthy: true,
+        fence: Some(LeadershipFence::new(fence).unwrap()),
+    }
+}
+
+#[tokio::test]
+async fn vip_ownership_follows_every_external_signal_idempotently() {
+    let advertiser = MockVipAdvertiser::new();
+    let advertisement = management_vip();
+    let mut coordinator = VipOwnershipCoordinator::new(advertisement.clone(), advertiser.clone());
+
+    coordinator
+        .reconcile(VipOwnershipIntent::default())
+        .await
+        .unwrap();
+    assert!(!coordinator.is_advertised());
+    assert!(advertiser.operations().is_empty());
+
+    for (fence, loss) in [
+        (
+            1,
+            VipOwnershipIntent {
+                leader: false,
+                ..owner_intent(1)
+            },
+        ),
+        (
+            2,
+            VipOwnershipIntent {
+                quorum_available: false,
+                ..owner_intent(2)
+            },
+        ),
+        (
+            3,
+            VipOwnershipIntent {
+                healthy: false,
+                ..owner_intent(3)
+            },
+        ),
+    ] {
+        let active = owner_intent(fence);
+        coordinator.reconcile(active).await.unwrap();
+        coordinator.reconcile(active).await.unwrap();
+        assert!(coordinator.is_advertised());
+
+        coordinator.reconcile(loss).await.unwrap();
+        coordinator.reconcile(loss).await.unwrap();
+        assert!(!coordinator.is_advertised());
+    }
+
+    assert_eq!(
+        advertiser.operations(),
+        vec![
+            MockVipOperation::Advertise(advertisement.clone()),
+            MockVipOperation::Withdraw(advertisement.clone()),
+            MockVipOperation::Advertise(advertisement.clone()),
+            MockVipOperation::Withdraw(advertisement.clone()),
+            MockVipOperation::Advertise(advertisement.clone()),
+            MockVipOperation::Withdraw(advertisement),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stale_missing_and_aba_fences_never_readvertise() {
+    let advertiser = MockVipAdvertiser::new();
+    let advertisement = management_vip();
+    let mut coordinator = VipOwnershipCoordinator::new(advertisement.clone(), advertiser.clone());
+
+    coordinator.reconcile(owner_intent(10)).await.unwrap();
+    coordinator.reconcile(owner_intent(9)).await.unwrap();
+    assert!(!coordinator.is_advertised());
+
+    coordinator.reconcile(owner_intent(9)).await.unwrap();
+    coordinator.reconcile(owner_intent(10)).await.unwrap();
+    coordinator
+        .reconcile(VipOwnershipIntent {
+            leader: true,
+            quorum_available: true,
+            healthy: true,
+            fence: None,
+        })
+        .await
+        .unwrap();
+    assert!(!coordinator.is_advertised());
+
+    coordinator.reconcile(owner_intent(11)).await.unwrap();
+    assert!(coordinator.is_advertised());
+    coordinator
+        .reconcile(VipOwnershipIntent {
+            healthy: false,
+            ..owner_intent(11)
+        })
+        .await
+        .unwrap();
+    assert!(!coordinator.is_advertised());
+
+    // An ABA return to this same node cannot reuse the prior epoch.
+    coordinator.reconcile(owner_intent(11)).await.unwrap();
+    assert!(!coordinator.is_advertised());
+    coordinator.reconcile(owner_intent(12)).await.unwrap();
+    assert!(coordinator.is_advertised());
+    assert_eq!(
+        coordinator.highest_observed_fence(),
+        Some(LeadershipFence::new(12).unwrap())
+    );
+
+    coordinator
+        .reconcile(VipOwnershipIntent {
+            leader: true,
+            quorum_available: true,
+            healthy: true,
+            fence: None,
+        })
+        .await
+        .unwrap();
+    assert!(!coordinator.is_advertised());
+
+    assert_eq!(
+        advertiser.operations(),
+        vec![
+            MockVipOperation::Advertise(advertisement.clone()),
+            MockVipOperation::Withdraw(advertisement.clone()),
+            MockVipOperation::Advertise(advertisement.clone()),
+            MockVipOperation::Withdraw(advertisement.clone()),
+            MockVipOperation::Advertise(advertisement),
+            MockVipOperation::Withdraw(management_vip()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn external_lb_provider_tracks_fenced_cycles_without_route_mutation() {
+    let advertiser = ExternalLbVipAdvertiser::new();
+    let probe = advertiser.probe().await.unwrap();
+    assert_eq!(probe.kind, VipAdvertiserKind::ExternalLb);
+    assert!(probe.platform_supported && probe.mutation_ready);
+
+    let mut coordinator = VipOwnershipCoordinator::new(management_vip(), advertiser);
+    coordinator.reconcile(owner_intent(40)).await.unwrap();
+    assert!(coordinator.is_advertised());
+    assert_eq!(
+        coordinator.advertised_fence(),
+        Some(LeadershipFence::new(40).unwrap())
+    );
+
+    coordinator
+        .reconcile(VipOwnershipIntent {
+            leader: false,
+            ..owner_intent(40)
+        })
+        .await
+        .unwrap();
+    assert!(!coordinator.is_advertised());
+
+    coordinator.reconcile(owner_intent(40)).await.unwrap();
+    assert!(!coordinator.is_advertised());
+    coordinator.reconcile(owner_intent(41)).await.unwrap();
+    assert!(coordinator.is_advertised());
+
+    // The provider is a zero-state adapter with no route backend to mutate.
+    assert_eq!(std::mem::size_of::<ExternalLbVipAdvertiser>(), 0);
 }
 
 fn shards(count: u16) -> ShardSet {

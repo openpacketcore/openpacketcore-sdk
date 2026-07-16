@@ -5,6 +5,10 @@
 //! crates compose these primitives with XDP/NIC backends and live failover
 //! evidence; this crate keeps kernel-independent conformance deterministic and
 //! CI-provable.
+//!
+//! VIP advertisement is protocol-neutral: callers can gate any management or
+//! dataplane VIP on their own election, quorum, health, and monotonic fence
+//! evidence without coupling that signal to IPsec SA ownership.
 
 #![forbid(unsafe_code)]
 
@@ -12,6 +16,7 @@ pub mod bgp;
 pub mod classifier;
 pub mod cookie;
 pub mod error;
+pub mod external_lb;
 pub mod failover;
 pub mod mock;
 pub mod model;
@@ -22,6 +27,7 @@ pub mod selector;
 pub mod session;
 pub mod spi;
 pub mod unsupported;
+pub mod vip;
 pub mod xdp;
 
 pub use bgp::{BgpRouteVipAdvertiser, BgpRouteVipAdvertiserConfig};
@@ -34,6 +40,7 @@ pub use cookie::{
     IkeCookieRequest,
 };
 pub use error::IpsecLbError;
+pub use external_lb::ExternalLbVipAdvertiser;
 pub use failover::{
     AntiReplayResume, IvResumeDecision, SendIvCounter, SendIvCounterMode, SendIvForwardJump,
     MAX_ESP_SEND_IV_FORWARD_JUMP, MIN_SEND_IV_FORWARD_JUMP,
@@ -70,6 +77,7 @@ pub use spi::{
 pub use unsupported::{
     UnsupportedOwnershipSource, UnsupportedSteeringBackend, UnsupportedVipAdvertiser,
 };
+pub use vip::{LeadershipFence, VipOwnershipCoordinator, VipOwnershipIntent, VipOwnershipState};
 pub use xdp::{
     HostXdpClusterChannelSecurity, HostXdpSteeringBackend, HostXdpSteeringBackendConfig,
     HostXdpTagTarget, HostXdpTarget,
@@ -84,5 +92,16 @@ mod integration_tests {
         let probe = SteeringProbe::mock();
         assert!(probe.key_material_free);
         assert!(!format!("{:?}", SteerKey::EspSpi(0x1234_5678)).contains("key"));
+
+        let coordinator = VipOwnershipCoordinator::new(
+            VipAdvertisement {
+                vip: IpAddress::V4([192, 0, 2, 40]),
+                node: ClusterNode::new("control-a"),
+            },
+            ExternalLbVipAdvertiser::new(),
+        );
+        assert!(!format!("{coordinator:?}")
+            .to_ascii_lowercase()
+            .contains("key"));
     }
 }

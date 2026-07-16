@@ -1,4 +1,4 @@
-//! Reusable ports for SWu load balancing.
+//! Reusable ports for VIP advertisement and SWu load balancing.
 
 use async_trait::async_trait;
 
@@ -46,10 +46,14 @@ pub trait SteeringBackend: Send + Sync + std::fmt::Debug {
 /// VIP advertisement port.
 #[async_trait]
 pub trait VipAdvertiser: Send + Sync + std::fmt::Debug {
-    /// Advertise a SWu VIP from this node.
+    /// Advertise a VIP from this node.
     async fn advertise(&self, advertisement: VipAdvertisement) -> Result<(), IpsecLbError>;
 
-    /// Withdraw a SWu VIP from this node.
+    /// Withdraw a VIP from this node.
+    ///
+    /// [`IpsecLbError::NotFound`] must mean that this exact advertisement is
+    /// absent. A coordinator can treat that result as successful convergence
+    /// while recovering from an ambiguous earlier provider mutation.
     async fn withdraw(&self, advertisement: VipAdvertisement) -> Result<(), IpsecLbError>;
 
     /// Probe advertiser capability and readiness.
