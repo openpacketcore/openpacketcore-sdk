@@ -219,15 +219,6 @@ impl LinuxXfrmBackend {
     }
 
     fn prepare_dscp(&self, parameters: &SaParameters) -> Result<Option<MarkProfile>, XfrmError> {
-        let configured_profile = self
-            .inner
-            .dscp_config
-            .as_ref()
-            .map(LinuxXfrmDscpMarkingConfig::profile)
-            .transpose()?;
-        if let (Some(output_mark), Some(profile)) = (parameters.output_mark, configured_profile) {
-            validate_output_mark_dscp_disjoint(output_mark, profile)?;
-        }
         let Some(dscp) = parameters.egress_dscp else {
             return Ok(None);
         };
@@ -319,7 +310,11 @@ impl LinuxXfrmBackend {
             .await
             .map_err(|_| indeterminate())?
             .ok_or_else(indeterminate)?;
-        let state = parse_sa_state(&response, dscp_profile).map_err(|_| indeterminate())?;
+        // Mutation admission already knows whether this SA requested DSCP.
+        // Compare the exact raw pair instead of inferring intent from an
+        // overlapping mark profile; query-time inference is intentionally
+        // conservative because arbitrary generic marks may overlap it.
+        let state = parse_sa_state(&response, None).map_err(|_| indeterminate())?;
         let expected_output_mark =
             compose_output_mark(parameters, dscp_profile).map_err(|_| indeterminate())?;
         if state.id != parameters.id
@@ -330,7 +325,6 @@ impl LinuxXfrmBackend {
             || state.replay_window != parameters.replay_window
             || state.lifetime_config != parameters.lifetime
             || state.output_mark != expected_output_mark
-            || state.egress_dscp != parameters.egress_dscp
         {
             return Err(indeterminate());
         }
@@ -367,12 +361,6 @@ impl XfrmBackend for LinuxXfrmBackend {
 
     async fn install_sa(&self, request: InstallSaRequest) -> Result<(), XfrmError> {
         let profile = self.prepare_dscp(&request.parameters)?;
-        let readback_profile = self
-            .inner
-            .dscp_config
-            .as_ref()
-            .map(LinuxXfrmDscpMarkingConfig::profile)
-            .transpose()?;
         let body = encode_sa_info_with_dscp(&request.parameters, profile)?;
         self.run_ack(
             "install_sa",
@@ -393,7 +381,7 @@ impl XfrmBackend for LinuxXfrmBackend {
             } else {
                 "install_sa_output_mark_readback"
             };
-            self.verify_output_mark_readback(&request.parameters, readback_profile, operation)
+            self.verify_output_mark_readback(&request.parameters, profile, operation)
                 .await?;
         }
         Ok(())
@@ -428,12 +416,6 @@ impl XfrmBackend for LinuxXfrmBackend {
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
         let profile = self.prepare_dscp(&request.parameters)?;
-        let readback_profile = self
-            .inner
-            .dscp_config
-            .as_ref()
-            .map(LinuxXfrmDscpMarkingConfig::profile)
-            .transpose()?;
         let body = encode_sa_info_with_dscp(&request.parameters, profile)?;
         self.run_ack(
             "rekey_sa",
@@ -452,7 +434,7 @@ impl XfrmBackend for LinuxXfrmBackend {
             } else {
                 "rekey_sa_output_mark_readback"
             };
-            self.verify_output_mark_readback(&request.parameters, readback_profile, operation)
+            self.verify_output_mark_readback(&request.parameters, profile, operation)
                 .await?;
         }
         Ok(())
@@ -1352,23 +1334,17 @@ fn parse_fixed_outer_dscp(
     let (Some(output_mark), Some(profile)) = (output_mark, profile) else {
         return Ok(None);
     };
-    let mask_overlap = output_mark.mask & profile.mask;
-    let value_overlap = output_mark.value & profile.mask;
-    if mask_overlap == 0 && value_overlap == 0 {
+    // Query has no durable record of whether an SA opted into fixed DSCP. Only
+    // an exclusive, complete token window is unambiguous; every broader or
+    // partial mask remains a generic output mark. Mutation readback separately
+    // proves composed DSCP state by comparing the exact raw pair.
+    if output_mark.mask != profile.mask || output_mark.value & !profile.mask != 0 {
         return Ok(None);
     }
-    if mask_overlap != profile.mask {
-        return Err(XfrmError::io(
-            "query_sa",
-            invalid_data("output mark partially overlaps configured DSCP profile"),
-        ));
-    }
-    let opc_ipsec_xfrm_ebpf_common::MarkToken::Dscp(dscp) = profile.decode_token(output_mark.value)
-    else {
-        return Err(XfrmError::io(
-            "query_sa",
-            invalid_data("malformed output-mark DSCP token"),
-        ));
+    let dscp = match profile.decode_token(output_mark.value) {
+        opc_ipsec_xfrm_ebpf_common::MarkToken::Dscp(dscp) => dscp,
+        opc_ipsec_xfrm_ebpf_common::MarkToken::Absent
+        | opc_ipsec_xfrm_ebpf_common::MarkToken::Malformed => return Ok(None),
     };
     DscpCodepoint::new(dscp)
         .map(Some)
@@ -2427,8 +2403,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_dscp_window_reserves_only_overlapping_generic_output_bits() {
-        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+    fn configured_dscp_companion_only_constrains_sas_that_request_dscp() {
         let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
             CapturingTransport::default(),
             dscp_config(),
@@ -2436,23 +2411,40 @@ mod tests {
         )
         .unwrap();
         let mut parameters = sa_parameters();
-        parameters.output_mark = Some(XfrmMark {
-            value: 0x0001_0000,
-            mask: 0x00ff_0000,
-        });
-        assert_eq!(backend.prepare_dscp(&parameters).unwrap(), None);
+        for output_mark in [
+            XfrmMark {
+                value: 0,
+                mask: u32::MAX,
+            },
+            XfrmMark {
+                value: u32::MAX,
+                mask: u32::MAX,
+            },
+        ] {
+            parameters.output_mark = Some(output_mark);
+            assert_eq!(backend.prepare_dscp(&parameters).unwrap(), None);
+        }
 
-        parameters.output_mark = Some(XfrmMark {
-            value: profile.presence_bit(),
-            mask: profile.mask,
-        });
-        assert!(matches!(
-            backend.prepare_dscp(&parameters),
-            Err(XfrmError::InvalidConfig {
-                field: "sa.output_mark",
-                ..
-            })
-        ));
+        parameters.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        for output_mark in [
+            XfrmMark {
+                value: 0,
+                mask: u32::MAX,
+            },
+            XfrmMark {
+                value: u32::MAX,
+                mask: u32::MAX,
+            },
+        ] {
+            parameters.output_mark = Some(output_mark);
+            assert!(matches!(
+                backend.prepare_dscp(&parameters),
+                Err(XfrmError::InvalidConfig {
+                    field: "sa.output_mark",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -2490,11 +2482,11 @@ mod tests {
         );
         let state = parse_sa_state(&body, Some(profile)).unwrap();
         assert_eq!(state.output_mark, Some(expected));
-        assert_eq!(state.egress_dscp, parameters.egress_dscp);
+        assert_eq!(state.egress_dscp, None);
     }
 
     #[test]
-    fn fixed_outer_dscp_query_round_trips_and_rejects_ambiguous_state() {
+    fn fixed_outer_dscp_query_round_trips_and_preserves_ambiguous_generic_state() {
         let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
         let mut parameters = sa_parameters();
         parameters.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
@@ -2527,25 +2519,28 @@ mod tests {
             Some(io::ErrorKind::InvalidData)
         );
 
-        let mut malformed = encode_sa_info(&sa_parameters()).unwrap();
+        let mut generic_without_presence = encode_sa_info(&sa_parameters()).unwrap();
         append_attr(
-            &mut malformed,
+            &mut generic_without_presence,
             XFRMA_SET_MARK,
             &(1_u32 << profile.shift).to_ne_bytes(),
         )
         .unwrap();
         append_attr(
-            &mut malformed,
+            &mut generic_without_presence,
             XFRMA_SET_MARK_MASK,
             &profile.mask.to_ne_bytes(),
         )
         .unwrap();
+        let state = parse_sa_state(&generic_without_presence, Some(profile)).unwrap();
         assert_eq!(
-            parse_sa_state(&malformed, Some(profile))
-                .unwrap_err()
-                .io_kind(),
-            Some(io::ErrorKind::InvalidData)
+            state.output_mark,
+            Some(XfrmMark {
+                value: 1_u32 << profile.shift,
+                mask: profile.mask,
+            })
         );
+        assert_eq!(state.egress_dscp, None);
 
         let mut disjoint_generic = encode_sa_info(&sa_parameters()).unwrap();
         append_attr(
@@ -2583,12 +2578,15 @@ mod tests {
             &profile.presence_bit().to_ne_bytes(),
         )
         .unwrap();
+        let state = parse_sa_state(&partial_overlap, Some(profile)).unwrap();
         assert_eq!(
-            parse_sa_state(&partial_overlap, Some(profile))
-                .unwrap_err()
-                .io_kind(),
-            Some(io::ErrorKind::InvalidData)
+            state.output_mark,
+            Some(XfrmMark {
+                value: profile.presence_bit(),
+                mask: profile.presence_bit(),
+            })
         );
+        assert_eq!(state.egress_dscp, None);
     }
 
     #[test]
@@ -3070,6 +3068,127 @@ mod tests {
         assert_eq!(
             route_attr_payload(rekey_body, XFRMA_SET_MARK_MASK),
             Some(rekeyed.mask.to_ne_bytes().as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn full_width_generic_marks_survive_a_configured_dscp_companion() {
+        for output_mark in [
+            XfrmMark {
+                value: 0,
+                mask: u32::MAX,
+            },
+            XfrmMark {
+                value: u32::MAX,
+                mask: u32::MAX,
+            },
+        ] {
+            let mut parameters = sa_parameters();
+            parameters.output_mark = Some(output_mark);
+            let response = encode_sa_info(&parameters).unwrap().to_vec();
+            let transport = CapturingTransport::with_response(response);
+            let runtime = FakeDscpRuntime::default();
+            let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
+                transport.clone(),
+                dscp_config(),
+                runtime.clone(),
+            )
+            .unwrap();
+
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: parameters.clone(),
+                })
+                .await
+                .unwrap();
+
+            let requests = transport.requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_NEWSA);
+            assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_GETSA);
+            assert_eq!(
+                route_attr_payload(netlink_body(&requests[0]), XFRMA_SET_MARK),
+                Some(output_mark.value.to_ne_bytes().as_slice())
+            );
+            assert_eq!(
+                route_attr_payload(netlink_body(&requests[0]), XFRMA_SET_MARK_MASK),
+                Some(output_mark.mask.to_ne_bytes().as_slice())
+            );
+            assert_eq!(runtime.ensure_calls(), 1);
+
+            let state = backend
+                .query_sa(QuerySaRequest {
+                    destination: parameters.id.destination,
+                    protocol: parameters.id.protocol,
+                    spi: parameters.id.spi,
+                    mark: parameters.mark,
+                })
+                .await
+                .unwrap();
+            assert_eq!(state.output_mark, Some(output_mark));
+            assert_eq!(state.egress_dscp, None);
+            assert_eq!(
+                backend.probe().await.unwrap().egress_dscp_marking,
+                XfrmCapability::Unknown
+            );
+
+            backend
+                .rekey_sa(RekeySaRequest { parameters })
+                .await
+                .unwrap();
+            let requests = transport.requests();
+            assert_eq!(requests.len(), 5);
+            assert_eq!(netlink_message_type(&requests[3]), XFRM_MSG_UPDSA);
+            assert_eq!(netlink_message_type(&requests[4]), XFRM_MSG_GETSA);
+            assert_eq!(runtime.ensure_calls(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn disjoint_generic_and_dscp_mutation_uses_exact_raw_readback() {
+        let profile = MarkProfile::new(25, 0xfe00_0000).unwrap();
+        let generic = XfrmMark {
+            value: 0x0001_0000,
+            mask: 0x00ff_0000,
+        };
+        let mut parameters = sa_parameters();
+        parameters.output_mark = Some(generic);
+        parameters.egress_dscp = Some(DscpCodepoint::new(46).unwrap());
+        let expected = XfrmMark {
+            value: generic.value | profile.encode_token(46).unwrap(),
+            mask: generic.mask | profile.mask,
+        };
+        let response = encode_sa_info_with_dscp(&parameters, Some(profile))
+            .unwrap()
+            .to_vec();
+        let transport = CapturingTransport::with_response(response);
+        let runtime = FakeDscpRuntime::default();
+        let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
+            transport.clone(),
+            dscp_config(),
+            runtime.clone(),
+        )
+        .unwrap();
+
+        backend
+            .install_sa(InstallSaRequest { parameters })
+            .await
+            .unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            route_attr_payload(netlink_body(&requests[0]), XFRMA_SET_MARK),
+            Some(expected.value.to_ne_bytes().as_slice())
+        );
+        assert_eq!(
+            route_attr_payload(netlink_body(&requests[0]), XFRMA_SET_MARK_MASK),
+            Some(expected.mask.to_ne_bytes().as_slice())
+        );
+        assert_eq!(runtime.ensure_calls(), 2);
+        assert_eq!(
+            backend.probe().await.unwrap().egress_dscp_marking,
+            XfrmCapability::Available
         );
     }
 

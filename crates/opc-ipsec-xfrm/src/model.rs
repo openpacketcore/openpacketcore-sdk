@@ -511,9 +511,10 @@ pub struct SaParameters {
     /// attributes for that pair on kernel readback, so use `None` to request
     /// no post-transform mark mutation.
     ///
-    /// When [`Self::egress_dscp`] is also set, this mask must not overlap the
-    /// backend's reserved DSCP token window; the Linux backend combines the
-    /// two disjoint values into the single kernel output-mark attribute pair.
+    /// A configured fixed-DSCP companion does not constrain this field unless
+    /// [`Self::egress_dscp`] is also set on this SA. When both are set, the
+    /// generic value and mask must be disjoint from the companion's token
+    /// window. The Linux backend combines both values into one kernel pair.
     pub output_mark: Option<XfrmMark>,
     /// Optional XFRM interface identifier.
     pub if_id: Option<u32>,
@@ -668,9 +669,14 @@ pub struct SaState {
     ///
     /// This is the raw combined `XFRMA_SET_MARK`/
     /// `XFRMA_SET_MARK_MASK` pair. When fixed outer DSCP is configured, it can
-    /// contain both the DSCP token window and a disjoint generic output mark.
+    /// contain both the DSCP token window and a generic output mark. The raw
+    /// pair is authoritative even when token intent is ambiguous.
     pub output_mark: Option<XfrmMark>,
-    /// Fixed outer DSCP decoded from this backend's post-transform mark token.
+    /// Fixed outer DSCP decoded from an exclusive, complete mark token.
+    ///
+    /// An arbitrary generic mark can overlap the backend's configured token
+    /// window, so this is a decoded observation rather than durable proof of
+    /// the original SA request. [`Self::output_mark`] remains exact.
     pub egress_dscp: Option<DscpCodepoint>,
 }
 
