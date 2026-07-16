@@ -220,7 +220,13 @@ fn spec_ref() -> SpecRef {
 /// @spec 3GPP TS29274 R18 5.1, 5.4, 5.5.1
 /// @req REQ-3GPP-TS29274-R18-5.1-002
 /// @conformance s2b-subset
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Safety for logging
+///
+/// `Debug` reports whether a TEID is present but never emits the tunnel
+/// identifier itself. Message type, flags, relative priority, length, and
+/// sequence metadata remain available for protocol diagnostics.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Header {
     /// Protocol version from flags octet bits 8-6; valid GTPv2-C is `2`.
     pub version: u8,
@@ -262,6 +268,25 @@ pub struct Header {
     /// raw-preserving encode retain ignored and spare bits; canonical encode
     /// always emits the typed priority and zero spare bits.
     pub spare_octet: u8,
+}
+
+impl fmt::Debug for Header {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Header")
+            .field("version", &self.version)
+            .field("piggybacking", &self.piggybacking)
+            .field("teid_flag", &self.teid_flag)
+            .field("teid_present", &self.teid.is_some())
+            .field("message_priority_flag", &self.message_priority_flag)
+            .field("spare", &self.spare)
+            .field("message_type", &self.message_type)
+            .field("length", &self.length)
+            .field("sequence_number", &self.sequence_number)
+            .field("message_priority", &self.message_priority)
+            .field("spare_octet", &self.spare_octet)
+            .finish()
+    }
 }
 
 impl Header {
@@ -574,9 +599,15 @@ pub fn encode_header(
     dst.put_u8(header.message_type);
     dst.put_u16(header.length);
     if header.teid_flag {
-        #[allow(clippy::unwrap_used)]
-        let teid = header.teid.unwrap(); // SAFETY: TEID flag/value consistency validated above.
-        dst.put_u32(teid);
+        match header.teid {
+            Some(teid) => dst.put_u32(teid),
+            None => {
+                return Err(EncodeError::new(EncodeErrorCode::Structural {
+                    reason: "TEID flag set without TEID value",
+                })
+                .with_spec_ref(spec));
+            }
+        }
     }
     dst.put_u8(((header.sequence_number >> 16) & 0xff) as u8);
     dst.put_u8(((header.sequence_number >> 8) & 0xff) as u8);

@@ -1810,7 +1810,9 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::ApnRestriction(value) => value.encode_value(dst),
             TypedIeValue::SelectionMode(value) => value.encode_value(dst),
             TypedIeValue::AdditionalProtocolConfigurationOptions(value) => value.encode_value(dst),
-            TypedIeValue::Raw(_) => unreachable!("raw IEs are encoded by the raw-preserving path"),
+            TypedIeValue::Raw(_) => Err(encode_structural_error(
+                "raw IE value must use the raw-preserving encoder",
+            )),
         }
     }
 }
@@ -1981,5 +1983,42 @@ fn apply_duplicate_policy<'a>(
             ies.push(typed);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_raw_value_encode_fails_structurally_without_panicking() {
+        let ie = TypedIe {
+            instance: 0,
+            value: TypedIeValue::Raw(RawIe {
+                ie_type: 254,
+                instance: 0,
+                spare: 0,
+                value: &[0xaa],
+            }),
+        };
+        let mut encoded = BytesMut::new();
+        let error = match ie.encode_value(&mut encoded, EncodeContext::default()) {
+            Ok(()) => panic!("internal raw value encoding unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert!(encoded.is_empty());
+        assert!(matches!(
+            error.code(),
+            EncodeErrorCode::Structural {
+                reason: "raw IE value must use the raw-preserving encoder"
+            }
+        ));
+        let spec = match error.spec_ref() {
+            Some(spec) => spec,
+            None => panic!("raw value encode error omitted its specification reference"),
+        };
+        assert_eq!(spec.doc(), "TS29274");
+        assert_eq!(spec.section(), "8.2");
     }
 }

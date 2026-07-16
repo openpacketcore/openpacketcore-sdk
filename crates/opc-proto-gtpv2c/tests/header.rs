@@ -256,6 +256,44 @@ fn message_priority_type_and_builder_are_bounded_and_canonical() {
 }
 
 #[test]
+fn header_debug_redacts_tunnel_identifier() {
+    let header = Header::with_teid(32, 0x0102_0304, 0x0000_abcd)
+        .with_message_priority(MessagePriority::LOWEST);
+    let debug = format!("{header:?}");
+
+    assert!(debug.contains("teid_flag: true"));
+    assert!(debug.contains("teid_present: true"));
+    assert!(debug.contains("message_priority: Some(MessagePriority(15))"));
+    assert!(!debug.contains("16909060"));
+    assert!(!debug.contains("teid: "));
+}
+
+#[test]
+fn missing_teid_encode_is_structured_and_does_not_write() {
+    let mut header = Header::with_teid(32, 0x0102_0304, 1);
+    header.teid = None;
+    let mut encoded = BytesMut::new();
+    let error = match encode_header(&header, &mut encoded, EncodeContext::default()) {
+        Ok(()) => panic!("inconsistent TEID header unexpectedly encoded"),
+        Err(error) => error,
+    };
+
+    assert!(encoded.is_empty());
+    assert!(matches!(
+        error.code(),
+        EncodeErrorCode::Structural {
+            reason: "TEID flag set without TEID value"
+        }
+    ));
+    let spec = match error.spec_ref() {
+        Some(spec) => spec,
+        None => panic!("TEID encode error omitted its specification reference"),
+    };
+    assert_eq!(spec.doc(), "TS29274");
+    assert_eq!(spec.section(), "5.1");
+}
+
+#[test]
 fn header_strict_decode_rejects_spares_and_encode_rejects_bad_shape() {
     let spare_flags = [0x41, 0x01, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00];
     let decoded = decode_header(&spare_flags, strict_context());
