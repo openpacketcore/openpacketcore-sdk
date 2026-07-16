@@ -1960,6 +1960,109 @@ async fn profiled_cold_connection_is_a_contained_fifteen_hundred_millisecond_bou
 }
 
 #[tokio::test]
+async fn append_soft_ttl_reserves_post_handshake_rpc_time_and_reuses_the_socket() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-append-soft-reserve", 18, 1);
+    let handler = Arc::new(CountingEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("profiled soft-reserve listener");
+
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let delayed_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                // Eighty percent of the derived one-second cold allocation is
+                // consumed before TCP, mTLS, and bootstrap. The remaining
+                // overall soft TTL must still carry the negotiated RPC.
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                Ok(addr)
+            })
+        })
+    };
+    let remote_binding = manifest
+        .bind_local(replica_id(1))
+        .expect("client binding")
+        .bind_remote(replica_id(SERVER_REPLICA))
+        .expect("remote binding");
+    let peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+        remote_binding,
+        delayed_resolver,
+        pki.client_config(1),
+    );
+    let soft_ttl = Duration::from_millis(1_500);
+
+    for payload in [b"near-cold-cap".to_vec(), b"cached-follow-up".to_vec()] {
+        assert_eq!(
+            peer.call_with_timeout(
+                request_for_family(
+                    &manifest,
+                    1,
+                    SessionConsensusRpcFamily::AppendEntries,
+                    payload.clone(),
+                ),
+                soft_ttl,
+            )
+            .await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(payload),
+            })
+        );
+    }
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "the validated first response must return the authenticated socket to its lane"
+    );
+
+    let too_late_resolver: RemoteAddrResolver = Arc::new(move || {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            Ok(addr)
+        })
+    });
+    let too_late_peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("late client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("late remote binding"),
+        too_late_resolver,
+        pki.client_config(1),
+    );
+    assert_eq!(
+        too_late_peer
+            .call_with_timeout(
+                request_for_family(
+                    &manifest,
+                    1,
+                    SessionConsensusRpcFamily::AppendEntries,
+                    b"reserved-for-rpc".to_vec(),
+                ),
+                soft_ttl,
+            )
+            .await,
+        Err(SessionConsensusPeerError::Timeout)
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        2,
+        "cold work beyond its proportional allocation must not consume the negotiated RPC reserve"
+    );
+
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn profiled_long_rpc_families_are_not_truncated_by_the_append_deadline() {
     let pki = TestPki::new();
     let manifest = manifest("consensus-profiled-family-deadlines", 9, 1);

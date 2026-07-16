@@ -1323,6 +1323,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- **Cold consensus reconnects preserve first-RPC progress — `opc-session-net`:**
+  DNS/TCP/mTLS/bootstrap now consumes at most two thirds of the caller's
+  existing logical budget, leaving a bounded nonzero remainder for the first
+  negotiated RPC without increasing any Openraft or qualification deadline.
+  Cached lanes clear shared reconnect cooldown only after a complete validated
+  reusable response, preventing stale sockets from restarting connection
+  churn during exact-address member replacement.
 - **Projected-mTLS restart readiness — `opc-identity` and
   `opc-session-testkit`:** waiting for an initial projected SVID now also
   guarantees that the paired TLS-controller publication is ready, preventing
