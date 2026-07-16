@@ -2,8 +2,11 @@
 //!
 //! This crate provides a backend trait for XFRM SA/policy lifecycle operations,
 //! a deterministic mock backend for tests, an unsupported-platform backend, and
-//! redaction-safe error types. It deliberately does not implement IKE,
-//! ESP processing, namespace management, or deployment policy.
+//! redaction-safe error types. SA parameters can carry an independent Linux
+//! lookup mark and a masked post-transform output mark; the latter is applied
+//! to inbound/decrypt SAs as well as outbound SAs. This crate deliberately does
+//! not implement IKE, ESP processing, namespace management, or deployment
+//! policy.
 //!
 //! Raw Linux netlink work stays in [`opc_linux_xfrm_sys`]; this crate is safe
 //! Rust and never performs `unsafe` operations.
@@ -96,6 +99,7 @@ mod integration_tests {
             replay_state: None,
             encap: None,
             mark: None,
+            output_mark: None,
             if_id: None,
             egress_dscp: None,
         }

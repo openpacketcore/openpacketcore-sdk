@@ -686,6 +686,7 @@ mod tests {
             replay_state: None,
             encap: None,
             mark: None,
+            output_mark: None,
             if_id: None,
             egress_dscp: None,
         }

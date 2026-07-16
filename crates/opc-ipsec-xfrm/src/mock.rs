@@ -8,10 +8,10 @@ use async_trait::async_trait;
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
-    AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig,
-    LifetimeCurrent, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest,
-    RemoveSaRequest, SaReplayState, SaState, SaStatistics, SpiAllocation, XfrmAction,
-    XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    validate_sa_output_mark, AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress,
+    LifetimeConfig, LifetimeCurrent, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
+    RemovePolicyRequest, RemoveSaRequest, SaReplayState, SaState, SaStatistics, SpiAllocation,
+    XfrmAction, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 
 /// One recorded call against the mock backend.
@@ -283,6 +283,7 @@ fn sa_state_from_parameters(parameters: &crate::model::SaParameters) -> SaState 
             replay_window: parameters.replay_window,
             ..SaStatistics::default()
         },
+        output_mark: parameters.output_mark,
         egress_dscp: None,
     }
 }
@@ -336,6 +337,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn install_sa(&self, request: InstallSaRequest) -> Result<(), XfrmError> {
+        validate_sa_output_mark(request.parameters.output_mark)?;
         if request.parameters.egress_dscp.is_some() {
             return Err(XfrmError::UnsupportedFeature {
                 feature: "fixed_outer_dscp",
@@ -431,6 +433,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
+        validate_sa_output_mark(request.parameters.output_mark)?;
         if request.parameters.egress_dscp.is_some() {
             return Err(XfrmError::UnsupportedFeature {
                 feature: "fixed_outer_dscp",
@@ -621,6 +624,7 @@ mod tests {
             replay_state: None,
             encap: None,
             mark: None,
+            output_mark: None,
             if_id: None,
             egress_dscp: None,
         }
@@ -807,6 +811,70 @@ mod tests {
             backend.probe().await.unwrap().egress_dscp_marking,
             XfrmCapability::Missing
         );
+    }
+
+    #[tokio::test]
+    async fn mock_round_trips_generic_output_mark_on_install_and_rekey() {
+        let backend = MockXfrmBackend::new();
+        let mut params = sample_sa_parameters();
+        params.output_mark = Some(XfrmMark {
+            value: 0x0001_0000,
+            mask: 0x00ff_0000,
+        });
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+
+        let query = QuerySaRequest::new(params.id.destination, params.id.protocol, params.id.spi);
+        assert_eq!(
+            backend.query_sa(query).await.unwrap().output_mark,
+            params.output_mark
+        );
+
+        params.output_mark = Some(XfrmMark {
+            value: u32::MAX,
+            mask: u32::MAX,
+        });
+        backend
+            .rekey_sa(RekeySaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.query_sa(query).await.unwrap().output_mark,
+            params.output_mark
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_rejects_zero_value_and_mask_output_mark_without_mutating() {
+        let backend = MockXfrmBackend::new();
+        let mut params = sample_sa_parameters();
+        params.output_mark = Some(XfrmMark { value: 0, mask: 0 });
+
+        for result in [
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: params.clone(),
+                })
+                .await,
+            backend
+                .rekey_sa(RekeySaRequest { parameters: params })
+                .await,
+        ] {
+            assert!(matches!(
+                result,
+                Err(XfrmError::InvalidConfig {
+                    field: "sa.output_mark",
+                    ..
+                })
+            ));
+        }
+        assert!(backend.operations().is_empty());
     }
 
     #[tokio::test]

@@ -3,8 +3,11 @@
 //! The test runs inside the fresh network namespace provided by CI. It
 //! installs real tunnel-mode ESP state and policy through the SDK, captures
 //! the encrypted packet in a peer namespace, and verifies the outer IPv4 DS
-//! field and checksum. It also proves the absent path, kernel-state query,
-//! capability transition, and gap-free adoption of an existing tc slot.
+//! field and checksum. The reverse path emits real ESP from that peer, decrypts
+//! it through an inbound SDK SA and policy, and observes the post-decrypt skb
+//! mark at the netfilter INPUT boundary. The test also proves the absent path,
+//! kernel-state query, capability transition, and gap-free adoption of an
+//! existing tc slot.
 
 #![cfg(target_os = "linux")]
 
@@ -15,6 +18,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 use aya::maps::MapInfo;
 use aya::programs::SchedClassifier;
@@ -38,9 +42,18 @@ const INNER_MARKED: [u8; 4] = [10, 45, 0, 2];
 const INNER_UNMARKED: [u8; 4] = [10, 45, 0, 3];
 const MARKED_SPI: u32 = 0x1000_0001;
 const UNMARKED_SPI: u32 = 0x1000_0002;
+const INBOUND_OUTPUT_MARK_SPI: u32 = 0x1000_0003;
+const INBOUND_PORT: u16 = 5_001;
+const INBOUND_PAYLOAD: &[u8] = b"opc-xfrm-inbound-output-mark";
+const EXPECTED_MARK_COMMENT: &str = "opc-xfrm-expected-inbound-mark";
+const ZERO_MARK_COMMENT: &str = "opc-xfrm-zero-inbound-mark";
 const MARKED_LOOKUP: XfrmMark = XfrmMark {
     value: 0x0000_0042,
     mask: 0x0000_00ff,
+};
+const INBOUND_OUTPUT_MARK: XfrmMark = XfrmMark {
+    value: 0x0012_0000,
+    mask: 0x00ff_0000,
 };
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ESP: u8 = 50;
@@ -110,6 +123,42 @@ impl TestNet {
         run("ip", &["-n", &peer_ns, "link", "set", "lo", "up"]);
         run(
             "ip",
+            &["-n", &peer_ns, "addr", "add", "10.45.0.2/32", "dev", "lo"],
+        );
+        run(
+            "ip",
+            &[
+                "-n",
+                &peer_ns,
+                "route",
+                "add",
+                "10.45.0.1/32",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "swup",
+                "src",
+                "10.45.0.2",
+            ],
+        );
+        run(
+            "ip",
+            &[
+                "-n",
+                &peer_ns,
+                "neigh",
+                "add",
+                "192.0.2.1",
+                "lladdr",
+                "02:00:00:00:00:01",
+                "nud",
+                "permanent",
+                "dev",
+                "swup",
+            ],
+        );
+        run(
+            "ip",
             &[
                 "neigh",
                 "add",
@@ -155,6 +204,37 @@ impl TestNet {
                 .expect("set capture timeout");
             socket
         })
+    }
+
+    fn send_inbound_esp(&self) {
+        let peer_ns = self.peer_ns.clone();
+        in_netns(&peer_ns, move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build peer XFRM runtime");
+            runtime.block_on(async {
+                let backend = LinuxXfrmBackend::new();
+                backend
+                    .install_sa(InstallSaRequest {
+                        parameters: peer_outbound_sa_parameters(INBOUND_OUTPUT_MARK_SPI),
+                    })
+                    .await
+                    .expect("install peer outbound SA");
+                backend
+                    .install_policy(InstallPolicyRequest {
+                        parameters: peer_outbound_policy_parameters(INBOUND_OUTPUT_MARK_SPI),
+                    })
+                    .await
+                    .expect("install peer outbound policy");
+            });
+
+            let socket = UdpSocket::bind((Ipv4Addr::from(INNER_MARKED), 0))
+                .expect("bind peer protected inner source");
+            socket
+                .send_to(INBOUND_PAYLOAD, (Ipv4Addr::from(INNER_LOCAL), INBOUND_PORT))
+                .expect("send peer packet through outbound ESP SA");
+        });
     }
 }
 
@@ -203,9 +283,52 @@ fn sa_parameters(
         replay_state: None,
         encap: None,
         mark,
+        output_mark: None,
         if_id: None,
         egress_dscp,
     }
+}
+
+fn inbound_sa_parameters(spi: u32, output_mark: XfrmMark) -> SaParameters {
+    let mut parameters = sa_parameters(INNER_MARKED, spi, None, None);
+    parameters.selector = XfrmSelector::new(ip(INNER_MARKED), ip(INNER_LOCAL), IPPROTO_UDP);
+    parameters.id.destination = ip(OUTER_LOCAL);
+    parameters.source_address = ip(OUTER_PEER);
+    parameters.output_mark = Some(output_mark);
+    parameters
+}
+
+fn inbound_policy_parameters(spi: u32) -> PolicyParameters {
+    PolicyParameters {
+        selector: XfrmSelector::new(ip(INNER_MARKED), ip(INNER_LOCAL), IPPROTO_UDP),
+        direction: XfrmDirection::In,
+        action: XfrmAction::Allow,
+        priority: 100,
+        templates: vec![XfrmTemplate {
+            id: XfrmId {
+                destination: ip(OUTER_LOCAL),
+                spi,
+                protocol: IPPROTO_ESP,
+            },
+            source_address: ip(OUTER_PEER),
+            request_id: None,
+            mode: XfrmMode::Tunnel,
+        }],
+        mark: None,
+        if_id: None,
+    }
+}
+
+fn peer_outbound_sa_parameters(spi: u32) -> SaParameters {
+    let mut parameters = inbound_sa_parameters(spi, INBOUND_OUTPUT_MARK);
+    parameters.output_mark = None;
+    parameters
+}
+
+fn peer_outbound_policy_parameters(spi: u32) -> PolicyParameters {
+    let mut parameters = inbound_policy_parameters(spi);
+    parameters.direction = XfrmDirection::Out;
+    parameters
 }
 
 fn policy_parameters(
@@ -331,6 +454,69 @@ fn send_protected(destination: [u8; 4], tos: i32, mark: Option<u32>) {
         .expect("send protected packet");
 }
 
+fn install_inbound_mark_observer() {
+    for (mark, comment) in [
+        ("0x00000000/0x00ff0000", ZERO_MARK_COMMENT),
+        ("0x00120000/0x00ff0000", EXPECTED_MARK_COMMENT),
+    ] {
+        run(
+            "iptables",
+            &[
+                "-w",
+                "5",
+                "-t",
+                "mangle",
+                "-A",
+                "INPUT",
+                "-s",
+                "10.45.0.2",
+                "-d",
+                "10.45.0.1",
+                "-p",
+                "udp",
+                "--dport",
+                "5001",
+                "-m",
+                "mark",
+                "--mark",
+                mark,
+                "-m",
+                "comment",
+                "--comment",
+                comment,
+                "-j",
+                "ACCEPT",
+            ],
+        );
+    }
+}
+
+fn inbound_mark_rule_packets(comment: &str) -> u64 {
+    let output = Command::new("iptables-save")
+        .args(["-c", "-t", "mangle"])
+        .output()
+        .expect("read inbound mark counters");
+    assert!(
+        output.status.success(),
+        "iptables-save failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rules = String::from_utf8_lossy(&output.stdout);
+    let rule = rules
+        .lines()
+        .find(|line| line.contains(comment))
+        .unwrap_or_else(|| panic!("missing inbound mark observer rule {comment}:\n{rules}"));
+    let counters = rule
+        .strip_prefix('[')
+        .and_then(|line| line.split_once(']'))
+        .map(|(counters, _)| counters)
+        .expect("iptables-save rule counter prefix");
+    counters
+        .split_once(':')
+        .and_then(|(packets, _)| packets.parse().ok())
+        .expect("iptables-save packet counter")
+}
+
 fn ipv4_checksum_is_valid(header: &[u8]) -> bool {
     header.chunks_exact(2).fold(0_u32, |sum, word| {
         let sum = sum + u32::from(u16::from_be_bytes([word[0], word[1]]));
@@ -444,6 +630,66 @@ async fn fixed_outer_dscp_is_visible_on_real_esp_and_survives_adoption(
         .await?;
     assert_eq!(unmarked_state.egress_dscp, None);
 
+    let inbound_parameters = inbound_sa_parameters(INBOUND_OUTPUT_MARK_SPI, INBOUND_OUTPUT_MARK);
+    assert_eq!(inbound_parameters.id.destination, ip(OUTER_LOCAL));
+    assert_eq!(inbound_parameters.source_address, ip(OUTER_PEER));
+    backend
+        .install_sa(InstallSaRequest {
+            parameters: inbound_parameters,
+        })
+        .await?;
+    backend
+        .install_policy(InstallPolicyRequest {
+            parameters: inbound_policy_parameters(INBOUND_OUTPUT_MARK_SPI),
+        })
+        .await?;
+    let inbound_state = backend
+        .query_sa(QuerySaRequest::new(
+            ip(OUTER_LOCAL),
+            IPPROTO_ESP,
+            INBOUND_OUTPUT_MARK_SPI,
+        ))
+        .await?;
+    assert_eq!(inbound_state.output_mark, Some(INBOUND_OUTPUT_MARK));
+    assert_eq!(inbound_state.egress_dscp, None);
+
+    // The peer XFRM path emits a real tunnel-mode ESP packet. Successful UDP
+    // delivery proves decryption and inbound policy acceptance; the two INPUT
+    // counters then observe the skb after XFRM input applied the SA smark.
+    // Matching the expected masked value while the zero-window control stays
+    // untouched proves this is a post-decrypt packet mark, not GETSA metadata.
+    install_inbound_mark_observer();
+    let receiver = UdpSocket::bind((Ipv4Addr::from(INNER_LOCAL), INBOUND_PORT))?;
+    receiver.set_read_timeout(Some(Duration::from_secs(3)))?;
+    net.send_inbound_esp();
+    let mut inbound_payload = [0_u8; 128];
+    let (inbound_len, inbound_source) = receiver.recv_from(&mut inbound_payload)?;
+    assert_eq!(inbound_source.ip(), Ipv4Addr::from(INNER_MARKED));
+    assert_eq!(&inbound_payload[..inbound_len], INBOUND_PAYLOAD);
+    assert_eq!(
+        inbound_mark_rule_packets(EXPECTED_MARK_COMMENT),
+        1,
+        "the decrypted skb must carry the inbound SA output mark"
+    );
+    assert_eq!(
+        inbound_mark_rule_packets(ZERO_MARK_COMMENT),
+        0,
+        "the decrypted skb must not retain a zero bearer-mark window"
+    );
+    assert!(
+        backend
+            .query_sa(QuerySaRequest::new(
+                ip(OUTER_LOCAL),
+                IPPROTO_ESP,
+                INBOUND_OUTPUT_MARK_SPI,
+            ))
+            .await?
+            .lifetime_current
+            .packets
+            > 0,
+        "the kernel inbound SA must account for the decrypted ESP packet"
+    );
+
     let capture = net.capture_socket();
     // Linux applies its own ECN tunnel mapping before tc egress. Capture that
     // exact legacy value, then prove the DSCP companion preserves it.
@@ -531,5 +777,19 @@ async fn fixed_outer_dscp_is_visible_on_real_esp_and_survives_adoption(
             })
             .await?;
     }
+    restarted
+        .remove_policy(RemovePolicyRequest {
+            selector: XfrmSelector::new(ip(INNER_MARKED), ip(INNER_LOCAL), IPPROTO_UDP),
+            direction: XfrmDirection::In,
+            mark: None,
+        })
+        .await?;
+    restarted
+        .remove_sa(RemoveSaRequest::new(
+            ip(OUTER_LOCAL),
+            IPPROTO_ESP,
+            INBOUND_OUTPUT_MARK_SPI,
+        ))
+        .await?;
     Ok(())
 }
