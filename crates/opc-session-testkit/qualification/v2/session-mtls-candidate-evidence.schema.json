@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-mtls-candidate-evidence/v2",
+  "title": "Digest-bound experimental synthetic session mTLS candidate evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "experimental",
+    "qualification_complete",
+    "source",
+    "artifact",
+    "campaign",
+    "topology",
+    "bindings",
+    "observations",
+    "coverage",
+    "remaining_acceptance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "opc-session-mtls-candidate-evidence/v2"
+    },
+    "experimental": {
+      "const": true
+    },
+    "qualification_complete": {
+      "const": false
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "tree_status", "worktree_sha256"],
+      "properties": {
+        "revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "tree_status": {
+          "enum": ["clean", "dirty_unqualified"]
+        },
+        "worktree_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "sha256",
+        "harness_name",
+        "harness_sha256",
+        "insecure_test_enabled"
+      ],
+      "properties": {
+        "name": {
+          "const": "opc-session-quorum-node"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "harness_name": {
+          "const": "qualification_mtls_multiprocess"
+        },
+        "harness_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "insecure_test_enabled": {
+          "const": false
+        }
+      }
+    },
+    "campaign": {
+      "enum": [
+        "rotation_core",
+        "fault_expiry_recovery",
+        "traffic_resource_bounds"
+      ]
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "members",
+        "distinct_processes",
+        "distinct_sqlite_databases",
+        "transport_mode",
+        "directed_path_count",
+        "counts_for_seamless_tls_rotation"
+      ],
+      "properties": {
+        "members": {
+          "enum": [3, 5]
+        },
+        "distinct_processes": {
+          "const": true
+        },
+        "distinct_sqlite_databases": {
+          "const": true
+        },
+        "transport_mode": {
+          "const": "projected_svid_mtls_pinned_loopback"
+        },
+        "directed_path_count": {
+          "enum": [6, 20]
+        },
+        "counts_for_seamless_tls_rotation": {
+          "const": false
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "members": { "const": 3 },
+            "directed_path_count": { "const": 6 }
+          }
+        },
+        {
+          "properties": {
+            "members": { "const": 5 },
+            "directed_path_count": { "const": 20 }
+          }
+        }
+      ]
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_schema_sha256",
+        "configuration_sha256",
+        "public_material_manifest_sha256",
+        "workload_schedule_sha256"
+      ],
+      "properties": {
+        "evidence_schema_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "configuration_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "public_material_manifest_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "workload_schedule_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "material_status_collected",
+        "durable_readiness_reached",
+        "directed_fresh_handshakes_succeeded",
+        "lifecycle_metrics_collected",
+        "encrypted_canary_verified",
+        "plaintext_canary_absent_from_sqlite_family"
+      ],
+      "properties": {
+        "material_status_collected": {
+          "const": true
+        },
+        "durable_readiness_reached": {
+          "const": true
+        },
+        "directed_fresh_handshakes_succeeded": {
+          "const": true
+        },
+        "lifecycle_metrics_collected": {
+          "const": true
+        },
+        "encrypted_canary_verified": {
+          "const": true
+        },
+        "plaintext_canary_absent_from_sqlite_family": {
+          "const": true
+        }
+      }
+    },
+    "coverage": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 9,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "leaf_renewal",
+          "intermediate_rotation_rollback",
+          "root_overlap_removal_rollback",
+          "removed_root_rejected",
+          "fresh_directed_handshakes",
+          "durable_readiness",
+          "encrypted_canary_boundary",
+          "synthetic_consensus_admission_loss",
+          "malformed_trust_retains_last_good",
+          "exact_address_active_mutator_restart",
+          "short_lived_svid_expiry",
+          "same_process_material_recovery",
+          "survivor_traffic_continuity",
+          "repeated_leaf_rotation_under_traffic",
+          "mixed_workload_continuity",
+          "bounded_connection_lifecycle",
+          "linux_process_resource_bounds"
+        ]
+      }
+    },
+    "remaining_acceptance": {
+      "type": "array",
+      "const": [
+        "real_network_storage_faults",
+        "deployed_cnf_kubernetes",
+        "supported_platform_resource_soak",
+        "remote_hkms",
+        "live_metrics_alerts_qualification",
+        "signed_independent_candidate",
+        "ha_profile_graduation"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "campaign": { "const": "rotation_core" },
+        "coverage": {
+          "const": [
+            "leaf_renewal",
+            "intermediate_rotation_rollback",
+            "root_overlap_removal_rollback",
+            "removed_root_rejected",
+            "fresh_directed_handshakes",
+            "durable_readiness",
+            "encrypted_canary_boundary"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "campaign": { "const": "fault_expiry_recovery" },
+        "coverage": {
+          "const": [
+            "synthetic_consensus_admission_loss",
+            "malformed_trust_retains_last_good",
+            "exact_address_active_mutator_restart",
+            "short_lived_svid_expiry",
+            "same_process_material_recovery",
+            "survivor_traffic_continuity",
+            "durable_readiness",
+            "encrypted_canary_boundary"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "campaign": { "const": "traffic_resource_bounds" },
+        "coverage": {
+          "const": [
+            "repeated_leaf_rotation_under_traffic",
+            "mixed_workload_continuity",
+            "root_overlap_removal_rollback",
+            "removed_root_rejected",
+            "fresh_directed_handshakes",
+            "durable_readiness",
+            "bounded_connection_lifecycle",
+            "linux_process_resource_bounds",
+            "encrypted_canary_boundary"
+          ]
+        }
+      }
+    }
+  ]
+}

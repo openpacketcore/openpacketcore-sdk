@@ -34,6 +34,7 @@ zeroize = { workspace = true }
 [dev-dependencies]
 opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 rcgen = { workspace = true }
+rustix = { version = "1", features = ["fs"] }
 
 [[test]]
 name = "qualification_multiprocess"

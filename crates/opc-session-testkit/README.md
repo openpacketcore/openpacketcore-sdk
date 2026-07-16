@@ -346,6 +346,45 @@ It is not silently widened by the newer multiprocess rotation core. Those seven
 gaps are not an exhaustive #164 acceptance inventory, and neither checkpoint is
 deployed production evidence.
 
+`qualification/v2/session-mtls-candidate-evidence.schema.json` is a separate,
+closed candidate contract for the completed local rotation-core,
+fault/expiry-recovery, and traffic/resource campaigns. The typed record binds
+the exact source revision and clean/dirty tree state, qualification child
+digest, parent harness digest, generated-configuration digest, immutable schema
+digest, exact declared phase/orchestration schedule, 3/5-member topology,
+ordered `N*(N-1)` directed-path count, and exact campaign-specific coverage.
+Source, child, parent, and configuration inputs are captured before execution
+and rehashed after the campaign; any change prevents emission. A separate
+domain-separated manifest digest binds the ordered publication phase, member,
+epoch, and exact public certificate-chain and trust-bundle bytes. It therefore
+binds the certificates' public validity, serial, issuer, and public-key facts
+without hashing or serializing private keys. Source state includes staged,
+modified, and nonignored untracked files. The record never contains certificate
+material, keys or key digests, SPIFFE IDs, peer addresses, filesystem paths,
+session payloads, or backend text, and every public `Debug` representation
+redacts source and digest bindings.
+
+Successful campaigns construct and validate this record in a private temporary
+directory through a harness-private successful construction path, so evidence
+is ephemeral by default. Public API supports bounded decode, validation, and
+read-only inspection, not manufacturing all-success records. Setting the existing absolute
+`OPC_SESSION_HA_EVIDENCE_DIR` contract preserves only `evidence.json` and the
+matching schema. Source files are opened no-follow and read through a hard
+bound; output is written as `0600` files in a held-descriptor `0700` sibling
+staging directory, fsynced, and atomically renamed without replacement to the
+final campaign name. An error before publication cannot expose a partial final
+bundle. The absolute root must itself be `0700`; symlink roots and pre-existing
+broader directories are rejected and never chmodded. Node configuration, logs,
+metrics payloads, projected material, and SQLite files are never copied. The schema fixes
+`experimental = true`, `qualification_complete = false`,
+`insecure_test_enabled = false`, and
+`counts_for_seamless_tls_rotation = false`; candidate emission fails closed
+when the `foundation-insecure` feature is compiled. Real network/storage faults,
+deployed CNF/Kubernetes execution, supported-platform soak, remote HKMS, live
+metrics/alerts, independent checking/signing, and HA-profile graduation remain
+explicitly open. This candidate record does not complete #164 or #158 and does
+not replace independent release evidence.
+
 ## Concurrent History Candidate
 
 `qualification/v3/session-ha-candidate-evidence.schema.json` is a closed,

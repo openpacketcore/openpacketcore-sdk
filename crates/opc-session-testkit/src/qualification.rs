@@ -93,6 +93,12 @@ pub const SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4: [&str; 8] = [
 /// Strict schema for one incomplete production-mTLS harness checkpoint.
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-mtls-candidate-evidence.schema.json");
+/// Closed schema for one digest-bound synthetic projected-mTLS campaign.
+///
+/// The v2 contract always remains experimental and cannot claim either
+/// completed qualification or seamless-rotation production credit.
+pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON: &str =
+    include_str!("../qualification/v2/session-mtls-candidate-evidence.schema.json");
 
 /// Version of the private node configuration and control protocol.
 pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 3;
@@ -346,6 +352,757 @@ pub const QUALIFICATION_TRAFFIC_CANCELLATION_PROFILE: &str =
     "accepted-operation-terminal-checkpoints/v1";
 /// Largest accepted finite lifecycle field in the private harness config.
 pub const QUALIFICATION_MAX_LIFECYCLE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+
+const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_VERSION: &str =
+    "opc-session-mtls-candidate-evidence/v2";
+const SESSION_MTLS_CANDIDATE_ARTIFACT_NAME: &str = "opc-session-quorum-node";
+const SESSION_MTLS_CANDIDATE_HARNESS_NAME: &str = "qualification_mtls_multiprocess";
+
+/// Source-tree state bound into one synthetic mTLS candidate record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMtlsCandidateSourceTreeStatus {
+    /// No staged, modified, or nonignored untracked source change was present.
+    Clean,
+    /// A staged, modified, or nonignored untracked change was present.
+    DirtyUnqualified,
+}
+
+/// Closed synthetic projected-mTLS campaign vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMtlsCandidateCampaign {
+    /// Leaf/intermediate/root rotation, trust removal, and rollback core.
+    RotationCore,
+    /// Unavailable-member, malformed-last-good, restart, and expiry recovery.
+    FaultExpiryRecovery,
+    /// Continuous mixed workload plus Linux process-resource bounds.
+    TrafficResourceBounds,
+}
+
+impl SessionMtlsCandidateCampaign {
+    /// Stable serialized campaign label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RotationCore => "rotation_core",
+            Self::FaultExpiryRecovery => "fault_expiry_recovery",
+            Self::TrafficResourceBounds => "traffic_resource_bounds",
+        }
+    }
+
+    /// Exact ordered coverage admitted by this synthetic campaign.
+    pub fn coverage(self) -> &'static [SessionMtlsCandidateCoverage] {
+        session_mtls_candidate_coverage(self)
+    }
+}
+
+/// Closed coverage claims admitted by the synthetic v2 contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMtlsCandidateCoverage {
+    /// Every member publishes a renewed leaf.
+    LeafRenewal,
+    /// Presented intermediate chains rotate and roll back.
+    IntermediateRotationRollback,
+    /// Root overlap, removal, and both rollback paths are exercised.
+    RootOverlapRemovalRollback,
+    /// Stale old-root client chains are rejected after removal.
+    RemovedRootRejected,
+    /// Every directed path performs a resolver-fresh authenticated bootstrap.
+    FreshDirectedHandshakes,
+    /// Every voter completes fresh durable readiness checkpoints.
+    DurableReadiness,
+    /// An acknowledged encrypted canary progresses and plaintext stays absent.
+    EncryptedCanaryBoundary,
+    /// One member loses synthetic consensus-RPC admission.
+    SyntheticConsensusAdmissionLoss,
+    /// A different member retains last-good after malformed trust publication.
+    MalformedTrustRetainsLastGood,
+    /// One active mutator restarts on the same disk and exact address.
+    ExactAddressActiveMutatorRestart,
+    /// A short-lived SVID crosses soft retirement and hard expiry.
+    ShortLivedSvidExpiry,
+    /// The expired member recovers in the same process with fresh material.
+    SameProcessMaterialRecovery,
+    /// Survivor mixed traffic remains bounded through the fault campaign.
+    SurvivorTrafficContinuity,
+    /// Repeated same-issuer leaf rotations run under continuous traffic.
+    RepeatedLeafRotationUnderTraffic,
+    /// Request, CAS, lease, watch, restore, and readiness traffic remain active.
+    MixedWorkloadContinuity,
+    /// Connection, reconnect, and lifecycle accounting stays within fixed bounds.
+    BoundedConnectionLifecycle,
+    /// Linux file-descriptor, thread, RSS, and high-water bounds are checked.
+    LinuxProcessResourceBounds,
+}
+
+impl SessionMtlsCandidateCoverage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LeafRenewal => "leaf_renewal",
+            Self::IntermediateRotationRollback => "intermediate_rotation_rollback",
+            Self::RootOverlapRemovalRollback => "root_overlap_removal_rollback",
+            Self::RemovedRootRejected => "removed_root_rejected",
+            Self::FreshDirectedHandshakes => "fresh_directed_handshakes",
+            Self::DurableReadiness => "durable_readiness",
+            Self::EncryptedCanaryBoundary => "encrypted_canary_boundary",
+            Self::SyntheticConsensusAdmissionLoss => "synthetic_consensus_admission_loss",
+            Self::MalformedTrustRetainsLastGood => "malformed_trust_retains_last_good",
+            Self::ExactAddressActiveMutatorRestart => "exact_address_active_mutator_restart",
+            Self::ShortLivedSvidExpiry => "short_lived_svid_expiry",
+            Self::SameProcessMaterialRecovery => "same_process_material_recovery",
+            Self::SurvivorTrafficContinuity => "survivor_traffic_continuity",
+            Self::RepeatedLeafRotationUnderTraffic => "repeated_leaf_rotation_under_traffic",
+            Self::MixedWorkloadContinuity => "mixed_workload_continuity",
+            Self::BoundedConnectionLifecycle => "bounded_connection_lifecycle",
+            Self::LinuxProcessResourceBounds => "linux_process_resource_bounds",
+        }
+    }
+}
+
+/// Closed production acceptance that synthetic local evidence cannot satisfy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMtlsRemainingAcceptance {
+    /// Real deployed network and storage fault campaigns.
+    RealNetworkStorageFaults,
+    /// Deployed CNF/Kubernetes rotation and rollback evidence.
+    DeployedCnfKubernetes,
+    /// Supported-platform sizing, pressure, and soak evidence.
+    SupportedPlatformResourceSoak,
+    /// Remote-HKMS continuity and rotation evidence.
+    RemoteHkms,
+    /// Live fixed-label metrics and alert behavior in a deployed fleet.
+    LiveMetricsAlertsQualification,
+    /// Independently checked and externally signed candidate evidence.
+    SignedIndependentCandidate,
+    /// Final consumption by the networked HA production profile.
+    HaProfileGraduation,
+}
+
+const ROTATION_CORE_COVERAGE: &[SessionMtlsCandidateCoverage] = &[
+    SessionMtlsCandidateCoverage::LeafRenewal,
+    SessionMtlsCandidateCoverage::IntermediateRotationRollback,
+    SessionMtlsCandidateCoverage::RootOverlapRemovalRollback,
+    SessionMtlsCandidateCoverage::RemovedRootRejected,
+    SessionMtlsCandidateCoverage::FreshDirectedHandshakes,
+    SessionMtlsCandidateCoverage::DurableReadiness,
+    SessionMtlsCandidateCoverage::EncryptedCanaryBoundary,
+];
+const FAULT_EXPIRY_COVERAGE: &[SessionMtlsCandidateCoverage] = &[
+    SessionMtlsCandidateCoverage::SyntheticConsensusAdmissionLoss,
+    SessionMtlsCandidateCoverage::MalformedTrustRetainsLastGood,
+    SessionMtlsCandidateCoverage::ExactAddressActiveMutatorRestart,
+    SessionMtlsCandidateCoverage::ShortLivedSvidExpiry,
+    SessionMtlsCandidateCoverage::SameProcessMaterialRecovery,
+    SessionMtlsCandidateCoverage::SurvivorTrafficContinuity,
+    SessionMtlsCandidateCoverage::DurableReadiness,
+    SessionMtlsCandidateCoverage::EncryptedCanaryBoundary,
+];
+const TRAFFIC_RESOURCE_COVERAGE: &[SessionMtlsCandidateCoverage] = &[
+    SessionMtlsCandidateCoverage::RepeatedLeafRotationUnderTraffic,
+    SessionMtlsCandidateCoverage::MixedWorkloadContinuity,
+    SessionMtlsCandidateCoverage::RootOverlapRemovalRollback,
+    SessionMtlsCandidateCoverage::RemovedRootRejected,
+    SessionMtlsCandidateCoverage::FreshDirectedHandshakes,
+    SessionMtlsCandidateCoverage::DurableReadiness,
+    SessionMtlsCandidateCoverage::BoundedConnectionLifecycle,
+    SessionMtlsCandidateCoverage::LinuxProcessResourceBounds,
+    SessionMtlsCandidateCoverage::EncryptedCanaryBoundary,
+];
+const SESSION_MTLS_REMAINING_ACCEPTANCE: &[SessionMtlsRemainingAcceptance] = &[
+    SessionMtlsRemainingAcceptance::RealNetworkStorageFaults,
+    SessionMtlsRemainingAcceptance::DeployedCnfKubernetes,
+    SessionMtlsRemainingAcceptance::SupportedPlatformResourceSoak,
+    SessionMtlsRemainingAcceptance::RemoteHkms,
+    SessionMtlsRemainingAcceptance::LiveMetricsAlertsQualification,
+    SessionMtlsRemainingAcceptance::SignedIndependentCandidate,
+    SessionMtlsRemainingAcceptance::HaProfileGraduation,
+];
+
+const ROTATION_CORE_ORCHESTRATION_PLAN: &str = concat!(
+    "initial-old-chain;ascending-members:",
+    "initial+overlap,renewed-leaf+overlap,rotated-intermediate+overlap,",
+    "renewed-leaf+overlap-rollback,new-root+overlap,",
+    "renewed-leaf+overlap-rollback,new-root+overlap-resume,",
+    "new-root+new-only-remove-old,new-root+overlap-restore,",
+    "renewed-leaf+overlap-post-removal-rollback,new-root+overlap-final,",
+    "new-root+new-only-final;each-member:",
+    "publish-coherent-generation,source-and-controller-ready,",
+    "fresh-incident-paths,durable-readiness,canary-read;each-phase:",
+    "fresh-all-directed-paths,durable-readiness,acknowledged-canary;",
+    "removed-root-negative-client-probe;plaintext-sqlite-family-scan"
+);
+const FAULT_EXPIRY_ORCHESTRATION_PLAN: &str = concat!(
+    "initial-traffic;stable-nonzero-consensus-admission-loss+",
+    "node-zero-malformed-trust-retains-last-good;survivor-readiness-canary-traffic;",
+    "exact-address-restart-catchup;valid-trust-repair+fresh-all-paths;",
+    "one-same-disk-exact-address-active-mutator-unclean-restart+",
+    "survivor-commit+journal-reconcile+higher-fence-resume;",
+    "stable-nonzero-same-issuer-short-lived-svid;fresh-all-paths+readiness+canary;",
+    "pre-soft-retirement-mutation-and-watch-stop;soft-retirement;hard-expiry+",
+    "zero-active-draining+survivor-readiness-canary-traffic;",
+    "bidirectional-expired-path-rejection;same-process-valid-leaf-replacement+",
+    "member-scoped-reauth+fresh-incident-paths+all-voter-readiness+canary;",
+    "watch-reconcile+final-traffic-convergence+plaintext-sqlite-family-scan"
+);
+const TRAFFIC_RESOURCE_ORCHESTRATION_PLAN: &str = concat!(
+    "initial-all-member-mixed-traffic+resolver-backoff-proof-when-three;",
+    "baseline-fresh-generations+readiness+progress+lifecycle-ledger;",
+    "seeded-round-robin-same-issuer-leaf-rotations+fresh-generations+",
+    "readiness+progress+lifecycle-bounds;rotation-core-plan-under-continuous-traffic;",
+    "stop-mutations+watch-heads+final-fresh-generation+record-convergence;",
+    "stop-watches+resource-settle+fd-thread-rss-high-water-bounds+",
+    "terminal-lifecycle-ledger+plaintext-sqlite-family-scan"
+);
+
+fn session_mtls_candidate_orchestration_plan(
+    campaign: SessionMtlsCandidateCampaign,
+) -> &'static str {
+    match campaign {
+        SessionMtlsCandidateCampaign::RotationCore => ROTATION_CORE_ORCHESTRATION_PLAN,
+        SessionMtlsCandidateCampaign::FaultExpiryRecovery => FAULT_EXPIRY_ORCHESTRATION_PLAN,
+        SessionMtlsCandidateCampaign::TrafficResourceBounds => TRAFFIC_RESOURCE_ORCHESTRATION_PLAN,
+    }
+}
+
+fn session_mtls_candidate_coverage(
+    campaign: SessionMtlsCandidateCampaign,
+) -> &'static [SessionMtlsCandidateCoverage] {
+    match campaign {
+        SessionMtlsCandidateCampaign::RotationCore => ROTATION_CORE_COVERAGE,
+        SessionMtlsCandidateCampaign::FaultExpiryRecovery => FAULT_EXPIRY_COVERAGE,
+        SessionMtlsCandidateCampaign::TrafficResourceBounds => TRAFFIC_RESOURCE_COVERAGE,
+    }
+}
+
+/// Exact source binding for one candidate record.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsCandidateSource {
+    /// Exact lowercase Git commit observed by the producer.
+    revision: String,
+    /// Whether tracked and nonignored untracked inputs were clean at emission.
+    tree_status: SessionMtlsCandidateSourceTreeStatus,
+    /// Domain-separated digest of exact tracked changes and nonignored
+    /// untracked source bytes observed before execution.
+    worktree_sha256: String,
+}
+
+impl SessionMtlsCandidateSource {
+    /// Exact lowercase Git revision carried by the decoded record.
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// Source-tree qualification state carried by the decoded record.
+    pub const fn tree_status(&self) -> SessionMtlsCandidateSourceTreeStatus {
+        self.tree_status
+    }
+
+    /// Digest of the exact working-tree source bytes used for the build.
+    pub fn worktree_sha256(&self) -> &str {
+        &self.worktree_sha256
+    }
+}
+
+impl fmt::Debug for SessionMtlsCandidateSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionMtlsCandidateSource")
+            .field("revision", &"<git-revision>")
+            .field("tree_status", &self.tree_status)
+            .field("worktree_sha256", &"<sha256>")
+            .finish()
+    }
+}
+
+/// Exact test-binary binding for one candidate record.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsCandidateArtifact {
+    /// Fixed qualification child binary name.
+    name: String,
+    /// SDK crate version used to build the child.
+    version: String,
+    /// SHA-256 of the exact child binary.
+    sha256: String,
+    /// Fixed qualification harness artifact name.
+    harness_name: String,
+    /// SHA-256 of the exact parent harness that enforced the assertions.
+    harness_sha256: String,
+    /// The plaintext test-only transport feature must remain disabled.
+    insecure_test_enabled: bool,
+}
+
+impl SessionMtlsCandidateArtifact {
+    /// Fixed child-artifact name carried by the decoded record.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// SDK version carried by the decoded record.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Digest of the exact child executable.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Fixed parent-harness artifact name.
+    pub fn harness_name(&self) -> &str {
+        &self.harness_name
+    }
+
+    /// Digest of the exact parent harness executable.
+    pub fn harness_sha256(&self) -> &str {
+        &self.harness_sha256
+    }
+
+    /// Whether the plaintext test-only transport feature was compiled in.
+    pub const fn insecure_test_enabled(&self) -> bool {
+        self.insecure_test_enabled
+    }
+}
+
+impl fmt::Debug for SessionMtlsCandidateArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionMtlsCandidateArtifact")
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("sha256", &"<sha256>")
+            .field("harness_name", &self.harness_name)
+            .field("harness_sha256", &"<sha256>")
+            .field("insecure_test_enabled", &self.insecure_test_enabled)
+            .finish()
+    }
+}
+
+/// Digest bindings that identify one exact synthetic execution input set.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsCandidateBindings {
+    /// SHA-256 of this immutable v2 schema.
+    evidence_schema_sha256: String,
+    /// Domain-separated digest of every generated node configuration.
+    configuration_sha256: String,
+    /// Domain-separated digest of every exact public certificate/trust input,
+    /// publication epoch, and phase label consumed by the campaign.
+    public_material_manifest_sha256: String,
+    /// Domain-separated digest of the fixed campaign schedule and bounds.
+    workload_schedule_sha256: String,
+}
+
+impl SessionMtlsCandidateBindings {
+    /// Digest of the immutable evidence schema.
+    pub fn evidence_schema_sha256(&self) -> &str {
+        &self.evidence_schema_sha256
+    }
+
+    /// Digest of the exact generated node configurations.
+    pub fn configuration_sha256(&self) -> &str {
+        &self.configuration_sha256
+    }
+
+    /// Digest of the ordered public-certificate and trust publication manifest.
+    pub fn public_material_manifest_sha256(&self) -> &str {
+        &self.public_material_manifest_sha256
+    }
+
+    /// Digest of the exact declared campaign schedule.
+    pub fn workload_schedule_sha256(&self) -> &str {
+        &self.workload_schedule_sha256
+    }
+}
+
+impl fmt::Debug for SessionMtlsCandidateBindings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionMtlsCandidateBindings")
+            .field("evidence_schema_sha256", &"<sha256>")
+            .field("configuration_sha256", &"<sha256>")
+            .field("public_material_manifest_sha256", &"<sha256>")
+            .field("workload_schedule_sha256", &"<sha256>")
+            .finish()
+    }
+}
+
+/// Closed topology description without identities, routes, or addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsCandidateTopology {
+    /// Exact supported voter count.
+    members: usize,
+    /// Every voter runs in its own process.
+    distinct_processes: bool,
+    /// Every voter uses a distinct SQLite database.
+    distinct_sqlite_databases: bool,
+    /// Fixed local candidate transport label.
+    transport_mode: String,
+    /// Number of ordered source-to-target fresh connection proofs.
+    directed_path_count: usize,
+    /// Synthetic local evidence never counts as seamless production rotation.
+    counts_for_seamless_tls_rotation: bool,
+}
+
+impl SessionMtlsCandidateTopology {
+    /// Number of distinct synthetic voter processes.
+    pub const fn members(&self) -> usize {
+        self.members
+    }
+
+    /// Whether every voter used a distinct process.
+    pub const fn distinct_processes(&self) -> bool {
+        self.distinct_processes
+    }
+
+    /// Whether every voter used a distinct SQLite database.
+    pub const fn distinct_sqlite_databases(&self) -> bool {
+        self.distinct_sqlite_databases
+    }
+
+    /// Fixed redaction-safe transport profile label.
+    pub fn transport_mode(&self) -> &str {
+        &self.transport_mode
+    }
+
+    /// Number of directed fresh-handshake paths.
+    pub const fn directed_path_count(&self) -> usize {
+        self.directed_path_count
+    }
+
+    /// Whether this synthetic evidence counts for seamless TLS rotation.
+    pub const fn counts_for_seamless_tls_rotation(&self) -> bool {
+        self.counts_for_seamless_tls_rotation
+    }
+}
+
+/// Closed successful observations emitted only after a campaign completes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsCandidateObservations {
+    /// Projected-source and TLS-controller status was collected.
+    material_status_collected: bool,
+    /// Every required voter reached fresh durable readiness.
+    durable_readiness_reached: bool,
+    /// Every scheduled directed fresh handshake completed.
+    directed_fresh_handshakes_succeeded: bool,
+    /// Lifecycle counters were collected and checked.
+    lifecycle_metrics_collected: bool,
+    /// The encrypted acknowledged canary completed its scheduled progress.
+    encrypted_canary_verified: bool,
+    /// Exact plaintext canary prefixes were absent from SQLite/WAL/SHM bytes.
+    plaintext_canary_absent_from_sqlite_family: bool,
+}
+
+impl SessionMtlsCandidateObservations {
+    /// Whether projected-material status was collected.
+    pub const fn material_status_collected(&self) -> bool {
+        self.material_status_collected
+    }
+
+    /// Whether durable readiness reached the campaign boundary.
+    pub const fn durable_readiness_reached(&self) -> bool {
+        self.durable_readiness_reached
+    }
+
+    /// Whether all scheduled fresh handshakes succeeded.
+    pub const fn directed_fresh_handshakes_succeeded(&self) -> bool {
+        self.directed_fresh_handshakes_succeeded
+    }
+
+    /// Whether lifecycle metrics were collected and checked.
+    pub const fn lifecycle_metrics_collected(&self) -> bool {
+        self.lifecycle_metrics_collected
+    }
+
+    /// Whether the acknowledged encrypted canary was verified.
+    pub const fn encrypted_canary_verified(&self) -> bool {
+        self.encrypted_canary_verified
+    }
+
+    /// Whether plaintext canary prefixes were absent from SQLite-family bytes.
+    pub const fn plaintext_canary_absent_from_sqlite_family(&self) -> bool {
+        self.plaintext_canary_absent_from_sqlite_family
+    }
+}
+
+/// One typed, digest-bound synthetic projected-mTLS candidate record.
+///
+/// The model contains no certificate material, keys, peer addresses, SPIFFE
+/// IDs, filesystem paths, session payloads, or backend error text. Its claim
+/// fields are fixed to incomplete experimental evidence by [`Self::validate`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsCandidateEvidenceV2 {
+    /// Exact immutable schema version.
+    schema_version: String,
+    /// Always true for this local candidate contract.
+    experimental: bool,
+    /// Always false for this local candidate contract.
+    qualification_complete: bool,
+    /// Exact source binding.
+    source: SessionMtlsCandidateSource,
+    /// Exact qualification-child artifact binding.
+    artifact: SessionMtlsCandidateArtifact,
+    /// Synthetic campaign that produced the record.
+    campaign: SessionMtlsCandidateCampaign,
+    /// Closed topology facts.
+    topology: SessionMtlsCandidateTopology,
+    /// Exact schema, configuration, and schedule bindings.
+    bindings: SessionMtlsCandidateBindings,
+    /// Successful bounded observations.
+    observations: SessionMtlsCandidateObservations,
+    /// Exact ordered coverage admitted for this campaign.
+    coverage: Vec<SessionMtlsCandidateCoverage>,
+    /// Exact ordered external acceptance that remains open.
+    remaining_acceptance: Vec<SessionMtlsRemainingAcceptance>,
+}
+
+impl fmt::Debug for SessionMtlsCandidateEvidenceV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionMtlsCandidateEvidenceV2")
+            .field("schema_version", &self.schema_version)
+            .field("experimental", &self.experimental)
+            .field("qualification_complete", &self.qualification_complete)
+            .field("source", &"<digest-bound>")
+            .field("artifact", &"<digest-bound>")
+            .field("campaign", &self.campaign)
+            .field("members", &self.topology.members)
+            .field("bindings", &"<sha256>")
+            .field("coverage", &self.coverage)
+            .field("remaining_acceptance", &self.remaining_acceptance)
+            .finish()
+    }
+}
+
+/// Stable candidate-evidence validation failures that never echo input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SessionMtlsCandidateEvidenceError {
+    /// Schema version is unsupported.
+    #[error("mTLS candidate evidence schema is unsupported")]
+    Schema,
+    /// A production or qualification claim was attempted.
+    #[error("mTLS candidate evidence claim is invalid")]
+    Claim,
+    /// Source provenance is malformed.
+    #[error("mTLS candidate source binding is invalid")]
+    Source,
+    /// Artifact provenance is malformed.
+    #[error("mTLS candidate artifact binding is invalid")]
+    Artifact,
+    /// Topology facts are inconsistent.
+    #[error("mTLS candidate topology is invalid")]
+    Topology,
+    /// A digest does not bind the expected exact input.
+    #[error("mTLS candidate digest binding is invalid")]
+    Binding,
+    /// A required successful observation is absent.
+    #[error("mTLS candidate observations are incomplete")]
+    Observations,
+    /// Campaign coverage is missing, duplicated, or inconsistent.
+    #[error("mTLS candidate coverage is invalid")]
+    Coverage,
+    /// External remaining acceptance is incomplete or inconsistent.
+    #[error("mTLS candidate remaining acceptance is invalid")]
+    RemainingAcceptance,
+}
+
+impl SessionMtlsCandidateEvidenceV2 {
+    /// Immutable schema-version label carried by the decoded record.
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    /// Whether the record is explicitly experimental.
+    pub const fn experimental(&self) -> bool {
+        self.experimental
+    }
+
+    /// Whether the record claims completed qualification.
+    pub const fn qualification_complete(&self) -> bool {
+        self.qualification_complete
+    }
+
+    /// Redaction-safe source binding.
+    pub const fn source(&self) -> &SessionMtlsCandidateSource {
+        &self.source
+    }
+
+    /// Redaction-safe child and harness artifact bindings.
+    pub const fn artifact(&self) -> &SessionMtlsCandidateArtifact {
+        &self.artifact
+    }
+
+    /// Synthetic campaign carried by the decoded record.
+    pub const fn campaign(&self) -> SessionMtlsCandidateCampaign {
+        self.campaign
+    }
+
+    /// Closed topology facts carried by the decoded record.
+    pub const fn topology(&self) -> &SessionMtlsCandidateTopology {
+        &self.topology
+    }
+
+    /// Redacted digest bindings carried by the decoded record.
+    pub const fn bindings(&self) -> &SessionMtlsCandidateBindings {
+        &self.bindings
+    }
+
+    /// Successful bounded observations carried by the decoded record.
+    pub const fn observations(&self) -> &SessionMtlsCandidateObservations {
+        &self.observations
+    }
+
+    /// Exact ordered coverage carried by the decoded record.
+    pub fn coverage(&self) -> &[SessionMtlsCandidateCoverage] {
+        &self.coverage
+    }
+
+    /// Exact ordered external acceptance that remains open.
+    pub fn remaining_acceptance(&self) -> &[SessionMtlsRemainingAcceptance] {
+        &self.remaining_acceptance
+    }
+
+    /// Canonical ordered external acceptance required by every v2 record.
+    pub fn required_remaining_acceptance() -> &'static [SessionMtlsRemainingAcceptance] {
+        SESSION_MTLS_REMAINING_ACCEPTANCE
+    }
+
+    /// Validate an untrusted decoded record without echoing any input value.
+    pub fn validate(&self) -> Result<(), SessionMtlsCandidateEvidenceError> {
+        if self.schema_version != SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_VERSION {
+            return Err(SessionMtlsCandidateEvidenceError::Schema);
+        }
+        if !self.experimental
+            || self.qualification_complete
+            || self.topology.counts_for_seamless_tls_rotation
+        {
+            return Err(SessionMtlsCandidateEvidenceError::Claim);
+        }
+        if !is_lower_hex_exact(&self.source.revision, 40)
+            || !is_exact_sha256(&self.source.worktree_sha256)
+        {
+            return Err(SessionMtlsCandidateEvidenceError::Source);
+        }
+        if self.artifact.name != SESSION_MTLS_CANDIDATE_ARTIFACT_NAME
+            || self.artifact.version != env!("CARGO_PKG_VERSION")
+            || self.artifact.harness_name != SESSION_MTLS_CANDIDATE_HARNESS_NAME
+            || self.artifact.insecure_test_enabled
+            || !is_exact_sha256(&self.artifact.sha256)
+            || !is_exact_sha256(&self.artifact.harness_sha256)
+        {
+            return Err(SessionMtlsCandidateEvidenceError::Artifact);
+        }
+        let directed_path_count = self
+            .topology
+            .members
+            .checked_mul(self.topology.members.saturating_sub(1))
+            .ok_or(SessionMtlsCandidateEvidenceError::Topology)?;
+        if !matches!(self.topology.members, 3 | 5)
+            || !self.topology.distinct_processes
+            || !self.topology.distinct_sqlite_databases
+            || self.topology.transport_mode != "projected_svid_mtls_pinned_loopback"
+            || self.topology.directed_path_count != directed_path_count
+        {
+            return Err(SessionMtlsCandidateEvidenceError::Topology);
+        }
+        let expected_schedule =
+            session_mtls_candidate_schedule_sha256(self.campaign, self.topology.members)
+                .ok_or(SessionMtlsCandidateEvidenceError::Topology)?;
+        if !is_exact_sha256(&self.bindings.evidence_schema_sha256)
+            || !is_exact_sha256(&self.bindings.configuration_sha256)
+            || !is_exact_sha256(&self.bindings.public_material_manifest_sha256)
+            || !is_exact_sha256(&self.bindings.workload_schedule_sha256)
+            || self.bindings.evidence_schema_sha256
+                != session_mtls_candidate_evidence_v2_schema_sha256()
+            || self.bindings.workload_schedule_sha256 != expected_schedule
+        {
+            return Err(SessionMtlsCandidateEvidenceError::Binding);
+        }
+        if !self.observations.material_status_collected
+            || !self.observations.durable_readiness_reached
+            || !self.observations.directed_fresh_handshakes_succeeded
+            || !self.observations.lifecycle_metrics_collected
+            || !self.observations.encrypted_canary_verified
+            || !self.observations.plaintext_canary_absent_from_sqlite_family
+        {
+            return Err(SessionMtlsCandidateEvidenceError::Observations);
+        }
+        if self.coverage != session_mtls_candidate_coverage(self.campaign) {
+            return Err(SessionMtlsCandidateEvidenceError::Coverage);
+        }
+        if self.remaining_acceptance != SESSION_MTLS_REMAINING_ACCEPTANCE {
+            return Err(SessionMtlsCandidateEvidenceError::RemainingAcceptance);
+        }
+        Ok(())
+    }
+}
+
+/// SHA-256 of the immutable v2 candidate-evidence schema bytes.
+pub fn session_mtls_candidate_evidence_v2_schema_sha256() -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON.as_bytes());
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+/// Domain-separated digest of one exact local mTLS campaign schedule.
+pub fn session_mtls_candidate_schedule_sha256(
+    campaign: SessionMtlsCandidateCampaign,
+    member_count: usize,
+) -> Option<String> {
+    let traffic_schedule = qualification_traffic_schedule_sha256(member_count)?;
+    let coverage = session_mtls_candidate_coverage(campaign)
+        .iter()
+        .map(|item| item.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let orchestration_plan = session_mtls_candidate_orchestration_plan(campaign);
+    let schedule = format!(
+        concat!(
+            "opc-session-mtls-candidate/v2\n",
+            "campaign={}\n",
+            "members={}\n",
+            "directed_paths={}\n",
+            "traffic_schedule={}\n",
+            "orchestration_plan={}\n",
+            "rotation_core_plan={}\n",
+            "harness_artifact_binding=required\n",
+            "coverage={}\n",
+            "transport=projected_svid_mtls_pinned_loopback\n",
+            "qualification_complete=false\n",
+            "counts_for_seamless_tls_rotation=false\n"
+        ),
+        campaign.as_str(),
+        member_count,
+        member_count.checked_mul(member_count.saturating_sub(1))?,
+        traffic_schedule,
+        orchestration_plan,
+        ROTATION_CORE_ORCHESTRATION_PLAN,
+        coverage,
+    );
+    Some(qualification_digest(
+        "mtls-candidate-schedule",
+        schedule.as_bytes(),
+    ))
+}
+
+fn is_lower_hex_exact(value: &str, width: usize) -> bool {
+    value.len() == width
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 /// Machine-readable experimental session-HA profile.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -3283,6 +4040,52 @@ mod tests {
         assert_eq!(
             qualification_value_sha256(b"value-1"),
             "sha256:eec72ba1a373f38b17ec083cb92efdef4e526cc8d2d987079d3f336a4ec2f7f5"
+        );
+    }
+
+    #[test]
+    fn mtls_candidate_schedule_digests_are_stable() {
+        let vectors = [
+            (
+                SessionMtlsCandidateCampaign::RotationCore,
+                3,
+                "sha256:af929a4f7cdd5422eae4c3110859e7230be6b47b30a50f1bcc4b01d35c9f74fa",
+            ),
+            (
+                SessionMtlsCandidateCampaign::RotationCore,
+                5,
+                "sha256:ae2815d6f6c8fa6c66fad6b0967ce9a990604fe4c07f09c0c5b61185e08f57d2",
+            ),
+            (
+                SessionMtlsCandidateCampaign::FaultExpiryRecovery,
+                3,
+                "sha256:99172e01703cf31f95b9d076c35be59c1328f9bf099a3ed103c7d29c86ab2033",
+            ),
+            (
+                SessionMtlsCandidateCampaign::FaultExpiryRecovery,
+                5,
+                "sha256:1bc286b52b643cb360e3e34f15499890af0a955cb70185b75ee17ed65ed79cc5",
+            ),
+            (
+                SessionMtlsCandidateCampaign::TrafficResourceBounds,
+                3,
+                "sha256:de3291e3e24dd24d20096503006c9b92d3bcbffb0504ee8d5392183e5584cadf",
+            ),
+            (
+                SessionMtlsCandidateCampaign::TrafficResourceBounds,
+                5,
+                "sha256:e4df715259edc1c1eb574c07bfb81594b23ab1ef2405730808a2b647a277a241",
+            ),
+        ];
+        for (campaign, member_count, expected) in vectors {
+            assert_eq!(
+                session_mtls_candidate_schedule_sha256(campaign, member_count).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            session_mtls_candidate_schedule_sha256(SessionMtlsCandidateCampaign::RotationCore, 4,),
+            None
         );
     }
 }

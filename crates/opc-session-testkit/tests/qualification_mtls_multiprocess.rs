@@ -1,12 +1,15 @@
 #![cfg(target_os = "linux")]
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::env;
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::os::unix::fs::{symlink, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::os::fd::AsFd;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{symlink, DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -32,20 +35,22 @@ use opc_session_store::{
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
     qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
-    write_json_line, QualificationConnectionLifecycleConfig,
-    QualificationConnectionLifecycleMetrics, QualificationConsensusRpcAvailability,
-    QualificationMember, QualificationNodeCommand, QualificationNodeConfig,
-    QualificationNodeErrorCode, QualificationNodeReply, QualificationPeerRouting,
-    QualificationProjectedMtlsConfig, QualificationProjectedSvidAvailability,
-    QualificationProjectedSvidReason, QualificationProjectedSvidStatus, QualificationReadinessCode,
+    session_mtls_candidate_schedule_sha256, write_json_line,
+    QualificationConnectionLifecycleConfig, QualificationConnectionLifecycleMetrics,
+    QualificationConsensusRpcAvailability, QualificationMember, QualificationNodeCommand,
+    QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
+    QualificationPeerRouting, QualificationProjectedMtlsConfig,
+    QualificationProjectedSvidAvailability, QualificationProjectedSvidReason,
+    QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
     QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
     QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
-    QualificationTrafficStatus, QualificationTransportConfig,
+    QualificationTrafficStatus, QualificationTransportConfig, SessionMtlsCandidateCampaign,
+    SessionMtlsCandidateEvidenceV2, SessionMtlsCandidateSourceTreeStatus,
     QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
     QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
     QUALIFICATION_FAULT_PATH_REFRESH_MILLIS, QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
-    QUALIFICATION_INBOUND_CONNECTION_SLOTS,
+    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_MAX_CONFIG_BYTES,
     QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE, QUALIFICATION_NODE_SCHEMA_VERSION,
     QUALIFICATION_OPERATION_TIMEOUT_MILLIS, QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS,
     QUALIFICATION_RESOLVER_PROOF_MILLIS, QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE,
@@ -75,9 +80,15 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
     QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
+    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use opc_types::Timestamp;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, SanType};
+use rustix::fs::{
+    fchmod, fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, FileType, Mode,
+    OFlags, RenameFlags,
+};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -98,8 +109,13 @@ const PLAINTEXT_CANARY_PREFIXES: [&[u8]; 2] = [
     ROTATION_PLAINTEXT_CANARY_PREFIX,
     TRAFFIC_PLAINTEXT_CANARY_PREFIX,
 ];
+const EVIDENCE_OUTPUT_DIRECTORY_ENV: &str = "OPC_SESSION_HA_EVIDENCE_DIR";
+const MAX_CANDIDATE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CANDIDATE_EVIDENCE_BYTES: u64 = 256 * 1024;
+const MAX_CANDIDATE_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 static FLEET_TEST_LOCK: Mutex<()> = Mutex::new(());
+static CANDIDATE_STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn single_attempt_removed_root_probe_lifecycle() -> ConnectionLifecyclePolicy {
     let cold_connect_timeout = DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout();
@@ -2256,6 +2272,111 @@ struct FleetReadiness {
     applied_index: Option<u64>,
 }
 
+struct CandidateEvidenceInputs {
+    source_revision: String,
+    source_tree_status: SessionMtlsCandidateSourceTreeStatus,
+    source_worktree_sha256: String,
+    child_sha256: String,
+    harness_sha256: String,
+    configuration_sha256: String,
+}
+
+struct CandidatePublicMaterialManifest {
+    hasher: Sha256,
+    publication_count: u64,
+}
+
+impl CandidatePublicMaterialManifest {
+    fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"opc-session-mtls-candidate-public-material/v2\0");
+        Self {
+            hasher,
+            publication_count: 0,
+        }
+    }
+
+    fn record(
+        &mut self,
+        phase: &str,
+        node_index: usize,
+        publication_epoch: u64,
+        certificate_chain_pem: &str,
+        trust_bundle_pem: &str,
+    ) -> io::Result<()> {
+        if phase.is_empty()
+            || phase.len() > 128
+            || !phase
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(io::Error::other(
+                "candidate public-material phase is invalid",
+            ));
+        }
+        let node_index = u64::try_from(node_index)
+            .map_err(|_| io::Error::other("candidate material node index overflow"))?;
+        let phase_length = u64::try_from(phase.len())
+            .map_err(|_| io::Error::other("candidate material phase length overflow"))?;
+        let certificate_length = u64::try_from(certificate_chain_pem.len())
+            .map_err(|_| io::Error::other("candidate certificate length overflow"))?;
+        let trust_length = u64::try_from(trust_bundle_pem.len())
+            .map_err(|_| io::Error::other("candidate trust length overflow"))?;
+        self.publication_count = self
+            .publication_count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("candidate material publication overflow"))?;
+        self.hasher.update(self.publication_count.to_be_bytes());
+        self.hasher.update(node_index.to_be_bytes());
+        self.hasher.update(publication_epoch.to_be_bytes());
+        self.hasher.update(phase_length.to_be_bytes());
+        self.hasher.update(phase.as_bytes());
+        self.hasher.update(certificate_length.to_be_bytes());
+        self.hasher.update(certificate_chain_pem.as_bytes());
+        self.hasher.update(trust_length.to_be_bytes());
+        self.hasher.update(trust_bundle_pem.as_bytes());
+        Ok(())
+    }
+
+    fn sha256(&self) -> io::Result<String> {
+        if self.publication_count == 0 {
+            return Err(io::Error::other(
+                "candidate public-material manifest is empty",
+            ));
+        }
+        let mut hasher = self.hasher.clone();
+        hasher.update(b"publication-count\0");
+        hasher.update(self.publication_count.to_be_bytes());
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    }
+}
+
+impl CandidateEvidenceInputs {
+    fn verify_unchanged(&self, config_paths: &[PathBuf]) -> io::Result<()> {
+        let source = candidate_source_provenance()?;
+        let child_sha256 = candidate_sha256_file(
+            Path::new(env!("CARGO_BIN_EXE_opc-session-quorum-node")),
+            MAX_CANDIDATE_ARTIFACT_BYTES,
+        )?;
+        let harness_path = env::current_exe()
+            .map_err(|_| io::Error::other("candidate harness artifact is unavailable"))?;
+        let harness_sha256 = candidate_sha256_file(&harness_path, MAX_CANDIDATE_ARTIFACT_BYTES)?;
+        let configuration_sha256 = candidate_configuration_sha256(config_paths)?;
+        if source.0 != self.source_revision
+            || source.1 != self.source_tree_status
+            || source.2 != self.source_worktree_sha256
+            || child_sha256 != self.child_sha256
+            || harness_sha256 != self.harness_sha256
+            || configuration_sha256 != self.configuration_sha256
+        {
+            return Err(io::Error::other(
+                "candidate execution inputs changed during the campaign",
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct Fleet {
     nodes: Vec<ChildNode>,
     // Keep the workspace alive until every child has been killed on panic.
@@ -2269,11 +2390,18 @@ struct Fleet {
     members: Vec<QualificationMember>,
     canary_generation: u64,
     canary_values: Vec<String>,
+    candidate_evidence_inputs: CandidateEvidenceInputs,
+    candidate_public_material_manifest: CandidatePublicMaterialManifest,
 }
 
 impl Fleet {
     fn start(member_count: usize) -> Self {
-        Self::start_with_schedule(member_count, format!("sha256:{}", "a".repeat(64)))
+        let schedule = session_mtls_candidate_schedule_sha256(
+            SessionMtlsCandidateCampaign::RotationCore,
+            member_count,
+        )
+        .expect("supported rotation-core candidate topology");
+        Self::start_with_schedule(member_count, schedule)
     }
 
     fn start_traffic(member_count: usize) -> Self {
@@ -2284,6 +2412,16 @@ impl Fleet {
 
     fn start_with_schedule(member_count: usize, workload_schedule_sha256: String) -> Self {
         assert!(matches!(member_count, 3 | 5));
+        let (source_revision, source_tree_status, source_worktree_sha256) =
+            candidate_source_provenance().expect("capture candidate source provenance");
+        let child_sha256 = candidate_sha256_file(
+            Path::new(env!("CARGO_BIN_EXE_opc-session-quorum-node")),
+            MAX_CANDIDATE_ARTIFACT_BYTES,
+        )
+        .expect("hash candidate child before execution");
+        let harness_path = env::current_exe().expect("locate candidate harness artifact");
+        let harness_sha256 = candidate_sha256_file(&harness_path, MAX_CANDIDATE_ARTIFACT_BYTES)
+            .expect("hash candidate harness before execution");
         let workspace = tempfile::tempdir().expect("create mTLS qualification workspace");
         let root = workspace.path();
         let mut configs = Vec::with_capacity(member_count);
@@ -2317,9 +2455,10 @@ impl Fleet {
             })
             .collect::<Vec<_>>();
         let pki = TestPki::new(member_count);
+        let mut candidate_public_material_manifest = CandidatePublicMaterialManifest::new();
         let mut projected_roots = Vec::with_capacity(member_count);
         let mut database_paths = Vec::with_capacity(member_count);
-        let mut projected_generation = vec![0; member_count];
+        let mut projected_generation = vec![0_u64; member_count];
         for (node_index, config_path) in configs.iter().enumerate() {
             let node_root = root.join(format!("node-{node_index}"));
             let projected_root = node_root.join("projected");
@@ -2327,11 +2466,22 @@ impl Fleet {
             let database_path = node_root.join("session.sqlite");
             fs::create_dir(&projected_root).expect("create projected root");
             fs::create_dir(&snapshots).expect("create snapshots root");
+            let initial_credential = pki.credential(node_index, CredentialGeneration::Initial);
+            let initial_trust = pki.trust_bundle(TrustGeneration::OldOnly);
+            candidate_public_material_manifest
+                .record(
+                    "initial-old-chain",
+                    node_index,
+                    projected_generation[node_index].saturating_add(1),
+                    &initial_credential.certificate_chain_pem,
+                    &initial_trust,
+                )
+                .expect("bind initial public certificate and trust input");
             publish_projected_generation(
                 &projected_root,
                 &mut projected_generation[node_index],
-                pki.credential(node_index, CredentialGeneration::Initial),
-                &pki.trust_bundle(TrustGeneration::OldOnly),
+                initial_credential,
+                &initial_trust,
             );
             let config = QualificationNodeConfig {
                 schema_version: QUALIFICATION_NODE_SCHEMA_VERSION,
@@ -2367,6 +2517,15 @@ impl Fleet {
             projected_roots.push(projected_root);
             database_paths.push(database_path);
         }
+        let candidate_evidence_inputs = CandidateEvidenceInputs {
+            source_revision,
+            source_tree_status,
+            source_worktree_sha256,
+            child_sha256,
+            harness_sha256,
+            configuration_sha256: candidate_configuration_sha256(&configs)
+                .expect("hash candidate configurations before execution"),
+        };
 
         // Bound the process-heavy store/transport startup to one child at a
         // time. All listeners are already bound and all immutable
@@ -2408,6 +2567,8 @@ impl Fleet {
             members,
             canary_generation: 0,
             canary_values: Vec::new(),
+            candidate_evidence_inputs,
+            candidate_public_material_manifest,
         };
         fleet.wait_ready();
         fleet.assert_all_material_ready();
@@ -4380,15 +4541,89 @@ impl Fleet {
             .collect()
     }
 
-    fn transition_traffic_leaf(&mut self, node_index: usize, rotation: usize) {
-        let source_before = self.projected_status(node_index);
-        let controller_before = self.material_status(node_index);
+    fn publish_known_projected_generation(
+        &mut self,
+        node_index: usize,
+        credential_generation: CredentialGeneration,
+        trust_generation: TrustGeneration,
+        phase: &str,
+    ) -> Instant {
+        let credential = self.pki.credential(node_index, credential_generation);
+        let trust_bundle = self.pki.trust_bundle(trust_generation);
+        self.candidate_public_material_manifest
+            .record(
+                phase,
+                node_index,
+                self.projected_generation[node_index].saturating_add(1),
+                &credential.certificate_chain_pem,
+                &trust_bundle,
+            )
+            .expect("bind public certificate and trust publication");
         publish_projected_generation(
             &self.projected_roots[node_index],
             &mut self.projected_generation[node_index],
-            self.pki
-                .credential(node_index, CredentialGeneration::TrafficLeaf(rotation)),
-            &self.pki.trust_bundle(TrustGeneration::OldOnly),
+            credential,
+            &trust_bundle,
+        )
+    }
+
+    fn publish_custom_projected_generation(
+        &mut self,
+        node_index: usize,
+        credential: &ProjectedCredential,
+        trust_bundle_pem: &str,
+        phase: &str,
+    ) -> Instant {
+        self.candidate_public_material_manifest
+            .record(
+                phase,
+                node_index,
+                self.projected_generation[node_index].saturating_add(1),
+                &credential.certificate_chain_pem,
+                trust_bundle_pem,
+            )
+            .expect("bind custom public certificate and trust publication");
+        publish_projected_generation(
+            &self.projected_roots[node_index],
+            &mut self.projected_generation[node_index],
+            credential,
+            trust_bundle_pem,
+        )
+    }
+
+    fn publish_known_projected_generation_with_trust(
+        &mut self,
+        node_index: usize,
+        credential_generation: CredentialGeneration,
+        trust_bundle_pem: &str,
+        phase: &str,
+    ) -> Instant {
+        let credential = self.pki.credential(node_index, credential_generation);
+        self.candidate_public_material_manifest
+            .record(
+                phase,
+                node_index,
+                self.projected_generation[node_index].saturating_add(1),
+                &credential.certificate_chain_pem,
+                trust_bundle_pem,
+            )
+            .expect("bind public certificate and custom trust publication");
+        publish_projected_generation(
+            &self.projected_roots[node_index],
+            &mut self.projected_generation[node_index],
+            credential,
+            trust_bundle_pem,
+        )
+    }
+
+    fn transition_traffic_leaf(&mut self, node_index: usize, rotation: usize) {
+        let source_before = self.projected_status(node_index);
+        let controller_before = self.material_status(node_index);
+        self.publish_known_projected_generation(
+            node_index,
+            CredentialGeneration::TrafficLeaf(rotation),
+            TrustGeneration::OldOnly,
+            "traffic-leaf-rotation",
         );
         self.wait_for_member_publication(
             node_index,
@@ -4705,13 +4940,11 @@ impl Fleet {
     ) {
         let source_before = self.projected_status(node_index);
         let controller_before = self.material_status(node_index);
-        let credential = self.pki.credential(node_index, credential_generation);
-        let trust_bundle = self.pki.trust_bundle(trust_generation);
-        publish_projected_generation(
-            &self.projected_roots[node_index],
-            &mut self.projected_generation[node_index],
-            credential,
-            &trust_bundle,
+        self.publish_known_projected_generation(
+            node_index,
+            credential_generation,
+            trust_generation,
+            phase,
         );
         self.wait_for_member_publication(
             node_index,
@@ -4738,13 +4971,11 @@ impl Fleet {
             started + Duration::from_millis(QUALIFICATION_TRAFFIC_TRANSITION_MILLIS);
         let source_before = self.projected_status(node_index);
         let controller_before = self.material_status(node_index);
-        let credential = self.pki.credential(node_index, credential_generation);
-        let trust_bundle = self.pki.trust_bundle(trust_generation);
-        publish_projected_generation(
-            &self.projected_roots[node_index],
-            &mut self.projected_generation[node_index],
-            credential,
-            &trust_bundle,
+        self.publish_known_projected_generation(
+            node_index,
+            credential_generation,
+            trust_generation,
+            phase,
         );
         self.wait_for_member_publication(
             node_index,
@@ -5885,6 +6116,565 @@ fn spiffe_id(node_index: usize) -> String {
     )
 }
 
+fn candidate_sha256_file(path: &Path, maximum_bytes: u64) -> io::Result<String> {
+    let mut file = open_bounded_candidate_file(path, maximum_bytes)?;
+    let mut hasher = Sha256::new();
+    let mut encoded = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut encoded)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).map_err(|_| io::Error::other("read overflow"))?)
+            .ok_or_else(|| io::Error::other("candidate artifact size overflow"))?;
+        if total > maximum_bytes {
+            return Err(io::Error::other("candidate artifact exceeds its bound"));
+        }
+        hasher.update(&encoded[..read]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn candidate_configuration_sha256(config_paths: &[PathBuf]) -> io::Result<String> {
+    if !matches!(config_paths.len(), 3 | 5) {
+        return Err(io::Error::other("candidate topology is unsupported"));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"opc-session-mtls-candidate-configuration/v2\0");
+    for config_path in config_paths {
+        let encoded = read_bounded_candidate_file(config_path, QUALIFICATION_MAX_CONFIG_BYTES)?;
+        let length = u64::try_from(encoded.len())
+            .map_err(|_| io::Error::other("candidate configuration size overflow"))?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(encoded);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn candidate_source_provenance_at(
+    repository: &Path,
+) -> io::Result<(String, SessionMtlsCandidateSourceTreeStatus, String)> {
+    let revision = candidate_git_output(repository, &["rev-parse", "HEAD"], 64)?;
+    if revision.len() != 41 {
+        return Err(io::Error::other("candidate source revision is unavailable"));
+    }
+    let revision = std::str::from_utf8(&revision)
+        .map_err(|_| io::Error::other("candidate source revision is invalid"))?
+        .trim_end()
+        .to_owned();
+    let source_status = candidate_git_output(
+        repository,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ],
+        MAX_CANDIDATE_SOURCE_BYTES,
+    )?;
+    let tree_status = if source_status.is_empty() {
+        SessionMtlsCandidateSourceTreeStatus::Clean
+    } else {
+        SessionMtlsCandidateSourceTreeStatus::DirtyUnqualified
+    };
+    let tracked_diff = candidate_git_output(
+        repository,
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--ignore-submodules=none",
+            "HEAD",
+            "--",
+        ],
+        MAX_CANDIDATE_SOURCE_BYTES,
+    )?;
+    let untracked_paths = candidate_git_output(
+        repository,
+        &["ls-files", "--others", "--exclude-standard", "-z", "--"],
+        MAX_CANDIDATE_SOURCE_BYTES,
+    )?;
+
+    let mut total = u64::try_from(source_status.len())
+        .ok()
+        .and_then(|status| {
+            u64::try_from(tracked_diff.len())
+                .ok()
+                .and_then(|diff| status.checked_add(diff))
+        })
+        .and_then(|total| {
+            u64::try_from(untracked_paths.len())
+                .ok()
+                .and_then(|paths| total.checked_add(paths))
+        })
+        .ok_or_else(|| io::Error::other("candidate source size overflow"))?;
+    if total > MAX_CANDIDATE_SOURCE_BYTES {
+        return Err(io::Error::other("candidate source exceeds its bound"));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"opc-session-mtls-candidate-source/v2\0");
+    hash_candidate_source_part(&mut hasher, b"revision", revision.as_bytes())?;
+    hash_candidate_source_part(&mut hasher, b"status", &source_status)?;
+    hash_candidate_source_part(&mut hasher, b"tracked-diff", &tracked_diff)?;
+    for encoded_path in untracked_paths
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative = PathBuf::from(std::ffi::OsString::from_vec(encoded_path.to_vec()));
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(io::Error::other(
+                "candidate untracked source path is invalid",
+            ));
+        }
+        let remaining = MAX_CANDIDATE_SOURCE_BYTES
+            .checked_sub(total)
+            .ok_or_else(|| io::Error::other("candidate source exceeds its bound"))?;
+        let encoded = read_bounded_candidate_file(&repository.join(&relative), remaining)?;
+        total = total
+            .checked_add(
+                u64::try_from(encoded.len())
+                    .map_err(|_| io::Error::other("candidate source size overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("candidate source size overflow"))?;
+        hash_candidate_source_part(&mut hasher, b"untracked-path", encoded_path)?;
+        hash_candidate_source_part(&mut hasher, b"untracked-bytes", &encoded)?;
+    }
+    Ok((
+        revision,
+        tree_status,
+        format!("sha256:{:x}", hasher.finalize()),
+    ))
+}
+
+fn candidate_git_output(
+    repository: &Path,
+    arguments: &[&str],
+    maximum_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    let mut child = Command::new("git")
+        .args(arguments)
+        .env("LC_ALL", "C")
+        .current_dir(repository)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("candidate source stdout is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("candidate source stderr is unavailable"))?;
+    let stderr_reader = match thread::Builder::new()
+        .name("candidate-git-stderr".to_owned())
+        .spawn(move || drain_candidate_git_stderr(stderr))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let stdout_result = read_bounded_stream(stdout, maximum_bytes);
+    if stdout_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = match child.wait() {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    };
+    let stderr_clean = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("candidate source stderr reader panicked"))??;
+    let status = status?;
+    let stdout = stdout_result?;
+    if !status.success() || !stderr_clean {
+        return Err(io::Error::other("candidate source state is unavailable"));
+    }
+    Ok(stdout)
+}
+
+fn read_bounded_stream<R: Read>(mut reader: R, maximum_bytes: u64) -> io::Result<Vec<u8>> {
+    let initial_capacity = usize::try_from(maximum_bytes.min(64 * 1024))
+        .map_err(|_| io::Error::other("candidate source size overflow"))?;
+    let mut encoded = Vec::with_capacity(initial_capacity);
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(encoded);
+        }
+        total = total
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| io::Error::other("candidate source size overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("candidate source size overflow"))?;
+        if total > maximum_bytes {
+            return Err(io::Error::other("candidate source exceeds its bound"));
+        }
+        encoded.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn drain_candidate_git_stderr<R: Read>(mut reader: R) -> io::Result<bool> {
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut empty = true;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(empty);
+        }
+        empty = false;
+    }
+}
+
+fn hash_candidate_source_part(hasher: &mut Sha256, label: &[u8], encoded: &[u8]) -> io::Result<()> {
+    let label_length = u64::try_from(label.len())
+        .map_err(|_| io::Error::other("candidate source label overflow"))?;
+    let encoded_length = u64::try_from(encoded.len())
+        .map_err(|_| io::Error::other("candidate source length overflow"))?;
+    hasher.update(label_length.to_be_bytes());
+    hasher.update(label);
+    hasher.update(encoded_length.to_be_bytes());
+    hasher.update(encoded);
+    Ok(())
+}
+
+fn candidate_source_provenance(
+) -> io::Result<(String, SessionMtlsCandidateSourceTreeStatus, String)> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    candidate_source_provenance_at(&repository)
+}
+
+fn write_private_candidate_file(path: &Path, encoded: &[u8]) -> io::Result<()> {
+    let descriptor = open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    fchmod(&descriptor, Mode::from_raw_mode(0o600))?;
+    let metadata = fstat(&descriptor)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_file()
+        || Mode::from_raw_mode(metadata.st_mode).bits() & 0o777 != 0o600
+    {
+        return Err(io::Error::other(
+            "candidate evidence output is not a private regular file",
+        ));
+    }
+    let mut file = File::from(descriptor);
+    file.write_all(encoded)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn open_bounded_candidate_file(path: &Path, maximum_bytes: u64) -> io::Result<File> {
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let metadata = fstat(&descriptor)?;
+    let length = u64::try_from(metadata.st_size)
+        .map_err(|_| io::Error::other("candidate evidence size is invalid"))?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_file() || length > maximum_bytes {
+        return Err(io::Error::other(
+            "candidate evidence artifact is not a bounded regular file",
+        ));
+    }
+    Ok(File::from(descriptor))
+}
+
+fn read_bounded_candidate_file(path: &Path, maximum_bytes: u64) -> io::Result<Vec<u8>> {
+    let file = open_bounded_candidate_file(path, maximum_bytes)?;
+    let file_metadata = file.metadata()?;
+    let capacity = usize::try_from(file_metadata.len())
+        .map_err(|_| io::Error::other("candidate evidence size overflow"))?;
+    let mut encoded = Vec::with_capacity(capacity);
+    file.take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut encoded)?;
+    if u64::try_from(encoded.len()).map_or(true, |size| size > maximum_bytes) {
+        return Err(io::Error::other("candidate evidence exceeds its bound"));
+    }
+    Ok(encoded)
+}
+
+fn preserve_mtls_candidate_evidence(
+    campaign: SessionMtlsCandidateCampaign,
+    member_count: usize,
+    evidence_path: &Path,
+    schema_path: &Path,
+) -> io::Result<()> {
+    let Some(configured_root) = env::var_os(EVIDENCE_OUTPUT_DIRECTORY_ENV) else {
+        return Ok(());
+    };
+    preserve_mtls_candidate_evidence_at(
+        &PathBuf::from(configured_root),
+        campaign,
+        member_count,
+        evidence_path,
+        schema_path,
+    )
+}
+
+fn preserve_mtls_candidate_evidence_at(
+    configured_root: &Path,
+    campaign: SessionMtlsCandidateCampaign,
+    member_count: usize,
+    evidence_path: &Path,
+    schema_path: &Path,
+) -> io::Result<()> {
+    if !configured_root.is_absolute() {
+        return Err(io::Error::other("candidate evidence root must be absolute"));
+    }
+    if !matches!(member_count, 3 | 5) {
+        return Err(io::Error::other("candidate evidence topology is invalid"));
+    }
+    let evidence = read_bounded_candidate_file(evidence_path, MAX_CANDIDATE_EVIDENCE_BYTES)?;
+    let schema = read_bounded_candidate_file(schema_path, MAX_CANDIDATE_EVIDENCE_BYTES)?;
+    let mut root_builder = DirBuilder::new();
+    root_builder.recursive(true).mode(0o700);
+    root_builder.create(configured_root)?;
+    let canonical_root = fs::canonicalize(configured_root)?;
+    if canonical_root != configured_root {
+        return Err(io::Error::other("candidate evidence root is invalid"));
+    }
+    let root_descriptor = open(
+        &canonical_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let root_metadata = fstat(&root_descriptor)?;
+    if !FileType::from_raw_mode(root_metadata.st_mode).is_dir()
+        || Mode::from_raw_mode(root_metadata.st_mode).bits() & 0o777 != 0o700
+    {
+        return Err(io::Error::other("candidate evidence root is invalid"));
+    }
+
+    let destination_name = format!("mtls-v2-{}-{member_count}-node", campaign.as_str());
+    let staging_name = create_candidate_staging_directory(&root_descriptor)?;
+    let staging_descriptor = match openat(
+        &root_descriptor,
+        staging_name.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            let _ = unlinkat(&root_descriptor, staging_name.as_str(), AtFlags::REMOVEDIR);
+            return Err(error.into());
+        }
+    };
+    let mut published = false;
+    let staged_result = (|| -> io::Result<()> {
+        fchmod(&staging_descriptor, Mode::from_raw_mode(0o700))?;
+        let staging_metadata = fstat(&staging_descriptor)?;
+        if !FileType::from_raw_mode(staging_metadata.st_mode).is_dir()
+            || Mode::from_raw_mode(staging_metadata.st_mode).bits() & 0o777 != 0o700
+        {
+            return Err(io::Error::other(
+                "candidate evidence staging directory is invalid",
+            ));
+        }
+        write_private_candidate_file_at(&staging_descriptor, "evidence.json", &evidence)?;
+        write_private_candidate_file_at(&staging_descriptor, "evidence.schema.json", &schema)?;
+        fsync(&staging_descriptor)?;
+        renameat_with(
+            &root_descriptor,
+            staging_name.as_str(),
+            &root_descriptor,
+            destination_name.as_str(),
+            RenameFlags::NOREPLACE,
+        )?;
+        published = true;
+        fsync(&root_descriptor)?;
+        Ok(())
+    })();
+    if staged_result.is_err() && !published {
+        cleanup_candidate_staging_directory(&root_descriptor, &staging_descriptor, &staging_name);
+    }
+    staged_result
+}
+
+fn create_candidate_staging_directory<Fd: AsFd>(root_descriptor: Fd) -> io::Result<String> {
+    for _ in 0..32 {
+        let sequence = CANDIDATE_STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".mtls-v2-staging-{}-{sequence}", std::process::id());
+        match mkdirat(&root_descriptor, name.as_str(), Mode::from_raw_mode(0o700)) {
+            Ok(()) => return Ok(name),
+            Err(error) if io::Error::from(error).kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(io::Error::other(
+        "candidate evidence staging namespace is exhausted",
+    ))
+}
+
+fn write_private_candidate_file_at<Fd: AsFd>(
+    directory: Fd,
+    name: &str,
+    encoded: &[u8],
+) -> io::Result<()> {
+    let descriptor = openat(
+        directory,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    fchmod(&descriptor, Mode::from_raw_mode(0o600))?;
+    let metadata = fstat(&descriptor)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_file()
+        || Mode::from_raw_mode(metadata.st_mode).bits() & 0o777 != 0o600
+    {
+        return Err(io::Error::other(
+            "candidate evidence output is not a private regular file",
+        ));
+    }
+    let mut file = File::from(descriptor);
+    file.write_all(encoded)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn cleanup_candidate_staging_directory<RootFd: AsFd, StagingFd: AsFd>(
+    root_descriptor: RootFd,
+    staging_descriptor: StagingFd,
+    staging_name: &str,
+) {
+    for name in ["evidence.json", "evidence.schema.json"] {
+        let _ = unlinkat(&staging_descriptor, name, AtFlags::empty());
+    }
+    let _ = unlinkat(&root_descriptor, staging_name, AtFlags::REMOVEDIR);
+}
+
+fn ensure_candidate_evidence_feature_profile() -> io::Result<()> {
+    if cfg!(feature = "foundation-insecure") {
+        return Err(io::Error::other(
+            "candidate evidence is disabled when foundation-insecure is compiled",
+        ));
+    }
+    Ok(())
+}
+
+fn emit_mtls_candidate_evidence(
+    fleet: &Fleet,
+    campaign: SessionMtlsCandidateCampaign,
+) -> io::Result<()> {
+    ensure_candidate_evidence_feature_profile()?;
+    let member_count = fleet.member_count();
+    fleet
+        .candidate_evidence_inputs
+        .verify_unchanged(&fleet.config_paths)?;
+    let directed_path_count = member_count
+        .checked_mul(member_count.saturating_sub(1))
+        .ok_or_else(|| io::Error::other("candidate topology path count overflow"))?;
+    let public_material_manifest_sha256 = fleet.candidate_public_material_manifest.sha256()?;
+    let workload_schedule_sha256 =
+        session_mtls_candidate_schedule_sha256(campaign, member_count)
+            .ok_or_else(|| io::Error::other("candidate topology is unsupported"))?;
+    let document = serde_json::json!({
+        "schema_version": "opc-session-mtls-candidate-evidence/v2",
+        "experimental": true,
+        "qualification_complete": false,
+        "source": {
+            "revision": fleet.candidate_evidence_inputs.source_revision,
+            "tree_status": fleet.candidate_evidence_inputs.source_tree_status,
+            "worktree_sha256": fleet.candidate_evidence_inputs.source_worktree_sha256,
+        },
+        "artifact": {
+            "name": "opc-session-quorum-node",
+            "version": env!("CARGO_PKG_VERSION"),
+            "sha256": fleet.candidate_evidence_inputs.child_sha256,
+            "harness_name": "qualification_mtls_multiprocess",
+            "harness_sha256": fleet.candidate_evidence_inputs.harness_sha256,
+            "insecure_test_enabled": cfg!(feature = "foundation-insecure"),
+        },
+        "campaign": campaign,
+        "topology": {
+            "members": member_count,
+            "distinct_processes": true,
+            "distinct_sqlite_databases": true,
+            "transport_mode": "projected_svid_mtls_pinned_loopback",
+            "directed_path_count": directed_path_count,
+            "counts_for_seamless_tls_rotation": false,
+        },
+        "bindings": {
+            "evidence_schema_sha256": opc_session_testkit::qualification::session_mtls_candidate_evidence_v2_schema_sha256(),
+            "configuration_sha256": fleet.candidate_evidence_inputs.configuration_sha256,
+            "public_material_manifest_sha256": public_material_manifest_sha256,
+            "workload_schedule_sha256": workload_schedule_sha256,
+        },
+        "observations": {
+            "material_status_collected": true,
+            "durable_readiness_reached": true,
+            "directed_fresh_handshakes_succeeded": true,
+            "lifecycle_metrics_collected": true,
+            "encrypted_canary_verified": true,
+            "plaintext_canary_absent_from_sqlite_family": true,
+        },
+        "coverage": campaign.coverage(),
+        "remaining_acceptance": SessionMtlsCandidateEvidenceV2::required_remaining_acceptance(),
+    });
+    let evidence: SessionMtlsCandidateEvidenceV2 = serde_json::from_value(document)
+        .map_err(|_| io::Error::other("candidate evidence construction failed"))?;
+    evidence
+        .validate()
+        .map_err(|_| io::Error::other("candidate evidence validation failed"))?;
+    let mut encoded = serde_json::to_vec_pretty(&evidence)
+        .map_err(|_| io::Error::other("candidate evidence encoding failed"))?;
+    encoded.push(b'\n');
+    if u64::try_from(encoded.len()).map_or(true, |size| size > MAX_CANDIDATE_EVIDENCE_BYTES) {
+        return Err(io::Error::other("candidate evidence exceeds its bound"));
+    }
+
+    let workspace = tempfile::tempdir()?;
+    let evidence_path = workspace.path().join("evidence.json");
+    let schema_path = workspace.path().join("evidence.schema.json");
+    write_private_candidate_file(&evidence_path, &encoded)?;
+    write_private_candidate_file(
+        &schema_path,
+        SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON.as_bytes(),
+    )?;
+    let decoded: SessionMtlsCandidateEvidenceV2 = serde_json::from_slice(
+        &read_bounded_candidate_file(&evidence_path, MAX_CANDIDATE_EVIDENCE_BYTES)?,
+    )
+    .map_err(|_| io::Error::other("candidate evidence round trip failed"))?;
+    decoded
+        .validate()
+        .map_err(|_| io::Error::other("candidate evidence round trip is invalid"))?;
+    preserve_mtls_candidate_evidence(campaign, member_count, &evidence_path, &schema_path)
+}
+
+fn assert_mtls_candidate_evidence_emission(fleet: &Fleet, campaign: SessionMtlsCandidateCampaign) {
+    let result = emit_mtls_candidate_evidence(fleet, campaign);
+    if cfg!(feature = "foundation-insecure") {
+        assert!(
+            result.is_err(),
+            "candidate evidence must be rejected when foundation-insecure is compiled"
+        );
+    } else {
+        result.expect("emit validated mTLS candidate evidence");
+    }
+}
+
 fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
     const MALFORMED_TRUST_BUNDLE: &str =
         "-----BEGIN CERTIFICATE-----\nqualification-malformed\n-----END CERTIFICATE-----\n";
@@ -5921,15 +6711,11 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         QualificationConsensusRpcAvailability::Unavailable,
     );
     fleet.wait_for_isolated_member_and_survivors(isolated_node_index);
-    let malformed_credential = fleet
-        .pki
-        .credential(malformed_node_index, CredentialGeneration::Initial);
-    publish_projected_files(
-        &fleet.projected_roots[malformed_node_index],
-        &mut fleet.projected_generation[malformed_node_index],
-        &malformed_credential.certificate_chain_pem,
-        &malformed_credential.private_key_pem,
+    fleet.publish_known_projected_generation_with_trust(
+        malformed_node_index,
+        CredentialGeneration::Initial,
         MALFORMED_TRUST_BUNDLE,
+        "malformed-trust-retain-last-good",
     );
     let malformed_security = fleet.wait_for_malformed_trust_retention(
         malformed_node_index,
@@ -5985,15 +6771,11 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
 
     let repair_source_before = fleet.projected_status(malformed_node_index);
     let repair_controller_before = fleet.material_status(malformed_node_index);
-    let repair_credential = fleet
-        .pki
-        .credential(malformed_node_index, CredentialGeneration::Initial);
-    let old_trust = fleet.pki.trust_bundle(TrustGeneration::OldOnly);
-    publish_projected_generation(
-        &fleet.projected_roots[malformed_node_index],
-        &mut fleet.projected_generation[malformed_node_index],
-        repair_credential,
-        &old_trust,
+    fleet.publish_known_projected_generation(
+        malformed_node_index,
+        CredentialGeneration::Initial,
+        TrustGeneration::OldOnly,
+        "malformed-trust-repair",
     );
     fleet.wait_for_member_recovery_publication(
         malformed_node_index,
@@ -6047,11 +6829,11 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
     assert_security_metrics_unsaturated(expiring_node_index, &expiring_security_before);
     let (expiring_credential, not_after) = fleet.pki.expiring_workload(expiring_node_index);
     let old_trust = fleet.pki.trust_bundle(TrustGeneration::OldOnly);
-    publish_projected_generation(
-        &fleet.projected_roots[expiring_node_index],
-        &mut fleet.projected_generation[expiring_node_index],
+    fleet.publish_custom_projected_generation(
+        expiring_node_index,
         &expiring_credential,
         &old_trust,
+        "short-lived-svid",
     );
     fleet.wait_for_member_publication(
         expiring_node_index,
@@ -6220,17 +7002,13 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         "replacement-prepublication-progress",
         prepublication_progress_deadline,
     );
-    let replacement = fleet
-        .pki
-        .credential(expiring_node_index, CredentialGeneration::RenewedLeaf);
-    let old_trust = fleet.pki.trust_bundle(TrustGeneration::OldOnly);
     let publication_stage_deadline =
         replacement_traffic_progress.next_deadline(replacement_traffic_progress.pulse_deadline());
-    let replacement_recovery_started = publish_projected_generation(
-        &fleet.projected_roots[expiring_node_index],
-        &mut fleet.projected_generation[expiring_node_index],
-        replacement,
-        &old_trust,
+    let replacement_recovery_started = fleet.publish_known_projected_generation(
+        expiring_node_index,
+        CredentialGeneration::RenewedLeaf,
+        TrustGeneration::OldOnly,
+        "same-process-material-recovery",
     );
     assert!(
         deadline_allows_completion(replacement_recovery_started, publication_stage_deadline),
@@ -6369,6 +7147,10 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
     fleet.retain_traffic_plaintext_canaries(&stopped_watches);
     fleet.shutdown();
     fleet.assert_plaintext_canaries_absent_from_sqlite();
+    assert_mtls_candidate_evidence_emission(
+        &fleet,
+        SessionMtlsCandidateCampaign::FaultExpiryRecovery,
+    );
     assert!(fleet.workspace.path().is_dir());
 }
 
@@ -6523,6 +7305,7 @@ fn run_projected_mtls_rotation_core(member_count: usize) {
 
     fleet.shutdown();
     fleet.assert_plaintext_canaries_absent_from_sqlite();
+    assert_mtls_candidate_evidence_emission(&fleet, SessionMtlsCandidateCampaign::RotationCore);
     assert!(fleet.workspace.path().is_dir());
 }
 
@@ -6853,7 +7636,370 @@ fn run_projected_mtls_traffic_resources(member_count: usize) {
 
     fleet.shutdown();
     fleet.assert_plaintext_canaries_absent_from_sqlite();
+    assert_mtls_candidate_evidence_emission(
+        &fleet,
+        SessionMtlsCandidateCampaign::TrafficResourceBounds,
+    );
     assert!(fleet.workspace.path().is_dir());
+}
+
+#[test]
+fn candidate_configuration_digest_is_order_content_and_bound_sensitive() {
+    let workspace = tempfile::tempdir().expect("create candidate-configuration workspace");
+    let config_paths = (0..3)
+        .map(|index| {
+            let path = workspace.path().join(format!("config-{index}.json"));
+            fs::write(&path, format!("{{\"node_index\":{index}}}\n"))
+                .expect("write candidate configuration");
+            path
+        })
+        .collect::<Vec<_>>();
+    let original =
+        candidate_configuration_sha256(&config_paths).expect("hash candidate configurations");
+
+    let mut reordered = config_paths.clone();
+    reordered.reverse();
+    assert_ne!(
+        candidate_configuration_sha256(&reordered).expect("hash reordered configurations"),
+        original
+    );
+
+    fs::write(&config_paths[0], b"{\"node_index\":30}\n").expect("change candidate configuration");
+    assert_ne!(
+        candidate_configuration_sha256(&config_paths).expect("hash changed configurations"),
+        original
+    );
+
+    assert!(candidate_configuration_sha256(&config_paths[..2]).is_err());
+    let symlink_path = workspace.path().join("config-symlink.json");
+    symlink(&config_paths[0], &symlink_path).expect("create configuration symlink");
+    let mut aliased = config_paths.clone();
+    aliased[0] = symlink_path;
+    assert!(candidate_configuration_sha256(&aliased).is_err());
+
+    let oversized_length = usize::try_from(QUALIFICATION_MAX_CONFIG_BYTES)
+        .expect("configuration bound fits usize")
+        + 1;
+    fs::write(&config_paths[0], vec![0_u8; oversized_length])
+        .expect("write oversized candidate configuration");
+    assert!(candidate_configuration_sha256(&config_paths).is_err());
+}
+
+#[test]
+fn candidate_evidence_feature_gate_matches_the_compiled_transport_profile() {
+    let result = ensure_candidate_evidence_feature_profile();
+    assert_eq!(result.is_err(), cfg!(feature = "foundation-insecure"));
+}
+
+#[test]
+fn candidate_execution_bindings_fail_when_a_preexecution_input_changes() {
+    let workspace = tempfile::tempdir().expect("create candidate binding workspace");
+    let config_paths = (0..3)
+        .map(|index| {
+            let path = workspace.path().join(format!("config-{index}.json"));
+            fs::write(&path, format!("{{\"node_index\":{index}}}\n"))
+                .expect("write candidate binding configuration");
+            path
+        })
+        .collect::<Vec<_>>();
+    let (source_revision, source_tree_status, source_worktree_sha256) =
+        candidate_source_provenance().expect("capture candidate source binding");
+    let harness_path = env::current_exe().expect("locate candidate harness artifact");
+    let inputs = CandidateEvidenceInputs {
+        source_revision,
+        source_tree_status,
+        source_worktree_sha256,
+        child_sha256: candidate_sha256_file(
+            Path::new(env!("CARGO_BIN_EXE_opc-session-quorum-node")),
+            MAX_CANDIDATE_ARTIFACT_BYTES,
+        )
+        .expect("hash candidate child artifact"),
+        harness_sha256: candidate_sha256_file(&harness_path, MAX_CANDIDATE_ARTIFACT_BYTES)
+            .expect("hash candidate harness artifact"),
+        configuration_sha256: candidate_configuration_sha256(&config_paths)
+            .expect("hash preexecution configurations"),
+    };
+    inputs
+        .verify_unchanged(&config_paths)
+        .expect("unchanged preexecution bindings remain valid");
+
+    fs::write(&config_paths[1], b"{\"node_index\":99}\n")
+        .expect("change bound candidate configuration");
+    assert!(inputs.verify_unchanged(&config_paths).is_err());
+}
+
+#[test]
+fn candidate_public_material_manifest_binds_order_epoch_and_public_bytes() {
+    let digest = |phase: &str, epoch: u64, certificate: &str, trust: &str| {
+        let mut manifest = CandidatePublicMaterialManifest::new();
+        manifest
+            .record(phase, 1, epoch, certificate, trust)
+            .expect("record public material input");
+        manifest.sha256().expect("hash public material manifest")
+    };
+    let baseline = digest("phase-one", 1, "public-certificate-a", "public-trust-a");
+    assert_eq!(
+        baseline,
+        digest("phase-one", 1, "public-certificate-a", "public-trust-a")
+    );
+    assert_ne!(
+        baseline,
+        digest("phase-two", 1, "public-certificate-a", "public-trust-a")
+    );
+    assert_ne!(
+        baseline,
+        digest("phase-one", 2, "public-certificate-a", "public-trust-a")
+    );
+    assert_ne!(
+        baseline,
+        digest("phase-one", 1, "public-certificate-b", "public-trust-a")
+    );
+    assert_ne!(
+        baseline,
+        digest("phase-one", 1, "public-certificate-a", "public-trust-b")
+    );
+
+    let mut invalid = CandidatePublicMaterialManifest::new();
+    assert!(invalid.record("", 0, 1, "certificate", "trust").is_err());
+    assert!(invalid.sha256().is_err());
+}
+
+#[test]
+fn candidate_source_provenance_marks_nonignored_untracked_inputs_dirty() {
+    let repository = tempfile::tempdir().expect("create provenance repository");
+    let run_git = |arguments: &[&str]| {
+        let status = Command::new("git")
+            .args(arguments)
+            .current_dir(repository.path())
+            .status()
+            .expect("run provenance git command");
+        assert!(status.success(), "provenance git command failed");
+    };
+    run_git(&["init", "--quiet"]);
+    fs::write(repository.path().join("tracked.txt"), b"tracked\n")
+        .expect("write tracked provenance input");
+    run_git(&["add", "tracked.txt"]);
+    run_git(&[
+        "-c",
+        "user.name=Qualification Test",
+        "-c",
+        "user.email=qualification@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "test fixture",
+    ]);
+
+    let (revision, status, clean_digest) =
+        candidate_source_provenance_at(repository.path()).expect("read clean provenance");
+    assert_eq!(revision.len(), 40);
+    assert_eq!(status, SessionMtlsCandidateSourceTreeStatus::Clean);
+
+    let untracked = repository.path().join("untracked-build-input.txt");
+    fs::write(&untracked, b"untracked\n").expect("write untracked provenance input");
+    let (_, status, untracked_digest) =
+        candidate_source_provenance_at(repository.path()).expect("read untracked provenance");
+    assert_eq!(
+        status,
+        SessionMtlsCandidateSourceTreeStatus::DirtyUnqualified
+    );
+    assert_ne!(untracked_digest, clean_digest);
+
+    fs::write(&untracked, b"changed-untracked\n").expect("change untracked provenance input bytes");
+    let (_, changed_status, changed_untracked_digest) =
+        candidate_source_provenance_at(repository.path())
+            .expect("read changed untracked provenance");
+    assert_eq!(changed_status, status);
+    assert_ne!(changed_untracked_digest, untracked_digest);
+
+    fs::remove_file(untracked).expect("remove untracked provenance input");
+    fs::write(repository.path().join("tracked.txt"), b"modified\n")
+        .expect("modify tracked provenance input");
+    let (_, status, modified_digest) =
+        candidate_source_provenance_at(repository.path()).expect("read modified provenance");
+    assert_eq!(
+        status,
+        SessionMtlsCandidateSourceTreeStatus::DirtyUnqualified
+    );
+    assert_ne!(modified_digest, clean_digest);
+
+    fs::write(repository.path().join("tracked.txt"), vec![b'x'; 256])
+        .expect("write bounded provenance diff");
+    assert!(candidate_git_output(
+        repository.path(),
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "HEAD",
+            "--",
+        ],
+        64,
+    )
+    .is_err());
+}
+
+#[test]
+fn candidate_evidence_persistence_is_bounded_private_and_create_new() {
+    let workspace = tempfile::tempdir().expect("create evidence persistence workspace");
+    let evidence_path = workspace.path().join("source-evidence.json");
+    let schema_path = workspace.path().join("source-schema.json");
+    write_private_candidate_file(&evidence_path, b"{\"experimental\":true}\n")
+        .expect("write source evidence");
+    write_private_candidate_file(&schema_path, b"{\"type\":\"object\"}\n")
+        .expect("write source schema");
+    let output_root = workspace.path().join("retained");
+
+    preserve_mtls_candidate_evidence_at(
+        &output_root,
+        SessionMtlsCandidateCampaign::RotationCore,
+        3,
+        &evidence_path,
+        &schema_path,
+    )
+    .expect("preserve bounded candidate evidence");
+    let destination = output_root.join("mtls-v2-rotation_core-3-node");
+    assert_eq!(
+        fs::metadata(&output_root)
+            .expect("retained evidence root metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&destination)
+            .expect("retained campaign directory metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let mut names = fs::read_dir(&destination)
+        .expect("read retained candidate directory")
+        .map(|entry| {
+            entry
+                .expect("retained candidate entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["evidence.json", "evidence.schema.json"]);
+    for name in names {
+        assert_eq!(
+            fs::metadata(destination.join(name))
+                .expect("retained candidate file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    assert!(
+        preserve_mtls_candidate_evidence_at(
+            &output_root,
+            SessionMtlsCandidateCampaign::RotationCore,
+            3,
+            &evidence_path,
+            &schema_path,
+        )
+        .is_err(),
+        "an existing campaign directory must never be replaced"
+    );
+    let mut root_entries = fs::read_dir(&output_root)
+        .expect("read retained evidence root")
+        .map(|entry| {
+            entry
+                .expect("retained root entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    root_entries.sort();
+    assert_eq!(root_entries, ["mtls-v2-rotation_core-3-node"]);
+
+    let missing_source_root = workspace.path().join("missing-source-root");
+    assert!(preserve_mtls_candidate_evidence_at(
+        &missing_source_root,
+        SessionMtlsCandidateCampaign::FaultExpiryRecovery,
+        3,
+        &evidence_path,
+        &workspace.path().join("missing-schema.json"),
+    )
+    .is_err());
+    assert!(
+        !missing_source_root.exists(),
+        "a source-read failure must not leave a root or partial destination"
+    );
+
+    let permissive_root = workspace.path().join("permissive-root");
+    fs::create_dir(&permissive_root).expect("create permissive evidence root");
+    fs::set_permissions(&permissive_root, Permissions::from_mode(0o755))
+        .expect("set permissive evidence-root mode");
+    assert!(
+        preserve_mtls_candidate_evidence_at(
+            &permissive_root,
+            SessionMtlsCandidateCampaign::RotationCore,
+            3,
+            &evidence_path,
+            &schema_path,
+        )
+        .is_err(),
+        "a pre-existing non-private root must fail closed"
+    );
+    assert_eq!(
+        fs::metadata(&permissive_root)
+            .expect("permissive evidence-root metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "the harness must not chmod a user-selected existing directory"
+    );
+
+    let private_root = workspace.path().join("private-root");
+    fs::create_dir(&private_root).expect("create private evidence root");
+    fs::set_permissions(&private_root, Permissions::from_mode(0o700))
+        .expect("set private evidence-root mode");
+    let aliased_root = workspace.path().join("aliased-root");
+    symlink(&private_root, &aliased_root).expect("create evidence-root symlink");
+    assert!(
+        preserve_mtls_candidate_evidence_at(
+            &aliased_root,
+            SessionMtlsCandidateCampaign::FaultExpiryRecovery,
+            3,
+            &evidence_path,
+            &schema_path,
+        )
+        .is_err(),
+        "a symlinked output root must fail closed"
+    );
+    assert_eq!(
+        fs::read_dir(&private_root)
+            .expect("read private symlink target")
+            .count(),
+        0
+    );
+
+    let victim = workspace.path().join("victim");
+    fs::write(&victim, b"unchanged").expect("write symlink victim");
+    let target = workspace.path().join("target");
+    symlink(&victim, &target).expect("create target symlink");
+    assert!(write_private_candidate_file(&target, b"replacement").is_err());
+    assert!(read_bounded_candidate_file(&target, 64).is_err());
+    assert!(candidate_sha256_file(&target, 64).is_err());
+    assert_eq!(fs::read(victim).expect("read symlink victim"), b"unchanged");
+
+    let oversized = workspace.path().join("oversized");
+    fs::write(&oversized, b"12345").expect("write oversized evidence");
+    assert!(read_bounded_candidate_file(&oversized, 4).is_err());
+    assert!(candidate_sha256_file(&oversized, 4).is_err());
 }
 
 #[test]

@@ -308,6 +308,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supported-platform, and signed candidate evidence remain open under
   #164/#158/#143. Session payload encryption, AAD, key-provider/HKMS
   boundaries, durable formats, and Openraft's sole authority are unchanged.
+- **Digest-bound local mTLS candidate evidence — `opc-session-testkit`:** a new
+  closed v2 schema and typed redaction-safe record bind each successful local
+  rotation-core, fault/expiry-recovery, or traffic/resource campaign to its
+  pre-execution source state, exact child and parent-harness artifacts,
+  generated configuration, ordered public-certificate/trust publication
+  manifest, exact declared orchestration schedule, 3/5-member topology,
+  directed-path count, and ordered coverage. Pre-execution bindings are
+  rechecked after the campaign. Records are ephemeral unless the existing
+  absolute evidence-output contract is set; the opt-in bundle uses bounded
+  no-follow reads and a private staged, fsynced, atomic no-replace publication.
+  Candidate emission is rejected when `foundation-insecure` is compiled, and
+  successful record construction remains private to the validated harness.
+  Production-credit fields remain fixed false, and deployed
+  network/storage, CNF/Kubernetes, platform soak, remote-HKMS, live
+  metrics/alerts, independent signing, and HA-profile graduation stay open, so
+  this does not complete #164/#158 or change runtime, at-rest encryption, HKMS,
+  durable formats, or Openraft authority.
 - **Experimental HA qualification — `opc-consensus`, `opc-session-store`, and
   `opc-persist`:** both durable domains now use one fail-closed Openraft runtime
   profile and the exact `openpacketcore/openraft` revision

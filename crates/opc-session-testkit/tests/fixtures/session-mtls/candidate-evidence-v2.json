@@ -1,0 +1,59 @@
+{
+  "schema_version": "opc-session-mtls-candidate-evidence/v2",
+  "experimental": true,
+  "qualification_complete": false,
+  "source": {
+    "revision": "0000000000000000000000000000000000000000",
+    "tree_status": "clean",
+    "worktree_sha256": "sha256:3a7bd3e2360a3d80b14acbedbbff0ae94a56b27f24c5fa8562b3d9a818c0561d"
+  },
+  "artifact": {
+    "name": "opc-session-quorum-node",
+    "version": "0.2.0",
+    "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "harness_name": "qualification_mtls_multiprocess",
+    "harness_sha256": "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+    "insecure_test_enabled": false
+  },
+  "campaign": "rotation_core",
+  "topology": {
+    "members": 3,
+    "distinct_processes": true,
+    "distinct_sqlite_databases": true,
+    "transport_mode": "projected_svid_mtls_pinned_loopback",
+    "directed_path_count": 6,
+    "counts_for_seamless_tls_rotation": false
+  },
+  "bindings": {
+    "evidence_schema_sha256": "sha256:911873fe33a2d376c25fa6cacb0b3644f59d0c5a372bf966204c33bd2f581fef",
+    "configuration_sha256": "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "public_material_manifest_sha256": "sha256:88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
+    "workload_schedule_sha256": "sha256:af929a4f7cdd5422eae4c3110859e7230be6b47b30a50f1bcc4b01d35c9f74fa"
+  },
+  "observations": {
+    "material_status_collected": true,
+    "durable_readiness_reached": true,
+    "directed_fresh_handshakes_succeeded": true,
+    "lifecycle_metrics_collected": true,
+    "encrypted_canary_verified": true,
+    "plaintext_canary_absent_from_sqlite_family": true
+  },
+  "coverage": [
+    "leaf_renewal",
+    "intermediate_rotation_rollback",
+    "root_overlap_removal_rollback",
+    "removed_root_rejected",
+    "fresh_directed_handshakes",
+    "durable_readiness",
+    "encrypted_canary_boundary"
+  ],
+  "remaining_acceptance": [
+    "real_network_storage_faults",
+    "deployed_cnf_kubernetes",
+    "supported_platform_resource_soak",
+    "remote_hkms",
+    "live_metrics_alerts_qualification",
+    "signed_independent_candidate",
+    "ha_profile_graduation"
+  ]
+}
