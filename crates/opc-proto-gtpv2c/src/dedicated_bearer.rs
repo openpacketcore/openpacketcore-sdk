@@ -258,7 +258,7 @@ fn spec_ref() -> SpecRef {
 }
 
 /// One Bearer Context in an S2b Create Bearer Request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bCreateBearerRequestContext<'a> {
     /// Canonical TS 24.008 TFT value.
     pub tft: TrafficFlowTemplate,
@@ -272,8 +272,21 @@ pub struct S2bCreateBearerRequestContext<'a> {
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
+impl fmt::Debug for S2bCreateBearerRequestContext<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bCreateBearerRequestContext")
+            .field("tft_present", &true)
+            .field("bearer_qos_present", &true)
+            .field("pgw_f_teid_present", &true)
+            .field("charging_id_present", &true)
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
 /// Typed S2b Create Bearer Request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bCreateBearerRequest<'a> {
     /// GTPv2-C sequence number.
     pub sequence_number: u32,
@@ -287,8 +300,18 @@ pub struct S2bCreateBearerRequest<'a> {
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
+impl fmt::Debug for S2bCreateBearerRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bCreateBearerRequest")
+            .field("bearer_context_count", &self.bearer_contexts.len())
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
 /// One bearer-level result in an S2b Create Bearer Response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum S2bCreateBearerResult<'a> {
     /// Bearer was installed successfully.
     Accepted {
@@ -312,6 +335,31 @@ pub enum S2bCreateBearerResult<'a> {
         /// Other conditional or extension nested IEs.
         additional_ies: Vec<TypedIe<'a>>,
     },
+}
+
+impl fmt::Debug for S2bCreateBearerResult<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accepted { additional_ies, .. } => formatter
+                .debug_struct("S2bCreateBearerResult")
+                .field("outcome", &"accepted")
+                .field("epdg_f_teid_present", &true)
+                .field("pgw_f_teid_present", &true)
+                .field("additional_ie_count", &additional_ies.len())
+                .finish(),
+            Self::Rejected {
+                cause,
+                additional_ies,
+                ..
+            } => formatter
+                .debug_struct("S2bCreateBearerResult")
+                .field("outcome", &"rejected")
+                .field("cause", cause)
+                .field("pgw_f_teid_present", &true)
+                .field("additional_ie_count", &additional_ies.len())
+                .finish(),
+        }
+    }
 }
 
 impl S2bCreateBearerResult<'_> {
@@ -348,7 +396,7 @@ impl S2bCreateBearerResult<'_> {
 }
 
 /// Typed S2b Create Bearer Response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bCreateBearerResponse<'a> {
     /// GTPv2-C sequence number copied from the request.
     pub sequence_number: u32,
@@ -362,8 +410,29 @@ pub struct S2bCreateBearerResponse<'a> {
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
+impl fmt::Debug for S2bCreateBearerResponse<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let accepted_count = self
+            .bearer_contexts
+            .iter()
+            .filter(|result| result.is_accepted())
+            .count();
+        formatter
+            .debug_struct("S2bCreateBearerResponse")
+            .field("cause", &self.cause)
+            .field("bearer_context_count", &self.bearer_contexts.len())
+            .field("accepted_count", &accepted_count)
+            .field(
+                "rejected_count",
+                &self.bearer_contexts.len().saturating_sub(accepted_count),
+            )
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
 /// Mutually exclusive Delete Bearer Request target form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum S2bDeleteBearerTarget {
     /// Delete the default bearer and all bearers in the PDN connection.
     Linked(EpsBearerId),
@@ -371,8 +440,20 @@ pub enum S2bDeleteBearerTarget {
     Dedicated(Vec<EpsBearerId>),
 }
 
+impl fmt::Debug for S2bDeleteBearerTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Linked(_) => formatter.write_str("S2bDeleteBearerTarget::Linked(<redacted>)"),
+            Self::Dedicated(ebis) => formatter
+                .debug_struct("S2bDeleteBearerTarget::Dedicated")
+                .field("bearer_count", &ebis.len())
+                .finish(),
+        }
+    }
+}
+
 /// Typed S2b Delete Bearer Request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bDeleteBearerRequest<'a> {
     /// GTPv2-C sequence number.
     pub sequence_number: u32,
@@ -386,8 +467,24 @@ pub struct S2bDeleteBearerRequest<'a> {
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
+impl fmt::Debug for S2bDeleteBearerRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (target_role, bearer_count) = match &self.target {
+            S2bDeleteBearerTarget::Linked(_) => ("linked", 1usize),
+            S2bDeleteBearerTarget::Dedicated(ebis) => ("dedicated", ebis.len()),
+        };
+        formatter
+            .debug_struct("S2bDeleteBearerRequest")
+            .field("target_role", &target_role)
+            .field("bearer_count", &bearer_count)
+            .field("cause_present", &self.cause.is_some())
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
 /// One dedicated bearer result in Delete Bearer Response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bDeleteBearerResult<'a> {
     /// Dedicated EBI from the request.
     pub ebi: EpsBearerId,
@@ -397,8 +494,18 @@ pub struct S2bDeleteBearerResult<'a> {
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
+impl fmt::Debug for S2bDeleteBearerResult<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bDeleteBearerResult")
+            .field("cause", &self.cause)
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
 /// Mutually exclusive Delete Bearer Response form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum S2bDeleteBearerResponseBody<'a> {
     /// Response for deleting a default bearer/PDN connection.
     Linked(EpsBearerId),
@@ -406,8 +513,29 @@ pub enum S2bDeleteBearerResponseBody<'a> {
     Dedicated(Vec<S2bDeleteBearerResult<'a>>),
 }
 
+impl fmt::Debug for S2bDeleteBearerResponseBody<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Linked(_) => {
+                formatter.write_str("S2bDeleteBearerResponseBody::Linked(<redacted>)")
+            }
+            Self::Dedicated(results) => formatter
+                .debug_struct("S2bDeleteBearerResponseBody::Dedicated")
+                .field("bearer_count", &results.len())
+                .field(
+                    "accepted_count",
+                    &results
+                        .iter()
+                        .filter(|result| result.cause == CauseValue::RequestAccepted)
+                        .count(),
+                )
+                .finish(),
+        }
+    }
+}
+
 /// Typed S2b Delete Bearer Response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bDeleteBearerResponse<'a> {
     /// GTPv2-C sequence number copied from the request.
     pub sequence_number: u32,
@@ -419,6 +547,22 @@ pub struct S2bDeleteBearerResponse<'a> {
     pub body: S2bDeleteBearerResponseBody<'a>,
     /// Other conditional or extension top-level IEs retained in order.
     pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+impl fmt::Debug for S2bDeleteBearerResponse<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (response_role, bearer_count) = match &self.body {
+            S2bDeleteBearerResponseBody::Linked(_) => ("linked", 1usize),
+            S2bDeleteBearerResponseBody::Dedicated(results) => ("dedicated", results.len()),
+        };
+        formatter
+            .debug_struct("S2bDeleteBearerResponse")
+            .field("cause", &self.cause)
+            .field("response_role", &response_role)
+            .field("bearer_count", &bearer_count)
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
 }
 
 impl S2bProcedureMessage<'_> {

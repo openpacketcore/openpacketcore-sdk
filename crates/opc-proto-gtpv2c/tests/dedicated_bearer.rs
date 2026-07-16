@@ -578,6 +578,108 @@ fn dedicated_bearer_cause_registry_uses_normative_release_18_values() {
 }
 
 #[test]
+fn public_identifier_and_dedicated_bearer_debug_is_redaction_safe() {
+    let endpoint = FullyQualifiedTeid {
+        interface_type: INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+        teid: 0xdeca_fbad,
+        ipv4: Some([203, 0, 113, 201]),
+        ipv6: None,
+    };
+    let charging_id = ChargingId { value: 0xfeed_beef };
+    let bearer_id = ebi(13);
+
+    let endpoint_debug = format!("{endpoint:?}");
+    assert!(endpoint_debug.contains("<redacted>"));
+    assert!(endpoint_debug.contains("ipv4_present: true"));
+    assert!(!endpoint_debug.contains("3737844653"));
+    assert!(!endpoint_debug.contains("203, 0, 113, 201"));
+    assert!(!format!("{charging_id:?}").contains("4276993775"));
+    assert!(!format!("{bearer_id:?}").contains("value: 13"));
+
+    let request = S2bCreateBearerRequest {
+        sequence_number: 0x00_ab_cd_ef,
+        teid: 0xdeca_fbad,
+        linked_ebi: bearer_id,
+        bearer_contexts: vec![S2bCreateBearerRequestContext {
+            tft: tft(1, 219, 61_337),
+            bearer_qos: qos(211),
+            pgw_f_teid: endpoint.clone(),
+            charging_id,
+            additional_ies: vec![raw_ie(250, 2, &[0xca, 0xfe, 0xba, 0xbe])],
+        }],
+        additional_ies: vec![raw_ie(251, 3, &[0xba, 0xad, 0xf0, 0x0d])],
+    };
+    let create_response = S2bCreateBearerResponse {
+        sequence_number: request.sequence_number,
+        teid: 0xface_cafe,
+        cause: CauseValue::RequestAccepted,
+        bearer_contexts: vec![S2bCreateBearerResult::Accepted {
+            ebi: ebi(14),
+            epdg_f_teid: f_teid(INTERFACE_TYPE_S2B_U_EPDG_GTP_U, 0xdec0_de01, 202),
+            pgw_f_teid: endpoint,
+            additional_ies: vec![raw_ie(249, 4, &[0xde, 0xad, 0xbe, 0xef])],
+        }],
+        additional_ies: Vec::new(),
+    };
+    let delete_request = S2bDeleteBearerRequest {
+        sequence_number: 0x00_ab_cd_ef,
+        teid: 0xdeca_fbad,
+        target: S2bDeleteBearerTarget::Dedicated(vec![ebi(13), ebi(14)]),
+        cause: Some(CauseValue::LocalDetach),
+        additional_ies: vec![raw_ie(248, 5, &[0xca, 0xfe, 0xba, 0xbe])],
+    };
+    let delete_response = S2bDeleteBearerResponse {
+        sequence_number: 0x00_ab_cd_ef,
+        teid: 0xface_cafe,
+        cause: CauseValue::RequestAcceptedPartially,
+        body: S2bDeleteBearerResponseBody::Dedicated(vec![
+            S2bDeleteBearerResult {
+                ebi: ebi(13),
+                cause: CauseValue::RequestAccepted,
+                additional_ies: Vec::new(),
+            },
+            S2bDeleteBearerResult {
+                ebi: ebi(14),
+                cause: CauseValue::ContextNotFound,
+                additional_ies: Vec::new(),
+            },
+        ]),
+        additional_ies: Vec::new(),
+    };
+
+    for debug in [
+        format!("{request:?}"),
+        format!("{:?}", request.bearer_contexts[0]),
+        format!("{create_response:?}"),
+        format!("{:?}", create_response.bearer_contexts[0]),
+        format!("{delete_request:?}"),
+        format!("{delete_response:?}"),
+        format!("{:?}", delete_response.body),
+    ] {
+        for forbidden in [
+            "3737844653",
+            "3737181697",
+            "4207856382",
+            "4276993775",
+            "203, 0, 113, 201",
+            "192, 0, 2, 202",
+            "TrafficFlowTemplate",
+            "FullyQualifiedTeid",
+            "ChargingId",
+            "EpsBearerId",
+            "cafebabe",
+            "baadf00d",
+            "deadbeef",
+        ] {
+            assert!(
+                !debug.contains(forbidden),
+                "Debug output leaked forbidden marker {forbidden}: {debug}"
+            );
+        }
+    }
+}
+
+#[test]
 fn response_cause_allowlists_accept_generic_and_procedure_specific_causes() {
     // TS 29.274 R18 clause 7.7 protocol errors plus the Table 8.4-1 generic
     // feature, operational, and unspecified-rejection causes.

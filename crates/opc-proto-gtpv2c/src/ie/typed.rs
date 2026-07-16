@@ -648,10 +648,19 @@ impl AggregateMaximumBitRate {
 ///
 /// @spec 3GPP TS29274 R18 8.8
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-EBI-001
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EpsBearerId {
     /// Low-nibble EPS bearer identity value.
     pub value: u8,
+}
+
+impl fmt::Debug for EpsBearerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EpsBearerId")
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl EpsBearerId {
@@ -980,7 +989,7 @@ impl ServingNetwork {
 ///
 /// @spec 3GPP TS29274 R18 8.22
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-FTEID-001
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FullyQualifiedTeid {
     /// Six-bit GTPv2-C interface type.
     pub interface_type: u8,
@@ -990,6 +999,18 @@ pub struct FullyQualifiedTeid {
     pub ipv4: Option<[u8; 4]>,
     /// IPv6 endpoint address if the V6 flag is set.
     pub ipv6: Option<[u8; 16]>,
+}
+
+impl fmt::Debug for FullyQualifiedTeid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FullyQualifiedTeid")
+            .field("interface_type", &self.interface_type)
+            .field("teid", &"<redacted>")
+            .field("ipv4_present", &self.ipv4.is_some())
+            .field("ipv6_present", &self.ipv6.is_some())
+            .finish()
+    }
 }
 
 impl FullyQualifiedTeid {
@@ -1448,10 +1469,19 @@ impl<'a> BearerContext<'a> {
 ///
 /// @spec 3GPP TS29274 R18 8.29
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-CHARGING-ID-001
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ChargingId {
     /// Charging identifier value.
     pub value: u32,
+}
+
+impl fmt::Debug for ChargingId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChargingId")
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ChargingId {
