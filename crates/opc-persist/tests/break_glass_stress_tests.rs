@@ -4,7 +4,7 @@ use tempfile::tempdir;
 use tokio::sync::Mutex as TokioMutex;
 
 mod common;
-use common::{wait_until, wait_until_async};
+use common::wait_until;
 
 use opc_alarm::SharedAlarmManager;
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
@@ -532,7 +532,7 @@ async fn test_survival_across_restart() {
 #[tokio::test]
 async fn test_revocation_and_expiry_under_stress() {
     let _guard = TEST_MUTEX.lock().await;
-    let (service, alarm_manager, _temp_dir) = setup_break_glass_service().await;
+    let (service, alarm_manager, temp_dir) = setup_break_glass_service().await;
     let service = Arc::new(service);
     let tenant = "test-tenant";
     let requester = get_admin_principal("requester");
@@ -558,7 +558,7 @@ async fn test_revocation_and_expiry_under_stress() {
             tenant: tenant.to_string(),
             reason: format!("Revoke target {i}"),
             scope: "/security:break-glass".to_string(),
-            requested_duration: 100,
+            requested_duration: 900,
             evidence_id: format!("REV-{i}"),
         };
         let s_rev = service
@@ -581,7 +581,7 @@ async fn test_revocation_and_expiry_under_stress() {
             tenant: tenant.to_string(),
             reason: format!("Expire target {i}"),
             scope: "/security:break-glass".to_string(),
-            requested_duration: 1, // 1 second
+            requested_duration: 900,
             evidence_id: format!("EXP-{i}"),
         };
         let s_exp = service
@@ -602,7 +602,42 @@ async fn test_revocation_and_expiry_under_stress() {
     // Alarm count should be 20, because alarms are unique by session_id (slice)
     assert_eq!(alarm_manager.active_count(), 20);
 
-    // Concurrently revoke the 10 revoke targets, and let the 10 expire targets time out.
+    // Move exactly the selected fixtures into the past without depending on setup speed.
+    // Production expiry cleanup remains responsible for the state, alarm and audit changes.
+    {
+        let db_path = temp_dir.path().join("test_break_glass_stress.db");
+        let mut conn = rusqlite::Connection::open(db_path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let expired_at = Timestamp::now_utc().add_seconds(-1).unwrap().to_string();
+
+        for id in &session_ids_to_expire {
+            let updated = tx
+                .execute(
+                    "UPDATE break_glass_sessions SET expires_at = ?1 \
+                     WHERE tenant = ?2 AND id = ?3 AND status = 'active'",
+                    rusqlite::params![expired_at, tenant, id],
+                )
+                .unwrap();
+            assert_eq!(updated, 1, "expiry fixture must be an active session");
+        }
+
+        let eligible: u64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM break_glass_sessions \
+                 WHERE tenant = ?1 AND status = 'active' AND expires_at <= ?2",
+                rusqlite::params![tenant, Timestamp::now_utc().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(eligible, 10, "exactly ten sessions must be expiry-eligible");
+        tx.commit().unwrap();
+    }
+
+    // Exercise production expiry cleanup once so every expiry fixture produces one
+    // state transition, alarm resolution and audit record.
+    service.clean_expired(tenant).await.unwrap();
+
+    // Concurrently revoke the 10 revoke targets.
     let mut revoke_tasks = vec![];
     for id in session_ids_to_revoke.clone() {
         let service_clone = Arc::clone(&service);
@@ -620,31 +655,6 @@ async fn test_revocation_and_expiry_under_stress() {
         t.await.unwrap();
     }
 
-    wait_until_async(
-        "all expire-target break-glass sessions to expire",
-        std::time::Duration::from_secs(10),
-        || {
-            let service = Arc::clone(&service);
-            let session_ids_to_expire = session_ids_to_expire.clone();
-            async move {
-                if service.clean_expired(tenant).await.is_err() {
-                    return false;
-                }
-                for id in &session_ids_to_expire {
-                    match service.get_session(tenant, id).await {
-                        Ok(session) if session.status == BreakGlassStatus::Expired => {}
-                        _ => return false,
-                    }
-                }
-                true
-            }
-        },
-    )
-    .await;
-
-    // Call clean_expired
-    service.clean_expired(tenant).await.unwrap();
-
     // Verify all states
     for id in session_ids_to_revoke {
         let s = service.get_session(tenant, &id).await.unwrap();
@@ -657,6 +667,22 @@ async fn test_revocation_and_expiry_under_stress() {
 
     // All alarms should be cleared
     assert_eq!(alarm_manager.active_count(), 0);
+
+    // Each production transition retains its one-for-one audit semantics.
+    let db_path = temp_dir.path().join("test_break_glass_stress.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    for action in ["REVOKE", "EXPIRE"] {
+        let audit_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM break_glass_audit WHERE tenant = ?1 AND action = ?2",
+                rusqlite::params![tenant, action],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 10, "each transition must be audited once");
+    }
+    drop(conn);
+    assert!(verify_break_glass_audit_chain(&db_path, &[0x42; 32], tenant).is_ok());
 }
 
 #[tokio::test]
