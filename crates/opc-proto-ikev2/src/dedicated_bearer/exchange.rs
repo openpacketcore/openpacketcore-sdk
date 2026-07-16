@@ -20,7 +20,7 @@ use crate::{
     sa_init::{
         Ikev2KeyExchangePayload, Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError,
         Ikev2NoncePayload, Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2SaPayload,
-        Ikev2SaPayloadBuild, Ikev2SaPayloadError,
+        Ikev2SaPayloadBuild, Ikev2SaPayloadError, Ikev2SaProposal,
     },
 };
 
@@ -30,7 +30,10 @@ use super::{
     Ikev2DedicatedBearerProtocolError, Ikev2EpsQos, Ikev2ExtendedApnAmbr, Ikev2ExtendedEpsQos,
 };
 
+const IKEV2_TRANSFORM_TYPE_ENCR: u8 = 1;
 const IKEV2_TRANSFORM_TYPE_DH: u8 = 4;
+const IKEV2_TRANSFORM_TYPE_ESN: u8 = 5;
+const IKEV2_TRANSFORM_ID_NONE: u16 = 0;
 
 /// Stable payload role used in missing/duplicate diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -891,6 +894,12 @@ fn validate_sa_build(
             });
         }
         validate_proposal_spi(proposal.protocol_id, &proposal.spi)?;
+        validate_mandatory_esp_transform_types(
+            proposal
+                .transforms
+                .iter()
+                .map(|transform| transform.transform_type),
+        )?;
     }
     Ok(())
 }
@@ -917,6 +926,38 @@ fn validate_sa_view(
             });
         }
         validate_proposal_spi(proposal.protocol_id, proposal.spi)?;
+        validate_mandatory_esp_transform_types(
+            proposal
+                .transforms
+                .iter()
+                .map(|transform| transform.transform_type),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_mandatory_esp_transform_types(
+    transform_types: impl IntoIterator<Item = u8>,
+) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    let mut has_encryption = false;
+    let mut has_extended_sequence_numbers = false;
+    for transform_type in transform_types {
+        has_encryption |= transform_type == IKEV2_TRANSFORM_TYPE_ENCR;
+        has_extended_sequence_numbers |= transform_type == IKEV2_TRANSFORM_TYPE_ESN;
+    }
+    if !has_encryption {
+        return Err(
+            Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
+                transform_type: IKEV2_TRANSFORM_TYPE_ENCR,
+            },
+        );
+    }
+    if !has_extended_sequence_numbers {
+        return Err(
+            Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
+                transform_type: IKEV2_TRANSFORM_TYPE_ESN,
+            },
+        );
     }
     Ok(())
 }
@@ -953,7 +994,10 @@ fn validate_ke_view(
         .proposals
         .iter()
         .flat_map(|proposal| &proposal.transforms)
-        .filter(|transform| transform.transform_type == IKEV2_TRANSFORM_TYPE_DH)
+        .filter(|transform| {
+            transform.transform_type == IKEV2_TRANSFORM_TYPE_DH
+                && transform.transform_id != IKEV2_TRANSFORM_ID_NONE
+        })
     {
         dh_offered = true;
         if key_exchange.is_some_and(|key_exchange| key_exchange.dh_group == transform.transform_id)
@@ -1078,6 +1122,11 @@ pub enum Ikev2DedicatedBearerExchangeError {
         /// Proposal count.
         actual: usize,
     },
+    /// An ESP proposal omitted an RFC 7296 mandatory transform type.
+    MissingMandatoryEspTransform {
+        /// Missing IKEv2 transform type.
+        transform_type: u8,
+    },
     /// A proposal used a DH transform but KE was absent.
     KeyExchangeRequired,
     /// KE was present without a DH transform.
@@ -1105,6 +1154,11 @@ pub enum Ikev2DedicatedBearerExchangeError {
     ResponseProposalNotOffered,
     /// Successful response selected a transform not offered in that proposal.
     ResponseTransformNotOffered,
+    /// Successful response omitted a transform type from the selected offer.
+    ResponseTransformTypeOmitted {
+        /// Offered IKEv2 transform type absent from the response.
+        transform_type: u8,
+    },
     /// Successful response KE presence or group did not match the request.
     ResponseKeyExchangeMismatch,
     /// Successful response expanded TSi or TSr beyond the request.
@@ -1149,6 +1203,9 @@ impl Ikev2DedicatedBearerExchangeError {
             Self::ChildSaSpiZero => "ikev2_bearer_child_spi_zero",
             Self::InvalidProposalNumber { .. } => "ikev2_bearer_proposal_number_invalid",
             Self::ResponseProposalCount { .. } => "ikev2_bearer_response_proposal_count",
+            Self::MissingMandatoryEspTransform { .. } => {
+                "ikev2_bearer_esp_mandatory_transform_missing"
+            }
             Self::KeyExchangeRequired => "ikev2_bearer_ke_required",
             Self::UnexpectedKeyExchange => "ikev2_bearer_ke_unexpected",
             Self::KeyExchangeDhGroupMismatch => "ikev2_bearer_ke_group_mismatch",
@@ -1161,6 +1218,9 @@ impl Ikev2DedicatedBearerExchangeError {
             Self::ResponseCorrelationMismatch => "ikev2_bearer_response_correlation_mismatch",
             Self::ResponseProposalNotOffered => "ikev2_bearer_response_proposal_not_offered",
             Self::ResponseTransformNotOffered => "ikev2_bearer_response_transform_not_offered",
+            Self::ResponseTransformTypeOmitted { .. } => {
+                "ikev2_bearer_response_transform_type_omitted"
+            }
             Self::ResponseKeyExchangeMismatch => "ikev2_bearer_response_ke_mismatch",
             Self::ResponseTrafficSelectorsExpanded => "ikev2_bearer_response_ts_expanded",
             Self::Sa(_) => "ikev2_bearer_sa_invalid",
@@ -1595,10 +1655,11 @@ pub fn validate_ikev2_dedicated_bearer_response_correlation(
 /// Validate CREATE_CHILD_SA header and successful selection correlation.
 ///
 /// Besides the two IKE SPIs, Message ID, exchange type, and response flag, a
-/// successful response must select an offered proposal number and transforms,
-/// retain the request's KE group when PFS is used, and narrow rather than
-/// expand both traffic-selector sets. A protocol-error response needs only the
-/// exact header correlation because it does not select a Child SA.
+/// successful response must select an offered proposal number and exactly one
+/// offered transform from every transform type in that proposal, retain the
+/// request's selected KE group when PFS is used, and narrow rather than expand
+/// both traffic-selector sets. A protocol-error response needs only the exact
+/// header correlation because it does not select a Child SA.
 ///
 /// # Errors
 ///
@@ -1637,6 +1698,45 @@ pub fn validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
                 && proposal.protocol_id == selected.protocol_id
         })
         .ok_or(Ikev2DedicatedBearerExchangeError::ResponseProposalNotOffered)?;
+    validate_selected_proposal(offered, selected)?;
+    let selected_dh_group = selected
+        .transforms
+        .iter()
+        .find(|transform| transform.transform_type == IKEV2_TRANSFORM_TYPE_DH)
+        .map(|transform| transform.transform_id);
+    match selected_dh_group {
+        None | Some(IKEV2_TRANSFORM_ID_NONE) if key_exchange.is_none() => {}
+        Some(group)
+            if request
+                .key_exchange
+                .as_ref()
+                .is_some_and(|request_ke| request_ke.dh_group == group)
+                && key_exchange
+                    .as_ref()
+                    .is_some_and(|response_ke| response_ke.dh_group == group) => {}
+        _ => return Err(Ikev2DedicatedBearerExchangeError::ResponseKeyExchangeMismatch),
+    }
+    if !traffic_selector_payload_is_narrowed(
+        &request.traffic_selectors_initiator,
+        traffic_selectors_initiator,
+    ) || !traffic_selector_payload_is_narrowed(
+        &request.traffic_selectors_responder,
+        traffic_selectors_responder,
+    ) {
+        return Err(Ikev2DedicatedBearerExchangeError::ResponseTrafficSelectorsExpanded);
+    }
+    Ok(())
+}
+
+fn validate_selected_proposal(
+    offered: &Ikev2SaProposal<'_>,
+    selected: &Ikev2SaProposal<'_>,
+) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    let offered_types = offered
+        .transforms
+        .iter()
+        .map(|transform| transform.transform_type)
+        .collect::<BTreeSet<_>>();
     let mut selected_types = BTreeSet::new();
     for transform in &selected.transforms {
         if !selected_types.insert(transform.transform_type)
@@ -1648,19 +1748,12 @@ pub fn validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
             return Err(Ikev2DedicatedBearerExchangeError::ResponseTransformNotOffered);
         }
     }
-    match (request.key_exchange.as_ref(), key_exchange.as_ref()) {
-        (Some(request_ke), Some(response_ke)) if request_ke.dh_group == response_ke.dh_group => {}
-        (None, None) => {}
-        _ => return Err(Ikev2DedicatedBearerExchangeError::ResponseKeyExchangeMismatch),
-    }
-    if !traffic_selector_payload_is_narrowed(
-        &request.traffic_selectors_initiator,
-        traffic_selectors_initiator,
-    ) || !traffic_selector_payload_is_narrowed(
-        &request.traffic_selectors_responder,
-        traffic_selectors_responder,
-    ) {
-        return Err(Ikev2DedicatedBearerExchangeError::ResponseTrafficSelectorsExpanded);
+    if let Some(transform_type) = offered_types.difference(&selected_types).next() {
+        return Err(
+            Ikev2DedicatedBearerExchangeError::ResponseTransformTypeOmitted {
+                transform_type: *transform_type,
+            },
+        );
     }
     Ok(())
 }

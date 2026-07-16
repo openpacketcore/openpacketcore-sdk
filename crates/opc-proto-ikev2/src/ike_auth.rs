@@ -39,6 +39,7 @@ const TS_FIXED_BODY_LEN: usize = 4;
 const TS_SELECTOR_HEADER_LEN: usize = 8;
 const DELETE_FIXED_BODY_LEN: usize = 4;
 const IKEV2_TRANSFORM_TYPE_DH: u8 = 4;
+const IKEV2_TRANSFORM_ID_NONE: u16 = 0;
 const TS_IPV4_ADDR_LEN: usize = 4;
 const TS_IPV6_ADDR_LEN: usize = 16;
 /// Traffic Selector type for IPv4 address ranges.
@@ -1829,7 +1830,10 @@ fn validate_rekey_key_exchange_shape(
         .proposals
         .iter()
         .flat_map(|proposal| &proposal.transforms)
-        .filter(|transform| transform.transform_type == IKEV2_TRANSFORM_TYPE_DH)
+        .filter(|transform| {
+            transform.transform_type == IKEV2_TRANSFORM_TYPE_DH
+                && transform.transform_id != IKEV2_TRANSFORM_ID_NONE
+        })
     {
         dh_offered = true;
         if key_exchange.is_some_and(|key_exchange| key_exchange.dh_group == transform.transform_id)

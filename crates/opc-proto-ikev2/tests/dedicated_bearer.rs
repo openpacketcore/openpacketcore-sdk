@@ -45,6 +45,12 @@ use opc_proto_tft::{
 };
 use quickcheck::quickcheck;
 
+const TRANSFORM_TYPE_ENCR: u8 = 1;
+const TRANSFORM_TYPE_INTEG: u8 = 3;
+const TRANSFORM_TYPE_DH: u8 = 4;
+const TRANSFORM_TYPE_ESN: u8 = 5;
+const TRANSFORM_ID_NONE: u16 = 0;
+
 fn must_ok<T, E: core::fmt::Debug>(result: Result<T, E>) -> T {
     match result {
         Ok(value) => value,
@@ -187,13 +193,13 @@ fn replacement_tft() -> TrafficFlowTemplate {
 fn transforms() -> Vec<Ikev2SaTransformBuild> {
     vec![
         Ikev2SaTransformBuild {
-            transform_type: 1,
+            transform_type: TRANSFORM_TYPE_ENCR,
             transform_id: 20,
             attributes: vec![],
         },
         Ikev2SaTransformBuild {
-            transform_type: 5,
-            transform_id: 0,
+            transform_type: TRANSFORM_TYPE_ESN,
+            transform_id: TRANSFORM_ID_NONE,
             attributes: vec![],
         },
     ]
@@ -265,10 +271,12 @@ fn create_response_build() -> Ikev2DedicatedBearerCreateChildSaResponseBuild {
     }
 }
 
-fn create_request_entries() -> Vec<Ikev2IkeAuthPayloadBuild> {
+fn create_request_entries_with_sa(
+    security_association: Ikev2SaPayloadBuild,
+) -> Vec<Ikev2IkeAuthPayloadBuild> {
     let common = must_ok(build_create_child_sa_rekey_response_payloads(
         &Ikev2CreateChildSaRekeyResponseBuild {
-            security_association: sa([1, 2, 3, 4]),
+            security_association,
             nonce: Ikev2NoncePayloadBuild {
                 nonce: vec![0x11; 32],
             },
@@ -285,6 +293,10 @@ fn create_request_entries() -> Vec<Ikev2IkeAuthPayloadBuild> {
         &Ikev2DedicatedBearerNotify::Tft(create_tft()),
     )));
     entries
+}
+
+fn create_request_entries() -> Vec<Ikev2IkeAuthPayloadBuild> {
+    create_request_entries_with_sa(sa([1, 2, 3, 4]))
 }
 
 fn decode_notify_body(body: &[u8]) -> Ikev2DedicatedBearerNotify {
@@ -469,7 +481,7 @@ fn new_child_sa_with_pfs_build_decode_and_response_correlation_succeed() {
     request_build.security_association.proposals[0]
         .transforms
         .push(Ikev2SaTransformBuild {
-            transform_type: 4,
+            transform_type: TRANSFORM_TYPE_DH,
             transform_id: DH_GROUP,
             attributes: vec![],
         });
@@ -497,7 +509,7 @@ fn new_child_sa_with_pfs_build_decode_and_response_correlation_succeed() {
     response_build.security_association.proposals[0]
         .transforms
         .push(Ikev2SaTransformBuild {
-            transform_type: 4,
+            transform_type: TRANSFORM_TYPE_DH,
             transform_id: DH_GROUP,
             attributes: vec![],
         });
@@ -528,6 +540,201 @@ fn new_child_sa_with_pfs_build_decode_and_response_correlation_succeed() {
     };
     assert_eq!(response_key_exchange.dh_group, DH_GROUP);
     assert_eq!(response_key_exchange.key_exchange_data, [0x42; 64]);
+    must_ok(
+        validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+            &request_header,
+            &response_header,
+            &request,
+            &response,
+        ),
+    );
+}
+
+#[test]
+fn esp_proposals_missing_mandatory_transform_types_fail_closed() {
+    let mut missing_encryption = create_request_build();
+    missing_encryption.security_association.proposals[0]
+        .transforms
+        .retain(|transform| transform.transform_type != TRANSFORM_TYPE_ENCR);
+    let missing_encryption_error =
+        Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
+            transform_type: TRANSFORM_TYPE_ENCR,
+        };
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&missing_encryption),
+        Err(missing_encryption_error.clone())
+    );
+    let raw_request =
+        create_request_entries_with_sa(missing_encryption.security_association.clone());
+    let (first_payload, bytes) = must_ok(build_ike_auth_cleartext_payload_chain(&raw_request));
+    assert_eq!(
+        decode_ikev2_dedicated_bearer_create_child_sa_request(
+            &request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 10),
+            first_payload,
+            &bytes,
+        ),
+        Err(missing_encryption_error)
+    );
+
+    let mut missing_esn = create_response_build();
+    missing_esn.security_association.proposals[0]
+        .transforms
+        .retain(|transform| transform.transform_type != TRANSFORM_TYPE_ESN);
+    let missing_esn_error = Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
+        transform_type: TRANSFORM_TYPE_ESN,
+    };
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_response(&missing_esn),
+        Err(missing_esn_error.clone())
+    );
+    let raw_response = must_ok(build_create_child_sa_rekey_response_payloads(
+        &Ikev2CreateChildSaRekeyResponseBuild {
+            security_association: missing_esn.security_association,
+            nonce: missing_esn.nonce,
+            key_exchange: missing_esn.key_exchange,
+            traffic_selectors_initiator: missing_esn.traffic_selectors_initiator,
+            traffic_selectors_responder: missing_esn.traffic_selectors_responder,
+        },
+    ))
+    .into_payloads();
+    let (first_payload, bytes) = must_ok(build_ike_auth_cleartext_payload_chain(&raw_response));
+    assert_eq!(
+        decode_ikev2_dedicated_bearer_create_child_sa_response(
+            &response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 10),
+            first_payload,
+            &bytes,
+        ),
+        Err(missing_esn_error)
+    );
+}
+
+#[test]
+fn response_selects_exactly_one_transform_from_every_offered_type() {
+    let integrity = Ikev2SaTransformBuild {
+        transform_type: TRANSFORM_TYPE_INTEG,
+        transform_id: 2,
+        attributes: vec![],
+    };
+    let mut request_build = create_request_build();
+    request_build.security_association.proposals[0].transforms[0].transform_id = 3;
+    request_build.security_association.proposals[0]
+        .transforms
+        .insert(1, integrity.clone());
+    let request_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(
+        &request_build,
+    ));
+    let request_header = request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 11);
+    let request = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
+        &request_header,
+        request_wire.first_payload(),
+        request_wire.bytes(),
+    ));
+    let response_header = response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 11);
+
+    let mut omitted = create_response_build();
+    omitted.security_association.proposals[0].transforms[0].transform_id = 3;
+    let omitted_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
+        &omitted,
+    ));
+    let omitted = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
+        &response_header,
+        omitted_wire.first_payload(),
+        omitted_wire.bytes(),
+    ));
+    assert_eq!(
+        validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+            &request_header,
+            &response_header,
+            &request,
+            &omitted,
+        ),
+        Err(
+            Ikev2DedicatedBearerExchangeError::ResponseTransformTypeOmitted {
+                transform_type: TRANSFORM_TYPE_INTEG,
+            }
+        )
+    );
+
+    let mut complete = create_response_build();
+    complete.security_association.proposals[0].transforms[0].transform_id = 3;
+    complete.security_association.proposals[0]
+        .transforms
+        .insert(1, integrity);
+    let complete_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
+        &complete,
+    ));
+    let complete = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
+        &response_header,
+        complete_wire.first_payload(),
+        complete_wire.bytes(),
+    ));
+    must_ok(
+        validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+            &request_header,
+            &response_header,
+            &request,
+            &complete,
+        ),
+    );
+}
+
+#[test]
+fn response_can_select_offered_dh_none_without_key_exchange() {
+    const DH_GROUP: u16 = 19;
+
+    let mut request_build = create_request_build();
+    request_build.security_association.proposals[0]
+        .transforms
+        .extend([
+            Ikev2SaTransformBuild {
+                transform_type: TRANSFORM_TYPE_DH,
+                transform_id: DH_GROUP,
+                attributes: vec![],
+            },
+            Ikev2SaTransformBuild {
+                transform_type: TRANSFORM_TYPE_DH,
+                transform_id: TRANSFORM_ID_NONE,
+                attributes: vec![],
+            },
+        ]);
+    request_build.key_exchange = Some(Ikev2KeyExchangePayloadBuild {
+        dh_group: DH_GROUP,
+        key_exchange_data: vec![0x51; 64],
+    });
+    let request_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(
+        &request_build,
+    ));
+    let request_header = request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 12);
+    let request = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
+        &request_header,
+        request_wire.first_payload(),
+        request_wire.bytes(),
+    ));
+
+    let mut response_build = create_response_build();
+    response_build.security_association.proposals[0]
+        .transforms
+        .push(Ikev2SaTransformBuild {
+            transform_type: TRANSFORM_TYPE_DH,
+            transform_id: TRANSFORM_ID_NONE,
+            attributes: vec![],
+        });
+    let response_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
+        &response_build,
+    ));
+    let response_header = response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 12);
+    let response = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
+        &response_header,
+        response_wire.first_payload(),
+        response_wire.bytes(),
+    ));
+    assert!(matches!(
+        response,
+        Ikev2DedicatedBearerCreateChildSaResponse::Success {
+            key_exchange: None,
+            ..
+        }
+    ));
     must_ok(
         validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
             &request_header,
@@ -743,7 +950,7 @@ fn request_cardinality_unknown_preservation_and_ke_rules_are_strict() {
     missing_ke.security_association.proposals[0]
         .transforms
         .push(Ikev2SaTransformBuild {
-            transform_type: 4,
+            transform_type: TRANSFORM_TYPE_DH,
             transform_id: 19,
             attributes: vec![],
         });
