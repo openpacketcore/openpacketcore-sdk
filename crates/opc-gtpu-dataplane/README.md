@@ -153,11 +153,20 @@ state, so a crash or map error at any earlier point leaves the bearer
 non-forwarding and safely retryable. A DSCP update is phase-gated by the same
 protocol. Removal publishes `Removing` first, deletes FAR, DSCP, and PDR, then
 deletes the owner last; an interrupted removal cannot resume forwarding and an
-exact retry finishes it. On attach or adoption the runtime validates the whole
-owner/resource graph and rebuilds a bounded TEID-to-owner index once, rather
-than scanning maps for each operation. Malformed owners, duplicate TEIDs,
-unowned marked resources, mismatched resources, and incomplete active owners
-all fail closed before either tc hook is changed.
+exact removal retry finishes it. Linux/Aya reports deletion of an absent hash
+entry as syscall `ENOENT`; the runtime classifies that result as idempotent
+absence, including when an optional DSCP entry was never installed. An install
+that encounters a valid persisted `Removing` owner also finishes that committed
+deletion, but never resurrects the bearer or reports `AlreadyExists` in the
+same call. It returns
+`GtpuError::RetryRequired { operation: "ebpf_install_after_removal" }`; the
+caller must submit a fresh install after that result. This remains true when
+the fresh request changes the endpoint, DSCP, local TEID, or selector. On
+attach or adoption the runtime validates the whole owner/resource graph and
+rebuilds a bounded TEID-to-owner index once, rather than scanning maps for each
+operation. Malformed owners, duplicate TEIDs, dual-schema ownership, unowned
+marked resources, mismatched resources, and incomplete active owners all fail
+closed before either tc hook is changed.
 
 All PDP cleanup first verifies that every named pin is the exact map held by
 the runtime. Each tc slot must contain either that runtime's exact program or

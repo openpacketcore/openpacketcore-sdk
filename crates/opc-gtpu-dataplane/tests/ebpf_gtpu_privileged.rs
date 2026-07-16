@@ -43,14 +43,15 @@ use aya::{Ebpf, EbpfLoader};
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpPdpContext, GtpVersion, GtpuCapability,
-    GtpuDataplaneBackend, RemovePdpContextRequest, Teid,
+    GtpuDataplaneBackend, GtpuError, RemovePdpContextRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
     ipv4_header_checksum, DownlinkPdr, MarkedBearerOwner, MarkedBearerOwnerPhase, UplinkFar,
     UplinkFarKey, DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS, MAP_DOWNLINK_PDR,
-    MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MARKED_BEARER_OWNER_VALUE_LEN,
-    PROG_DOWNLINK, PROG_UPLINK, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
+    MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_FAR,
+    MARKED_BEARER_OWNER_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN,
+    UPLINK_MARK_KEY_LEN,
 };
 
 const EPDG_S2BU_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
@@ -667,6 +668,24 @@ fn set_marked_owner_phase(pin_dir: &std::path::Path, mark: u32, phase: MarkedBea
         .expect("atomically replace owner phase");
 }
 
+fn take_marked_far(pin_dir: &std::path::Path, mark: u32) -> [u8; UPLINK_FAR_VALUE_LEN] {
+    let selector = UplinkFarKey {
+        ue_ip: UE_PAA.octets(),
+        bearer_mark: mark.to_be_bytes(),
+    }
+    .encode();
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_MARK_FAR)).expect("open pinned marked FAR"),
+    )
+    .expect("identify pinned marked FAR");
+    let mut fars =
+        BpfHashMap::<_, [u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+            .expect("typed pinned marked FAR");
+    let value = fars.get(&selector, 0).expect("read dedicated-bearer FAR");
+    fars.remove(&selector).expect("remove dedicated-bearer FAR");
+    value
+}
+
 fn tc_program_id(direction: &str) -> u32 {
     let filters = tc_filters(direction);
     let fields: Vec<_> = filters.split_whitespace().collect();
@@ -764,6 +783,18 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         .install_pdp_context(session_context(device.ifindex))
         .await?;
 
+    // Aya exposes an absent BPF hash delete as syscall ENOENT, not
+    // MapError::KeyNotFound. Prove a default bearer that never had optional
+    // DSCP state still removes cleanly after its FAR delete.
+    let mut no_dscp_removal = session_context(device.ifindex);
+    no_dscp_removal.local_teid = Teid::new(0x1000_0010).expect("nonzero local TEID");
+    no_dscp_removal.peer_teid = Teid::new(0x2000_0010).expect("nonzero peer TEID");
+    no_dscp_removal.ms_address = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 3));
+    backend.install_pdp_context(no_dscp_removal.clone()).await?;
+    let no_dscp_remove = RemovePdpContextRequest::from_context(&no_dscp_removal);
+    backend.remove_pdp_context(no_dscp_remove.clone()).await?;
+    backend.remove_pdp_context(no_dscp_remove).await?;
+
     // Sockets living in the peer namespaces.
     let pgw_socket = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW GTP-U socket")
@@ -858,6 +889,31 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     let bearer_b = dedicated_session_context(device.ifindex, MARK_B, LOCAL_TEID_B, PEER_TEID_B);
     backend.install_pdp_context(bearer_a.clone()).await?;
     backend.install_pdp_context(bearer_b.clone()).await?;
+
+    // Reproduce SDK #269's exact kernel signature: a committed Removing
+    // owner with its marked FAR already absent. The first install attempt
+    // must finish the old removal without claiming the bearer is present or
+    // resurrecting it in the same call; the next attempt publishes a fresh
+    // Active owner/FAR pair.
+    let marked_pin_dir = net.pin_root.join("s2bu");
+    set_marked_owner_phase(&marked_pin_dir, MARK_B, MarkedBearerOwnerPhase::Removing);
+    let removed_far = UplinkFar::decode(&take_marked_far(&marked_pin_dir, MARK_B));
+    assert_eq!(removed_far.o_teid, PEER_TEID_B.to_be_bytes());
+    let recovery = backend
+        .install_pdp_context(bearer_b.clone())
+        .await
+        .expect_err("Removing owner must require a fresh install retry");
+    assert!(
+        matches!(
+            &recovery,
+            GtpuError::RetryRequired {
+                operation: "ebpf_install_after_removal"
+            }
+        ),
+        "unexpected recovery result: {recovery:?}"
+    );
+    backend.install_pdp_context(bearer_b.clone()).await?;
+
     for (socket, payload, expected_teid) in [
         (&ue_mark_a_socket, b"opc-mark-a".as_slice(), PEER_TEID_A),
         (&ue_mark_b_socket, b"opc-mark-b".as_slice(), PEER_TEID_B),

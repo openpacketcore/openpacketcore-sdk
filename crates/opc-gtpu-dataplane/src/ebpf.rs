@@ -432,24 +432,61 @@ impl EbpfGtpuDataplaneBackend {
             });
         }
 
+        let existing_owner = self.inner.runtime.marked_owner_get(ifindex, far_key)?;
+        if let Some(encoded) = existing_owner {
+            let owner = MarkedBearerOwner::decode(&encoded);
+            if !owner.is_valid() {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_install_pdp_context",
+                });
+            }
+            if owner.phase == MarkedBearerOwnerPhase::Removing {
+                self.finish_marked_pdp_context_removal(ifindex, far_key, owner)?;
+                // Removal already won its publication race. This call
+                // completes that committed transaction, but must not
+                // resurrect the bearer in the same install attempt: a
+                // delayed pre-removal retry is indistinguishable from a new
+                // desired install without a caller transaction ID.
+                return Err(GtpuError::RetryRequired {
+                    operation: "ebpf_install_after_removal",
+                });
+            }
+        }
+
         // A local TEID is globally unique across default PDRs and every
         // journal phase, including a crash before marked PDR publication.
         if self.inner.runtime.pdr_get(ifindex, pdr_key)?.is_some() {
             return Err(GtpuError::AlreadyExists);
         }
-        if self
-            .inner
-            .runtime
-            .marked_owner_for_teid(ifindex, pdr_key)?
-            .is_some_and(|selector| selector != far_key)
-        {
-            return Err(GtpuError::AlreadyExists);
+        if let Some(selector) = self.inner.runtime.marked_owner_for_teid(ifindex, pdr_key)? {
+            if selector != far_key {
+                let encoded = self
+                    .inner
+                    .runtime
+                    .marked_owner_get(ifindex, selector)?
+                    .ok_or(GtpuError::StateIndeterminate {
+                        operation: "ebpf_install_pdp_context",
+                    })?;
+                let owner = MarkedBearerOwner::decode(&encoded);
+                if !owner.is_valid() || owner.local_teid != pdr_key {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_install_pdp_context",
+                    });
+                }
+                if owner.phase == MarkedBearerOwnerPhase::Removing {
+                    self.finish_marked_pdp_context_removal(ifindex, selector, owner)?;
+                    return Err(GtpuError::RetryRequired {
+                        operation: "ebpf_install_after_removal",
+                    });
+                }
+                return Err(GtpuError::AlreadyExists);
+            }
         }
 
         let existing_far = self.inner.runtime.marked_far_get(ifindex, far_key)?;
         let existing_pdr = self.inner.runtime.marked_pdr_get(ifindex, pdr_key)?;
         let existing_dscp = self.inner.runtime.marked_dscp_get(ifindex, far_key)?;
-        match self.inner.runtime.marked_owner_get(ifindex, far_key)? {
+        match existing_owner {
             None => {
                 // This schema has never shipped without the owner journal.
                 // Unowned forwarding state is corruption, not a recoverable
@@ -465,15 +502,7 @@ impl EbpfGtpuDataplaneBackend {
             }
             Some(encoded) => {
                 let existing_owner = MarkedBearerOwner::decode(&encoded);
-                if !existing_owner.is_valid() {
-                    return Err(GtpuError::StateIndeterminate {
-                        operation: "ebpf_install_pdp_context",
-                    });
-                }
                 if existing_owner.local_teid != pdr_key {
-                    return Err(GtpuError::AlreadyExists);
-                }
-                if existing_owner.phase == MarkedBearerOwnerPhase::Removing {
                     return Err(GtpuError::AlreadyExists);
                 }
                 if existing_owner.uplink_far != pending_owner.uplink_far {
@@ -546,6 +575,88 @@ impl EbpfGtpuDataplaneBackend {
         publish.map_err(|_| GtpuError::StateIndeterminate {
             operation: "ebpf_install_pdp_context",
         })
+    }
+
+    fn finish_marked_pdp_context_removal(
+        &self,
+        ifindex: u32,
+        selector: [u8; UPLINK_MARK_KEY_LEN],
+        owner: MarkedBearerOwner,
+    ) -> Result<(), GtpuError> {
+        let owner_key = UplinkFarKey::decode(&selector);
+        let expected_pdr = MarkedDownlinkPdr {
+            ue_ip: owner_key.ue_ip,
+            bearer_mark: owner_key.bearer_mark,
+        }
+        .encode();
+        let legacy_pdr = self.inner.runtime.pdr_get(ifindex, owner.local_teid)?;
+        let indexed_selector = self
+            .inner
+            .runtime
+            .marked_owner_for_teid(ifindex, owner.local_teid)?;
+        let marked_pdr = self
+            .inner
+            .runtime
+            .marked_pdr_get(ifindex, owner.local_teid)?;
+        if !owner.is_valid()
+            || owner_key.ue_ip == [0; 4]
+            || owner_key.bearer_mark == [0; 4]
+            || legacy_pdr.is_some()
+            || indexed_selector != Some(selector)
+            || marked_pdr.is_some_and(|value| value != expected_pdr)
+        {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_remove_pdp_context",
+            });
+        }
+        let far = self.inner.runtime.marked_far_get(ifindex, selector)?;
+        let dscp = self.inner.runtime.marked_dscp_get(ifindex, selector)?;
+        if far.is_some_and(|value| value != owner.uplink_far.encode())
+            || dscp.is_some_and(|value| value[0] > 63)
+            || owner.phase == MarkedBearerOwnerPhase::Active
+                && dscp.map(|value| value[0]) != owner.egress_dscp()
+        {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_remove_pdp_context",
+            });
+        }
+        if owner.phase != MarkedBearerOwnerPhase::Removing {
+            let removing = MarkedBearerOwner::new(
+                owner.local_teid,
+                owner.uplink_far,
+                owner.egress_dscp(),
+                MarkedBearerOwnerPhase::Removing,
+            );
+            self.inner
+                .runtime
+                .marked_owner_insert(ifindex, selector, removing.encode())?;
+        }
+        if self
+            .inner
+            .runtime
+            .marked_far_remove(ifindex, selector)
+            .is_err()
+            || self
+                .inner
+                .runtime
+                .marked_dscp_remove(ifindex, selector)
+                .is_err()
+            || self
+                .inner
+                .runtime
+                .marked_pdr_remove(ifindex, owner.local_teid)
+                .is_err()
+        {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_remove_pdp_context",
+            });
+        }
+        match self.inner.runtime.marked_owner_remove(ifindex, selector) {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_remove_pdp_context",
+            }),
+        }
     }
 
     fn create_device_sync(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError> {
@@ -880,82 +991,12 @@ impl EbpfGtpuDataplaneBackend {
                     operation: "ebpf_remove_pdp_context",
                 })?;
             let owner = MarkedBearerOwner::decode(&encoded_owner);
-            let owner_key = UplinkFarKey::decode(&selector);
-            let expected_pdr = MarkedDownlinkPdr {
-                ue_ip: owner_key.ue_ip,
-                bearer_mark: owner_key.bearer_mark,
-            }
-            .encode();
-            if !owner.is_valid()
-                || owner.local_teid != pdr_key
-                || owner_key.ue_ip == [0; 4]
-                || owner_key.bearer_mark == [0; 4]
-                || marked_pdr.is_some_and(|value| value != expected_pdr)
-            {
+            if owner.local_teid != pdr_key {
                 return Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_remove_pdp_context",
                 });
             }
-            let far = self
-                .inner
-                .runtime
-                .marked_far_get(request.link_ifindex, selector)?;
-            let dscp = self
-                .inner
-                .runtime
-                .marked_dscp_get(request.link_ifindex, selector)?;
-            if far.is_some_and(|value| value != owner.uplink_far.encode())
-                || dscp.is_some_and(|value| value[0] > 63)
-                || owner.phase == MarkedBearerOwnerPhase::Active
-                    && dscp.map(|value| value[0]) != owner.egress_dscp()
-            {
-                return Err(GtpuError::StateIndeterminate {
-                    operation: "ebpf_remove_pdp_context",
-                });
-            }
-            if owner.phase != MarkedBearerOwnerPhase::Removing {
-                let removing = MarkedBearerOwner::new(
-                    owner.local_teid,
-                    owner.uplink_far,
-                    owner.egress_dscp(),
-                    MarkedBearerOwnerPhase::Removing,
-                );
-                self.inner.runtime.marked_owner_insert(
-                    request.link_ifindex,
-                    selector,
-                    removing.encode(),
-                )?;
-            }
-            if self
-                .inner
-                .runtime
-                .marked_far_remove(request.link_ifindex, selector)
-                .is_err()
-                || self
-                    .inner
-                    .runtime
-                    .marked_dscp_remove(request.link_ifindex, selector)
-                    .is_err()
-                || self
-                    .inner
-                    .runtime
-                    .marked_pdr_remove(request.link_ifindex, pdr_key)
-                    .is_err()
-            {
-                return Err(GtpuError::StateIndeterminate {
-                    operation: "ebpf_remove_pdp_context",
-                });
-            }
-            return match self
-                .inner
-                .runtime
-                .marked_owner_remove(request.link_ifindex, selector)
-            {
-                Ok(true) => Ok(()),
-                Ok(false) | Err(_) => Err(GtpuError::StateIndeterminate {
-                    operation: "ebpf_remove_pdp_context",
-                }),
-            };
+            return self.finish_marked_pdp_context_removal(request.link_ifindex, selector, owner);
         }
 
         let Some(legacy_pdr) = legacy_pdr else {
@@ -3054,11 +3095,7 @@ mod aya_runtime {
                     .ok_or_else(|| GtpuError::io("ebpf_far_map", invalid_data("map missing")))?;
                 let mut hash = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
                     .map_err(|error| map_error("ebpf_far_map", error))?;
-                match hash.remove(&key) {
-                    Ok(()) => Ok(true),
-                    Err(MapError::KeyNotFound) => Ok(false),
-                    Err(error) => Err(map_error("ebpf_far_remove", error)),
-                }
+                map_delete_result("ebpf_far_remove", hash.remove(&key))
             })
         }
 
@@ -3121,11 +3158,7 @@ mod aya_runtime {
                     [u8; UPLINK_FAR_VALUE_LEN],
                 >::try_from(map)
                 .map_err(|error| map_error("ebpf_marked_far_map", error))?;
-                match hash.remove(&key) {
-                    Ok(()) => Ok(true),
-                    Err(MapError::KeyNotFound) => Ok(false),
-                    Err(error) => Err(map_error("ebpf_marked_far_remove", error)),
-                }
+                map_delete_result("ebpf_marked_far_remove", hash.remove(&key))
             })
         }
 
@@ -3175,11 +3208,7 @@ mod aya_runtime {
                     .ok_or_else(|| GtpuError::io("ebpf_dscp_map", invalid_data("map missing")))?;
                 let mut hash = BpfHashMap::<_, [u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]>::try_from(map)
                     .map_err(|error| map_error("ebpf_dscp_map", error))?;
-                match hash.remove(&key) {
-                    Ok(()) => Ok(true),
-                    Err(MapError::KeyNotFound) => Ok(false),
-                    Err(error) => Err(map_error("ebpf_dscp_remove", error)),
-                }
+                map_delete_result("ebpf_dscp_remove", hash.remove(&key))
             })
         }
 
@@ -3242,11 +3271,7 @@ mod aya_runtime {
                     [u8; UPLINK_DSCP_VALUE_LEN],
                 >::try_from(map)
                 .map_err(|error| map_error("ebpf_marked_dscp_map", error))?;
-                match hash.remove(&key) {
-                    Ok(()) => Ok(true),
-                    Err(MapError::KeyNotFound) => Ok(false),
-                    Err(error) => Err(map_error("ebpf_marked_dscp_remove", error)),
-                }
+                map_delete_result("ebpf_marked_dscp_remove", hash.remove(&key))
             })
         }
 
@@ -3298,11 +3323,7 @@ mod aya_runtime {
                 let mut hash =
                     BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]>::try_from(map)
                         .map_err(|error| map_error("ebpf_pdr_map", error))?;
-                match hash.remove(&key) {
-                    Ok(()) => Ok(true),
-                    Err(MapError::KeyNotFound) => Ok(false),
-                    Err(error) => Err(map_error("ebpf_pdr_remove", error)),
-                }
+                map_delete_result("ebpf_pdr_remove", hash.remove(&key))
             })
         }
 
@@ -3352,11 +3373,7 @@ mod aya_runtime {
                 let mut hash =
                     BpfHashMap::<_, [u8; 4], [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>::try_from(map)
                         .map_err(|error| map_error("ebpf_marked_pdr_map", error))?;
-                match hash.remove(&key) {
-                    Ok(()) => Ok(true),
-                    Err(MapError::KeyNotFound) => Ok(false),
-                    Err(error) => Err(map_error("ebpf_marked_pdr_remove", error)),
-                }
+                map_delete_result("ebpf_marked_pdr_remove", hash.remove(&key))
             })
         }
 
@@ -3462,6 +3479,10 @@ mod aya_runtime {
                 {
                     return Err(state_indeterminate("ebpf_marked_owner_remove"));
                 }
+                // Unlike an independently optional forwarding resource, the
+                // owner was just read and its in-memory TEID reservation was
+                // proven. ENOENT here is a concurrent/ambiguous mutation and
+                // must remain an error rather than idempotent absence.
                 hash.remove(&selector)
                     .map_err(|error| map_error("ebpf_marked_owner_remove", error))?;
                 device.marked_owner_by_teid.remove(&owner.local_teid);
@@ -3558,6 +3579,25 @@ mod aya_runtime {
         }
     }
 
+    /// Classify an Aya hash-map delete without confusing Linux `ENOENT` with
+    /// an I/O failure. Aya's lookup API emits `KeyNotFound`, but its delete
+    /// API exposes the same absent-key condition as a syscall error.
+    fn map_delete_result(
+        operation: &'static str,
+        result: Result<(), MapError>,
+    ) -> Result<bool, GtpuError> {
+        match result {
+            Ok(()) => Ok(true),
+            Err(MapError::KeyNotFound) => Ok(false),
+            Err(MapError::SyscallError(error))
+                if error.io_error.kind() == io::ErrorKind::NotFound =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(map_error(operation, error)),
+        }
+    }
+
     fn invalid_data(message: &'static str) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message)
     }
@@ -3565,6 +3605,29 @@ mod aya_runtime {
     #[cfg(test)]
     mod race_tests {
         use super::*;
+
+        #[test]
+        fn map_delete_treats_aya_enoent_as_an_idempotent_absence() {
+            assert!(!map_delete_result("delete", Err(MapError::KeyNotFound)).unwrap());
+            let absent = MapError::SyscallError(aya::sys::SyscallError {
+                call: "bpf_map_delete_elem",
+                io_error: io::Error::from(io::ErrorKind::NotFound),
+            });
+            assert!(!map_delete_result("delete", Err(absent)).unwrap());
+
+            let denied = MapError::SyscallError(aya::sys::SyscallError {
+                call: "bpf_map_delete_elem",
+                io_error: io::Error::from(io::ErrorKind::PermissionDenied),
+            });
+            assert!(matches!(
+                map_delete_result("delete", Err(denied)).unwrap_err(),
+                GtpuError::Io {
+                    operation: "delete",
+                    kind: io::ErrorKind::Other,
+                    ..
+                }
+            ));
+        }
 
         fn hook(
             name: &'static str,
@@ -5815,6 +5878,367 @@ mod tests {
             assert!(state
                 .marked_owner_by_teid
                 .contains_key(&(S2BU_IFINDEX, first.local_teid.get().to_be_bytes())));
+        }
+    }
+
+    #[tokio::test]
+    async fn install_after_each_removal_cut_finishes_tombstone_before_retrying() {
+        for failure in [
+            "marked_far_remove",
+            "marked_dscp_remove",
+            "marked_pdr_remove",
+            "marked_owner_remove",
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let mut marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+            marked.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+            backend.install_pdp_context(marked.clone()).await.unwrap();
+            runtime.fail_in_order([failure]);
+            assert!(matches!(
+                backend
+                    .remove_pdp_context(RemovePdpContextRequest::from_context(&marked))
+                    .await
+                    .unwrap_err(),
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_remove_pdp_context"
+                }
+            ));
+
+            let selector = UplinkFarKey {
+                ue_ip: [10, 45, 0, 2],
+                bearer_mark: 0x1001_u32.to_be_bytes(),
+            }
+            .encode();
+            assert_eq!(
+                MarkedBearerOwner::decode(
+                    runtime
+                        .state()
+                        .marked_owner
+                        .get(&(S2BU_IFINDEX, selector))
+                        .unwrap(),
+                )
+                .phase,
+                MarkedBearerOwnerPhase::Removing,
+                "{failure}"
+            );
+
+            assert!(matches!(
+                backend
+                    .install_pdp_context(marked.clone())
+                    .await
+                    .unwrap_err(),
+                GtpuError::RetryRequired {
+                    operation: "ebpf_install_after_removal"
+                }
+            ));
+            {
+                let state = runtime.state();
+                assert!(state.marked_far.is_empty(), "{failure}");
+                assert!(state.marked_dscp.is_empty(), "{failure}");
+                assert!(state.marked_pdr.is_empty(), "{failure}");
+                assert!(state.marked_owner.is_empty(), "{failure}");
+                assert!(state.marked_owner_by_teid.is_empty(), "{failure}");
+            }
+
+            backend.install_pdp_context(marked.clone()).await.unwrap();
+            let state = runtime.state();
+            let owner = MarkedBearerOwner::decode(
+                state.marked_owner.get(&(S2BU_IFINDEX, selector)).unwrap(),
+            );
+            assert_eq!(owner.phase, MarkedBearerOwnerPhase::Active, "{failure}");
+            assert!(state.marked_far.contains_key(&(S2BU_IFINDEX, selector)));
+            assert!(state.marked_dscp.contains_key(&(S2BU_IFINDEX, selector)));
+            assert!(state
+                .marked_pdr
+                .contains_key(&(S2BU_IFINDEX, marked.local_teid.get().to_be_bytes())));
+        }
+    }
+
+    #[tokio::test]
+    async fn restarted_install_recovers_the_live_owned_without_far_signature() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+        backend.install_pdp_context(marked.clone()).await.unwrap();
+        runtime.fail_in_order(["marked_owner_remove"]);
+        assert!(matches!(
+            backend
+                .remove_pdp_context(RemovePdpContextRequest::from_context(&marked))
+                .await
+                .unwrap_err(),
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_remove_pdp_context"
+            }
+        ));
+        let selector = UplinkFarKey {
+            ue_ip: [10, 45, 0, 2],
+            bearer_mark: 0x1001_u32.to_be_bytes(),
+        }
+        .encode();
+        {
+            let mut state = runtime.state();
+            let encoded = state
+                .marked_owner
+                .get(&(S2BU_IFINDEX, selector))
+                .copied()
+                .expect("Removing owner remains after the injected final cut");
+            assert_eq!(&encoded[16..], &[0xff, 1, 3, 0]);
+            assert_eq!(
+                MarkedBearerOwner::decode(&encoded).phase,
+                MarkedBearerOwnerPhase::Removing
+            );
+            assert!(state.marked_far.is_empty());
+            assert!(state.marked_dscp.is_empty());
+            assert!(state.marked_pdr.is_empty());
+            state.attached.clear();
+            state.marked_owner_by_teid.clear();
+        }
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        restarted.resolve_device("s2bu").await.unwrap();
+        assert!(matches!(
+            restarted
+                .install_pdp_context(marked.clone())
+                .await
+                .unwrap_err(),
+            GtpuError::RetryRequired {
+                operation: "ebpf_install_after_removal"
+            }
+        ));
+        {
+            let state = runtime.state();
+            assert!(state.marked_far.is_empty());
+            assert!(state.marked_pdr.is_empty());
+            assert!(state.marked_owner.is_empty());
+        }
+
+        restarted.install_pdp_context(marked.clone()).await.unwrap();
+        let state = runtime.state();
+        let owner =
+            MarkedBearerOwner::decode(state.marked_owner.get(&(S2BU_IFINDEX, selector)).unwrap());
+        assert_eq!(owner.phase, MarkedBearerOwnerPhase::Active);
+        assert!(state.marked_far.contains_key(&(S2BU_IFINDEX, selector)));
+        assert!(state
+            .marked_pdr
+            .contains_key(&(S2BU_IFINDEX, marked.local_teid.get().to_be_bytes())));
+    }
+
+    #[tokio::test]
+    async fn install_cleanup_failure_keeps_removing_gate_until_retry_completes() {
+        for failure in [
+            "marked_far_remove",
+            "marked_dscp_remove",
+            "marked_pdr_remove",
+            "marked_owner_remove",
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let mut marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+            marked.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+            backend.install_pdp_context(marked.clone()).await.unwrap();
+            runtime.fail_in_order(["marked_far_remove"]);
+            assert!(matches!(
+                backend
+                    .remove_pdp_context(RemovePdpContextRequest::from_context(&marked))
+                    .await
+                    .unwrap_err(),
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_remove_pdp_context"
+                }
+            ));
+
+            runtime.fail_in_order([failure]);
+            assert!(matches!(
+                backend
+                    .install_pdp_context(marked.clone())
+                    .await
+                    .unwrap_err(),
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_remove_pdp_context"
+                }
+            ));
+            let selector = UplinkFarKey {
+                ue_ip: [10, 45, 0, 2],
+                bearer_mark: 0x1001_u32.to_be_bytes(),
+            }
+            .encode();
+            assert_eq!(
+                MarkedBearerOwner::decode(
+                    runtime
+                        .state()
+                        .marked_owner
+                        .get(&(S2BU_IFINDEX, selector))
+                        .unwrap(),
+                )
+                .phase,
+                MarkedBearerOwnerPhase::Removing,
+                "{failure}"
+            );
+
+            assert!(matches!(
+                backend
+                    .install_pdp_context(marked.clone())
+                    .await
+                    .unwrap_err(),
+                GtpuError::RetryRequired {
+                    operation: "ebpf_install_after_removal"
+                }
+            ));
+            {
+                let state = runtime.state();
+                assert!(state.marked_far.is_empty(), "{failure}");
+                assert!(state.marked_dscp.is_empty(), "{failure}");
+                assert!(state.marked_pdr.is_empty(), "{failure}");
+                assert!(state.marked_owner.is_empty(), "{failure}");
+            }
+
+            backend.install_pdp_context(marked.clone()).await.unwrap();
+            let state = runtime.state();
+            let owner = MarkedBearerOwner::decode(
+                state.marked_owner.get(&(S2BU_IFINDEX, selector)).unwrap(),
+            );
+            assert_eq!(owner.phase, MarkedBearerOwnerPhase::Active, "{failure}");
+            assert!(state.marked_far.contains_key(&(S2BU_IFINDEX, selector)));
+        }
+    }
+
+    #[tokio::test]
+    async fn install_drift_finishes_removing_owner_without_false_already_exists() {
+        for drift in ["far", "dscp", "local_teid", "selector"] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let mut original = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+            original.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+            backend.install_pdp_context(original.clone()).await.unwrap();
+            runtime.fail_in_order(["marked_owner_remove"]);
+            assert!(matches!(
+                backend
+                    .remove_pdp_context(RemovePdpContextRequest::from_context(&original))
+                    .await
+                    .unwrap_err(),
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_remove_pdp_context"
+                }
+            ));
+
+            let mut desired = original.clone();
+            match drift {
+                "far" => desired.peer_teid = teid(0x2000_0003),
+                "dscp" => desired.egress_dscp = Some(crate::DscpCodepoint::new(10).unwrap()),
+                "local_teid" => desired.local_teid = teid(0x1000_0003),
+                _ => desired.bearer_mark = GtpBearerMark::new(0x1002),
+            }
+            assert!(matches!(
+                backend
+                    .install_pdp_context(desired.clone())
+                    .await
+                    .unwrap_err(),
+                GtpuError::RetryRequired {
+                    operation: "ebpf_install_after_removal"
+                }
+            ));
+            {
+                let state = runtime.state();
+                assert!(state.marked_far.is_empty(), "{drift}");
+                assert!(state.marked_dscp.is_empty(), "{drift}");
+                assert!(state.marked_pdr.is_empty(), "{drift}");
+                assert!(state.marked_owner.is_empty(), "{drift}");
+            }
+
+            backend.install_pdp_context(desired.clone()).await.unwrap();
+            let selector = UplinkFarKey {
+                ue_ip: [10, 45, 0, 2],
+                bearer_mark: desired
+                    .bearer_mark
+                    .expect("test desired context is marked")
+                    .get()
+                    .to_be_bytes(),
+            }
+            .encode();
+            let state = runtime.state();
+            let owner = MarkedBearerOwner::decode(
+                state.marked_owner.get(&(S2BU_IFINDEX, selector)).unwrap(),
+            );
+            assert_eq!(owner.phase, MarkedBearerOwnerPhase::Active, "{drift}");
+            assert_eq!(owner.local_teid, desired.local_teid.get().to_be_bytes());
+            assert_eq!(
+                owner.uplink_far.o_teid,
+                desired.peer_teid.get().to_be_bytes()
+            );
+            assert_eq!(
+                owner.egress_dscp(),
+                desired.egress_dscp.map(crate::DscpCodepoint::get)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_owner_corruption_blocks_install_cleanup_without_mutation() {
+        for corruption in ["legacy_pdr", "owner_index"] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+            backend.install_pdp_context(marked.clone()).await.unwrap();
+            runtime.fail_in_order(["marked_far_remove"]);
+            assert!(matches!(
+                backend
+                    .remove_pdp_context(RemovePdpContextRequest::from_context(&marked))
+                    .await
+                    .unwrap_err(),
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_remove_pdp_context"
+                }
+            ));
+            let selector = UplinkFarKey {
+                ue_ip: [10, 45, 0, 2],
+                bearer_mark: 0x1001_u32.to_be_bytes(),
+            }
+            .encode();
+            {
+                let mut state = runtime.state();
+                if corruption == "legacy_pdr" {
+                    state.pdr.insert(
+                        (S2BU_IFINDEX, marked.local_teid.get().to_be_bytes()),
+                        DownlinkPdr {
+                            ue_ip: [10, 45, 0, 2],
+                        }
+                        .encode(),
+                    );
+                } else {
+                    state.marked_owner_by_teid.clear();
+                }
+            }
+            let before = {
+                let state = runtime.state();
+                (
+                    state.marked_far.clone(),
+                    state.marked_dscp.clone(),
+                    state.marked_pdr.clone(),
+                    state.marked_owner.clone(),
+                )
+            };
+            assert!(matches!(
+                backend
+                    .install_pdp_context(marked.clone())
+                    .await
+                    .unwrap_err(),
+                GtpuError::StateIndeterminate {
+                    operation: "ebpf_remove_pdp_context"
+                }
+            ));
+            let state = runtime.state();
+            assert_eq!(state.marked_far, before.0, "{corruption}");
+            assert_eq!(state.marked_dscp, before.1, "{corruption}");
+            assert_eq!(state.marked_pdr, before.2, "{corruption}");
+            assert_eq!(state.marked_owner, before.3, "{corruption}");
+            assert_eq!(
+                MarkedBearerOwner::decode(
+                    state.marked_owner.get(&(S2BU_IFINDEX, selector)).unwrap(),
+                )
+                .phase,
+                MarkedBearerOwnerPhase::Removing
+            );
         }
     }
 

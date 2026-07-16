@@ -1352,6 +1352,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- **GTP-U removal recovery — `opc-gtpu-dataplane`:** default and marked bearer
+  forwarding-resource removal now treats Aya's Linux `ENOENT` delete result as
+  idempotent absence, matching its lookup semantics. This prevents an optional
+  absent DSCP entry from stranding either a default-bearer PDR or a `Removing`
+  owner after its FAR was deleted. A marked-bearer
+  install that encounters a valid persisted tombstone finishes the
+  already-committed FAR/DSCP/PDR/owner deletion instead of reporting
+  `AlreadyExists` for non-forwarding state. The recovery call returns the new
+  typed `GtpuError::RetryRequired` and never republishes in the same call; a
+  fresh retry can then install an `Active` owner and its marked uplink FAR.
+  Endpoint, DSCP, local-TEID, and selector drift cannot turn the tombstone into
+  false idempotent success, while corrupt dual-schema or owner-index state
+  still fails closed without mutation.
 - **Cold consensus reconnects preserve first-RPC progress — `opc-session-net`:**
   DNS/TCP/mTLS/bootstrap now consumes at most two thirds of the caller's
   existing logical budget, leaving a bounded nonzero remainder for the first

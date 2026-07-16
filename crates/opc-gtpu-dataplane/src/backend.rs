@@ -24,6 +24,11 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     async fn remove_device(&self, device: &GtpDevice) -> Result<(), GtpuError>;
 
     /// Install a GTP-U PDP context.
+    ///
+    /// [`GtpuError::RetryRequired`] means the backend completed a safe
+    /// prerequisite recovery step but did not install this request. Callers
+    /// must not treat that result as already present; resubmit the desired
+    /// context as a new operation.
     async fn install_pdp_context(&self, request: GtpPdpContext) -> Result<(), GtpuError>;
 
     /// Remove a GTP-U PDP context.
