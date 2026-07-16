@@ -9,14 +9,14 @@ use std::{error::Error, io::Error as IoError};
 use bytes::{Bytes, BytesMut};
 use opc_proto_gtpv2c::{
     correlate_create_bearer_response, correlate_delete_bearer_response, s2b_create_bearer_request,
-    s2b_create_bearer_response, s2b_delete_bearer_request, s2b_delete_bearer_response, BearerQos,
-    CauseValue, ChargingId, EpsBearerId, FullyQualifiedTeid, Gtpv2cMonotonicMillis,
-    Gtpv2cPeerToken, Gtpv2cTriggeredCompletion, Gtpv2cTriggeredRequestDisposition,
-    Gtpv2cTriggeredTransactions, Gtpv2cTriggeredWorkToken, OwnedMessage, S2bCreateBearerRequest,
-    S2bCreateBearerRequestContext, S2bCreateBearerResponse, S2bCreateBearerResult,
-    S2bDeleteBearerRequest, S2bDeleteBearerResponse, S2bDeleteBearerResponseBody,
-    S2bDeleteBearerResult, S2bDeleteBearerTarget, S2bMessage, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
-    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    s2b_create_bearer_response, s2b_delete_bearer_request, s2b_delete_bearer_response,
+    AllocationRetentionPriority, BearerQos, CauseValue, ChargingId, EpsBearerId,
+    FullyQualifiedTeid, Gtpv2cMonotonicMillis, Gtpv2cPeerToken, Gtpv2cTriggeredCompletion,
+    Gtpv2cTriggeredRequestDisposition, Gtpv2cTriggeredTransactions, Gtpv2cTriggeredWorkToken,
+    OwnedMessage, S2bCreateBearerRequest, S2bCreateBearerRequestContext, S2bCreateBearerResponse,
+    S2bCreateBearerResult, S2bDeleteBearerRequest, S2bDeleteBearerResponse,
+    S2bDeleteBearerResponseBody, S2bDeleteBearerResult, S2bDeleteBearerTarget, S2bMessage,
+    INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_proto_ikev2::{
     build_ikev2_dedicated_bearer_create_child_sa_request,
@@ -71,14 +71,14 @@ fn create_dedicated_bearer(
             tft,
             // QCI-only EPS QoS is lossless for this non-GBR example because
             // every optional GTP bearer bit-rate is explicitly zero.
-            bearer_qos: BearerQos {
-                priority_flags: 0x4f,
-                qci: 9,
-                maximum_bitrate_uplink: 0,
-                maximum_bitrate_downlink: 0,
-                guaranteed_bitrate_uplink: 0,
-                guaranteed_bitrate_downlink: 0,
-            },
+            bearer_qos: BearerQos::new(
+                AllocationRetentionPriority::new(3, true, true)?,
+                9,
+                0,
+                0,
+                0,
+                0,
+            )?,
             pgw_f_teid: FullyQualifiedTeid {
                 interface_type: INTERFACE_TYPE_S2B_U_PGW_GTP_U,
                 teid: 0x1000_0001,
