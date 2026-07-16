@@ -33,11 +33,11 @@ use opc_proto_ikev2::{
     },
     derive_child_sa_key_material, Header, HeaderFlags, Ikev2ChildSaCryptoProfile,
     Ikev2CreateChildSaRekeyResponseBuild, Ikev2EncryptionAlgorithm, Ikev2IkeAuthPayloadBuild,
-    Ikev2NoncePayloadBuild, Ikev2NotifyPayload, Ikev2NotifyPayloadBuild, Ikev2PrfAlgorithm,
-    Ikev2SaPayloadBuild, Ikev2SaProposalBuild, Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild,
-    Ikev2TrafficSelectorPayloadBuild, PayloadChain, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
-    EXCHANGE_TYPE_INFORMATIONAL, IKEV2_NOTIFY_REKEY_SA, IKEV2_SECURITY_PROTOCOL_ID_ESP,
-    IKEV2_TS_IPV4_ADDR_RANGE,
+    Ikev2KeyExchangePayloadBuild, Ikev2NoncePayloadBuild, Ikev2NotifyPayload,
+    Ikev2NotifyPayloadBuild, Ikev2PrfAlgorithm, Ikev2SaPayloadBuild, Ikev2SaProposalBuild,
+    Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayloadBuild,
+    PayloadChain, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_INFORMATIONAL,
+    IKEV2_NOTIFY_REKEY_SA, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_TS_IPV4_ADDR_RANGE,
 };
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier,
@@ -462,6 +462,83 @@ fn new_child_sa_build_decode_and_response_correlation_succeed() {
 }
 
 #[test]
+fn new_child_sa_with_pfs_build_decode_and_response_correlation_succeed() {
+    const DH_GROUP: u16 = 19;
+
+    let mut request_build = create_request_build();
+    request_build.security_association.proposals[0]
+        .transforms
+        .push(Ikev2SaTransformBuild {
+            transform_type: 4,
+            transform_id: DH_GROUP,
+            attributes: vec![],
+        });
+    request_build.key_exchange = Some(Ikev2KeyExchangePayloadBuild {
+        dh_group: DH_GROUP,
+        key_exchange_data: vec![0x31; 64],
+    });
+    let request_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(
+        &request_build,
+    ));
+    let request_header = request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 9);
+    let request = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
+        &request_header,
+        request_wire.first_payload(),
+        request_wire.bytes(),
+    ));
+    let request_key_exchange = match request.key_exchange {
+        Some(value) => value,
+        None => panic!("PFS request decoded without KE"),
+    };
+    assert_eq!(request_key_exchange.dh_group, DH_GROUP);
+    assert_eq!(request_key_exchange.key_exchange_data, [0x31; 64]);
+
+    let mut response_build = create_response_build();
+    response_build.security_association.proposals[0]
+        .transforms
+        .push(Ikev2SaTransformBuild {
+            transform_type: 4,
+            transform_id: DH_GROUP,
+            attributes: vec![],
+        });
+    response_build.key_exchange = Some(Ikev2KeyExchangePayloadBuild {
+        dh_group: DH_GROUP,
+        key_exchange_data: vec![0x42; 64],
+    });
+    let response_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
+        &response_build,
+    ));
+    let response_header = response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 9);
+    let response = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
+        &response_header,
+        response_wire.first_payload(),
+        response_wire.bytes(),
+    ));
+    let response_key_exchange = match &response {
+        Ikev2DedicatedBearerCreateChildSaResponse::Success {
+            key_exchange: Some(value),
+            ..
+        } => value,
+        Ikev2DedicatedBearerCreateChildSaResponse::Success {
+            key_exchange: None, ..
+        } => panic!("PFS response decoded without KE"),
+        Ikev2DedicatedBearerCreateChildSaResponse::Error(_) => {
+            panic!("PFS success fixture decoded as error")
+        }
+    };
+    assert_eq!(response_key_exchange.dh_group, DH_GROUP);
+    assert_eq!(response_key_exchange.key_exchange_data, [0x42; 64]);
+    must_ok(
+        validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+            &request_header,
+            &response_header,
+            &request,
+            &response,
+        ),
+    );
+}
+
+#[test]
 fn create_child_rejects_rekey_and_non_create_tft() {
     let common = must_ok(build_create_child_sa_rekey_response_payloads(
         &Ikev2CreateChildSaRekeyResponseBuild {
@@ -529,6 +606,34 @@ fn create_child_error_response_is_typed_and_cannot_mix_success() {
             )
         )
     ));
+
+    let mut mixed_payloads = must_ok(build_create_child_sa_rekey_response_payloads(
+        &Ikev2CreateChildSaRekeyResponseBuild {
+            security_association: sa([5, 6, 7, 8]),
+            nonce: Ikev2NoncePayloadBuild {
+                nonce: vec![0x22; 32],
+            },
+            key_exchange: None,
+            traffic_selectors_initiator: narrow_ts(),
+            traffic_selectors_responder: narrow_ts(),
+        },
+    ))
+    .into_payloads();
+    mixed_payloads.push(must_ok(build_ikev2_dedicated_bearer_notify(
+        &Ikev2DedicatedBearerNotify::ProtocolError(
+            Ikev2DedicatedBearerProtocolError::SyntacticalErrorsInPacketFilters,
+        ),
+    )));
+    let (first_payload, mixed_wire) =
+        must_ok(build_ike_auth_cleartext_payload_chain(&mixed_payloads));
+    assert_eq!(
+        decode_ikev2_dedicated_bearer_create_child_sa_response(
+            &response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 7),
+            first_payload,
+            &mixed_wire,
+        ),
+        Err(Ikev2DedicatedBearerExchangeError::ErrorResponseMixedWithPayloads)
+    );
 }
 
 #[test]

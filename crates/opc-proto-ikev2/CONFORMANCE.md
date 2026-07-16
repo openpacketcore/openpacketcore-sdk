@@ -109,9 +109,10 @@ corpus provenance.
 TS 24.302 R17 §8.2.9.9-§8.2.9.14 and composes generic RFC 7296 payload builders
 for complete opened `CREATE_CHILD_SA` and `INFORMATIONAL` chains. It proves the
 exact Notify numbers and inner lengths, every typed Notify round trip, strict
-negative cardinality/shape/correlation cases, response selector narrowing,
-Child-SA key-derivation compatibility, and byte identity between a canonical
-TS 24.008 TFT value embedded in IKEv2 and the shared codec.
+negative cardinality/shape/correlation cases, positive PFS request/response KE
+correlation, rejection of mixed success/error response payloads, response
+selector narrowing, Child-SA key-derivation compatibility, and byte identity
+between a canonical TS 24.008 TFT value embedded in IKEv2 and the shared codec.
 `tests/dedicated_bearer_cross_protocol.rs` additionally builds and
 procedure-aware decodes a typed GTPv2-C Create Bearer Request, extracts the raw
 nested Bearer TFT IE value, extracts the inner value from the typed IKEv2 TFT
