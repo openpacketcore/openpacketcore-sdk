@@ -24,6 +24,7 @@ use crate::{
 };
 
 mod exchange;
+mod qos;
 
 pub use exchange::{
     build_ikev2_dedicated_bearer_create_child_sa_error_response,
@@ -51,6 +52,11 @@ pub use exchange::{
     Ikev2DedicatedBearerModificationRequestBuild, Ikev2DedicatedBearerPayloadRole,
     Ikev2DedicatedBearerPeerErrorNotify, Ikev2DedicatedBearerResponseError,
     Ikev2UnknownNonCriticalPayload,
+};
+pub use qos::{
+    Ikev2ApnAmbrKbps, Ikev2ApnAmbrMapping, Ikev2EpsBearerBitRatesKbps, Ikev2EpsQosKbps,
+    Ikev2EpsQosMapping, Ikev2QosDirection, Ikev2QosMappingError, Ikev2QosQuantization,
+    Ikev2QosRateField, Ikev2QosResourceType,
 };
 
 /// Private error Notify for a semantic error in a TFT operation.

@@ -34,9 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response proposal/transform and traffic-selector correlation; an
   uplink-applicable create TFT; directional paired-SPI Delete responses; the
   explicit RFC 7296 crossed-delete exception; canonical shared TS 24.008 TFT
-  bytes; and exact error/success separation while leaving admission, SPI allocation,
-  retransmission timers, cryptographic sealing, and dataplane installation to
-  the product.
+  exact error/success separation. A checked integer-kbps bridge maps typed
+  GBR/non-GBR bearer QoS and APN-AMBR onto the complete TS 24.301 normal and
+  extended rate grids with explicit exact/ceiling quantization and reports the
+  values represented on the wire. Admission, SPI allocation, retransmission
+  timers, cryptographic sealing, and dataplane installation remain with the
+  product.
 - `opc-sctp`: an explicit, default-off `DiameterInboundPpidPolicy` escape hatch
   can accept inbound PPID 0 from a configured legacy clear-text Diameter peer.
   Standard PPID 46 remains accepted and is always used outbound; DTLS remains

@@ -121,6 +121,44 @@ by Delete Bearer and Child-SA deletion, is executable as
 That example makes the application-owned admission, allocation, and dataplane
 boundaries explicit and proves exact GTP retransmission replay.
 
+Integer-kbps bearer QoS must be mapped onto the discrete TS 24.301 NAS grid
+before building `EPS_QOS`/`EXTENDED_EPS_QOS`. The checked mapping API makes the
+operator-QCI GBR classification and quantization policy explicit and returns
+the rate actually represented on the wire:
+
+```rust
+use opc_proto_ikev2::{
+    Ikev2EpsBearerBitRatesKbps, Ikev2EpsQosKbps, Ikev2EpsQosMapping,
+    Ikev2QosQuantization,
+};
+
+let mapped = Ikev2EpsQosMapping::from_kbps(
+    Ikev2EpsQosKbps::Gbr {
+        qci: 200, // Operator-specific: the variant supplies its GBR type.
+        rates: Ikev2EpsBearerBitRatesKbps {
+            maximum_uplink: 10_000_001,
+            maximum_downlink: 9_900_000,
+            guaranteed_uplink: 9_000_000,
+            guaranteed_downlink: 9_000_000,
+        },
+    },
+    Ikev2QosQuantization::Ceiling,
+)?;
+
+assert_eq!(
+    mapped.represented_rates().map(|rates| rates.maximum_uplink),
+    Some(10_000_200),
+);
+# Ok::<(), opc_proto_ikev2::Ikev2QosMappingError>(())
+```
+
+`Exact` rejects rates between grid points. `Ceiling` is a documented SDK
+policy that selects the smallest representation not below the requested rate;
+TS 24.301 requires mapping to an explicit value but does not mandate that
+rounding direction. `Ikev2ApnAmbrMapping` provides the same checked boundary
+for APN-AMBR, including Extended APN-AMBR above 65,280 Mbps. See
+[`examples/dedicated_bearer_qos_mapping.rs`](examples/dedicated_bearer_qos_mapping.rs).
+
 ## Example
 
 ```rust
@@ -186,6 +224,7 @@ cargo check -p opc-proto-ikev2 --all-targets --all-features
 cargo test -p opc-proto-ikev2 --all-features
 cargo clippy -p opc-proto-ikev2 --all-targets -- -D warnings
 cargo run -p opc-proto-ikev2 --example dedicated_bearer_sdk_flow
+cargo run -p opc-proto-ikev2 --example dedicated_bearer_qos_mapping
 (cd crates/opc-proto-ikev2 && cargo +nightly fuzz list)
 (cd crates/opc-proto-ikev2 && cargo +nightly fuzz run dedicated_bearer -- -runs=1000)
 ```
