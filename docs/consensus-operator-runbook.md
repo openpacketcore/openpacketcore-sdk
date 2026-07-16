@@ -175,6 +175,32 @@ original request/payload pair remains retryable while its outcome is retained;
 after expiry, recover through a fresh authoritative read rather than assuming
 the old response is still cached.
 
+At the config-bus boundary, loss of acknowledgement after durable admission is
+reported as `OutcomeUnknown` and raises the recovery fence. gNMI maps that code
+to `FAILED_PRECONDITION` rather than retryable `UNAVAILABLE`; NETCONF returns an
+application `operation-failed`. In either transport, reconcile with the exact
+original request ID (`ConfigBus::resolve_request_id`) or resubmit the exact
+original operation with its idempotency key before retrying anything else. A
+changed mode, candidate, confirmation timeout, rollback selector,
+caller-asserted base-version precondition, or caller context is rejected as a
+collision. The fenced bus admits that exact keyed
+replay only as a read-only result lookup; it remains fenced and keeps serving
+its prior snapshot until rebuilt from the authoritative store. A slow append
+that later proves committed remains success even if the caller's local deadline elapsed,
+and failure to clear the post-publication recovery marker does not rewrite that
+durable success as failure; it fences later writes and requires recovery.
+
+This config-consensus change advances both its command and config-specific RPC
+payload revisions to 2. Drain config writers, stop every config-consensus
+member, upgrade the complete voter set, and restart it as one coordinated
+operation. Cross-revision paths in a rolling deployment of mixed
+revision-1/revision-2 binaries fail closed at the exact formation probe or RPC
+revision check before a revision-2 node admits writes; there is no wire
+downgrade. Do not rely on that rejection to drain an already-running
+revision-1 majority. Existing revision-1 persisted commands remain replayable
+for the original append, confirm, and rollback-point intents, but revision-1
+commands carrying either new intent are rejected as corrupt state.
+
 After the Openraft authority marker exists, direct mutation through
 `SqliteBackend` is fenced, including through clones freshly opened or retained
 around the claim. The safe API exposes no raw SQLite connection, audit key, or

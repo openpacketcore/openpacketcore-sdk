@@ -84,6 +84,67 @@ async fn commit_confirmed_stores_deadline_and_publishes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_append_arms_rollback_from_the_persisted_absolute_deadline() {
+    let store = Arc::new(BlockingStore::new());
+    store
+        .inner
+        .seed(StoredConfig::new(
+            opc_types::TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+
+    let submit = {
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            bus.submit(
+                CommitRequest::new(
+                    RequestId::new(),
+                    principal(),
+                    TransportType::Internal,
+                    RequestSource::Northbound,
+                    ConfigOperation::Replace,
+                    CommitMode::CommitConfirmed {
+                        timeout: Duration::from_secs(1),
+                    },
+                    Instant::now() + Duration::from_secs(3),
+                    Some(TestConfig::new("tentative")),
+                    vec![changed_path()],
+                )
+                .with_base_version(ConfigVersion::new(1)),
+            )
+            .await
+        })
+    };
+
+    store.wait_until_append_started().await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    store.release();
+    submit
+        .await
+        .expect("submit task completes")
+        .expect("slow durable append remains a successful pending commit");
+
+    tokio::time::timeout(Duration::from_millis(600), async {
+        loop {
+            if store.inner.history().await.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("rollback fires from the pre-append persisted deadline");
+    assert_eq!(bus.load().name, "initial");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_confirmed_requires_durable_rollback_parent() {
     let store = Arc::new(MockManagedDatastore::new());
     let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
@@ -433,6 +494,130 @@ async fn expiry_rollback_fires_on_virtual_clock() {
     assert_eq!(bus.version(), ConfigVersion::new(3));
 }
 
+#[tokio::test(start_paused = true)]
+async fn replaying_pending_commit_confirmed_does_not_extend_its_durable_deadline() {
+    let store = Arc::new(MockManagedDatastore::new());
+    store
+        .seed(StoredConfig::new(
+            opc_types::TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+    let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 4);
+    let key = IdempotencyKey::new("pending-replay-deadline").expect("key");
+    let request = || {
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_secs(60),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(ConfigVersion::new(1))
+        .with_idempotency_key(key.clone())
+    };
+
+    let timer_started = tokio::time::Instant::now();
+    let first = bus
+        .submit(request())
+        .await
+        .expect("commit-confirmed succeeds");
+    subscriber.recv().await.expect("pending change published");
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let replayed = bus.submit(request()).await.expect("exact replay succeeds");
+    assert_eq!(replayed, first);
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    subscriber.recv().await.expect("rollback change published");
+    assert!(
+        tokio::time::Instant::now() <= timer_started + Duration::from_secs(62),
+        "read-only replay must not push rollback into a new timeout window"
+    );
+    let history = store.history().await;
+    assert_eq!(history.len(), 3, "rollback must use the original deadline");
+    assert_eq!(bus.load().name, "initial");
+}
+
+#[tokio::test(start_paused = true)]
+async fn replaying_an_older_commit_does_not_clear_a_newer_pending_deadline() {
+    let store = Arc::new(MockManagedDatastore::new());
+    store
+        .seed(StoredConfig::new(
+            opc_types::TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), Arc::clone(&store))
+        .await
+        .expect("startup succeeds");
+    let subscriber = bus.subscribe(SubscriberLagPolicy::DropOldest, 6);
+    let old_key = IdempotencyKey::new("older-stable-commit").expect("key");
+    let old_request = || {
+        commit_request("stable", Instant::now() + Duration::from_secs(1))
+            .with_base_version(ConfigVersion::new(1))
+            .with_idempotency_key(old_key.clone())
+    };
+    let old_result = bus
+        .submit(old_request())
+        .await
+        .expect("stable commit succeeds");
+    subscriber.recv().await.expect("stable change published");
+
+    let pending_timer_started = tokio::time::Instant::now();
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_secs(60),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(ConfigVersion::new(2))
+        .with_idempotency_key(IdempotencyKey::new("newer-pending").expect("key")),
+    )
+    .await
+    .expect("commit-confirmed succeeds");
+    subscriber.recv().await.expect("pending change published");
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let replayed = bus
+        .submit(old_request())
+        .await
+        .expect("older replay succeeds");
+    assert_eq!(replayed, old_result);
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    subscriber.recv().await.expect("rollback change published");
+    assert!(
+        tokio::time::Instant::now() <= pending_timer_started + Duration::from_secs(62),
+        "older replay must not disarm the newer rollback timer"
+    );
+    let history = store.history().await;
+    assert_eq!(history.len(), 4, "older replay must not disarm rollback");
+    assert_eq!(bus.load().name, "stable");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
     let alarms = SharedAlarmManager::default();
@@ -459,18 +644,24 @@ async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
         ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
             self.inner.load_by_idempotency_key(k).await
         }
-        async fn append_commit(&self, commit: StoredConfig<TestConfig>) -> Result<(), StoreError> {
-            if commit.source == RequestSource::Internal {
+        async fn load_by_request_id(
+            &self,
+            request_id: RequestId,
+        ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+            self.inner.load_by_request_id(request_id).await
+        }
+        async fn append_commit_write(
+            &self,
+            commit: CommitWrite<TestConfig>,
+        ) -> Result<(), StoreError> {
+            if commit.record().source == RequestSource::Internal {
                 self.rollback_append_attempts.fetch_add(1, Ordering::SeqCst);
                 return Err(StoreError::internal("disk full or similar write error"));
             }
-            self.inner.append_commit(commit).await
+            self.inner.append_commit_write(commit).await
         }
         async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
             self.inner.clear_recovery_required(tx_id).await
-        }
-        async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
-            self.inner.mark_confirmed(tx_id).await
         }
     }
 
@@ -533,6 +724,115 @@ async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expiry_rollback_marker_clear_failure_reports_applied_decision_and_fences() {
+    struct RollbackMarkerFailureStore {
+        inner: MockManagedDatastore<TestConfig>,
+        clear_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ManagedDatastore<TestConfig> for RollbackMarkerFailureStore {
+        async fn load_latest(&self) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+            self.inner.load_latest().await
+        }
+        async fn load_rollback(
+            &self,
+            target: RollbackTarget,
+        ) -> Result<StoredConfig<TestConfig>, StoreError> {
+            self.inner.load_rollback(target).await
+        }
+        async fn load_by_idempotency_key(
+            &self,
+            key: &IdempotencyKey,
+        ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+            self.inner.load_by_idempotency_key(key).await
+        }
+        async fn load_by_request_id(
+            &self,
+            request_id: RequestId,
+        ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+            self.inner.load_by_request_id(request_id).await
+        }
+        async fn append_commit_write(
+            &self,
+            commit: CommitWrite<TestConfig>,
+        ) -> Result<(), StoreError> {
+            self.inner.append_commit_write(commit).await
+        }
+        async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
+            if self.clear_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.inner.clear_recovery_required(tx_id).await
+            } else {
+                Err(StoreError::internal(
+                    "rollback recovery marker clear failed",
+                ))
+            }
+        }
+    }
+
+    let inner = MockManagedDatastore::new();
+    inner
+        .seed(StoredConfig::new(
+            opc_types::TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+    let store = Arc::new(RollbackMarkerFailureStore {
+        inner,
+        clear_calls: AtomicUsize::new(0),
+    });
+    let alarms = SharedAlarmManager::default();
+    let bus = ConfigBus::restore_or_new_with_alarm_manager_dev_only(
+        TestConfig::new("fallback"),
+        Arc::clone(&store),
+        alarms.clone(),
+    )
+    .await
+    .expect("startup succeeds");
+
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: Duration::from_millis(50),
+            },
+            Instant::now() + Duration::from_secs(1),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(ConfigVersion::new(1)),
+    )
+    .await
+    .expect("commit-confirmed succeeds");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if bus.version() == ConfigVersion::new(3) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("expiry rollback publishes despite marker-clear failure");
+
+    assert_eq!(bus.load().name, "initial");
+    assert_eq!(bus.drift_state(), DriftState::RecoveryRequired);
+    let history = store.inner.history().await;
+    assert_eq!(history.len(), 3);
+    assert!(history[2].recovery_required);
+    let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
+    assert_alarm_details_code(&alarm, "recovery_required");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_confirmed_expiry_validates_rollback_parent_before_publish() {
     struct InvalidRollbackParentStore {
         inner: MockManagedDatastore<TestConfig>,
@@ -558,14 +858,14 @@ async fn commit_confirmed_expiry_validates_rollback_parent_before_publish() {
         ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
             self.inner.load_by_idempotency_key(k).await
         }
-        async fn append_commit(&self, commit: StoredConfig<TestConfig>) -> Result<(), StoreError> {
-            self.inner.append_commit(commit).await
+        async fn append_commit_write(
+            &self,
+            commit: CommitWrite<TestConfig>,
+        ) -> Result<(), StoreError> {
+            self.inner.append_commit_write(commit).await
         }
         async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
             self.inner.clear_recovery_required(tx_id).await
-        }
-        async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
-            self.inner.mark_confirmed(tx_id).await
         }
     }
 
@@ -619,7 +919,7 @@ async fn commit_confirmed_expiry_validates_rollback_parent_before_publish() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_confirmed_confirm_marker_failure_fences_after_append() {
+async fn commit_confirmed_atomic_decision_failure_does_not_append_or_fence() {
     struct MarkConfirmFailureStore {
         inner: MockManagedDatastore<TestConfig>,
     }
@@ -641,14 +941,23 @@ async fn commit_confirmed_confirm_marker_failure_fences_after_append() {
         ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
             self.inner.load_by_idempotency_key(k).await
         }
-        async fn append_commit(&self, commit: StoredConfig<TestConfig>) -> Result<(), StoreError> {
-            self.inner.append_commit(commit).await
+        async fn load_by_request_id(
+            &self,
+            request_id: RequestId,
+        ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+            self.inner.load_by_request_id(request_id).await
+        }
+        async fn append_commit_write(
+            &self,
+            commit: CommitWrite<TestConfig>,
+        ) -> Result<(), StoreError> {
+            if commit.confirmed_resolution().is_some() {
+                return Err(StoreError::internal("confirmation decision write failed"));
+            }
+            self.inner.append_commit_write(commit).await
         }
         async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
             self.inner.clear_recovery_required(tx_id).await
-        }
-        async fn mark_confirmed(&self, _tx_id: opc_types::TxId) -> Result<(), StoreError> {
-            Err(StoreError::internal("confirmation marker write failed"))
         }
     }
 
@@ -700,10 +1009,15 @@ async fn commit_confirmed_confirm_marker_failure_fences_after_append() {
             vec![changed_path()],
         ))
         .await
-        .expect_err("failed confirm marker after append must fence recovery");
+        .expect_err("failed atomic confirmation must be a clean persistence failure");
 
-    assert_eq!(err.code, CommitErrorCode::RecoveryRequired);
-    assert_eq!(bus.drift_state(), DriftState::RecoveryRequired);
+    assert_eq!(err.code, CommitErrorCode::PersistFailed);
+    assert_eq!(bus.drift_state(), DriftState::InSync);
+    assert_eq!(bus.version(), ConfigVersion::new(2));
+    assert_eq!(bus.load().name, "tentative");
+    let history = store.inner.history().await;
+    assert_eq!(history.len(), 2);
+    assert!(history[1].confirmed_deadline.is_some());
 
     let follow_up = bus
         .submit(commit_request(
@@ -711,8 +1025,8 @@ async fn commit_confirmed_confirm_marker_failure_fences_after_append() {
             Instant::now() + Duration::from_secs(1),
         ))
         .await
-        .expect_err("future writes should be fenced after reconciliation failure");
-    assert_eq!(follow_up.code, CommitErrorCode::RecoveryRequired);
+        .expect_err("a pending commit still rejects an unrelated update");
+    assert_eq!(follow_up.code, CommitErrorCode::AdmissionRejected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4,8 +4,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use opc_amf_lite::{AmfConfig, PersistDatastore};
-use opc_config_bus::{EncryptingManagedDatastore, ManagedDatastore, StoreErrorCode, StoredConfig};
-use opc_config_model::{RequestSource, RollbackTarget, TrustedPrincipal, WorkloadIdentity};
+use opc_config_bus::{
+    CommitWrite, EncryptingManagedDatastore, ManagedDatastore, StoreErrorCode, StoredConfig,
+    StoredRequestFingerprint, StoredRequestMode,
+};
+use opc_config_model::{
+    ApplyPlan, ConfigOperation, IdempotencyKey, RequestId, RequestSource, RollbackTarget,
+    TransportType, TrustedPrincipal, WorkloadIdentity, YangPath,
+};
 use opc_key::{
     KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing,
     AES_256_GCM_SIV_KEY_LEN,
@@ -23,6 +29,9 @@ const SECOND_KEY_MATERIAL: [u8; AES_256_GCM_SIV_KEY_LEN] = [0xD2; 32];
 const AUDIT_KEY_MATERIAL: [u8; 32] = [0x55; 32];
 const PROVIDER_ENDPOINT_CANARY: &[u8] = b"hkms+unix:///provider-credential-must-not-persist";
 const OPAQUE_HANDLE_CANARY: &[u8] = b"HKMS-OPAQUE-PROVIDER-HANDLE-MUST-NOT-PERSIST";
+const RAW_IDEMPOTENCY_CANARY: &[u8] = b"RAW-IDEMPOTENCY-KEY-MUST-NOT-REACH-RAFT";
+const REPLAY_FINGERPRINT_CANARY: &[u8] = b"replay-fingerprint-must-not-reach-raft";
+const REQUEST_ID_CANARY: &[u8] = b"f7a35c21-9c72-4e9b-83f8-c1453d205f92";
 
 struct CountingKeyProvider {
     inner: MemoryKeyProvider,
@@ -91,6 +100,9 @@ fn assert_forbidden_bytes_absent(location: &str, bytes: &[u8]) {
         ("raw audit key", AUDIT_KEY_MATERIAL.as_slice()),
         ("provider endpoint", PROVIDER_ENDPOINT_CANARY),
         ("opaque provider handle", OPAQUE_HANDLE_CANARY),
+        ("raw idempotency key", RAW_IDEMPOTENCY_CANARY),
+        ("request fingerprint", REPLAY_FINGERPRINT_CANARY),
+        ("request ID", REQUEST_ID_CANARY),
     ] {
         assert!(
             !bytes
@@ -179,6 +191,25 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
     let encrypted = EncryptingManagedDatastore::new(raw.clone(), provider.clone());
 
     let first_tx = TxId::new();
+    let idempotency_key =
+        IdempotencyKey::new(String::from_utf8_lossy(RAW_IDEMPOTENCY_CANARY).into_owned())
+            .expect("idempotency key");
+    let fingerprint_path = YangPath::new(format!(
+        "/amf/{}",
+        String::from_utf8_lossy(REPLAY_FINGERPRINT_CANARY)
+    ))
+    .expect("fingerprint path");
+    let apply_plan = ApplyPlan::default_hot(vec![fingerprint_path.clone()], None);
+    let request_fingerprint = StoredRequestFingerprint {
+        operation: ConfigOperation::Replace,
+        mode: StoredRequestMode::Commit,
+        transport: TransportType::Internal,
+        changed_paths: vec![fingerprint_path],
+        base_version: Some(ConfigVersion::new(0)),
+    };
+    let request_id: RequestId = String::from_utf8_lossy(REQUEST_ID_CANARY)
+        .parse()
+        .expect("request ID");
     let mut first = StoredConfig::new(
         first_tx,
         ConfigVersion::new(1),
@@ -195,8 +226,12 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
         },
     );
     first.committed_at = opc_types::Timestamp::now_utc();
+    first.idempotency_key = Some(idempotency_key.clone());
+    first.apply_plan = Some(apply_plan.clone());
+    first.request_fingerprint = Some(request_fingerprint.clone());
+    first.request_id = Some(request_id);
     encrypted
-        .append_commit(first)
+        .append_commit_write(CommitWrite::new(first))
         .await
         .expect("first encrypted quorum commit");
     assert_eq!(
@@ -219,7 +254,7 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
     );
     second.parent_tx_id = Some(first_tx);
     encrypted
-        .append_commit(second)
+        .append_commit_write(CommitWrite::new(second))
         .await
         .expect("rotated-key quorum commit");
     assert_eq!(
@@ -296,6 +331,20 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
         "current-key unseal performs one additional lookup"
     );
 
+    let replay = encrypted
+        .load_by_idempotency_key(&idempotency_key)
+        .await
+        .expect("authoritative replay lookup")
+        .expect("replay record");
+    assert_eq!(first_tx, replay.tx_id);
+    assert_eq!(Some(idempotency_key.clone()), replay.idempotency_key);
+    assert_eq!(Some(apply_plan.clone()), replay.apply_plan);
+    assert_eq!(
+        Some(request_fingerprint.clone()),
+        replay.request_fingerprint
+    );
+    assert_eq!(Some(request_id), replay.request_id);
+
     let calls_before_maintenance = provider.call_count();
     let missing_calls_before_maintenance = missing_provider.call_count();
     let (one, two, three) = tokio::join!(
@@ -338,6 +387,23 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
         missing_provider.call_count(),
         "Openraft recovery must not consult an unrelated provider"
     );
+    let restarted_raw = Arc::new(PersistDatastore::<AmfConfig, _>::new(Arc::new(
+        restarted.stores[0].clone(),
+    )));
+    let restarted_encrypted = EncryptingManagedDatastore::new(restarted_raw, Arc::clone(&provider));
+    let restarted_replay = restarted_encrypted
+        .load_by_idempotency_key(&idempotency_key)
+        .await
+        .expect("restarted authoritative replay lookup")
+        .expect("restarted replay record");
+    assert_eq!(first_tx, restarted_replay.tx_id);
+    assert_eq!(Some(idempotency_key), restarted_replay.idempotency_key);
+    assert_eq!(Some(apply_plan), restarted_replay.apply_plan);
+    assert_eq!(
+        Some(request_fingerprint),
+        restarted_replay.request_fingerprint
+    );
+    assert_eq!(Some(request_id), restarted_replay.request_id);
     assert_live_artifacts_forbidden_absent(temp.path(), &restarted);
     restarted.shutdown().await;
     drop(restarted);

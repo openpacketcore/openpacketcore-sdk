@@ -133,5 +133,5 @@ pub use security_policy::{
 };
 pub use types::{
     extract_tenant, redact_entry, AttestedConfigCommit, AuditKey, AuditOpType, AuditRecord,
-    CommitRecord, CommitSource, RollbackTarget, StoredConfig,
+    CommitRecord, CommitSource, ConfirmedCommitResolution, RollbackTarget, StoredConfig,
 };

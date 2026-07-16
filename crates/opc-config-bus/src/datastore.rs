@@ -11,12 +11,15 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
-use opc_config_model::{IdempotencyKey, OpcConfig, RollbackTarget};
+use opc_config_model::{IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget};
 use opc_crypto::{decrypt_envelope, encrypt_attested_envelope};
 use opc_key::{ConfigAad, EnvelopeAad, KeyProvider, Zeroizing};
 use opc_types::TxId;
 
-use crate::types::{SealedConfig, StoreError, StoredConfig};
+use crate::types::{
+    CommitWrite, ConfirmedCommitResolution, SealedConfig, StoreError, StoredConfig,
+    StoredRequestFingerprint,
+};
 
 const CONFIG_STORE_KIND: &str = "running";
 const CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE: &str = "config envelope serialization failed";
@@ -25,13 +28,49 @@ const CONFIG_ENVELOPE_DECRYPT_FAILED_MESSAGE: &str = "config envelope decryption
 const CONFIG_ENVELOPE_MISSING_BLOB_MESSAGE: &str = "config envelope ciphertext is missing";
 const CONFIG_ENVELOPE_AAD_FAILED_MESSAGE: &str = "config envelope AAD construction failed";
 const RESTORE_SCHEMA_MISMATCH_MESSAGE: &str = "stored running config schema digest mismatch";
+const CONFIG_PLAINTEXT_V2_MAGIC: &[u8] = b"\x89OPCCFG\x02\r\n\x1a\n";
+const IDEMPOTENCY_LOOKUP_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/config-bus/idempotency-lookup/v1\0";
+const REQUEST_LOOKUP_DIGEST_DOMAIN: &[u8] = b"openpacketcore/config-bus/request-lookup/v1\0";
+const REPLAY_LOOKUP_BINDING_FAILED_MESSAGE: &str = "config envelope replay lookup binding mismatch";
+
+#[derive(Serialize)]
+struct ConfigPlaintextV2Ref<'a, C> {
+    config: &'a C,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<RequestSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a IdempotencyKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apply_plan: Option<&'a opc_config_model::ApplyPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_fingerprint: Option<&'a StoredRequestFingerprint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<opc_config_model::RequestId>,
+}
+
+#[derive(serde::Deserialize)]
+struct ConfigPlaintextV2<C> {
+    config: C,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<RequestSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<IdempotencyKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    apply_plan: Option<opc_config_model::ApplyPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_fingerprint: Option<StoredRequestFingerprint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<opc_config_model::RequestId>,
+}
 
 /// Durable backend contract consumed by the commit worker.
 ///
-/// The bus is the single logical writer: implementations may assume calls are
-/// not raced by other writers, but every mutation must be atomic and durable
-/// before returning `Ok` — a commit the worker reports as persisted must be
-/// visible after a crash, and a failed append must leave no partial record.
+/// A process has one logical commit worker, but HA leaders can race across a
+/// failover boundary. Implementations therefore must compare the expected
+/// durable head at apply time and make every mutation atomic and durable before
+/// returning `Ok` — a commit the worker reports as persisted must be visible
+/// after a crash, and a definite failed append must leave no partial record.
 #[async_trait]
 pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
     /// Loads the highest-version record, or `None` for an empty store (which
@@ -48,19 +87,73 @@ pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
         &self,
         idempotency_key: &IdempotencyKey,
     ) -> Result<Option<StoredConfig<C>>, StoreError>;
-    /// Durably appends a commit record. Must be all-or-nothing and must
-    /// reject duplicate transaction ids and duplicate versions so history
-    /// stays a strict sequence. Records arrive with `recovery_required` set;
-    /// the worker clears it only after snapshot publication.
-    async fn append_commit(&self, commit: StoredConfig<C>) -> Result<(), StoreError>;
+    /// Compatibility lookup for records written before encrypting stores
+    /// replaced the caller's raw idempotency key with a digest-only index.
+    /// New persistence adapters that never stored raw keys override this with
+    /// `Ok(None)`; the default preserves legacy in-memory/custom stores.
+    #[doc(hidden)]
+    async fn load_by_legacy_idempotency_key(
+        &self,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        self.load_by_idempotency_key(idempotency_key).await
+    }
+    /// Looks up a durable record by its original request identifier. This is
+    /// the reconciliation path for an `OutcomeUnknown` write whose caller did
+    /// not supply an idempotency key.
+    ///
+    /// The default fails closed; stores that cannot perform an authoritative
+    /// lookup must not guess from only the latest record.
+    async fn load_by_request_id(
+        &self,
+        _request_id: RequestId,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        Err(StoreError::unavailable(
+            "authoritative config request lookup is unsupported",
+        ))
+    }
+    /// Durably appends an ordinary commit record.
+    ///
+    /// This is the pre-atomic-extension API retained for source compatibility.
+    /// The config bus itself uses [`ManagedDatastore::append_commit_write`];
+    /// production backends must override that method so compare-and-append and
+    /// commit-confirmed resolution cannot be split. Built-in backends route
+    /// this legacy entry point through their atomic implementation.
+    async fn append_commit(&self, commit: StoredConfig<C>) -> Result<(), StoreError> {
+        self.append_commit_write(CommitWrite::new(commit)).await
+    }
+    /// Durably applies one compare-and-append write. The backend must compare
+    /// [`CommitWrite::expected_current_tx_id`] with its applied latest record,
+    /// append the successor, and apply any confirmed-commit resolution as one
+    /// indivisible state-machine operation. It must report
+    /// [`crate::StoreErrorCode::OutcomeUnknown`] whenever the write may have
+    /// committed but its acknowledgement was lost; every other returned error
+    /// guarantees that no part of the write applied.
+    ///
+    /// The default fails closed so existing external datastore implementations
+    /// continue to compile but cannot accidentally provide non-atomic HA
+    /// semantics. Such implementations must explicitly add this method before
+    /// they can serve writes from the updated config bus.
+    async fn append_commit_write(&self, _commit: CommitWrite<C>) -> Result<(), StoreError> {
+        Err(StoreError::unavailable(
+            "atomic config compare-and-append is unsupported",
+        ))
+    }
     /// Durably clears the commit-fencing marker on `tx_id` after the snapshot
     /// swap. If this fails the bus fences itself, because a restart would
     /// otherwise refuse to republish the record.
     async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), StoreError>;
-    /// Durably clears the commit-confirmed deadline on `tx_id`, making the
-    /// tentative commit permanent so it no longer auto-rolls back on expiry
-    /// or restart.
-    async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), StoreError>;
+    /// Legacy explicit confirmation hook retained for external datastore API
+    /// compatibility. The config bus resolves confirmation together with its
+    /// successor through [`ManagedDatastore::append_commit_write`].
+    ///
+    /// The default fails closed; built-in backends retain strict support for
+    /// callers that still invoke this method directly.
+    async fn mark_confirmed(&self, _tx_id: TxId) -> Result<(), StoreError> {
+        Err(StoreError::unavailable(
+            "standalone commit confirmation is unsupported",
+        ))
+    }
 }
 
 #[async_trait]
@@ -84,8 +177,28 @@ where
         (**self).load_by_idempotency_key(idempotency_key).await
     }
 
+    async fn load_by_legacy_idempotency_key(
+        &self,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        (**self)
+            .load_by_legacy_idempotency_key(idempotency_key)
+            .await
+    }
+
+    async fn load_by_request_id(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        (**self).load_by_request_id(request_id).await
+    }
+
     async fn append_commit(&self, commit: StoredConfig<C>) -> Result<(), StoreError> {
         (**self).append_commit(commit).await
+    }
+
+    async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
+        (**self).append_commit_write(commit).await
     }
 
     async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), StoreError> {
@@ -129,7 +242,8 @@ impl<C, P: ?Sized, S: ?Sized> EncryptingManagedDatastore<C, P, S> {
     }
 
     /// Returns the wrapped backend, which only ever observes sealed records:
-    /// schema digest and commit metadata in the clear, payload as ciphertext.
+    /// schema/lifecycle and digest-only lookup metadata in the clear, while
+    /// the config and original replay metadata remain ciphertext.
     pub fn inner(&self) -> &Arc<S> {
         &self.inner
     }
@@ -158,12 +272,35 @@ where
         &self,
         mut record: StoredConfig<C>,
     ) -> Result<StoredConfig<SealedConfig<C>>, StoreError> {
-        let plaintext = Zeroizing::new(
-            serde_json::to_vec(&record.config)
-                .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?,
-        );
+        let plaintext_v2 = ConfigPlaintextV2Ref {
+            config: &record.config,
+            source: Some(record.source),
+            idempotency_key: record.idempotency_key.as_ref(),
+            apply_plan: record.apply_plan.as_ref(),
+            request_fingerprint: record.request_fingerprint.as_ref(),
+            request_id: record.request_id,
+        };
+        // Serialize directly into zeroizing storage. Wrapping a `to_vec`
+        // result only after serialization would leave both its error path and
+        // any copied intermediate allocation able to retain config and raw
+        // replay metadata in allocator memory.
+        let mut encoded = Zeroizing::new(Vec::new());
+        serde_json::to_writer(&mut *encoded, &plaintext_v2)
+            .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(
+            CONFIG_PLAINTEXT_V2_MAGIC
+                .len()
+                .saturating_add(encoded.len()),
+        ));
+        plaintext.extend_from_slice(CONFIG_PLAINTEXT_V2_MAGIC);
+        plaintext.extend_from_slice(&encoded);
         record.plaintext_digest = Some(compute_plaintext_digest(plaintext.as_slice()));
-        let aad = build_config_envelope_aad(&record, self.store_kind())?;
+        record.idempotency_key =
+            replay_lookup_digest(record.idempotency_key.as_ref(), record.request_id)?;
+        record.apply_plan = None;
+        record.request_fingerprint = None;
+        record.request_id = None;
+        let aad = build_config_envelope_aad(&record, self.store_kind(), None)?;
         let schema_digest = record.schema_digest;
         let envelope =
             encrypt_attested_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
@@ -175,7 +312,7 @@ where
 
     async fn decrypt_record(
         &self,
-        record: StoredConfig<SealedConfig<C>>,
+        mut record: StoredConfig<SealedConfig<C>>,
     ) -> Result<StoredConfig<C>, StoreError> {
         if record.encrypted_blob.is_empty() {
             let Some(config) = record.config.legacy_plaintext_config().cloned() else {
@@ -190,17 +327,55 @@ where
             return Ok(record.with_config(config));
         }
 
-        let aad = build_config_envelope_aad(&record, self.store_kind())?;
+        let aad =
+            build_config_envelope_aad(&record, self.store_kind(), record.config.aad_principal())?;
         let plaintext = decrypt_envelope(self.provider.as_ref(), &aad, &record.encrypted_blob)
             .await
             .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_DECRYPT_FAILED_MESSAGE))?;
         verify_plaintext_digest(&record, plaintext.as_slice())?;
-        let config: C = serde_json::from_slice(plaintext.as_slice())
-            .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
+        let (config, metadata) = if let Some(encoded) =
+            plaintext.as_slice().strip_prefix(CONFIG_PLAINTEXT_V2_MAGIC)
+        {
+            let plaintext: ConfigPlaintextV2<C> = serde_json::from_slice(encoded)
+                .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
+            verify_replay_lookup_binding(
+                record.idempotency_key.as_ref(),
+                plaintext.idempotency_key.as_ref(),
+                plaintext.request_id,
+            )?;
+            (
+                plaintext.config,
+                Some((
+                    plaintext.source,
+                    plaintext.idempotency_key,
+                    plaintext.apply_plan,
+                    plaintext.request_fingerprint,
+                    plaintext.request_id,
+                )),
+            )
+        } else {
+            // Records written before the v2 plaintext envelope contained only
+            // the serialized config. The binary magic above cannot prefix a
+            // valid JSON value, making this compatibility path unambiguous.
+            let config: C = serde_json::from_slice(plaintext.as_slice())
+                .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
+            (config, None)
+        };
         if config.schema_digest() != record.schema_digest {
             return Err(StoreError::restore_schema_mismatch(
                 RESTORE_SCHEMA_MISMATCH_MESSAGE,
             ));
+        }
+        if let Some((source, idempotency_key, apply_plan, request_fingerprint, request_id)) =
+            metadata
+        {
+            if let Some(source) = source {
+                record.source = source;
+            }
+            record.idempotency_key = idempotency_key;
+            record.apply_plan = apply_plan;
+            record.request_fingerprint = request_fingerprint;
+            record.request_id = request_id;
         }
         Ok(record.with_config(config))
     }
@@ -229,15 +404,61 @@ where
         &self,
         idempotency_key: &IdempotencyKey,
     ) -> Result<Option<StoredConfig<C>>, StoreError> {
-        match self.inner.load_by_idempotency_key(idempotency_key).await? {
-            Some(record) => self.decrypt_record(record).await.map(Some),
+        let lookup_digest = idempotency_lookup_digest(idempotency_key)?;
+        let encrypted = match self.inner.load_by_idempotency_key(&lookup_digest).await? {
+            Some(record) => Some(record),
+            None => {
+                self.inner
+                    .load_by_legacy_idempotency_key(idempotency_key)
+                    .await?
+            }
+        };
+        match encrypted {
+            Some(record) => {
+                let record = self.decrypt_record(record).await?;
+                if record.idempotency_key.as_ref() != Some(idempotency_key) {
+                    return Err(StoreError::crypto(REPLAY_LOOKUP_BINDING_FAILED_MESSAGE));
+                }
+                Ok(Some(record))
+            }
             None => Ok(None),
         }
     }
 
-    async fn append_commit(&self, commit: StoredConfig<C>) -> Result<(), StoreError> {
-        let record = self.encrypt_record(commit).await?;
-        self.inner.append_commit(record).await
+    async fn load_by_request_id(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        let lookup_digest = request_lookup_digest(request_id)?;
+        match self.inner.load_by_idempotency_key(&lookup_digest).await? {
+            Some(record) => {
+                let record = self.decrypt_record(record).await?;
+                if record.request_id != Some(request_id) {
+                    return Err(StoreError::crypto(REPLAY_LOOKUP_BINDING_FAILED_MESSAGE));
+                }
+                Ok(Some(record))
+            }
+            None => match self.inner.load_by_request_id(request_id).await? {
+                Some(record) => {
+                    let record = self.decrypt_record(record).await?;
+                    if record.request_id != Some(request_id) {
+                        return Err(StoreError::crypto(REPLAY_LOOKUP_BINDING_FAILED_MESSAGE));
+                    }
+                    Ok(Some(record))
+                }
+                None => Ok(None),
+            },
+        }
+    }
+
+    async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
+        let (record, resolution) = commit.into_parts();
+        let record = self.encrypt_record(record).await?;
+        let write = match resolution {
+            Some(resolution) => CommitWrite::resolving(record, resolution)?,
+            None => CommitWrite::new(record),
+        };
+        self.inner.append_commit_write(write).await
     }
 
     async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), StoreError> {
@@ -252,9 +473,13 @@ where
 fn build_config_envelope_aad<C: OpcConfig>(
     record: &StoredConfig<C>,
     store_kind: &str,
+    persisted_principal: Option<&str>,
 ) -> Result<EnvelopeAad, StoreError> {
-    let principal = serde_json::to_string(&record.principal)
-        .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
+    let principal = match persisted_principal {
+        Some(principal) => principal.to_owned(),
+        None => serde_json::to_string(&record.principal)
+            .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?,
+    };
     let metadata = ConfigAad::new(
         record.tx_id,
         record.parent_tx_id,
@@ -273,6 +498,60 @@ fn build_config_envelope_aad<C: OpcConfig>(
 
 fn compute_plaintext_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+fn idempotency_lookup_digest(
+    idempotency_key: &IdempotencyKey,
+) -> Result<IdempotencyKey, StoreError> {
+    encode_lookup_digest(
+        IDEMPOTENCY_LOOKUP_DIGEST_DOMAIN,
+        idempotency_key.as_str().as_bytes(),
+    )
+}
+
+fn request_lookup_digest(request_id: RequestId) -> Result<IdempotencyKey, StoreError> {
+    encode_lookup_digest(
+        REQUEST_LOOKUP_DIGEST_DOMAIN,
+        request_id.as_uuid().as_bytes(),
+    )
+}
+
+fn replay_lookup_digest(
+    idempotency_key: Option<&IdempotencyKey>,
+    request_id: Option<RequestId>,
+) -> Result<Option<IdempotencyKey>, StoreError> {
+    match (idempotency_key, request_id) {
+        (Some(idempotency_key), _) => idempotency_lookup_digest(idempotency_key).map(Some),
+        (None, Some(request_id)) => request_lookup_digest(request_id).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn encode_lookup_digest(domain: &[u8], value: &[u8]) -> Result<IdempotencyKey, StoreError> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(value);
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len().saturating_mul(2));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    IdempotencyKey::new(encoded)
+        .map_err(|_| StoreError::internal("replay lookup digest construction failed"))
+}
+
+fn verify_replay_lookup_binding(
+    stored_lookup_digest: Option<&IdempotencyKey>,
+    plaintext_key: Option<&IdempotencyKey>,
+    plaintext_request_id: Option<RequestId>,
+) -> Result<(), StoreError> {
+    let expected = replay_lookup_digest(plaintext_key, plaintext_request_id)?;
+    if stored_lookup_digest != expected.as_ref() {
+        return Err(StoreError::crypto(REPLAY_LOOKUP_BINDING_FAILED_MESSAGE));
+    }
+    Ok(())
 }
 
 fn verify_plaintext_digest<C: OpcConfig>(
@@ -467,7 +746,21 @@ impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
             .cloned())
     }
 
-    async fn append_commit(&self, commit: StoredConfig<C>) -> Result<(), StoreError> {
+    async fn load_by_request_id(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        let state = self.state.lock().await;
+        Ok(state
+            .history
+            .iter()
+            .rev()
+            .find(|record| record.request_id == Some(request_id))
+            .cloned())
+    }
+
+    async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
+        let (commit, resolution) = commit.into_parts();
         let mut state = self.state.lock().await;
         if state
             .history
@@ -488,6 +781,72 @@ impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
                 "duplicate config version {} rejected by in-memory store",
                 commit.version
             )));
+        }
+
+        let current_tx_id = state.latest.as_ref().map(|record| record.tx_id);
+        if current_tx_id != commit.parent_tx_id {
+            return Err(StoreError::unavailable(
+                "config write parent is not the applied latest transaction",
+            ));
+        }
+
+        if let Some(current) = state.latest.as_ref() {
+            let expected_version = current
+                .version
+                .next()
+                .ok_or_else(|| StoreError::internal("config version counter is exhausted"))?;
+            if commit.version != expected_version {
+                return Err(StoreError::internal(
+                    "config write version is not the applied successor",
+                ));
+            }
+        }
+
+        let current_is_pending = state
+            .latest
+            .as_ref()
+            .is_some_and(|record| record.confirmed_deadline.is_some());
+        let confirm_index = match (current_is_pending, resolution) {
+            (false, None) => None,
+            (true, Some(ConfirmedCommitResolution::Confirm { pending_tx_id }))
+                if Some(pending_tx_id) == current_tx_id =>
+            {
+                Some(
+                    state
+                        .history
+                        .iter()
+                        .position(|record| record.tx_id == pending_tx_id)
+                        .ok_or_else(|| {
+                            StoreError::internal(
+                                "pending config transaction is absent from history",
+                            )
+                        })?,
+                )
+            }
+            (true, Some(ConfirmedCommitResolution::Rollback { pending_tx_id }))
+                if Some(pending_tx_id) == current_tx_id =>
+            {
+                None
+            }
+            (true, None) => {
+                return Err(StoreError::unavailable(
+                    "pending confirmed commit requires an atomic decision",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(StoreError::unavailable(
+                    "confirmed commit decision is no longer current",
+                ));
+            }
+            (true, Some(_)) => {
+                return Err(StoreError::unavailable(
+                    "confirmed commit decision targets a stale transaction",
+                ));
+            }
+        };
+
+        if let Some(index) = confirm_index {
+            state.history[index].confirmed_deadline = None;
         }
         let index = state.history.len();
         if let Some(label) = commit.rollback_label.clone() {
@@ -523,23 +882,24 @@ impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
 
     async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), StoreError> {
         let mut state = self.state.lock().await;
+        let latest_is_target = state
+            .latest
+            .as_ref()
+            .is_some_and(|record| record.tx_id == tx_id && record.confirmed_deadline.is_some());
+        if !latest_is_target {
+            return Err(StoreError::unavailable(
+                "confirmed commit decision is no longer current",
+            ));
+        }
         let index = state
             .history
             .iter()
             .position(|record| record.tx_id == tx_id)
             .ok_or_else(|| {
-                StoreError::not_found(format!(
-                    "transaction {tx_id} not present in in-memory store for confirmation"
-                ))
+                StoreError::internal("current pending config transaction is absent from history")
             })?;
         state.history[index].confirmed_deadline = None;
-        if state
-            .latest
-            .as_ref()
-            .is_some_and(|record| record.tx_id == tx_id)
-        {
-            state.latest = Some(state.history[index].clone());
-        }
+        state.latest = Some(state.history[index].clone());
         Ok(())
     }
 }

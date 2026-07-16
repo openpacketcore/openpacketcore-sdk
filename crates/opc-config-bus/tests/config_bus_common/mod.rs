@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use opc_alarm::{Alarm, AlarmState, ProbableCause, Severity, SharedAlarmManager};
 pub use opc_config_bus::{
-    ConfigBus, ConfigEvent, ConfigSnapshot, DriftState, ManagedDatastore, MockManagedDatastore,
-    StoreError, StoreErrorCode, StoredConfig, SubscriberLagPolicy,
+    CommitWrite, ConfigBus, ConfigEvent, ConfigSnapshot, DriftState, ManagedDatastore,
+    MockManagedDatastore, StoreError, StoreErrorCode, StoredConfig, SubscriberLagPolicy,
 };
 pub use opc_config_model::{
     CommitErrorCode, CommitMode, CommitRequest, ConfigError, ConfigOperation, IdempotencyKey,
@@ -21,7 +21,10 @@ use std::{
     time::{Duration, Instant},
 };
 use time::OffsetDateTime;
-use tokio::{sync::Notify, time::timeout};
+use tokio::{
+    sync::{Barrier, Notify},
+    time::timeout,
+};
 
 #[derive(Clone)]
 pub struct TestConfig {
@@ -173,6 +176,7 @@ pub struct ContextBoundConfig {
     pub required_role: Option<&'static str>,
     pub required_transport: Option<TransportType>,
     pub required_source: Option<RequestSource>,
+    pub required_mode: Option<CommitMode>,
 }
 
 impl ContextBoundConfig {
@@ -182,6 +186,7 @@ impl ContextBoundConfig {
             required_role: None,
             required_transport: None,
             required_source: None,
+            required_mode: None,
         }
     }
 
@@ -194,6 +199,11 @@ impl ContextBoundConfig {
         self.required_role = Some(required_role);
         self.required_transport = Some(required_transport);
         self.required_source = Some(required_source);
+        self
+    }
+
+    pub fn expect_mode(mut self, mode: CommitMode) -> Self {
+        self.required_mode = Some(mode);
         self
     }
 }
@@ -211,6 +221,7 @@ impl OpcConfig for ContextBoundConfig {
             && self.required_role == previous.required_role
             && self.required_transport == previous.required_transport
             && self.required_source == previous.required_source
+            && self.required_mode == previous.required_mode
         {
             Ok(Vec::new())
         } else {
@@ -265,6 +276,16 @@ impl OpcConfig for ContextBoundConfig {
                     "source is not authorized for this config",
                 ));
             }
+        }
+
+        if self
+            .required_mode
+            .as_ref()
+            .is_some_and(|mode| &ctx.mode != mode)
+        {
+            return Err(ValidationError::semantics(
+                "commit mode was not preserved across restore",
+            ));
         }
 
         Ok(())
@@ -489,6 +510,147 @@ pub struct BlockingStore<C: OpcConfig> {
     pub release: Notify,
 }
 
+/// Forces two config authorities to observe an absent replay identity before
+/// either can append, reproducing the leader-handoff compare-and-append race.
+pub struct ConcurrentReplayStore<C: OpcConfig> {
+    pub inner: MockManagedDatastore<C>,
+    lookup_barrier: Barrier,
+    gated_lookups: AtomicUsize,
+    append_barrier: Barrier,
+    gated_appends: AtomicUsize,
+}
+
+impl<C: OpcConfig> ConcurrentReplayStore<C> {
+    pub fn new() -> Self {
+        Self {
+            inner: MockManagedDatastore::new(),
+            lookup_barrier: Barrier::new(2),
+            gated_lookups: AtomicUsize::new(0),
+            append_barrier: Barrier::new(2),
+            gated_appends: AtomicUsize::new(0),
+        }
+    }
+
+    pub async fn history(&self) -> Vec<StoredConfig<C>> {
+        self.inner.history().await
+    }
+
+    async fn gate_initial_lookup<T>(&self, result: T) -> T {
+        if self.gated_lookups.fetch_add(1, Ordering::AcqRel) < 2 {
+            self.lookup_barrier.wait().await;
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl<C: OpcConfig> ManagedDatastore<C> for ConcurrentReplayStore<C> {
+    async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
+        self.inner.load_latest().await
+    }
+
+    async fn load_rollback(
+        &self,
+        target: opc_config_model::RollbackTarget,
+    ) -> Result<StoredConfig<C>, StoreError> {
+        self.inner.load_rollback(target).await
+    }
+
+    async fn load_by_idempotency_key(
+        &self,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        let result = self.inner.load_by_idempotency_key(idempotency_key).await;
+        self.gate_initial_lookup(result).await
+    }
+
+    async fn load_by_request_id(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        self.inner.load_by_request_id(request_id).await
+    }
+
+    async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
+        if self.gated_appends.fetch_add(1, Ordering::AcqRel) < 2 {
+            self.append_barrier.wait().await;
+        }
+        self.inner.append_commit_write(commit).await
+    }
+
+    async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
+        self.inner.clear_recovery_required(tx_id).await
+    }
+}
+
+/// Models a competing authority winning the same logical write while the
+/// losing authority receives a definite CAS rejection and cannot read back
+/// the winner's indexed result.
+pub struct UnreadableConcurrentWinnerStore<C: OpcConfig> {
+    pub inner: MockManagedDatastore<C>,
+    keyed_lookups: AtomicUsize,
+}
+
+impl<C: OpcConfig> UnreadableConcurrentWinnerStore<C> {
+    pub fn new() -> Self {
+        Self {
+            inner: MockManagedDatastore::new(),
+            keyed_lookups: AtomicUsize::new(0),
+        }
+    }
+
+    pub async fn history(&self) -> Vec<StoredConfig<C>> {
+        self.inner.history().await
+    }
+}
+
+#[async_trait]
+impl<C: OpcConfig> ManagedDatastore<C> for UnreadableConcurrentWinnerStore<C> {
+    async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
+        self.inner.load_latest().await
+    }
+
+    async fn load_rollback(
+        &self,
+        target: opc_config_model::RollbackTarget,
+    ) -> Result<StoredConfig<C>, StoreError> {
+        self.inner.load_rollback(target).await
+    }
+
+    async fn load_by_idempotency_key(
+        &self,
+        _idempotency_key: &IdempotencyKey,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        if self.keyed_lookups.fetch_add(1, Ordering::AcqRel) == 0 {
+            Ok(None)
+        } else {
+            Err(StoreError::unavailable(
+                "authoritative replay index is temporarily unavailable",
+            ))
+        }
+    }
+
+    async fn load_by_request_id(
+        &self,
+        _request_id: RequestId,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        Err(StoreError::unavailable(
+            "authoritative replay index is temporarily unavailable",
+        ))
+    }
+
+    async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
+        self.inner.append_commit_write(commit).await?;
+        Err(StoreError::unavailable(
+            "the competing authority won compare-and-append",
+        ))
+    }
+
+    async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
+        self.inner.clear_recovery_required(tx_id).await
+    }
+}
+
 impl<C: OpcConfig> BlockingStore<C> {
     pub fn new() -> Self {
         Self {
@@ -528,20 +690,23 @@ impl<C: OpcConfig> ManagedDatastore<C> for BlockingStore<C> {
         self.inner.load_by_idempotency_key(idempotency_key).await
     }
 
-    async fn append_commit(&self, commit: StoredConfig<C>) -> Result<(), StoreError> {
+    async fn load_by_request_id(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        self.inner.load_by_request_id(request_id).await
+    }
+
+    async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
         if self.append_count.fetch_add(1, Ordering::AcqRel) == 0 {
             self.started.notify_one();
             self.release.notified().await;
         }
-        self.inner.append_commit(commit).await
+        self.inner.append_commit_write(commit).await
     }
 
     async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
         self.inner.clear_recovery_required(tx_id).await
-    }
-
-    async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
-        self.inner.mark_confirmed(tx_id).await
     }
 }
 
@@ -589,7 +754,14 @@ impl<C: OpcConfig> ManagedDatastore<C> for BlockingAppendFailureStore<C> {
         self.inner.load_by_idempotency_key(idempotency_key).await
     }
 
-    async fn append_commit(&self, _commit: StoredConfig<C>) -> Result<(), StoreError> {
+    async fn load_by_request_id(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        self.inner.load_by_request_id(request_id).await
+    }
+
+    async fn append_commit_write(&self, _commit: CommitWrite<C>) -> Result<(), StoreError> {
         self.started.notify_one();
         self.release.notified().await;
         Err(StoreError::internal(
@@ -599,10 +771,6 @@ impl<C: OpcConfig> ManagedDatastore<C> for BlockingAppendFailureStore<C> {
 
     async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
         self.inner.clear_recovery_required(tx_id).await
-    }
-
-    async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
-        self.inner.mark_confirmed(tx_id).await
     }
 }
 
@@ -650,7 +818,7 @@ impl<C: OpcConfig> ManagedDatastore<C> for BlockingAppendPanicStore<C> {
         self.inner.load_by_idempotency_key(idempotency_key).await
     }
 
-    async fn append_commit(&self, _commit: StoredConfig<C>) -> Result<(), StoreError> {
+    async fn append_commit_write(&self, _commit: CommitWrite<C>) -> Result<(), StoreError> {
         self.started.notify_one();
         self.release.notified().await;
         panic!("panic store append crashed after caller cancellation");
@@ -658,10 +826,6 @@ impl<C: OpcConfig> ManagedDatastore<C> for BlockingAppendPanicStore<C> {
 
     async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
         self.inner.clear_recovery_required(tx_id).await
-    }
-
-    async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
-        self.inner.mark_confirmed(tx_id).await
     }
 }
 
@@ -701,17 +865,13 @@ impl<C: OpcConfig> ManagedDatastore<C> for PostAppendPanicStore<C> {
         self.inner.load_by_idempotency_key(idempotency_key).await
     }
 
-    async fn append_commit(&self, commit: StoredConfig<C>) -> Result<(), StoreError> {
-        self.inner.append_commit(commit).await?;
+    async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
+        self.inner.append_commit_write(commit).await?;
         panic!("panic store append crashed after durable write");
     }
 
     async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
         self.inner.clear_recovery_required(tx_id).await
-    }
-
-    async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
-        self.inner.mark_confirmed(tx_id).await
     }
 }
 
@@ -753,17 +913,71 @@ impl<C: OpcConfig> ManagedDatastore<C> for SlowAppendStore<C> {
         self.inner.load_by_idempotency_key(idempotency_key).await
     }
 
-    async fn append_commit(&self, commit: StoredConfig<C>) -> Result<(), StoreError> {
+    async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
         tokio::time::sleep(self.delay).await;
-        self.inner.append_commit(commit).await
+        self.inner.append_commit_write(commit).await
     }
 
     async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
         self.inner.clear_recovery_required(tx_id).await
     }
+}
 
-    async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
-        self.inner.mark_confirmed(tx_id).await
+pub struct OutcomeUnknownAfterAppendStore<C: OpcConfig> {
+    pub inner: MockManagedDatastore<C>,
+    pub append_attempts: AtomicUsize,
+}
+
+impl<C: OpcConfig> OutcomeUnknownAfterAppendStore<C> {
+    pub fn new() -> Self {
+        Self {
+            inner: MockManagedDatastore::new(),
+            append_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    pub async fn history(&self) -> Vec<StoredConfig<C>> {
+        self.inner.history().await
+    }
+}
+
+#[async_trait]
+impl<C: OpcConfig> ManagedDatastore<C> for OutcomeUnknownAfterAppendStore<C> {
+    async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
+        self.inner.load_latest().await
+    }
+
+    async fn load_rollback(
+        &self,
+        target: opc_config_model::RollbackTarget,
+    ) -> Result<StoredConfig<C>, StoreError> {
+        self.inner.load_rollback(target).await
+    }
+
+    async fn load_by_idempotency_key(
+        &self,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        self.inner.load_by_idempotency_key(idempotency_key).await
+    }
+
+    async fn load_by_request_id(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<StoredConfig<C>>, StoreError> {
+        self.inner.load_by_request_id(request_id).await
+    }
+
+    async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
+        self.append_attempts.fetch_add(1, Ordering::AcqRel);
+        self.inner.append_commit_write(commit).await?;
+        Err(StoreError::outcome_unknown(
+            "durable quorum acknowledgement was lost",
+        ))
+    }
+
+    async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), StoreError> {
+        self.inner.clear_recovery_required(tx_id).await
     }
 }
 
@@ -837,7 +1051,17 @@ impl ManagedDatastore<TestConfig> for ErrorStore {
         }
     }
 
-    async fn append_commit(&self, _commit: StoredConfig<TestConfig>) -> Result<(), StoreError> {
+    async fn load_by_request_id(
+        &self,
+        _request_id: RequestId,
+    ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+        Ok(None)
+    }
+
+    async fn append_commit_write(
+        &self,
+        _commit: CommitWrite<TestConfig>,
+    ) -> Result<(), StoreError> {
         match self.append_error {
             Some(message) => Err(StoreError::internal(message)),
             None => Ok(()),
@@ -849,10 +1073,6 @@ impl ManagedDatastore<TestConfig> for ErrorStore {
             Some(message) => Err(StoreError::internal(message)),
             None => Ok(()),
         }
-    }
-
-    async fn mark_confirmed(&self, _tx_id: opc_types::TxId) -> Result<(), StoreError> {
-        Ok(())
     }
 }
 
@@ -878,15 +1098,14 @@ impl ManagedDatastore<TestConfig> for PanicStore {
         Ok(None)
     }
 
-    async fn append_commit(&self, _commit: StoredConfig<TestConfig>) -> Result<(), StoreError> {
+    async fn append_commit_write(
+        &self,
+        _commit: CommitWrite<TestConfig>,
+    ) -> Result<(), StoreError> {
         panic!("panic store append crashed");
     }
 
     async fn clear_recovery_required(&self, _tx_id: opc_types::TxId) -> Result<(), StoreError> {
-        Ok(())
-    }
-
-    async fn mark_confirmed(&self, _tx_id: opc_types::TxId) -> Result<(), StoreError> {
         Ok(())
     }
 }

@@ -32,13 +32,12 @@ use crate::restore::{
 use crate::rollback::resolve_candidate;
 use crate::subscribers::{ConfigReceiver, SubscriberLagPolicy, SubscriberState};
 use crate::types::{
-    AtomicConfigSnapshot, AuthorityMode, ConfigChange, ConfigEvent, ConfigSnapshot, DriftState,
-    PublishedSnapshot, StoreError, StoredConfig, StoredRequestFingerprint, StoredRequestMode,
+    AtomicConfigSnapshot, AuthorityMode, CommitWrite, ConfigChange, ConfigEvent, ConfigSnapshot,
+    ConfirmedCommitResolution, DriftState, PublishedSnapshot, StoreError, StoreErrorCode,
+    StoredConfig, StoredRequestFingerprint, StoredRequestMode,
 };
 
 pub(crate) const DEFAULT_COMMIT_QUEUE_CAPACITY: usize = 32;
-pub(crate) const RECOVERY_REQUIRED_MESSAGE: &str =
-    "durable commit completed after the request deadline; recovery is required before the next write";
 const UNSUPPORTED_VALIDATE_ONLY_OPERATION_MESSAGE: &str =
     "validate-only only supports replace operations in this skeleton config bus";
 const PERSIST_FAILED_MESSAGE: &str = "durable config persistence failed";
@@ -47,10 +46,16 @@ const IDEMPOTENCY_KEY_COLLISION_MESSAGE: &str =
     "idempotency key is already bound to a different commit request";
 const WORKER_PANIC_RECOVERY_REQUIRED_MESSAGE: &str =
     "config commit worker panicked; recovery is required before the next write";
-const CONFIRM_RECONCILIATION_FAILED_MESSAGE: &str =
-    "commit was persisted but the pending commit-confirmed marker could not be cleared durably";
 const RECOVERY_RECONCILIATION_FAILED_MESSAGE: &str =
     "commit was published but the recovery marker could not be cleared durably";
+const CONCURRENT_COMMIT_RECOVERY_REQUIRED_MESSAGE: &str =
+    "durable config advanced concurrently; restore is required before the next write";
+const EXPIRY_ROLLBACK_RECOVERY_REQUIRED_MESSAGE: &str =
+    "commit-confirmed expiry rollback failed; recovery is required before the next write";
+const OUTCOME_UNKNOWN_MESSAGE: &str =
+    "durable config outcome is unknown; verify authoritative state before retrying";
+const REQUEST_ID_COLLISION_MESSAGE: &str =
+    "request id is already bound to a different commit request";
 const PENDING_CONFIRMED_UPDATE_UNSUPPORTED_MESSAGE: &str =
     "commit-confirmed update while another confirmed commit is pending is not supported";
 const STALE_BASE_VERSION_MESSAGE: &str =
@@ -65,6 +70,26 @@ const CANDIDATE_PAYLOAD_SIZE_FAILED_MESSAGE: &str =
 pub(crate) struct Submission<C: OpcConfig> {
     pub(crate) request: CommitRequest<C>,
     pub(crate) reply: oneshot::Sender<Result<CommitResult, CommitError>>,
+}
+
+enum PendingTimerUpdate {
+    Unchanged,
+    Set(Timestamp),
+    Clear,
+}
+
+struct ProcessedCommit {
+    result: CommitResult,
+    pending_timer_update: PendingTimerUpdate,
+}
+
+impl ProcessedCommit {
+    fn read_only(result: CommitResult) -> Self {
+        Self {
+            result,
+            pending_timer_update: PendingTimerUpdate::Unchanged,
+        }
+    }
 }
 
 pub(crate) struct RecoveryState {
@@ -87,14 +112,23 @@ impl RecoveryState {
             return None;
         }
 
-        self.reason
-            .lock()
-            .expect("recovery reason mutex poisoned")
-            .clone()
+        match self.reason.lock() {
+            Ok(reason) => reason.clone(),
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned config recovery-fence state");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 
     pub(crate) fn fence(&self, reason: impl Into<String>) {
-        let mut slot = self.reason.lock().expect("recovery reason mutex poisoned");
+        let mut slot = match self.reason.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned config recovery-fence state");
+                poisoned.into_inner()
+            }
+        };
         if slot.is_none() {
             *slot = Some(reason.into());
         }
@@ -142,6 +176,7 @@ pub struct ConfigBus<C: OpcConfig> {
     pub(crate) alarm_manager: SharedAlarmManager,
     pub(crate) authorizer: Arc<dyn ConfigAuthorizer>,
     pub(crate) admission_limits: Arc<CommitAdmissionLimits>,
+    pub(crate) store: Arc<dyn ManagedDatastore<C>>,
 }
 
 impl<C: OpcConfig> ConfigBus<C> {
@@ -170,7 +205,7 @@ impl<C: OpcConfig> ConfigBus<C> {
             Arc::clone(&subscribers),
             Arc::clone(&recovery),
             Arc::clone(&admission_limits),
-            store,
+            Arc::clone(&store),
             alarm_manager.clone(),
             authorizer.clone(),
             impact_classifier.clone(),
@@ -186,6 +221,7 @@ impl<C: OpcConfig> ConfigBus<C> {
             alarm_manager,
             authorizer,
             admission_limits,
+            store,
         }
     }
 
@@ -213,8 +249,10 @@ impl<C: OpcConfig> ConfigBus<C> {
     ///
     /// Admission never blocks: if the bounded queue (default capacity 32) is
     /// full the request is rejected immediately with `AdmissionRejected` so
-    /// callers can apply backpressure. While the recovery fence is raised
-    /// every request fails with `RecoveryRequired` before any side effect.
+    /// callers can apply backpressure. While the recovery fence is raised,
+    /// every new mutation fails with `RecoveryRequired`; an exact same-key
+    /// retry may still replay an already persisted durable result without a
+    /// side effect.
     /// A request is only reported successful after authorization, validation,
     /// durable append, and snapshot publication have all succeeded; failures
     /// before the durable append leave the running config untouched.
@@ -245,23 +283,33 @@ impl<C: OpcConfig> ConfigBus<C> {
             }
         };
 
-        let result = match reply_rx.await {
-            Ok(result) => result,
-            Err(_) => {
-                if sub {
-                    crate::metrics::decrement_pending_commits();
-                }
-                let err = CommitError::state_machine_fault("config commit worker dropped reply");
-                raise_commit_error(&self.alarm_manager, &err);
-                return Err(err);
-            }
-        };
+        let result =
+            await_worker_reply(reply_rx, self.recovery.as_ref(), &self.alarm_manager).await;
 
         if sub {
             crate::metrics::decrement_pending_commits();
         }
 
         result
+    }
+
+    /// Resolve an ambiguous write by its original request identifier.
+    ///
+    /// This performs an authoritative datastore read and returns the exact
+    /// persisted result metadata without exposing the config payload or
+    /// principal. Encrypting stores retain a domain-separated request digest
+    /// only when the original request had no idempotency key; callers that did
+    /// supply one resolve ambiguity by retrying that key instead.
+    pub async fn resolve_request_id(
+        &self,
+        request_id: opc_config_model::RequestId,
+    ) -> Result<Option<CommitResult>, StoreError> {
+        let Some(record) = self.store.load_by_request_id(request_id).await? else {
+            return Ok(None);
+        };
+        replay_commit_result(&record)
+            .map(Some)
+            .map_err(|_| StoreError::internal("stored request replay metadata is invalid"))
     }
 
     /// Registers a change subscriber with its own bounded queue (capacity is
@@ -303,10 +351,10 @@ impl<C: OpcConfig> ConfigBus<C> {
     }
 
     /// Reports whether the recovery fence is raised. `RecoveryRequired` means
-    /// a durable side effect could not be reconciled (post-deadline persist,
-    /// failed expiry rollback, or a worker panic): all new writes are
-    /// rejected until the bus is rebuilt from the store, while reads keep
-    /// serving the last published snapshot.
+    /// a durable side effect could not be reconciled (ambiguous append,
+    /// recovery-marker failure, failed expiry rollback, or a worker panic):
+    /// all new writes are rejected until the bus is rebuilt from the store,
+    /// while reads keep serving the last published snapshot.
     pub fn drift_state(&self) -> DriftState {
         if self.recovery.reason().is_some() {
             DriftState::RecoveryRequired
@@ -340,6 +388,15 @@ impl<C: OpcConfig> ConfigSnapshot<C> for ConfigBus<C> {
     }
 }
 
+fn pending_deadline_fire_at(deadline: &Timestamp) -> tokio::time::Instant {
+    let now = Timestamp::now_utc();
+    let remaining: std::time::Duration = (*deadline.as_offset_datetime()
+        - *now.as_offset_datetime())
+    .try_into()
+    .unwrap_or_default();
+    tokio::time::Instant::now() + remaining
+}
+
 async fn worker_loop<C: OpcConfig>(
     mut rx: mpsc::Receiver<Submission<C>>,
     snapshot: Arc<AtomicConfigSnapshot<C>>,
@@ -352,13 +409,9 @@ async fn worker_loop<C: OpcConfig>(
     impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
     initial_pending_deadline: Option<Timestamp>,
 ) {
-    let mut pending_fire_at: Option<tokio::time::Instant> = initial_pending_deadline.map(|ts| {
-        let now = Timestamp::now_utc();
-        let remaining: std::time::Duration = (*ts.as_offset_datetime() - *now.as_offset_datetime())
-            .try_into()
-            .unwrap_or_default();
-        tokio::time::Instant::now() + remaining
-    });
+    let mut pending_fire_at = initial_pending_deadline
+        .as_ref()
+        .map(pending_deadline_fire_at);
 
     loop {
         let current_fire_at = pending_fire_at;
@@ -369,10 +422,9 @@ async fn worker_loop<C: OpcConfig>(
                     break;
                 };
 
-                let req_mode = submission.request.mode.clone();
                 let has_pending = pending_fire_at.is_some();
 
-                let result = AssertUnwindSafe(process_commit(
+                let processed = AssertUnwindSafe(process_commit(
                     submission.request,
                     Arc::clone(&snapshot),
                     Arc::clone(&subscribers),
@@ -393,21 +445,31 @@ async fn worker_loop<C: OpcConfig>(
                     ))
                 });
 
-                if result.is_ok() {
-                    match req_mode {
-                        CommitMode::CommitConfirmed { timeout } => {
-                            pending_fire_at = Some(tokio::time::Instant::now() + timeout);
+                if let Ok(processed) = &processed {
+                    match &processed.pending_timer_update {
+                        PendingTimerUpdate::Unchanged => {}
+                        PendingTimerUpdate::Set(deadline) => {
+                            pending_fire_at = Some(pending_deadline_fire_at(deadline));
                         }
-                        CommitMode::Commit
-                        | CommitMode::CancelConfirmed
-                        | CommitMode::Rollback { .. } => {
+                        PendingTimerUpdate::Clear => {
                             pending_fire_at = None;
                         }
-                        _ => {}
                     }
                 }
+                let result = processed.map(|processed| processed.result);
 
-                apply_commit_alarm_outcome(&alarm_manager, &result);
+                if result.is_ok() {
+                    if let Some(reason) = recovery.reason() {
+                        raise_commit_error(
+                            &alarm_manager,
+                            &CommitError::recovery_required(reason),
+                        );
+                    } else {
+                        apply_commit_alarm_outcome(&alarm_manager, &result);
+                    }
+                } else {
+                    apply_commit_alarm_outcome(&alarm_manager, &result);
+                }
                 let _ = submission.reply.send(result);
             }
             _ = async {
@@ -424,9 +486,11 @@ async fn worker_loop<C: OpcConfig>(
                     let latest_stored = store
                         .load_latest()
                         .await
-                        .map_err(|err| {
-                            tracing::error!("failed to load latest config during expiry rollback: {:?}", err);
-                            err
+                        .inspect_err(|err| {
+                            log_automatic_store_error(
+                                "failed to load latest config during expiry rollback",
+                                err,
+                            );
                         })?
                         .ok_or_else(|| {
                             StoreError::internal("no config stored during expiry rollback")
@@ -437,9 +501,11 @@ async fn worker_loop<C: OpcConfig>(
                     let prev_stored = store
                         .load_rollback(RollbackTarget::TxId(parent_tx))
                         .await
-                        .map_err(|err| {
-                            tracing::error!("failed to load previous confirmed config during expiry rollback: {:?}", err);
-                            err
+                        .inspect_err(|err| {
+                            log_automatic_store_error(
+                                "failed to load previous confirmed config during expiry rollback",
+                                err,
+                            );
                         })?;
                     validate_publishable_stored_config(&prev_stored)?;
                     let validation_context = restore_validation_context(&prev_stored);
@@ -463,9 +529,26 @@ async fn worker_loop<C: OpcConfig>(
                     rollback_record.parent_tx_id = current_snap.tx_id;
                     rollback_record.recovery_required = true;
 
-                    store.append_commit(rollback_record).await.map_err(|err| {
-                        tracing::error!("failed to append expiry rollback commit: {:?}", err);
-                        err
+                    let pending_tx_id = current_snap.tx_id.ok_or_else(|| {
+                        StoreError::internal("pending snapshot has no transaction id")
+                    })?;
+                    if latest_stored.tx_id != pending_tx_id {
+                        return Err(StoreError::unavailable(
+                            "pending durable transaction changed before rollback",
+                        ));
+                    }
+                    let rollback_write = CommitWrite::resolving(
+                        rollback_record,
+                        ConfirmedCommitResolution::Rollback { pending_tx_id },
+                    )?;
+                    store
+                        .append_commit_write(rollback_write)
+                        .await
+                        .inspect_err(|err| {
+                        log_automatic_store_error(
+                            "failed to append expiry rollback commit",
+                            err,
+                        );
                     })?;
 
                     let previous = Arc::clone(&current_snap.config);
@@ -474,7 +557,8 @@ async fn worker_loop<C: OpcConfig>(
                         previous,
                         RequestId::new(),
                     ).await.map_err(|err| {
-                        tracing::error!("failed to compute deltas for expiry rollback: {:?}", err);
+                        drop(err);
+                        tracing::error!("failed to compute deltas for expiry rollback");
                         StoreError::internal("failed to compute deltas for expiry rollback")
                     })?;
 
@@ -491,31 +575,49 @@ async fn worker_loop<C: OpcConfig>(
 
                     fanout(&subscribers, change);
 
-                    store.clear_recovery_required(rollback_tx_id).await.map_err(|err| {
-                        tracing::error!("failed to clear recovery required on expiry rollback commit: {:?}", err);
-                        err
-                    })?;
+                    let marker_clear_error = store
+                        .clear_recovery_required(rollback_tx_id)
+                        .await
+                        .err();
+                    if let Some(err) = marker_clear_error.as_ref() {
+                            log_automatic_store_error(
+                                "failed to clear recovery required on expiry rollback commit",
+                                err,
+                            );
+                    }
 
-                    Ok::<(), StoreError>(())
+                    Ok::<Option<StoreError>, StoreError>(marker_clear_error)
                 }.await;
 
                 pending_fire_at = None;
 
-                if let Err(err) = rollback_res {
-                    crate::metrics::record_rollback_failure();
-                    tracing::error!("expiry rollback failed: {:?}", err);
-                    recovery.fence(format!("commit-confirmed expiry rollback failed: {err:?}"));
+                match rollback_res {
+                    Err(err) => {
+                        crate::metrics::record_rollback_failure();
+                        log_automatic_store_error("expiry rollback failed", &err);
+                        recovery.fence(EXPIRY_ROLLBACK_RECOVERY_REQUIRED_MESSAGE);
 
-                    raise_config_error_alarm(
-                        &alarm_manager,
-                        CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
-                        "rollback_failed",
-                        "rollback_failed",
-                        Severity::Major,
-                        ProbableCause::StorageCorruption,
-                    );
-                } else {
-                    crate::metrics::record_rollback_success();
+                        raise_config_error_alarm(
+                            &alarm_manager,
+                            CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
+                            "rollback_failed",
+                            "rollback_failed",
+                            Severity::Major,
+                            ProbableCause::StorageCorruption,
+                        );
+                    }
+                    Ok(marker_clear_error) => {
+                        crate::metrics::record_rollback_success();
+                        if marker_clear_error.is_some() {
+                            recovery.fence(RECOVERY_RECONCILIATION_FAILED_MESSAGE);
+                            raise_commit_error(
+                                &alarm_manager,
+                                &CommitError::recovery_required(
+                                    RECOVERY_RECONCILIATION_FAILED_MESSAGE,
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -532,9 +634,19 @@ async fn process_commit<C: OpcConfig>(
     authorizer: &dyn ConfigAuthorizer,
     impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
     has_pending: bool,
-) -> Result<CommitResult, CommitError> {
+) -> Result<ProcessedCommit, CommitError> {
     if let Some(reason) = recovery.reason() {
-        return Err(CommitError::recovery_required(reason));
+        let can_attempt_durable_replay = request.idempotency_key.is_some()
+            && matches!(
+                request.mode,
+                CommitMode::CommitConfirmed { .. }
+                    | CommitMode::Commit
+                    | CommitMode::CancelConfirmed
+                    | CommitMode::Rollback { .. }
+            );
+        if !can_attempt_durable_replay {
+            return Err(CommitError::recovery_required(reason));
+        }
     }
 
     ensure_deadline(request.deadline)?;
@@ -546,13 +658,6 @@ async fn process_commit<C: OpcConfig>(
             "commit-confirmed requires a durable rollback parent",
         ));
     }
-    if matches!(request.mode, CommitMode::CommitConfirmed { .. }) && has_pending {
-        return Err(CommitError::new(
-            CommitErrorCode::AdmissionRejected,
-            PENDING_CONFIRMED_UPDATE_UNSUPPORTED_MESSAGE,
-        ));
-    }
-
     let tx_id = TxId::new();
     let validation_context = ValidationContext {
         request_id: request.request_id,
@@ -597,14 +702,14 @@ async fn process_commit<C: OpcConfig>(
             .await?;
 
             ensure_deadline(request.deadline)?;
-            Ok(CommitResult {
+            Ok(ProcessedCommit::read_only(CommitResult {
                 tx_id,
                 base_version: current.version,
                 new_version: None,
                 status: CommitStatus::Validated,
                 changed_paths,
                 apply_plan: Some(apply_plan),
-            })
+            }))
         }
         CommitMode::CommitConfirmed { .. }
         | CommitMode::Commit
@@ -645,7 +750,7 @@ async fn process_commit<C: OpcConfig>(
                             })?;
                         authorize_request(&request, current.version, replay_paths, authorizer)
                             .await?;
-                        return replay_commit_result(&existing);
+                        return replay_commit_result(&existing).map(ProcessedCommit::read_only);
                     }
 
                     return Err(CommitError::new(
@@ -655,7 +760,27 @@ async fn process_commit<C: OpcConfig>(
                 }
             }
 
+            // A fenced bus may answer only an exact persisted replay above.
+            // Missing and colliding keys must never pass into validation or a
+            // new durable mutation, and a fence raised during lookup must be
+            // observed before the new-write path.
+            if let Some(reason) = recovery.reason() {
+                return Err(CommitError::recovery_required(reason));
+            }
+
+            // A byte-for-byte retry of the request that created the pending
+            // commit is resolved above before this new-write guard. Without
+            // that ordering, a lost acknowledgement would make the original
+            // commit-confirmed result permanently unrecoverable.
+            if matches!(request.mode, CommitMode::CommitConfirmed { .. }) && has_pending {
+                return Err(CommitError::new(
+                    CommitErrorCode::AdmissionRejected,
+                    PENDING_CONFIRMED_UPDATE_UNSUPPORTED_MESSAGE,
+                ));
+            }
+
             ensure_candidate_base_version(&request, current.version)?;
+            let candidate_was_supplied = request.candidate.is_some();
 
             let apply_start = std::time::Instant::now();
             let previous = Arc::clone(&current.config);
@@ -716,8 +841,19 @@ async fn process_commit<C: OpcConfig>(
                     "running config version counter is exhausted",
                 )
             })?;
-            let request_fingerprint =
-                persisted_request_fingerprint(&request, changed_paths.clone(), current.version);
+            let request_fingerprint = persisted_request_fingerprint(
+                &request,
+                candidate_was_supplied,
+                changed_paths.clone(),
+                current.version,
+            );
+            let reconciliation_candidate = candidate_was_supplied.then(|| candidate.clone());
+            let confirmed_deadline = match &request.mode {
+                CommitMode::CommitConfirmed { timeout } => Some(Timestamp::from_offset_datetime(
+                    time::OffsetDateTime::now_utc() + *timeout,
+                )),
+                _ => None,
+            };
 
             let mut record = StoredConfig::new(
                 tx_id,
@@ -729,34 +865,89 @@ async fn process_commit<C: OpcConfig>(
             record.parent_tx_id = current.tx_id;
             record.request_fingerprint = request_fingerprint;
             record.request_id = Some(request.request_id);
-            record.idempotency_key = request.idempotency_key;
+            record.idempotency_key = request.idempotency_key.clone();
             record.apply_plan = apply_plan.clone();
             record.recovery_required = true;
+            record.confirmed_deadline = confirmed_deadline;
 
-            if let CommitMode::CommitConfirmed { timeout } = &request.mode {
-                let deadline = time::OffsetDateTime::now_utc() + *timeout;
-                record.confirmed_deadline = Some(Timestamp::from_offset_datetime(deadline));
-            }
+            let resolution = if has_pending {
+                let pending_tx_id = current.tx_id.ok_or_else(|| {
+                    CommitError::state_machine_fault(
+                        "pending commit-confirmed snapshot has no transaction id",
+                    )
+                })?;
+                match &request.mode {
+                    CommitMode::Commit => {
+                        Some(ConfirmedCommitResolution::Confirm { pending_tx_id })
+                    }
+                    CommitMode::CancelConfirmed | CommitMode::Rollback { .. } => {
+                        Some(ConfirmedCommitResolution::Rollback { pending_tx_id })
+                    }
+                    CommitMode::ValidateOnly | CommitMode::CommitConfirmed { .. } => None,
+                }
+            } else {
+                None
+            };
+            let write = match resolution {
+                Some(resolution) => CommitWrite::resolving(record, resolution).map_err(|_| {
+                    CommitError::state_machine_fault("invalid durable commit write")
+                })?,
+                None => CommitWrite::new(record),
+            };
 
             let persist_start = std::time::Instant::now();
-            store.append_commit(record).await.map_err(|err| {
-                log_store_error("append_commit failed", request.request_id, &err);
-                CommitError::persist_failed(PERSIST_FAILED_MESSAGE)
-            })?;
-
-            if Instant::now() > request.deadline {
-                recovery.fence(RECOVERY_REQUIRED_MESSAGE);
-                return Err(CommitError::recovery_required(RECOVERY_REQUIRED_MESSAGE));
-            }
-
-            if has_pending && matches!(request.mode, CommitMode::Commit) {
-                if let Some(pending_tx) = current.tx_id {
-                    store.mark_confirmed(pending_tx).await.map_err(|err| {
-                        log_store_error("mark_confirmed failed", request.request_id, &err);
-                        recovery.fence(CONFIRM_RECONCILIATION_FAILED_MESSAGE);
-                        CommitError::recovery_required(CONFIRM_RECONCILIATION_FAILED_MESSAGE)
-                    })?;
+            match AssertUnwindSafe(store.append_commit_write(write))
+                .catch_unwind()
+                .await
+            {
+                Err(panic_payload) => {
+                    drop(panic_payload);
+                    tracing::error!(
+                        request_id = %request.request_id,
+                        "managed datastore panicked during append; durable outcome is unknown"
+                    );
+                    recovery.fence(OUTCOME_UNKNOWN_MESSAGE);
+                    return Err(CommitError::outcome_unknown(OUTCOME_UNKNOWN_MESSAGE));
                 }
+                Ok(Err(err)) => {
+                    log_store_error("append_commit failed", request.request_id, &err);
+                    if err.code == StoreErrorCode::OutcomeUnknown {
+                        recovery.fence(OUTCOME_UNKNOWN_MESSAGE);
+                        return Err(CommitError::outcome_unknown(OUTCOME_UNKNOWN_MESSAGE));
+                    }
+
+                    // A leadership handoff can let two workers both miss the
+                    // replay index before one wins the compare-and-append.
+                    // Re-read the authoritative index after a definite
+                    // rejection so the loser reports the committed logical
+                    // request, rather than a false PersistFailed result.
+                    request.candidate = reconciliation_candidate;
+                    match load_reconciliation_record(store, &request).await {
+                        Ok(Some(existing)) => {
+                            if request_matches_stored_fingerprint(&request, &existing)? {
+                                recovery.fence(CONCURRENT_COMMIT_RECOVERY_REQUIRED_MESSAGE);
+                                return replay_commit_result(&existing)
+                                    .map(ProcessedCommit::read_only);
+                            }
+                            return Err(CommitError::new(
+                                CommitErrorCode::AdmissionRejected,
+                                replay_collision_message(&request),
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(lookup_error) => {
+                            log_store_error(
+                                "post-append reconciliation lookup failed",
+                                request.request_id,
+                                &lookup_error,
+                            );
+                            recovery.fence(OUTCOME_UNKNOWN_MESSAGE);
+                            return Err(CommitError::outcome_unknown(OUTCOME_UNKNOWN_MESSAGE));
+                        }
+                    }
+                    return Err(CommitError::persist_failed(PERSIST_FAILED_MESSAGE));
+                }
+                Ok(Ok(())) => {}
             }
 
             let current_config = Arc::new(candidate);
@@ -771,18 +962,31 @@ async fn process_commit<C: OpcConfig>(
 
             snapshot.publish(Some(tx_id), new_version, Arc::clone(&current_config));
 
-            store.clear_recovery_required(tx_id).await.map_err(|err| {
-                log_store_error("clear_recovery_required failed", request.request_id, &err);
-                recovery.fence(RECOVERY_RECONCILIATION_FAILED_MESSAGE);
-                CommitError::recovery_required(RECOVERY_RECONCILIATION_FAILED_MESSAGE)
-            })?;
+            match AssertUnwindSafe(store.clear_recovery_required(tx_id))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    log_store_error("clear_recovery_required failed", request.request_id, &err);
+                    recovery.fence(RECOVERY_RECONCILIATION_FAILED_MESSAGE);
+                }
+                Err(panic_payload) => {
+                    drop(panic_payload);
+                    tracing::error!(
+                        request_id = %request.request_id,
+                        "managed datastore panicked while clearing the recovery marker"
+                    );
+                    recovery.fence(RECOVERY_RECONCILIATION_FAILED_MESSAGE);
+                }
+            }
             crate::metrics::observe_persist_latency(persist_start.elapsed().as_secs_f64());
 
             let notify_start = std::time::Instant::now();
             fanout(&subscribers, change);
             crate::metrics::observe_notify_latency(notify_start.elapsed().as_secs_f64());
 
-            let status = match request.mode {
+            let status = match &request.mode {
                 CommitMode::Commit => CommitStatus::Committed,
                 CommitMode::CommitConfirmed { .. } => CommitStatus::CommitConfirmedPending,
                 CommitMode::CancelConfirmed | CommitMode::Rollback { .. } => {
@@ -793,13 +997,19 @@ async fn process_commit<C: OpcConfig>(
                 }
             };
 
-            Ok(CommitResult {
-                tx_id,
-                base_version: current.version,
-                new_version: Some(new_version),
-                status,
-                changed_paths,
-                apply_plan,
+            Ok(ProcessedCommit {
+                result: CommitResult {
+                    tx_id,
+                    base_version: current.version,
+                    new_version: Some(new_version),
+                    status,
+                    changed_paths,
+                    apply_plan,
+                },
+                pending_timer_update: match confirmed_deadline {
+                    Some(deadline) => PendingTimerUpdate::Set(deadline),
+                    None => PendingTimerUpdate::Clear,
+                },
             })
         }
     }
@@ -887,27 +1097,42 @@ async fn authorize_request<C: OpcConfig>(
         .map_err(|_auth_err| CommitError::authorization_denied("authorization denied"))
 }
 
+async fn load_reconciliation_record<C: OpcConfig>(
+    store: &dyn ManagedDatastore<C>,
+    request: &CommitRequest<C>,
+) -> Result<Option<StoredConfig<C>>, StoreError> {
+    match request.idempotency_key.as_ref() {
+        Some(idempotency_key) => store.load_by_idempotency_key(idempotency_key).await,
+        None => store.load_by_request_id(request.request_id).await,
+    }
+}
+
+fn replay_collision_message<C: OpcConfig>(request: &CommitRequest<C>) -> &'static str {
+    if request.idempotency_key.is_some() {
+        IDEMPOTENCY_KEY_COLLISION_MESSAGE
+    } else {
+        REQUEST_ID_COLLISION_MESSAGE
+    }
+}
+
 fn replay_commit_result<C: OpcConfig>(
     stored: &StoredConfig<C>,
 ) -> Result<CommitResult, CommitError> {
-    let status = match stored
-        .request_fingerprint
-        .as_ref()
-        .map(|fingerprint| &fingerprint.mode)
-    {
-        Some(StoredRequestMode::Commit) => CommitStatus::Committed,
-        Some(StoredRequestMode::Rollback { .. }) => CommitStatus::RollbackApplied,
-        None => {
-            return Err(CommitError::state_machine_fault(
-                "idempotent replay requires a persisted request fingerprint",
-            ));
+    let fingerprint = stored.request_fingerprint.as_ref().ok_or_else(|| {
+        CommitError::state_machine_fault(
+            "request reconciliation requires a persisted request fingerprint",
+        )
+    })?;
+    let status = match &fingerprint.mode {
+        StoredRequestMode::Commit | StoredRequestMode::ConfirmPending => CommitStatus::Committed,
+        StoredRequestMode::CommitConfirmed { .. } => CommitStatus::CommitConfirmedPending,
+        StoredRequestMode::CancelConfirmed | StoredRequestMode::Rollback { .. } => {
+            CommitStatus::RollbackApplied
         }
     };
 
-    let base_version = stored
-        .request_fingerprint
-        .as_ref()
-        .and_then(|fp| fp.base_version)
+    let base_version = fingerprint
+        .base_version
         .unwrap_or_else(|| ConfigVersion::new(stored.version.get().saturating_sub(1)));
 
     Ok(CommitResult {
@@ -915,31 +1140,28 @@ fn replay_commit_result<C: OpcConfig>(
         base_version,
         new_version: Some(stored.version),
         status,
-        changed_paths: stored
-            .request_fingerprint
-            .as_ref()
-            .expect("checked above")
-            .changed_paths
-            .clone(),
+        changed_paths: fingerprint.changed_paths.clone(),
         apply_plan: stored.apply_plan.clone(),
     })
 }
 
 fn persisted_request_fingerprint<C: OpcConfig>(
     request: &CommitRequest<C>,
+    candidate_was_supplied: bool,
     changed_paths: Vec<YangPath>,
     base_version: ConfigVersion,
 ) -> Option<StoredRequestFingerprint> {
     let mode = match &request.mode {
+        CommitMode::Commit if !candidate_was_supplied => StoredRequestMode::ConfirmPending,
         CommitMode::Commit => StoredRequestMode::Commit,
+        CommitMode::CommitConfirmed { timeout } => {
+            StoredRequestMode::CommitConfirmed { timeout: *timeout }
+        }
+        CommitMode::CancelConfirmed => StoredRequestMode::CancelConfirmed,
         CommitMode::Rollback { target } => StoredRequestMode::Rollback {
             target: target.clone(),
         },
-        CommitMode::ValidateOnly
-        | CommitMode::CommitConfirmed { .. }
-        | CommitMode::CancelConfirmed => {
-            return None;
-        }
+        CommitMode::ValidateOnly => return None,
     };
 
     Some(StoredRequestFingerprint {
@@ -975,8 +1197,32 @@ fn request_matches_stored_fingerprint<C: OpcConfig>(
             let Some(candidate) = request.candidate.as_ref() else {
                 return Ok(false);
             };
+            if request.base_version != stored_request_base_version(stored, fingerprint) {
+                return Ok(false);
+            }
             candidate_matches_stored(candidate, &stored.config)
         }
+        (
+            CommitMode::CommitConfirmed { timeout },
+            StoredRequestMode::CommitConfirmed {
+                timeout: stored_timeout,
+            },
+        ) => {
+            if timeout != stored_timeout {
+                return Ok(false);
+            }
+            let Some(candidate) = request.candidate.as_ref() else {
+                return Ok(false);
+            };
+            if request.base_version != stored_request_base_version(stored, fingerprint) {
+                return Ok(false);
+            }
+            candidate_matches_stored(candidate, &stored.config)
+        }
+        (CommitMode::CancelConfirmed, StoredRequestMode::CancelConfirmed) => {
+            Ok(request.candidate.is_none())
+        }
+        (CommitMode::Commit, StoredRequestMode::ConfirmPending) => Ok(request.candidate.is_none()),
         (
             CommitMode::Rollback { target },
             StoredRequestMode::Rollback {
@@ -985,6 +1231,15 @@ fn request_matches_stored_fingerprint<C: OpcConfig>(
         ) => Ok(target == stored_target),
         _ => Ok(false),
     }
+}
+
+fn stored_request_base_version<C: OpcConfig>(
+    stored: &StoredConfig<C>,
+    fingerprint: &StoredRequestFingerprint,
+) -> ConfigVersion {
+    fingerprint
+        .base_version
+        .unwrap_or_else(|| ConfigVersion::new(stored.version.get().saturating_sub(1)))
 }
 
 fn principal_matches_idempotent_context(
@@ -1145,7 +1400,13 @@ fn fanout<C: OpcConfig>(
     change: ConfigChange<C>,
 ) {
     let snapshot = {
-        let mut guard = subscribers.lock().expect("subscriber list mutex poisoned");
+        let mut guard = match subscribers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned config subscriber-list state");
+                poisoned.into_inner()
+            }
+        };
         guard.retain(|subscriber| !subscriber.closed.load(Ordering::Acquire));
         guard.clone()
     };
@@ -1164,6 +1425,14 @@ fn log_store_error(operation: &str, request_id: RequestId, error: &StoreError) {
     );
 }
 
+fn log_automatic_store_error(operation: &str, error: &StoreError) {
+    tracing::error!(
+        store_error_code = %error.code,
+        store_error = %redact(&error.message),
+        "{operation}"
+    );
+}
+
 fn ensure_deadline(deadline: Instant) -> Result<(), CommitError> {
     if Instant::now() > deadline {
         Err(CommitError::deadline_exceeded(
@@ -1171,6 +1440,29 @@ fn ensure_deadline(deadline: Instant) -> Result<(), CommitError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn dropped_worker_reply_error() -> CommitError {
+    // The worker owns the durable boundary. Losing its response cannot prove
+    // whether it stopped before or after append, so this is never an ordinary
+    // state-machine failure.
+    CommitError::outcome_unknown(OUTCOME_UNKNOWN_MESSAGE)
+}
+
+async fn await_worker_reply(
+    reply_rx: oneshot::Receiver<Result<CommitResult, CommitError>>,
+    recovery: &RecoveryState,
+    alarm_manager: &SharedAlarmManager,
+) -> Result<CommitResult, CommitError> {
+    match reply_rx.await {
+        Ok(result) => result,
+        Err(_) => {
+            recovery.fence(OUTCOME_UNKNOWN_MESSAGE);
+            let error = dropped_worker_reply_error();
+            raise_commit_error(alarm_manager, &error);
+            Err(error)
+        }
     }
 }
 
@@ -1252,5 +1544,43 @@ mod tests {
         assert!(!rendered.contains(secret));
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("internal"));
+    }
+
+    #[test]
+    fn automatic_expiry_store_error_logs_are_redacted() {
+        let secret = "token=expiry-rollback-secret";
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber::new(Arc::clone(&captured));
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_automatic_store_error("expiry rollback failed", &StoreError::internal(secret));
+        });
+
+        let rendered = captured.lock().expect("capture mutex poisoned").join("\n");
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("internal"));
+    }
+
+    #[tokio::test]
+    async fn dropped_worker_reply_is_an_ambiguous_fenced_outcome() {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        drop(reply_tx);
+        let recovery = RecoveryState::default();
+        let alarms = SharedAlarmManager::default();
+
+        let error = await_worker_reply(reply_rx, &recovery, &alarms)
+            .await
+            .expect_err("a lost worker reply cannot prove the durable outcome");
+
+        assert_eq!(error.code, CommitErrorCode::OutcomeUnknown);
+        assert_eq!(error.message, OUTCOME_UNKNOWN_MESSAGE);
+        assert_eq!(recovery.reason().as_deref(), Some(OUTCOME_UNKNOWN_MESSAGE));
+        let active = alarms.active_alarms();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].alarm_type.as_str(),
+            CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE
+        );
     }
 }

@@ -41,6 +41,7 @@ opc-security-testkit = { path = "../opc-security-testkit", version = "0.2.0" }
 opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0" }
 tempfile = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

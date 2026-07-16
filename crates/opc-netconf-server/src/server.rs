@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use opc_config_bus::{ConfigChange, ConfigEvent, ConfigReceiver, SubscriberLagPolicy};
 use opc_config_model::{
-    CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource, TransportType,
-    TrustedPrincipal, ValidationContext, YangPath,
+    CommitErrorCode, CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId,
+    RequestSource, TransportType, TrustedPrincipal, ValidationContext, YangPath,
 };
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
@@ -17,7 +17,10 @@ use opc_mgmt_audit::{
 use opc_mgmt_authz::{
     AuthzError, ConfigWriteAuthorizer, ExecAuthorizer, PolicySource, ReadAction, ReadAuthorizer,
 };
-use opc_mgmt_errors::{commit_error_to_netconf, NetconfError, NetconfErrorTag, NetconfErrorType};
+use opc_mgmt_errors::{
+    commit_error_to_netconf, commit_error_to_netconf_app_tag, NetconfError, NetconfErrorTag,
+    NetconfErrorType,
+};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::ModelData;
 use opc_types::{ConfigVersion, Timestamp};
@@ -3157,16 +3160,13 @@ where
                     context.reply_attrs,
                 ))
             }
-            Err(error) => {
-                let classification = commit_error_to_netconf(error.code);
-                self.exec_failure_reply(
-                    &context,
-                    NetconfOperation::Commit,
-                    NETCONF_COMMIT_PATH,
-                    audit_failed(error.code.as_str()),
-                    rpc_error_for_netconf(classification),
-                )
-            }
+            Err(error) => self.exec_failure_reply(
+                &context,
+                NetconfOperation::Commit,
+                NETCONF_COMMIT_PATH,
+                audit_failed(error.code.as_str()),
+                rpc_error_for_commit_error(error.code),
+            ),
         }
     }
 
@@ -3324,16 +3324,13 @@ where
                     context.reply_attrs,
                 ))
             }
-            Err(error) => {
-                let classification = commit_error_to_netconf(error.code);
-                self.exec_failure_reply(
-                    &context,
-                    NetconfOperation::CancelCommit,
-                    NETCONF_CANCEL_COMMIT_PATH,
-                    audit_failed(error.code.as_str()),
-                    rpc_error_for_netconf(classification),
-                )
-            }
+            Err(error) => self.exec_failure_reply(
+                &context,
+                NetconfOperation::CancelCommit,
+                NETCONF_CANCEL_COMMIT_PATH,
+                audit_failed(error.code.as_str()),
+                rpc_error_for_commit_error(error.code),
+            ),
         }
     }
 
@@ -3717,14 +3714,11 @@ where
                 );
                 self.copy_config_success_reply(context, paths)
             }
-            Err(error) => {
-                let classification = commit_error_to_netconf(error.code);
-                self.copy_config_failure_reply_for_rpc(
-                    context,
-                    audit_failed(error.code.as_str()),
-                    rpc_error_for_netconf(classification),
-                )
-            }
+            Err(error) => self.copy_config_failure_reply_for_rpc(
+                context,
+                audit_failed(error.code.as_str()),
+                rpc_error_for_commit_error(error.code),
+            ),
         }
     }
 
@@ -4387,15 +4381,12 @@ where
                     context.reply_attrs,
                 ))
             }
-            Err(error) => {
-                let classification = commit_error_to_netconf(error.code);
-                self.edit_config_failure_reply(
-                    &context,
-                    kind,
-                    audit_failed(error.code.as_str()),
-                    rpc_error_for_netconf(classification),
-                )
-            }
+            Err(error) => self.edit_config_failure_reply(
+                &context,
+                kind,
+                audit_failed(error.code.as_str()),
+                rpc_error_for_commit_error(error.code),
+            ),
         }
     }
 
@@ -5610,6 +5601,15 @@ fn rpc_error_for_netconf(classification: NetconfError) -> RpcError {
     RpcError::new(classification, netconf_error_message(classification.tag))
 }
 
+fn rpc_error_for_commit_error(code: CommitErrorCode) -> RpcError {
+    let classification = commit_error_to_netconf(code);
+    let error = rpc_error_for_netconf(classification);
+    match commit_error_to_netconf_app_tag(code) {
+        Some(app_tag) => error.with_app_tag(app_tag),
+        None => error,
+    }
+}
+
 fn netconf_error_message(tag: NetconfErrorTag) -> &'static str {
     match tag {
         NetconfErrorTag::InUse => "in use",
@@ -5770,6 +5770,27 @@ mod tests {
     };
     use crate::testkit::NetconfSshTestKeyFixture;
     use crate::xml::WithDefaultsMode;
+
+    #[test]
+    fn outcome_unknown_commit_error_has_distinct_wire_app_tag() {
+        let outcome_unknown = rpc_error_reply_with_attrs(
+            Some("m1"),
+            &RpcReplyAttributes::default(),
+            rpc_error_for_commit_error(CommitErrorCode::OutcomeUnknown),
+        );
+        assert!(outcome_unknown.contains("<error-type>application</error-type>"));
+        assert!(outcome_unknown.contains("<error-tag>operation-failed</error-tag>"));
+        assert!(outcome_unknown.contains("<error-app-tag>outcome-unknown</error-app-tag>"));
+        assert!(!outcome_unknown.contains("backend"));
+
+        let persist_failed = rpc_error_reply_with_attrs(
+            Some("m2"),
+            &RpcReplyAttributes::default(),
+            rpc_error_for_commit_error(CommitErrorCode::PersistFailed),
+        );
+        assert!(persist_failed.contains("<error-tag>operation-failed</error-tag>"));
+        assert!(!persist_failed.contains("<error-app-tag>"));
+    }
 
     #[derive(Clone)]
     struct DemoConfig {

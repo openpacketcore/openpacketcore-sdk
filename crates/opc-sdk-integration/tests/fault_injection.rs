@@ -330,36 +330,30 @@ use std::sync::Arc;
 
 use opc_alarm::SharedAlarmManager;
 use opc_config_bus::{
-    ConfigBus, ConfigSnapshot, DriftState, ManagedDatastore, SealedConfig, StoreError, StoredConfig,
+    CommitWrite, ConfigBus, ConfigSnapshot, ConfirmedCommitResolution, DriftState,
+    ManagedDatastore, SealedConfig, StoreError, StoredConfig,
 };
 use opc_config_model::{CommitRequest, RequestId, RequestSource, TransportType, TrustedPrincipal};
-use opc_persist::{CommitRecord, ConfigStore, FaultInjectingStore, FaultType, SqliteBackend};
+use opc_persist::{
+    CommitRecord, ConfigStore, ConfirmedCommitResolution as PersistConfirmedCommitResolution,
+    FaultInjectingStore, FaultType, PersistErrorKind, SqliteBackend,
+};
 use opc_redaction::metrics::METRICS;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedMetadata {
-    principal: TrustedPrincipal,
-    idempotency_key: Option<opc_config_model::IdempotencyKey>,
-    request_id: Option<RequestId>,
-    request_fingerprint: Option<opc_config_bus::StoredRequestFingerprint>,
+    principal: String,
+    replay_lookup_digest: Option<opc_config_model::IdempotencyKey>,
     recovery_required: bool,
 }
 
 pub struct ConfigStoreAdapter<S> {
     store: S,
-    db_path: Option<PathBuf>,
-    mock_recovery_required: Arc<std::sync::Mutex<std::collections::HashMap<TxId, bool>>>,
 }
 
 impl<S> ConfigStoreAdapter<S> {
-    pub fn new(store: S, db_path: Option<PathBuf>) -> Self {
-        Self {
-            store,
-            db_path,
-            mock_recovery_required: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-        }
+    pub fn new(store: S, _db_path: Option<PathBuf>) -> Self {
+        Self { store }
     }
 }
 
@@ -384,23 +378,18 @@ where
             serde_json::from_str(&stored.record.principal).map_err(|e| {
                 StoreError::internal(format!("failed to deserialize principal metadata: {e}"))
             })?;
-
-        let mut recovery_required = meta.recovery_required;
-        if let Some(&val) = self
-            .mock_recovery_required
-            .lock()
-            .unwrap()
-            .get(&stored.record.tx_id)
-        {
-            recovery_required = val;
-        }
+        let principal = serde_json::from_str(&meta.principal).map_err(|e| {
+            StoreError::internal(format!(
+                "failed to deserialize authenticated principal: {e}"
+            ))
+        })?;
 
         Ok(Some(StoredConfig {
             tx_id: stored.record.tx_id,
             parent_tx_id: stored.record.parent_tx_id,
             version: stored.record.version,
             committed_at: stored.record.committed_at,
-            principal: meta.principal,
+            principal,
             source: match stored.record.source {
                 opc_persist::CommitSource::Gnmi => opc_config_model::RequestSource::Northbound,
                 opc_persist::CommitSource::Netconf => opc_config_model::RequestSource::Northbound,
@@ -423,13 +412,16 @@ where
                 arr.copy_from_slice(&stored.record.plaintext_digest);
                 Some(arr)
             },
-            config: SealedConfig::new(stored.record.schema_digest),
+            config: SealedConfig::from_persisted_aad_principal(
+                stored.record.schema_digest,
+                meta.principal,
+            )?,
             encrypted_blob: stored.record.encrypted_blob,
-            idempotency_key: meta.idempotency_key,
+            idempotency_key: meta.replay_lookup_digest,
             apply_plan: None,
-            request_fingerprint: meta.request_fingerprint,
-            request_id: meta.request_id,
-            recovery_required,
+            request_fingerprint: None,
+            request_id: None,
+            recovery_required: meta.recovery_required,
             confirmed_deadline: stored.record.confirmed_deadline,
             rollback_label: None,
         }))
@@ -460,23 +452,18 @@ where
             serde_json::from_str(&stored.record.principal).map_err(|e| {
                 StoreError::internal(format!("failed to deserialize principal metadata: {e}"))
             })?;
-
-        let mut recovery_required = meta.recovery_required;
-        if let Some(&val) = self
-            .mock_recovery_required
-            .lock()
-            .unwrap()
-            .get(&stored.record.tx_id)
-        {
-            recovery_required = val;
-        }
+        let principal = serde_json::from_str(&meta.principal).map_err(|e| {
+            StoreError::internal(format!(
+                "failed to deserialize authenticated principal: {e}"
+            ))
+        })?;
 
         Ok(StoredConfig {
             tx_id: stored.record.tx_id,
             parent_tx_id: stored.record.parent_tx_id,
             version: stored.record.version,
             committed_at: stored.record.committed_at,
-            principal: meta.principal,
+            principal,
             source: match stored.record.source {
                 opc_persist::CommitSource::Gnmi => opc_config_model::RequestSource::Northbound,
                 opc_persist::CommitSource::Netconf => opc_config_model::RequestSource::Northbound,
@@ -499,13 +486,16 @@ where
                 arr.copy_from_slice(&stored.record.plaintext_digest);
                 Some(arr)
             },
-            config: SealedConfig::new(stored.record.schema_digest),
+            config: SealedConfig::from_persisted_aad_principal(
+                stored.record.schema_digest,
+                meta.principal,
+            )?,
             encrypted_blob: stored.record.encrypted_blob,
-            idempotency_key: meta.idempotency_key,
+            idempotency_key: meta.replay_lookup_digest,
             apply_plan: None,
-            request_fingerprint: meta.request_fingerprint,
-            request_id: meta.request_id,
-            recovery_required,
+            request_fingerprint: None,
+            request_id: None,
+            recovery_required: meta.recovery_required,
             confirmed_deadline: stored.record.confirmed_deadline,
             rollback_label: None,
         })
@@ -533,15 +523,38 @@ where
         Ok(None)
     }
 
-    async fn append_commit(
+    async fn load_by_request_id(
         &self,
-        commit: StoredConfig<SealedConfig<opc_sdk_integration::ToyConfig>>,
+        request_id: RequestId,
+    ) -> Result<Option<StoredConfig<SealedConfig<opc_sdk_integration::ToyConfig>>>, StoreError>
+    {
+        let mut current = self.load_latest().await?;
+        while let Some(stored) = current {
+            if stored.request_id == Some(request_id) {
+                return Ok(Some(stored));
+            }
+            if let Some(parent_tx) = stored.parent_tx_id {
+                current = self
+                    .load_rollback(opc_config_model::RollbackTarget::TxId(parent_tx))
+                    .await
+                    .ok();
+            } else {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    async fn append_commit_write(
+        &self,
+        commit: CommitWrite<SealedConfig<opc_sdk_integration::ToyConfig>>,
     ) -> Result<(), StoreError> {
+        let (commit, resolution) = commit.into_parts();
+        let aad_principal = serde_json::to_string(&commit.principal)
+            .map_err(|e| StoreError::internal(e.to_string()))?;
         let principal_str = serde_json::to_string(&PersistedMetadata {
-            principal: commit.principal,
-            idempotency_key: commit.idempotency_key,
-            request_id: commit.request_id,
-            request_fingerprint: commit.request_fingerprint,
+            principal: aad_principal,
+            replay_lookup_digest: commit.idempotency_key,
             recovery_required: commit.recovery_required,
         })
         .map_err(|e| StoreError::internal(e.to_string()))?;
@@ -576,50 +589,45 @@ where
 
         let audit = vec![];
 
-        self.store
-            .append_commit(record, audit)
-            .await
-            .map_err(|e| StoreError::internal(e.to_string()))
+        let result = match resolution {
+            Some(ConfirmedCommitResolution::Confirm { pending_tx_id }) => {
+                self.store
+                    .append_commit_resolving(
+                        record,
+                        audit,
+                        PersistConfirmedCommitResolution::Confirm { pending_tx_id },
+                    )
+                    .await
+            }
+            Some(ConfirmedCommitResolution::Rollback { pending_tx_id }) => {
+                self.store
+                    .append_commit_resolving(
+                        record,
+                        audit,
+                        PersistConfirmedCommitResolution::Rollback { pending_tx_id },
+                    )
+                    .await
+            }
+            None => self.store.append_commit(record, audit).await,
+        };
+        result.map_err(|error| match error.kind() {
+            PersistErrorKind::OutcomeUnknown => {
+                StoreError::outcome_unknown("durable config acknowledgement was lost")
+            }
+            _ => StoreError::internal(error.to_string()),
+        })
     }
 
     async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), StoreError> {
-        self.mock_recovery_required
-            .lock()
-            .unwrap()
-            .insert(tx_id, false);
-        if let Some(ref path) = self.db_path {
-            let conn = rusqlite::Connection::open(path)
-                .map_err(|e| StoreError::internal(e.to_string()))?;
-            let tx_id_bytes = tx_id.as_uuid().as_bytes().to_vec();
-            let principal_str: String = conn
-                .query_row(
-                    "SELECT principal FROM config_history WHERE tx_id = ?1",
-                    [&tx_id_bytes],
-                    |row| row.get(0),
-                )
-                .map_err(|e| StoreError::internal(e.to_string()))?;
-
-            let mut meta: PersistedMetadata = serde_json::from_str(&principal_str)
-                .map_err(|e| StoreError::internal(e.to_string()))?;
-            meta.recovery_required = false;
-
-            let new_principal_str =
-                serde_json::to_string(&meta).map_err(|e| StoreError::internal(e.to_string()))?;
-
-            conn.execute(
-                "UPDATE config_history SET principal = ?1 WHERE tx_id = ?2",
-                rusqlite::params![new_principal_str, &tx_id_bytes],
-            )
-            .map_err(|e| StoreError::internal(e.to_string()))?;
-        }
-        Ok(())
-    }
-
-    async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), StoreError> {
         self.store
-            .mark_confirmed(tx_id)
+            .clear_recovery_required(tx_id)
             .await
-            .map_err(|e| StoreError::internal(e.to_string()))
+            .map_err(|error| match error.kind() {
+                PersistErrorKind::OutcomeUnknown => {
+                    StoreError::outcome_unknown("recovery-marker acknowledgement was lost")
+                }
+                _ => StoreError::internal(error.to_string()),
+            })
     }
 }
 
@@ -970,14 +978,26 @@ async fn test_fault_injection_mark_confirmed_failure() {
 
     let err_str = err.to_string();
     assert!(!err_str.contains("secret"));
+    assert_eq!(err.code, opc_config_model::CommitErrorCode::PersistFailed);
 
-    // Failure fences the bus/future writes
-    let req2 = test_commit_request("commit-2", deadline);
-    let err2 = bus.submit(req2).await.unwrap_err();
-    assert_eq!(
-        err2.code,
-        opc_config_model::CommitErrorCode::RecoveryRequired
+    // The atomic resolution failed before it committed, so the pending record
+    // remains current and the bus must not invent an outcome-unknown fence.
+    fault_store.disable_fault(FaultType::MarkConfirmedFailure);
+    let retry = CommitRequest::new(
+        RequestId::new(),
+        test_principal(),
+        TransportType::Internal,
+        RequestSource::Northbound,
+        opc_config_model::ConfigOperation::Replace,
+        opc_config_model::CommitMode::Commit,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        None,
+        vec![opc_config_model::YangPath::new("/name").unwrap()],
     );
+    bus.submit(retry).await.unwrap();
+
+    let req2 = test_commit_request("commit-2", deadline).with_base_version(bus.version());
+    bus.submit(req2).await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1025,8 +1045,10 @@ async fn test_fault_injection_recovery_restart_remains_fenced() {
         .await
         .unwrap();
 
-    // Inject MarkConfirmedFailure, then try to confirm, which fails and forces recovery_required = true
-    fault_store.enable_fault(FaultType::MarkConfirmedFailure);
+    // The append and confirmation commit durably, but the separate marker
+    // clear fails. The caller must still see success while the bus fences all
+    // subsequent writes until an operator reconciles the durable record.
+    fault_store.enable_fault(FaultType::ClearRecoveryRequiredFailure);
     let confirm_req = CommitRequest::new(
         RequestId::new(),
         test_principal(),
@@ -1038,12 +1060,20 @@ async fn test_fault_injection_recovery_restart_remains_fenced() {
         None,
         vec![opc_config_model::YangPath::new("/name").unwrap()],
     );
-    let _ = bus.submit(confirm_req).await.unwrap_err();
+    bus.submit(confirm_req).await.unwrap();
+    let fenced = bus
+        .submit(test_commit_request("commit-3", deadline).with_base_version(bus.version()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        fenced.code,
+        opc_config_model::CommitErrorCode::RecoveryRequired
+    );
 
     // Shutdown/drop the bus, then restart it.
     drop(bus);
 
-    fault_store.disable_fault(FaultType::MarkConfirmedFailure);
+    fault_store.disable_fault(FaultType::ClearRecoveryRequiredFailure);
 
     let adapter = Arc::new(ConfigStoreAdapter::new(
         fault_store.clone(),

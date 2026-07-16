@@ -24,7 +24,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::storage::ConfigConsensusStorageError;
-use super::types::CONFIG_CONSENSUS_STORAGE_VERSION;
+use super::types::{CONFIG_CONSENSUS_STORAGE_VERSION, LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION};
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusResponse, ConfigMutationFailure,
     ConfigMutationIntent, ConfigRaftTypeConfig,
@@ -2215,9 +2215,15 @@ fn deterministic_row_id(domain: &[u8], identity: &[u8]) -> i64 {
     i64::try_from(id.max(1)).expect("masked deterministic row ID fits i64")
 }
 
+type LatestConfigHeadRow = (Vec<u8>, i64, Option<String>, Option<String>);
+
 fn append_prepared_commit_sync(
     conn: &Connection,
     commit: &super::PreparedConfigCommit,
+    resolution: Option<crate::ConfirmedCommitResolution>,
+    schema_version: u16,
+    logical_time: Timestamp,
+    request_id: opc_consensus::ConsensusRequestId,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     cancellation.check_io()?;
@@ -2236,21 +2242,62 @@ fn append_prepared_commit_sync(
     if duplicate {
         return Ok(Err(ConfigMutationFailure::Conflict));
     }
-    let latest: Option<(Vec<u8>, i64)> = conn
+    let replay_lookup_digest = match crate::types::config_replay_lookup_digest(&record.principal) {
+        Ok(digest) => digest,
+        Err(_) => return Ok(Err(ConfigMutationFailure::InvalidInput)),
+    };
+    if let Some(digest) = replay_lookup_digest {
+        let duplicate: bool = conn
+            .query_row(
+                r#"SELECT EXISTS(
+                       SELECT 1 FROM config_history
+                       WHERE CASE
+                               WHEN json_valid(principal)
+                               THEN json_extract(principal, '$.replay_lookup_digest')
+                               ELSE NULL
+                             END = ?1
+                   )"#,
+                [&digest],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if duplicate {
+            return Ok(Err(ConfigMutationFailure::Conflict));
+        }
+    }
+    let latest: Option<LatestConfigHeadRow> = conn
         .query_row(
-            "SELECT tx_id, version FROM config_history ORDER BY version DESC LIMIT 1",
+            "SELECT tx_id, version, confirmed_deadline, confirmed_at FROM config_history ORDER BY version DESC LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(db_error)?;
-    match (latest, record.parent_tx_id) {
+    match (&latest, record.parent_tx_id) {
         (None, None) => {}
-        (Some((latest_tx, latest_version)), Some(parent))
+        (Some((latest_tx, latest_version, _, _)), Some(parent))
             if latest_tx.as_slice() == parent.as_uuid().as_bytes()
-                && checked_u64(latest_version)?
+                && checked_u64(*latest_version)?
                     .checked_add(1)
                     .is_some_and(|next| next == record.version.get()) => {}
+        _ => return Ok(Err(ConfigMutationFailure::Conflict)),
+    }
+    let latest_is_pending = latest
+        .as_ref()
+        .is_some_and(|(_, _, deadline, confirmed)| deadline.is_some() && confirmed.is_none());
+    match (latest_is_pending, resolution) {
+        (false, None) => {}
+        (true, None) if schema_version == LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION => {
+            // Revision 1 represented confirmation as a subsequent standalone
+            // MarkConfirmed command, so its already-committed AppendCommit
+            // must retain those historical apply semantics during upgrade.
+        }
+        (true, Some(crate::ConfirmedCommitResolution::Confirm { pending_tx_id })) => {
+            if mark_confirmed_sync(conn, pending_tx_id, logical_time, request_id, true)?.is_err() {
+                return Ok(Err(ConfigMutationFailure::Conflict));
+            }
+        }
+        (true, Some(crate::ConfirmedCommitResolution::Rollback { .. })) => {}
         _ => return Ok(Err(ConfigMutationFailure::Conflict)),
     }
     let terminal_hash = commit
@@ -2316,6 +2363,7 @@ fn mark_confirmed_sync(
     tx_id: opc_types::TxId,
     logical_time: Timestamp,
     request_id: opc_consensus::ConsensusRequestId,
+    require_current_head: bool,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     let tx_id = tx_id.as_uuid().as_bytes().as_slice();
     let principal: Option<String> = conn
@@ -2329,14 +2377,73 @@ fn mark_confirmed_sync(
     let Some(principal) = principal else {
         return Ok(Err(ConfigMutationFailure::NotFound));
     };
-    conn.execute(
-        "UPDATE config_history SET confirmed_at = ?1 WHERE tx_id = ?2",
-        params![logical_time.to_string(), tx_id],
-    )
-    .map_err(db_error)?;
+    let changed = if require_current_head {
+        conn.execute(
+            "UPDATE config_history SET confirmed_at = ?1 WHERE tx_id = ?2 AND confirmed_deadline IS NOT NULL AND confirmed_at IS NULL AND tx_id = (SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1)",
+            params![logical_time.to_string(), tx_id],
+        )
+        .map_err(db_error)?
+    } else {
+        // Revision 1 applied MarkConfirmed as an unconditional update for any
+        // existing transaction, including a non-pending or already-confirmed
+        // record. Preserve that exact durable replay behavior during upgrade.
+        conn.execute(
+            "UPDATE config_history SET confirmed_at = ?1 WHERE tx_id = ?2",
+            params![logical_time.to_string(), tx_id],
+        )
+        .map_err(db_error)?
+    };
+    if require_current_head && changed != 1 {
+        return Ok(Err(ConfigMutationFailure::Conflict));
+    }
     conn.execute(
         "INSERT INTO config_lifecycle_audit (id, tx_id, action, principal, occurred_at, details) VALUES (?1, ?2, 'MARK_CONFIRMED', ?3, ?4, 'commit confirmed')",
         params![deterministic_row_id(b"lifecycle-confirm", request_id.as_bytes()), tx_id, principal, logical_time.to_string()],
+    )
+    .map_err(db_error)?;
+    Ok(Ok(()))
+}
+
+fn clear_recovery_required_sync(
+    conn: &Connection,
+    tx_id: opc_types::TxId,
+    logical_time: Timestamp,
+    request_id: opc_consensus::ConsensusRequestId,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    let tx_id_bytes = tx_id.as_uuid().as_bytes().as_slice();
+    let principal: Option<String> = conn
+        .query_row(
+            "SELECT principal FROM config_history WHERE tx_id = ?1 AND tx_id = (SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1)",
+            [tx_id_bytes],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some(principal) = principal else {
+        return Ok(Err(ConfigMutationFailure::NotFound));
+    };
+    let encoded = match crate::types::clear_config_recovery_required(&principal) {
+        Ok(Some(encoded)) => encoded,
+        Ok(None) => return Ok(Ok(())),
+        Err(_) => return Ok(Err(ConfigMutationFailure::InvalidInput)),
+    };
+    let changed = conn
+        .execute(
+            "UPDATE config_history SET principal = ?1 WHERE tx_id = ?2 AND tx_id = (SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1)",
+            params![encoded, tx_id_bytes],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Ok(Err(ConfigMutationFailure::Conflict));
+    }
+    conn.execute(
+        "INSERT INTO config_lifecycle_audit (id, tx_id, action, principal, occurred_at, details) VALUES (?1, ?2, 'CLEAR_RECOVERY_REQUIRED', ?3, ?4, 'config recovery marker cleared')",
+        params![
+            deterministic_row_id(b"lifecycle-recovery", request_id.as_bytes()),
+            tx_id_bytes,
+            principal,
+            logical_time.to_string(),
+        ],
     )
     .map_err(db_error)?;
     Ok(Ok(()))
@@ -2403,17 +2510,42 @@ fn create_rollback_point_sync(
 fn execute_intent_sync(
     conn: &Connection,
     intent: &ConfigMutationIntent,
+    schema_version: u16,
     logical_time: Timestamp,
     request_id: opc_consensus::ConsensusRequestId,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     match intent {
-        ConfigMutationIntent::AppendCommit(commit) => {
-            append_prepared_commit_sync(conn, commit, cancellation)
+        ConfigMutationIntent::AppendCommit(commit) => append_prepared_commit_sync(
+            conn,
+            commit,
+            None,
+            schema_version,
+            logical_time,
+            request_id,
+            cancellation,
+        ),
+        ConfigMutationIntent::ResolveConfirmedAndAppend { commit, resolution } => {
+            append_prepared_commit_sync(
+                conn,
+                commit,
+                Some(*resolution),
+                schema_version,
+                logical_time,
+                request_id,
+                cancellation,
+            )
         }
-        ConfigMutationIntent::MarkConfirmed { tx_id } => {
-            mark_confirmed_sync(conn, *tx_id, logical_time, request_id)
+        ConfigMutationIntent::ClearRecoveryRequired { tx_id } => {
+            clear_recovery_required_sync(conn, *tx_id, logical_time, request_id)
         }
+        ConfigMutationIntent::MarkConfirmed { tx_id } => mark_confirmed_sync(
+            conn,
+            *tx_id,
+            logical_time,
+            request_id,
+            schema_version != LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+        ),
         ConfigMutationIntent::CreateRollbackPoint { tx_id, label } => {
             create_rollback_point_sync(conn, *tx_id, label, logical_time, request_id)
         }
@@ -2539,6 +2671,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                     let result = execute_intent_sync(
                         &tx,
                         &command.intent,
+                        command.schema_version,
                         logical_time,
                         command.request_id,
                         cancellation,
@@ -2691,10 +2824,12 @@ fn validate_sealed_state_sync(
         if key_id != envelope.key_id
             || aad.purpose() != opc_key::KeyPurpose::Config
             || aad.version() != version
+            || aad.tenant().as_str() != crate::types::extract_tenant(&principal)
             || metadata.tx_id() != &tx_id_value
             || metadata.parent_tx_id() != parent_value.as_ref()
             || metadata.committed_at() != &committed_at
-            || metadata.principal() != principal
+            || !crate::types::config_principal_metadata_is_valid(&principal)
+            || !crate::types::config_principal_matches_aad(&principal, metadata.principal())
             || metadata.schema_digest() != &schema_digest
         {
             return Err(invalid_data("config consensus state AAD metadata mismatch"));
@@ -3263,15 +3398,22 @@ pub(crate) fn read_current_snapshot_sync(
 #[cfg(test)]
 mod tests {
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
-    use opc_types::{ConfigVersion, TxId};
+    use opc_crypto::CryptoEnvelopeV1;
+    use opc_key::{
+        serialize_bound_aad, AeadAlgorithm, ConfigAad, EnvelopeAad, KeyId,
+        AES_256_GCM_SIV_NONCE_LEN,
+    };
+    use opc_types::{ConfigVersion, SchemaDigest, TenantId, TxId};
 
     use super::*;
-    use crate::consensus::types::ValidatedRollbackLabel;
+    use crate::consensus::types::LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION;
+    use crate::consensus::types::{PreparedConfigCommit, ValidatedRollbackLabel};
     use crate::consensus::{
         ConfigConsensusClusterId, ConfigConsensusCommand, ConfigConsensusConfigurationEpoch,
         ConfigConsensusConfigurationId, ConfigConsensusRequestId, ConfigMutationIntent,
         CONFIG_CONSENSUS_COMMAND_VERSION,
     };
+    use crate::types::CommitRecord;
 
     fn identity() -> ConsensusIdentity {
         ConsensusIdentity::new(
@@ -3321,16 +3463,623 @@ mod tests {
         request_id: [u8; 16],
         tx_id: TxId,
     ) -> Entry<ConfigRaftTypeConfig> {
+        mark_confirmed_entry_with_version(
+            term,
+            index,
+            request_id,
+            tx_id,
+            CONFIG_CONSENSUS_COMMAND_VERSION,
+        )
+    }
+
+    fn mark_confirmed_entry_with_version(
+        term: u64,
+        index: u64,
+        request_id: [u8; 16],
+        tx_id: TxId,
+        schema_version: u16,
+    ) -> Entry<ConfigRaftTypeConfig> {
         Entry {
             log_id: log_id_with_term(term, index),
             payload: EntryPayload::Normal(ConfigConsensusCommand {
-                schema_version: CONFIG_CONSENSUS_COMMAND_VERSION,
+                schema_version,
                 identity: identity(),
                 request_id: ConfigConsensusRequestId::from_bytes(request_id),
                 logical_time: Timestamp::now_utc(),
                 intent: ConfigMutationIntent::MarkConfirmed { tx_id },
             }),
         }
+    }
+
+    fn legacy_append_entry(
+        index: u64,
+        request_id: [u8; 16],
+        tx_id: TxId,
+        parent_tx_id: Option<TxId>,
+        version: u64,
+        confirmed_deadline: Option<Timestamp>,
+        audit_key: &AuditKey,
+    ) -> Entry<ConfigRaftTypeConfig> {
+        let committed_at =
+            Timestamp::from_str("2026-01-01T00:00:00Z").expect("fixed committed time");
+        let principal =
+            "spiffe://qualification.invalid/tenant/test/ns/test/sa/config/nf/test/instance/0"
+                .to_owned();
+        let schema_digest = SchemaDigest::from_bytes([request_id[0]; 32]);
+        let key_id = KeyId::new("legacy-replay-config-key").expect("key ID");
+        let aad = EnvelopeAad::config(
+            TenantId::from_static("test"),
+            version,
+            ConfigAad::new(
+                tx_id,
+                parent_tx_id,
+                committed_at,
+                &principal,
+                schema_digest,
+                "running",
+            )
+            .expect("config AAD"),
+        );
+        let encrypted_blob = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![request_id[0]; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag: vec![request_id[0]; opc_key::AEAD_TAG_LEN],
+        }
+        .encode()
+        .expect("config envelope");
+        let record = CommitRecord {
+            tx_id,
+            parent_tx_id,
+            version: ConfigVersion::new(version),
+            committed_at,
+            principal,
+            source: CommitSource::Gnmi,
+            schema_digest,
+            plaintext_digest: vec![request_id[0]; 32],
+            encrypted_blob,
+            rollback_point: false,
+            confirmed_deadline,
+        };
+        let prepared = PreparedConfigCommit::prepare(record, Vec::new(), audit_key)
+            .expect("prepared config commit");
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(ConfigConsensusCommand {
+                schema_version: LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity: identity(),
+                request_id: ConfigConsensusRequestId::from_bytes(request_id),
+                logical_time: committed_at,
+                intent: ConfigMutationIntent::AppendCommit(Box::new(prepared)),
+            }),
+        }
+    }
+
+    fn metadata_append_entry(
+        index: u64,
+        request_id: [u8; 16],
+        tx_id: TxId,
+        parent_tx_id: Option<TxId>,
+        version: u64,
+        replay_lookup_digest: char,
+        audit_key: &AuditKey,
+    ) -> Entry<ConfigRaftTypeConfig> {
+        let committed_at =
+            Timestamp::from_str("2026-01-01T00:00:00Z").expect("fixed committed time");
+        let aad_principal =
+            "spiffe://qualification.invalid/tenant/test/ns/test/sa/config/nf/test/instance/0";
+        let principal = serde_json::json!({
+            "principal": aad_principal,
+            "replay_lookup_digest": replay_lookup_digest.to_string().repeat(64),
+            "recovery_required": false,
+        })
+        .to_string();
+        let schema_digest = SchemaDigest::from_bytes([request_id[0]; 32]);
+        let key_id = KeyId::new("metadata-replay-config-key").expect("key ID");
+        let aad = EnvelopeAad::config(
+            TenantId::from_static("test"),
+            version,
+            ConfigAad::new(
+                tx_id,
+                parent_tx_id,
+                committed_at,
+                aad_principal,
+                schema_digest,
+                "running",
+            )
+            .expect("config AAD"),
+        );
+        let encrypted_blob = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![request_id[0]; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag: vec![request_id[0]; opc_key::AEAD_TAG_LEN],
+        }
+        .encode()
+        .expect("config envelope");
+        let record = CommitRecord {
+            tx_id,
+            parent_tx_id,
+            version: ConfigVersion::new(version),
+            committed_at,
+            principal,
+            source: CommitSource::Gnmi,
+            schema_digest,
+            plaintext_digest: vec![request_id[0]; 32],
+            encrypted_blob,
+            rollback_point: false,
+            confirmed_deadline: None,
+        };
+        let prepared = PreparedConfigCommit::prepare(record, Vec::new(), audit_key)
+            .expect("prepared config commit");
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(ConfigConsensusCommand {
+                schema_version: CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity: identity(),
+                request_id: ConfigConsensusRequestId::from_bytes(request_id),
+                logical_time: committed_at,
+                intent: ConfigMutationIntent::AppendCommit(Box::new(prepared)),
+            }),
+        }
+    }
+
+    fn sealed_record_for_exact_principal(principal: String, marker: u8) -> CommitRecord {
+        let tx_id = TxId::new();
+        let committed_at =
+            Timestamp::from_str("2026-01-01T00:00:00Z").expect("fixed committed time");
+        let schema_digest = SchemaDigest::from_bytes([marker; 32]);
+        let key_id = KeyId::new("metadata-validation-config-key").expect("key ID");
+        let tenant = TenantId::new(crate::types::extract_tenant(&principal)).expect("tenant ID");
+        let aad = EnvelopeAad::config(
+            tenant,
+            1,
+            ConfigAad::new(
+                tx_id,
+                None,
+                committed_at,
+                &principal,
+                schema_digest,
+                "running",
+            )
+            .expect("config AAD"),
+        );
+        let encrypted_blob = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![marker; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag: vec![marker; opc_key::AEAD_TAG_LEN],
+        }
+        .encode()
+        .expect("config envelope");
+        CommitRecord {
+            tx_id,
+            parent_tx_id: None,
+            version: ConfigVersion::new(1),
+            committed_at,
+            principal,
+            source: CommitSource::Gnmi,
+            schema_digest,
+            plaintext_digest: vec![marker; 32],
+            encrypted_blob,
+            rollback_point: false,
+            confirmed_deadline: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_revision_one_pending_successor_and_late_confirmation_replay() {
+        let temp = tempfile::tempdir().expect("config consensus directory");
+        let path = temp.path().join("legacy-replay.sqlite");
+        let audit_key = AuditKey::new([0xD7; 32]).expect("audit key");
+        let backend = SqliteBackend::open_with_audit_key(&path, true, 0, audit_key.clone())
+            .await
+            .expect("open config database");
+        let shared_conn = backend.conn();
+        let conn = shared_conn.lock().await;
+        initialize_schema(
+            &conn,
+            identity(),
+            &expected_members(),
+            backend.audit_key(),
+            None,
+            &Arc::new(SqliteWorkCancellation::new()),
+            None,
+        )
+        .expect("config consensus schema");
+        let pending_tx_id = TxId::new();
+        let successor_tx_id = TxId::new();
+        let membership = membership_entry();
+        let pending = legacy_append_entry(
+            1,
+            [0xD8; 16],
+            pending_tx_id,
+            None,
+            1,
+            Some(Timestamp::from_str("2026-01-01T00:05:00Z").expect("fixed confirmation deadline")),
+            backend.audit_key(),
+        );
+        let successor = legacy_append_entry(
+            2,
+            [0xD9; 16],
+            successor_tx_id,
+            Some(pending_tx_id),
+            2,
+            None,
+            backend.audit_key(),
+        );
+        let confirmation = mark_confirmed_entry_with_version(
+            1,
+            3,
+            [0xDA; 16],
+            pending_tx_id,
+            LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+        );
+        let entries = vec![membership, pending, successor, confirmation];
+        append_logs_sync(&conn, identity(), &expected_members(), &entries)
+            .expect("persist legacy revision-one log");
+        drop(conn);
+        drop(shared_conn);
+        drop(backend);
+
+        let reopened = SqliteBackend::open_with_audit_key(&path, true, 0, audit_key)
+            .await
+            .expect("reopen config database");
+        let shared_conn = reopened.conn();
+        let conn = shared_conn.lock().await;
+        initialize_schema(
+            &conn,
+            identity(),
+            &expected_members(),
+            reopened.audit_key(),
+            None,
+            &Arc::new(SqliteWorkCancellation::new()),
+            None,
+        )
+        .expect("validate reopened config consensus schema");
+        let persisted = read_log_range_sync(&conn, identity(), &expected_members(), 0, None, None)
+            .expect("read persisted legacy log");
+        assert_eq!(persisted, entries);
+        let responses = apply_entries_sync(&conn, identity(), &expected_members(), persisted)
+            .expect("replay legacy log");
+        assert!(responses.iter().all(|response| response.result.is_ok()));
+
+        let latest: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT tx_id, version FROM config_history ORDER BY version DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("latest replayed config");
+        assert_eq!(latest.0, successor_tx_id.as_uuid().as_bytes());
+        assert_eq!(latest.1, 2);
+        let confirmed_at: Option<String> = conn
+            .query_row(
+                "SELECT confirmed_at FROM config_history WHERE tx_id = ?1",
+                [pending_tx_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("pending confirmation state");
+        assert!(confirmed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn revision_one_mark_confirmed_replays_legacy_unconditional_updates() {
+        let backend = initialized_backend().await;
+        let shared_conn = backend.conn();
+        let conn = shared_conn.lock().await;
+        let audit_key = backend.audit_key();
+        let tx_id = TxId::new();
+        let entries = vec![
+            membership_entry(),
+            legacy_append_entry(1, [0xA1; 16], tx_id, None, 1, None, audit_key),
+            mark_confirmed_entry_with_version(
+                1,
+                2,
+                [0xA2; 16],
+                tx_id,
+                LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+            ),
+            mark_confirmed_entry_with_version(
+                1,
+                3,
+                [0xA3; 16],
+                tx_id,
+                LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+            ),
+        ];
+
+        let responses = apply_entries_sync(&conn, identity(), &expected_members(), entries)
+            .expect("apply revision-one confirmation history");
+        assert!(responses.iter().all(|response| response.result.is_ok()));
+        let confirmed_at: Option<String> = conn
+            .query_row(
+                "SELECT confirmed_at FROM config_history WHERE tx_id = ?1",
+                [tx_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("confirmation state");
+        assert!(confirmed_at.is_some());
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config_lifecycle_audit WHERE tx_id = ?1 AND action = 'MARK_CONFIRMED'",
+                [tx_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("legacy confirmation audit count");
+        assert_eq!(2, audit_count);
+    }
+
+    #[tokio::test]
+    async fn duplicate_replay_digest_is_a_conflict_and_later_entries_apply() {
+        let backend = initialized_backend().await;
+        let shared_conn = backend.conn();
+        let conn = shared_conn.lock().await;
+        let first_tx_id = TxId::new();
+        let successor_tx_id = TxId::new();
+        let entries = vec![
+            membership_entry(),
+            metadata_append_entry(
+                1,
+                [0xB1; 16],
+                first_tx_id,
+                None,
+                1,
+                'a',
+                backend.audit_key(),
+            ),
+            metadata_append_entry(
+                2,
+                [0xB2; 16],
+                TxId::new(),
+                Some(first_tx_id),
+                2,
+                'a',
+                backend.audit_key(),
+            ),
+            metadata_append_entry(
+                3,
+                [0xB3; 16],
+                successor_tx_id,
+                Some(first_tx_id),
+                2,
+                'b',
+                backend.audit_key(),
+            ),
+        ];
+
+        let responses = apply_entries_sync(&conn, identity(), &expected_members(), entries)
+            .expect("apply digest collision and successor");
+        assert_eq!(Ok(()), responses[1].result);
+        assert_eq!(Err(ConfigMutationFailure::Conflict), responses[2].result);
+        assert_eq!(Ok(()), responses[3].result);
+        let latest: Vec<u8> = conn
+            .query_row(
+                "SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("latest config head");
+        assert_eq!(successor_tx_id.as_uuid().as_bytes(), latest.as_slice());
+    }
+
+    #[test]
+    fn consensus_admission_rejects_wrapper_fields_without_a_principal() {
+        let principal = format!(
+            "{{\"replay_lookup_digest\":\"{}\",\"recovery_required\":true}}",
+            "a".repeat(64)
+        );
+        let record = sealed_record_for_exact_principal(principal, 0xC1);
+        let error = PreparedConfigCommit::prepare(
+            record,
+            Vec::new(),
+            &AuditKey::new([0xC2; 32]).expect("audit key"),
+        )
+        .expect_err("ambiguous metadata must not enter consensus");
+        assert!(matches!(
+            error.kind(),
+            crate::PersistErrorKind::ConstraintViolation(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn wrapper_metadata_cannot_replace_the_principal_bound_into_aad() {
+        let principal = serde_json::json!({
+            "principal": "spiffe://qualification.invalid/tenant/test/ns/test/sa/config",
+            "replay_lookup_digest": "a".repeat(64),
+            "recovery_required": false,
+        })
+        .to_string();
+        let record = sealed_record_for_exact_principal(principal, 0xC3);
+        let error = PreparedConfigCommit::prepare(
+            record.clone(),
+            Vec::new(),
+            &AuditKey::new([0xC4; 32]).expect("audit key"),
+        )
+        .expect_err("wrapper bytes must not replace the authenticated nested principal");
+        assert!(matches!(error.kind(), crate::PersistErrorKind::CorruptBlob));
+
+        let backend = initialized_backend().await;
+        let shared_conn = backend.conn();
+        let conn = shared_conn.lock().await;
+        SqliteBackend::append_commit_raw(&conn, record, Vec::new(), backend.audit_key())
+            .expect("seed externally malformed durable state");
+        assert!(validate_sealed_state_sync(
+            &conn,
+            backend.audit_key(),
+            &SqliteWorkCancellation::new(),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_ambiguous_principal_metadata_even_when_aad_matches() {
+        let malformed = [
+            format!(
+                "{{\"replay_lookup_digest\":\"{}\",\"recovery_required\":true}}",
+                "a".repeat(64)
+            ),
+            "{\"principal\":\"first\",\"principal\":\"second\",\"recovery_required\":false}"
+                .to_owned(),
+        ];
+        for (offset, principal) in malformed.into_iter().enumerate() {
+            let backend = initialized_backend().await;
+            let shared_conn = backend.conn();
+            let conn = shared_conn.lock().await;
+            let marker = u8::try_from(offset)
+                .expect("bounded fixture marker")
+                .saturating_add(0xD1);
+            let record = sealed_record_for_exact_principal(principal, marker);
+            SqliteBackend::append_commit_raw(&conn, record, Vec::new(), backend.audit_key())
+                .expect("seed externally malformed durable state");
+            assert!(validate_sealed_state_sync(
+                &conn,
+                backend.audit_key(),
+                &SqliteWorkCancellation::new(),
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_an_envelope_tenant_that_disagrees_with_its_principal() {
+        let backend = initialized_backend().await;
+        let shared_conn = backend.conn();
+        let conn = shared_conn.lock().await;
+        let tx_id = TxId::new();
+        let committed_at =
+            Timestamp::from_str("2026-01-01T00:00:00Z").expect("fixed committed time");
+        let principal =
+            "spiffe://qualification.invalid/tenant/test/ns/test/sa/config/nf/test/instance/0"
+                .to_owned();
+        let schema_digest = SchemaDigest::from_bytes([0xE1; 32]);
+        let key_id = KeyId::new("tenant-mismatch-config-key").expect("key ID");
+        let aad = EnvelopeAad::config(
+            TenantId::from_static("different-tenant"),
+            1,
+            ConfigAad::new(
+                tx_id,
+                None,
+                committed_at,
+                &principal,
+                schema_digest,
+                "running",
+            )
+            .expect("config AAD"),
+        );
+        let encrypted_blob = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![0xE2; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag: vec![0xE3; opc_key::AEAD_TAG_LEN],
+        }
+        .encode()
+        .expect("config envelope");
+        let record = CommitRecord {
+            tx_id,
+            parent_tx_id: None,
+            version: ConfigVersion::new(1),
+            committed_at,
+            principal,
+            source: CommitSource::Gnmi,
+            schema_digest,
+            plaintext_digest: vec![0xE4; 32],
+            encrypted_blob,
+            rollback_point: false,
+            confirmed_deadline: None,
+        };
+        assert!(super::super::types::validate_encrypted_record(&record).is_err());
+        SqliteBackend::append_commit_raw(&conn, record, Vec::new(), backend.audit_key())
+            .expect("seed externally malformed durable state");
+        assert!(validate_sealed_state_sync(
+            &conn,
+            backend.audit_key(),
+            &SqliteWorkCancellation::new(),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn persisted_revision_one_legacy_command_replays_and_new_intent_is_rejected() {
+        let backend = initialized_backend().await;
+        let shared_conn = backend.conn();
+        let conn = shared_conn.lock().await;
+        let missing_tx_id = TxId::new();
+        let request_id = [0xD1; 16];
+        let membership = membership_entry();
+        let legacy = mark_confirmed_entry_with_version(
+            1,
+            1,
+            request_id,
+            missing_tx_id,
+            LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+        );
+        let replay = mark_confirmed_entry_with_version(
+            1,
+            2,
+            request_id,
+            missing_tx_id,
+            CONFIG_CONSENSUS_COMMAND_VERSION,
+        );
+        append_logs_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            &[membership.clone(), legacy.clone(), replay.clone()],
+        )
+        .expect("revision-one legacy log and revision-two retry remain readable");
+        let persisted = read_log_range_sync(&conn, identity(), &expected_members(), 0, None, None)
+            .expect("read revision-one persisted command");
+        assert_eq!(
+            vec![membership.clone(), legacy.clone(), replay.clone()],
+            persisted
+        );
+
+        let responses = apply_entries_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            vec![membership, legacy, replay],
+        )
+        .expect("replay revision-one legacy command through revision two");
+        assert_eq!(3, responses.len());
+        assert_eq!(Err(ConfigMutationFailure::NotFound), responses[1].result);
+        assert_eq!(
+            responses[1], responses[2],
+            "same request replays exact outcome"
+        );
+
+        let revision_one_new_intent = Entry {
+            log_id: log_id(3),
+            payload: EntryPayload::Normal(ConfigConsensusCommand {
+                schema_version: LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity: identity(),
+                request_id: ConfigConsensusRequestId::from_bytes([0xD2; 16]),
+                logical_time: Timestamp::now_utc(),
+                intent: ConfigMutationIntent::ClearRecoveryRequired {
+                    tx_id: missing_tx_id,
+                },
+            }),
+        };
+        assert!(append_logs_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            std::slice::from_ref(&revision_one_new_intent),
+        )
+        .is_err());
+        assert_eq!(
+            Some(log_id(2)),
+            last_log_sync(&conn, identity()).expect("legacy log remains intact")
+        );
+        assert_eq!(
+            Some(log_id(2)),
+            read_applied_sync(&conn, identity()).expect("replayed applied pointer")
+        );
     }
 
     fn rollback_label_entry(label_length: usize) -> Entry<ConfigRaftTypeConfig> {
@@ -3770,7 +4519,7 @@ mod tests {
                  schema_digest, plaintext_digest, encrypted_blob, rollback_point,
                  confirmed_deadline, confirmed_at, audit_count, audit_terminal_hash)
                 VALUES (?1, NULL, ?2, ?3, ?4, 'gnmi', ?5, ?6, ?7, 0,
-                        NULL, NULL, 0, ?8)"#,
+                        ?8, NULL, 0, ?9)"#,
             params![
                 tx_id.as_uuid().as_bytes().as_slice(),
                 checked_i64(ConfigVersion::new(1).get()).expect("version"),
@@ -3779,6 +4528,7 @@ mod tests {
                 [0x11_u8; 32].as_slice(),
                 [0x22_u8; 32].as_slice(),
                 [0x33_u8; 32].as_slice(),
+                Timestamp::now_utc().to_string(),
                 [0_u8; 32].as_slice(),
             ],
         )

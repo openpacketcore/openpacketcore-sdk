@@ -69,6 +69,87 @@ async fn repeated_idempotency_key_replays_without_duplicate_commit_or_publicatio
         .is_err());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_authorities_reconcile_the_same_committed_idempotency_request() {
+    let store = Arc::new(ConcurrentReplayStore::new());
+    let bus_a = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("first authority starts");
+    let bus_b = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("second authority starts");
+    let key = IdempotencyKey::new("leader-handoff-race").expect("key");
+
+    let (result_a, result_b) = tokio::join!(
+        bus_a.submit(
+            commit_request("next", Instant::now() + Duration::from_secs(2))
+                .with_idempotency_key(key.clone()),
+        ),
+        bus_b.submit(
+            commit_request("next", Instant::now() + Duration::from_secs(2))
+                .with_idempotency_key(key),
+        ),
+    );
+    let result_a = result_a.expect("first logical request resolves as committed");
+    let result_b = result_b.expect("racing logical request replays the committed result");
+
+    assert_eq!(result_a, result_b);
+    let history = store.history().await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].tx_id, result_a.tx_id);
+    assert_eq!(bus_a.version().get() + bus_b.version().get(), 1);
+    assert_eq!(
+        [bus_a.drift_state(), bus_b.drift_state()]
+            .into_iter()
+            .filter(|state| *state == DriftState::RecoveryRequired)
+            .count(),
+        1,
+        "the authority whose snapshot lost the CAS race must fence until restore"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_authorities_reconcile_the_same_committed_request_id() {
+    let store = Arc::new(ConcurrentReplayStore::new());
+    let bus_a = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("first authority starts");
+    let bus_b = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("second authority starts");
+    let request_id = RequestId::new();
+    let request = || {
+        CommitRequest::commit(
+            request_id,
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig::new("next"),
+            vec![changed_path()],
+            Instant::now() + Duration::from_secs(2),
+        )
+    };
+
+    let (result_a, result_b) = tokio::join!(bus_a.submit(request()), bus_b.submit(request()));
+    let result_a = result_a.expect("first logical request resolves as committed");
+    let result_b = result_b.expect("racing request id replays the committed result");
+
+    assert_eq!(result_a, result_b);
+    let history = store.history().await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].request_id, Some(request_id));
+    assert_eq!(history[0].tx_id, result_a.tx_id);
+    assert_eq!(bus_a.version().get() + bus_b.version().get(), 1);
+    assert_eq!(
+        [bus_a.drift_state(), bus_b.drift_state()]
+            .into_iter()
+            .filter(|state| *state == DriftState::RecoveryRequired)
+            .count(),
+        1
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_idempotency_key_replays_with_reordered_roles() {
     let store = Arc::new(MockManagedDatastore::new());
@@ -395,9 +476,9 @@ async fn reused_idempotency_key_rejects_different_request_mode() {
             TestConfig::new("initial"),
         ))
         .await;
-    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
         .await
-        .expect("startup succeeds");
+        .expect("startup restore succeeds");
     let key = IdempotencyKey::new("req-1").expect("key");
 
     bus.submit(
@@ -543,6 +624,20 @@ async fn test_idempotent_replay_uses_persisted_base_version() {
     let res2 = bus.submit(req2).await.expect("second commit (replay)");
     assert_eq!(res2.base_version, ConfigVersion::INITIAL);
     assert_eq!(res2.new_version, Some(ConfigVersion::new(1)));
+
+    let changed_precondition = commit_request("val1", Instant::now() + Duration::from_secs(1))
+        .with_base_version(ConfigVersion::new(1))
+        .with_idempotency_key(id_key);
+    let error = bus
+        .submit(changed_precondition)
+        .await
+        .expect_err("the caller's changed CAS precondition must collide");
+    assert_eq!(error.code, CommitErrorCode::AdmissionRejected);
+    assert_eq!(
+        error.message,
+        "idempotency key is already bound to a different commit request"
+    );
+    assert_eq!(store.history().await.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -573,6 +668,7 @@ async fn test_idempotent_replay_legacy_fallback() {
         .expect("restore");
 
     let req = commit_request("idempotent", Instant::now() + Duration::from_secs(1))
+        .with_base_version(expected_base)
         .with_idempotency_key(id_key);
     let res = bus.submit(req).await.expect("replay commit");
 

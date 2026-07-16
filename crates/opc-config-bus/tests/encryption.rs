@@ -1,13 +1,18 @@
 use opc_config_bus::{
-    ConfigBus, ConfigSnapshot, EncryptingManagedDatastore, ManagedDatastore, MockManagedDatastore,
-    SealedConfig, StoreErrorCode, StoredConfig,
+    CommitWrite, ConfigBus, ConfigSnapshot, EncryptingManagedDatastore, ManagedDatastore,
+    MockManagedDatastore, SealedConfig, StoreErrorCode, StoredConfig, StoredRequestFingerprint,
+    StoredRequestMode,
 };
 use opc_config_model::{
-    CommitRequest, CommitStatus, ConfigError, ConfigOperation, IdempotencyKey, OpcConfig,
-    RequestId, RequestSource, RollbackTarget, TransportType, TrustedPrincipal, ValidationContext,
-    ValidationError, WorkloadIdentity, YangPath,
+    ApplyPlan, CommitRequest, CommitStatus, ConfigError, ConfigOperation, IdempotencyKey,
+    OpcConfig, RequestId, RequestSource, RollbackTarget, TransportType, TrustedPrincipal,
+    ValidationContext, ValidationError, WorkloadIdentity, YangPath,
 };
-use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+use opc_crypto::encrypt_attested_envelope;
+use opc_key::{
+    ConfigAad, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing,
+    AES_256_GCM_SIV_KEY_LEN,
+};
 use opc_types::{ConfigVersion, SchemaDigest, TenantId, TxId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -156,6 +161,35 @@ fn test_provider() -> Arc<MemoryKeyProvider> {
     provider
 }
 
+async fn legacy_ciphertext_record(
+    mut record: StoredConfig<TestConfig>,
+    provider: &MemoryKeyProvider,
+) -> StoredConfig<SealedConfig<TestConfig>> {
+    let plaintext = serde_json::to_vec(&record.config).expect("legacy config JSON");
+    record.plaintext_digest = Some(Sha256::digest(&plaintext).into());
+    let encoded_principal = serde_json::to_string(&record.principal).expect("principal JSON");
+    let metadata = ConfigAad::new(
+        record.tx_id,
+        record.parent_tx_id,
+        record.committed_at,
+        encoded_principal,
+        record.schema_digest,
+        "running",
+    )
+    .expect("legacy config AAD");
+    let aad = EnvelopeAad::config(
+        record.principal.tenant.clone(),
+        record.version.get(),
+        metadata,
+    );
+    let envelope = encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .expect("legacy config encryption");
+    record.encrypted_blob = envelope.encoded().to_vec();
+    let schema_digest = record.schema_digest;
+    record.with_config(SealedConfig::new(schema_digest))
+}
+
 async fn submit_commit(bus: &ConfigBus<TestConfig>, name: &str) -> opc_config_model::CommitResult {
     bus.submit(
         CommitRequest::commit(
@@ -258,6 +292,16 @@ async fn encrypted_idempotency_lookup_returns_decrypted_record() {
     let provider = test_provider();
     let store = EncryptingManagedDatastore::new(Arc::clone(&inner), Arc::clone(&provider));
     let idempotency_key = IdempotencyKey::new("commit-idempotency-key").expect("idempotency key");
+    let changed_path = YangPath::new("/system/replay-fingerprint-canary").expect("path");
+    let apply_plan = ApplyPlan::default_hot(vec![changed_path.clone()], None);
+    let request_fingerprint = StoredRequestFingerprint {
+        operation: ConfigOperation::Replace,
+        mode: StoredRequestMode::Commit,
+        transport: TransportType::Internal,
+        changed_paths: vec![changed_path],
+        base_version: Some(ConfigVersion::new(0)),
+    };
+    let request_id = RequestId::new();
 
     let mut record = StoredConfig::new(
         TxId::new(),
@@ -267,7 +311,13 @@ async fn encrypted_idempotency_lookup_returns_decrypted_record() {
         TestConfig::new("idempotent"),
     );
     record.idempotency_key = Some(idempotency_key.clone());
-    store.append_commit(record).await.expect("encrypted append");
+    record.apply_plan = Some(apply_plan.clone());
+    record.request_fingerprint = Some(request_fingerprint.clone());
+    record.request_id = Some(request_id);
+    store
+        .append_commit_write(CommitWrite::new(record))
+        .await
+        .expect("encrypted append");
 
     let stored = inner
         .history()
@@ -284,6 +334,30 @@ async fn encrypted_idempotency_lookup_returns_decrypted_record() {
         stored.encrypted_blob,
         serde_json::to_vec(&TestConfig::new("idempotent")).expect("plaintext json")
     );
+    let lookup_digest = stored
+        .idempotency_key
+        .as_ref()
+        .expect("digest-only lookup value");
+    assert_ne!(lookup_digest, &idempotency_key);
+    assert_eq!(lookup_digest.as_str().len(), 64);
+    assert!(lookup_digest
+        .as_str()
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    assert_eq!(stored.apply_plan, None);
+    assert_eq!(stored.request_fingerprint, None);
+    assert_eq!(stored.request_id, None);
+    let request_id_text = request_id.to_string();
+    for forbidden in [
+        idempotency_key.as_str().as_bytes(),
+        b"replay-fingerprint-canary".as_slice(),
+        request_id_text.as_bytes(),
+    ] {
+        assert!(!stored
+            .encrypted_blob
+            .windows(forbidden.len())
+            .any(|window| window == forbidden));
+    }
 
     let loaded = store
         .load_by_idempotency_key(&idempotency_key)
@@ -292,11 +366,14 @@ async fn encrypted_idempotency_lookup_returns_decrypted_record() {
         .expect("record");
     assert_eq!(loaded.config.name, "idempotent");
     assert_eq!(loaded.idempotency_key, Some(idempotency_key));
+    assert_eq!(loaded.apply_plan, Some(apply_plan));
+    assert_eq!(loaded.request_fingerprint, Some(request_fingerprint));
+    assert_eq!(loaded.request_id, Some(request_id));
 
     let stored_digest = stored.plaintext_digest.expect("plaintext digest");
-    let expected_digest: [u8; 32] =
+    let legacy_config_digest: [u8; 32] =
         Sha256::digest(serde_json::to_vec(&TestConfig::new("idempotent")).expect("json")).into();
-    assert_eq!(stored_digest, expected_digest);
+    assert_ne!(stored_digest, legacy_config_digest);
 }
 
 #[tokio::test]
@@ -306,13 +383,13 @@ async fn encrypting_store_append_commit_reports_missing_key() {
     let store = EncryptingManagedDatastore::new(inner, provider);
 
     let err = store
-        .append_commit(StoredConfig::new(
+        .append_commit_write(CommitWrite::new(StoredConfig::new(
             TxId::new(),
             ConfigVersion::new(1),
             principal(),
             RequestSource::Northbound,
             TestConfig::new("missing-key"),
-        ))
+        )))
         .await
         .expect_err("append must fail without a config key");
 
@@ -346,6 +423,7 @@ async fn legacy_plaintext_config_records_restore_and_reseal_on_next_commit() {
         .expect("legacy latest")
         .expect("latest record");
     assert_eq!(latest.config.name, "legacy");
+    assert_eq!(latest.idempotency_key, Some(idempotency_key.clone()));
 
     let rollback = store
         .load_rollback(RollbackTarget::Label("legacy-label".into()))
@@ -359,6 +437,7 @@ async fn legacy_plaintext_config_records_restore_and_reseal_on_next_commit() {
         .expect("legacy idempotency")
         .expect("idempotent record");
     assert_eq!(idempotent.config.name, "legacy");
+    assert_eq!(idempotent.idempotency_key, Some(idempotency_key.clone()));
 
     let restored = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), store)
         .await
@@ -385,13 +464,13 @@ async fn encrypted_schema_mismatch_uses_restore_error_code() {
     );
 
     writer
-        .append_commit(StoredConfig::new(
+        .append_commit_write(CommitWrite::new(StoredConfig::new(
             TxId::new(),
             ConfigVersion::new(1),
             principal(),
             RequestSource::Northbound,
             TestConfig::new("schema-bound"),
-        ))
+        )))
         .await
         .expect("encrypted append");
 
@@ -424,13 +503,13 @@ async fn encrypted_plaintext_digest_mismatch_fails_closed() {
     let store = EncryptingManagedDatastore::new(Arc::clone(&inner), Arc::clone(&provider));
 
     store
-        .append_commit(StoredConfig::new(
+        .append_commit_write(CommitWrite::new(StoredConfig::new(
             TxId::new(),
             ConfigVersion::new(1),
             principal(),
             RequestSource::Northbound,
             TestConfig::new("digest-bound"),
-        ))
+        )))
         .await
         .expect("encrypted append");
 
@@ -455,40 +534,130 @@ async fn encrypted_plaintext_digest_mismatch_fails_closed() {
 }
 
 #[tokio::test]
-async fn encrypted_pre_digest_record_restores_during_rolling_upgrade() {
+async fn encrypted_replay_lookup_digest_mismatch_fails_closed() {
     let inner = Arc::new(MockManagedDatastore::new());
     let provider = test_provider();
     let store = EncryptingManagedDatastore::new(Arc::clone(&inner), Arc::clone(&provider));
-
+    let mut record = StoredConfig::new(
+        TxId::new(),
+        ConfigVersion::new(1),
+        principal(),
+        RequestSource::Northbound,
+        TestConfig::new("lookup-bound"),
+    );
+    record.idempotency_key = Some(IdempotencyKey::new("original-key").expect("idempotency key"));
     store
-        .append_commit(StoredConfig::new(
-            TxId::new(),
-            ConfigVersion::new(1),
-            principal(),
-            RequestSource::Northbound,
-            TestConfig::new("pre-digest"),
-        ))
+        .append_commit_write(CommitWrite::new(record))
         .await
         .expect("encrypted append");
 
-    let mut legacy_ciphertext = inner
+    let mut corrupted = inner
         .history()
         .await
         .into_iter()
         .next()
         .expect("stored record");
-    legacy_ciphertext.plaintext_digest = None;
+    corrupted.idempotency_key =
+        Some(IdempotencyKey::new("0".repeat(64)).expect("replacement lookup digest"));
+    let corrupt_inner = Arc::new(MockManagedDatastore::new());
+    corrupt_inner.seed(corrupted).await;
+    let corrupt_store = EncryptingManagedDatastore::new(corrupt_inner, provider);
 
-    let legacy_inner = Arc::new(MockManagedDatastore::new());
-    legacy_inner.seed(legacy_ciphertext).await;
-    let legacy_store = EncryptingManagedDatastore::new(legacy_inner, provider);
+    let error = match corrupt_store.load_latest().await {
+        Ok(_) => panic!("lookup digest tampering must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(StoreErrorCode::Crypto, error.code);
+    assert_eq!(
+        "config envelope replay lookup binding mismatch",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn encrypted_request_id_lookup_returns_decrypted_record() {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let provider = test_provider();
+    let store = EncryptingManagedDatastore::new(Arc::clone(&inner), Arc::clone(&provider));
+    let request_id = RequestId::new();
+    let mut record = StoredConfig::new(
+        TxId::new(),
+        ConfigVersion::new(1),
+        principal(),
+        RequestSource::Northbound,
+        TestConfig::new("request-reconciled"),
+    );
+    record.request_id = Some(request_id);
+    record.request_fingerprint = Some(StoredRequestFingerprint {
+        operation: ConfigOperation::Replace,
+        mode: StoredRequestMode::Commit,
+        transport: TransportType::Internal,
+        changed_paths: vec![YangPath::new("/system/hostname").expect("path")],
+        base_version: Some(ConfigVersion::INITIAL),
+    });
+    store
+        .append_commit_write(CommitWrite::new(record))
+        .await
+        .expect("encrypted append");
+
+    let sealed = inner
+        .history()
+        .await
+        .into_iter()
+        .next()
+        .expect("sealed record");
+    assert!(sealed.request_id.is_none());
+    assert!(sealed.request_fingerprint.is_none());
+    assert_eq!(
+        sealed
+            .idempotency_key
+            .as_ref()
+            .expect("request digest")
+            .as_str()
+            .len(),
+        64
+    );
+
+    let loaded = store
+        .load_by_request_id(request_id)
+        .await
+        .expect("request lookup")
+        .expect("request record");
+    assert_eq!(loaded.config.name, "request-reconciled");
+    assert_eq!(loaded.request_id, Some(request_id));
+    assert_eq!(loaded.idempotency_key, None);
+    assert!(store
+        .load_by_request_id(RequestId::new())
+        .await
+        .expect("different request lookup")
+        .is_none());
+}
+
+#[tokio::test]
+async fn encrypted_legacy_config_only_plaintext_restores_during_rolling_upgrade() {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let provider = test_provider();
+    let mut legacy_ciphertext = legacy_ciphertext_record(
+        StoredConfig::new(
+            TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("pre-v2-envelope"),
+        ),
+        provider.as_ref(),
+    )
+    .await;
+    legacy_ciphertext.plaintext_digest = None;
+    inner.seed(legacy_ciphertext).await;
+    let legacy_store = EncryptingManagedDatastore::new(inner, provider);
 
     let restored = legacy_store
         .load_latest()
         .await
-        .expect("restore pre-digest ciphertext")
+        .expect("restore pre-v2 ciphertext")
         .expect("record");
-    assert_eq!(restored.config.name, "pre-digest");
+    assert_eq!(restored.config.name, "pre-v2-envelope");
 }
 
 #[tokio::test]
@@ -502,13 +671,13 @@ async fn custom_config_store_kind_is_bound_into_envelope_aad() {
     );
 
     writer
-        .append_commit(StoredConfig::new(
+        .append_commit_write(CommitWrite::new(StoredConfig::new(
             TxId::new(),
             ConfigVersion::new(1),
             principal(),
             RequestSource::Northbound,
             TestConfig::new("startup-checkpoint"),
-        ))
+        )))
         .await
         .expect("encrypted append");
 
@@ -543,7 +712,10 @@ async fn encrypting_store_rejects_corrupt_encrypted_rollback_target() {
         TestConfig::new("checkpoint"),
     );
     let rollback_tx_id = record.tx_id;
-    store.append_commit(record).await.expect("encrypted append");
+    store
+        .append_commit_write(CommitWrite::new(record))
+        .await
+        .expect("encrypted append");
 
     let mut corrupted = inner
         .history()
@@ -584,7 +756,10 @@ async fn test_refactored_config_zeroizing_decrypt_hygiene() {
     );
 
     // 1. Decrypt round-trip verification
-    store.append_commit(record).await.expect("encrypted append");
+    store
+        .append_commit_write(CommitWrite::new(record))
+        .await
+        .expect("encrypted append");
     let restored = store
         .load_latest()
         .await

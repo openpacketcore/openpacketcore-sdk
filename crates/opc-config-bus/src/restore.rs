@@ -16,7 +16,10 @@ use crate::alarms::{clear_config_alarm_type, preserve_startup_error};
 use crate::authorizer::{AllowAllAuthorizer, ConfigAuthorizer};
 use crate::commit::{ConfigBus, DEFAULT_COMMIT_QUEUE_CAPACITY};
 use crate::datastore::ManagedDatastore;
-use crate::types::{AuthorityMode, StoreError, StoredConfig, StoredRequestMode};
+use crate::types::{
+    AuthorityMode, CommitWrite, ConfirmedCommitResolution, StoreError, StoredConfig,
+    StoredRequestMode,
+};
 
 pub(crate) const RESTORE_SCHEMA_MISMATCH_MESSAGE: &str =
     "stored running config schema digest mismatch";
@@ -91,6 +94,11 @@ pub(crate) fn restore_validation_context<C: OpcConfig>(
 fn restore_commit_mode(mode: &StoredRequestMode) -> CommitMode {
     match mode {
         StoredRequestMode::Commit => CommitMode::Commit,
+        StoredRequestMode::CommitConfirmed { timeout } => {
+            CommitMode::CommitConfirmed { timeout: *timeout }
+        }
+        StoredRequestMode::CancelConfirmed => CommitMode::CancelConfirmed,
+        StoredRequestMode::ConfirmPending => CommitMode::Commit,
         StoredRequestMode::Rollback { target } => CommitMode::Rollback {
             target: target.clone(),
         },
@@ -511,7 +519,10 @@ impl<C: OpcConfig> ConfigBus<C> {
                             .load_rollback(RollbackTarget::TxId(parent_tx))
                             .await
                             .map_err(|err| {
-                                tracing::error!("failed to load previous confirmed config during startup rollback: {:?}", err);
+                                log_startup_store_error(
+                                    "failed to load previous confirmed config during startup rollback",
+                                    &err,
+                                );
                                 preserve_startup_error(&alarm_manager, StoreError::restore_confirmed_deadline("stored running config requires commit-confirmed recovery"))
                             })?;
                         validate_publishable_stored_config(&prev_stored)
@@ -541,22 +552,47 @@ impl<C: OpcConfig> ConfigBus<C> {
                         rollback_record.parent_tx_id = Some(stored.tx_id);
                         rollback_record.recovery_required = true;
 
-                        // Append rollback commit
-                        store.append_commit(rollback_record).await.map_err(|err| {
-                            tracing::error!("failed to append startup rollback commit: {:?}", err);
-                            preserve_startup_error(
-                                &alarm_manager,
-                                StoreError::restore_recovery_required(
-                                    RESTORE_RECOVERY_REQUIRED_MESSAGE,
-                                ),
-                            )
-                        })?;
+                        // Append the rollback and decide the pending commit in
+                        // one applied-state compare-and-swap.
+                        let rollback_write = CommitWrite::resolving(
+                            rollback_record,
+                            ConfirmedCommitResolution::Rollback {
+                                pending_tx_id: stored.tx_id,
+                            },
+                        )
+                        .map_err(|err| preserve_startup_error(&alarm_manager, err))?;
+                        store
+                            .append_commit_write(rollback_write)
+                            .await
+                            .map_err(|err| {
+                                log_startup_store_error(
+                                    "failed to append startup rollback commit",
+                                    &err,
+                                );
+                                preserve_startup_error(
+                                    &alarm_manager,
+                                    StoreError::restore_recovery_required(
+                                        RESTORE_RECOVERY_REQUIRED_MESSAGE,
+                                    ),
+                                )
+                            })?;
 
                         // Clear recovery required on the rollback commit
-                        store.clear_recovery_required(rollback_tx_id).await.map_err(|err| {
-                            tracing::error!("failed to clear recovery required on startup rollback commit: {:?}", err);
-                            preserve_startup_error(&alarm_manager, StoreError::restore_recovery_required(RESTORE_RECOVERY_REQUIRED_MESSAGE))
-                        })?;
+                        store
+                            .clear_recovery_required(rollback_tx_id)
+                            .await
+                            .map_err(|err| {
+                                log_startup_store_error(
+                                    "failed to clear recovery required on startup rollback commit",
+                                    &err,
+                                );
+                                preserve_startup_error(
+                                    &alarm_manager,
+                                    StoreError::restore_recovery_required(
+                                        RESTORE_RECOVERY_REQUIRED_MESSAGE,
+                                    ),
+                                )
+                            })?;
 
                         (
                             rollback_config,
@@ -595,13 +631,13 @@ impl<C: OpcConfig> ConfigBus<C> {
                 .map_err(|err| preserve_startup_error(&alarm_manager, err))?;
                 let tx_id = TxId::new();
                 store
-                    .append_commit(StoredConfig::new(
+                    .append_commit_write(CommitWrite::new(StoredConfig::new(
                         tx_id,
                         version,
                         startup_bootstrap_principal(),
                         RequestSource::StartupRecovery,
                         config.clone(),
-                    ))
+                    )))
                     .await
                     .map_err(|err| preserve_startup_error(&alarm_manager, err))?;
                 (config, version, Some(tx_id), None)
@@ -657,6 +693,14 @@ impl<C: OpcConfig> ConfigBus<C> {
     {
         Self::restore_or_new_with_alarm_manager(initial, store, authorizer, alarm_manager).await
     }
+}
+
+fn log_startup_store_error(operation: &str, error: &StoreError) {
+    tracing::error!(
+        store_error_code = %error.code,
+        store_error = %redact(&error.message),
+        "{operation}"
+    );
 }
 
 #[cfg(test)]
@@ -733,5 +777,24 @@ mod tests {
         assert!(!rendered.contains(secret));
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("syntax"));
+    }
+
+    #[test]
+    fn startup_store_error_logs_are_redacted() {
+        let secret = "credential=startup-store-secret";
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber::new(Arc::clone(&captured));
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_startup_store_error(
+                "startup store operation failed",
+                &StoreError::internal(secret),
+            );
+        });
+
+        let rendered = captured.lock().expect("capture mutex poisoned").join("\n");
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("internal"));
     }
 }

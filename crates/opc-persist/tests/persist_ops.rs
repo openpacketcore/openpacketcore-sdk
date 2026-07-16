@@ -1,6 +1,9 @@
 mod persist_common;
 
-use opc_persist::{ConfigStore, MockConfigStore, PersistErrorKind, RollbackTarget, SqliteBackend};
+use opc_persist::{
+    ConfigStore, ConfirmedCommitResolution, MockConfigStore, PersistErrorKind, RollbackTarget,
+    SqliteBackend,
+};
 use opc_types::{Timestamp, TxId};
 use std::sync::Arc;
 
@@ -144,6 +147,7 @@ async fn load_latest_returns_most_recent_by_version() {
     let tx2 = TxId::new();
     let mut rec2 = make_commit_record(tx2, 2);
     rec2.rollback_point = false;
+    rec2.parent_tx_id = Some(tx1);
     backend
         .append_commit(rec2.clone(), vec![])
         .await
@@ -152,6 +156,7 @@ async fn load_latest_returns_most_recent_by_version() {
     let tx3 = TxId::new();
     let mut rec3 = make_commit_record(tx3, 3);
     rec3.rollback_point = false;
+    rec3.parent_tx_id = Some(tx2);
     backend
         .append_commit(rec3.clone(), vec![])
         .await
@@ -264,7 +269,8 @@ async fn mark_confirmed_updates_commit_record() {
         .expect("open backend");
 
     let tx_id = TxId::new();
-    let record = make_commit_record(tx_id, 1);
+    let mut record = make_commit_record(tx_id, 1);
+    record.confirmed_deadline = Some(Timestamp::now_utc());
     backend
         .append_commit(record, vec![])
         .await
@@ -313,6 +319,153 @@ async fn mock_mark_confirmed_clears_pending_deadline() {
         .await
         .expect("confirmed commit should be a rollback target");
     assert!(rollback.record.confirmed_deadline.is_none());
+}
+
+async fn race_confirm_and_rollback(store: Arc<dyn ConfigStore>) -> TxId {
+    let pending_tx_id = TxId::new();
+    let mut pending = make_commit_record(pending_tx_id, 1);
+    pending.confirmed_deadline = Some(Timestamp::now_utc());
+    store
+        .append_commit(pending, Vec::new())
+        .await
+        .expect("append pending head");
+
+    let confirm_tx_id = TxId::new();
+    let mut confirm = make_commit_record(confirm_tx_id, 2);
+    confirm.parent_tx_id = Some(pending_tx_id);
+    let rollback_tx_id = TxId::new();
+    let mut rollback = make_commit_record(rollback_tx_id, 2);
+    rollback.parent_tx_id = Some(pending_tx_id);
+
+    let confirm_store = Arc::clone(&store);
+    let rollback_store = Arc::clone(&store);
+    let (confirm_result, rollback_result) = tokio::join!(
+        confirm_store.append_commit_resolving(
+            confirm,
+            Vec::new(),
+            ConfirmedCommitResolution::Confirm { pending_tx_id },
+        ),
+        rollback_store.append_commit_resolving(
+            rollback,
+            Vec::new(),
+            ConfirmedCommitResolution::Rollback { pending_tx_id },
+        ),
+    );
+
+    assert_ne!(
+        confirm_result.is_ok(),
+        rollback_result.is_ok(),
+        "exactly one persisted decision must win"
+    );
+    let expected_tx_id = if confirm_result.is_ok() {
+        confirm_tx_id
+    } else {
+        rollback_tx_id
+    };
+    let latest = store
+        .load_latest()
+        .await
+        .expect("load decided head")
+        .expect("decided head exists");
+    assert_eq!(expected_tx_id, latest.record.tx_id);
+    assert_eq!(2, latest.record.version.get());
+
+    let stale_confirm = store
+        .mark_confirmed(pending_tx_id)
+        .await
+        .expect_err("a successor makes the old pending decision immutable");
+    assert!(matches!(
+        stale_confirm.kind(),
+        PersistErrorKind::RollbackNotFound | PersistErrorKind::ConstraintViolation(_)
+    ));
+    expected_tx_id
+}
+
+#[tokio::test]
+async fn sqlite_confirm_and_rollback_are_one_atomic_decision() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("confirmed_decision_race.db");
+    let backend: Arc<dyn ConfigStore> = Arc::new(
+        SqliteBackend::open(&db_path, true, 0)
+            .await
+            .expect("open backend"),
+    );
+    let expected_tx_id = race_confirm_and_rollback(backend).await;
+
+    let reopened = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("reopen backend");
+    let latest = reopened
+        .load_latest()
+        .await
+        .expect("load decision after restart")
+        .expect("decision survives restart");
+    assert_eq!(2, latest.record.version.get());
+    assert_eq!(expected_tx_id, latest.record.tx_id);
+}
+
+#[tokio::test]
+async fn mock_confirm_and_rollback_are_one_atomic_decision() {
+    let _ = race_confirm_and_rollback(Arc::new(MockConfigStore::new())).await;
+}
+
+async fn assert_recovery_marker_lifecycle(store: &dyn ConfigStore) {
+    let tx_id = TxId::new();
+    let mut record = make_commit_record(tx_id, 1);
+    record.principal = serde_json::json!({
+        "principal": "spiffe://test.invalid/config-writer",
+        "recovery_required": true,
+    })
+    .to_string();
+    store
+        .append_commit(record, Vec::new())
+        .await
+        .expect("append recovery-marked commit");
+
+    store
+        .clear_recovery_required(tx_id)
+        .await
+        .expect("clear current recovery marker");
+    store
+        .clear_recovery_required(tx_id)
+        .await
+        .expect("repeated clear is idempotent");
+    let latest = store
+        .load_latest()
+        .await
+        .expect("load cleared record")
+        .expect("cleared record exists");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&latest.record.principal).expect("decode recovery metadata");
+    assert_eq!(Some(false), metadata["recovery_required"].as_bool());
+}
+
+#[tokio::test]
+async fn sqlite_recovery_marker_clear_is_durable_and_idempotent() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("recovery_marker.db");
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("open backend");
+    assert_recovery_marker_lifecycle(&backend).await;
+    drop(backend);
+
+    let reopened = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("reopen backend");
+    let latest = reopened
+        .load_latest()
+        .await
+        .expect("load cleared record after restart")
+        .expect("cleared record survives restart");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&latest.record.principal).expect("decode recovery metadata");
+    assert_eq!(Some(false), metadata["recovery_required"].as_bool());
+}
+
+#[tokio::test]
+async fn mock_recovery_marker_clear_is_idempotent() {
+    assert_recovery_marker_lifecycle(&MockConfigStore::new()).await;
 }
 
 #[tokio::test]
@@ -533,4 +686,234 @@ async fn mock_store_append_and_load_latest_round_trip() {
 
     assert_eq!(loaded.record.tx_id, tx_id);
     assert_eq!(loaded.audit.len(), 1);
+}
+
+#[tokio::test]
+async fn indexed_replay_lookup_finds_a_record_beyond_the_legacy_history_bound() {
+    const HISTORY_LEN: usize = 16_385;
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("long_replay_history.db");
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("initialize backend");
+    drop(backend);
+
+    let digest = "a".repeat(64);
+    let target_principal = serde_json::json!({
+        "principal": "spiffe://test.example/tenant/tenant-a/ns/core/sa/config",
+        "replay_lookup_digest": digest,
+        "recovery_required": false,
+    })
+    .to_string();
+    let mut conn = rusqlite::Connection::open(&db_path).expect("open direct fixture connection");
+    let tx = conn.transaction().expect("begin long-history fixture");
+    {
+        let mut insert = tx
+            .prepare(
+                r#"INSERT INTO config_history
+                   (tx_id, parent_tx_id, version, committed_at, principal, source,
+                    schema_digest, plaintext_digest, encrypted_blob, rollback_point,
+                    rollback_label, confirmed_deadline, confirmed_at, audit_count,
+                    audit_terminal_hash)
+                   VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', ?4, 'gnmi',
+                           ?5, ?6, ?7, 0, NULL, NULL, NULL, 0, ?8)"#,
+            )
+            .expect("prepare long-history insert");
+        let mut parent: Option<[u8; 16]> = None;
+        for offset in 0..HISTORY_LEN {
+            let tx_id = u128::try_from(offset + 1)
+                .expect("bounded fixture index")
+                .to_be_bytes();
+            let principal = if offset == 0 {
+                target_principal.as_str()
+            } else {
+                "spiffe://test.example/tenant/tenant-a/ns/core/sa/config"
+            };
+            insert
+                .execute(rusqlite::params![
+                    tx_id.as_slice(),
+                    parent.as_ref().map(<[u8; 16]>::as_slice),
+                    i64::try_from(offset + 1).expect("bounded fixture version"),
+                    principal,
+                    [0x11_u8; 32].as_slice(),
+                    [0x22_u8; 32].as_slice(),
+                    [0x33_u8; 32].as_slice(),
+                    [0_u8; 32].as_slice(),
+                ])
+                .expect("insert long-history row");
+            parent = Some(tx_id);
+        }
+    }
+    tx.commit().expect("commit long-history fixture");
+    drop(conn);
+
+    let backend = SqliteBackend::open(&db_path, true, 0)
+        .await
+        .expect("reopen long-history backend");
+    let record = backend
+        .load_by_replay_lookup_digest(&"a".repeat(64))
+        .await
+        .expect("indexed authoritative lookup")
+        .expect("oldest record remains addressable");
+    assert_eq!(record.record.version.get(), 1);
+    assert_eq!(
+        record.record.tx_id.as_uuid().as_bytes(),
+        &1_u128.to_be_bytes()
+    );
+}
+
+fn replay_metadata(digest: char) -> String {
+    serde_json::json!({
+        "principal": "spiffe://test.invalid/tenant/test/ns/default/sa/config",
+        "replay_lookup_digest": digest.to_string().repeat(64),
+        "recovery_required": false,
+    })
+    .to_string()
+}
+
+async fn assert_duplicate_replay_digest_is_a_recoverable_conflict(store: &dyn ConfigStore) {
+    let first_tx_id = TxId::new();
+    let mut first = make_commit_record(first_tx_id, 1);
+    first.principal = replay_metadata('a');
+    store
+        .append_commit(first, Vec::new())
+        .await
+        .expect("append first replay identity");
+
+    let mut duplicate = make_commit_record(TxId::new(), 2);
+    duplicate.parent_tx_id = Some(first_tx_id);
+    duplicate.principal = replay_metadata('a');
+    let error = store
+        .append_commit(duplicate, Vec::new())
+        .await
+        .expect_err("duplicate replay identity must be rejected");
+    assert!(matches!(
+        error.kind(),
+        PersistErrorKind::ConstraintViolation(_)
+    ));
+
+    let successor_tx_id = TxId::new();
+    let mut successor = make_commit_record(successor_tx_id, 2);
+    successor.parent_tx_id = Some(first_tx_id);
+    successor.principal = replay_metadata('b');
+    store
+        .append_commit(successor, Vec::new())
+        .await
+        .expect("a later non-conflicting command still applies");
+    assert_eq!(
+        successor_tx_id,
+        store
+            .load_latest()
+            .await
+            .expect("load latest")
+            .expect("latest record")
+            .record
+            .tx_id
+    );
+}
+
+#[tokio::test]
+async fn sqlite_duplicate_replay_digest_is_a_recoverable_conflict() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let store = SqliteBackend::open(temp_dir.path().join("replay-conflict.db"), true, 0)
+        .await
+        .expect("open backend");
+    assert_duplicate_replay_digest_is_a_recoverable_conflict(&store).await;
+}
+
+#[tokio::test]
+async fn mock_duplicate_replay_digest_is_a_recoverable_conflict() {
+    assert_duplicate_replay_digest_is_a_recoverable_conflict(&MockConfigStore::new()).await;
+}
+
+async fn assert_invalid_metadata_is_rejected_without_mutation(store: &dyn ConfigStore) {
+    let malformed = [
+        format!(
+            "{{\"replay_lookup_digest\":\"{}\",\"recovery_required\":true}}",
+            "a".repeat(64)
+        ),
+        "{\"principal\":\"first\",\"principal\":\"second\",\"recovery_required\":false}"
+            .to_owned(),
+        format!(
+            "{{\"principal\":\"spiffe://test.invalid/tenant/test\",\"replay_lookup_digest\":\"{}\",\"replay_lookup_digest\":\"{}\",\"recovery_required\":false}}",
+            "a".repeat(64),
+            "b".repeat(64)
+        ),
+        "{\"principal\":\"spiffe://test.invalid/tenant/test\",\"recovery_required\":true,\"recovery_required\":false}"
+            .to_owned(),
+    ];
+    for principal in malformed {
+        let mut record = make_commit_record(TxId::new(), 1);
+        record.principal = principal;
+        let error = store
+            .append_commit(record, Vec::new())
+            .await
+            .expect_err("malformed metadata must fail standalone admission");
+        assert!(matches!(
+            error.kind(),
+            PersistErrorKind::ConstraintViolation(_)
+        ));
+        assert!(store
+            .load_latest()
+            .await
+            .expect("authoritative empty-state read")
+            .is_none());
+    }
+
+    store
+        .append_commit(make_commit_record(TxId::new(), 1), Vec::new())
+        .await
+        .expect("valid legacy metadata still applies after rejections");
+}
+
+#[tokio::test]
+async fn sqlite_standalone_admission_rejects_ambiguous_metadata() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let store = SqliteBackend::open(temp_dir.path().join("metadata-admission.db"), true, 0)
+        .await
+        .expect("open backend");
+    assert_invalid_metadata_is_rejected_without_mutation(&store).await;
+}
+
+#[tokio::test]
+async fn mock_standalone_admission_rejects_ambiguous_metadata() {
+    assert_invalid_metadata_is_rejected_without_mutation(&MockConfigStore::new()).await;
+}
+
+#[tokio::test]
+async fn indexed_replay_lookup_fails_closed_on_ambiguous_stored_metadata() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let path = temp_dir.path().join("ambiguous-index-metadata.db");
+    let store = SqliteBackend::open(&path, true, 0)
+        .await
+        .expect("open backend");
+    let tx_id = TxId::new();
+    let mut record = make_commit_record(tx_id, 1);
+    record.principal = replay_metadata('a');
+    store
+        .append_commit(record, Vec::new())
+        .await
+        .expect("append valid indexed metadata");
+    drop(store);
+
+    let conn = rusqlite::Connection::open(&path).expect("open fixture database");
+    let malformed = format!(
+        "{{\"replay_lookup_digest\":\"{}\",\"recovery_required\":false}}",
+        "a".repeat(64)
+    );
+    conn.execute(
+        "UPDATE config_history SET principal = ?1 WHERE tx_id = ?2",
+        rusqlite::params![malformed, tx_id.as_uuid().as_bytes().as_slice()],
+    )
+    .expect("inject wrapper-only indexed metadata");
+    drop(conn);
+
+    let store = SqliteBackend::open(&path, true, 0)
+        .await
+        .expect("reopen backend");
+    let error = store
+        .load_by_replay_lookup_digest(&"a".repeat(64))
+        .await
+        .expect_err("indexed corrupt metadata must fail closed");
+    assert!(matches!(error.kind(), PersistErrorKind::CorruptBlob));
 }

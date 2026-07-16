@@ -17,7 +17,8 @@ use opc_alarm::{
     Severity, SharedAlarmManager,
 };
 use opc_config_bus::{
-    AuthorizationContext, AuthorizationError, ConfigAuthorizer, ConfigBus, ConfigEvent,
+    AuthorizationContext, AuthorizationError, CommitWrite as BusCommitWrite, ConfigAuthorizer,
+    ConfigBus, ConfigEvent, ConfirmedCommitResolution as BusConfirmedCommitResolution,
     EncryptingManagedDatastore, ManagedDatastore, SealedConfig, StoreError,
     StoredConfig as BusStoredConfig, SubscriberLagPolicy,
 };
@@ -30,7 +31,9 @@ use opc_data_governance::IdentifierType;
 use opc_key::{KeyProvider, KeyPurpose, KmsKeyProvider};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmEvaluator, NacmPolicy};
 use opc_persist::{
-    AttestedConfigCommit, AuditRecord, CommitRecord, CommitSource, ConfigStore, RollbackTarget,
+    AttestedConfigCommit, AuditRecord, CommitRecord, CommitSource, ConfigStore,
+    ConfirmedCommitResolution as PersistConfirmedCommitResolution, PersistError, PersistErrorKind,
+    RollbackTarget,
 };
 use opc_redaction::{DigestKey, RedactionLevel, TelcoIdentifier};
 use opc_runtime::{
@@ -251,6 +254,223 @@ struct SubscriberPrivacyAlias {
     redacted_identity: String,
 }
 
+const REPLAY_LOOKUP_DIGEST_HEX_LEN: usize = 64;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedBusMetadata {
+    /// Exact JSON bytes bound into `ConfigAad::principal`, encoded as a JSON
+    /// string so persistence can validate them without depending on config
+    /// model types or reserializing a nested object in a different key order.
+    principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_lookup_digest: Option<IdempotencyKey>,
+    recovery_required: bool,
+}
+
+struct DecodedPersistedBusMetadata {
+    principal: TrustedPrincipal,
+    aad_principal: String,
+    replay_lookup_digest: Option<IdempotencyKey>,
+    recovery_required: bool,
+}
+
+fn decode_persisted_bus_metadata(value: &str) -> Result<DecodedPersistedBusMetadata, StoreError> {
+    let shape: serde_json::Value = serde_json::from_str(value)
+        .map_err(|_| StoreError::internal("stored config principal metadata is invalid"))?;
+    let is_metadata_wrapper = shape.as_object().is_some_and(|fields| {
+        fields.contains_key("principal")
+            || fields.contains_key("replay_lookup_digest")
+            || fields.contains_key("recovery_required")
+    });
+    let metadata = if is_metadata_wrapper {
+        // Once any wrapper-only field is present, never fall back to the
+        // permissive legacy principal decoder: doing so would silently discard
+        // replay or recovery state carried alongside a legacy principal shape.
+        let metadata: PersistedBusMetadata = serde_json::from_str(value)
+            .map_err(|_| StoreError::internal("stored config principal metadata is invalid"))?;
+        let principal = serde_json::from_str(&metadata.principal)
+            .map_err(|_| StoreError::internal("stored authenticated principal is invalid"))?;
+        DecodedPersistedBusMetadata {
+            principal,
+            aad_principal: metadata.principal,
+            replay_lookup_digest: metadata.replay_lookup_digest,
+            recovery_required: metadata.recovery_required,
+        }
+    } else {
+        let principal = serde_json::from_str(value)
+            .map_err(|_| StoreError::internal("stored authenticated principal is invalid"))?;
+        DecodedPersistedBusMetadata {
+            principal,
+            aad_principal: value.to_owned(),
+            replay_lookup_digest: None,
+            recovery_required: false,
+        }
+    };
+    validate_replay_lookup_digest(metadata.replay_lookup_digest.as_ref())?;
+    Ok(metadata)
+}
+
+fn validate_replay_lookup_digest(digest: Option<&IdempotencyKey>) -> Result<(), StoreError> {
+    let Some(digest) = digest else {
+        return Ok(());
+    };
+    let bytes = digest.as_str().as_bytes();
+    if bytes.len() != REPLAY_LOOKUP_DIGEST_HEX_LEN
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(StoreError::internal(
+            "sealed config replay lookup value is not a SHA-256 digest",
+        ));
+    }
+    Ok(())
+}
+
+fn map_persist_error(error: PersistError) -> StoreError {
+    match error.kind() {
+        PersistErrorKind::OutcomeUnknown => {
+            StoreError::outcome_unknown("durable config quorum acknowledgement was lost")
+        }
+        _ => StoreError::internal(error.to_string()),
+    }
+}
+
+fn adapt_stored_config<C: OpcConfig>(
+    stored: opc_persist::StoredConfig,
+) -> Result<BusStoredConfig<SealedConfig<C>>, StoreError> {
+    let metadata = decode_persisted_bus_metadata(&stored.record.principal)?;
+    let source = match stored.record.source {
+        CommitSource::Gnmi => RequestSource::Northbound,
+        CommitSource::StartupRestore => RequestSource::StartupRecovery,
+        _ => RequestSource::Internal,
+    };
+    let mut plaintext_digest = [0u8; 32];
+    if stored.record.plaintext_digest.len() == plaintext_digest.len() {
+        plaintext_digest.copy_from_slice(&stored.record.plaintext_digest);
+    } else {
+        return Err(StoreError::internal("invalid plaintext digest length"));
+    }
+    Ok(BusStoredConfig {
+        tx_id: stored.record.tx_id,
+        parent_tx_id: stored.record.parent_tx_id,
+        version: stored.record.version,
+        committed_at: stored.record.committed_at,
+        principal: metadata.principal,
+        source,
+        schema_digest: stored.record.schema_digest,
+        plaintext_digest: Some(plaintext_digest),
+        config: SealedConfig::from_persisted_aad_principal(
+            stored.record.schema_digest,
+            metadata.aad_principal,
+        )?,
+        encrypted_blob: stored.record.encrypted_blob,
+        idempotency_key: metadata.replay_lookup_digest,
+        apply_plan: None,
+        request_fingerprint: None,
+        request_id: None,
+        recovery_required: metadata.recovery_required,
+        confirmed_deadline: stored.record.confirmed_deadline,
+        rollback_label: if stored.record.rollback_point {
+            Some("rollback".to_string())
+        } else {
+            None
+        },
+    })
+}
+
+#[cfg(test)]
+mod persisted_bus_metadata_tests {
+    use super::*;
+
+    fn encoded_principal() -> String {
+        serde_json::to_string(&TrustedPrincipal::new(
+            opc_config_model::WorkloadIdentity::Internal("config-writer".to_owned()),
+            TenantId::new("tenant-a").expect("tenant"),
+        ))
+        .expect("principal JSON")
+    }
+
+    #[test]
+    fn malformed_metadata_wrapper_shapes_fail_closed() {
+        let principal = encoded_principal();
+        let nested_principal: serde_json::Value =
+            serde_json::from_str(&principal).expect("principal value");
+        let malformed = [
+            serde_json::json!({
+                "principal": encoded_principal()
+            }),
+            serde_json::json!({
+                "principal": nested_principal,
+                "recovery_required": false
+            }),
+            serde_json::json!({
+                "principal": "not-json",
+                "recovery_required": false
+            }),
+            serde_json::json!({
+                "principal": principal,
+                "recovery_required": "false"
+            }),
+            serde_json::json!({
+                "principal": encoded_principal(),
+                "idempotency_lookup_digest": "ABC123",
+                "recovery_required": false
+            }),
+        ];
+
+        for value in malformed {
+            let encoded = serde_json::to_string(&value).expect("metadata JSON");
+            assert!(
+                decode_persisted_bus_metadata(&encoded).is_err(),
+                "malformed persisted metadata must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_fields_cannot_hide_inside_a_legacy_principal_shape() {
+        let mut principal: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str::<serde_json::Value>(&encoded_principal())
+                .expect("principal JSON")
+                .as_object()
+                .expect("principal object")
+                .clone();
+        principal.insert(
+            "replay_lookup_digest".to_owned(),
+            serde_json::Value::String("a".repeat(64)),
+        );
+        principal.insert(
+            "recovery_required".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        let encoded = serde_json::Value::Object(principal).to_string();
+        assert!(decode_persisted_bus_metadata(&encoded).is_err());
+    }
+
+    #[test]
+    fn duplicate_metadata_fields_fail_closed() {
+        let principal = encoded_principal();
+        let duplicate = [
+            format!(
+                "{{\"principal\":{principal:?},\"principal\":{principal:?},\"recovery_required\":false}}"
+            ),
+            format!(
+                "{{\"principal\":{principal:?},\"replay_lookup_digest\":\"{}\",\"replay_lookup_digest\":\"{}\",\"recovery_required\":false}}",
+                "a".repeat(64),
+                "b".repeat(64)
+            ),
+            format!(
+                "{{\"principal\":{principal:?},\"recovery_required\":true,\"recovery_required\":false}}"
+            ),
+        ];
+        for encoded in duplicate {
+            assert!(decode_persisted_bus_metadata(&encoded).is_err());
+        }
+    }
+}
+
 /// Helper to add a std Duration to opc_types::Timestamp
 pub fn add_duration(ts: Timestamp, dur: Duration) -> Timestamp {
     let odt = *ts.as_offset_datetime();
@@ -281,46 +501,9 @@ where
 {
     async fn load_latest(&self) -> Result<Option<BusStoredConfig<SealedConfig<C>>>, StoreError> {
         match self.inner.load_latest().await {
-            Ok(Some(stored)) => {
-                let principal = serde_json::from_str(&stored.record.principal)
-                    .map_err(|e| StoreError::internal(e.to_string()))?;
-                let source = match stored.record.source {
-                    CommitSource::Gnmi => RequestSource::Northbound,
-                    CommitSource::StartupRestore => RequestSource::StartupRecovery,
-                    _ => RequestSource::Internal,
-                };
-                let mut plaintext_digest = [0u8; 32];
-                if stored.record.plaintext_digest.len() == 32 {
-                    plaintext_digest.copy_from_slice(&stored.record.plaintext_digest);
-                } else {
-                    return Err(StoreError::internal("invalid plaintext digest length"));
-                }
-                Ok(Some(BusStoredConfig {
-                    tx_id: stored.record.tx_id,
-                    parent_tx_id: stored.record.parent_tx_id,
-                    version: stored.record.version,
-                    committed_at: stored.record.committed_at,
-                    principal,
-                    source,
-                    schema_digest: stored.record.schema_digest,
-                    plaintext_digest: Some(plaintext_digest),
-                    config: SealedConfig::new(stored.record.schema_digest),
-                    encrypted_blob: stored.record.encrypted_blob,
-                    idempotency_key: None,
-                    apply_plan: None,
-                    request_fingerprint: None,
-                    request_id: None,
-                    recovery_required: false,
-                    confirmed_deadline: stored.record.confirmed_deadline,
-                    rollback_label: if stored.record.rollback_point {
-                        Some("rollback".to_string())
-                    } else {
-                        None
-                    },
-                }))
-            }
+            Ok(Some(stored)) => adapt_stored_config(stored).map(Some),
             Ok(None) => Ok(None),
-            Err(e) => Err(StoreError::internal(e.to_string())),
+            Err(error) => Err(map_persist_error(error)),
         }
     }
 
@@ -335,61 +518,65 @@ where
             BusRollbackTarget::Label(l) => RollbackTarget::ByLabel(l),
         };
         match self.inner.load_rollback(persist_target).await {
-            Ok(stored) => {
-                let principal = serde_json::from_str(&stored.record.principal)
-                    .map_err(|e| StoreError::internal(e.to_string()))?;
-                let source = match stored.record.source {
-                    CommitSource::Gnmi => RequestSource::Northbound,
-                    CommitSource::StartupRestore => RequestSource::StartupRecovery,
-                    _ => RequestSource::Internal,
-                };
-                let mut plaintext_digest = [0u8; 32];
-                if stored.record.plaintext_digest.len() == 32 {
-                    plaintext_digest.copy_from_slice(&stored.record.plaintext_digest);
-                } else {
-                    return Err(StoreError::internal("invalid plaintext digest length"));
-                }
-                Ok(BusStoredConfig {
-                    tx_id: stored.record.tx_id,
-                    parent_tx_id: stored.record.parent_tx_id,
-                    version: stored.record.version,
-                    committed_at: stored.record.committed_at,
-                    principal,
-                    source,
-                    schema_digest: stored.record.schema_digest,
-                    plaintext_digest: Some(plaintext_digest),
-                    config: SealedConfig::new(stored.record.schema_digest),
-                    encrypted_blob: stored.record.encrypted_blob,
-                    idempotency_key: None,
-                    apply_plan: None,
-                    request_fingerprint: None,
-                    request_id: None,
-                    recovery_required: false,
-                    confirmed_deadline: stored.record.confirmed_deadline,
-                    rollback_label: if stored.record.rollback_point {
-                        Some("rollback".to_string())
-                    } else {
-                        None
-                    },
-                })
-            }
-            Err(e) => Err(StoreError::internal(e.to_string())),
+            Ok(stored) => adapt_stored_config(stored),
+            Err(error) => Err(map_persist_error(error)),
         }
     }
 
     async fn load_by_idempotency_key(
         &self,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Option<BusStoredConfig<SealedConfig<C>>>, StoreError> {
+        validate_replay_lookup_digest(Some(idempotency_key))?;
+        self.inner
+            .load_by_replay_lookup_digest(idempotency_key.as_str())
+            .await
+            .map_err(map_persist_error)?
+            .map(adapt_stored_config)
+            .transpose()
+    }
+
+    async fn load_by_legacy_idempotency_key(
+        &self,
         _idempotency_key: &IdempotencyKey,
     ) -> Result<Option<BusStoredConfig<SealedConfig<C>>>, StoreError> {
+        // This adapter never persisted caller-provided raw keys in cleartext;
+        // pre-envelope records therefore cannot have a legacy raw-key index.
         Ok(None)
     }
 
-    async fn append_commit(
+    async fn load_by_request_id(
         &self,
-        commit: BusStoredConfig<SealedConfig<C>>,
+        _request_id: RequestId,
+    ) -> Result<Option<BusStoredConfig<SealedConfig<C>>>, StoreError> {
+        // Clear request identifiers were never persisted by this adapter. A
+        // current encrypted record is found through its domain-separated
+        // replay digest before this compatibility fallback is reached.
+        Ok(None)
+    }
+
+    async fn append_commit_write(
+        &self,
+        commit: BusCommitWrite<SealedConfig<C>>,
     ) -> Result<(), StoreError> {
-        let principal_str = serde_json::to_string(&commit.principal)
-            .map_err(|e| StoreError::internal(e.to_string()))?;
+        let (commit, resolution) = commit.into_parts();
+        validate_replay_lookup_digest(commit.idempotency_key.as_ref())?;
+        if commit.apply_plan.is_some()
+            || commit.request_fingerprint.is_some()
+            || commit.request_id.is_some()
+        {
+            return Err(StoreError::internal(
+                "sealed config adapter received plaintext replay metadata",
+            ));
+        }
+        let aad_principal = serde_json::to_string(&commit.principal)
+            .map_err(|_| StoreError::internal("authenticated principal serialization failed"))?;
+        let principal_str = serde_json::to_string(&PersistedBusMetadata {
+            principal: aad_principal,
+            replay_lookup_digest: commit.idempotency_key,
+            recovery_required: commit.recovery_required,
+        })
+        .map_err(|_| StoreError::internal("sealed config metadata serialization failed"))?;
         let source = match commit.source {
             RequestSource::Northbound => CommitSource::Gnmi,
             RequestSource::StartupRecovery => CommitSource::StartupRestore,
@@ -427,23 +614,54 @@ where
         }];
 
         let claim = commit.config.claim_fresh_envelope()?;
-        let commit = AttestedConfigCommit::try_new(record, audit, claim)
-            .map_err(|error| StoreError::internal(error.to_string()))?;
+        if !claim.matches(&record.encrypted_blob) {
+            return Err(StoreError::crypto(
+                "fresh config envelope bytes do not match durable record",
+            ));
+        }
+        if !claim.matches_plaintext_digest(&record.plaintext_digest) {
+            return Err(StoreError::crypto(
+                "fresh config envelope digest does not match durable record",
+            ));
+        }
+        let commit = match resolution {
+            Some(BusConfirmedCommitResolution::Confirm { pending_tx_id }) => {
+                AttestedConfigCommit::try_new_resolving(
+                    record,
+                    audit,
+                    claim,
+                    PersistConfirmedCommitResolution::Confirm { pending_tx_id },
+                )
+            }
+            Some(BusConfirmedCommitResolution::Rollback { pending_tx_id }) => {
+                AttestedConfigCommit::try_new_resolving(
+                    record,
+                    audit,
+                    claim,
+                    PersistConfirmedCommitResolution::Rollback { pending_tx_id },
+                )
+            }
+            None => AttestedConfigCommit::try_new(record, audit, claim),
+        }
+        .map_err(|error| StoreError::internal(error.to_string()))?;
         self.inner
             .append_attested_commit(commit)
             .await
-            .map_err(|e| StoreError::internal(e.to_string()))
+            .map_err(map_persist_error)
     }
 
-    async fn clear_recovery_required(&self, _tx_id: TxId) -> Result<(), StoreError> {
-        Ok(())
+    async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), StoreError> {
+        self.inner
+            .clear_recovery_required(tx_id)
+            .await
+            .map_err(map_persist_error)
     }
 
     async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), StoreError> {
         self.inner
             .mark_confirmed(tx_id)
             .await
-            .map_err(|e| StoreError::internal(e.to_string()))
+            .map_err(map_persist_error)
     }
 }
 

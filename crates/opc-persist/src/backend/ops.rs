@@ -10,13 +10,15 @@ use crate::error::PersistError;
 use crate::preflight::PersistCapabilities;
 use crate::types::{
     AlarmAuditEventRecord, AuditKey, AuditOpType, AuditRecord, CommitRecord, CommitSource,
-    ConfigStore, RollbackTarget, StoredConfig,
+    ConfigStore, ConfirmedCommitResolution, RollbackTarget, StoredConfig,
 };
 
 use super::{
     deserialize_audit_op_type, deserialize_commit_source, uuid_from_bytes, validate_uuid_bytes,
     SqliteBackend, StoredConfigRow,
 };
+
+type LatestConfigHeadRow = (Vec<u8>, i64, Option<String>, Option<String>);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ConfigStore implementation
@@ -56,6 +58,48 @@ impl ConfigStore for SqliteBackend {
         res
     }
 
+    async fn load_by_replay_lookup_digest(
+        &self,
+        digest: &str,
+    ) -> Result<Option<StoredConfig>, PersistError> {
+        crate::types::validate_replay_lookup_digest(digest)?;
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let res = (|| {
+            let tx_id: Option<Vec<u8>> = guard
+                .query_row(
+                    r#"SELECT tx_id
+                       FROM config_history
+                       WHERE CASE
+                               WHEN json_valid(principal)
+                               THEN json_extract(principal, '$.replay_lookup_digest')
+                               ELSE NULL
+                             END = ?1
+                       LIMIT 1"#,
+                    [digest],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            tx_id
+                .map(|tx_id| {
+                    Self::load_by_tx_id_bytes(&guard, &tx_id, self.audit_key.as_ref())
+                        .and_then(|record| record.ok_or_else(PersistError::rollback_not_found))
+                })
+                .transpose()
+        })();
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_read_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
     async fn append_commit(
         &self,
         record: CommitRecord,
@@ -64,8 +108,91 @@ impl ConfigStore for SqliteBackend {
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
         let res = Self::ensure_standalone_write_authority(&guard).and_then(|()| {
-            Self::append_commit_impl(&guard, record, audit, self.audit_key.as_ref())
+            Self::append_commit_impl(&guard, record, audit, None, self.audit_key.as_ref())
         });
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_write_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn append_commit_resolving(
+        &self,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        resolution: ConfirmedCommitResolution,
+    ) -> Result<(), PersistError> {
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let res = Self::ensure_standalone_write_authority(&guard).and_then(|()| {
+            Self::append_commit_impl(
+                &guard,
+                record,
+                audit,
+                Some(resolution),
+                self.audit_key.as_ref(),
+            )
+        });
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_write_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), PersistError> {
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let res = (|| -> Result<(), PersistError> {
+            Self::ensure_standalone_write_authority(&guard)?;
+            let tx = guard
+                .unchecked_transaction()
+                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            let tx_id_bytes = tx_id.as_uuid().as_bytes().to_vec();
+            let principal: Option<String> = tx
+                .query_row(
+                    "SELECT principal FROM config_history WHERE tx_id = ?1 AND tx_id = (SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1)",
+                    [&tx_id_bytes],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            let Some(principal) = principal else {
+                return Err(PersistError::rollback_not_found());
+            };
+            let Some(encoded) = crate::types::clear_config_recovery_required(&principal)? else {
+                return Ok(());
+            };
+            let changed = tx
+                .execute(
+                    "UPDATE config_history SET principal = ?1 WHERE tx_id = ?2 AND tx_id = (SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1)",
+                    params![encoded, &tx_id_bytes],
+                )
+                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            if changed != 1 {
+                return Err(PersistError::constraint_violation(
+                    "config recovery marker is no longer current",
+                ));
+            }
+            tx.execute(
+                "INSERT INTO config_lifecycle_audit (tx_id, action, principal, occurred_at, details) VALUES (?1, 'CLEAR_RECOVERY_REQUIRED', ?2, ?3, 'config recovery marker cleared')",
+                params![&tx_id_bytes, principal, Timestamp::now_utc().to_string()],
+            )
+            .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            tx.commit().map_err(|_| PersistError::outcome_unknown())?;
+            Ok(())
+        })();
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_write_success
@@ -89,21 +216,25 @@ impl ConfigStore for SqliteBackend {
             let tx = guard
                 .unchecked_transaction()
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
-            let principal: String = tx
+            let principal: Option<String> = tx
                 .query_row(
                     "SELECT principal FROM config_history WHERE tx_id = ?1",
                     params![&tx_id_bytes],
                     |row| row.get(0),
                 )
+                .optional()
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            let Some(principal) = principal else {
+                return Err(PersistError::rollback_not_found());
+            };
             let rows = tx
                 .execute(
-                    "UPDATE config_history SET confirmed_at = ?1 WHERE tx_id = ?2",
+                    "UPDATE config_history SET confirmed_at = ?1 WHERE tx_id = ?2 AND confirmed_deadline IS NOT NULL AND confirmed_at IS NULL AND tx_id = (SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1)",
                     params![now, &tx_id_bytes],
                 )
                 .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
-            if rows == 0 {
+            if rows != 1 {
                 return Err(PersistError::rollback_not_found());
             }
             tx.execute(
@@ -467,16 +598,111 @@ impl SqliteBackend {
         conn: &rusqlite::Connection,
         record: CommitRecord,
         audit: Vec<AuditRecord>,
+        resolution: Option<ConfirmedCommitResolution>,
         audit_key: &AuditKey,
     ) -> Result<(), PersistError> {
+        if !crate::types::config_principal_metadata_is_valid(&record.principal) {
+            return Err(PersistError::constraint_violation(
+                "config principal metadata is invalid",
+            ));
+        }
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| PersistError::sqlite(e.to_string()))?;
 
+        let latest: Option<LatestConfigHeadRow> = tx
+            .query_row(
+                "SELECT tx_id, version, confirmed_deadline, confirmed_at FROM config_history ORDER BY version DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| PersistError::sqlite(error.to_string()))?;
+        match (&latest, record.parent_tx_id) {
+            (None, None) => {}
+            (Some((latest_tx_id, latest_version, _, _)), Some(parent_tx_id))
+                if latest_tx_id.as_slice() == parent_tx_id.as_uuid().as_bytes()
+                    && u64::try_from(*latest_version)
+                        .ok()
+                        .and_then(|version| version.checked_add(1))
+                        == Some(record.version.get()) => {}
+            _ => {
+                return Err(PersistError::constraint_violation(
+                    "config commit parent is not the applied head",
+                ));
+            }
+        }
+
+        let latest_is_pending = latest
+            .as_ref()
+            .is_some_and(|(_, _, deadline, confirmed)| deadline.is_some() && confirmed.is_none());
+        match (latest_is_pending, resolution) {
+            (false, None) => {}
+            (true, Some(ConfirmedCommitResolution::Rollback { pending_tx_id }))
+                if record.parent_tx_id == Some(pending_tx_id)
+                    && record.confirmed_deadline.is_none() => {}
+            (true, Some(ConfirmedCommitResolution::Confirm { pending_tx_id }))
+                if record.parent_tx_id == Some(pending_tx_id)
+                    && record.confirmed_deadline.is_none() =>
+            {
+                let pending_tx_id = pending_tx_id.as_uuid().as_bytes().to_vec();
+                let principal: String = tx
+                    .query_row(
+                        "SELECT principal FROM config_history WHERE tx_id = ?1",
+                        [&pending_tx_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                let now = Timestamp::now_utc().to_string();
+                let rows = tx
+                    .execute(
+                        "UPDATE config_history SET confirmed_at = ?1 WHERE tx_id = ?2 AND confirmed_deadline IS NOT NULL AND confirmed_at IS NULL",
+                        params![&now, &pending_tx_id],
+                    )
+                    .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                if rows != 1 {
+                    return Err(PersistError::constraint_violation(
+                        "pending commit decision is no longer current",
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO config_lifecycle_audit (tx_id, action, principal, occurred_at, details) VALUES (?1, 'MARK_CONFIRMED', ?2, ?3, 'commit confirmed atomically with successor')",
+                    params![&pending_tx_id, principal, &now],
+                )
+                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            }
+            _ => {
+                return Err(PersistError::constraint_violation(
+                    "pending commit requires one atomic current-parent decision",
+                ));
+            }
+        }
+
+        if let Some(digest) = crate::types::config_replay_lookup_digest(&record.principal)? {
+            let duplicate: bool = tx
+                .query_row(
+                    r#"SELECT EXISTS(
+                           SELECT 1 FROM config_history
+                           WHERE CASE
+                                   WHEN json_valid(principal)
+                                   THEN json_extract(principal, '$.replay_lookup_digest')
+                                   ELSE NULL
+                                 END = ?1
+                       )"#,
+                    [&digest],
+                    |row| row.get(0),
+                )
+                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            if duplicate {
+                return Err(PersistError::constraint_violation(
+                    "config replay lookup digest is not unique",
+                ));
+            }
+        }
+
         Self::append_commit_raw(&tx, record.clone(), audit, audit_key)?;
 
-        tx.commit()
-            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        tx.commit().map_err(|_| PersistError::outcome_unknown())?;
         Ok(())
     }
 
@@ -618,6 +844,9 @@ impl SqliteBackend {
             rollback_point: rollback_point != 0,
             confirmed_deadline,
         };
+        if !crate::types::config_principal_metadata_is_valid(&record.principal) {
+            return Err(PersistError::corrupt_blob());
+        }
 
         // Load audit trail — use `query` to get rows, validate each in safe Rust,
         // and fail closed on corrupt data rather than silently dropping rows.

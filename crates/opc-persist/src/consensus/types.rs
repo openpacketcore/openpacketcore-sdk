@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::error::PersistError;
-use crate::types::{extract_tenant, AuditRecord, CommitRecord};
+use crate::types::{extract_tenant, AuditRecord, CommitRecord, ConfirmedCommitResolution};
 
 pub use opc_consensus::{
     ConsensusClusterId as ConfigConsensusClusterId,
@@ -26,15 +26,23 @@ pub use opc_consensus::{
     ConsensusNodeId as ConfigConsensusNodeId, ConsensusRequestId as ConfigConsensusRequestId,
 };
 
+pub(crate) const LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 1;
 /// Current config command revision. This is deliberately independent of the
 /// shared transport, durable-storage, and snapshot revisions.
-pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 1;
+///
+/// Revision 2 adds atomic commit-confirmed resolution and recovery-fence
+/// clearing. Revision-1 commands remain readable only for their original
+/// three intents so existing durable logs can be replayed after upgrade.
+pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 2;
 /// Current SQLite authority schema revision.
 pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 1;
 /// Current config snapshot envelope revision.
 pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 1;
 /// Current config-specific RPC payload revision.
-pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 1;
+///
+/// Revision 2 carries the revision-2 command admission contract. Peers require
+/// an exact match and do not negotiate a downgrade.
+pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 2;
 
 /// Maximum configured voter count admitted by the config consensus adapter.
 pub const CONFIG_CONSENSUS_MAX_MEMBERS: usize = 9;
@@ -290,6 +298,20 @@ impl PreparedConfigCommit {
     }
 }
 
+fn validate_confirmed_resolution(
+    record: &CommitRecord,
+    resolution: ConfirmedCommitResolution,
+) -> Result<(), PersistError> {
+    if record.parent_tx_id != Some(resolution.pending_tx_id())
+        || record.confirmed_deadline.is_some()
+    {
+        return Err(PersistError::constraint_violation(
+            "confirmed resolution does not match a non-pending successor",
+        ));
+    }
+    Ok(())
+}
+
 /// High-level deterministic mutation carried by a normal Openraft entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum ConfigMutationIntent {
@@ -302,6 +324,32 @@ pub(crate) enum ConfigMutationIntent {
         tx_id: TxId,
         label: Option<ValidatedRollbackLabel>,
     },
+    /// Resolve the exact pending head and append its successor atomically.
+    ///
+    /// New intents stay after every revision-1 variant because postcard uses
+    /// declaration order in config RPC/Openraft replication payloads. Durable
+    /// JSON rows retain their named revision-1 variant shapes separately.
+    ResolveConfirmedAndAppend {
+        /// Encrypted successor and finalized audit history.
+        commit: Box<PreparedConfigCommit>,
+        /// Exact pending-parent decision.
+        resolution: ConfirmedCommitResolution,
+    },
+    /// Clear the config-bus recovery fence marker on one durable record.
+    ClearRecoveryRequired { tx_id: TxId },
+}
+
+impl ConfigMutationIntent {
+    const fn minimum_command_version(&self) -> u16 {
+        match self {
+            Self::AppendCommit(_)
+            | Self::MarkConfirmed { .. }
+            | Self::CreateRollbackPoint { .. } => LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+            Self::ResolveConfirmedAndAppend { .. } | Self::ClearRecoveryRequired { .. } => {
+                CONFIG_CONSENSUS_COMMAND_VERSION
+            }
+        }
+    }
 }
 
 /// Canonical rollback label validated before it can enter a command.
@@ -345,7 +393,12 @@ pub(crate) struct ConfigConsensusCommand {
 impl ConfigConsensusCommand {
     /// Digest the command bytes for request-ID collision detection.
     pub(crate) fn payload_digest(&self) -> Result<[u8; 32], PersistError> {
-        let bytes = serde_json::to_vec(&(self.schema_version, self.identity, &self.intent))
+        // Legacy intents retain their revision-1 digest across the coordinated
+        // upgrade. A caller that lost the old leader's response can therefore
+        // resubmit the same durable request ID through a revision-2 binary and
+        // receive the stored outcome instead of a false collision.
+        let semantic_revision = self.intent.minimum_command_version();
+        let bytes = serde_json::to_vec(&(semantic_revision, self.identity, &self.intent))
             .map_err(|_| PersistError::inconsistent_state("config consensus encoding failed"))?;
         let mut hasher = Sha256::new();
         hasher.update(OUTCOME_DIGEST_DOMAIN);
@@ -370,13 +423,25 @@ impl ConfigConsensusCommand {
 
     /// Validate scope, schema, and encrypted command contents.
     pub(crate) fn validate(&self, identity: ConsensusIdentity) -> Result<(), PersistError> {
-        if self.schema_version != CONFIG_CONSENSUS_COMMAND_VERSION || self.identity != identity {
+        let supported_revision = match self.schema_version {
+            LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION => {
+                self.intent.minimum_command_version() == LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION
+            }
+            CONFIG_CONSENSUS_COMMAND_VERSION => true,
+            _ => false,
+        };
+        if !supported_revision || self.identity != identity {
             return Err(PersistError::inconsistent_state(
-                "config consensus command scope mismatch",
+                "config consensus command scope or revision mismatch",
             ));
         }
         match &self.intent {
             ConfigMutationIntent::AppendCommit(commit) => commit.validate()?,
+            ConfigMutationIntent::ResolveConfirmedAndAppend { commit, resolution } => {
+                commit.validate()?;
+                validate_confirmed_resolution(&commit.record, *resolution)?;
+            }
+            ConfigMutationIntent::ClearRecoveryRequired { .. } => {}
             ConfigMutationIntent::MarkConfirmed { .. } => {}
             ConfigMutationIntent::CreateRollbackPoint { label, .. } => {
                 if label
@@ -492,10 +557,11 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
     if bound_key_id != envelope.key_id
         || aad.purpose() != opc_key::KeyPurpose::Config
         || aad.version() != record.version.get()
+        || aad.tenant().as_str() != extract_tenant(&record.principal)
         || metadata.tx_id() != &record.tx_id
         || metadata.parent_tx_id() != record.parent_tx_id.as_ref()
         || metadata.committed_at() != &record.committed_at
-        || metadata.principal() != record.principal
+        || !crate::types::config_principal_matches_aad(&record.principal, metadata.principal())
         || metadata.schema_digest() != &record.schema_digest
     {
         return Err(PersistError::corrupt_blob());
@@ -508,6 +574,7 @@ fn validate_record_representability(record: &CommitRecord) -> Result<(), Persist
         || record.principal.is_empty()
         || record.principal.len() > CONFIG_PRINCIPAL_MAX_BYTES
         || record.principal.chars().any(char::is_control)
+        || !crate::types::config_principal_metadata_is_valid(&record.principal)
     {
         return Err(PersistError::constraint_violation(
             "config record is not representable by durable storage",
@@ -651,6 +718,28 @@ pub type SharedConfigConsensusClock = Arc<dyn ConfigConsensusClock>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    #[derive(Serialize)]
+    enum LegacyConfigMutationIntent<'a> {
+        AppendCommit(&'a PreparedConfigCommit),
+        MarkConfirmed {
+            tx_id: TxId,
+        },
+        CreateRollbackPoint {
+            tx_id: TxId,
+            label: Option<&'a ValidatedRollbackLabel>,
+        },
+    }
+
+    #[derive(Serialize)]
+    struct LegacyConfigConsensusCommand<'a> {
+        schema_version: u16,
+        identity: ConfigConsensusIdentity,
+        request_id: ConfigConsensusRequestId,
+        logical_time: Timestamp,
+        intent: LegacyConfigMutationIntent<'a>,
+    }
 
     #[test]
     fn topology_rejects_even_and_missing_self_membership() {
@@ -697,11 +786,18 @@ mod tests {
 
     #[test]
     fn config_wire_revision_is_independent_and_exact() {
+        assert_eq!(2, CONFIG_CONSENSUS_WIRE_VERSION);
         let current = encode_config_wire(&7_u64).expect("current wire");
         assert_eq!(
             7,
             decode_config_wire::<u64>(&current).expect("current reader")
         );
+        let legacy = opc_consensus::encode_bounded(&ConfigWirePayload {
+            revision: CONFIG_CONSENSUS_WIRE_VERSION - 1,
+            value: 7_u64,
+        })
+        .expect("legacy fixture");
+        assert!(decode_config_wire::<u64>(&legacy).is_err());
         let future = opc_consensus::encode_bounded(&ConfigWirePayload {
             revision: CONFIG_CONSENSUS_WIRE_VERSION + 1,
             value: 7_u64,
@@ -722,5 +818,133 @@ mod tests {
             intent: ConfigMutationIntent::MarkConfirmed { tx_id: TxId::new() },
         };
         assert!(future_command.validate(identity).is_err());
+    }
+
+    #[test]
+    fn revision_one_persisted_commands_decode_but_cannot_claim_revision_two_intents() {
+        assert_eq!(2, CONFIG_CONSENSUS_COMMAND_VERSION);
+        let identity = ConfigConsensusIdentity::new(
+            ConfigConsensusClusterId::new("config-command-v1-replay-test").expect("cluster"),
+            ConfigConsensusConfigurationId::from_bytes([0xB1; 32]),
+            ConfigConsensusConfigurationEpoch::new(1).expect("epoch"),
+        );
+        let request_id = ConfigConsensusRequestId::from_bytes([0xB2; 16]);
+        let tx_id = TxId::new();
+        let encoded = serde_json::to_vec(&LegacyConfigConsensusCommand {
+            schema_version: LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+            identity,
+            request_id,
+            logical_time: Timestamp::from_str("2026-01-01T00:00:00Z").expect("fixed timestamp"),
+            intent: LegacyConfigMutationIntent::MarkConfirmed { tx_id },
+        })
+        .expect("persisted revision-one command fixture");
+        let replayed: ConfigConsensusCommand =
+            serde_json::from_slice(&encoded).expect("current reader decodes revision-one command");
+        assert!(replayed.validate(identity).is_ok());
+        let mut revision_two_retry = replayed.clone();
+        revision_two_retry.schema_version = CONFIG_CONSENSUS_COMMAND_VERSION;
+        assert!(revision_two_retry.validate(identity).is_ok());
+        assert_eq!(
+            replayed.payload_digest().expect("revision-one digest"),
+            revision_two_retry
+                .payload_digest()
+                .expect("revision-two retry digest")
+        );
+
+        let legacy_clear = ConfigConsensusCommand {
+            schema_version: LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+            identity,
+            request_id: ConfigConsensusRequestId::from_bytes([0xB3; 16]),
+            logical_time: Timestamp::now_utc(),
+            intent: ConfigMutationIntent::ClearRecoveryRequired { tx_id },
+        };
+        assert_eq!(
+            CONFIG_CONSENSUS_COMMAND_VERSION,
+            legacy_clear.intent.minimum_command_version()
+        );
+        assert!(legacy_clear.validate(identity).is_err());
+
+        let pending_tx_id = TxId::new();
+        let successor = PreparedConfigCommit {
+            record: CommitRecord {
+                tx_id: TxId::new(),
+                parent_tx_id: Some(pending_tx_id),
+                version: opc_types::ConfigVersion::new(2),
+                committed_at: Timestamp::from_str("2026-01-01T00:00:01Z").expect("fixed timestamp"),
+                principal: "spiffe://test.invalid/tenant/test/config".to_owned(),
+                source: crate::types::CommitSource::CommitConfirmedRestore,
+                schema_digest: opc_types::SchemaDigest::from_bytes([0xB4; 32]),
+                plaintext_digest: vec![0xB5; 32],
+                encrypted_blob: vec![0xB6; 32],
+                rollback_point: false,
+                confirmed_deadline: None,
+            },
+            audit: Vec::new(),
+        };
+        let legacy_resolution = ConfigConsensusCommand {
+            schema_version: LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+            identity,
+            request_id: ConfigConsensusRequestId::from_bytes([0xB7; 16]),
+            logical_time: Timestamp::now_utc(),
+            intent: ConfigMutationIntent::ResolveConfirmedAndAppend {
+                commit: Box::new(successor),
+                resolution: ConfirmedCommitResolution::Confirm { pending_tx_id },
+            },
+        };
+        assert_eq!(
+            CONFIG_CONSENSUS_COMMAND_VERSION,
+            legacy_resolution.intent.minimum_command_version()
+        );
+        assert!(legacy_resolution.validate(identity).is_err());
+    }
+
+    #[test]
+    fn revision_one_intents_retain_their_pre_resolution_wire_shapes() {
+        let prepared = PreparedConfigCommit {
+            record: CommitRecord {
+                tx_id: TxId::new(),
+                parent_tx_id: None,
+                version: opc_types::ConfigVersion::new(1),
+                committed_at: Timestamp::from_str("2026-01-01T00:00:00Z").expect("fixed timestamp"),
+                principal: "spiffe://test.invalid/tenant/test/config".to_owned(),
+                source: crate::types::CommitSource::Gnmi,
+                schema_digest: opc_types::SchemaDigest::from_bytes([0xA6; 32]),
+                plaintext_digest: vec![0xA7; 32],
+                encrypted_blob: vec![0xA8; 32],
+                rollback_point: false,
+                confirmed_deadline: None,
+            },
+            audit: Vec::new(),
+        };
+        let legacy =
+            opc_consensus::encode_bounded(&LegacyConfigMutationIntent::AppendCommit(&prepared))
+                .expect("legacy append fixture");
+        let current =
+            opc_consensus::encode_bounded(&ConfigMutationIntent::AppendCommit(Box::new(prepared)))
+                .expect("current append fixture");
+        assert_eq!(legacy, current);
+
+        let tx_id = TxId::new();
+        let legacy =
+            opc_consensus::encode_bounded(&LegacyConfigMutationIntent::MarkConfirmed { tx_id })
+                .expect("legacy confirmation fixture");
+        let current = opc_consensus::encode_bounded(&ConfigMutationIntent::MarkConfirmed { tx_id })
+            .expect("current confirmation fixture");
+        assert_eq!(legacy, current);
+
+        let label = ValidatedRollbackLabel::try_new("release-candidate".to_owned())
+            .expect("rollback label");
+        let legacy =
+            opc_consensus::encode_bounded(&LegacyConfigMutationIntent::CreateRollbackPoint {
+                tx_id,
+                label: Some(&label),
+            })
+            .expect("legacy rollback-point fixture");
+        let current = opc_consensus::encode_bounded(&ConfigMutationIntent::CreateRollbackPoint {
+            tx_id,
+            label: Some(label),
+        })
+        .expect("current rollback-point fixture");
+        assert_eq!(legacy, current);
     }
 }

@@ -163,6 +163,9 @@ enum ForwardMutationReply {
     NotLeader { leader: Option<ConsensusNodeId> },
     Unavailable,
     Rejected(ForwardMutationRejection),
+    // Keep additive variants after the original discriminants so their
+    // postcard shapes remain stable inside the exact revision-2 payload.
+    OutcomeUnknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +205,8 @@ struct ReadBarrierRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigPeerCompatibility {
+    wire_version: u16,
+    command_version: u16,
     audit_key_epoch: u64,
     audit_key_fingerprint: [u8; 32],
 }
@@ -528,15 +533,17 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
-        let (record, audit) = commit.into_parts();
+        let (record, audit, resolution) = commit.into_parts();
         let prepared =
             PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
-        self.submit_request(
-            request_id,
-            ConfigMutationIntent::AppendCommit(Box::new(prepared)),
-        )
-        .await?
-        .into_result()
+        let intent = match resolution {
+            Some(resolution) => ConfigMutationIntent::ResolveConfirmedAndAppend {
+                commit: Box::new(prepared),
+                resolution,
+            },
+            None => ConfigMutationIntent::AppendCommit(Box::new(prepared)),
+        };
+        self.submit_request(request_id, intent).await?.into_result()
     }
 
     /// Confirm with a caller-retained durable request ID.
@@ -548,6 +555,21 @@ impl ConsensusConfigStore {
         self.submit_request(request_id, ConfigMutationIntent::MarkConfirmed { tx_id })
             .await?
             .into_result()
+    }
+
+    /// Clear a config-bus recovery marker with a caller-retained durable
+    /// request ID.
+    pub async fn clear_recovery_required_idempotent(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        tx_id: opc_types::TxId,
+    ) -> Result<(), PersistError> {
+        self.submit_request(
+            request_id,
+            ConfigMutationIntent::ClearRecoveryRequired { tx_id },
+        )
+        .await?
+        .into_result()
     }
 
     /// Create a rollback point with a caller-retained durable request ID.
@@ -647,6 +669,8 @@ impl ConsensusConfigStore {
 
     fn peer_compatibility(&self) -> ConfigPeerCompatibility {
         ConfigPeerCompatibility {
+            wire_version: super::CONFIG_CONSENSUS_WIRE_VERSION,
+            command_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
             audit_key_epoch: self.inner.backend.audit_key().epoch(),
             audit_key_fingerprint: self.inner.backend.audit_key().fingerprint(),
         }
@@ -717,16 +741,32 @@ impl ConsensusConfigStore {
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         let mut preferred = None;
+        let mut ambiguity_seen = false;
         loop {
             let leader = match preferred.take() {
                 Some(leader) => leader,
-                None => self.wait_for_known_leader(deadline).await?,
+                None => match self.wait_for_known_leader(deadline).await {
+                    Ok(leader) => leader,
+                    Err(error) if ambiguity_seen => {
+                        drop(error);
+                        return Err(PersistError::outcome_unknown());
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+            let budget = match ForwardedBudget::from_deadline(deadline) {
+                Ok(budget) => budget,
+                Err(error) if ambiguity_seen => {
+                    drop(error);
+                    return Err(PersistError::outcome_unknown());
+                }
+                Err(error) => return Err(error),
             };
             let request = ForwardMutationRequest {
                 request_id,
                 intent: intent.clone(),
                 compatibility: self.peer_compatibility(),
-                budget: ForwardedBudget::from_deadline(deadline)?,
+                budget,
             };
             let reply = if leader == self.inner.local_node_id {
                 self.apply_on_local_leader(request.clone(), deadline).await
@@ -742,14 +782,17 @@ impl ConsensusConfigStore {
                 {
                     Ok(reply) => reply,
                     Err(_) => {
-                        self.wait_for_route_refresh(leader, deadline).await?;
+                        ambiguity_seen = true;
+                        if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
+                            drop(error);
+                            return Err(PersistError::outcome_unknown());
+                        }
                         continue;
                     }
                 }
             };
             match reply {
                 ForwardMutationReply::Applied(response) => {
-                    self.require_admission()?;
                     return Ok(*response);
                 }
                 ForwardMutationReply::Rejected(rejection) => {
@@ -763,11 +806,30 @@ impl ConsensusConfigStore {
                         *candidate != leader && self.inner.members.contains(candidate)
                     });
                     if preferred.is_none() {
-                        self.wait_for_route_refresh(leader, deadline).await?;
+                        if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
+                            if ambiguity_seen {
+                                drop(error);
+                                return Err(PersistError::outcome_unknown());
+                            }
+                            return Err(error);
+                        }
                     }
                 }
                 ForwardMutationReply::Unavailable => {
-                    self.wait_for_route_refresh(leader, deadline).await?;
+                    if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
+                        if ambiguity_seen {
+                            drop(error);
+                            return Err(PersistError::outcome_unknown());
+                        }
+                        return Err(error);
+                    }
+                }
+                ForwardMutationReply::OutcomeUnknown => {
+                    ambiguity_seen = true;
+                    if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
+                        drop(error);
+                        return Err(PersistError::outcome_unknown());
+                    }
                 }
             }
         }
@@ -830,7 +892,8 @@ impl ConsensusConfigStore {
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
-                Err(_) | Ok(Err(_)) => return ForwardMutationReply::Unavailable,
+                Err(_) => return ForwardMutationReply::OutcomeUnknown,
+                Ok(Err(_)) => return ForwardMutationReply::Unavailable,
                 Ok(Ok(response)) => response,
             };
         // The returned receiver proves that Openraft accepted this durable
@@ -839,7 +902,7 @@ impl ConsensusConfigStore {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let reply = match response.await {
-                Err(_) => ForwardMutationReply::Unavailable,
+                Err(_) => ForwardMutationReply::OutcomeUnknown,
                 Ok(Ok(response)) => ForwardMutationReply::Applied(Box::new(response.data)),
                 Ok(Err(ClientWriteError::ForwardToLeader(forward))) => {
                     ForwardMutationReply::NotLeader {
@@ -854,13 +917,10 @@ impl ConsensusConfigStore {
             drop(proposal_permit);
         });
         match tokio::time::timeout_at(deadline, completion_rx).await {
-            Err(_) | Ok(Err(_)) => ForwardMutationReply::Unavailable,
-            Ok(Ok(ForwardMutationReply::Applied(response)))
-                if self.exact_membership_is_admitted() =>
-            {
+            Err(_) | Ok(Err(_)) => ForwardMutationReply::OutcomeUnknown,
+            Ok(Ok(ForwardMutationReply::Applied(response))) => {
                 ForwardMutationReply::Applied(response)
             }
-            Ok(Ok(ForwardMutationReply::Applied(_))) => ForwardMutationReply::Unavailable,
             Ok(Ok(reply)) => reply,
         }
     }
@@ -1317,6 +1377,17 @@ impl ConfigStore for ConsensusConfigStore {
         self.inner.backend.load_rollback(target).await
     }
 
+    async fn load_by_replay_lookup_digest(
+        &self,
+        digest: &str,
+    ) -> Result<Option<StoredConfig>, PersistError> {
+        self.linearizable_barrier().await?;
+        self.inner
+            .backend
+            .load_by_replay_lookup_digest(digest)
+            .await
+    }
+
     async fn append_commit(
         &self,
         _record: CommitRecord,
@@ -1338,6 +1409,16 @@ impl ConfigStore for ConsensusConfigStore {
             record.tx_id.as_uuid().as_bytes(),
         );
         self.append_commit_idempotent(request_id, commit).await
+    }
+
+    async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), PersistError> {
+        let request_id = derive_durable_request_id(
+            self.inner.identity,
+            b"clear-recovery",
+            tx_id.as_uuid().as_bytes(),
+        );
+        self.clear_recovery_required_idempotent(request_id, tx_id)
+            .await
     }
 
     async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), PersistError> {
@@ -1375,6 +1456,25 @@ mod tests {
         ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
     };
     use super::*;
+
+    #[allow(dead_code)]
+    #[derive(Serialize)]
+    enum LegacyForwardMutationReply {
+        Applied(Box<ConfigConsensusResponse>),
+        NotLeader { leader: Option<ConsensusNodeId> },
+        Unavailable,
+        Rejected(ForwardMutationRejection),
+    }
+
+    #[test]
+    fn legacy_forward_rejection_discriminant_retains_its_wire_shape() {
+        let rejection = ForwardMutationRejection::CommandTooLarge;
+        let legacy = encode_config_wire(&LegacyForwardMutationReply::Rejected(rejection))
+            .expect("legacy forwarded rejection fixture");
+        let current = encode_config_wire(&ForwardMutationReply::Rejected(rejection))
+            .expect("current forwarded rejection fixture");
+        assert_eq!(legacy, current);
+    }
 
     fn size_test_timestamp() -> opc_types::Timestamp {
         opc_types::Timestamp::from_offset_datetime(
@@ -1833,8 +1933,8 @@ mod tests {
 
         let incompatible = ReadBarrierRequest {
             compatibility: ConfigPeerCompatibility {
-                audit_key_epoch: store.peer_compatibility().audit_key_epoch,
                 audit_key_fingerprint: [0; 32],
+                ..store.peer_compatibility()
             },
             compatibility_probe: false,
             budget: ForwardedBudget {
@@ -1848,6 +1948,80 @@ mod tests {
         )
         .await;
         assert_eq!(Err(ConsensusPeerError::ScopeMismatch), response.result);
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn formation_probe_rejects_mixed_wire_and_command_revisions_before_admission() {
+        #[derive(Serialize)]
+        struct ExplicitWirePayload<'a, T: ?Sized> {
+            revision: u16,
+            value: &'a T,
+        }
+
+        let (store, _snapshots) = singleton_store().await;
+        let before_log = store.inner.raft.metrics().borrow().last_log_index;
+        let current_probe = ReadBarrierRequest {
+            compatibility: store.peer_compatibility(),
+            compatibility_probe: true,
+            budget: ForwardedBudget {
+                remaining_nanos: 50_000_000,
+            },
+        };
+        let current_response = service_call(
+            &store,
+            ConsensusRpcFamily::ReadBarrier,
+            encode_config_wire(&current_probe).expect("current formation probe"),
+        )
+        .await;
+        let current_reply: ReadBarrierReply = decode_config_wire(
+            &current_response
+                .result
+                .expect("uniform revision formation probe reply"),
+        )
+        .expect("decode uniform revision formation reply");
+        assert_eq!(ReadBarrierReply::Compatible, current_reply);
+
+        store.inner.admitted.store(false, Ordering::Release);
+        let legacy_wire = opc_consensus::encode_bounded(&ExplicitWirePayload {
+            revision: super::super::CONFIG_CONSENSUS_WIRE_VERSION - 1,
+            value: &current_probe,
+        })
+        .expect("legacy wire formation probe");
+        let response = service_call(&store, ConsensusRpcFamily::ReadBarrier, legacy_wire).await;
+        assert_eq!(Err(ConsensusPeerError::Protocol), response.result);
+
+        for compatibility in [
+            ConfigPeerCompatibility {
+                wire_version: super::super::CONFIG_CONSENSUS_WIRE_VERSION - 1,
+                ..store.peer_compatibility()
+            },
+            ConfigPeerCompatibility {
+                command_version: super::super::CONFIG_CONSENSUS_COMMAND_VERSION - 1,
+                ..store.peer_compatibility()
+            },
+        ] {
+            let mixed_probe = ReadBarrierRequest {
+                compatibility,
+                ..current_probe
+            };
+            let response = service_call(
+                &store,
+                ConsensusRpcFamily::ReadBarrier,
+                encode_config_wire(&mixed_probe).expect("mixed revision formation probe"),
+            )
+            .await;
+            assert_eq!(Err(ConsensusPeerError::ScopeMismatch), response.result);
+        }
+        assert!(!store.status().admitted);
+        assert_eq!(
+            before_log,
+            store.inner.raft.metrics().borrow().last_log_index
+        );
+        assert_eq!(
+            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+            store.inner.proposal_admission.available_permits()
+        );
         store.shutdown().await.expect("shutdown");
     }
 

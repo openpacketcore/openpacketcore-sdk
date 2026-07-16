@@ -59,24 +59,24 @@ async fn mock_store_rejects_duplicate_history_keys() {
     );
 
     store
-        .append_commit(record.clone())
+        .append_commit_write(CommitWrite::new(record.clone()))
         .await
         .expect("first insert succeeds");
 
     let duplicate_tx = store
-        .append_commit(record.clone())
+        .append_commit_write(CommitWrite::new(record.clone()))
         .await
         .expect_err("duplicate tx id should be rejected");
     assert_eq!(duplicate_tx.code, StoreErrorCode::Internal);
 
     let duplicate_version = store
-        .append_commit(StoredConfig::new(
+        .append_commit_write(CommitWrite::new(StoredConfig::new(
             opc_types::TxId::new(),
             ConfigVersion::new(1),
             principal(),
             RequestSource::Northbound,
             TestConfig::new("persisted-v2"),
-        ))
+        )))
         .await
         .expect_err("duplicate version should be rejected");
     assert_eq!(duplicate_version.code, StoreErrorCode::Internal);

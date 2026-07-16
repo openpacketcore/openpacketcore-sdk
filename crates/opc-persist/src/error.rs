@@ -32,6 +32,10 @@ pub enum PersistErrorKind {
     /// A durable request identity was reused for a different mutation payload.
     #[error("durable request identity was reused with a different payload")]
     RequestIdCollision,
+    /// A write may have committed but its authoritative acknowledgement was
+    /// lost; callers must resolve it by durable request identity before retry.
+    #[error("durable write outcome is unknown")]
+    OutcomeUnknown,
     /// The storage path is not writable or does not exist.
     #[error("path not writable: {0}")]
     PathNotWritable(String),
@@ -234,6 +238,11 @@ impl PersistError {
 
     pub fn request_id_collision() -> Self {
         Self::new(PersistErrorKind::RequestIdCollision)
+    }
+
+    /// Construct an ambiguous durable-write result.
+    pub fn outcome_unknown() -> Self {
+        Self::new(PersistErrorKind::OutcomeUnknown)
     }
 
     pub fn path_not_writable(path: impl Into<String>) -> Self {

@@ -1359,6 +1359,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cached lanes clear shared reconnect cooldown only after a complete validated
   reusable response, preventing stale sockets from restarting connection
   churn during exact-address member replacement.
+- **Honest durable config outcomes — `opc-config-bus`, `opc-persist`, and
+  `opc-amf-lite`:** a write that has reached the Openraft state machine can no
+  longer be reported as a definite persistence failure merely because its
+  acknowledgement, caller deadline, or post-publication recovery-marker clear
+  was lost. Ambiguous writes return the distinct `OutcomeUnknown` code, fence
+  further mutation, and retain encrypted request/idempotency replay metadata
+  for authoritative readback without exposing raw keys in Raft, SQLite, logs,
+  or snapshots. SQLite resolves the domain-separated replay digest with one
+  unique indexed read, so reconciliation remains available regardless of
+  history length. Ordinary commits, pending commit creation, explicit confirm,
+  cancel, and rollback retain distinct encrypted request fingerprints so a
+  semantically different same-key request cannot alias the original result.
+  Commit-confirmed decisions now compare the applied head and
+  append their successor in one state-machine operation, preventing competing
+  leaders from committing sibling decisions. Existing `ManagedDatastore`
+  implementations remain source-compatible through `append_commit` and
+  `mark_confirmed`; they must implement the new fail-closed
+  `append_commit_write` extension before serving config-bus writes. Config
+  command and RPC payload revisions advance to 2; exact RPC decoding and
+  formation compatibility make cross-revision paths in a rolling mixed-binary
+  deployment fail closed before a revision-2 node admits writes, so consensus
+  members require a coordinated drained stop/upgrade/start.
+  Persisted revision-1 commands for the original append, confirm, and
+  rollback-point intents remain readable and replayable; revision-1 commands
+  cannot claim either new revision-2 intent. Their semantic request digest is
+  stable, so a revision-2 retry with the same durable ID replays the exact
+  revision-1 outcome. Existing forwarded-reply discriminants retain their
+  prior ordering inside the revision-2 payload.
 - **Projected-mTLS restart readiness — `opc-identity` and
   `opc-session-testkit`:** waiting for an initial projected SVID now also
   guarantees that the paired TLS-controller publication is ready, preventing

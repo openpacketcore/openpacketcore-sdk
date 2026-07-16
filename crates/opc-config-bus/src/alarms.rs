@@ -82,6 +82,7 @@ pub(crate) fn apply_commit_alarm_outcome(
 pub(crate) fn commit_error_alarm_spec(code: CommitErrorCode) -> (Severity, ProbableCause) {
     match code {
         CommitErrorCode::PersistFailed
+        | CommitErrorCode::OutcomeUnknown
         | CommitErrorCode::RecoveryRequired
         | CommitErrorCode::RollbackUnavailable
         | CommitErrorCode::StateMachineFault => (Severity::Major, ProbableCause::StorageCorruption),
@@ -103,6 +104,7 @@ pub(crate) fn commit_error_alarm_spec(code: CommitErrorCode) -> (Severity, Proba
 pub(crate) fn startup_error_alarm_spec(code: StoreErrorCode) -> (Severity, ProbableCause) {
     match code {
         StoreErrorCode::Unavailable
+        | StoreErrorCode::OutcomeUnknown
         | StoreErrorCode::Internal
         | StoreErrorCode::Crypto
         | StoreErrorCode::RestoreSchemaMismatch

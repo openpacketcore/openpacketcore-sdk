@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use opc_data_governance::DataClass;
 use opc_redaction::{redact, RedactionLevel};
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::Sha256;
 use std::net::Ipv6Addr;
 use std::{fmt, fmt::Debug};
@@ -73,6 +74,35 @@ pub struct CommitRecord {
     pub confirmed_deadline: Option<Timestamp>,
 }
 
+/// Atomic decision applied with a successor configuration commit.
+///
+/// The referenced transaction must be the current durable head, must still be
+/// pending commit-confirmed, and must equal the successor's `parent_tx_id`.
+/// Persistence backends compare and apply this decision in the same
+/// transaction as the successor append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfirmedCommitResolution {
+    /// Permanently confirm the exact pending parent.
+    Confirm {
+        /// Pending transaction that must still be the applied head.
+        pending_tx_id: TxId,
+    },
+    /// Supersede the exact pending parent with a rollback successor.
+    Rollback {
+        /// Pending transaction that must still be the applied head.
+        pending_tx_id: TxId,
+    },
+}
+
+impl ConfirmedCommitResolution {
+    /// Return the pending transaction guarded by this decision.
+    pub const fn pending_tx_id(self) -> TxId {
+        match self {
+            Self::Confirm { pending_tx_id } | Self::Rollback { pending_tx_id } => pending_tx_id,
+        }
+    }
+}
+
 /// An individual YANG-path-level audit entry.
 ///
 /// Each entry records the operation performed on a single YANG data node during
@@ -127,6 +157,7 @@ pub struct StoredConfig {
 pub struct AttestedConfigCommit {
     record: CommitRecord,
     audit: Vec<AuditRecord>,
+    confirmed_resolution: Option<ConfirmedCommitResolution>,
 }
 
 impl AttestedConfigCommit {
@@ -140,15 +171,58 @@ impl AttestedConfigCommit {
         {
             return Err(PersistError::corrupt_blob());
         }
-        Ok(Self { record, audit })
+        Ok(Self {
+            record,
+            audit,
+            confirmed_resolution: None,
+        })
     }
 
-    pub(crate) fn into_parts(self) -> (CommitRecord, Vec<AuditRecord>) {
-        (self.record, self.audit)
+    /// Bind a fresh authenticated envelope to an atomic commit-confirmed
+    /// decision. The successor must name the guarded pending transaction as
+    /// its parent and cannot itself be pending.
+    pub fn try_new_resolving(
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        claim: opc_crypto::AuthenticatedEnvelopeClaim,
+        resolution: ConfirmedCommitResolution,
+    ) -> Result<Self, PersistError> {
+        if record.parent_tx_id != Some(resolution.pending_tx_id())
+            || record.confirmed_deadline.is_some()
+        {
+            return Err(PersistError::constraint_violation(
+                "confirmed resolution does not match a non-pending successor",
+            ));
+        }
+        if !claim.matches(&record.encrypted_blob)
+            || !claim.matches_plaintext_digest(&record.plaintext_digest)
+        {
+            return Err(PersistError::corrupt_blob());
+        }
+        Ok(Self {
+            record,
+            audit,
+            confirmed_resolution: Some(resolution),
+        })
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CommitRecord,
+        Vec<AuditRecord>,
+        Option<ConfirmedCommitResolution>,
+    ) {
+        (self.record, self.audit, self.confirmed_resolution)
     }
 
     pub fn record(&self) -> &CommitRecord {
         &self.record
+    }
+
+    /// Return the optional atomic decision carried by this commit.
+    pub const fn confirmed_resolution(&self) -> Option<ConfirmedCommitResolution> {
+        self.confirmed_resolution
     }
 }
 
@@ -158,6 +232,7 @@ impl fmt::Debug for AttestedConfigCommit {
             .debug_struct("AttestedConfigCommit")
             .field("tx_id", &self.record.tx_id)
             .field("version", &self.record.version)
+            .field("confirmed_resolution", &self.confirmed_resolution)
             .field("encrypted_blob", &"<redacted>")
             .field("audit_records", &self.audit.len())
             .finish()
@@ -185,6 +260,21 @@ pub trait ConfigStore: Send + Sync {
     /// Load a specific rollback target.
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError>;
 
+    /// Load the unique config record carrying one domain-separated replay
+    /// lookup digest.
+    ///
+    /// Production stores override this with one authoritative indexed read.
+    /// The default fails closed so external stores continue to compile but do
+    /// not turn a long history walk into an availability cliff.
+    async fn load_by_replay_lookup_digest(
+        &self,
+        _digest: &str,
+    ) -> Result<Option<StoredConfig>, PersistError> {
+        Err(PersistError::constraint_violation(
+            "indexed config replay lookup is unsupported",
+        ))
+    }
+
     /// Append a new commit record and its audit trail atomically.
     ///
     /// This method MUST be atomic: on recovery, either both `record` and all
@@ -195,6 +285,21 @@ pub trait ConfigStore: Send + Sync {
         audit: Vec<AuditRecord>,
     ) -> Result<(), PersistError>;
 
+    /// Atomically compare the current head, append the successor, and resolve
+    /// its exact pending commit-confirmed parent. The default rejects the
+    /// operation so legacy adapters fail closed instead of splitting it into
+    /// two writes; production backends in this SDK override it.
+    async fn append_commit_resolving(
+        &self,
+        _record: CommitRecord,
+        _audit: Vec<AuditRecord>,
+        _resolution: ConfirmedCommitResolution,
+    ) -> Result<(), PersistError> {
+        Err(PersistError::constraint_violation(
+            "atomic confirmed-commit resolution is unsupported",
+        ))
+    }
+
     /// Append a commit carrying one-shot evidence from the real encryption
     /// adapter. Ordinary SQLite/mock stores delegate to their existing typed
     /// append; consensus stores override this and reject the raw method.
@@ -202,8 +307,23 @@ pub trait ConfigStore: Send + Sync {
         &self,
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
-        let (record, audit) = commit.into_parts();
-        self.append_commit(record, audit).await
+        let (record, audit, resolution) = commit.into_parts();
+        match resolution {
+            Some(resolution) => {
+                self.append_commit_resolving(record, audit, resolution)
+                    .await
+            }
+            None => self.append_commit(record, audit).await,
+        }
+    }
+
+    /// Durably clear the config-bus recovery marker for one committed
+    /// transaction. Production backends apply this as an idempotent lifecycle
+    /// mutation; the default fails closed for legacy adapters.
+    async fn clear_recovery_required(&self, _tx_id: TxId) -> Result<(), PersistError> {
+        Err(PersistError::constraint_violation(
+            "durable recovery-marker lifecycle is unsupported",
+        ))
     }
 
     /// Mark a commit-confirmed transaction as confirmed before its deadline.
@@ -319,7 +439,234 @@ impl fmt::Debug for AuditKey {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ConfigPrincipalMetadata {
+    principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_lookup_digest: Option<String>,
+    recovery_required: bool,
+}
+
+#[derive(Debug, Default)]
+struct ConfigPrincipalMetadataProbe {
+    is_object: bool,
+    saw_reserved_field: bool,
+    saw_principal: bool,
+    principal: Option<String>,
+    saw_replay_lookup_digest: bool,
+    replay_lookup_digest: Option<String>,
+    saw_recovery_required: bool,
+    recovery_required: Option<bool>,
+    duplicate_reserved_field: bool,
+    unknown_field: bool,
+    invalid_field_type: bool,
+}
+
+impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProbeVisitor;
+
+        impl<'de> Visitor<'de> for ProbeVisitor {
+            type Value = ConfigPrincipalMetadataProbe;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut probe = ConfigPrincipalMetadataProbe {
+                    is_object: true,
+                    ..ConfigPrincipalMetadataProbe::default()
+                };
+                while let Some(field) = map.next_key::<String>()? {
+                    match field.as_str() {
+                        "principal" => {
+                            probe.saw_reserved_field = true;
+                            if probe.saw_principal {
+                                probe.duplicate_reserved_field = true;
+                            }
+                            probe.saw_principal = true;
+                            let value = map.next_value::<serde_json::Value>()?;
+                            match value {
+                                serde_json::Value::String(principal) => {
+                                    probe.principal = Some(principal);
+                                }
+                                _ => probe.invalid_field_type = true,
+                            }
+                        }
+                        "replay_lookup_digest" => {
+                            probe.saw_reserved_field = true;
+                            if probe.saw_replay_lookup_digest {
+                                probe.duplicate_reserved_field = true;
+                            }
+                            probe.saw_replay_lookup_digest = true;
+                            let value = map.next_value::<serde_json::Value>()?;
+                            match value {
+                                serde_json::Value::Null => probe.replay_lookup_digest = None,
+                                serde_json::Value::String(digest) => {
+                                    probe.replay_lookup_digest = Some(digest);
+                                }
+                                _ => probe.invalid_field_type = true,
+                            }
+                        }
+                        "recovery_required" => {
+                            probe.saw_reserved_field = true;
+                            if probe.saw_recovery_required {
+                                probe.duplicate_reserved_field = true;
+                            }
+                            probe.saw_recovery_required = true;
+                            let value = map.next_value::<serde_json::Value>()?;
+                            match value {
+                                serde_json::Value::Bool(required) => {
+                                    probe.recovery_required = Some(required);
+                                }
+                                _ => probe.invalid_field_type = true,
+                            }
+                        }
+                        _ => {
+                            probe.unknown_field = true;
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(probe)
+            }
+        }
+
+        deserializer.deserialize_any(ProbeVisitor)
+    }
+}
+
+enum ParsedConfigPrincipal {
+    Legacy,
+    Wrapped(ConfigPrincipalMetadata),
+    Invalid,
+}
+
+fn parse_config_principal(stored: &str) -> ParsedConfigPrincipal {
+    let Ok(probe) = serde_json::from_str::<ConfigPrincipalMetadataProbe>(stored) else {
+        return ParsedConfigPrincipal::Legacy;
+    };
+    if !probe.is_object || !probe.saw_reserved_field {
+        return ParsedConfigPrincipal::Legacy;
+    }
+    if probe.duplicate_reserved_field
+        || probe.unknown_field
+        || probe.invalid_field_type
+        || !probe.saw_principal
+        || !probe.saw_recovery_required
+    {
+        return ParsedConfigPrincipal::Invalid;
+    }
+    let Some(principal) = probe.principal else {
+        return ParsedConfigPrincipal::Invalid;
+    };
+    let Some(recovery_required) = probe.recovery_required else {
+        return ParsedConfigPrincipal::Invalid;
+    };
+    if principal.is_empty()
+        || probe
+            .replay_lookup_digest
+            .as_deref()
+            .is_some_and(|digest| validate_replay_lookup_digest(digest).is_err())
+    {
+        return ParsedConfigPrincipal::Invalid;
+    }
+    ParsedConfigPrincipal::Wrapped(ConfigPrincipalMetadata {
+        principal,
+        replay_lookup_digest: probe.replay_lookup_digest,
+        recovery_required,
+    })
+}
+
+fn wrapped_config_principal(principal: &str) -> Option<String> {
+    match parse_config_principal(principal) {
+        ParsedConfigPrincipal::Wrapped(metadata) => Some(metadata.principal),
+        ParsedConfigPrincipal::Legacy | ParsedConfigPrincipal::Invalid => None,
+    }
+}
+
+/// Compare a durable principal field with the principal bound into config
+/// envelope AAD. Newer adapters may wrap the authenticated principal with
+/// cleartext lookup/lifecycle metadata; legacy rows store the principal
+/// directly. The wrapper retains the exact serialized principal string, so
+/// the comparison does not depend on JSON object ordering or on a product
+/// model type in the persistence crate.
+pub(crate) fn config_principal_matches_aad(stored: &str, aad_principal: &str) -> bool {
+    match parse_config_principal(stored) {
+        ParsedConfigPrincipal::Legacy => stored == aad_principal,
+        ParsedConfigPrincipal::Wrapped(metadata) => metadata.principal == aad_principal,
+        ParsedConfigPrincipal::Invalid => false,
+    }
+}
+
+/// Validate the bounded cleartext metadata wrapper used by encrypted config
+/// adapters. A principal without the wrapper remains a supported legacy
+/// representation.
+pub(crate) fn config_principal_metadata_is_valid(stored: &str) -> bool {
+    !matches!(
+        parse_config_principal(stored),
+        ParsedConfigPrincipal::Invalid
+    )
+}
+
+/// Extract and validate the clear, domain-separated replay lookup digest from
+/// the encrypted config metadata wrapper. Legacy principal-only rows have no
+/// wrapper and therefore no lookup value.
+pub(crate) fn config_replay_lookup_digest(stored: &str) -> Result<Option<String>, PersistError> {
+    match parse_config_principal(stored) {
+        ParsedConfigPrincipal::Legacy => Ok(None),
+        ParsedConfigPrincipal::Wrapped(metadata) => Ok(metadata.replay_lookup_digest),
+        ParsedConfigPrincipal::Invalid => Err(PersistError::corrupt_blob()),
+    }
+}
+
+pub(crate) fn clear_config_recovery_required(stored: &str) -> Result<Option<String>, PersistError> {
+    let ParsedConfigPrincipal::Wrapped(mut metadata) = parse_config_principal(stored) else {
+        return Err(PersistError::corrupt_blob());
+    };
+    if !metadata.recovery_required {
+        return Ok(None);
+    }
+    metadata.recovery_required = false;
+    serde_json::to_string(&metadata)
+        .map(Some)
+        .map_err(|_| PersistError::corrupt_blob())
+}
+
+pub(crate) fn validate_replay_lookup_digest(digest: &str) -> Result<(), PersistError> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(PersistError::constraint_violation(
+            "config replay lookup digest is invalid",
+        ));
+    }
+    Ok(())
+}
+
 pub fn extract_tenant(principal: &str) -> String {
+    let wrapped = wrapped_config_principal(principal);
+    let principal = wrapped.as_deref().unwrap_or(principal);
+    if let Some(tenant) = serde_json::from_str::<serde_json::Value>(principal)
+        .ok()
+        .and_then(|principal| {
+            principal
+                .get("tenant")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+    {
+        return tenant;
+    }
     if let Some(rest) = principal.strip_prefix("spiffe://") {
         let mut segs = rest.split('/');
         while let Some(seg) = segs.next() {
@@ -646,5 +993,84 @@ impl StoredConfig {
             prev_hash = entry.entry_hmac;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_principal_metadata_tests {
+    use super::*;
+
+    const PRINCIPAL: &str =
+        "{\"tenant\":\"tenant-a\",\"identity\":{\"internal\":\"config-writer\"}}";
+
+    #[test]
+    fn strict_wrapper_parser_preserves_the_exact_nested_principal() {
+        let encoded = serde_json::json!({
+            "principal": PRINCIPAL,
+            "replay_lookup_digest": "a".repeat(64),
+            "recovery_required": true,
+        })
+        .to_string();
+        assert!(config_principal_metadata_is_valid(&encoded));
+        assert_eq!(
+            Some(PRINCIPAL),
+            wrapped_config_principal(&encoded).as_deref()
+        );
+        assert!(config_principal_matches_aad(&encoded, PRINCIPAL));
+        assert!(
+            !config_principal_matches_aad(&encoded, &encoded),
+            "the metadata wrapper itself is never an authenticated principal"
+        );
+        assert_eq!(
+            Some("a".repeat(64)),
+            config_replay_lookup_digest(&encoded).expect("valid replay digest")
+        );
+
+        let cleared = clear_config_recovery_required(&encoded)
+            .expect("valid recovery metadata")
+            .expect("marker changes");
+        assert_eq!(
+            Some(PRINCIPAL),
+            wrapped_config_principal(&cleared).as_deref()
+        );
+        assert!(clear_config_recovery_required(&cleared)
+            .expect("valid cleared metadata")
+            .is_none());
+    }
+
+    #[test]
+    fn wrapper_only_and_duplicate_reserved_fields_fail_closed() {
+        let malformed = [
+            format!(
+                "{{\"replay_lookup_digest\":\"{}\",\"recovery_required\":true}}",
+                "a".repeat(64)
+            ),
+            format!(
+                "{{\"principal\":{PRINCIPAL:?},\"principal\":{PRINCIPAL:?},\"recovery_required\":true}}"
+            ),
+            format!(
+                "{{\"principal\":{PRINCIPAL:?},\"replay_lookup_digest\":\"{}\",\"replay_lookup_digest\":\"{}\",\"recovery_required\":true}}",
+                "a".repeat(64),
+                "b".repeat(64)
+            ),
+            format!(
+                "{{\"principal\":{PRINCIPAL:?},\"recovery_required\":true,\"recovery_required\":false}}"
+            ),
+        ];
+        for encoded in malformed {
+            assert!(!config_principal_metadata_is_valid(&encoded));
+            assert!(config_replay_lookup_digest(&encoded).is_err());
+            assert!(clear_config_recovery_required(&encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_principal_objects_without_wrapper_fields_remain_supported() {
+        assert!(config_principal_metadata_is_valid(PRINCIPAL));
+        assert_eq!(
+            None,
+            config_replay_lookup_digest(PRINCIPAL).expect("legacy principal")
+        );
+        assert!(config_principal_matches_aad(PRINCIPAL, PRINCIPAL));
     }
 }
