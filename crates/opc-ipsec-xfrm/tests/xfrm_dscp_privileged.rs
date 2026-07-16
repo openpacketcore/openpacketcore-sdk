@@ -53,7 +53,7 @@ const MARKED_LOOKUP: XfrmMark = XfrmMark {
 };
 const INBOUND_OUTPUT_MARK: XfrmMark = XfrmMark {
     value: 0x0012_0000,
-    mask: 0x00ff_0000,
+    mask: u32::MAX,
 };
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ESP: u8 = 50;
@@ -655,9 +655,10 @@ async fn fixed_outer_dscp_is_visible_on_real_esp_and_survives_adoption(
 
     // The peer XFRM path emits a real tunnel-mode ESP packet. Successful UDP
     // delivery proves decryption and inbound policy acceptance; the two INPUT
-    // counters then observe the skb after XFRM input applied the SA smark.
-    // Matching the expected masked value while the zero-window control stays
-    // untouched proves this is a post-decrypt packet mark, not GETSA metadata.
+    // counters then observe the skb after XFRM input applied the full-width SA
+    // smark. Matching the expected value while the zero-window control stays
+    // untouched proves this is a post-decrypt packet mark, not GETSA metadata,
+    // even though the backend also has its DSCP companion configured.
     install_inbound_mark_observer();
     let receiver = UdpSocket::bind((Ipv4Addr::from(INNER_LOCAL), INBOUND_PORT))?;
     receiver.set_read_timeout(Some(Duration::from_secs(3)))?;

@@ -35,8 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel pair through `SaState`. The value and mask cannot both be zero because
   Linux canonicalizes that pair to absent attributes; callers use `None` for
   no output mark. The default absent path preserves legacy bytes; lookup marks
-  remain a separate namespace; and a disjoint generic mark can compose with
-  fixed outer DSCP while overlapping output windows fail closed. Existing
+  remain a separate namespace; and configuring the fixed-DSCP companion does
+  not reserve its mark window for SAs whose `egress_dscp` is absent. An SA that
+  does request fixed DSCP must keep its generic output value and mask disjoint
+  from the token window so composition remains deterministic. Existing
   `SaParameters` literals must initialize `output_mark`, normally to `None`.
 - **Private qualification-node control socket — `opc-session-testkit`:** the
   existing JSON-line node protocol can now run over a `0700` workspace control

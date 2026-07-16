@@ -116,15 +116,25 @@ Source migration: existing `SaParameters` struct literals must add
 `SaState` destructuring must account for the new `output_mark` field (or use
 `..`). No Cargo feature is required.
 
-This generic path requires no fixed-DSCP companion. If `egress_dscp` is also
-set on the same SA, the generic output-mark value and mask must not touch the
-configured seven-bit DSCP window. The Linux backend combines disjoint generic
-and DSCP values into the kernel's single output-mark pair and rejects an
-overlap. Callers own namespace-wide `skb->mark` allocation and must coordinate
-every producer and consumer of the selected bits. A successful Linux install
-or rekey includes an exact GETSA readback of the output-mark pair; an ACK
-without that proof returns `StateIndeterminate` and is never followed by an
-unsafe compensating delete.
+This generic path remains independent when the Linux backend also has the
+fixed-DSCP companion configured: an SA with `egress_dscp: None` may use the
+complete mark and mask, including `(value = 0, mask = u32::MAX)` to clear a
+stale bearer selector. If `egress_dscp` is set on the same SA, the generic
+output-mark value and mask must remain disjoint from the configured seven-bit
+token window. The backend combines the disjoint generic value and DSCP token
+into the kernel's single output-mark pair and rejects an overlap.
+
+`SaState::output_mark` is always the exact kernel pair. A query cannot recover
+whether an arbitrary overlapping generic mark was originally intended as a
+DSCP token, so `SaState::egress_dscp` is decoded only when the output-mark pair
+exclusively carries one complete token; broader, partial, or presence-free
+overlaps remain generic. Callers own
+namespace-wide `skb->mark` allocation and must coordinate every producer and
+consumer of the selected bits. In particular, packets crossing the DSCP tc
+companion must not carry an accidental token in its reserved window. A
+successful Linux install or rekey includes an exact GETSA readback of the
+output-mark pair; an ACK without that proof returns `StateIndeterminate` and is
+never followed by an unsafe compensating delete.
 
 ## Fixed Outer DSCP
 
@@ -158,8 +168,12 @@ the tc priority/handle, and the exact seven-bit mask are validated. The CNF
 must reserve the chosen mark window against every output-mark producer and
 packet-mark consumer in its network namespace. An SA lookup mark may use the
 same numeric bits because `XFRMA_MARK` is a separate kernel attribute; a
-generic SA output mark may coexist only when its value and mask are disjoint
-from the DSCP window. Fixed DSCP is accepted only for tunnel-mode ESP SAs.
+generic output mark on the same SA as fixed DSCP may compose only when its
+value and mask are disjoint from the DSCP window. SAs without `egress_dscp`
+remain independent of the backend-level companion configuration, while the
+caller still prevents their packet values from accidentally encoding a token
+on an interface where that companion runs. Fixed DSCP is accepted only for
+tunnel-mode ESP SAs.
 
 Construction eagerly attaches or adopts the exact owned tc slot. Every marked
 install/rekey revalidates the live map and filter before sending netlink. The
