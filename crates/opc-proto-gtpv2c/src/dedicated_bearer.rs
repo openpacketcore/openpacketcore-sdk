@@ -653,8 +653,78 @@ fn typed_cause(
     }
 }
 
-fn valid_response_cause(cause: CauseValue) -> bool {
-    cause.is_accepted() || cause.is_rejection()
+const fn is_common_response_rejection(cause: CauseValue) -> bool {
+    // TS 29.274 R18 clause 7.7 requires the four protocol-error responses
+    // below. Table 8.4-1 also defines the general feature, operational, and
+    // unspecified-rejection causes that can apply to any request. Keep this
+    // list explicit: `CauseValue::is_rejection` intentionally classifies the
+    // full 64..=239 wire range, which includes reserved/spare values and
+    // procedure-specific causes that must not be emitted here.
+    matches!(
+        cause,
+        CauseValue::InvalidMessageFormat
+            | CauseValue::InvalidLength
+            | CauseValue::ServiceNotSupported
+            | CauseValue::MandatoryIeIncorrect
+            | CauseValue::MandatoryIeMissing
+            | CauseValue::SystemFailure
+            | CauseValue::NoResourcesAvailable
+            | CauseValue::RequestRejected
+            | CauseValue::ConditionalIeMissing
+    )
+}
+
+const fn is_create_bearer_response_rejection(cause: CauseValue) -> bool {
+    // TS 29.274 R18 clause 7.2.4 plus the common response causes above.
+    is_common_response_rejection(cause)
+        || matches!(
+            cause,
+            CauseValue::ContextNotFound
+                | CauseValue::SemanticErrorInTftOperation
+                | CauseValue::SyntacticErrorInTftOperation
+                | CauseValue::SemanticErrorsInPacketFilters
+                | CauseValue::SyntacticErrorsInPacketFilters
+                | CauseValue::UnableToPageUe
+                | CauseValue::UeNotResponding
+                | CauseValue::UnableToPageUeDueToSuspension
+                | CauseValue::UeRefuses
+                | CauseValue::DeniedInRat
+                | CauseValue::TemporarilyRejectedForMobilityProcedure
+                | CauseValue::RefusedDueToVplmnPolicy
+                | CauseValue::UeTemporarilyUnreachableDueToPowerSaving
+                | CauseValue::RequestRejectedDueToUeCapability
+        )
+}
+
+const fn valid_create_bearer_message_cause(cause: CauseValue) -> bool {
+    matches!(
+        cause,
+        CauseValue::RequestAccepted | CauseValue::RequestAcceptedPartially
+    ) || is_create_bearer_response_rejection(cause)
+}
+
+const fn valid_create_bearer_context_cause(cause: CauseValue) -> bool {
+    matches!(cause, CauseValue::RequestAccepted) || is_create_bearer_response_rejection(cause)
+}
+
+const fn is_delete_bearer_response_rejection(cause: CauseValue) -> bool {
+    // TS 29.274 R18 clause 7.2.10.2 plus the common response causes above.
+    is_common_response_rejection(cause)
+        || matches!(
+            cause,
+            CauseValue::ContextNotFound | CauseValue::TemporarilyRejectedForMobilityProcedure
+        )
+}
+
+const fn valid_delete_bearer_message_cause(cause: CauseValue) -> bool {
+    matches!(
+        cause,
+        CauseValue::RequestAccepted | CauseValue::RequestAcceptedPartially
+    ) || is_delete_bearer_response_rejection(cause)
+}
+
+const fn valid_delete_bearer_context_cause(cause: CauseValue) -> bool {
+    matches!(cause, CauseValue::RequestAccepted) || is_delete_bearer_response_rejection(cause)
 }
 
 fn ensure_outcome_consistency(
@@ -882,7 +952,7 @@ fn project_create_bearer_response<'a>(
         )?,
         None,
     )?;
-    if !valid_response_cause(message_cause) {
+    if !valid_create_bearer_message_cause(message_cause) {
         return Err(DedicatedBearerError::message(
             DedicatedBearerErrorKind::InvalidResponseCause,
         ));
@@ -930,7 +1000,7 @@ fn project_create_bearer_response<'a>(
             )?,
             Some(index),
         )?;
-        if bearer_cause != CauseValue::RequestAccepted && !bearer_cause.is_rejection() {
+        if !valid_create_bearer_context_cause(bearer_cause) {
             return Err(DedicatedBearerError::bearer(
                 DedicatedBearerErrorKind::InvalidResponseCause,
                 index,
@@ -1130,7 +1200,7 @@ fn project_delete_bearer_response<'a>(
         )?,
         None,
     )?;
-    if !valid_response_cause(message_cause) {
+    if !valid_delete_bearer_message_cause(message_cause) {
         return Err(DedicatedBearerError::message(
             DedicatedBearerErrorKind::InvalidResponseCause,
         ));
@@ -1198,7 +1268,7 @@ fn project_delete_bearer_response<'a>(
                     )?,
                     Some(index),
                 )?;
-                if bearer_cause != CauseValue::RequestAccepted && !bearer_cause.is_rejection() {
+                if !valid_delete_bearer_context_cause(bearer_cause) {
                     return Err(DedicatedBearerError::bearer(
                         DedicatedBearerErrorKind::InvalidResponseCause,
                         index,

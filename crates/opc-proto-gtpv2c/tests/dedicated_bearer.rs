@@ -148,6 +148,36 @@ fn rejected_result(index: u8, cause: CauseValue) -> S2bCreateBearerResult<'stati
     }
 }
 
+fn rejected_create_response(
+    message_cause: CauseValue,
+    bearer_cause: CauseValue,
+) -> S2bCreateBearerResponse<'static> {
+    S2bCreateBearerResponse {
+        sequence_number: SEQUENCE,
+        teid: RESPONSE_TEID,
+        cause: message_cause,
+        bearer_contexts: vec![rejected_result(1, bearer_cause)],
+        additional_ies: Vec::new(),
+    }
+}
+
+fn rejected_delete_response(
+    message_cause: CauseValue,
+    bearer_cause: CauseValue,
+) -> S2bDeleteBearerResponse<'static> {
+    S2bDeleteBearerResponse {
+        sequence_number: SEQUENCE,
+        teid: RESPONSE_TEID,
+        cause: message_cause,
+        body: S2bDeleteBearerResponseBody::Dedicated(vec![S2bDeleteBearerResult {
+            ebi: ebi(6),
+            cause: bearer_cause,
+            additional_ies: Vec::new(),
+        }]),
+        additional_ies: Vec::new(),
+    }
+}
+
 fn encode(message: &OwnedMessage) -> Bytes {
     let mut bytes = BytesMut::new();
     message
@@ -544,6 +574,133 @@ fn dedicated_bearer_cause_registry_uses_normative_release_18_values() {
     for (cause, value) in cases {
         assert_eq!(cause.as_u8(), value);
         assert_eq!(CauseValue::from(value), cause);
+    }
+}
+
+#[test]
+fn response_cause_allowlists_accept_generic_and_procedure_specific_causes() {
+    // TS 29.274 R18 clause 7.7 protocol errors plus the Table 8.4-1 generic
+    // feature, operational, and unspecified-rejection causes.
+    let common_rejections = [
+        CauseValue::InvalidMessageFormat,
+        CauseValue::InvalidLength,
+        CauseValue::ServiceNotSupported,
+        CauseValue::MandatoryIeIncorrect,
+        CauseValue::MandatoryIeMissing,
+        CauseValue::SystemFailure,
+        CauseValue::NoResourcesAvailable,
+        CauseValue::RequestRejected,
+        CauseValue::ConditionalIeMissing,
+    ];
+    for cause in common_rejections {
+        s2b_create_bearer_response(rejected_create_response(cause, cause))
+            .expect("common Cause must be legal in Create Bearer response positions");
+        s2b_delete_bearer_response(rejected_delete_response(cause, cause))
+            .expect("common Cause must be legal in Delete Bearer response positions");
+    }
+
+    // Exact message-specific rejection set from clause 7.2.4.
+    let create_rejections = [
+        CauseValue::ContextNotFound,
+        CauseValue::SemanticErrorInTftOperation,
+        CauseValue::SyntacticErrorInTftOperation,
+        CauseValue::SemanticErrorsInPacketFilters,
+        CauseValue::SyntacticErrorsInPacketFilters,
+        CauseValue::UnableToPageUe,
+        CauseValue::UeNotResponding,
+        CauseValue::UnableToPageUeDueToSuspension,
+        CauseValue::UeRefuses,
+        CauseValue::DeniedInRat,
+        CauseValue::TemporarilyRejectedForMobilityProcedure,
+        CauseValue::RefusedDueToVplmnPolicy,
+        CauseValue::UeTemporarilyUnreachableDueToPowerSaving,
+        CauseValue::RequestRejectedDueToUeCapability,
+    ];
+    for cause in create_rejections {
+        s2b_create_bearer_response(rejected_create_response(cause, cause))
+            .expect("clause 7.2.4 Cause must be legal at message and bearer level");
+    }
+
+    // Exact message-specific rejection set from clause 7.2.10.2.
+    for cause in [
+        CauseValue::ContextNotFound,
+        CauseValue::TemporarilyRejectedForMobilityProcedure,
+    ] {
+        s2b_delete_bearer_response(rejected_delete_response(cause, cause))
+            .expect("clause 7.2.10.2 Cause must be legal at message and bearer level");
+    }
+}
+
+#[test]
+fn response_cause_allowlists_reject_spare_unknown_and_unrelated_causes() {
+    let invalid_for_both = [
+        CauseValue::Unknown(71),
+        CauseValue::Unknown(132),
+        CauseValue::BearerHandlingNotSupported,
+        CauseValue::UeContextWithoutTftAlreadyActivated,
+        CauseValue::CollisionWithNetworkInitiatedRequest,
+        CauseValue::LateOverlappingRequest,
+        CauseValue::TimedOutRequest,
+        CauseValue::MultipleAccessesToPdnConnectionNotAllowed,
+    ];
+    for cause in invalid_for_both {
+        assert!(
+            s2b_create_bearer_response(rejected_create_response(
+                cause,
+                CauseValue::ContextNotFound,
+            ))
+            .is_err(),
+            "Create Bearer message level accepted unrelated Cause {cause:?}"
+        );
+        assert!(
+            s2b_create_bearer_response(rejected_create_response(
+                CauseValue::ContextNotFound,
+                cause,
+            ))
+            .is_err(),
+            "Create Bearer context level accepted unrelated Cause {cause:?}"
+        );
+        assert!(
+            s2b_delete_bearer_response(rejected_delete_response(
+                cause,
+                CauseValue::ContextNotFound,
+            ))
+            .is_err(),
+            "Delete Bearer message level accepted unrelated Cause {cause:?}"
+        );
+        assert!(
+            s2b_delete_bearer_response(rejected_delete_response(
+                CauseValue::ContextNotFound,
+                cause,
+            ))
+            .is_err(),
+            "Delete Bearer context level accepted unrelated Cause {cause:?}"
+        );
+    }
+
+    for cause in [
+        CauseValue::SemanticErrorInTftOperation,
+        CauseValue::SyntacticErrorsInPacketFilters,
+        CauseValue::DeniedInRat,
+        CauseValue::UeNotResponding,
+        CauseValue::RequestRejectedDueToUeCapability,
+    ] {
+        assert!(
+            s2b_delete_bearer_response(rejected_delete_response(
+                cause,
+                CauseValue::ContextNotFound,
+            ))
+            .is_err(),
+            "Delete Bearer message level accepted Create-only Cause {cause:?}"
+        );
+        assert!(
+            s2b_delete_bearer_response(rejected_delete_response(
+                CauseValue::ContextNotFound,
+                cause,
+            ))
+            .is_err(),
+            "Delete Bearer context level accepted Create-only Cause {cause:?}"
+        );
     }
 }
 

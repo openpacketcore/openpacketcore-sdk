@@ -84,6 +84,12 @@ failures and must cover at least these rules:
   ePDG F-TEID instance 8/interface 31, and the correlated request PGW F-TEID
   instance 9/interface 33. Rejected contexts prohibit the ePDG endpoint and
   carry a rejection Cause. Message Cause 17 is valid only for mixed results.
+- Create Bearer and Delete Bearer response Causes use audited, procedure-aware
+  allow-lists at both message and Bearer Context level. The lists combine the
+  protocol-error handling in TS 29.274 Release 18 clause 7.7, the general
+  operational/fallback rejections defined by Table 8.4-1, and the applicable
+  message-specific causes in clauses 7.2.4 and 7.2.10.2. Reserved, spare,
+  unknown, and causes assigned only to unrelated procedures are rejected.
 - Delete Bearer Request must use exactly one target shape: one linked EBI at
   instance 0, or one to fifteen dedicated EBIs at instance 1. Responses must
   use the corresponding linked or grouped per-bearer form and account for
