@@ -31,8 +31,9 @@ pub use error::GtpuError;
 pub use linux::{LinuxGtpuDataplaneBackend, LinuxGtpuDataplaneBackendConfig};
 pub use mock::{MockGtpuDataplaneBackend, MockOperation};
 pub use model::{
-    CreateGtpDeviceRequest, GtpAddressFamily, GtpDevice, GtpPdpContext, GtpRole, GtpVersion,
-    GtpuBackendKind, GtpuCapability, GtpuProbe, RemovePdpContextRequest, Teid, GTPU_PORT,
+    CreateGtpDeviceRequest, GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext, GtpRole,
+    GtpVersion, GtpuBackendKind, GtpuCapability, GtpuProbe, RemovePdpContextRequest, Teid,
+    GTPU_PORT,
 };
 pub use opc_types::DscpCodepoint;
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
@@ -55,6 +56,7 @@ mod integration_tests {
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
             gtp_version: GtpVersion::V1,
+            bearer_mark: None,
             egress_dscp: None,
         }
     }

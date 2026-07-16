@@ -59,6 +59,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inconsistent external-rate sentinels. Admission, SPI allocation,
   retransmission timers, cryptographic sealing, and dataplane installation
   remain with the product.
+- **Per-bearer GTP-U mark steering — `opc-gtpu-dataplane`:** an optional typed
+  non-zero `GtpBearerMark` now selects additive dedicated-bearer FAR, DSCP, and
+  PDR state without changing the legacy map ABI or default-bearer GTP-U wire
+  bytes. A marked-only owner journal gates forwarding through explicit
+  pending, active, and removing phases, binds the complete FAR/DSCP/PDR
+  identity, and makes interrupted installation, update, removal, and restart
+  recovery fail closed and exactly retryable. The S2b-U boundary owns the
+  complete 32-bit packet mark: zero selects the default bearer, dedicated
+  Child SAs use exact non-zero values, and XFRM mark operations and policies
+  must use `u32::MAX` masks. Unknown marked uplink traffic fails closed,
+  successful uplink encapsulation consumes the mark, and validated downlink
+  traffic writes either the dedicated mark or a deliberately normalized
+  default zero. A capability probe exposes support; existing public literals
+  add `bearer_mark: None` and the probe field, with no new feature or
+  dependency. Atomic tc replacement, exact pin/hook cleanup, and a hash-pinned
+  frozen-v1 identity fixture provide retryable live migration while rejecting
+  ambiguous or foreign state.
 - `opc-proto-gtpv2c`: TEID-present EPC headers now expose the TS 29.274 R18
   Message Priority flag and a bounded `MessagePriority` value (`0` highest,
   `15` lowest). Strict decode accepts valid MP-bearing headers while rejecting

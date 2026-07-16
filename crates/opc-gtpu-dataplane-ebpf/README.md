@@ -12,12 +12,16 @@ CO-RE object, and is intentionally excluded from the SDK workspace.
 
 The crate exposes tc entry points, not a Rust library API:
 
-- `opc_gtpu_uplink`: tc egress program. It looks up uplink FAR state by inner
-  UE IPv4 source address, prepends `[outer IPv4][UDP][GTPv1-U]`, and redirects
-  toward the peer.
+- `opc_gtpu_uplink`: tc egress program. Mark zero looks up the default FAR by
+  inner UE IPv4 source address. A non-zero complete packet mark selects an
+  additive FAR by `(UE address, mark)` and must match an `Active` owner-journal
+  entry before the program prepends `[outer IPv4][UDP][GTPv1-U]`, consumes the
+  mark, and redirects toward the peer. Unknown or inactive marked state drops.
 - `opc_gtpu_downlink`: tc ingress program. It matches UDP/2152 GTPv1-U G-PDUs,
   looks up downlink PDR state by TEID, validates the inner destination, strips
-  outer headers, and lets the inner packet continue through the stack.
+  outer headers, writes zero for a default bearer or the exact dedicated mark
+  from an `Active` owner, and lets the inner packet continue to XFRM policy
+  selection through the stack.
 
 Map names, counter indexes, program names, and byte layouts are imported from
 `opc-gtpu-ebpf-common`.
@@ -35,6 +39,11 @@ Map names, counter indexes, program names, and byte layouts are imported from
 - Unpublished standalone crate (`publish = false`) with its own `Cargo.lock`.
 - Build profile uses `panic = "abort"` and optimized BPF codegen.
 - The datapath is currently IPv4 GTP-U only.
+- The S2b-U boundary owns the complete 32-bit packet mark; masked sharing is
+  unsupported. The userspace crate remains safe Rust. Aya exposes a safe mark
+  setter but no getter, so the verifier-bound program uses one isolated,
+  aligned raw read of `__sk_buff::mark` in addition to its existing raw
+  map/helper accesses.
 - It does not load itself, manage bpffs pins, manage sessions, or implement
   product policy; those live in the userspace backend.
 

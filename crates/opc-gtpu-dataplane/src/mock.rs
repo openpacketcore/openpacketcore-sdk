@@ -237,6 +237,11 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
+        if request.bearer_mark.is_some() {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "per_bearer_marking",
+            });
+        }
         if request.egress_dscp.is_some() {
             return Err(GtpuError::UnsupportedFeature {
                 feature: "fixed_outer_dscp",
@@ -301,6 +306,7 @@ mod tests {
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
             gtp_version: GtpVersion::V1,
+            bearer_mark: None,
             egress_dscp: None,
         }
     }

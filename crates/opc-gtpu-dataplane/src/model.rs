@@ -50,6 +50,48 @@ impl fmt::Display for Teid {
     }
 }
 
+/// Non-zero Linux packet mark selecting one bearer that shares a UE PAA.
+///
+/// The eBPF backend owns the complete 32-bit mark: the default inbound Child
+/// SA must clear it with `(value=0, mask=u32::MAX)`, while a dedicated inbound
+/// Child SA must set `(value=mark, mask=u32::MAX)` and the corresponding
+/// outbound XFRM policy must select the same exact value/full mask. Partial
+/// masks are incompatible and fail closed. Marks are treated as routing
+/// handles and are redacted from diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct GtpBearerMark(NonZeroU32);
+
+impl GtpBearerMark {
+    /// Create a bearer mark. Zero is reserved for the unmarked/default path.
+    #[must_use]
+    pub const fn new(value: u32) -> Option<Self> {
+        match NonZeroU32::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the complete Linux packet-mark value.
+    ///
+    /// Callers must not expose routing handles through logs or diagnostics.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl fmt::Debug for GtpBearerMark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("GtpBearerMark").field(&"<redacted>").finish()
+    }
+}
+
+impl fmt::Display for GtpBearerMark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted-bearer-mark>")
+    }
+}
+
 /// Linux GTP netdevice role.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -157,6 +199,15 @@ pub struct GtpPdpContext {
     pub link_ifindex: u32,
     /// GTP version.
     pub gtp_version: GtpVersion,
+    /// Optional non-zero packet mark selecting this bearer.
+    ///
+    /// The Linux eBPF backend keys marked uplink state by this value together
+    /// with `ms_address`, and stamps it on downlink packets before XFRM policy
+    /// lookup. Backends whose [`GtpuProbe::per_bearer_marking`] is not
+    /// [`GtpuCapability::Available`] reject `Some`. `None` preserves legacy
+    /// map and wire bytes; successful eBPF downlink decapsulation explicitly
+    /// clears the complete packet mark to the default-bearer value zero.
+    pub bearer_mark: Option<GtpBearerMark>,
     /// Optional fixed DSCP stamped on the outer uplink IP header.
     ///
     /// The Linux eBPF backend supports this per PDP context. Backends whose
@@ -175,6 +226,7 @@ impl fmt::Debug for GtpPdpContext {
             .field("peer_address", &"<redacted>")
             .field("link_ifindex", &self.link_ifindex)
             .field("gtp_version", &self.gtp_version)
+            .field("bearer_mark", &self.bearer_mark)
             .field("egress_dscp", &self.egress_dscp)
             .finish()
     }
@@ -271,6 +323,9 @@ pub struct GtpuProbe {
     pub mutation_ready: bool,
     /// Ability to stamp a fixed per-PDP DSCP on uplink outer IP headers.
     pub egress_dscp_marking: GtpuCapability,
+    /// Ability to select uplink TEIDs and downlink XFRM policies by a
+    /// per-bearer Linux packet mark while multiple bearers share one UE PAA.
+    pub per_bearer_marking: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,
 }
@@ -288,6 +343,7 @@ impl GtpuProbe {
             btf_present: false,
             mutation_ready: false,
             egress_dscp_marking: GtpuCapability::Missing,
+            per_bearer_marking: GtpuCapability::Missing,
             details: Some("dry-run/mock backend"),
         }
     }
@@ -304,6 +360,7 @@ impl GtpuProbe {
             btf_present: false,
             mutation_ready: false,
             egress_dscp_marking: GtpuCapability::Missing,
+            per_bearer_marking: GtpuCapability::Missing,
             details: Some("GTP-U dataplane operations are not supported on this platform"),
         }
     }
@@ -321,6 +378,19 @@ mod tests {
         assert_eq!(teid.get(), 0x1234_5678);
         assert!(!format!("{teid:?}").contains("12345678"));
         assert!(!teid.to_string().contains("12345678"));
+    }
+
+    #[test]
+    fn bearer_mark_rejects_zero_and_redacts_debug_display() {
+        assert_eq!(GtpBearerMark::new(0), None);
+        let mark = GtpBearerMark::new(0x1234_5678).unwrap();
+        assert_eq!(mark.get(), 0x1234_5678);
+        assert_eq!(
+            GtpBearerMark::new(u32::MAX).map(GtpBearerMark::get),
+            Some(u32::MAX)
+        );
+        assert!(!format!("{mark:?}").contains("12345678"));
+        assert!(!mark.to_string().contains("12345678"));
     }
 
     #[test]
@@ -342,6 +412,7 @@ mod tests {
             peer_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             link_ifindex: 7,
             gtp_version: GtpVersion::V1,
+            bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
             egress_dscp: None,
         };
         let debug = format!("{ctx:?}");
@@ -349,6 +420,7 @@ mod tests {
         assert!(!debug.contains("87654321"));
         assert!(!debug.contains("10.23.0.2"));
         assert!(!debug.contains("::1"));
+        assert!(!debug.contains("3456789a"));
     }
 
     #[test]
@@ -360,6 +432,7 @@ mod tests {
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 9,
             gtp_version: GtpVersion::V1,
+            bearer_mark: None,
             egress_dscp: None,
         };
         let remove = RemovePdpContextRequest::from_context(&ctx);
