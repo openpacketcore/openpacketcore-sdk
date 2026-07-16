@@ -80,6 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed data fail closed. Source validation, response rate limiting,
   retransmission behavior, and other unauthenticated anti-amplification policy
   remain product responsibilities.
+- **Combined HA candidate evidence contract — `opc-session-testkit`:** an
+  additive frozen v4 profile preserves the v2 runtime inventory while binding
+  both the v1 sequential and v3 concurrent independent-checker contracts. A
+  closed, bounded typed manifest digest-binds one exact candidate campaign,
+  artifact, environment, schedules, histories, checker programs and outputs,
+  diagnostics, and complete eight-gate acceptance inventory. Strict negative
+  and frozen-byte tests reject production claims, drift, malformed digests,
+  inconsistent release artifacts, reversed timestamps, inconclusive checkers,
+  and gate/digest mismatches. All v4 evidence remains experimental and counts
+  for no production qualification.
 - **Experimental projected-mTLS fault/expiry qualification —
   `opc-session-testkit`:** non-ignored, serialized single-host tests now run
   real three- and five-process Openraft/SQLite fleets through two bounded

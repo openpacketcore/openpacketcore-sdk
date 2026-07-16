@@ -390,6 +390,38 @@ Run the focused contract and checker suite with:
 
 `cargo test --locked -p opc-session-testkit --test qualification_history_v3`.
 
+## Combined HA Candidate Manifest
+
+`qualification/v4/session-ha-profile.json` is an additive candidate profile.
+It keeps the v2 workspace, source-build, artifact, platform, topology,
+protocol, timing, bound, and provisional-threshold inventory exactly
+equivalent at the JSON-value level, while naming both the immutable v1
+sequential checker contract and the immutable v3 concurrent checker contract.
+It does not replace or widen either older contract.
+
+`qualification/v4/session-ha-candidate-manifest.schema.json` closes the
+aggregate boundary. One manifest binds the exact source revision, candidate
+profile, binary, optional OCI image, feature inventory, environment,
+configuration, fault schedule, logs, metrics, resource results, both histories,
+both checker programs, and both canonical checker outputs. It admits only mTLS
+three- or five-voter campaigns with independent processes and storage,
+canonical SPIFFE identities, and canonical FQDN routes. The typed
+`SessionHaCandidateManifestV4::from_json` boundary is size-limited and also
+checks cross-field constraints that JSON Schema cannot express, including
+ordered timestamps, exact-release source/profile/image rules, conclusive
+checker outcomes, and acceptance status/digest pairing. Digests have a
+redacted `Debug` representation; manifests contain no certificate, key,
+payload, route, peer-identity, log, or metric-label values.
+
+Every v4 document is fixed to `experimental = true`,
+`qualification_complete = false`, and `counts_for_production = false`. The
+eight acceptance entries are a complete inventory, but attached evidence is
+still candidate evidence. This contract neither closes #143 nor makes a
+production HA claim. Run its schema, frozen-byte, digest cross-binding,
+independent-checker, and tamper tests with:
+
+`cargo test --locked -p opc-session-testkit --test qualification_candidate_v4`.
+
 ## Status Notes
 
 - `publish = false`; this crate is test-only.

@@ -1,0 +1,111 @@
+{
+  "schema_version": "opc-session-ha-candidate-manifest/v4",
+  "profile_id": "opc-session-openraft-ha/v4-candidate",
+  "experimental": true,
+  "qualification_complete": false,
+  "counts_for_production": false,
+  "source_revision": "0000000000000000000000000000000000000000",
+  "source_tree_status": "dirty_unqualified",
+  "profile": {
+    "schema_version": "opc-session-ha-profile/v4-candidate",
+    "sha256": "sha256:61cef867f909fc2b4c081e0eff1d86f6e924f59211ab869baf38d2d7f8daf4f8"
+  },
+  "artifact": {
+    "name": "opc-session-quorum-node",
+    "version": "0.2.0-synthetic-fixture",
+    "binary_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "container_image_sha256": null,
+    "feature_inventory_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cargo_profile": "debug",
+    "exact_release_artifact": false,
+    "foundation_insecure_enabled": false,
+    "legacy_session_net_compat_enabled": false
+  },
+  "campaign": {
+    "campaign_id_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "topology_members": 3,
+    "target": "x86_64-unknown-linux-gnu",
+    "started_at_utc": "2026-07-15T00:00:00Z",
+    "completed_at_utc": "2026-07-15T00:00:01Z",
+    "transport_mode": "mtls",
+    "independent_processes": true,
+    "independent_disks": true,
+    "canonical_spiffe_identities": true,
+    "canonical_fqdn_routes": true
+  },
+  "bindings": {
+    "environment_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "configuration_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "fault_schedule_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "logs_manifest_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "metrics_manifest_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "resource_results_sha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+  },
+  "sequential": {
+    "schedule_schema_version": "opc-session-ha-schedule/v1",
+    "schedule_sha256": "sha256:0945a97ace03d5b8e9c49e912afc226498e9b439f8a1620d68d01e7d83bfa542",
+    "history_schema_version": "opc-session-ha-history/v1",
+    "history_sha256": "sha256:2c6406b6e292dafd805390f1e6c8d7a7e17d84cfdf184e38370e5078ab729a53",
+    "checker": {
+      "name": "check-session-ha-history.py",
+      "version": "1",
+      "sha256": "sha256:1740818dc4dc485bec26294c8d04c543658c49715e0e920467441993c65d94a7",
+      "output_sha256": "sha256:b4c41def0a73e18e449b65c9ce42ce88f87a4a441e3d99a225b2361478f8245e",
+      "exit_code": 0,
+      "status": "pass",
+      "violation_count": 0,
+      "inconclusive_count": 0
+    }
+  },
+  "concurrent": {
+    "evidence_schema_version": "opc-session-ha-candidate-evidence/v3",
+    "evidence_sha256": "sha256:0d2c9f825873b50e38281aceb4bd144fdffced69b9412b98cf9ff7ae3267e2ea",
+    "workload_schedule_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "history_schema_version": "opc-session-ha-concurrent-history/v3",
+    "history_sha256": "sha256:0760768b670c723546c7ba72b532b1ed4354b26acd99b537825ef9d70263f719",
+    "checker": {
+      "name": "check-session-ha-concurrent-history.py",
+      "version": "3",
+      "sha256": "sha256:7573648bdec6941f37c446bf3f7333ae9c0da7adc600b8b226c5cb8cff789e61",
+      "output_sha256": "sha256:dbb7c9d3ccdcc176df9a226e97bedd15064fc3339a9185f2fb21d9291ce58287",
+      "exit_code": 0,
+      "status": "pass",
+      "violation_count": 0,
+      "inconclusive_count": 0
+    }
+  },
+  "acceptance": {
+    "deployed_kubernetes_3_5": {
+      "status": "unproven",
+      "evidence_sha256": null
+    },
+    "real_network_and_storage_faults": {
+      "status": "unproven",
+      "evidence_sha256": null
+    },
+    "crash_point_matrix": {
+      "status": "unproven",
+      "evidence_sha256": null
+    },
+    "version_migration_and_rollback": {
+      "status": "unproven",
+      "evidence_sha256": null
+    },
+    "platform_resource_soak": {
+      "status": "unproven",
+      "evidence_sha256": null
+    },
+    "remote_hkms_rotation": {
+      "status": "unproven",
+      "evidence_sha256": null
+    },
+    "live_alert_fire_and_clear": {
+      "status": "unproven",
+      "evidence_sha256": null
+    },
+    "signed_release_bundle": {
+      "status": "unproven",
+      "evidence_sha256": null
+    }
+  }
+}
