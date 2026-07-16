@@ -18,7 +18,8 @@ use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError}
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
     decode_bounded, durable_openraft_config, encode_bounded, DurableOpenraftDomain,
-    EnsureLinearizableOutcome, EnsureLinearizableSupervisor, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    EnsureLinearizableOutcome, EnsureLinearizableSupervisor, LinearizableReadBarrier,
+    LinearizableReadBarrierError, LinearizableReadLease, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use opc_types::Timestamp;
@@ -264,6 +265,7 @@ struct ConsensusSessionStoreInner {
     operation_timeout: Duration,
     admitted: AtomicBool,
     linearizability: EnsureLinearizableSupervisor<SessionRaftTypeConfig>,
+    read_barrier: LinearizableReadBarrier<SessionRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
 }
 
@@ -393,6 +395,12 @@ impl ConsensusSessionStore {
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
         let raft_handler = SessionRaftRpcHandler::new(raft.clone(), identity, local_node_id);
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
+        let read_barrier = LinearizableReadBarrier::new(
+            local_node_id,
+            linearizability.clone(),
+            raft.metrics(),
+            LinearizableReadLease::Disabled,
+        );
         let topology_summary = topology.summary().clone();
 
         Ok(Self {
@@ -409,6 +417,7 @@ impl ConsensusSessionStore {
                 operation_timeout,
                 admitted: AtomicBool::new(false),
                 linearizability,
+                read_barrier,
                 proposal_admission: Arc::new(tokio::sync::Semaphore::new(
                     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
                 )),
@@ -1356,23 +1365,14 @@ impl ConsensusSessionStore {
         if recovery_pending {
             return ReadBarrierReply::Unavailable;
         }
-        match self
-            .inner
-            .linearizability
-            .ensure_linearizable(deadline)
-            .await
-        {
-            EnsureLinearizableOutcome::Ready { read_log_id }
-                if self.exact_membership_is_admitted() =>
-            {
-                ReadBarrierReply::Ready(read_log_id)
+        match self.inner.read_barrier.admit(deadline).await {
+            Ok(admit) if self.exact_membership_is_admitted() => {
+                ReadBarrierReply::Ready(admit.read_log_id())
             }
-            EnsureLinearizableOutcome::Ready { .. } | EnsureLinearizableOutcome::Unavailable => {
-                ReadBarrierReply::Unavailable
+            Ok(_) | Err(LinearizableReadBarrierError::Unavailable) => ReadBarrierReply::Unavailable,
+            Err(LinearizableReadBarrierError::NotLeader { leader }) => {
+                ReadBarrierReply::NotLeader { leader }
             }
-            EnsureLinearizableOutcome::Retry { leader_hint } => ReadBarrierReply::NotLeader {
-                leader: leader_hint,
-            },
             _ => ReadBarrierReply::Unavailable,
         }
     }
@@ -1411,8 +1411,12 @@ impl ConsensusSessionStore {
             };
             match reply {
                 ReadBarrierReply::Ready(log_id) => {
-                    if let Some(log_id) = log_id {
-                        self.wait_for_local_apply(log_id.index, deadline).await?;
+                    if let Some(log_id) = &log_id {
+                        self.inner
+                            .read_barrier
+                            .wait_for_applied_index(log_id.index, deadline)
+                            .await
+                            .map_err(|_| consensus_unavailable())?;
                     }
                     self.require_exact_membership_admission()?;
                     return Ok(log_id);
@@ -1430,28 +1434,6 @@ impl ConsensusSessionStore {
                 ReadBarrierReply::Unavailable => {
                     self.wait_for_route_refresh(leader, deadline).await?;
                 }
-            }
-        }
-    }
-
-    async fn wait_for_local_apply(
-        &self,
-        index: u64,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), StoreError> {
-        let mut metrics = self.inner.raft.metrics();
-        loop {
-            if metrics
-                .borrow()
-                .last_applied
-                .as_ref()
-                .is_some_and(|applied| applied.index >= index)
-            {
-                return Ok(());
-            }
-            match tokio::time::timeout_at(deadline, metrics.changed()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => return Err(consensus_unavailable()),
             }
         }
     }
@@ -1478,8 +1460,11 @@ impl ConsensusSessionStore {
         if response.raft_log_index == 0 {
             return Err(consensus_unavailable());
         }
-        self.wait_for_local_apply(response.raft_log_index, deadline)
-            .await?;
+        self.inner
+            .read_barrier
+            .wait_for_applied_index(response.raft_log_index, deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
         response.logical_time.ok_or_else(consensus_unavailable)
     }
 

@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Linearizable local-read gate — `opc-consensus`:** a product-neutral
+  `LinearizableReadBarrier` now maps coalesced Openraft read-index outcomes to
+  typed serve/not-leader/unavailable decisions and waits for the serving
+  node's local apply before admission. An optional default-off same-term
+  leader lease has a fixed profile-derived duration and falls back to a full
+  quorum round on expiry or any leadership/term change. The leader-open helper
+  gates advertisement on an exact consumer projection rebuild. Session-store
+  now uses the shared full-round/apply gate without changing its membership,
+  recovery, routing, wire, or encryption behavior.
 - **Generic XFRM SA output marks — `opc-ipsec-xfrm`:** callers can set an
   independent typed `SaParameters::output_mark` value/mask pair for Linux
   `XFRMA_SET_MARK`, including on inbound/decrypt SAs, and recover the exact
