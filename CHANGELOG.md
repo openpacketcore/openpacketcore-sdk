@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Generic XFRM SA output marks — `opc-ipsec-xfrm`:** callers can set an
+  independent typed `SaParameters::output_mark` value/mask pair for Linux
+  `XFRMA_SET_MARK`, including on inbound/decrypt SAs, and recover the exact
+  kernel pair through `SaState`. The value and mask cannot both be zero because
+  Linux canonicalizes that pair to absent attributes; callers use `None` for
+  no output mark. The default absent path preserves legacy bytes; lookup marks
+  remain a separate namespace; and a disjoint generic mark can compose with
+  fixed outer DSCP while overlapping output windows fail closed. Existing
+  `SaParameters` literals must initialize `output_mark`, normally to `None`.
 - **Canonical 3GPP TFT codec — `opc-proto-tft`:** one shared, bounded TS 24.008
   V18.8.0 value model now covers every operation, parameter, and Release 18
   packet-filter component for GTPv2-C Bearer TFT IEs and IKEv2 TFT Notify

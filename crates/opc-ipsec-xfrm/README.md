@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replay_state: None,
         encap: None,
         mark: None,
+        output_mark: None,
         if_id: None,
         egress_dscp: None,
     };
@@ -75,6 +76,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Per-SA output marks
+
+`SaParameters::output_mark` emits the generic Linux
+`XFRMA_SET_MARK`/`XFRMA_SET_MARK_MASK` pair. Linux applies that masked value to
+`skb->mark` after the SA transforms a packet, including after an inbound SA
+decrypts it. This lets a later routing or dataplane boundary distinguish which
+SA accepted a packet even when several SAs carry the same inner address. The
+Linux and mock backends both return the exact pair as `SaState::output_mark`.
+The value and mask must not both be zero: Linux omits that pair from kernel
+readback, so use `output_mark: None` when no post-transform mark mutation is
+required.
+
+The ignored privileged test installs matching peer and local XFRM paths, sends
+real inbound ESP, receives the decrypted UDP payload, and observes the masked
+output mark with an `iptables` INPUT counter. This distinguishes datapath
+behavior from netlink state readback alone.
+
+The output mark is independent of `SaParameters::mark`: `mark` emits
+`XFRMA_MARK` and participates in selecting the SA, while `output_mark` changes
+the packet only after that SA runs. For example, a caller can annotate the
+inbound half of an IKEv2 Child SA without changing SA lookup:
+
+```rust,no_run
+use opc_ipsec_xfrm::{InstallSaRequest, XfrmMark};
+
+fn mark_inbound_bearer(mut request: InstallSaRequest) -> InstallSaRequest {
+    request.parameters.output_mark = Some(XfrmMark {
+        value: 0x0001_0000,
+        mask: 0x00ff_0000,
+    });
+    request
+}
+```
+
+Source migration: existing `SaParameters` struct literals must add
+`output_mark: None` to preserve their previous wire behavior. Exhaustive
+`SaState` destructuring must account for the new `output_mark` field (or use
+`..`). No Cargo feature is required.
+
+This generic path requires no fixed-DSCP companion. If `egress_dscp` is also
+set on the same SA, the generic output-mark value and mask must not touch the
+configured seven-bit DSCP window. The Linux backend combines disjoint generic
+and DSCP values into the kernel's single output-mark pair and rejects an
+overlap. Callers own namespace-wide `skb->mark` allocation and must coordinate
+every producer and consumer of the selected bits. A successful Linux install
+or rekey includes an exact GETSA readback of the output-mark pair; an ACK
+without that proof returns `StateIndeterminate` and is never followed by an
+unsafe compensating delete.
 
 ## Fixed Outer DSCP
 
@@ -105,9 +155,11 @@ let backend = LinuxXfrmBackend::with_dscp_marking(marking)?;
 
 The pin root must be a normalized child of `/sys/fs/bpf`. Interface names,
 the tc priority/handle, and the exact seven-bit mask are validated. The CNF
-must reserve the chosen mark window against every other mark producer and
-consumer in its network namespace. SA lookup marks that overlap it are
-rejected, and fixed DSCP is accepted only for tunnel-mode ESP SAs.
+must reserve the chosen mark window against every output-mark producer and
+packet-mark consumer in its network namespace. An SA lookup mark may use the
+same numeric bits because `XFRMA_MARK` is a separate kernel attribute; a
+generic SA output mark may coexist only when its value and mask are disjoint
+from the DSCP window. Fixed DSCP is accepted only for tunnel-mode ESP SAs.
 
 Construction eagerly attaches or adopts the exact owned tc slot. Every marked
 install/rekey revalidates the live map and filter before sending netlink. The
@@ -137,8 +189,9 @@ namespace-wide XFRM SA and policy identity mutations and rollback: Linux
 DELSA/DELPOLICY has no owner- or generation-conditional delete. The probe
 reports `Available` only while the exact companion remains live. Mock,
 unsupported, and mainline Linux GTP-style paths reject `Some` instead of
-silently ignoring it. `egress_dscp: None` does not require this configuration
-and emits the exact pre-feature XFRM netlink payload.
+silently ignoring it. `egress_dscp: None` does not require this configuration.
+When `output_mark` is also `None`, the backend emits the exact pre-feature XFRM
+netlink payload.
 
 An SA or policy's optional input/lookup `XfrmMark` is a separate identity
 component from the companion's reserved output-mark window. Use the same mark
@@ -146,13 +199,13 @@ on `SaParameters`, `PolicyParameters`, `QuerySaRequest`, `RemoveSaRequest`, and
 `RemovePolicyRequest`; the Linux and mock backends keep marked and unmarked SA
 identities distinct and Linux applies the mark to exact policy deletion. The
 request constructors target unmarked kernel objects, while `with_mark` selects
-a marked object. Marked installs are not reported successful until an exact
-GETSA readback succeeds. If readback fails or any stable returned field differs
-after the NEWSA ACK, the backend returns `StateIndeterminate` and never sends a
-compensating DELSA: an external writer may already have updated that identity,
-so deletion would be unsafe. A marked UPDSA readback failure is likewise
-`StateIndeterminate` because safe query state deliberately excludes the old key
-material needed for rollback.
+a marked object. Installs carrying any output mark are not reported successful
+until an exact GETSA readback succeeds. If readback fails or any stable returned
+field differs after the NEWSA ACK, the backend returns `StateIndeterminate` and
+never sends a compensating DELSA: an external writer may already have updated
+that identity, so deletion would be unsafe. An output-marked UPDSA readback
+failure is likewise `StateIndeterminate` because safe query state deliberately
+excludes the old key material needed for rollback.
 
 ## Relationships
 
@@ -171,7 +224,8 @@ material needed for rollback.
 - Fixed outer DSCP additionally requires bpffs, kernel BTF, `CAP_BPF` (or
   `CAP_SYS_ADMIN`), one configured tc egress attachment per SWu interface, and
   a globally reserved seven-bit skb-mark window.
-- `query_sa` returns replay/lifetime/statistics state but never key material.
+- `query_sa` returns replay/lifetime/statistics and the exact generic/combined
+  output mark, but never key material.
 - The `ikev2` feature maps validated Child SA intent to XFRM requests; it does
   not run IKE, allocate SPIs, or choose product policy.
 - The IKEv2 mapper keeps SPI-pinned policies as its compatibility default and

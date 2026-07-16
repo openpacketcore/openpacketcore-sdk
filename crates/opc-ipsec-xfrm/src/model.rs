@@ -11,6 +11,8 @@ use opc_types::DscpCodepoint;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use crate::error::XfrmError;
+
 /// IP address used by XFRM selectors and identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum IpAddress {
@@ -132,13 +134,28 @@ impl UdpEncap {
     }
 }
 
-/// Optional Linux XFRM packet mark.
+/// Linux XFRM mark value and mask.
+///
+/// The same wire shape is used for an SA or policy lookup mark
+/// (`XFRMA_MARK`) and for an SA output mark (`XFRMA_SET_MARK` plus
+/// `XFRMA_SET_MARK_MASK`). The field carrying the value determines which
+/// kernel attribute is emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct XfrmMark {
     /// Mark value.
     pub value: u32,
     /// Mark mask.
     pub mask: u32,
+}
+
+pub(crate) fn validate_sa_output_mark(output_mark: Option<XfrmMark>) -> Result<(), XfrmError> {
+    if matches!(output_mark, Some(XfrmMark { value: 0, mask: 0 })) {
+        return Err(XfrmError::invalid_config(
+            "sa.output_mark",
+            "output-mark value and mask must not both be zero; use None",
+        ));
+    }
+    Ok(())
 }
 
 /// XFRM mode.
@@ -480,8 +497,24 @@ pub struct SaParameters {
     pub replay_state: Option<SaReplayState>,
     /// Optional UDP encapsulation template for NAT-T.
     pub encap: Option<UdpEncap>,
-    /// Optional packet mark.
+    /// Optional packet lookup mark (`XFRMA_MARK`).
     pub mark: Option<XfrmMark>,
+    /// Optional post-transform packet mark (`XFRMA_SET_MARK`).
+    ///
+    /// Linux applies the masked value to `skb->mark` after this SA transforms
+    /// a packet. This applies to inbound/decrypt SAs as well as outbound SAs,
+    /// so callers can carry the decrypting SA identity into later routing or
+    /// dataplane classification. It is independent of [`Self::mark`], which
+    /// selects an SA during lookup.
+    ///
+    /// The value and mask must not both be zero. Linux omits both output-mark
+    /// attributes for that pair on kernel readback, so use `None` to request
+    /// no post-transform mark mutation.
+    ///
+    /// When [`Self::egress_dscp`] is also set, this mask must not overlap the
+    /// backend's reserved DSCP token window; the Linux backend combines the
+    /// two disjoint values into the single kernel output-mark attribute pair.
+    pub output_mark: Option<XfrmMark>,
     /// Optional XFRM interface identifier.
     pub if_id: Option<u32>,
     /// Optional fixed DSCP for the outer tunnel header.
@@ -631,6 +664,12 @@ pub struct SaState {
     pub lifetime_current: LifetimeCurrent,
     /// Current kernel failure counters.
     pub statistics: SaStatistics,
+    /// Exact post-transform packet mark returned by the kernel.
+    ///
+    /// This is the raw combined `XFRMA_SET_MARK`/
+    /// `XFRMA_SET_MARK_MASK` pair. When fixed outer DSCP is configured, it can
+    /// contain both the DSCP token window and a disjoint generic output mark.
+    pub output_mark: Option<XfrmMark>,
     /// Fixed outer DSCP decoded from this backend's post-transform mark token.
     pub egress_dscp: Option<DscpCodepoint>,
 }

@@ -67,7 +67,7 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --no-deps --all-features
 
   privileged:
-    name: Privileged Linux XFRM DSCP
+    name: Privileged Linux XFRM datapath
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -84,7 +84,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y iproute2
+          sudo apt-get install -y iproute2 iptables
           mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           sudo unshare -n -- bash -c 'ip link set lo up; ip xfrm state list'
 
@@ -96,7 +96,7 @@ jobs:
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
           cargo test --locked -p opc-ipsec-xfrm --test xfrm_dscp_privileged --no-run
 
-      - name: Run real XFRM and tc datapath proof
+      - name: Run real XFRM output-mark and tc datapath proof
         run: |
           set -euo pipefail
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
