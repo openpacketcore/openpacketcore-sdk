@@ -74,11 +74,14 @@ assert!(decoded.as_view().is_some());
 ```
 
 The runnable [`dedicated_bearer` example](examples/dedicated_bearer.rs) shows
-the complete SDK-side flow for receiving a triggered request, projecting its
-typed bearer data, handing the actual Child-SA side effect to the application,
-building and committing the response, and replaying the exact response for a
-retransmission. The same example covers dedicated-bearer deletion. The SDK
-does not allocate EBIs, TEIDs, or SPIs and does not program XFRM/eBPF state.
+the GTP transaction boundary for receiving a triggered request, projecting its
+typed bearer data, committing a correlated response, and replaying the exact
+response for a retransmission. The same example covers dedicated-bearer
+deletion. The cross-crate
+[`dedicated_bearer_sdk_flow` example](../opc-proto-ikev2/examples/dedicated_bearer_sdk_flow.rs)
+additionally invokes the real typed IKEv2 Child-SA create/delete APIs between
+the GTP request and response. The SDK does not allocate EBIs, TEIDs, or SPIs
+and does not program XFRM/eBPF state.
 
 ## Relationships
 

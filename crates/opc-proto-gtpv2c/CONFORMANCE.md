@@ -219,6 +219,11 @@ coverage.
      oversized retained bytes, capacity exhaustion, and expired transactions
      return stable redaction-safe errors. Sequence 0 and `0x00ff_ffff` are
      independent keys, so wrap does not alias active transactions.
+   - `opc-proto-ikev2/examples/dedicated_bearer_sdk_flow.rs` composes this
+     boundary with the real non-rekey IKEv2 Child-SA create/delete APIs. It
+     commits the GTP response only after IKE response correlation and proves
+     that a duplicate GTP request receives the exact cached response without
+     repeating application work.
 
 6. **Echo peer helper**
    - `Gtpv2cEchoPeer` tracks Echo request/response liveness, sequence mismatch,

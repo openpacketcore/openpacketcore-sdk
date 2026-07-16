@@ -105,8 +105,14 @@ Modification uses
 `build_ikev2_dedicated_bearer_delete_request`. Their empty or typed-error
 `INFORMATIONAL` responses must be decoded and checked with the corresponding
 `validate_..._response_correlation` helper before application state changes.
-The complete compilable establishment-and-deletion flow is in
+The IKE-only establishment-and-deletion flow is in
 [`examples/dedicated_bearer_ikev2.rs`](examples/dedicated_bearer_ikev2.rs).
+The complete SDK composition from a triggered GTPv2-C Create Bearer request,
+through a correlated IKEv2 Child-SA exchange and GTP response commit, followed
+by Delete Bearer and Child-SA deletion, is executable as
+[`examples/dedicated_bearer_sdk_flow.rs`](examples/dedicated_bearer_sdk_flow.rs).
+That example makes the application-owned admission, allocation, and dataplane
+boundaries explicit and proves exact GTP retransmission replay.
 
 ## Example
 
@@ -172,6 +178,7 @@ explicit non-goals.
 cargo check -p opc-proto-ikev2 --all-targets --all-features
 cargo test -p opc-proto-ikev2 --all-features
 cargo clippy -p opc-proto-ikev2 --all-targets -- -D warnings
+cargo run -p opc-proto-ikev2 --example dedicated_bearer_sdk_flow
 (cd crates/opc-proto-ikev2 && cargo +nightly fuzz list)
 (cd crates/opc-proto-ikev2 && cargo +nightly fuzz run dedicated_bearer -- -runs=1000)
 ```

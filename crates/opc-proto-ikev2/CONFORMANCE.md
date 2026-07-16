@@ -120,3 +120,11 @@ procedure-aware decodes a typed GTPv2-C Create Bearer Request, extracts the raw
 nested Bearer TFT IE value, extracts the inner value from the typed IKEv2 TFT
 Notify, and asserts literal byte identity. These vectors are
 specification-derived rather than independent-peer captures.
+
+`examples/dedicated_bearer_sdk_flow.rs` is the executable product-boundary
+composition. It processes a triggered Create Bearer request exactly once,
+passes the decoded canonical TFT and QoS into a non-rekey IKEv2 Child-SA
+exchange, correlates both protocol responses, commits the GTP response for
+exact replay, and then performs the corresponding Delete Bearer and IKEv2
+Child-SA deletion flow. Admission, identifier allocation, key installation,
+and dataplane programming remain explicit application responsibilities.
