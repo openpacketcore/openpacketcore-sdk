@@ -22,12 +22,25 @@ through `opc_consensus::engine`, allowing every production consensus consumer
 to share one exact engine version while keeping Openraft details out of
 domain-facing wire and storage APIs.
 
-`DURABLE_CONSENSUS_TIMING_PROFILE` is the sole timing authority for both
-durable domains: AppendEntries/Openraft read-index and heartbeat 2,000 ms,
-Vote 5,000 ms, elections `[5,000 ms, 8,000 ms)`, InstallSnapshot/forwarded
-mutation/consumer ReadBarrier and operation default 10,000 ms, and listener
-idle/handler ceilings 30,000 ms. The 1,500 ms DNS/TCP/mTLS/bootstrap cold cap is
-contained inside the selected family deadline, never added to it.
+`DURABLE_CONSENSUS_TIMING_PROFILE` and `DURABLE_OPENRAFT_PROFILE` are the two
+fixed shared profiles for both durable domains: heartbeat cadence 250 ms,
+AppendEntries/Openraft read-index complete-call ceiling 2,000 ms, Vote
+5,000 ms, elections
+`[5,000 ms, 8,000 ms)`, InstallSnapshot/forwarded mutation/consumer
+ReadBarrier and operation default 10,000 ms, and listener idle/handler
+ceilings 30,000 ms. Validation binds their election and snapshot values while
+keeping the heartbeat cadence deliberately independent from the outer
+AppendEntries RPC deadline. The election jitter spans eight of the exact-pinned
+engine's scheduling ticks so independently resampled campaigns do not collapse
+into one or two timer buckets under CPU contention. The 1,500 ms
+DNS/TCP/mTLS/bootstrap cold cap is contained inside the selected family
+deadline, never added to it.
+
+At idle this cadence allows four leader-to-follower heartbeat scheduling
+opportunities per second: 8 for a three-node fleet, 16 for a five-node fleet,
+and 120 at the shared 31-member ceiling. RPC payload limits and complete-call
+deadlines are unchanged. These are deterministic profile bounds, not soak or
+resource-graduation evidence; those #143 acceptance gates remain open.
 
 `DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS` fixes both durable adapters at
 eight concurrent proposal paths. Admission is obtained inside the original
@@ -56,11 +69,12 @@ its own barrier before reading local state.
 The optional `LinearizableReadLease::Enabled` mode reuses a prior successful
 Openraft quorum proof only while Openraft still reports the same local leader
 and term. Its fixed maximum lifetime is derived from the smaller of the shared
-heartbeat interval and read-barrier deadline, remains below the minimum
-election timeout, and starts no later than dispatch of the proving round so
-delayed task scheduling cannot extend it. The default is `Disabled`, which
-retains a fresh coalesced quorum round for every barrier cohort; consumers
-cannot supply a lease duration.
+heartbeat interval and read-barrier deadline and is therefore 250 ms. It
+remains below the minimum election timeout and starts no later than dispatch
+of the proving round so delayed task scheduling cannot extend it. The default
+is `Disabled`, which retains a fresh coalesced quorum round for every barrier
+cohort; consumers cannot supply a lease duration. An explicitly enabled lease
+may perform more quorum rounds after this safety-tightening cadence change.
 
 New leaders can use `open_leader(projection, deadline)` with a
 `LeaderReadProjection` implementation. The helper executes the barrier,

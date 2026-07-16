@@ -64,7 +64,7 @@ pub struct DurableOpenraftProfile {
 pub struct DurableConsensusTimingProfile {
     /// Resolver, TCP, mutual-TLS, identity, and application-bootstrap ceiling.
     pub cold_connect_timeout_millis: u64,
-    /// Openraft heartbeat interval and AppendEntries/read-index call ceiling.
+    /// AppendEntries/read-index complete-call ceiling.
     pub append_entries_timeout_millis: u64,
     /// Vote RPC ceiling.
     pub vote_timeout_millis: u64,
@@ -150,9 +150,13 @@ pub const DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES: usize = 64;
 /// when the originating caller is cancelled or its operation deadline elapses.
 pub const DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS: usize = 8;
 
+const OPENRAFT_TIMER_TICK_HEARTBEAT_NUMERATOR: u64 = 3;
+const OPENRAFT_TIMER_TICK_HEARTBEAT_DENOMINATOR: u64 = 2;
+const MINIMUM_ELECTION_JITTER_TICK_OPPORTUNITIES: u64 = 8;
+
 /// The one SDK-owned runtime configuration used by durable Openraft consumers.
 pub const DURABLE_OPENRAFT_PROFILE: DurableOpenraftProfile = DurableOpenraftProfile {
-    heartbeat_interval_millis: DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis,
+    heartbeat_interval_millis: 250,
     election_timeout_min_millis: DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_min_millis,
     election_timeout_max_millis: DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis,
     install_snapshot_timeout_millis: DURABLE_CONSENSUS_TIMING_PROFILE
@@ -180,7 +184,7 @@ pub struct DurableConsensusTimingProfileError;
 pub fn validate_durable_consensus_timing_profile(
     profile: DurableConsensusTimingProfile,
 ) -> Result<(), DurableConsensusTimingProfileError> {
-    let doubled_heartbeat = profile
+    let doubled_append_entries_deadline = profile
         .append_entries_timeout_millis
         .checked_mul(2)
         .ok_or(DurableConsensusTimingProfileError)?;
@@ -205,7 +209,7 @@ pub fn validate_durable_consensus_timing_profile(
         || profile.read_barrier_timeout_millis == 0
         || profile.operation_timeout_millis == 0
         || profile.append_entries_timeout_millis >= profile.election_timeout_min_millis
-        || profile.election_timeout_min_millis < doubled_heartbeat
+        || profile.election_timeout_min_millis < doubled_append_entries_deadline
         || profile.election_timeout_min_millis >= profile.election_timeout_max_millis
         || profile.election_timeout_max_millis >= profile.operation_timeout_millis
         || profile.vote_timeout_millis != profile.election_timeout_min_millis
@@ -219,6 +223,44 @@ pub fn validate_durable_consensus_timing_profile(
     Ok(())
 }
 
+/// Validate the fixed Openraft cadence against the complete-call timing
+/// contract.
+///
+/// The exact-pinned Openraft runtime evaluates election timeouts on a timer
+/// tick that is three halves of the configured heartbeat interval. Keeping at
+/// least eight such ticks in the election jitter range prevents independently
+/// sampled campaign deadlines from collapsing into only one or two scheduling
+/// buckets under CPU contention.
+fn validate_durable_openraft_profile(
+    profile: DurableOpenraftProfile,
+    timing: DurableConsensusTimingProfile,
+) -> Result<(), DurableOpenraftProfileError> {
+    validate_durable_consensus_timing_profile(timing).map_err(|_| DurableOpenraftProfileError)?;
+    let scaled_election_jitter = profile
+        .election_timeout_max_millis
+        .checked_sub(profile.election_timeout_min_millis)
+        .and_then(|jitter| jitter.checked_mul(OPENRAFT_TIMER_TICK_HEARTBEAT_DENOMINATOR))
+        .ok_or(DurableOpenraftProfileError)?;
+    let minimum_scaled_jitter = profile
+        .heartbeat_interval_millis
+        .checked_mul(OPENRAFT_TIMER_TICK_HEARTBEAT_NUMERATOR)
+        .and_then(|tick_numerator| {
+            tick_numerator.checked_mul(MINIMUM_ELECTION_JITTER_TICK_OPPORTUNITIES)
+        })
+        .ok_or(DurableOpenraftProfileError)?;
+
+    if profile.heartbeat_interval_millis == 0
+        || profile.heartbeat_interval_millis >= timing.append_entries_timeout_millis
+        || scaled_election_jitter < minimum_scaled_jitter
+        || profile.election_timeout_min_millis != timing.election_timeout_min_millis
+        || profile.election_timeout_max_millis != timing.election_timeout_max_millis
+        || profile.install_snapshot_timeout_millis != timing.install_snapshot_timeout_millis
+    {
+        return Err(DurableOpenraftProfileError);
+    }
+    Ok(())
+}
+
 /// Build and validate the one Openraft configuration for a durable SDK
 /// state-machine domain.
 pub fn durable_openraft_config(
@@ -226,14 +268,7 @@ pub fn durable_openraft_config(
 ) -> Result<Config, DurableOpenraftProfileError> {
     let profile = DURABLE_OPENRAFT_PROFILE;
     let timing = DURABLE_CONSENSUS_TIMING_PROFILE;
-    validate_durable_consensus_timing_profile(timing).map_err(|_| DurableOpenraftProfileError)?;
-    if profile.heartbeat_interval_millis != timing.append_entries_timeout_millis
-        || profile.election_timeout_min_millis != timing.election_timeout_min_millis
-        || profile.election_timeout_max_millis != timing.election_timeout_max_millis
-        || profile.install_snapshot_timeout_millis != timing.install_snapshot_timeout_millis
-    {
-        return Err(DurableOpenraftProfileError);
-    }
+    validate_durable_openraft_profile(profile, timing)?;
     Config {
         cluster_name: domain.cluster_name().into(),
         heartbeat_interval: profile.heartbeat_interval_millis,
@@ -278,6 +313,11 @@ mod tests {
                 DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES as u64
             );
             assert_eq!(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS, 8);
+            assert_eq!(config.heartbeat_interval, 250);
+            assert!(
+                config.heartbeat_interval
+                    < DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis
+            );
             assert_eq!(
                 config.heartbeat_interval,
                 DURABLE_OPENRAFT_PROFILE.heartbeat_interval_millis
@@ -328,6 +368,10 @@ mod tests {
             crate::DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE
                 <= Duration::from_millis(DURABLE_OPENRAFT_PROFILE.heartbeat_interval_millis)
         );
+        assert_eq!(
+            crate::DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE,
+            Duration::from_millis(250)
+        );
         assert!(
             crate::DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE
                 <= profile.rpc_timeout(ConsensusRpcFamily::ReadBarrier)
@@ -337,6 +381,42 @@ mod tests {
                 < Duration::from_millis(profile.election_timeout_min_millis)
         );
         validate_durable_consensus_timing_profile(profile).expect("fixed timing profile");
+    }
+
+    #[test]
+    fn openraft_profile_rejects_cadence_and_jitter_regressions() {
+        let profile = DURABLE_OPENRAFT_PROFILE;
+        let timing = DURABLE_CONSENSUS_TIMING_PROFILE;
+        validate_durable_openraft_profile(profile, timing).expect("fixed Openraft profile");
+
+        for invalid in [
+            DurableOpenraftProfile {
+                heartbeat_interval_millis: 0,
+                ..profile
+            },
+            DurableOpenraftProfile {
+                heartbeat_interval_millis: timing.append_entries_timeout_millis,
+                ..profile
+            },
+        ] {
+            assert_eq!(
+                validate_durable_openraft_profile(invalid, timing),
+                Err(DurableOpenraftProfileError)
+            );
+        }
+
+        let narrow_timing = DurableConsensusTimingProfile {
+            election_timeout_max_millis: timing.election_timeout_max_millis - 1,
+            ..timing
+        };
+        let narrow_profile = DurableOpenraftProfile {
+            election_timeout_max_millis: narrow_timing.election_timeout_max_millis,
+            ..profile
+        };
+        assert_eq!(
+            validate_durable_openraft_profile(narrow_profile, narrow_timing),
+            Err(DurableOpenraftProfileError)
+        );
     }
 
     #[test]

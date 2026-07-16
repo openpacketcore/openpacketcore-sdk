@@ -532,6 +532,11 @@ handshake. Configure a shared control with
 `with_connection_lifecycle`, on every client/peer and listener that must rotate
 together.
 
+The shared durable consensus runtime sends leader heartbeats on a fixed 250 ms
+cadence. That cadence is independent from the 2-second complete AppendEntries
+RPC ceiling used by this transport; the latter bounds a stalled call and is
+not an election-timer scheduling interval.
+
 Cold-connection admission is shared per remote peer across logical calls. The
 two consensus lanes use one gate, and the legacy direct request and watch paths
 use another common gate for that backend. Only one resolver/TCP/TLS/bootstrap

@@ -51,14 +51,17 @@ persistence authority.
   compatibility engine.
 
 The shared engine also has one runtime and complete-call profile.
-`opc-consensus` owns the 2,000 ms heartbeat/AppendEntries/read-index ceiling,
-5,000 ms Vote ceiling, `[5,000 ms, 8,000 ms)` election range, 10,000 ms
+`opc-consensus` owns the independent 250 ms heartbeat cadence and 2,000 ms
+AppendEntries/read-index complete-call ceiling, 5,000 ms Vote ceiling,
+`[5,000 ms, 8,000 ms)` election range, 10,000 ms
 snapshot/forward/read-barrier and operation ceilings, 30,000 ms listener
-ceilings, and the contained 1,500 ms cold-connect sub-bound. It also owns the
-replication payload, snapshot trigger/chunk, retained-log, and Tokio runtime
-choices. Session and configuration adapters select only their non-secret
-cluster label; they cannot silently drift to separate timing or runtime
-behavior.
+ceilings, and the contained 1,500 ms cold-connect sub-bound. The election
+jitter spans at least eight of the exact-pinned engine's scheduling ticks so
+independently resampled campaigns retain useful timer resolution under
+contention. It also owns the replication payload, snapshot trigger/chunk,
+retained-log, and Tokio runtime choices. Session and configuration adapters
+select only their non-secret cluster label; they cannot silently drift to
+separate timing or runtime behavior.
 
 ### Interim engine-source and release gate
 

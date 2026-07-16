@@ -122,8 +122,9 @@ gates.
 The current exact pin is the immutable `openpacketcore/openraft` revision
 `f607e636406b16bd0ad7925dbb631da1b7a4cd96`, not registry 0.9.24. Both domains
 consume one fixed runtime profile from `opc-consensus`, including fresh
-per-campaign `[5,000 ms, 8,000 ms)` election-timeout sampling, a 2,000 ms
-heartbeat/AppendEntries ceiling, and the shared 10,000 ms operation default.
+per-campaign `[5,000 ms, 8,000 ms)` election-timeout sampling, an independent
+250 ms heartbeat cadence, a 2,000 ms AppendEntries complete-call ceiling, and
+the shared 10,000 ms operation default.
 This temporary git source makes the mechanically derived 26-crate normal
 reverse-dependency
 closure source-build-only and `publish = false`. Keep that boundary until an

@@ -212,7 +212,7 @@
         "cold_connect_budget_composition": { "const": "contained-within-family-deadline" },
         "cold_connect_timeout_millis": { "const": 1500 },
         "append_entries_timeout_millis": { "const": 2000 },
-        "heartbeat_interval_millis": { "const": 2000 },
+        "heartbeat_interval_millis": { "const": 250 },
         "vote_timeout_millis": { "const": 5000 },
         "election_timeout_min_millis": { "const": 5000 },
         "election_timeout_max_millis": { "const": 8000 },

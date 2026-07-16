@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Durable consensus election liveness — `opc-consensus`:** the shared session
+  and configuration Openraft profile now keeps its 250 ms heartbeat cadence
+  independent from the 2-second AppendEntries/read-index RPC ceiling. Profile
+  validation requires the 3-second election jitter to span at least eight of
+  the exact-pinned engine's scheduling ticks, preventing independently
+  resampled campaigns from repeatedly collapsing into the same one or two
+  timer buckets under CPU contention. The fixed v2/v4 qualification profiles
+  and schemas record the corrected cadence; payload sealing, HKMS/KMS custody,
+  persisted formats, quorum authority, and the existing readiness deadline are
+  unchanged. The optional leader-read lease inherits a 250 ms maximum and
+  remains disabled by default. Idle scheduling is bounded at four heartbeat
+  opportunities per follower per second (120 at the shared 31-member ceiling),
+  while #143 soak and resource graduation remain open.
+
 ### Added
 - **Linearizable local-read gate — `opc-consensus`:** a product-neutral
   `LinearizableReadBarrier` now maps coalesced Openraft read-index outcomes to

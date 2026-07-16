@@ -8,7 +8,7 @@
   "source_tree_status": "dirty_unqualified",
   "profile": {
     "schema_version": "opc-session-ha-profile/v4-candidate",
-    "sha256": "sha256:61cef867f909fc2b4c081e0eff1d86f6e924f59211ab869baf38d2d7f8daf4f8"
+    "sha256": "sha256:fa2d20d8f31080bf1fa31d7ee1977053744bfeff6949949796d5bc5d99aafab0"
   },
   "artifact": {
     "name": "opc-session-quorum-node",

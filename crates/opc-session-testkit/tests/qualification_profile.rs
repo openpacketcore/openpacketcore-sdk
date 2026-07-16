@@ -612,17 +612,20 @@ fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
         profile.consensus_timing.server_handler_timeout_millis,
         timing.server_handler_timeout_millis
     );
-    assert_eq!(
-        profile.consensus_timing.heartbeat_interval_millis,
-        profile.consensus_timing.append_entries_timeout_millis
+    assert!(
+        profile.consensus_timing.heartbeat_interval_millis
+            < profile.consensus_timing.append_entries_timeout_millis
     );
     assert!(
         profile.consensus_timing.cold_connect_timeout_millis
             < profile.consensus_timing.append_entries_timeout_millis
     );
+    // The exact-pinned Openraft timer tick is three halves of heartbeat.
     assert!(
-        profile.consensus_timing.election_timeout_min_millis
-            >= profile.consensus_timing.heartbeat_interval_millis * 2
+        (profile.consensus_timing.election_timeout_max_millis
+            - profile.consensus_timing.election_timeout_min_millis)
+            * 2
+            >= profile.consensus_timing.heartbeat_interval_millis * 3 * 8
     );
     assert!(
         profile.consensus_timing.election_timeout_min_millis

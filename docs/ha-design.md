@@ -27,26 +27,39 @@ yet approved as a production deployment profile.
 ### Interim Openraft source and shared runtime profile
 
 Both domains use `opc_consensus::durable_openraft_config`, the same Tokio
-runtime, and the same end-to-end timing profile. AppendEntries/Openraft
-read-index and the heartbeat are 2,000 ms; Vote is 5,000 ms; elections sample
-freshly from `[5,000 ms, 8,000 ms)`; InstallSnapshot, forwarded mutation,
-consumer ReadBarrier, and the operation default are 10,000 ms. Listener
-idle/handler ceilings are 30,000 ms. A fresh connection has a contained
-1,500 ms DNS/TCP/mTLS/bootstrap cap inside its already-running family deadline,
-may consume at most two thirds of the remaining call budget, and therefore
-leaves a bounded final third for the first negotiated RPC. It is never added to
-the family deadline. The engine profile admits at most 64 log entries per
-replication payload. Limited readers retain the longest ordered entry prefix
-within a 1 MiB soft entry-section target; the first entry is retained alone
-when it exceeds that soft target so replication can still make progress,
-provided the complete singleton remains within the 2 MiB hard codec ceiling.
-Every complete private consensus RPC remains subject to that hard ceiling.
+runtime, and the same end-to-end timing profile. The leader heartbeat cadence
+is 250 ms, independently of the 2,000 ms AppendEntries/Openraft read-index
+complete-call ceiling; Vote is 5,000 ms; elections sample freshly from
+`[5,000 ms, 8,000 ms)`; InstallSnapshot, forwarded mutation, consumer
+ReadBarrier, and the operation default are 10,000 ms. The 3,000 ms election
+jitter spans eight of the exact-pinned engine's 375 ms scheduling ticks,
+preventing independently resampled campaigns from collapsing into one or two
+timer buckets under contention. Listener idle/handler ceilings are 30,000 ms.
+A fresh connection has a contained 1,500 ms DNS/TCP/mTLS/bootstrap cap inside
+its already-running family deadline, may consume at most two thirds of the
+remaining call budget, and therefore leaves a bounded final third for the first
+negotiated RPC. It is never added to the family deadline. The engine profile
+admits at most 64 log entries per replication payload. Limited readers retain
+the longest ordered entry prefix within a 1 MiB soft entry-section target; the
+first entry is retained alone when it exceeds that soft target so replication
+can still make progress, provided the complete singleton remains within the
+2 MiB hard codec ceiling. Every complete private consensus RPC remains subject
+to that hard ceiling.
+
+At idle the 250 ms cadence allows four leader-to-follower heartbeat scheduling
+opportunities per second: 8 for a three-node fleet, 16 for a five-node fleet,
+and 120 at the shared 31-member ceiling. Payload and complete-call bounds are
+unchanged, and #143 still requires deployed soak and resource qualification.
 The profile also uses a 4,096-log snapshot trigger, 1 MiB snapshot chunks, and
 1,024 retained applied logs. Both domain adapters also share one fixed
 eight-slot proposal-admission profile. A slot is acquired within the original
 operation deadline; after `client_write_ff` accepts a proposal, a detached
 supervisor holds its slot until the exact result resolves across caller
 cancellation or timeout. Domain adapters select only their cluster label.
+
+The optional same-term linearizable-read lease now inherits the 250 ms
+heartbeat bound; it remains disabled by default, and explicitly enabling it may
+perform more quorum rounds after the shorter safety window expires.
 These are code-path constants, not operator tuning knobs and not proof that
 the experimental profile meets #143 under deployed load.
 
