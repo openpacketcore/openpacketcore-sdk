@@ -18,7 +18,7 @@ use opc_key::{
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
-use super::ConsensusSessionStore;
+use super::{ConsensusSessionStore, SessionConsensusStatus};
 use crate::backend::{
     CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend,
     SessionBackend, SessionOp,
@@ -600,8 +600,10 @@ async fn actual_encryption_wrapper_survives_snapshot_restart_and_key_rotation() 
 }
 
 const REMOTE_ROTATION_MEMBER_COUNT: usize = 3;
+const REMOTE_ROTATION_SURVIVING_MEMBERS: [usize; 2] = [1, 2];
 const REMOTE_ROTATION_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const REMOTE_ROTATION_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_ROTATION_TRANSITION_TIMEOUT: Duration = CONSENSUS_READY_TIMEOUT;
+const REMOTE_ROTATION_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct RemoteRotationPeer {
@@ -782,41 +784,97 @@ impl RemoteRotationCluster {
     }
 
     async fn wait_all_ready(&self) {
-        tokio::time::timeout(REMOTE_ROTATION_TIMEOUT, async {
-            loop {
-                let reports = futures_util::future::join_all(
-                    self.stores
-                        .iter()
-                        .map(ConsensusSessionStore::probe_durable_readiness),
-                )
-                .await;
-                if reports.iter().all(|report| report.is_ready()) {
-                    return;
-                }
-                tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
-            }
-        })
-        .await
-        .expect("remote rotation cluster reaches readiness");
+        let members = (0..REMOTE_ROTATION_MEMBER_COUNT).collect::<Vec<_>>();
+        self.wait_ready_members(&members, "remote rotation cluster reaches readiness")
+            .await;
     }
 
     async fn wait_surviving_majority_ready(&self) {
-        tokio::time::timeout(REMOTE_ROTATION_TIMEOUT, async {
+        self.wait_ready_members(
+            &REMOTE_ROTATION_SURVIVING_MEMBERS,
+            "surviving remote rotation majority reaches readiness",
+        )
+        .await;
+    }
+
+    fn statuses(&self, members: &[usize]) -> Vec<SessionConsensusStatus> {
+        members
+            .iter()
+            .map(|member| self.stores[*member].status())
+            .collect()
+    }
+
+    async fn wait_ready_members(&self, members: &[usize], stage: &'static str) {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(REMOTE_ROTATION_TRANSITION_TIMEOUT)
+            .expect("remote rotation transition deadline");
+        let eligible_leaders = members
+            .iter()
+            .map(|member| self.stores[*member].status().node_id)
+            .collect::<Vec<_>>();
+        let mut attempts = 0_usize;
+        let mut last_reports = Vec::new();
+
+        loop {
+            // A readiness probe may consume the complete production operation
+            // timeout while a former leader is unreachable. Observe Openraft's
+            // redaction-safe status first so each expensive barrier is issued
+            // only after the participating members agree on an eligible leader.
             loop {
-                let reports = futures_util::future::join_all(
-                    self.stores[1..]
-                        .iter()
-                        .map(ConsensusSessionStore::probe_durable_readiness),
-                )
-                .await;
-                if reports.iter().all(|report| report.is_ready()) {
-                    return;
+                let statuses = self.statuses(members);
+                let leader = statuses.first().and_then(|status| status.leader_id);
+                let term = statuses.first().map(|status| status.term);
+                let converged = leader.is_some_and(|leader| {
+                    eligible_leaders.contains(&leader)
+                        && statuses.iter().all(|status| {
+                            status.admitted
+                                && status.leader_id == Some(leader)
+                                && Some(status.term) == term
+                        })
+                });
+                if converged {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "{stage}: leader convergence deadline elapsed; \
+                         statuses={statuses:?}, last_completed_reports={last_reports:?}"
+                    );
                 }
                 tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
             }
-        })
-        .await
-        .expect("surviving remote rotation majority reaches readiness");
+
+            attempts = attempts.saturating_add(1);
+            let reports = tokio::time::timeout_at(
+                deadline,
+                futures_util::future::join_all(
+                    members
+                        .iter()
+                        .map(|member| self.stores[*member].probe_durable_readiness()),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{stage}: readiness deadline elapsed after {attempts} barrier attempts; \
+                     statuses={:?}, last_completed_reports={last_reports:?}",
+                    self.statuses(members)
+                )
+            });
+            if reports.iter().all(|report| report.is_ready()) {
+                return;
+            }
+            last_reports = reports;
+
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "{stage}: readiness deadline elapsed after {attempts} barrier attempts; \
+                     statuses={:?}, last_completed_reports={last_reports:?}",
+                    self.statuses(members)
+                );
+            }
+            tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
+        }
     }
 
     fn isolate(&self, node: usize) {
@@ -881,7 +939,7 @@ impl RemoteRotationCluster {
                 .expect("purge logs covered by remote rotation snapshot");
         }
 
-        tokio::time::timeout(REMOTE_ROTATION_TIMEOUT, async {
+        tokio::time::timeout(REMOTE_ROTATION_SNAPSHOT_TIMEOUT, async {
             loop {
                 let compacted = self.stores[1..].iter().all(|store| {
                     let metrics = store.inner.raft.metrics();
