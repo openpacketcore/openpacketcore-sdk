@@ -1879,7 +1879,7 @@ exec sleep 30"#,
     async fn kubectl_probe_rejects_malformed_and_duplicate_replies() {
         let cancellation = QualificationKubernetesCampaignCancellation::new();
         let (_malformed_directory, malformed_executable) =
-            write_fake_kubectl("printf '%s\\n' 'not-json'");
+            write_fake_kubectl("IFS= read -r _\nprintf '%s\\n' 'not-json'");
         let malformed = KubectlQualificationKubernetesCampaignPort::with_executable(
             malformed_executable.into_os_string(),
             Duration::from_secs(2),
@@ -1892,7 +1892,7 @@ exec sleep 30"#,
         ));
 
         let (_duplicate_directory, duplicate_executable) = write_fake_kubectl(
-            "printf '%s\\n%s\\n' '{\"reply\":\"initialized\"}' '{\"reply\":\"initialized\"}'",
+            "IFS= read -r _\nprintf '%s\\n%s\\n' '{\"reply\":\"initialized\"}' '{\"reply\":\"initialized\"}'",
         );
         let duplicate = KubectlQualificationKubernetesCampaignPort::with_executable(
             duplicate_executable.into_os_string(),
