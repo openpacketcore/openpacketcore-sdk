@@ -25,7 +25,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time", "test-util"] }
+tokio = { workspace = true, features = ["io-util", "process", "signal", "sync", "time", "test-util"] }
 time = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }

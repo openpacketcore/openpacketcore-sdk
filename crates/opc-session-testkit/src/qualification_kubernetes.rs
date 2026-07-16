@@ -1,10 +1,12 @@
 //! Deterministic Kubernetes manifest foundation for session-HA qualification.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use opc_consensus::{derive_node_id, ConsensusClusterId, ConsensusNodeId};
 use opc_session_net::{
     DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
     DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
@@ -16,12 +18,32 @@ use thiserror::Error;
 
 use crate::qualification::{
     qualification_traffic_schedule_sha256, QualificationConnectionLifecycleConfig,
-    QualificationMember, QualificationNodeConfig, QualificationPeerRouting,
-    QualificationProjectedMtlsConfig, QualificationTransportConfig,
+    QualificationMember, QualificationNodeConfig, QualificationNodeReply, QualificationPeerRouting,
+    QualificationProjectedMtlsConfig, QualificationReadinessCode, QualificationTransportConfig,
     QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
 };
 
-const FLEET_NAME: &str = "opc-session-ha";
+/// Stable Kubernetes name prefix for every deployed qualification member.
+pub const QUALIFICATION_KUBERNETES_FLEET_NAME: &str = "opc-session-ha";
+/// Container that owns the private qualification control socket.
+pub const QUALIFICATION_KUBERNETES_CONTAINER_NAME: &str = "session-quorum";
+/// Exact local-only control socket path shared with the same-binary client.
+pub const QUALIFICATION_KUBERNETES_CONTROL_SOCKET_PATH: &str =
+    "/var/lib/opc-session-qualification/control/node.sock";
+/// Custom Pod readiness condition derived only from a fresh durable barrier.
+pub const QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION: &str =
+    "opc.openpacketcore.io/durable-quorum-ready";
+/// Local UDS readiness-client bound, leaving one second above the fixed store
+/// operation timeout and one second below kubelet termination.
+pub const QUALIFICATION_KUBERNETES_READINESS_CLIENT_TIMEOUT_MILLIS: u64 =
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS + 1_000;
+/// Kubelet execution deadline, leaving two seconds above the fixed store
+/// readiness operation bound and one second above the local client bound.
+pub const QUALIFICATION_KUBERNETES_READINESS_TIMEOUT_SECONDS: u64 = 12;
+/// Kubelet cadence for the local self-expiring durable-readiness probe.
+pub const QUALIFICATION_KUBERNETES_READINESS_PERIOD_SECONDS: u64 = 5;
+
+const FLEET_NAME: &str = QUALIFICATION_KUBERNETES_FLEET_NAME;
 const PEER_SERVICE_NAME: &str = "opc-session-ha-peer";
 const CONFIG_MAP_NAME_PREFIX: &str = "opc-session-ha-config";
 const SERVICE_ACCOUNT_NAME: &str = "opc-session-ha";
@@ -30,7 +52,145 @@ const WORKSPACE_DIRECTORY: &str = "/var/lib/opc-session-qualification";
 const DATABASE_PATH: &str = "/var/lib/opc-session-qualification/state/session.sqlite";
 const SNAPSHOT_DIRECTORY: &str = "/var/lib/opc-session-qualification/state/snapshots";
 const PROJECTED_IDENTITY_ROOT: &str = "/var/lib/opc-session-qualification/identity";
-const CONTROL_SOCKET_PATH: &str = "/var/lib/opc-session-qualification/control/node.sock";
+const CONTROL_SOCKET_PATH: &str = QUALIFICATION_KUBERNETES_CONTROL_SOCKET_PATH;
+const QUALIFICATION_KUBERNETES_CLUSTER_ID: &str = "opc-session-ha-release-qualification";
+
+/// Exact local and fleet identities required by one fresh readiness reply.
+#[derive(Clone, PartialEq, Eq)]
+pub struct QualificationKubernetesReadinessExpectation {
+    expected_node_id: u64,
+    expected_voter_ids: Vec<u64>,
+}
+
+impl fmt::Debug for QualificationKubernetesReadinessExpectation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QualificationKubernetesReadinessExpectation")
+            .field("expected_node_id", &"<redacted>")
+            .field("expected_voter_count", &self.expected_voter_ids.len())
+            .finish()
+    }
+}
+
+impl QualificationKubernetesReadinessExpectation {
+    /// Validate one exact three- or five-voter identity set.
+    pub fn try_new(
+        expected_node_id: u64,
+        mut expected_voter_ids: Vec<u64>,
+    ) -> Result<Self, QualificationKubernetesReadinessExpectationError> {
+        if !matches!(expected_voter_ids.len(), 3 | 5)
+            || ConsensusNodeId::new(expected_node_id).is_err()
+            || expected_voter_ids
+                .iter()
+                .any(|node_id| ConsensusNodeId::new(*node_id).is_err())
+        {
+            return Err(QualificationKubernetesReadinessExpectationError);
+        }
+        expected_voter_ids.sort_unstable();
+        let distinct = expected_voter_ids.iter().copied().collect::<BTreeSet<_>>();
+        if distinct.len() != expected_voter_ids.len()
+            || expected_voter_ids.binary_search(&expected_node_id).is_err()
+        {
+            return Err(QualificationKubernetesReadinessExpectationError);
+        }
+        Ok(Self {
+            expected_node_id,
+            expected_voter_ids,
+        })
+    }
+
+    /// Exact stable Openraft ID expected from this Pod's local socket.
+    pub const fn expected_node_id(&self) -> u64 {
+        self.expected_node_id
+    }
+
+    /// Exact sorted stable Openraft voter IDs admitted by this campaign.
+    pub fn expected_voter_ids(&self) -> &[u64] {
+        &self.expected_voter_ids
+    }
+
+    /// Exact supported fleet size.
+    pub fn voter_count(&self) -> usize {
+        self.expected_voter_ids.len()
+    }
+
+    /// Exact majority denominator implied by the admitted fleet.
+    pub fn required_quorum(&self) -> usize {
+        self.voter_count() / 2 + 1
+    }
+
+    /// Whether one ID belongs to the exact admitted voter set.
+    pub fn contains_voter(&self, node_id: u64) -> bool {
+        self.expected_voter_ids.binary_search(&node_id).is_ok()
+    }
+
+    /// Accept only a fresh, internally coherent barrier reply for this exact
+    /// local identity and voter set.
+    pub fn accepts_ready_reply(&self, reply: &QualificationNodeReply) -> bool {
+        let QualificationNodeReply::Readiness {
+            ready,
+            reason_code,
+            node_id,
+            term,
+            leader_id,
+            configured_voters,
+            configured_voter_ids,
+            fresh_reachable_voters,
+            agreeing_voters,
+            required_quorum,
+            committed_index,
+            applied_index,
+        } = reply
+        else {
+            return false;
+        };
+        *ready
+            && *reason_code == QualificationReadinessCode::Ready
+            && *node_id == self.expected_node_id
+            && *term != 0
+            && leader_id.is_some_and(|leader| self.contains_voter(leader))
+            && *configured_voters == self.voter_count()
+            && configured_voter_ids.as_deref() == Some(self.expected_voter_ids.as_slice())
+            && *required_quorum == self.required_quorum()
+            && *fresh_reachable_voters == self.required_quorum()
+            && *agreeing_voters == self.required_quorum()
+            && committed_index.is_some()
+            && applied_index
+                .zip(*committed_index)
+                .is_some_and(|(applied, committed)| applied >= committed)
+    }
+}
+
+/// Redaction-safe invalid Kubernetes readiness identity contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("qualification Kubernetes readiness identity contract is invalid")]
+pub struct QualificationKubernetesReadinessExpectationError;
+
+/// Derive the exact stable Openraft identity contract for every rendered Pod.
+pub fn qualification_kubernetes_readiness_expectations(
+    member_count: usize,
+) -> Result<Vec<QualificationKubernetesReadinessExpectation>, QualificationKubernetesManifestError>
+{
+    if !matches!(member_count, 3 | 5) {
+        return Err(QualificationKubernetesManifestError::InvalidTopology);
+    }
+    let cluster_id = ConsensusClusterId::new(QUALIFICATION_KUBERNETES_CLUSTER_ID)
+        .map_err(|_| QualificationKubernetesManifestError::InvalidNodeConfiguration)?;
+    let voter_ids = (0..member_count)
+        .map(|node_index| {
+            derive_node_id(cluster_id, format!("node-{node_index}").as_bytes())
+                .map(ConsensusNodeId::get)
+                .map_err(|_| QualificationKubernetesManifestError::InvalidNodeConfiguration)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    voter_ids
+        .iter()
+        .map(|node_id| {
+            QualificationKubernetesReadinessExpectation::try_new(*node_id, voter_ids.clone())
+                .map_err(|_| QualificationKubernetesManifestError::InvalidNodeConfiguration)
+        })
+        .collect()
+}
 
 /// Fixed-input request for one deterministic Kubernetes fleet manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +261,8 @@ pub fn render_qualification_kubernetes_manifest(
 ) -> Result<Value, QualificationKubernetesManifestError> {
     config.validate()?;
     let members = qualification_members(config);
+    let readiness_expectations =
+        qualification_kubernetes_readiness_expectations(config.member_count)?;
     let release_generation = format!(
         "release-sha256-{}",
         config
@@ -121,10 +283,10 @@ pub fn render_qualification_kubernetes_manifest(
         let node_config = QualificationNodeConfig {
             schema_version: QUALIFICATION_NODE_SCHEMA_VERSION,
             node_index,
-            cluster_id: format!("{FLEET_NAME}-release-qualification"),
+            cluster_id: QUALIFICATION_KUBERNETES_CLUSTER_ID.to_owned(),
             configuration_generation: release_generation.clone(),
             configuration_epoch: 1,
-            backend_namespace: format!("{FLEET_NAME}-release-qualification"),
+            backend_namespace: QUALIFICATION_KUBERNETES_CLUSTER_ID.to_owned(),
             workload_schedule_sha256: qualification_traffic_schedule_sha256(config.member_count)
                 .ok_or(QualificationKubernetesManifestError::InvalidTopology)?,
             members: members.clone(),
@@ -161,7 +323,15 @@ pub fn render_qualification_kubernetes_manifest(
         "data": node_configs,
     }));
     for node_index in 0..config.member_count {
-        items.push(member_stateful_set(config, node_index, &config_map_name));
+        let expectation = readiness_expectations
+            .get(node_index)
+            .ok_or(QualificationKubernetesManifestError::InvalidNodeConfiguration)?;
+        items.push(member_stateful_set(
+            config,
+            node_index,
+            &config_map_name,
+            expectation,
+        ));
     }
 
     Ok(json!({
@@ -249,6 +419,7 @@ fn qualification_annotations() -> Value {
     json!({
         "opc.openpacketcore.io/qualification-status": "experimental",
         "opc.openpacketcore.io/production-evidence": "false",
+        "opc.openpacketcore.io/durable-readiness-source": "kubelet-uds-barrier-and-external-evidence-gate",
     })
 }
 
@@ -343,11 +514,18 @@ fn member_stateful_set(
     config: &QualificationKubernetesManifestConfig,
     node_index: usize,
     config_map_name: &str,
+    readiness_expectation: &QualificationKubernetesReadinessExpectation,
 ) -> Value {
     let name = format!("{FLEET_NAME}-{node_index}");
     let labels = member_labels(node_index);
     let secret_name = format!("{FLEET_NAME}-node-{node_index}-svid");
     let config_key = format!("node-{node_index}.json");
+    let expected_voter_ids = readiness_expectation
+        .expected_voter_ids()
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let linux_node_selector = json!({ "kubernetes.io/os": "linux" });
     let mut stateful_set = json!({
         "apiVersion": "apps/v1",
@@ -372,7 +550,7 @@ fn member_stateful_set(
                     "serviceAccountName": SERVICE_ACCOUNT_NAME,
                     "automountServiceAccountToken": false,
                     "readinessGates": [{
-                        "conditionType": "opc.openpacketcore.io/durable-quorum-ready",
+                        "conditionType": QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION,
                     }],
                     "terminationGracePeriodSeconds": 90,
                     "securityContext": {
@@ -390,7 +568,7 @@ fn member_stateful_set(
                         },
                     },
                     "containers": [{
-                        "name": "session-quorum",
+                        "name": QUALIFICATION_KUBERNETES_CONTAINER_NAME,
                         "image": config.image,
                         "imagePullPolicy": "IfNotPresent",
                         "args": [
@@ -419,6 +597,21 @@ fn member_stateful_set(
                         "resources": {
                             "requests": { "cpu": "250m", "memory": "256Mi" },
                             "limits": { "cpu": "2", "memory": "1Gi" },
+                        },
+                        "readinessProbe": {
+                            "exec": { "command": [
+                                "opc-session-quorum-node",
+                                "--readiness-client",
+                                CONTROL_SOCKET_PATH,
+                                "--expected-node-id",
+                                readiness_expectation.expected_node_id().to_string(),
+                                "--expected-voter-ids",
+                                expected_voter_ids,
+                            ]},
+                            "periodSeconds": QUALIFICATION_KUBERNETES_READINESS_PERIOD_SECONDS,
+                            "timeoutSeconds": QUALIFICATION_KUBERNETES_READINESS_TIMEOUT_SECONDS,
+                            "successThreshold": 1,
+                            "failureThreshold": 1,
                         },
                         "volumeMounts": [
                             { "name": "workspace", "mountPath": WORKSPACE_DIRECTORY },
@@ -470,7 +663,7 @@ fn member_stateful_set(
     stateful_set
 }
 
-fn is_kubernetes_dns_label(value: &str) -> bool {
+pub(crate) fn is_kubernetes_dns_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
         && value
@@ -616,6 +809,11 @@ mod tests {
                 manifest["metadata"]["annotations"]["opc.openpacketcore.io/qualification-status"],
                 "experimental"
             );
+            assert_eq!(
+                manifest["metadata"]["annotations"]
+                    ["opc.openpacketcore.io/durable-readiness-source"],
+                "kubelet-uds-barrier-and-external-evidence-gate"
+            );
             let items = manifest["items"].as_array().expect("manifest items");
             assert_eq!(items.len(), member_count + 5);
             assert_eq!(
@@ -678,7 +876,150 @@ mod tests {
                     |item| item["spec"]["template"]["spec"]["volumes"][1]["configMap"]["name"]
                         == config_map_name
                 ));
+            let expectations = qualification_kubernetes_readiness_expectations(member_count)
+                .expect("fixed readiness expectations");
+            assert_eq!(
+                expectations
+                    .iter()
+                    .map(QualificationKubernetesReadinessExpectation::expected_node_id)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                member_count
+            );
+            for (node_index, expectation) in expectations.iter().enumerate() {
+                let stateful_set = items
+                    .iter()
+                    .find(|item| {
+                        item["kind"] == "StatefulSet"
+                            && item["metadata"]["name"] == format!("{FLEET_NAME}-{node_index}")
+                    })
+                    .expect("member StatefulSet");
+                let pod_spec = &stateful_set["spec"]["template"]["spec"];
+                assert_eq!(
+                    pod_spec["readinessGates"][0]["conditionType"],
+                    QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION
+                );
+                let probe = &pod_spec["containers"][0]["readinessProbe"];
+                assert_eq!(probe["failureThreshold"], 1);
+                assert_eq!(probe["successThreshold"], 1);
+                assert_eq!(
+                    probe["periodSeconds"],
+                    QUALIFICATION_KUBERNETES_READINESS_PERIOD_SECONDS
+                );
+                assert_eq!(
+                    probe["timeoutSeconds"],
+                    QUALIFICATION_KUBERNETES_READINESS_TIMEOUT_SECONDS
+                );
+                let expected_voters = expectation
+                    .expected_voter_ids()
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                assert_eq!(
+                    probe["exec"]["command"],
+                    json!([
+                        "opc-session-quorum-node",
+                        "--readiness-client",
+                        QUALIFICATION_KUBERNETES_CONTROL_SOCKET_PATH,
+                        "--expected-node-id",
+                        expectation.expected_node_id().to_string(),
+                        "--expected-voter-ids",
+                        expected_voters,
+                    ])
+                );
+            }
+            const {
+                assert!(
+                    QUALIFICATION_OPERATION_TIMEOUT_MILLIS
+                        < QUALIFICATION_KUBERNETES_READINESS_CLIENT_TIMEOUT_MILLIS
+                );
+                assert!(
+                    QUALIFICATION_KUBERNETES_READINESS_CLIENT_TIMEOUT_MILLIS
+                        < QUALIFICATION_KUBERNETES_READINESS_TIMEOUT_SECONDS * 1_000
+                );
+            }
         }
+    }
+
+    #[test]
+    fn readiness_expectation_binds_exact_distinct_local_and_leader_identities() {
+        let expectations =
+            qualification_kubernetes_readiness_expectations(3).expect("fixed expectations");
+        let expectation = &expectations[0];
+        let leader_id = expectations[1].expected_node_id();
+        let ready = |node_id, leader_id| QualificationNodeReply::Readiness {
+            ready: true,
+            reason_code: QualificationReadinessCode::Ready,
+            node_id,
+            term: 2,
+            leader_id: Some(leader_id),
+            configured_voters: 3,
+            configured_voter_ids: Some(expectation.expected_voter_ids().to_vec()),
+            fresh_reachable_voters: 2,
+            agreeing_voters: 2,
+            required_quorum: 2,
+            committed_index: Some(7),
+            applied_index: Some(7),
+        };
+        assert!(expectation.accepts_ready_reply(&ready(expectation.expected_node_id(), leader_id)));
+        assert!(
+            !expectation.accepts_ready_reply(&ready(expectations[1].expected_node_id(), leader_id))
+        );
+        let outsider = (1..)
+            .find(|candidate| !expectation.contains_voter(*candidate))
+            .expect("outside voter ID");
+        assert!(!expectation.accepts_ready_reply(&ready(expectation.expected_node_id(), outsider)));
+        let mut wrong_voter_set = ready(expectation.expected_node_id(), leader_id);
+        if let QualificationNodeReply::Readiness {
+            configured_voter_ids,
+            ..
+        } = &mut wrong_voter_set
+        {
+            configured_voter_ids
+                .as_mut()
+                .expect("ready reply voter IDs")[2] = outsider;
+        }
+        assert!(!expectation.accepts_ready_reply(&wrong_voter_set));
+        assert!(QualificationKubernetesReadinessExpectation::try_new(
+            expectation.expected_node_id(),
+            vec![
+                expectation.expected_node_id(),
+                expectation.expected_node_id(),
+                leader_id,
+            ],
+        )
+        .is_err());
+        let debug = format!("{expectation:?}");
+        assert!(!debug.contains(&expectation.expected_node_id().to_string()));
+    }
+
+    #[test]
+    fn legacy_readiness_reply_decodes_but_cannot_authorize_without_voter_ids() {
+        let expectation = qualification_kubernetes_readiness_expectations(3)
+            .expect("fixed expectations")
+            .remove(0);
+        let legacy = json!({
+            "reply": "readiness",
+            "ready": true,
+            "reason_code": "ready",
+            "node_id": expectation.expected_node_id(),
+            "term": 2,
+            "leader_id": expectation.expected_voter_ids()[0],
+            "configured_voters": 3,
+            "fresh_reachable_voters": 2,
+            "agreeing_voters": 2,
+            "required_quorum": 2,
+            "committed_index": 7,
+            "applied_index": 7,
+        });
+        let reply: QualificationNodeReply =
+            serde_json::from_value(legacy).expect("decode legacy readiness reply");
+        assert!(!expectation.accepts_ready_reply(&reply));
+        assert!(serde_json::to_value(reply)
+            .expect("re-encode legacy readiness reply")
+            .get("configured_voter_ids")
+            .is_none());
     }
 
     #[test]

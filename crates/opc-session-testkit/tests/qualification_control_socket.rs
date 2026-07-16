@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -236,6 +236,53 @@ fn invoke_raw(socket: &Path, bytes: &[u8]) -> Value {
         .expect("raw reply")
 }
 
+fn invoke_fake_readiness_client(
+    reply: QualificationNodeReply,
+    expected_node_id: u64,
+    expected_voter_ids: &str,
+) -> std::process::Output {
+    let workspace = tempfile::tempdir().expect("readiness client workspace");
+    let control_directory = workspace.path().join("control");
+    fs::create_dir(&control_directory).expect("create readiness control directory");
+    fs::set_permissions(
+        &control_directory,
+        fs::Permissions::from_mode(CONTROL_DIRECTORY_MODE),
+    )
+    .expect("set readiness control directory mode");
+    let socket = control_directory.join("node.sock");
+    let listener = UnixListener::bind(&socket).expect("bind fake readiness socket");
+    fs::set_permissions(&socket, fs::Permissions::from_mode(CONTROL_SOCKET_MODE))
+        .expect("set fake readiness socket mode");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept readiness client");
+        stream
+            .set_read_timeout(Some(PROCESS_TIMEOUT))
+            .expect("bound readiness request");
+        stream
+            .set_write_timeout(Some(PROCESS_TIMEOUT))
+            .expect("bound readiness reply");
+        let command = read_bounded_json_line::<_, QualificationNodeCommand>(&mut BufReader::new(
+            stream.try_clone().expect("clone readiness stream"),
+        ))
+        .expect("decode readiness command")
+        .expect("readiness command");
+        assert!(matches!(command, QualificationNodeCommand::Probe));
+        write_json_line(&mut stream, &reply).expect("write readiness reply");
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_opc-session-quorum-node"))
+        .arg("--readiness-client")
+        .arg(&socket)
+        .arg("--expected-node-id")
+        .arg(expected_node_id.to_string())
+        .arg("--expected-voter-ids")
+        .arg(expected_voter_ids)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run readiness client");
+    server.join().expect("join fake readiness server");
+    output
+}
+
 #[test]
 fn private_control_server_survives_bad_clients_and_recovers_stale_socket() {
     let workspace = tempfile::tempdir().expect("control test workspace");
@@ -365,6 +412,55 @@ fn control_client_failures_are_fixed_and_redacted() {
     assert!(output.stdout.is_empty());
     assert_eq!(output.stderr, b"qualification node failed\n");
     assert!(!String::from_utf8_lossy(&output.stderr).contains(private));
+}
+
+#[test]
+fn readiness_client_is_silent_and_requires_exact_uds_barrier_identity() {
+    let ready_reply = |node_id| QualificationNodeReply::Readiness {
+        ready: true,
+        reason_code: QualificationReadinessCode::Ready,
+        node_id,
+        term: 2,
+        leader_id: Some(22),
+        configured_voters: 3,
+        configured_voter_ids: Some(vec![11, 22, 33]),
+        fresh_reachable_voters: 2,
+        agreeing_voters: 2,
+        required_quorum: 2,
+        committed_index: Some(7),
+        applied_index: Some(7),
+    };
+    let success = invoke_fake_readiness_client(ready_reply(11), 11, "11,22,33");
+    assert!(success.status.success());
+    assert!(success.stdout.is_empty());
+    assert!(success.stderr.is_empty());
+
+    let wrong_local = invoke_fake_readiness_client(ready_reply(11), 22, "11,22,33");
+    assert!(!wrong_local.status.success());
+    assert!(wrong_local.stdout.is_empty());
+    assert_eq!(wrong_local.stderr, b"qualification node failed\n");
+
+    let mut legacy_without_voter_ids = ready_reply(11);
+    if let QualificationNodeReply::Readiness {
+        configured_voter_ids,
+        ..
+    } = &mut legacy_without_voter_ids
+    {
+        *configured_voter_ids = None;
+    }
+    let missing_voters = invoke_fake_readiness_client(legacy_without_voter_ids, 11, "11,22,33");
+    assert!(!missing_voters.status.success());
+    assert!(missing_voters.stdout.is_empty());
+    assert_eq!(missing_voters.stderr, b"qualification node failed\n");
+
+    let mut outsider_leader = ready_reply(11);
+    if let QualificationNodeReply::Readiness { leader_id, .. } = &mut outsider_leader {
+        *leader_id = Some(44);
+    }
+    let wrong_leader = invoke_fake_readiness_client(outsider_leader, 11, "11,22,33");
+    assert!(!wrong_leader.status.success());
+    assert!(wrong_leader.stdout.is_empty());
+    assert_eq!(wrong_leader.stderr, b"qualification node failed\n");
 }
 
 #[test]

@@ -34,6 +34,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container stdin, and retains a tokenless ServiceAccount without adding RBAC,
   ports, identities, or controller authority. Kubernetes `pods/exec` access to
   the client is node-administrator-equivalent qualification authority.
+- **Bounded Kubernetes readiness campaign — `opc-session-testkit`:** a new
+  candidate-only external runner drives the private same-binary control client
+  with direct, time/output-bounded `kubectl` processes, continuously updates
+  the custom Pod condition only from strict fresh Openraft barrier replies,
+  resets all conditions before sampling, latches the first failure, and
+  attempts all-false cleanup. A kubelet exec probe independently validates the
+  exact local and fleet identities over the private UDS with layered deadlines,
+  so readiness self-expires on quorum loss, a hung probe, or process exit even
+  if the external evidence condition becomes stale. Ctrl-C and SIGTERM wake
+  interval waits, terminate and reap an active local `kubectl`, and enter
+  bounded all-false cleanup. Exact voter IDs are additive and optional on
+  decode: legacy readiness replies remain readable but cannot authorize the
+  exact-ID Kubernetes gates.
+  It atomically publishes private digest-bound command/reply and readiness-v3
+  fragment artifacts without adding a port, token, or RBAC to the fleet. The
+  fragment intentionally omits v1 workload and v3 batch/watch/restore evidence,
+  so #143 and every production-qualification gate remain open.
 - **Canonical 3GPP TFT codec — `opc-proto-tft`:** one shared, bounded TS 24.008
   V18.8.0 value model now covers every operation, parameter, and Release 18
   packet-filter component for GTPv2-C Bearer TFT IEs and IKEv2 TFT Notify
