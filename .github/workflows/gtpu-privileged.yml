@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y iproute2 kmod
+          sudo apt-get install -y iproute2 kmod nftables
 
       - name: Check privileged GTP kernel support
         run: |
@@ -80,12 +80,12 @@ jobs:
           cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run
 
       # Proves the committed CO-RE artifact end-to-end on a real kernel:
-      # uplink tc-egress GTP-U encapsulation toward the PGW peer, downlink
-      # tc-ingress decapsulation with stack forwarding to the UE netns,
-      # unknown-TEID drops, echo passthrough, restore/adoption, and
-      # ownership-safe teardown (no opc_gtpu filters or pins left behind,
-      # already-visible foreign filters preserved under the documented
-      # exclusive-writer boundary).
+      # uplink tc-egress selection of distinct TEIDs by the exact skb mark,
+      # downlink tc-ingress mark stamping before post-decap routing/XFRM,
+      # byte-compatible unmarked traffic, v1 live-filter/schema adoption,
+      # unknown-mark/TEID drops, echo passthrough, restore/adoption, and
+      # ownership-safe teardown (no opc_gtpu filters or pins left behind;
+      # already-visible foreign filters are preserved).
       - name: Run privileged eBPF GTP-U datapath test in a fresh netns
         run: |
           set -euo pipefail
@@ -124,6 +124,22 @@ jobs:
       - name: Install pinned bpf-linker
         run: cargo install bpf-linker --version 0.10.3 --locked
 
+      - name: Verify frozen v1 migration authority
+        run: |
+          set -euo pipefail
+          frozen="crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath-v1.bpf.o"
+          echo "f31ccc2914f2fd61ae8f1e892e9ac0342f9e81350a4a065d5d8dcfcc9f7a943f  ${frozen}" | sha256sum -c -
+          readelf -sW "${frozen}" | awk '$4 == "FUNC" && $8 ~ /^opc_gtpu_/ {print $8}' | sort > frozen.programs
+          readelf -sW "${frozen}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > frozen.maps
+          diff -u <(printf '%s\n' opc_gtpu_downlink opc_gtpu_uplink) frozen.programs
+          diff -u <(printf '%s\n' GTPU_CONFIG GTPU_COUNTERS GTPU_DOWNLINK_PDR GTPU_UPLINK_DSCP GTPU_UPLINK_FAR) frozen.maps
+          for marked in GTPU_ULM_FAR GTPU_ULM_DSCP GTPU_DLM_PDR GTPU_M_OWNER; do
+            if grep -qx "${marked}" frozen.maps; then
+              echo "frozen v1 authority unexpectedly contains ${marked}" >&2
+              exit 1
+            fi
+          done
+
       # Rebuild the datapath object from source with the pinned toolchain and
       # fail on structural drift against the committed artifact. A byte-exact
       # comparison is not possible across build hosts (bpf-linker resolves a
@@ -143,6 +159,6 @@ jobs:
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_gtpu_uplink opc_gtpu_downlink GTPU_UPLINK_FAR GTPU_UPLINK_DSCP GTPU_DOWNLINK_PDR GTPU_COUNTERS GTPU_CONFIG; do
+          for symbol in opc_gtpu_uplink opc_gtpu_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
             grep -q " ${symbol}$" committed.inventory
           done

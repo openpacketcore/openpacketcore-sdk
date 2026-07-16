@@ -554,6 +554,7 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             btf_present: false,
             mutation_ready,
             egress_dscp_marking: GtpuCapability::Missing,
+            per_bearer_marking: GtpuCapability::Missing,
             details,
         }
     }
@@ -622,6 +623,11 @@ fn validate_device(device: &GtpDevice) -> Result<(), GtpuError> {
 }
 
 fn validate_pdp_context(context: &GtpPdpContext) -> Result<(), GtpuError> {
+    if context.bearer_mark.is_some() {
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "per_bearer_marking",
+        });
+    }
     if context.egress_dscp.is_some() {
         return Err(GtpuError::UnsupportedFeature {
             feature: "fixed_outer_dscp",
@@ -1172,6 +1178,7 @@ mod tests {
                     btf_present: false,
                     mutation_ready: true,
                     egress_dscp_marking: GtpuCapability::Missing,
+                    per_bearer_marking: GtpuCapability::Missing,
                     details: Some("test transport"),
                 },
                 socket_fd: 9,
@@ -1255,6 +1262,7 @@ mod tests {
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 42,
             gtp_version: GtpVersion::V1,
+            bearer_mark: None,
             egress_dscp: None,
         }
     }
