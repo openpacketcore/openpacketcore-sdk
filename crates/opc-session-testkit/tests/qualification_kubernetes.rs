@@ -47,32 +47,78 @@ fn renderer_emits_strict_three_and_five_member_lists() {
             .collect::<Vec<_>>();
         assert_eq!(stateful_sets.len(), member_count);
         for (node_index, stateful_set) in stateful_sets.into_iter().enumerate() {
+            let container = &stateful_set["spec"]["template"]["spec"]["containers"][0];
+            assert_eq!(container["image"], digest_image());
             assert_eq!(
-                stateful_set["spec"]["template"]["spec"]["containers"][0]["image"],
-                digest_image()
+                container["args"],
+                serde_json::json!([
+                    "--config",
+                    "/etc/opc-session/config/node.json",
+                    "--node-index",
+                    node_index.to_string(),
+                    "--bind-addr",
+                    "0.0.0.0:7443",
+                    "--control-socket",
+                    "/var/lib/opc-session-qualification/control/node.sock",
+                ])
             );
-            assert_eq!(
-                stateful_set["spec"]["template"]["spec"]["containers"][0]["stdin"],
-                true
-            );
+            for removed in ["stdin", "stdinOnce", "tty"] {
+                assert!(container.get(removed).is_none());
+            }
             assert_eq!(
                 stateful_set["spec"]["template"]["spec"]["readinessGates"][0]["conditionType"],
                 "opc.openpacketcore.io/durable-quorum-ready"
             );
+            let volumes = stateful_set["spec"]["template"]["spec"]["volumes"]
+                .as_array()
+                .expect("pod volumes");
+            let volume = |name: &str| {
+                volumes
+                    .iter()
+                    .find(|volume| volume["name"] == name)
+                    .expect("named pod volume")
+            };
+            assert_eq!(volume("config")["configMap"]["name"], config_map_name);
             assert_eq!(
-                stateful_set["spec"]["template"]["spec"]["volumes"][1]["configMap"]["name"],
-                config_map_name
-            );
-            assert_eq!(
-                stateful_set["spec"]["template"]["spec"]["volumes"][2]["projected"]["sources"][0]
-                    ["secret"]["name"],
+                volume("identity")["projected"]["sources"][0]["secret"]["name"],
                 format!("opc-session-ha-node-{node_index}-svid")
             );
+            assert_eq!(volume("workspace")["emptyDir"], serde_json::json!({}));
+            assert!(volumes.iter().all(|volume| volume["name"] != "control"));
+            assert!(container["volumeMounts"].as_array().is_some_and(|mounts| {
+                mounts.iter().any(|mount| {
+                    mount["name"] == "workspace"
+                        && mount["mountPath"] == "/var/lib/opc-session-qualification"
+                }) && mounts
+                    .iter()
+                    .all(|mount| mount["mountPath"] != "/var/lib/opc-session-qualification/control")
+            }));
+            assert!(container["ports"]
+                .as_array()
+                .is_some_and(|ports| { ports.len() == 1 && ports[0]["name"] == "consensus-mtls" }));
             assert_eq!(
                 stateful_set["spec"]["volumeClaimTemplates"][0]["spec"]["accessModes"][0],
                 "ReadWriteOnce"
             );
+            assert_eq!(
+                stateful_set["spec"]["template"]["spec"]["automountServiceAccountToken"],
+                false
+            );
+            assert_eq!(
+                stateful_set["spec"]["template"]["spec"]["nodeSelector"],
+                serde_json::json!({"kubernetes.io/os": "linux"})
+            );
         }
+        assert!(items.iter().all(|item| !matches!(
+            item["kind"].as_str(),
+            Some("Role" | "RoleBinding" | "ClusterRole" | "ClusterRoleBinding")
+        )));
+        let service_accounts = items
+            .iter()
+            .filter(|item| item["kind"] == "ServiceAccount")
+            .collect::<Vec<_>>();
+        assert_eq!(service_accounts.len(), 1);
+        assert_eq!(service_accounts[0]["automountServiceAccountToken"], false);
     }
 }
 
