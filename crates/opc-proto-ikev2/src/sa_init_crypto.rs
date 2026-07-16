@@ -258,6 +258,24 @@ impl Ikev2EncryptionAlgorithm {
         }
     }
 
+    pub(crate) fn from_sa_transform(
+        transform: &Ikev2SaTransform<'_>,
+    ) -> Result<Self, Ikev2SaInitCryptoError> {
+        Self::from_transform_id(
+            transform.transform_id,
+            transform_key_length_bits(transform)?,
+        )
+    }
+
+    pub(crate) fn from_sa_transform_build(
+        transform: &Ikev2SaTransformBuild,
+    ) -> Result<Self, Ikev2SaInitCryptoError> {
+        Self::from_transform_id(
+            transform.transform_id,
+            transform_build_key_length_bits(transform)?,
+        )
+    }
+
     /// IKEv2 encryption Transform ID.
     pub const fn transform_id(self) -> u16 {
         match self {

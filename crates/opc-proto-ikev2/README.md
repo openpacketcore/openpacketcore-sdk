@@ -102,9 +102,16 @@ fn accept_new_bearer_response<'a>(
 
 Modification uses
 `build_ikev2_dedicated_bearer_modification_request`; deletion uses
-`build_ikev2_dedicated_bearer_delete_request`. Their empty or typed-error
-`INFORMATIONAL` responses must be decoded and checked with the corresponding
-`validate_..._response_correlation` helper before application state changes.
+`build_ikev2_dedicated_bearer_delete_request`. A normal Delete response is
+built/decoded with `build_ikev2_dedicated_bearer_delete_response` and
+`decode_ikev2_dedicated_bearer_delete_response`: the ePDG request names its
+inbound ESP SPI, while the UE response names the paired UE inbound ESP SPI.
+Pass both values through `Ikev2DedicatedBearerDeleteResponseExpectation::PairedSa`
+to `validate_ikev2_dedicated_bearer_delete_response_correlation` before changing
+application state. An empty response is accepted only with the explicit
+`SimultaneousDelete` expectation when RFC 7296 crossed Delete requests apply.
+Modification responses remain empty or typed-error INFORMATIONAL responses and
+use their corresponding decoder/correlation helper.
 The IKE-only establishment-and-deletion flow is in
 [`examples/dedicated_bearer_ikev2.rs`](examples/dedicated_bearer_ikev2.rs).
 The complete SDK composition from a triggered GTPv2-C Create Bearer request,

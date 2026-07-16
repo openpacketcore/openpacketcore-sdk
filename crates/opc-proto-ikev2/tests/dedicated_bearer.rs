@@ -6,26 +6,27 @@ use opc_proto_ikev2::{
         build_ikev2_dedicated_bearer_create_child_sa_error_response,
         build_ikev2_dedicated_bearer_create_child_sa_request,
         build_ikev2_dedicated_bearer_create_child_sa_response,
-        build_ikev2_dedicated_bearer_delete_request,
+        build_ikev2_dedicated_bearer_delete_request, build_ikev2_dedicated_bearer_delete_response,
         build_ikev2_dedicated_bearer_informational_error_response,
         build_ikev2_dedicated_bearer_informational_success_response,
         build_ikev2_dedicated_bearer_modification_request, build_ikev2_dedicated_bearer_notify,
         decode_ikev2_dedicated_bearer_create_child_sa_request,
         decode_ikev2_dedicated_bearer_create_child_sa_response,
         decode_ikev2_dedicated_bearer_delete_request,
-        decode_ikev2_dedicated_bearer_informational_response,
+        decode_ikev2_dedicated_bearer_delete_response,
         decode_ikev2_dedicated_bearer_modification_request, decode_ikev2_dedicated_bearer_notify,
         validate_ikev2_dedicated_bearer_create_child_sa_response_correlation,
         validate_ikev2_dedicated_bearer_delete_response_correlation, Ikev2ApnAmbr,
         Ikev2ApnAmbrRateCodes, Ikev2DedicatedBearerCreateChildSaRequestBuild,
         Ikev2DedicatedBearerCreateChildSaResponse, Ikev2DedicatedBearerCreateChildSaResponseBuild,
+        Ikev2DedicatedBearerDeleteResponse, Ikev2DedicatedBearerDeleteResponseExpectation,
         Ikev2DedicatedBearerError, Ikev2DedicatedBearerEspSpi, Ikev2DedicatedBearerExchangeError,
-        Ikev2DedicatedBearerInformationalResponse, Ikev2DedicatedBearerModificationRequestBuild,
-        Ikev2DedicatedBearerNotify, Ikev2DedicatedBearerProtocolError,
-        Ikev2DedicatedBearerResponseError, Ikev2EpsQos, Ikev2EpsQosRateCodes, Ikev2ExtendedApnAmbr,
-        Ikev2ExtendedBitRateUnit, Ikev2ExtendedEpsQos, IKEV2_NOTIFY_APN_AMBR, IKEV2_NOTIFY_EPS_QOS,
-        IKEV2_NOTIFY_EXTENDED_APN_AMBR, IKEV2_NOTIFY_EXTENDED_EPS_QOS,
-        IKEV2_NOTIFY_MODIFIED_BEARER, IKEV2_NOTIFY_MULTIPLE_BEARER_PDN_CONNECTIVITY,
+        Ikev2DedicatedBearerModificationRequestBuild, Ikev2DedicatedBearerNotify,
+        Ikev2DedicatedBearerProtocolError, Ikev2DedicatedBearerResponseError, Ikev2EpsQos,
+        Ikev2EpsQosRateCodes, Ikev2ExtendedApnAmbr, Ikev2ExtendedBitRateUnit, Ikev2ExtendedEpsQos,
+        IKEV2_NOTIFY_APN_AMBR, IKEV2_NOTIFY_EPS_QOS, IKEV2_NOTIFY_EXTENDED_APN_AMBR,
+        IKEV2_NOTIFY_EXTENDED_EPS_QOS, IKEV2_NOTIFY_MODIFIED_BEARER,
+        IKEV2_NOTIFY_MULTIPLE_BEARER_PDN_CONNECTIVITY,
         IKEV2_NOTIFY_SEMANTIC_ERRORS_IN_PACKET_FILTERS,
         IKEV2_NOTIFY_SEMANTIC_ERROR_IN_THE_TFT_OPERATION,
         IKEV2_NOTIFY_SYNTACTICAL_ERRORS_IN_PACKET_FILTERS,
@@ -34,10 +35,12 @@ use opc_proto_ikev2::{
     derive_child_sa_key_material, Header, HeaderFlags, Ikev2ChildSaCryptoProfile,
     Ikev2CreateChildSaRekeyResponseBuild, Ikev2EncryptionAlgorithm, Ikev2IkeAuthPayloadBuild,
     Ikev2KeyExchangePayloadBuild, Ikev2NoncePayloadBuild, Ikev2NotifyPayload,
-    Ikev2NotifyPayloadBuild, Ikev2PrfAlgorithm, Ikev2SaPayloadBuild, Ikev2SaProposalBuild,
-    Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayloadBuild,
-    PayloadChain, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_INFORMATIONAL,
-    IKEV2_NOTIFY_REKEY_SA, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_TS_IPV4_ADDR_RANGE,
+    Ikev2NotifyPayloadBuild, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaPayloadBuild,
+    Ikev2SaProposalBuild, Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild,
+    Ikev2TrafficSelectorPayloadBuild, Ikev2TransformAttributeBuild,
+    Ikev2TransformAttributeBuildValue, PayloadChain, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
+    EXCHANGE_TYPE_INFORMATIONAL, IKEV2_NOTIFY_REKEY_SA, IKEV2_SECURITY_PROTOCOL_ID_ESP,
+    IKEV2_TS_IPV4_ADDR_RANGE,
 };
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier,
@@ -46,6 +49,7 @@ use opc_proto_tft::{
 use quickcheck::quickcheck;
 
 const TRANSFORM_TYPE_ENCR: u8 = 1;
+const TRANSFORM_TYPE_PRF: u8 = 2;
 const TRANSFORM_TYPE_INTEG: u8 = 3;
 const TRANSFORM_TYPE_DH: u8 = 4;
 const TRANSFORM_TYPE_ESN: u8 = 5;
@@ -192,17 +196,24 @@ fn replacement_tft() -> TrafficFlowTemplate {
 
 fn transforms() -> Vec<Ikev2SaTransformBuild> {
     vec![
-        Ikev2SaTransformBuild {
-            transform_type: TRANSFORM_TYPE_ENCR,
-            transform_id: 20,
-            attributes: vec![],
-        },
+        encryption_transform(20, 256),
         Ikev2SaTransformBuild {
             transform_type: TRANSFORM_TYPE_ESN,
             transform_id: TRANSFORM_ID_NONE,
             attributes: vec![],
         },
     ]
+}
+
+fn encryption_transform(transform_id: u16, key_bits: u16) -> Ikev2SaTransformBuild {
+    Ikev2SaTransformBuild {
+        transform_type: TRANSFORM_TYPE_ENCR,
+        transform_id,
+        attributes: vec![Ikev2TransformAttributeBuild {
+            attribute_type: 14,
+            value: Ikev2TransformAttributeBuildValue::Tv(key_bits),
+        }],
+    }
 }
 
 fn sa(spi: [u8; 4]) -> Ikev2SaPayloadBuild {
@@ -551,7 +562,7 @@ fn new_child_sa_with_pfs_build_decode_and_response_correlation_succeed() {
 }
 
 #[test]
-fn esp_proposals_missing_mandatory_transform_types_fail_closed() {
+fn esp_proposals_require_encryption_and_allow_esn_omission() {
     let mut missing_encryption = create_request_build();
     missing_encryption.security_association.proposals[0]
         .transforms
@@ -580,43 +591,25 @@ fn esp_proposals_missing_mandatory_transform_types_fail_closed() {
     missing_esn.security_association.proposals[0]
         .transforms
         .retain(|transform| transform.transform_type != TRANSFORM_TYPE_ESN);
-    let missing_esn_error = Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
-        transform_type: TRANSFORM_TYPE_ESN,
-    };
-    assert_eq!(
-        build_ikev2_dedicated_bearer_create_child_sa_response(&missing_esn),
-        Err(missing_esn_error.clone())
-    );
-    let raw_response = must_ok(build_create_child_sa_rekey_response_payloads(
-        &Ikev2CreateChildSaRekeyResponseBuild {
-            security_association: missing_esn.security_association,
-            nonce: missing_esn.nonce,
-            key_exchange: missing_esn.key_exchange,
-            traffic_selectors_initiator: missing_esn.traffic_selectors_initiator,
-            traffic_selectors_responder: missing_esn.traffic_selectors_responder,
-        },
-    ))
-    .into_payloads();
-    let (first_payload, bytes) = must_ok(build_ike_auth_cleartext_payload_chain(&raw_response));
-    assert_eq!(
-        decode_ikev2_dedicated_bearer_create_child_sa_response(
-            &response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 10),
-            first_payload,
-            &bytes,
-        ),
-        Err(missing_esn_error)
-    );
+    let wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
+        &missing_esn,
+    ));
+    must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
+        &response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 10),
+        wire.first_payload(),
+        wire.bytes(),
+    ));
 }
 
 #[test]
-fn response_selects_exactly_one_transform_from_every_offered_type() {
+fn non_aead_esp_requires_and_correlates_integrity() {
     let integrity = Ikev2SaTransformBuild {
         transform_type: TRANSFORM_TYPE_INTEG,
-        transform_id: 2,
+        transform_id: 12,
         attributes: vec![],
     };
     let mut request_build = create_request_build();
-    request_build.security_association.proposals[0].transforms[0].transform_id = 3;
+    request_build.security_association.proposals[0].transforms[0] = encryption_transform(12, 256);
     request_build.security_association.proposals[0]
         .transforms
         .insert(1, integrity.clone());
@@ -632,31 +625,14 @@ fn response_selects_exactly_one_transform_from_every_offered_type() {
     let response_header = response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 11);
 
     let mut omitted = create_response_build();
-    omitted.security_association.proposals[0].transforms[0].transform_id = 3;
-    let omitted_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
-        &omitted,
-    ));
-    let omitted = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
-        &response_header,
-        omitted_wire.first_payload(),
-        omitted_wire.bytes(),
-    ));
+    omitted.security_association.proposals[0].transforms[0] = encryption_transform(12, 256);
     assert_eq!(
-        validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
-            &request_header,
-            &response_header,
-            &request,
-            &omitted,
-        ),
-        Err(
-            Ikev2DedicatedBearerExchangeError::ResponseTransformTypeOmitted {
-                transform_type: TRANSFORM_TYPE_INTEG,
-            }
-        )
+        build_ikev2_dedicated_bearer_create_child_sa_response(&omitted),
+        Err(Ikev2DedicatedBearerExchangeError::EspIntegrityRequired)
     );
 
     let mut complete = create_response_build();
-    complete.security_association.proposals[0].transforms[0].transform_id = 3;
+    complete.security_association.proposals[0].transforms[0] = encryption_transform(12, 256);
     complete.security_association.proposals[0]
         .transforms
         .insert(1, integrity);
@@ -675,6 +651,191 @@ fn response_selects_exactly_one_transform_from_every_offered_type() {
             &request,
             &complete,
         ),
+    );
+}
+
+#[test]
+fn esp_request_alternatives_and_esn_omission_correlate() {
+    let mut request_build = create_request_build();
+    request_build.security_association.proposals[0]
+        .transforms
+        .insert(1, encryption_transform(20, 128));
+    request_build.security_association.proposals[0]
+        .transforms
+        .push(Ikev2SaTransformBuild {
+            transform_type: TRANSFORM_TYPE_ESN,
+            transform_id: 1,
+            attributes: vec![],
+        });
+    let request_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(
+        &request_build,
+    ));
+    let request_header = request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 13);
+    let request = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
+        &request_header,
+        request_wire.first_payload(),
+        request_wire.bytes(),
+    ));
+
+    let mut response_build = create_response_build();
+    response_build.security_association.proposals[0].transforms[0] = encryption_transform(20, 128);
+    response_build.security_association.proposals[0]
+        .transforms
+        .retain(|transform| transform.transform_type != TRANSFORM_TYPE_ESN);
+    let response_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
+        &response_build,
+    ));
+    let response_header = response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 13);
+    let response = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
+        &response_header,
+        response_wire.first_payload(),
+        response_wire.bytes(),
+    ));
+    must_ok(
+        validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+            &request_header,
+            &response_header,
+            &request,
+            &response,
+        ),
+    );
+}
+
+#[test]
+fn esp_proposal_rejects_mixed_modes_prf_duplicates_and_bad_esn() {
+    let mut mixed = create_request_build();
+    mixed.security_association.proposals[0]
+        .transforms
+        .insert(1, encryption_transform(12, 256));
+    mixed.security_association.proposals[0].transforms.insert(
+        2,
+        Ikev2SaTransformBuild {
+            transform_type: TRANSFORM_TYPE_INTEG,
+            transform_id: 12,
+            attributes: vec![],
+        },
+    );
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&mixed),
+        Err(Ikev2DedicatedBearerExchangeError::MixedEspEncryptionModes)
+    );
+
+    let mut with_prf = create_request_build();
+    with_prf.security_association.proposals[0]
+        .transforms
+        .push(Ikev2SaTransformBuild {
+            transform_type: TRANSFORM_TYPE_PRF,
+            transform_id: 5,
+            attributes: vec![],
+        });
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&with_prf),
+        Err(Ikev2DedicatedBearerExchangeError::InvalidEspTransformType {
+            transform_type: TRANSFORM_TYPE_PRF,
+        })
+    );
+
+    let mut duplicate = create_request_build();
+    let duplicate_transform = duplicate.security_association.proposals[0].transforms[0].clone();
+    duplicate.security_association.proposals[0]
+        .transforms
+        .push(duplicate_transform);
+    assert!(matches!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&duplicate),
+        Err(Ikev2DedicatedBearerExchangeError::DuplicateEspTransform {
+            transform_type: TRANSFORM_TYPE_ENCR,
+            transform_id: 20,
+        })
+    ));
+
+    let mut duplicate_attribute = create_request_build();
+    let attribute =
+        duplicate_attribute.security_association.proposals[0].transforms[0].attributes[0].clone();
+    duplicate_attribute.security_association.proposals[0].transforms[0]
+        .attributes
+        .push(attribute);
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&duplicate_attribute),
+        Err(
+            Ikev2DedicatedBearerExchangeError::DuplicateEspTransformAttribute {
+                transform_type: TRANSFORM_TYPE_ENCR,
+                attribute_type: 14,
+            }
+        )
+    );
+
+    let mut bad_esn = create_request_build();
+    bad_esn.security_association.proposals[0]
+        .transforms
+        .iter_mut()
+        .find(|transform| transform.transform_type == TRANSFORM_TYPE_ESN)
+        .expect("test fixture has ESN")
+        .transform_id = 2;
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&bad_esn),
+        Err(Ikev2DedicatedBearerExchangeError::InvalidEspEsnTransformId { transform_id: 2 })
+    );
+}
+
+#[test]
+fn esp_proposal_rejects_unsupported_algorithms_and_selected_cardinality() {
+    let mut unsupported = create_request_build();
+    unsupported.security_association.proposals[0].transforms[0] = encryption_transform(99, 256);
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&unsupported),
+        Err(Ikev2DedicatedBearerExchangeError::Crypto(
+            Ikev2SaInitCryptoError::UnsupportedEncryptionTransform { transform_id: 99 }
+        ))
+    );
+
+    let mut unsupported_integrity = create_request_build();
+    unsupported_integrity.security_association.proposals[0].transforms[0] =
+        encryption_transform(12, 256);
+    unsupported_integrity.security_association.proposals[0]
+        .transforms
+        .insert(
+            1,
+            Ikev2SaTransformBuild {
+                transform_type: TRANSFORM_TYPE_INTEG,
+                transform_id: 99,
+                attributes: vec![],
+            },
+        );
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&unsupported_integrity),
+        Err(Ikev2DedicatedBearerExchangeError::Crypto(
+            Ikev2SaInitCryptoError::UnsupportedIntegrityTransform { transform_id: 99 }
+        ))
+    );
+
+    let mut with_integrity = create_response_build();
+    with_integrity.security_association.proposals[0]
+        .transforms
+        .insert(
+            1,
+            Ikev2SaTransformBuild {
+                transform_type: TRANSFORM_TYPE_INTEG,
+                transform_id: 12,
+                attributes: vec![],
+            },
+        );
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_response(&with_integrity),
+        Err(Ikev2DedicatedBearerExchangeError::EspIntegrityForbiddenWithAead)
+    );
+
+    let mut multiple_encryption = create_response_build();
+    multiple_encryption.security_association.proposals[0]
+        .transforms
+        .insert(1, encryption_transform(20, 128));
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_response(&multiple_encryption),
+        Err(
+            Ikev2DedicatedBearerExchangeError::InvalidEspTransformCardinality {
+                transform_type: TRANSFORM_TYPE_ENCR,
+                actual: 2,
+            }
+        )
     );
 }
 
@@ -792,6 +953,21 @@ fn create_child_rejects_rekey_and_non_create_tft() {
     assert_eq!(
         build_ikev2_dedicated_bearer_create_child_sa_request(&invalid),
         Err(Ikev2DedicatedBearerExchangeError::CreateTftOperationRequired)
+    );
+
+    let downlink_filter = must_ok(PacketFilter::new(
+        must_ok(PacketFilterIdentifier::new(4)),
+        PacketFilterDirection::DownlinkOnly,
+        20,
+        vec![PacketFilterComponent::SingleRemotePort(5_001)],
+    ));
+    invalid.tft = must_ok(TrafficFlowTemplate::create_new(
+        vec![downlink_filter],
+        vec![],
+    ));
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&invalid),
+        Err(Ikev2DedicatedBearerExchangeError::CreateTftHasNoUplinkFilter)
     );
 }
 
@@ -994,7 +1170,7 @@ fn response_correlation_rejects_unoffered_proposal_and_transform() {
     );
 
     let mut wrong_transform = create_response_build();
-    wrong_transform.security_association.proposals[0].transforms[0].transform_id = 21;
+    wrong_transform.security_association.proposals[0].transforms[0] = encryption_transform(20, 128);
     let wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
         &wrong_transform,
     ));
@@ -1061,41 +1237,99 @@ fn modification_roundtrip_and_dependencies_are_strict() {
 
 #[test]
 fn deletion_and_informational_responses_are_correlated_and_typed() {
-    let spi = must_ok(Ikev2DedicatedBearerEspSpi::new(0x1020_3040));
-    let wire = must_ok(build_ikev2_dedicated_bearer_delete_request(spi));
+    let local_spi = must_ok(Ikev2DedicatedBearerEspSpi::new(0x1020_3040));
+    let peer_spi = must_ok(Ikev2DedicatedBearerEspSpi::new(0x5060_7080));
+    let wire = must_ok(build_ikev2_dedicated_bearer_delete_request(local_spi));
     let request_header = request_header(EXCHANGE_TYPE_INFORMATIONAL, 9);
-    let decoded = must_ok(decode_ikev2_dedicated_bearer_delete_request(
+    let request = must_ok(decode_ikev2_dedicated_bearer_delete_request(
         &request_header,
         wire.first_payload(),
         wire.bytes(),
     ));
-    assert_eq!(decoded.esp_spi, spi);
+    assert_eq!(request.esp_spi, local_spi);
 
-    let success = build_ikev2_dedicated_bearer_informational_success_response();
+    let success = must_ok(build_ikev2_dedicated_bearer_delete_response(peer_spi));
     let response_header = response_header(EXCHANGE_TYPE_INFORMATIONAL, 9);
+    let response = must_ok(decode_ikev2_dedicated_bearer_delete_response(
+        &response_header,
+        success.first_payload(),
+        success.bytes(),
+    ));
     assert!(matches!(
-        must_ok(decode_ikev2_dedicated_bearer_informational_response(
-            &response_header,
-            success.first_payload(),
-            success.bytes(),
-        )),
-        Ikev2DedicatedBearerInformationalResponse::Success { .. }
+        response,
+        Ikev2DedicatedBearerDeleteResponse::PairedSaDeleted {
+            peer_inbound_esp_spi,
+            ..
+        } if peer_inbound_esp_spi == peer_spi
     ));
     must_ok(validate_ikev2_dedicated_bearer_delete_response_correlation(
         &request_header,
         &response_header,
+        &request,
+        &response,
+        Ikev2DedicatedBearerDeleteResponseExpectation::PairedSa {
+            local_inbound_esp_spi: local_spi,
+            peer_inbound_esp_spi: peer_spi,
+        },
     ));
+    let wrong_peer_spi = must_ok(Ikev2DedicatedBearerEspSpi::new(0x90a0_b0c0));
+    assert_eq!(
+        validate_ikev2_dedicated_bearer_delete_response_correlation(
+            &request_header,
+            &response_header,
+            &request,
+            &response,
+            Ikev2DedicatedBearerDeleteResponseExpectation::PairedSa {
+                local_inbound_esp_spi: local_spi,
+                peer_inbound_esp_spi: wrong_peer_spi,
+            },
+        ),
+        Err(Ikev2DedicatedBearerExchangeError::DeleteResponsePayloadMismatch)
+    );
+
+    let crossed_wire = build_ikev2_dedicated_bearer_informational_success_response();
+    let crossed = must_ok(decode_ikev2_dedicated_bearer_delete_response(
+        &response_header,
+        crossed_wire.first_payload(),
+        crossed_wire.bytes(),
+    ));
+    assert!(matches!(
+        crossed,
+        Ikev2DedicatedBearerDeleteResponse::SimultaneousDelete
+    ));
+    must_ok(validate_ikev2_dedicated_bearer_delete_response_correlation(
+        &request_header,
+        &response_header,
+        &request,
+        &crossed,
+        Ikev2DedicatedBearerDeleteResponseExpectation::SimultaneousDelete {
+            local_inbound_esp_spi: local_spi,
+        },
+    ));
+    assert_eq!(
+        validate_ikev2_dedicated_bearer_delete_response_correlation(
+            &request_header,
+            &response_header,
+            &request,
+            &crossed,
+            Ikev2DedicatedBearerDeleteResponseExpectation::PairedSa {
+                local_inbound_esp_spi: local_spi,
+                peer_inbound_esp_spi: peer_spi,
+            },
+        ),
+        Err(Ikev2DedicatedBearerExchangeError::DeleteResponsePayloadMismatch)
+    );
 
     let error = must_ok(build_ikev2_dedicated_bearer_informational_error_response(
         Ikev2DedicatedBearerProtocolError::SemanticErrorsInPacketFilters,
     ));
     assert!(matches!(
-        must_ok(decode_ikev2_dedicated_bearer_informational_response(
+        must_ok(decode_ikev2_dedicated_bearer_delete_response(
             &response_header,
             error.first_payload(),
             error.bytes(),
         )),
-        Ikev2DedicatedBearerInformationalResponse::Error(
+        Ikev2DedicatedBearerDeleteResponse::Error(
             Ikev2DedicatedBearerResponseError::DedicatedBearer(
                 Ikev2DedicatedBearerProtocolError::SemanticErrorsInPacketFilters
             )
@@ -1127,6 +1361,14 @@ fn deletion_rejects_multiple_spis_and_duplicate_delete_payloads() {
         ),
         Err(Ikev2DedicatedBearerExchangeError::DeleteSpiCount { actual: 2 })
     );
+    assert_eq!(
+        decode_ikev2_dedicated_bearer_delete_response(
+            &response_header(EXCHANGE_TYPE_INFORMATIONAL, 9),
+            first,
+            &bytes,
+        ),
+        Err(Ikev2DedicatedBearerExchangeError::DeleteSpiCount { actual: 2 })
+    );
     let (first, bytes) = must_ok(build_ike_auth_cleartext_payload_chain(&[
         entry.clone(),
         entry,
@@ -1141,6 +1383,49 @@ fn deletion_rejects_multiple_spis_and_duplicate_delete_payloads() {
             role: opc_proto_ikev2::dedicated_bearer::Ikev2DedicatedBearerPayloadRole::Delete,
         })
     );
+    assert_eq!(
+        decode_ikev2_dedicated_bearer_delete_response(
+            &response_header(EXCHANGE_TYPE_INFORMATIONAL, 9),
+            first,
+            &bytes,
+        ),
+        Err(Ikev2DedicatedBearerExchangeError::DuplicatePayload {
+            role: opc_proto_ikev2::dedicated_bearer::Ikev2DedicatedBearerPayloadRole::Delete,
+        })
+    );
+
+    let ah_body = must_ok(build_delete_payload_body(2, 4, &[&first_spi]));
+    let (first, bytes) = must_ok(build_ike_auth_cleartext_payload_chain(&[
+        Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::Delete,
+            body: ah_body,
+        },
+    ]));
+    assert_eq!(
+        decode_ikev2_dedicated_bearer_delete_response(
+            &response_header(EXCHANGE_TYPE_INFORMATIONAL, 9),
+            first,
+            &bytes,
+        ),
+        Err(Ikev2DedicatedBearerExchangeError::ChildSaProtocolNotEsp { actual: 2 })
+    );
+
+    let (first, bytes) = must_ok(build_ike_auth_cleartext_payload_chain(&[
+        Ikev2IkeAuthPayloadBuild {
+            payload_type: PayloadType::Delete,
+            body: vec![IKEV2_SECURITY_PROTOCOL_ID_ESP, 3, 0, 1, 1, 2, 3],
+        },
+    ]));
+    assert!(matches!(
+        decode_ikev2_dedicated_bearer_delete_response(
+            &response_header(EXCHANGE_TYPE_INFORMATIONAL, 9),
+            first,
+            &bytes,
+        ),
+        Err(Ikev2DedicatedBearerExchangeError::ThreeGpp(
+            Ikev2DedicatedBearerError::InvalidEspSpiLength { actual: 3 }
+        ))
+    ));
 }
 
 #[test]
@@ -1185,8 +1470,8 @@ fn specification_authored_opened_payload_fixtures_are_byte_exact() {
     // RFC 7296 generic payload framing combined with TS 24.302 R17 7.2.7,
     // 7.4.6.3 and 8.2.9.10-8.2.9.12. The first octet is the SK Next Payload;
     // the remaining octets are the already-authenticated cleartext chain.
-    const CREATE_REQUEST: &str = "21280000200000001c0103040201020304030000080100001400000008050000002c00002411111111111111111111111111111111111111111111111111111111111111112d00001801000000070000100000ffff00000000ffffffff2900001801000000070000100000ffff00000000ffffffff2900000a0000a41e0101290000130000a41f0a07000b000c08000d000e000000120000a4210921330a053011501194";
-    const CREATE_RESPONSE: &str = "21280000200000001c0103040205060708030000080100001400000008050000002c00002422222222222222222222222222222222222222222222222222222222222222222d0000180100000007000010119411940a0000010a00000a000000180100000007000010119411940a0000010a00000a";
+    const CREATE_REQUEST: &str = "21280000240000002001030402010203040300000c01000014800e010000000008050000002c00002411111111111111111111111111111111111111111111111111111111111111112d00001801000000070000100000ffff00000000ffffffff2900001801000000070000100000ffff00000000ffffffff2900000a0000a41e0101290000130000a41f0a07000b000c08000d000e000000120000a4210921330a053011501194";
+    const CREATE_RESPONSE: &str = "21280000240000002001030402050607080300000c01000014800e010000000008050000002c00002422222222222222222222222222222222222222222222222222222222222222222d0000180100000007000010119411940a0000010a00000a000000180100000007000010119411940a0000010a00000a";
     const CREATE_ERROR: &str = "290000000800002035";
     const MODIFICATION: &str =
         "292900000c0304a424102030402900000a0000a41e0101000000100000a4210781330a03501388";

@@ -30,9 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Notify codecs now compose with strict opened-payload builders/views for new
   non-rekey `CREATE_CHILD_SA`, bearer-modification `INFORMATIONAL`, and
   Child-SA deletion exchanges. The boundary enforces payload cardinality,
-  ESP SPI and KE/proposal relationships, response proposal/transform and
-  traffic-selector correlation, canonical shared TS 24.008 TFT bytes, and
-  exact error/success separation while leaving admission, SPI allocation,
+  supported ESP algorithm, AEAD/INTEG, ESN, SPI, and KE/proposal relationships;
+  response proposal/transform and traffic-selector correlation; an
+  uplink-applicable create TFT; directional paired-SPI Delete responses; the
+  explicit RFC 7296 crossed-delete exception; canonical shared TS 24.008 TFT
+  bytes; and exact error/success separation while leaving admission, SPI allocation,
   retransmission timers, cryptographic sealing, and dataplane installation to
   the product.
 - `opc-sctp`: an explicit, default-off `DiameterInboundPpidPolicy` escape hatch

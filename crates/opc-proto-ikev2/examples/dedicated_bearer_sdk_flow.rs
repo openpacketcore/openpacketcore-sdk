@@ -21,18 +21,17 @@ use opc_proto_gtpv2c::{
 use opc_proto_ikev2::{
     build_ikev2_dedicated_bearer_create_child_sa_request,
     build_ikev2_dedicated_bearer_create_child_sa_response,
-    build_ikev2_dedicated_bearer_delete_request,
-    build_ikev2_dedicated_bearer_informational_success_response,
+    build_ikev2_dedicated_bearer_delete_request, build_ikev2_dedicated_bearer_delete_response,
     decode_ikev2_dedicated_bearer_create_child_sa_request,
     decode_ikev2_dedicated_bearer_create_child_sa_response,
-    decode_ikev2_dedicated_bearer_delete_request,
-    decode_ikev2_dedicated_bearer_informational_response,
+    decode_ikev2_dedicated_bearer_delete_request, decode_ikev2_dedicated_bearer_delete_response,
     validate_ikev2_dedicated_bearer_create_child_sa_response_correlation,
     validate_ikev2_dedicated_bearer_delete_response_correlation, Header, HeaderFlags,
     Ikev2DedicatedBearerCreateChildSaRequestBuild, Ikev2DedicatedBearerCreateChildSaResponseBuild,
-    Ikev2DedicatedBearerEspSpi, Ikev2EpsQos, Ikev2NoncePayloadBuild, Ikev2SaPayloadBuild,
-    Ikev2SaProposalBuild, Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild,
-    Ikev2TrafficSelectorPayloadBuild, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
+    Ikev2DedicatedBearerDeleteResponseExpectation, Ikev2DedicatedBearerEspSpi, Ikev2EpsQos,
+    Ikev2NoncePayloadBuild, Ikev2SaPayloadBuild, Ikev2SaProposalBuild, Ikev2SaTransformBuild,
+    Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayloadBuild, Ikev2TransformAttributeBuild,
+    Ikev2TransformAttributeBuildValue, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
     EXCHANGE_TYPE_INFORMATIONAL, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_TS_IPV4_ADDR_RANGE,
 };
 use opc_proto_tft::{
@@ -104,7 +103,9 @@ fn create_dedicated_bearer(
     // Admission and identifier allocation happen once, only after Dispatch.
     // The typed GTP TFT is passed unchanged into the typed IKEv2 Notify.
     let ike_request_build = Ikev2DedicatedBearerCreateChildSaRequestBuild {
-        security_association: child_sa(UE_CHILD_SPI),
+        // An SA proposal carries the sending endpoint's inbound SPI. This
+        // request is sent by the ePDG, so it advertises the ePDG-owned SPI.
+        security_association: child_sa(EPDG_CHILD_SPI),
         nonce: Ikev2NoncePayloadBuild {
             nonce: vec![0x11; 32],
         },
@@ -127,7 +128,8 @@ fn create_dedicated_bearer(
     )?;
 
     let ike_response_build = Ikev2DedicatedBearerCreateChildSaResponseBuild {
-        security_association: child_sa(EPDG_CHILD_SPI),
+        // The UE response advertises the UE-owned inbound SPI.
+        security_association: child_sa(UE_CHILD_SPI),
         nonce: Ikev2NoncePayloadBuild {
             nonce: vec![0x22; 32],
         },
@@ -204,17 +206,18 @@ fn delete_dedicated_bearer(
 
     // The application looks up the ePDG-owned SPI bound to EBI 6 and performs
     // the IKE delete exactly once for this dispatched GTP transaction.
-    let child_spi = Ikev2DedicatedBearerEspSpi::new(u32::from_be_bytes(EPDG_CHILD_SPI))?;
-    let ike_delete_payloads = build_ikev2_dedicated_bearer_delete_request(child_spi)?;
+    let epdg_inbound_spi = Ikev2DedicatedBearerEspSpi::new(u32::from_be_bytes(EPDG_CHILD_SPI))?;
+    let ue_inbound_spi = Ikev2DedicatedBearerEspSpi::new(u32::from_be_bytes(UE_CHILD_SPI))?;
+    let ike_delete_payloads = build_ikev2_dedicated_bearer_delete_request(epdg_inbound_spi)?;
     let ike_delete_header = ike_header(EXCHANGE_TYPE_INFORMATIONAL, 8, false);
-    decode_ikev2_dedicated_bearer_delete_request(
+    let ike_delete_request = decode_ikev2_dedicated_bearer_delete_request(
         &ike_delete_header,
         ike_delete_payloads.first_payload(),
         ike_delete_payloads.bytes(),
     )?;
-    let ike_response_payloads = build_ikev2_dedicated_bearer_informational_success_response();
+    let ike_response_payloads = build_ikev2_dedicated_bearer_delete_response(ue_inbound_spi)?;
     let ike_response_header = ike_header(EXCHANGE_TYPE_INFORMATIONAL, 8, true);
-    decode_ikev2_dedicated_bearer_informational_response(
+    let ike_delete_response = decode_ikev2_dedicated_bearer_delete_response(
         &ike_response_header,
         ike_response_payloads.first_payload(),
         ike_response_payloads.bytes(),
@@ -222,6 +225,12 @@ fn delete_dedicated_bearer(
     validate_ikev2_dedicated_bearer_delete_response_correlation(
         &ike_delete_header,
         &ike_response_header,
+        &ike_delete_request,
+        &ike_delete_response,
+        Ikev2DedicatedBearerDeleteResponseExpectation::PairedSa {
+            local_inbound_esp_spi: epdg_inbound_spi,
+            peer_inbound_esp_spi: ue_inbound_spi,
+        },
     )?;
 
     let response = S2bDeleteBearerResponse {
@@ -269,7 +278,10 @@ fn child_sa(spi: [u8; 4]) -> Ikev2SaPayloadBuild {
                 Ikev2SaTransformBuild {
                     transform_type: 1,
                     transform_id: 20,
-                    attributes: Vec::new(),
+                    attributes: vec![Ikev2TransformAttributeBuild {
+                        attribute_type: 14,
+                        value: Ikev2TransformAttributeBuildValue::Tv(256),
+                    }],
                 },
                 Ikev2SaTransformBuild {
                     transform_type: 5,

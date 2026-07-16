@@ -5,24 +5,26 @@ use std::error::Error;
 use opc_proto_ikev2::{
     build_ikev2_dedicated_bearer_create_child_sa_request,
     build_ikev2_dedicated_bearer_create_child_sa_response,
-    build_ikev2_dedicated_bearer_delete_request,
-    build_ikev2_dedicated_bearer_informational_success_response,
+    build_ikev2_dedicated_bearer_delete_request, build_ikev2_dedicated_bearer_delete_response,
     decode_ikev2_dedicated_bearer_create_child_sa_request,
     decode_ikev2_dedicated_bearer_create_child_sa_response,
-    decode_ikev2_dedicated_bearer_delete_request,
-    decode_ikev2_dedicated_bearer_informational_response,
+    decode_ikev2_dedicated_bearer_delete_request, decode_ikev2_dedicated_bearer_delete_response,
     validate_ikev2_dedicated_bearer_create_child_sa_response_correlation,
     validate_ikev2_dedicated_bearer_delete_response_correlation, Header, HeaderFlags,
     Ikev2DedicatedBearerCreateChildSaRequestBuild, Ikev2DedicatedBearerCreateChildSaResponseBuild,
-    Ikev2DedicatedBearerEspSpi, Ikev2EpsQos, Ikev2NoncePayloadBuild, Ikev2SaPayloadBuild,
-    Ikev2SaProposalBuild, Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild,
-    Ikev2TrafficSelectorPayloadBuild, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
+    Ikev2DedicatedBearerDeleteResponseExpectation, Ikev2DedicatedBearerEspSpi, Ikev2EpsQos,
+    Ikev2NoncePayloadBuild, Ikev2SaPayloadBuild, Ikev2SaProposalBuild, Ikev2SaTransformBuild,
+    Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayloadBuild, Ikev2TransformAttributeBuild,
+    Ikev2TransformAttributeBuildValue, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
     EXCHANGE_TYPE_INFORMATIONAL, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_TS_IPV4_ADDR_RANGE,
 };
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier,
     TrafficFlowTemplate,
 };
+
+const EPDG_INBOUND_CHILD_SPI: [u8; 4] = [1, 2, 3, 4];
+const UE_INBOUND_CHILD_SPI: [u8; 4] = [5, 6, 7, 8];
 
 fn header(exchange_type: u8, message_id: u32, response: bool) -> Header {
     Header::new(
@@ -45,7 +47,10 @@ fn child_sa(spi: [u8; 4]) -> Ikev2SaPayloadBuild {
                 Ikev2SaTransformBuild {
                     transform_type: 1,
                     transform_id: 20,
-                    attributes: vec![],
+                    attributes: vec![Ikev2TransformAttributeBuild {
+                        attribute_type: 14,
+                        value: Ikev2TransformAttributeBuildValue::Tv(256),
+                    }],
                 },
                 Ikev2SaTransformBuild {
                     transform_type: 5,
@@ -79,7 +84,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let tft = TrafficFlowTemplate::create_new(vec![filter], vec![])?;
     let request_build = Ikev2DedicatedBearerCreateChildSaRequestBuild {
-        security_association: child_sa([1, 2, 3, 4]),
+        security_association: child_sa(EPDG_INBOUND_CHILD_SPI),
         nonce: Ikev2NoncePayloadBuild {
             nonce: vec![0x11; 32],
         },
@@ -101,7 +106,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     let response_build = Ikev2DedicatedBearerCreateChildSaResponseBuild {
-        security_association: child_sa([5, 6, 7, 8]),
+        security_association: child_sa(UE_INBOUND_CHILD_SPI),
         nonce: Ikev2NoncePayloadBuild {
             nonce: vec![0x22; 32],
         },
@@ -123,17 +128,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         &response,
     )?;
 
-    let child_spi = Ikev2DedicatedBearerEspSpi::new(0x1020_3040)?;
-    let delete_payloads = build_ikev2_dedicated_bearer_delete_request(child_spi)?;
+    let epdg_inbound_spi =
+        Ikev2DedicatedBearerEspSpi::new(u32::from_be_bytes(EPDG_INBOUND_CHILD_SPI))?;
+    let ue_inbound_spi = Ikev2DedicatedBearerEspSpi::new(u32::from_be_bytes(UE_INBOUND_CHILD_SPI))?;
+    let delete_payloads = build_ikev2_dedicated_bearer_delete_request(epdg_inbound_spi)?;
     let delete_header = header(EXCHANGE_TYPE_INFORMATIONAL, 8, false);
-    decode_ikev2_dedicated_bearer_delete_request(
+    let delete_request = decode_ikev2_dedicated_bearer_delete_request(
         &delete_header,
         delete_payloads.first_payload(),
         delete_payloads.bytes(),
     )?;
-    let delete_response = build_ikev2_dedicated_bearer_informational_success_response();
+    let delete_response = build_ikev2_dedicated_bearer_delete_response(ue_inbound_spi)?;
     let delete_response_header = header(EXCHANGE_TYPE_INFORMATIONAL, 8, true);
-    decode_ikev2_dedicated_bearer_informational_response(
+    let decoded_delete_response = decode_ikev2_dedicated_bearer_delete_response(
         &delete_response_header,
         delete_response.first_payload(),
         delete_response.bytes(),
@@ -141,6 +148,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     validate_ikev2_dedicated_bearer_delete_response_correlation(
         &delete_header,
         &delete_response_header,
+        &delete_request,
+        &decoded_delete_response,
+        Ikev2DedicatedBearerDeleteResponseExpectation::PairedSa {
+            local_inbound_esp_spi: epdg_inbound_spi,
+            peer_inbound_esp_spi: ue_inbound_spi,
+        },
     )?;
 
     Ok(())

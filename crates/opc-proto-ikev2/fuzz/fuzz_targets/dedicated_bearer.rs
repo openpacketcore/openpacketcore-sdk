@@ -4,7 +4,7 @@ use libfuzzer_sys::fuzz_target;
 use opc_proto_ikev2::{
     decode_ikev2_dedicated_bearer_create_child_sa_request,
     decode_ikev2_dedicated_bearer_create_child_sa_response,
-    decode_ikev2_dedicated_bearer_delete_request,
+    decode_ikev2_dedicated_bearer_delete_request, decode_ikev2_dedicated_bearer_delete_response,
     decode_ikev2_dedicated_bearer_informational_response,
     decode_ikev2_dedicated_bearer_modification_request, decode_ikev2_dedicated_bearer_notify,
     Header, HeaderFlags, Ikev2NotifyPayload, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
@@ -55,8 +55,9 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let is_response = matches!(mode % 5, 1 | 4);
-    let exchange_type = if mode % 5 <= 1 {
+    let mode = mode % 6;
+    let is_response = matches!(mode, 1 | 4 | 5);
+    let exchange_type = if mode <= 1 {
         EXCHANGE_TYPE_CREATE_CHILD_SA
     } else {
         EXCHANGE_TYPE_INFORMATIONAL
@@ -71,7 +72,7 @@ fuzz_target!(|data: &[u8]| {
     );
     let first_payload = PayloadType::from_u8(first_payload);
 
-    match mode % 5 {
+    match mode {
         0 => {
             let _ = decode_ikev2_dedicated_bearer_create_child_sa_request(
                 &header,
@@ -100,8 +101,15 @@ fuzz_target!(|data: &[u8]| {
                 cleartext_payloads,
             );
         }
-        _ => {
+        4 => {
             let _ = decode_ikev2_dedicated_bearer_informational_response(
+                &header,
+                first_payload,
+                cleartext_payloads,
+            );
+        }
+        _ => {
+            let _ = decode_ikev2_dedicated_bearer_delete_response(
                 &header,
                 first_payload,
                 cleartext_payloads,

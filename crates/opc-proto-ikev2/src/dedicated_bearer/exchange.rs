@@ -20,7 +20,11 @@ use crate::{
     sa_init::{
         Ikev2KeyExchangePayload, Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError,
         Ikev2NoncePayload, Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2SaPayload,
-        Ikev2SaPayloadBuild, Ikev2SaPayloadError, Ikev2SaProposal,
+        Ikev2SaPayloadBuild, Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaTransform,
+        Ikev2SaTransformBuild,
+    },
+    sa_init_crypto::{
+        Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError,
     },
 };
 
@@ -31,9 +35,12 @@ use super::{
 };
 
 const IKEV2_TRANSFORM_TYPE_ENCR: u8 = 1;
+const IKEV2_TRANSFORM_TYPE_INTEG: u8 = 3;
 const IKEV2_TRANSFORM_TYPE_DH: u8 = 4;
 const IKEV2_TRANSFORM_TYPE_ESN: u8 = 5;
 const IKEV2_TRANSFORM_ID_NONE: u16 = 0;
+const IKEV2_TRANSFORM_ID_ESN: u16 = 1;
+const IKEV2_TRANSFORM_ATTRIBUTE_KEY_LENGTH: u16 = 14;
 
 /// Stable payload role used in missing/duplicate diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -887,19 +894,17 @@ fn validate_sa_build(
         });
     }
     let mut proposal_numbers = BTreeSet::new();
-    for proposal in &sa.proposals {
-        if proposal.proposal_number == 0 || !proposal_numbers.insert(proposal.proposal_number) {
+    for (index, proposal) in sa.proposals.iter().enumerate() {
+        if proposal.proposal_number == 0
+            || !proposal_numbers.insert(proposal.proposal_number)
+            || (!response && usize::from(proposal.proposal_number) != index + 1)
+        {
             return Err(Ikev2DedicatedBearerExchangeError::InvalidProposalNumber {
                 value: proposal.proposal_number,
             });
         }
         validate_proposal_spi(proposal.protocol_id, &proposal.spi)?;
-        validate_mandatory_esp_transform_types(
-            proposal
-                .transforms
-                .iter()
-                .map(|transform| transform.transform_type),
-        )?;
+        validate_esp_transform_builds(&proposal.transforms, response)?;
     }
     Ok(())
 }
@@ -914,8 +919,11 @@ fn validate_sa_view(
         });
     }
     let mut proposal_numbers = BTreeSet::new();
-    for proposal in &sa.proposals {
-        if proposal.proposal_number == 0 || !proposal_numbers.insert(proposal.proposal_number) {
+    for (index, proposal) in sa.proposals.iter().enumerate() {
+        if proposal.proposal_number == 0
+            || !proposal_numbers.insert(proposal.proposal_number)
+            || (!response && usize::from(proposal.proposal_number) != index + 1)
+        {
             return Err(Ikev2DedicatedBearerExchangeError::InvalidProposalNumber {
                 value: proposal.proposal_number,
             });
@@ -926,40 +934,265 @@ fn validate_sa_view(
             });
         }
         validate_proposal_spi(proposal.protocol_id, proposal.spi)?;
-        validate_mandatory_esp_transform_types(
-            proposal
-                .transforms
-                .iter()
-                .map(|transform| transform.transform_type),
-        )?;
+        validate_esp_transforms(&proposal.transforms, response)?;
     }
     Ok(())
 }
 
-fn validate_mandatory_esp_transform_types(
-    transform_types: impl IntoIterator<Item = u8>,
+#[derive(Default)]
+struct EspTransformShape {
+    encryption: usize,
+    integrity: usize,
+    dh: usize,
+    esn: usize,
+    has_aead_encryption: bool,
+    has_non_aead_encryption: bool,
+}
+
+impl EspTransformShape {
+    fn record_encryption(&mut self, encryption: Ikev2EncryptionAlgorithm) {
+        self.encryption += 1;
+        if encryption.is_aead() {
+            self.has_aead_encryption = true;
+        } else {
+            self.has_non_aead_encryption = true;
+        }
+    }
+
+    fn validate(&self, response: bool) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+        if self.encryption == 0 {
+            return Err(
+                Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
+                    transform_type: IKEV2_TRANSFORM_TYPE_ENCR,
+                },
+            );
+        }
+        if self.has_aead_encryption && self.has_non_aead_encryption {
+            return Err(Ikev2DedicatedBearerExchangeError::MixedEspEncryptionModes);
+        }
+        if self.has_aead_encryption && self.integrity != 0 {
+            return Err(Ikev2DedicatedBearerExchangeError::EspIntegrityForbiddenWithAead);
+        }
+        if self.has_non_aead_encryption && self.integrity == 0 {
+            return Err(Ikev2DedicatedBearerExchangeError::EspIntegrityRequired);
+        }
+        if response {
+            for (transform_type, actual) in [
+                (IKEV2_TRANSFORM_TYPE_ENCR, self.encryption),
+                (IKEV2_TRANSFORM_TYPE_INTEG, self.integrity),
+                (IKEV2_TRANSFORM_TYPE_DH, self.dh),
+                (IKEV2_TRANSFORM_TYPE_ESN, self.esn),
+            ] {
+                if actual > 1 {
+                    return Err(
+                        Ikev2DedicatedBearerExchangeError::InvalidEspTransformCardinality {
+                            transform_type,
+                            actual,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_esp_transform_builds(
+    transforms: &[Ikev2SaTransformBuild],
+    response: bool,
 ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
-    let mut has_encryption = false;
-    let mut has_extended_sequence_numbers = false;
-    for transform_type in transform_types {
-        has_encryption |= transform_type == IKEV2_TRANSFORM_TYPE_ENCR;
-        has_extended_sequence_numbers |= transform_type == IKEV2_TRANSFORM_TYPE_ESN;
+    let mut shape = EspTransformShape::default();
+    for (index, transform) in transforms.iter().enumerate() {
+        validate_transform_build_attributes(transform)?;
+        if transforms[..index]
+            .iter()
+            .any(|candidate| transform_builds_are_equivalent(candidate, transform))
+        {
+            return Err(Ikev2DedicatedBearerExchangeError::DuplicateEspTransform {
+                transform_type: transform.transform_type,
+                transform_id: transform.transform_id,
+            });
+        }
+        match transform.transform_type {
+            IKEV2_TRANSFORM_TYPE_ENCR => shape.record_encryption(
+                Ikev2EncryptionAlgorithm::from_sa_transform_build(transform)
+                    .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?,
+            ),
+            IKEV2_TRANSFORM_TYPE_INTEG => {
+                shape.integrity += 1;
+            }
+            IKEV2_TRANSFORM_TYPE_DH => {
+                if transform.transform_id != IKEV2_TRANSFORM_ID_NONE {
+                    Ikev2DhGroup::from_transform_id(transform.transform_id)
+                        .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
+                }
+                shape.dh += 1;
+            }
+            IKEV2_TRANSFORM_TYPE_ESN => {
+                validate_esn_transform_id(transform.transform_id)?;
+                shape.esn += 1;
+            }
+            _ => {
+                return Err(Ikev2DedicatedBearerExchangeError::InvalidEspTransformType {
+                    transform_type: transform.transform_type,
+                });
+            }
+        }
     }
-    if !has_encryption {
-        return Err(
-            Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
-                transform_type: IKEV2_TRANSFORM_TYPE_ENCR,
-            },
-        );
-    }
-    if !has_extended_sequence_numbers {
-        return Err(
-            Ikev2DedicatedBearerExchangeError::MissingMandatoryEspTransform {
-                transform_type: IKEV2_TRANSFORM_TYPE_ESN,
-            },
-        );
+    shape.validate(response)?;
+    if shape.has_non_aead_encryption {
+        for transform in transforms
+            .iter()
+            .filter(|transform| transform.transform_type == IKEV2_TRANSFORM_TYPE_INTEG)
+        {
+            Ikev2IntegrityAlgorithm::from_transform_id(transform.transform_id)
+                .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
+        }
     }
     Ok(())
+}
+
+fn validate_esp_transforms(
+    transforms: &[Ikev2SaTransform<'_>],
+    response: bool,
+) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    let mut shape = EspTransformShape::default();
+    for (index, transform) in transforms.iter().enumerate() {
+        validate_transform_attributes(transform)?;
+        if transforms[..index]
+            .iter()
+            .any(|candidate| transforms_are_equivalent(candidate, transform))
+        {
+            return Err(Ikev2DedicatedBearerExchangeError::DuplicateEspTransform {
+                transform_type: transform.transform_type,
+                transform_id: transform.transform_id,
+            });
+        }
+        match transform.transform_type {
+            IKEV2_TRANSFORM_TYPE_ENCR => shape.record_encryption(
+                Ikev2EncryptionAlgorithm::from_sa_transform(transform)
+                    .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?,
+            ),
+            IKEV2_TRANSFORM_TYPE_INTEG => {
+                shape.integrity += 1;
+            }
+            IKEV2_TRANSFORM_TYPE_DH => {
+                if transform.transform_id != IKEV2_TRANSFORM_ID_NONE {
+                    Ikev2DhGroup::from_transform_id(transform.transform_id)
+                        .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
+                }
+                shape.dh += 1;
+            }
+            IKEV2_TRANSFORM_TYPE_ESN => {
+                validate_esn_transform_id(transform.transform_id)?;
+                shape.esn += 1;
+            }
+            _ => {
+                return Err(Ikev2DedicatedBearerExchangeError::InvalidEspTransformType {
+                    transform_type: transform.transform_type,
+                });
+            }
+        }
+    }
+    shape.validate(response)?;
+    if shape.has_non_aead_encryption {
+        for transform in transforms
+            .iter()
+            .filter(|transform| transform.transform_type == IKEV2_TRANSFORM_TYPE_INTEG)
+        {
+            Ikev2IntegrityAlgorithm::from_transform_id(transform.transform_id)
+                .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_transform_build_attributes(
+    transform: &Ikev2SaTransformBuild,
+) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    let mut attribute_types = BTreeSet::new();
+    for attribute in &transform.attributes {
+        if !attribute_types.insert(attribute.attribute_type) {
+            return Err(
+                Ikev2DedicatedBearerExchangeError::DuplicateEspTransformAttribute {
+                    transform_type: transform.transform_type,
+                    attribute_type: attribute.attribute_type,
+                },
+            );
+        }
+        if transform.transform_type != IKEV2_TRANSFORM_TYPE_ENCR
+            || attribute.attribute_type != IKEV2_TRANSFORM_ATTRIBUTE_KEY_LENGTH
+        {
+            return Err(
+                Ikev2DedicatedBearerExchangeError::InvalidEspTransformAttribute {
+                    transform_type: transform.transform_type,
+                    attribute_type: attribute.attribute_type,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_transform_attributes(
+    transform: &Ikev2SaTransform<'_>,
+) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    let mut attribute_types = BTreeSet::new();
+    for attribute in &transform.attributes {
+        if !attribute_types.insert(attribute.attribute_type) {
+            return Err(
+                Ikev2DedicatedBearerExchangeError::DuplicateEspTransformAttribute {
+                    transform_type: transform.transform_type,
+                    attribute_type: attribute.attribute_type,
+                },
+            );
+        }
+        if transform.transform_type != IKEV2_TRANSFORM_TYPE_ENCR
+            || attribute.attribute_type != IKEV2_TRANSFORM_ATTRIBUTE_KEY_LENGTH
+        {
+            return Err(
+                Ikev2DedicatedBearerExchangeError::InvalidEspTransformAttribute {
+                    transform_type: transform.transform_type,
+                    attribute_type: attribute.attribute_type,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn transform_builds_are_equivalent(
+    left: &Ikev2SaTransformBuild,
+    right: &Ikev2SaTransformBuild,
+) -> bool {
+    left.transform_type == right.transform_type
+        && left.transform_id == right.transform_id
+        && left.attributes.len() == right.attributes.len()
+        && left
+            .attributes
+            .iter()
+            .all(|attribute| right.attributes.contains(attribute))
+}
+
+fn transforms_are_equivalent(left: &Ikev2SaTransform<'_>, right: &Ikev2SaTransform<'_>) -> bool {
+    left.transform_type == right.transform_type
+        && left.transform_id == right.transform_id
+        && left.attributes.len() == right.attributes.len()
+        && left
+            .attributes
+            .iter()
+            .all(|attribute| right.attributes.contains(attribute))
+}
+
+fn validate_esn_transform_id(transform_id: u16) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    if matches!(
+        transform_id,
+        IKEV2_TRANSFORM_ID_NONE | IKEV2_TRANSFORM_ID_ESN
+    ) {
+        Ok(())
+    } else {
+        Err(Ikev2DedicatedBearerExchangeError::InvalidEspEsnTransformId { transform_id })
+    }
 }
 
 fn validate_proposal_spi(
@@ -1023,6 +1256,17 @@ fn validate_create_tft(
     }
     if tft.packet_filters().is_empty() {
         return Err(Ikev2DedicatedBearerExchangeError::CreateTftEmpty);
+    }
+    if !tft.packet_filters().filters().is_some_and(|filters| {
+        filters.iter().any(|filter| {
+            matches!(
+                filter.direction(),
+                opc_proto_tft::PacketFilterDirection::UplinkOnly
+                    | opc_proto_tft::PacketFilterDirection::Bidirectional
+            )
+        })
+    }) {
+        return Err(Ikev2DedicatedBearerExchangeError::CreateTftHasNoUplinkFilter);
     }
     Ok(())
 }
@@ -1127,6 +1371,50 @@ pub enum Ikev2DedicatedBearerExchangeError {
         /// Missing IKEv2 transform type.
         transform_type: u8,
     },
+    /// An ESP proposal used a transform type not valid for ESP (including PRF).
+    InvalidEspTransformType {
+        /// Received IKEv2 transform type.
+        transform_type: u8,
+    },
+    /// A selected ESP proposal contained multiple transforms of one type.
+    InvalidEspTransformCardinality {
+        /// Duplicated IKEv2 transform type.
+        transform_type: u8,
+        /// Number of transforms of that type.
+        actual: usize,
+    },
+    /// An ESP proposal repeated the same transform alternative.
+    DuplicateEspTransform {
+        /// IKEv2 transform type.
+        transform_type: u8,
+        /// IKEv2 transform identifier.
+        transform_id: u16,
+    },
+    /// A transform repeated an attribute type.
+    DuplicateEspTransformAttribute {
+        /// IKEv2 transform type.
+        transform_type: u8,
+        /// Repeated attribute type.
+        attribute_type: u16,
+    },
+    /// A transform used an attribute not valid in the supported ESP profile.
+    InvalidEspTransformAttribute {
+        /// IKEv2 transform type.
+        transform_type: u8,
+        /// Invalid attribute type.
+        attribute_type: u16,
+    },
+    /// An ESN transform used an identifier other than NO_ESN or ESN.
+    InvalidEspEsnTransformId {
+        /// Received ESN transform identifier.
+        transform_id: u16,
+    },
+    /// One proposal mixed combined-mode AEAD and non-AEAD encryption alternatives.
+    MixedEspEncryptionModes,
+    /// A non-AEAD ESP proposal omitted its integrity transform.
+    EspIntegrityRequired,
+    /// A combined-mode AEAD ESP proposal carried a separate integrity transform.
+    EspIntegrityForbiddenWithAead,
     /// A proposal used a DH transform but KE was absent.
     KeyExchangeRequired,
     /// KE was present without a DH transform.
@@ -1137,6 +1425,8 @@ pub enum Ikev2DedicatedBearerExchangeError {
     CreateTftOperationRequired,
     /// Dedicated-bearer creation TFT had no packet filters.
     CreateTftEmpty,
+    /// Dedicated-bearer creation TFT had no uplink-applicable packet filter.
+    CreateTftHasNoUplinkFilter,
     /// Extended APN-AMBR appeared without APN-AMBR.
     ExtendedApnAmbrWithoutApnAmbr,
     /// Extended EPS QoS appeared without EPS QoS.
@@ -1148,6 +1438,10 @@ pub enum Ikev2DedicatedBearerExchangeError {
         /// Received SPI count.
         actual: usize,
     },
+    /// A non-empty successful Delete response omitted its Delete payload.
+    DeleteResponseMissingPayload,
+    /// Delete request/response payload state did not match the explicit expectation.
+    DeleteResponsePayloadMismatch,
     /// Response did not correlate with the request header.
     ResponseCorrelationMismatch,
     /// Successful response selected a proposal number/protocol not offered.
@@ -1173,6 +1467,8 @@ pub enum Ikev2DedicatedBearerExchangeError {
     Payload(Ikev2IkeAuthPayloadError),
     /// Typed Notify decode failed.
     Notify(Ikev2NotifyPayloadError),
+    /// Supported-algorithm or transform-attribute validation failed.
+    Crypto(Ikev2SaInitCryptoError),
     /// TS 24.302 typed Notify validation failed.
     ThreeGpp(Ikev2DedicatedBearerError),
     /// Existing payload builder rejected the input.
@@ -1206,15 +1502,33 @@ impl Ikev2DedicatedBearerExchangeError {
             Self::MissingMandatoryEspTransform { .. } => {
                 "ikev2_bearer_esp_mandatory_transform_missing"
             }
+            Self::InvalidEspTransformType { .. } => "ikev2_bearer_esp_transform_type_invalid",
+            Self::InvalidEspTransformCardinality { .. } => {
+                "ikev2_bearer_esp_transform_cardinality_invalid"
+            }
+            Self::DuplicateEspTransform { .. } => "ikev2_bearer_esp_transform_duplicate",
+            Self::DuplicateEspTransformAttribute { .. } => {
+                "ikev2_bearer_esp_transform_attribute_duplicate"
+            }
+            Self::InvalidEspTransformAttribute { .. } => {
+                "ikev2_bearer_esp_transform_attribute_invalid"
+            }
+            Self::InvalidEspEsnTransformId { .. } => "ikev2_bearer_esp_esn_transform_id_invalid",
+            Self::MixedEspEncryptionModes => "ikev2_bearer_esp_encryption_modes_mixed",
+            Self::EspIntegrityRequired => "ikev2_bearer_esp_integrity_required",
+            Self::EspIntegrityForbiddenWithAead => "ikev2_bearer_esp_integrity_forbidden_with_aead",
             Self::KeyExchangeRequired => "ikev2_bearer_ke_required",
             Self::UnexpectedKeyExchange => "ikev2_bearer_ke_unexpected",
             Self::KeyExchangeDhGroupMismatch => "ikev2_bearer_ke_group_mismatch",
             Self::CreateTftOperationRequired => "ikev2_bearer_tft_create_required",
             Self::CreateTftEmpty => "ikev2_bearer_tft_create_empty",
+            Self::CreateTftHasNoUplinkFilter => "ikev2_bearer_tft_create_no_uplink_filter",
             Self::ExtendedApnAmbrWithoutApnAmbr => "ikev2_bearer_extended_apn_ambr_without_base",
             Self::ExtendedEpsQosWithoutEpsQos => "ikev2_bearer_extended_eps_qos_without_base",
             Self::ModificationHasNoUpdates => "ikev2_bearer_modification_no_updates",
             Self::DeleteSpiCount { .. } => "ikev2_bearer_delete_spi_count",
+            Self::DeleteResponseMissingPayload => "ikev2_bearer_delete_response_payload_missing",
+            Self::DeleteResponsePayloadMismatch => "ikev2_bearer_delete_response_payload_mismatch",
             Self::ResponseCorrelationMismatch => "ikev2_bearer_response_correlation_mismatch",
             Self::ResponseProposalNotOffered => "ikev2_bearer_response_proposal_not_offered",
             Self::ResponseTransformNotOffered => "ikev2_bearer_response_transform_not_offered",
@@ -1228,6 +1542,7 @@ impl Ikev2DedicatedBearerExchangeError {
             Self::KeyExchange(_) => "ikev2_bearer_ke_invalid",
             Self::Payload(_) => "ikev2_bearer_payload_invalid",
             Self::Notify(_) => "ikev2_bearer_notify_invalid",
+            Self::Crypto(_) => "ikev2_bearer_crypto_transform_invalid",
             Self::ThreeGpp(_) => "ikev2_bearer_3gpp_notify_invalid",
             Self::Build(_) => "ikev2_bearer_build_invalid",
         }
@@ -1248,6 +1563,7 @@ impl Error for Ikev2DedicatedBearerExchangeError {
             Self::KeyExchange(error) => Some(error),
             Self::Payload(error) => Some(error),
             Self::Notify(error) => Some(error),
+            Self::Crypto(error) => Some(error),
             Self::ThreeGpp(error) => Some(error),
             Self::Build(error) => Some(error),
             _ => None,
@@ -1366,7 +1682,73 @@ impl fmt::Debug for Ikev2DedicatedBearerDeleteRequest<'_> {
     }
 }
 
-/// Strict INFORMATIONAL response view for modification or deletion.
+/// Expected state used to correlate a dedicated-bearer Delete response.
+///
+/// A normal response names the peer's inbound ESP SPI. When simultaneous
+/// Delete requests crossed, RFC 7296 requires the response to omit the Delete
+/// payload; callers must select that exception explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2DedicatedBearerDeleteResponseExpectation {
+    /// Normal paired-SA deletion with both directional inbound SPIs known.
+    PairedSa {
+        /// Local/ePDG inbound SPI named in the request.
+        local_inbound_esp_spi: Ikev2DedicatedBearerEspSpi,
+        /// Peer/UE inbound SPI that the normal response must name.
+        peer_inbound_esp_spi: Ikev2DedicatedBearerEspSpi,
+    },
+    /// Simultaneous local deletion was already initiated for the paired SA.
+    SimultaneousDelete {
+        /// Local/ePDG inbound SPI named in the request.
+        local_inbound_esp_spi: Ikev2DedicatedBearerEspSpi,
+    },
+}
+
+/// Strict typed response to a dedicated-bearer Delete request.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Ikev2DedicatedBearerDeleteResponse<'a> {
+    /// Normal success naming the paired peer/UE inbound ESP SPI.
+    PairedSaDeleted {
+        /// Peer/UE inbound ESP SPI named by the response Delete payload.
+        peer_inbound_esp_spi: Ikev2DedicatedBearerEspSpi,
+        /// Unknown non-critical payloads retained in wire order.
+        unknown_noncritical_payloads: Vec<Ikev2UnknownNonCriticalPayload<'a>>,
+        /// Unrecognized status Notifies retained in wire order.
+        unrecognized_notifies: Vec<Ikev2NotifyPayload<'a>>,
+    },
+    /// Empty response required when simultaneous Delete requests crossed.
+    SimultaneousDelete,
+    /// Peer rejection.
+    Error(Ikev2DedicatedBearerResponseError<'a>),
+}
+
+impl fmt::Debug for Ikev2DedicatedBearerDeleteResponse<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PairedSaDeleted {
+                unknown_noncritical_payloads,
+                unrecognized_notifies,
+                ..
+            } => f
+                .debug_struct("Ikev2DedicatedBearerDeleteResponse::PairedSaDeleted")
+                .field("peer_inbound_esp_spi", &"<redacted>")
+                .field(
+                    "unknown_noncritical_payload_count",
+                    &unknown_noncritical_payloads.len(),
+                )
+                .field("unrecognized_notify_count", &unrecognized_notifies.len())
+                .finish(),
+            Self::SimultaneousDelete => {
+                f.write_str("Ikev2DedicatedBearerDeleteResponse::SimultaneousDelete")
+            }
+            Self::Error(error) => f
+                .debug_tuple("Ikev2DedicatedBearerDeleteResponse::Error")
+                .field(error)
+                .finish(),
+        }
+    }
+}
+
+/// Strict INFORMATIONAL response view for bearer modification.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Ikev2DedicatedBearerInformationalResponse<'a> {
     /// Successful response, normally with an empty opened payload chain.
@@ -1503,6 +1885,28 @@ pub fn decode_ikev2_dedicated_bearer_modification_request<'a>(
 pub fn build_ikev2_dedicated_bearer_delete_request(
     esp_spi: Ikev2DedicatedBearerEspSpi,
 ) -> Result<Ikev2DedicatedBearerCleartextPayloads, Ikev2DedicatedBearerExchangeError> {
+    build_ikev2_dedicated_bearer_delete_payload(esp_spi)
+}
+
+/// Build a normal INFORMATIONAL Delete response for the paired peer/UE SA.
+///
+/// `peer_inbound_esp_spi` is the SPI the peer expects on its inbound ESP
+/// packets. It is the opposite-direction member of the pair from the
+/// local/ePDG inbound SPI named in the request.
+///
+/// # Errors
+///
+/// Returns [`Ikev2DedicatedBearerExchangeError`] if the Delete payload cannot
+/// be encoded.
+pub fn build_ikev2_dedicated_bearer_delete_response(
+    peer_inbound_esp_spi: Ikev2DedicatedBearerEspSpi,
+) -> Result<Ikev2DedicatedBearerCleartextPayloads, Ikev2DedicatedBearerExchangeError> {
+    build_ikev2_dedicated_bearer_delete_payload(peer_inbound_esp_spi)
+}
+
+fn build_ikev2_dedicated_bearer_delete_payload(
+    esp_spi: Ikev2DedicatedBearerEspSpi,
+) -> Result<Ikev2DedicatedBearerCleartextPayloads, Ikev2DedicatedBearerExchangeError> {
     let spi = esp_spi.to_be_bytes();
     let body = build_delete_payload_body(
         IKEV2_SECURITY_PROTOCOL_ID_ESP,
@@ -1537,6 +1941,64 @@ pub fn decode_ikev2_dedicated_bearer_delete_request<'a>(
         parts.decode_delete_payload(raw, context.unknown_ie_policy)?;
     }
     let delete = required(parts.delete, Ikev2DedicatedBearerPayloadRole::Delete)?;
+    let esp_spi = decode_single_esp_delete(delete)?;
+    Ok(Ikev2DedicatedBearerDeleteRequest {
+        esp_spi,
+        unknown_noncritical_payloads: parts.unknown_noncritical_payloads,
+        unrecognized_notifies: parts.unrecognized_notifies,
+    })
+}
+
+/// Decode a strict dedicated-bearer INFORMATIONAL Delete response.
+///
+/// Normal success contains exactly one ESP Delete payload naming one non-zero
+/// peer/UE inbound SPI. An empty success is represented separately for the
+/// RFC 7296 simultaneous-delete exception. Error Notifies cannot be mixed with
+/// Delete or extension payloads.
+///
+/// # Errors
+///
+/// Returns [`Ikev2DedicatedBearerExchangeError`] for malformed headers,
+/// payloads, protocol/SPI cardinality, or ambiguous success/error content.
+pub fn decode_ikev2_dedicated_bearer_delete_response<'a>(
+    header: &Header,
+    first_payload: PayloadType,
+    cleartext_payloads: &'a [u8],
+) -> Result<Ikev2DedicatedBearerDeleteResponse<'a>, Ikev2DedicatedBearerExchangeError> {
+    validate_exchange_header(header, EXCHANGE_TYPE_INFORMATIONAL, true)?;
+    let mut context = DecodeContext::conservative();
+    context.unknown_ie_policy = UnknownIePolicy::Preserve;
+    validate_cleartext_len(cleartext_payloads, context.max_message_len)?;
+    let mut parts = InformationalParts::default();
+    for raw in PayloadChain::new(first_payload, cleartext_payloads).iter_with_context(context) {
+        let raw = raw.map_err(|_| Ikev2DedicatedBearerExchangeError::PayloadChain)?;
+        parts.decode_delete_response_payload(raw, context.unknown_ie_policy)?;
+    }
+    if let Some(error) = parts.error {
+        if parts.delete.is_some()
+            || !parts.unknown_noncritical_payloads.is_empty()
+            || !parts.unrecognized_notifies.is_empty()
+        {
+            return Err(Ikev2DedicatedBearerExchangeError::ErrorResponseMixedWithPayloads);
+        }
+        return Ok(Ikev2DedicatedBearerDeleteResponse::Error(error));
+    }
+    if let Some(delete) = parts.delete {
+        return Ok(Ikev2DedicatedBearerDeleteResponse::PairedSaDeleted {
+            peer_inbound_esp_spi: decode_single_esp_delete(delete)?,
+            unknown_noncritical_payloads: parts.unknown_noncritical_payloads,
+            unrecognized_notifies: parts.unrecognized_notifies,
+        });
+    }
+    if !parts.unknown_noncritical_payloads.is_empty() || !parts.unrecognized_notifies.is_empty() {
+        return Err(Ikev2DedicatedBearerExchangeError::DeleteResponseMissingPayload);
+    }
+    Ok(Ikev2DedicatedBearerDeleteResponse::SimultaneousDelete)
+}
+
+fn decode_single_esp_delete(
+    delete: Ikev2DeletePayload<'_>,
+) -> Result<Ikev2DedicatedBearerEspSpi, Ikev2DedicatedBearerExchangeError> {
     if delete.protocol_id != IKEV2_SECURITY_PROTOCOL_ID_ESP {
         return Err(Ikev2DedicatedBearerExchangeError::ChildSaProtocolNotEsp {
             actual: delete.protocol_id,
@@ -1547,15 +2009,16 @@ pub fn decode_ikev2_dedicated_bearer_delete_request<'a>(
             actual: delete.spis.len(),
         });
     }
-    let esp_spi = Ikev2DedicatedBearerEspSpi::decode(delete.spis[0])?;
-    Ok(Ikev2DedicatedBearerDeleteRequest {
-        esp_spi,
-        unknown_noncritical_payloads: parts.unknown_noncritical_payloads,
-        unrecognized_notifies: parts.unrecognized_notifies,
-    })
+    Ikev2DedicatedBearerEspSpi::decode(delete.spis[0]).map_err(Into::into)
 }
 
 /// Build an empty successful INFORMATIONAL response opened-payload chain.
+///
+/// This is the normal success response for bearer modification. For bearer
+/// deletion it is valid only when simultaneous Delete requests crossed; use
+/// [`decode_ikev2_dedicated_bearer_delete_response`] and the explicit
+/// [`Ikev2DedicatedBearerDeleteResponseExpectation::SimultaneousDelete`]
+/// correlation mode.
 pub fn build_ikev2_dedicated_bearer_informational_success_response(
 ) -> Ikev2DedicatedBearerCleartextPayloads {
     Ikev2DedicatedBearerCleartextPayloads::empty()
@@ -1573,7 +2036,7 @@ pub fn build_ikev2_dedicated_bearer_informational_error_response(
     build_ikev2_dedicated_bearer_create_child_sa_error_response(error)
 }
 
-/// Decode a strict INFORMATIONAL response for modification or deletion.
+/// Decode a strict INFORMATIONAL response for bearer modification.
 ///
 /// # Errors
 ///
@@ -1732,30 +2195,71 @@ fn validate_selected_proposal(
     offered: &Ikev2SaProposal<'_>,
     selected: &Ikev2SaProposal<'_>,
 ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
-    let offered_types = offered
-        .transforms
-        .iter()
-        .map(|transform| transform.transform_type)
-        .collect::<BTreeSet<_>>();
-    let mut selected_types = BTreeSet::new();
-    for transform in &selected.transforms {
-        if !selected_types.insert(transform.transform_type)
-            || !offered
-                .transforms
-                .iter()
-                .any(|candidate| candidate == transform)
+    for transform in selected.transforms.iter().filter(|transform| {
+        matches!(
+            transform.transform_type,
+            IKEV2_TRANSFORM_TYPE_ENCR | IKEV2_TRANSFORM_TYPE_INTEG
+        )
+    }) {
+        if !offered
+            .transforms
+            .iter()
+            .any(|candidate| transforms_are_equivalent(candidate, transform))
         {
             return Err(Ikev2DedicatedBearerExchangeError::ResponseTransformNotOffered);
         }
     }
-    if let Some(transform_type) = offered_types.difference(&selected_types).next() {
-        return Err(
-            Ikev2DedicatedBearerExchangeError::ResponseTransformTypeOmitted {
-                transform_type: *transform_type,
-            },
-        );
-    }
+    validate_optional_selected_transform(
+        offered,
+        selected,
+        IKEV2_TRANSFORM_TYPE_DH,
+        IKEV2_TRANSFORM_ID_NONE,
+    )?;
+    validate_optional_selected_transform(
+        offered,
+        selected,
+        IKEV2_TRANSFORM_TYPE_ESN,
+        IKEV2_TRANSFORM_ID_NONE,
+    )?;
     Ok(())
+}
+
+fn validate_optional_selected_transform(
+    offered: &Ikev2SaProposal<'_>,
+    selected: &Ikev2SaProposal<'_>,
+    transform_type: u8,
+    omitted_transform_id: u16,
+) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    let offered_for_type = offered
+        .transforms
+        .iter()
+        .filter(|transform| transform.transform_type == transform_type)
+        .collect::<Vec<_>>();
+    let selected_for_type = selected
+        .transforms
+        .iter()
+        .find(|transform| transform.transform_type == transform_type);
+    let selected_is_offered = match selected_for_type {
+        Some(transform) => {
+            offered_for_type
+                .iter()
+                .any(|candidate| transforms_are_equivalent(candidate, transform))
+                || (transform.transform_id == omitted_transform_id && offered_for_type.is_empty())
+        }
+        None => {
+            offered_for_type.is_empty()
+                || offered_for_type
+                    .iter()
+                    .any(|transform| transform.transform_id == omitted_transform_id)
+        }
+    };
+    if selected_is_offered {
+        Ok(())
+    } else if selected_for_type.is_none() {
+        Err(Ikev2DedicatedBearerExchangeError::ResponseTransformTypeOmitted { transform_type })
+    } else {
+        Err(Ikev2DedicatedBearerExchangeError::ResponseTransformNotOffered)
+    }
 }
 
 /// Validate exact correlation of a bearer-modification INFORMATIONAL response.
@@ -1771,17 +2275,55 @@ pub fn validate_ikev2_dedicated_bearer_modification_response_correlation(
     validate_informational_header_correlation(request_header, response_header)
 }
 
-/// Validate exact correlation of a bearer-deletion INFORMATIONAL response.
+/// Validate header and directional-SPI correlation of a Delete response.
+///
+/// Normal deletion requires the request to name the configured local/ePDG
+/// inbound SPI and the response to name the paired peer/UE inbound SPI. The
+/// empty simultaneous-delete response is accepted only when the caller
+/// explicitly supplies that expectation.
 ///
 /// # Errors
 ///
-/// Returns [`Ikev2DedicatedBearerExchangeError::ResponseCorrelationMismatch`]
-/// for any SPI, Message-ID, flag, or exchange mismatch.
+/// Returns [`Ikev2DedicatedBearerExchangeError`] for any header, expected
+/// request SPI, response shape, or peer SPI mismatch.
 pub fn validate_ikev2_dedicated_bearer_delete_response_correlation(
     request_header: &Header,
     response_header: &Header,
+    request: &Ikev2DedicatedBearerDeleteRequest<'_>,
+    response: &Ikev2DedicatedBearerDeleteResponse<'_>,
+    expectation: Ikev2DedicatedBearerDeleteResponseExpectation,
 ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
-    validate_informational_header_correlation(request_header, response_header)
+    validate_informational_header_correlation(request_header, response_header)?;
+    let expected_local_inbound_spi = match expectation {
+        Ikev2DedicatedBearerDeleteResponseExpectation::PairedSa {
+            local_inbound_esp_spi,
+            ..
+        }
+        | Ikev2DedicatedBearerDeleteResponseExpectation::SimultaneousDelete {
+            local_inbound_esp_spi,
+        } => local_inbound_esp_spi,
+    };
+    if request.esp_spi != expected_local_inbound_spi {
+        return Err(Ikev2DedicatedBearerExchangeError::DeleteResponsePayloadMismatch);
+    }
+    match (response, expectation) {
+        (Ikev2DedicatedBearerDeleteResponse::Error(_), _) => Ok(()),
+        (
+            Ikev2DedicatedBearerDeleteResponse::PairedSaDeleted {
+                peer_inbound_esp_spi,
+                ..
+            },
+            Ikev2DedicatedBearerDeleteResponseExpectation::PairedSa {
+                peer_inbound_esp_spi: expected_peer_inbound_spi,
+                ..
+            },
+        ) if *peer_inbound_esp_spi == expected_peer_inbound_spi => Ok(()),
+        (
+            Ikev2DedicatedBearerDeleteResponse::SimultaneousDelete,
+            Ikev2DedicatedBearerDeleteResponseExpectation::SimultaneousDelete { .. },
+        ) => Ok(()),
+        _ => Err(Ikev2DedicatedBearerExchangeError::DeleteResponsePayloadMismatch),
+    }
 }
 
 fn validate_informational_header_correlation(
@@ -1932,42 +2474,7 @@ impl<'a> InformationalParts<'a> {
         policy: UnknownIePolicy,
     ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
         match raw.payload_type {
-            PayloadType::Notify => {
-                let notify = Ikev2NotifyPayload::decode(raw)
-                    .map_err(Ikev2DedicatedBearerExchangeError::Notify)?;
-                if notify.notify_message_type < 16_384 {
-                    let error = match decode_ikev2_dedicated_bearer_notify(notify)? {
-                        Some(Ikev2DedicatedBearerNotify::ProtocolError(error)) => {
-                            Ikev2DedicatedBearerResponseError::DedicatedBearer(error)
-                        }
-                        Some(_) => {
-                            return Err(Ikev2DedicatedBearerExchangeError::UnexpectedNotifyType {
-                                notify_message_type: notify.notify_message_type,
-                            })
-                        }
-                        None => Ikev2DedicatedBearerResponseError::Peer(
-                            Ikev2DedicatedBearerPeerErrorNotify {
-                                notify_message_type: notify.notify_message_type,
-                                protocol_id: notify.protocol_id,
-                                spi: notify.spi,
-                                notification_data: notify.notification_data,
-                            },
-                        ),
-                    };
-                    set_once(
-                        &mut self.error,
-                        error,
-                        Ikev2DedicatedBearerPayloadRole::ErrorNotify,
-                    )
-                } else {
-                    match decode_ikev2_dedicated_bearer_notify(notify)? {
-                        Some(_) => Err(Ikev2DedicatedBearerExchangeError::UnexpectedNotifyType {
-                            notify_message_type: notify.notify_message_type,
-                        }),
-                        None => preserve_notify(&mut self.unrecognized_notifies, notify, policy),
-                    }
-                }
-            }
+            PayloadType::Notify => self.decode_response_notify(raw, policy),
             PayloadType::Unknown(value) => preserve_unknown(
                 &mut self.unknown_noncritical_payloads,
                 value,
@@ -1977,6 +2484,72 @@ impl<'a> InformationalParts<'a> {
             _ => Err(Ikev2DedicatedBearerExchangeError::UnexpectedPayloadType {
                 payload_type: raw.payload_type.as_u8(),
             }),
+        }
+    }
+
+    fn decode_delete_response_payload(
+        &mut self,
+        raw: RawPayload<'a>,
+        policy: UnknownIePolicy,
+    ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+        match raw.payload_type {
+            PayloadType::Delete => set_once(
+                &mut self.delete,
+                Ikev2DeletePayload::decode(raw)
+                    .map_err(Ikev2DedicatedBearerExchangeError::Payload)?,
+                Ikev2DedicatedBearerPayloadRole::Delete,
+            ),
+            PayloadType::Notify => self.decode_response_notify(raw, policy),
+            PayloadType::Unknown(value) => preserve_unknown(
+                &mut self.unknown_noncritical_payloads,
+                value,
+                raw.body,
+                policy,
+            ),
+            _ => Err(Ikev2DedicatedBearerExchangeError::UnexpectedPayloadType {
+                payload_type: raw.payload_type.as_u8(),
+            }),
+        }
+    }
+
+    fn decode_response_notify(
+        &mut self,
+        raw: RawPayload<'a>,
+        policy: UnknownIePolicy,
+    ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+        let notify =
+            Ikev2NotifyPayload::decode(raw).map_err(Ikev2DedicatedBearerExchangeError::Notify)?;
+        if notify.notify_message_type < 16_384 {
+            let error = match decode_ikev2_dedicated_bearer_notify(notify)? {
+                Some(Ikev2DedicatedBearerNotify::ProtocolError(error)) => {
+                    Ikev2DedicatedBearerResponseError::DedicatedBearer(error)
+                }
+                Some(_) => {
+                    return Err(Ikev2DedicatedBearerExchangeError::UnexpectedNotifyType {
+                        notify_message_type: notify.notify_message_type,
+                    });
+                }
+                None => {
+                    Ikev2DedicatedBearerResponseError::Peer(Ikev2DedicatedBearerPeerErrorNotify {
+                        notify_message_type: notify.notify_message_type,
+                        protocol_id: notify.protocol_id,
+                        spi: notify.spi,
+                        notification_data: notify.notification_data,
+                    })
+                }
+            };
+            set_once(
+                &mut self.error,
+                error,
+                Ikev2DedicatedBearerPayloadRole::ErrorNotify,
+            )
+        } else {
+            match decode_ikev2_dedicated_bearer_notify(notify)? {
+                Some(_) => Err(Ikev2DedicatedBearerExchangeError::UnexpectedNotifyType {
+                    notify_message_type: notify.notify_message_type,
+                }),
+                None => preserve_notify(&mut self.unrecognized_notifies, notify, policy),
+            }
         }
     }
 }
