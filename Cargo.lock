@@ -2889,6 +2889,7 @@ name = "opc-proto-gtpv2c"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "opc-proto-tft",
  "opc-protocol",
 ]
 

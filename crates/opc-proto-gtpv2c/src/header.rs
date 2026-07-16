@@ -43,10 +43,18 @@ pub enum MessageType {
     DeleteSessionRequest,
     /// Delete Session Response (37).
     DeleteSessionResponse,
+    /// Create Bearer Request (95).
+    CreateBearerRequest,
+    /// Create Bearer Response (96).
+    CreateBearerResponse,
     /// Update Bearer Request (97), used by the S2b Update Session view.
     UpdateBearerRequest,
     /// Update Bearer Response (98), used by the S2b Update Session view.
     UpdateBearerResponse,
+    /// Delete Bearer Request (99).
+    DeleteBearerRequest,
+    /// Delete Bearer Response (100).
+    DeleteBearerResponse,
     /// Unsupported or future GTPv2-C message type.
     Unknown(u8),
 }
@@ -63,8 +71,12 @@ impl MessageType {
             35 => Self::ModifyBearerResponse,
             36 => Self::DeleteSessionRequest,
             37 => Self::DeleteSessionResponse,
+            95 => Self::CreateBearerRequest,
+            96 => Self::CreateBearerResponse,
             97 => Self::UpdateBearerRequest,
             98 => Self::UpdateBearerResponse,
+            99 => Self::DeleteBearerRequest,
+            100 => Self::DeleteBearerResponse,
             other => Self::Unknown(other),
         }
     }
@@ -80,8 +92,12 @@ impl MessageType {
             Self::ModifyBearerResponse => 35,
             Self::DeleteSessionRequest => 36,
             Self::DeleteSessionResponse => 37,
+            Self::CreateBearerRequest => 95,
+            Self::CreateBearerResponse => 96,
             Self::UpdateBearerRequest => 97,
             Self::UpdateBearerResponse => 98,
+            Self::DeleteBearerRequest => 99,
+            Self::DeleteBearerResponse => 100,
             Self::Unknown(value) => value,
         }
     }

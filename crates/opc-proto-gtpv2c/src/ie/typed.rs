@@ -10,6 +10,7 @@
 use core::fmt;
 
 use bytes::{BufMut, BytesMut};
+use opc_proto_tft::TrafficFlowTemplate;
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DuplicateIePolicy, EncodeContext, EncodeError,
     EncodeErrorCode, SpecRef, UnknownIePolicy,
@@ -45,6 +46,8 @@ pub const IE_TYPE_BEARER_QOS: u8 = 80;
 pub const IE_TYPE_RAT_TYPE: u8 = 82;
 /// GTPv2-C Serving Network IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_SERVING_NETWORK: u8 = 83;
+/// GTPv2-C Bearer TFT IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_BEARER_TFT: u8 = 84;
 /// GTPv2-C Fully Qualified TEID IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_F_TEID: u8 = 87;
 /// GTPv2-C Bearer Context grouped IE type (TS 29.274 Table 8.1-1).
@@ -233,7 +236,7 @@ impl fmt::Debug for TbcdDigits {
     }
 }
 
-/// GTPv2-C Cause value subset used by S2b response examples.
+/// GTPv2-C Cause values used by the S2b protocol surface.
 ///
 /// Unknown cause codes are preserved as [`CauseValue::Unknown`].
 ///
@@ -241,6 +244,22 @@ impl fmt::Debug for TbcdDigits {
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-CAUSE-001
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CauseValue {
+    /// Local detach (2).
+    LocalDetach,
+    /// RAT changed from 3GPP to non-3GPP (4).
+    RatChangedFrom3gppToNon3gpp,
+    /// ISR deactivation (5).
+    IsrDeactivation,
+    /// Reactivation requested (8).
+    ReactivationRequested,
+    /// PDN reconnection to this APN disallowed (9).
+    PdnReconnectionDisallowed,
+    /// Access changed from non-3GPP to 3GPP (10).
+    AccessChangedFromNon3gppTo3gpp,
+    /// PDN connection inactivity timer expires (11).
+    PdnConnectionInactivityTimerExpires,
+    /// EPS to 5GS mobility (15).
+    EpsTo5gsMobility,
     /// Request accepted (16).
     RequestAccepted,
     /// Request accepted partially (17).
@@ -249,23 +268,174 @@ pub enum CauseValue {
     ContextNotFound,
     /// Invalid message format (65).
     InvalidMessageFormat,
+    /// Invalid length (67).
+    InvalidLength,
+    /// Service not supported (68).
+    ServiceNotSupported,
     /// Mandatory IE incorrect (69).
     MandatoryIeIncorrect,
     /// Mandatory IE missing (70).
     MandatoryIeMissing,
+    /// System failure (72).
+    SystemFailure,
+    /// No resources available (73).
+    NoResourcesAvailable,
+    /// Semantic error in the TFT operation (74).
+    SemanticErrorInTftOperation,
+    /// Syntactic error in the TFT operation (75).
+    SyntacticErrorInTftOperation,
+    /// Semantic errors in packet filter(s) (76).
+    SemanticErrorsInPacketFilters,
+    /// Syntactic errors in packet filter(s) (77).
+    SyntacticErrorsInPacketFilters,
+    /// Denied in RAT (82).
+    DeniedInRat,
+    /// UE context without TFT already activated (85).
+    UeContextWithoutTftAlreadyActivated,
+    /// UE not responding (87).
+    UeNotResponding,
+    /// UE refuses (88).
+    UeRefuses,
+    /// Unable to page UE (90).
+    UnableToPageUe,
+    /// Request rejected without a more specific reason (94).
+    RequestRejected,
+    /// Collision with network initiated request (101).
+    CollisionWithNetworkInitiatedRequest,
+    /// Unable to page UE due to suspension (102).
+    UnableToPageUeDueToSuspension,
+    /// Conditional IE missing (103).
+    ConditionalIeMissing,
+    /// Temporarily rejected because handover, TAU, or RAU is in progress (110).
+    TemporarilyRejectedForMobilityProcedure,
+    /// Bearer handling not supported (114).
+    BearerHandlingNotSupported,
+    /// MME or SGSN refuses due to VPLMN policy (119).
+    RefusedDueToVplmnPolicy,
+    /// Late overlapping request (121).
+    LateOverlappingRequest,
+    /// Timed out request (122).
+    TimedOutRequest,
+    /// UE is temporarily unreachable due to power saving (123).
+    UeTemporarilyUnreachableDueToPowerSaving,
+    /// Request rejected due to UE capability (127).
+    RequestRejectedDueToUeCapability,
+    /// Multiple accesses to one PDN connection are not allowed (126).
+    MultipleAccessesToPdnConnectionNotAllowed,
     /// Unmodelled cause value.
     Unknown(u8),
+}
+
+impl CauseValue {
+    /// Return the normative numeric Cause value.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::LocalDetach => 2,
+            Self::RatChangedFrom3gppToNon3gpp => 4,
+            Self::IsrDeactivation => 5,
+            Self::ReactivationRequested => 8,
+            Self::PdnReconnectionDisallowed => 9,
+            Self::AccessChangedFromNon3gppTo3gpp => 10,
+            Self::PdnConnectionInactivityTimerExpires => 11,
+            Self::EpsTo5gsMobility => 15,
+            Self::RequestAccepted => 16,
+            Self::RequestAcceptedPartially => 17,
+            Self::ContextNotFound => 64,
+            Self::InvalidMessageFormat => 65,
+            Self::InvalidLength => 67,
+            Self::ServiceNotSupported => 68,
+            Self::MandatoryIeIncorrect => 69,
+            Self::MandatoryIeMissing => 70,
+            Self::SystemFailure => 72,
+            Self::NoResourcesAvailable => 73,
+            Self::SemanticErrorInTftOperation => 74,
+            Self::SyntacticErrorInTftOperation => 75,
+            Self::SemanticErrorsInPacketFilters => 76,
+            Self::SyntacticErrorsInPacketFilters => 77,
+            Self::DeniedInRat => 82,
+            Self::UeContextWithoutTftAlreadyActivated => 85,
+            Self::UeNotResponding => 87,
+            Self::UeRefuses => 88,
+            Self::UnableToPageUe => 90,
+            Self::RequestRejected => 94,
+            Self::CollisionWithNetworkInitiatedRequest => 101,
+            Self::UnableToPageUeDueToSuspension => 102,
+            Self::ConditionalIeMissing => 103,
+            Self::TemporarilyRejectedForMobilityProcedure => 110,
+            Self::BearerHandlingNotSupported => 114,
+            Self::RefusedDueToVplmnPolicy => 119,
+            Self::LateOverlappingRequest => 121,
+            Self::TimedOutRequest => 122,
+            Self::UeTemporarilyUnreachableDueToPowerSaving => 123,
+            Self::MultipleAccessesToPdnConnectionNotAllowed => 126,
+            Self::RequestRejectedDueToUeCapability => 127,
+            Self::Unknown(value) => value,
+        }
+    }
+
+    /// Return `true` for Cause values in the acceptance range used here.
+    #[must_use]
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::RequestAccepted | Self::RequestAcceptedPartially)
+    }
+
+    /// Return `true` when this is the partial-acceptance Cause.
+    #[must_use]
+    pub const fn is_partially_accepted(self) -> bool {
+        matches!(self, Self::RequestAcceptedPartially)
+    }
+
+    /// Return `true` for a rejection Cause value (64 through 239).
+    #[must_use]
+    pub const fn is_rejection(self) -> bool {
+        let value = self.as_u8();
+        value >= 64 && value <= 239
+    }
 }
 
 impl From<u8> for CauseValue {
     fn from(value: u8) -> Self {
         match value {
+            2 => Self::LocalDetach,
+            4 => Self::RatChangedFrom3gppToNon3gpp,
+            5 => Self::IsrDeactivation,
+            8 => Self::ReactivationRequested,
+            9 => Self::PdnReconnectionDisallowed,
+            10 => Self::AccessChangedFromNon3gppTo3gpp,
+            11 => Self::PdnConnectionInactivityTimerExpires,
+            15 => Self::EpsTo5gsMobility,
             16 => Self::RequestAccepted,
             17 => Self::RequestAcceptedPartially,
             64 => Self::ContextNotFound,
             65 => Self::InvalidMessageFormat,
+            67 => Self::InvalidLength,
+            68 => Self::ServiceNotSupported,
             69 => Self::MandatoryIeIncorrect,
             70 => Self::MandatoryIeMissing,
+            72 => Self::SystemFailure,
+            73 => Self::NoResourcesAvailable,
+            74 => Self::SemanticErrorInTftOperation,
+            75 => Self::SyntacticErrorInTftOperation,
+            76 => Self::SemanticErrorsInPacketFilters,
+            77 => Self::SyntacticErrorsInPacketFilters,
+            82 => Self::DeniedInRat,
+            85 => Self::UeContextWithoutTftAlreadyActivated,
+            87 => Self::UeNotResponding,
+            88 => Self::UeRefuses,
+            90 => Self::UnableToPageUe,
+            94 => Self::RequestRejected,
+            101 => Self::CollisionWithNetworkInitiatedRequest,
+            102 => Self::UnableToPageUeDueToSuspension,
+            103 => Self::ConditionalIeMissing,
+            110 => Self::TemporarilyRejectedForMobilityProcedure,
+            114 => Self::BearerHandlingNotSupported,
+            119 => Self::RefusedDueToVplmnPolicy,
+            121 => Self::LateOverlappingRequest,
+            122 => Self::TimedOutRequest,
+            123 => Self::UeTemporarilyUnreachableDueToPowerSaving,
+            126 => Self::MultipleAccessesToPdnConnectionNotAllowed,
+            127 => Self::RequestRejectedDueToUeCapability,
             other => Self::Unknown(other),
         }
     }
@@ -273,15 +443,7 @@ impl From<u8> for CauseValue {
 
 impl From<CauseValue> for u8 {
     fn from(value: CauseValue) -> Self {
-        match value {
-            CauseValue::RequestAccepted => 16,
-            CauseValue::RequestAcceptedPartially => 17,
-            CauseValue::ContextNotFound => 64,
-            CauseValue::InvalidMessageFormat => 65,
-            CauseValue::MandatoryIeIncorrect => 69,
-            CauseValue::MandatoryIeMissing => 70,
-            CauseValue::Unknown(other) => other,
-        }
+        value.as_u8()
     }
 }
 
@@ -1386,6 +1548,8 @@ pub enum TypedIeValue<'a> {
     RatType(RatType),
     /// Serving Network IE (type 83).
     ServingNetwork(ServingNetwork),
+    /// EPS Bearer Level Traffic Flow Template IE (type 84).
+    BearerTft(TrafficFlowTemplate),
     /// Fully Qualified TEID IE (type 87).
     FullyQualifiedTeid(FullyQualifiedTeid),
     /// Bearer Context IE (type 93).
@@ -1474,6 +1638,23 @@ impl<'a> TypedIe<'a> {
             IE_TYPE_SERVING_NETWORK => {
                 TypedIeValue::ServingNetwork(ServingNetwork::decode_value(raw.value, value_offset)?)
             }
+            IE_TYPE_BEARER_TFT => TypedIeValue::BearerTft(
+                TrafficFlowTemplate::decode_value_with_context(raw.value, ctx).map_err(
+                    |error| {
+                        let error_offset = error
+                            .offset()
+                            .and_then(|relative| value_offset.checked_add(relative))
+                            .unwrap_or(value_offset);
+                        DecodeError::new(
+                            DecodeErrorCode::Structural {
+                                reason: "Bearer TFT IE failed TS 24.008 validation",
+                            },
+                            error_offset,
+                        )
+                        .with_spec_ref(spec_ref())
+                    },
+                )?,
+            ),
             IE_TYPE_F_TEID => TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid::decode_value(
                 raw.value,
                 value_offset,
@@ -1532,6 +1713,7 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::BearerQos(_) => IE_TYPE_BEARER_QOS,
             TypedIeValue::RatType(_) => IE_TYPE_RAT_TYPE,
             TypedIeValue::ServingNetwork(_) => IE_TYPE_SERVING_NETWORK,
+            TypedIeValue::BearerTft(_) => IE_TYPE_BEARER_TFT,
             TypedIeValue::FullyQualifiedTeid(_) => IE_TYPE_F_TEID,
             TypedIeValue::BearerContext(_) => IE_TYPE_BEARER_CONTEXT,
             TypedIeValue::ChargingId(_) => IE_TYPE_CHARGING_ID,
@@ -1588,6 +1770,9 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::BearerQos(value) => value.encode_value(dst),
             TypedIeValue::RatType(value) => value.encode_value(dst),
             TypedIeValue::ServingNetwork(value) => value.encode_value(dst),
+            TypedIeValue::BearerTft(value) => value
+                .encode_value(dst)
+                .map_err(|_| encode_structural_error("Bearer TFT IE failed TS 24.008 validation")),
             TypedIeValue::FullyQualifiedTeid(value) => value.encode_value(dst),
             TypedIeValue::BearerContext(value) => value.encode_value(dst, ctx),
             TypedIeValue::ChargingId(value) => value.encode_value(dst),
@@ -1625,6 +1810,7 @@ impl fmt::Debug for TypedIeValue<'_> {
             Self::BearerQos(value) => f.debug_tuple("BearerQos").field(value).finish(),
             Self::RatType(value) => f.debug_tuple("RatType").field(value).finish(),
             Self::ServingNetwork(value) => f.debug_tuple("ServingNetwork").field(value).finish(),
+            Self::BearerTft(value) => f.debug_tuple("BearerTft").field(value).finish(),
             Self::FullyQualifiedTeid(value) => {
                 f.debug_tuple("FullyQualifiedTeid").field(value).finish()
             }
@@ -1716,7 +1902,7 @@ fn decode_typed_ie_sequence_at<'a>(
         match iter.next() {
             Some(Ok(raw)) => {
                 let typed = TypedIe::decode_from_raw(raw, ctx, depth, offset)?;
-                apply_duplicate_policy(&mut ies, typed, ctx.duplicate_ie_policy, offset)?;
+                apply_duplicate_policy(&mut ies, typed, ctx.duplicate_ie_policy, depth, offset)?;
             }
             Some(Err(error)) => return Err(error),
             None => break,
@@ -1729,8 +1915,24 @@ fn apply_duplicate_policy<'a>(
     ies: &mut Vec<TypedIe<'a>>,
     typed: TypedIe<'a>,
     policy: DuplicateIePolicy,
+    depth: usize,
     offset: usize,
 ) -> Result<(), DecodeError> {
+    // TS 29.274 procedure tables explicitly use these type/instance pairs as
+    // lists. Treating them as singleton duplicates would either discard
+    // dedicated bearers under First/Last or reject conforming multi-bearer
+    // messages under Reject. Nested typed EBI IEs remain singleton members.
+    // Unknown IEs still follow the caller's duplicate policy: without a
+    // dictionary entry, treating every unknown type as repeatable would
+    // silently weaken `DuplicateIePolicy::Reject` for the whole crate.
+    let repeatable = depth == 0
+        && ((typed.ie_type() == IE_TYPE_BEARER_CONTEXT && typed.instance == 0)
+            || (typed.ie_type() == IE_TYPE_EBI && typed.instance == 1));
+    if repeatable {
+        ies.push(typed);
+        return Ok(());
+    }
+
     let duplicate = ies.iter().position(|existing| {
         existing.ie_type() == typed.ie_type() && existing.instance == typed.instance
     });
