@@ -48,6 +48,30 @@ const DEFAULT_CONSENSUS_IDLE_TIMEOUT: Duration =
 const DEFAULT_CONSENSUS_RPC_TIMEOUT: Duration =
     DURABLE_CONSENSUS_TIMING_PROFILE.server_handler_timeout();
 
+// Cold establishment is contained inside the caller's existing logical
+// deadline. Limiting it to two thirds of the remaining budget guarantees that
+// a successful DNS/TCP/TLS/bootstrap phase leaves a non-zero bounded interval
+// for the first negotiated RPC. This is especially important for Openraft
+// AppendEntries: its 1,500 ms soft TTL is equal to the profile's absolute cold
+// cap, so applying only that cap could leave no time to send the heartbeat that
+// makes the new connection useful.
+const CONSENSUS_COLD_CONNECT_BUDGET_NUMERATOR: u32 = 2;
+const CONSENSUS_COLD_CONNECT_BUDGET_DENOMINATOR: u32 = 3;
+
+fn contained_cold_connect_deadline(
+    now: tokio::time::Instant,
+    call_deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let remaining = call_deadline.saturating_duration_since(now);
+    let proportional_budget = remaining.saturating_mul(CONSENSUS_COLD_CONNECT_BUDGET_NUMERATOR)
+        / CONSENSUS_COLD_CONNECT_BUDGET_DENOMINATOR;
+    let cold_budget =
+        proportional_budget.min(DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout());
+    now.checked_add(cold_budget)
+        .unwrap_or(call_deadline)
+        .min(call_deadline)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ConsensusDeadlinePolicy {
     Profiled,
@@ -686,6 +710,7 @@ impl RemoteSessionConsensusPeer {
                     .is_ok_and(consensus_response_allows_connection_reuse)
                     && self.connection_is_current(&mut connection, tokio::time::Instant::now())
                 {
+                    self.mark_connection_usable(&connection);
                     *connection_slot = Some(connection);
                 }
                 return result;
@@ -695,10 +720,8 @@ impl RemoteSessionConsensusPeer {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        let connect_deadline = tokio::time::Instant::now()
-            .checked_add(DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout())
-            .ok_or(SessionConsensusPeerError::Protocol)?
-            .min(deadline);
+        let connect_deadline =
+            contained_cold_connect_deadline(tokio::time::Instant::now(), deadline);
         let mut reconnect_reauthentication_rx = self.reauthentication.subscribe();
         let _ = self
             .tls_config
@@ -1057,6 +1080,7 @@ impl RemoteSessionConsensusPeer {
             .is_ok_and(consensus_response_allows_connection_reuse)
             && self.connection_is_current(&mut connection, tokio::time::Instant::now())
         {
+            self.mark_connection_usable(&connection);
             *connection_slot = Some(connection);
         }
         result
@@ -1120,18 +1144,24 @@ impl RemoteSessionConsensusPeer {
         // intentionally cooperative and remains usable until its stable
         // per-peer jitter deadline. Fresh handshakes take the strict mismatch
         // path in `call_once` and are never admitted with stale evidence.
-        let usable = connection.lifecycle.retirement(now).is_none();
-        if usable
-            && connection
-                .lifecycle
-                .evidence_mismatch_reason(current_generation, current_material_epoch)
-                .is_none()
+        connection.lifecycle.retirement(now).is_none()
+    }
+
+    fn mark_connection_usable(&self, connection: &ConsensusConnection) {
+        let current_generation = self.reauthentication.generation();
+        let current_material_epoch = self
+            .tls_config
+            .as_ref()
+            .map(|config| config.material_status().epoch());
+        if connection
+            .lifecycle
+            .evidence_mismatch_reason(current_generation, current_material_epoch)
+            .is_none()
         {
             self.connection_pool
                 .reconnect_gate
                 .mark_usable(current_generation, current_material_epoch);
         }
-        usable
     }
 
     async fn bootstrap<R, W>(
@@ -2423,6 +2453,92 @@ mod tests {
         (server, client)
     }
 
+    #[test]
+    fn cold_connect_budget_reserves_one_third_of_the_append_soft_ttl() {
+        let now = tokio::time::Instant::now();
+        let append_soft_ttl = Duration::from_millis(1_500);
+        let call_deadline = now + append_soft_ttl;
+        let connect_deadline = contained_cold_connect_deadline(now, call_deadline);
+
+        assert_eq!(connect_deadline.duration_since(now), Duration::from_secs(1));
+        assert_eq!(
+            call_deadline.duration_since(connect_deadline),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn cold_connect_budget_retains_the_profile_cap_for_long_rpc_families() {
+        let now = tokio::time::Instant::now();
+        let call_deadline = now + Duration::from_secs(10);
+        let connect_deadline = contained_cold_connect_deadline(now, call_deadline);
+
+        assert_eq!(
+            connect_deadline.duration_since(now),
+            DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout()
+        );
+        assert_eq!(
+            call_deadline.duration_since(connect_deadline),
+            Duration::from_millis(8_500)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unproven_cached_lane_does_not_clear_shared_reconnect_cooldown() {
+        let (_server_binding, client_binding) = bindings();
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::ZERO,
+        )
+        .expect("lifecycle policy");
+        let peer = RemoteSessionConsensusPeer::new_insecure(
+            client_binding,
+            "127.0.0.1:9".parse().expect("test address"),
+            Some(Duration::from_secs(1)),
+        )
+        .with_connection_lifecycle(policy);
+        let now = tokio::time::Instant::now();
+        peer.connection_pool
+            .reconnect_gate
+            .acquire(now + Duration::from_secs(1), 0, None)
+            .await
+            .expect("seed reconnect attempt")
+            .failed();
+
+        let (stream, _remote) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(stream);
+        let mut connection = ConsensusConnection {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
+                .expect("connection lifecycle"),
+        };
+        assert!(peer.connection_is_current(&mut connection, now));
+
+        let gate = Arc::clone(&peer.connection_pool.reconnect_gate);
+        let waiting = tokio::spawn(async move {
+            gate.acquire(now + Duration::from_secs(1), 0, None)
+                .await
+                .expect("cooled reconnect attempt")
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "an unproven cached socket must not erase a failed reconnect cooldown"
+        );
+
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        waiting.await.expect("reconnect admission task").succeeded();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cached_consensus_lane_honors_material_rotation_jitter_before_retirement() {
         let (_server_binding, client_binding) = bindings();
@@ -2568,6 +2684,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn consensus_soft_timeout_classifies_pending_connect_without_abandoning() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let (_server_binding, client_binding) = bindings();
         let resolver: RemoteAddrResolver =
             Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>()));
@@ -2585,6 +2704,7 @@ mod tests {
         )
         .expect("bounded request");
         let accounting = Arc::new(crate::lifecycle::ConnectionAttemptTestAccounting::default());
+        let started_at = tokio::time::Instant::now();
 
         let result = crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING
             .scope(Arc::clone(&accounting), async move {
@@ -2594,6 +2714,12 @@ mod tests {
             .await;
 
         assert_eq!(result, Err(SessionConsensusPeerError::Timeout));
+        let elapsed = tokio::time::Instant::now().duration_since(started_at);
+        let expected = Duration::from_millis(100).saturating_mul(2) / 3;
+        assert!(
+            elapsed >= expected && elapsed <= expected + Duration::from_millis(1),
+            "the pending cold phase must leave one third of the soft TTL undispatched: elapsed={elapsed:?}, expected={expected:?}"
+        );
         let (attempts, terminals, superseded, abandoned) = accounting.snapshot();
         assert!(attempts > 0, "the stalled resolver must start an attempt");
         assert_eq!(terminals, attempts);
@@ -2602,7 +2728,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn configured_ceiling_can_shorten_the_consensus_soft_timeout() {
+    async fn configured_ceiling_also_reserves_post_connect_rpc_time() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let (_server_binding, client_binding) = bindings();
         let resolver: RemoteAddrResolver =
             Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>()));
@@ -2630,9 +2759,11 @@ mod tests {
             .await;
 
         assert_eq!(result, Err(SessionConsensusPeerError::Timeout));
-        assert_eq!(
-            tokio::time::Instant::now().duration_since(started_at),
-            Duration::from_millis(50)
+        let elapsed = tokio::time::Instant::now().duration_since(started_at);
+        let expected = Duration::from_millis(50).saturating_mul(2) / 3;
+        assert!(
+            elapsed >= expected && elapsed <= expected + Duration::from_millis(1),
+            "the configured cold phase exceeded its proportional allocation: elapsed={elapsed:?}, expected={expected:?}"
         );
         let (attempts, terminals, superseded, abandoned) = accounting.snapshot();
         assert!(attempts > 0, "the stalled resolver must start an attempt");

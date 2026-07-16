@@ -755,7 +755,9 @@ dial route. They never select self, a vote, or a certificate identity.
 Each call's absolute family deadline begins before lane acquisition and covers
 bounded encoding, write, and response read. When a connection is needed,
 resolution, TCP, mTLS, identity admission, and bootstrap receive at most 1,500
-ms inside that family deadline; they do not add time. AppendEntries and
+ms and at most two thirds of the remaining call budget inside that family
+deadline. The final third is reserved for the first negotiated RPC; cold time
+does not add time. AppendEntries and
 Openraft read-index use 2,000 ms, Vote 5,000 ms, and
 InstallSnapshot/ForwardMutation/consumer ReadBarrier 10,000 ms. A complete,
 correlated, authenticated, and validated success or typed semantic

@@ -33,7 +33,9 @@ freshly from `[5,000 ms, 8,000 ms)`; InstallSnapshot, forwarded mutation,
 consumer ReadBarrier, and the operation default are 10,000 ms. Listener
 idle/handler ceilings are 30,000 ms. A fresh connection has a contained
 1,500 ms DNS/TCP/mTLS/bootstrap cap inside its already-running family deadline,
-never in addition to it. The engine profile admits at most 64 log entries per
+may consume at most two thirds of the remaining call budget, and therefore
+leaves a bounded final third for the first negotiated RPC. It is never added to
+the family deadline. The engine profile admits at most 64 log entries per
 replication payload. Limited readers retain the longest ordered entry prefix
 within a 1 MiB soft entry-section target; the first entry is retained alone
 when it exceeds that soft target so replication can still make progress,

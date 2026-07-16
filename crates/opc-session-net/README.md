@@ -72,8 +72,12 @@ mutual TLS, identity admission, and bootstrap. One absolute family deadline
 starts before lane acquisition. Direct calls use the fixed family ceiling;
 Openraft calls use its smaller supplied soft TTL, never more than that family
 ceiling. A fresh connection receives the lesser of the remaining budget and a
-1,500 ms cold-phase cap; response work keeps only the original remaining
-budget, so cold time is contained and never additive.
+1,500 ms cold-phase cap, and the cold phase may consume at most two thirds of
+that remaining budget. The reserved final third carries the first negotiated
+RPC, so an AppendEntries soft TTL cannot be exhausted by a successful
+handshake before the connection sends useful work. Cold time remains contained
+and never additive. A cached lane resets shared reconnect backoff only after a
+complete validated reusable response proves the connection usable.
 At the 31-member ceiling, one node has at most 30 remote peers: 60 steady-state
 outbound lanes. During one bounded retirement step, at most one retiring
 generation per lane may overlap its replacement, for up to 120 server-side

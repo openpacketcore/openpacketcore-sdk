@@ -1364,8 +1364,10 @@ and InstallSnapshot, forwarded mutation, and consumer ReadBarrier 10,000 ms.
 An Openraft network call uses the smaller soft TTL described below. If no valid
 cached connection exists,
 resolution, TCP connect, mutual TLS, identity admission, and bootstrap MUST use
-the lesser of the remaining family budget and a 1,500 ms cold sub-bound; cold
-time MUST NOT be added to the family deadline. Each directed peer MAY cache a
+the lesser of two thirds of the remaining family budget and a 1,500 ms cold
+sub-bound. The reserved final third MUST remain available for the first
+negotiated RPC; cold time MUST NOT be added to the family deadline. Each
+directed peer MAY cache a
 fixed primary/overflow pool of at most two authenticated connections, with at
 most one in-flight RPC per lane. Sequential calls MUST prefer primary; a
 concurrent call MAY use overflow; when both lanes are busy, further calls MUST
@@ -1373,7 +1375,9 @@ wait for either lane under the same absolute family deadline. It MUST recache a
 selected lane only after a complete, correctly correlated, authenticated,
 validated successful response or typed semantic `Unavailable` response. The
 `Unavailable` exception preserves a known stream position but grants no
-success or authority. Cancellation, timeout, EOF, malformed/cross-correlated
+success or authority. A cached lane MUST NOT clear shared reconnect cooldown
+until such a reusable response has proved that lane usable. Cancellation,
+timeout, EOF, malformed/cross-correlated
 response, protocol, authentication, scope mismatch, rejection, lifecycle
 evidence mismatch, or any uncertain stream position MUST evict that lane. A
 late connection or response after cancellation MUST NOT be reused. The
