@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Shared Raft-managed config datastore — `opc-config-bus-consensus`:** a
+  source-build-only adapter now connects `opc-config-bus` to the existing
+  `opc-persist::ConsensusConfigStore` without adding another election,
+  replication, membership, recovery, or transport authority. The production
+  newtype accepts only sealed config records; callers compose the existing
+  HKMS-backed `EncryptingManagedDatastore` outside it, so Openraft continues to
+  receive only authenticated ciphertext, clear lifecycle metadata, a
+  digest-only replay index, and product-neutral redacted audit. Named rollback
+  points are created atomically with their commit, temporary consensus loss is
+  a typed unavailable outcome, and ambiguous accepted writes retain the
+  distinct `OutcomeUnknown` reconciliation contract. The config command and
+  config-specific RPC revisions advance to 3 and require a coordinated drained
+  fleet upgrade. Multi-group deployed qualification remains open under #250
+  and #143. Frozen v2/v4 session-HA profiles remain byte-identical and do not
+  represent the new adapter; the current 27-crate source-build closure is
+  checked independently until an additive follow-up qualification change under
+  #250 supplies candidate evidence.
 - **Linearizable local-read gate — `opc-consensus`:** a product-neutral
   `LinearizableReadBarrier` now maps coalesced Openraft read-index outcomes to
   typed serve/not-leader/unavailable decisions and waits for the serving

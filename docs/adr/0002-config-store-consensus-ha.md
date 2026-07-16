@@ -11,6 +11,9 @@ Accepted
 Amended 2026-07-12 for the atomic #177 migration to the workspace's shared
 Openraft engine.
 
+Amended 2026-07-16 for the shared config-bus adapter and atomic named rollback
+points.
+
 ## Context
 
 Single-node SQLite persistence cannot support a carrier-HA configuration
@@ -50,6 +53,13 @@ peer/server, and standalone consensus-node binary are not compatibility
 authority paths and must not be reintroduced behind another constructor or
 feature.
 
+`opc-config-bus-consensus` owns the narrow application-facing adapter. Its
+production `RaftManagedDatastore<C>` can wrap only `ConsensusConfigStore` and
+implements only `ManagedDatastore<SealedConfig<C>>`. The generic
+`PersistManagedDatastore<C, S>` exists for single-node/test composition and
+compatibility, but it does not make `S` a consensus authority. AMF-lite uses
+the shared adapter rather than maintaining a product-local copy.
+
 ### Protection boundary
 
 The production composition is:
@@ -58,6 +68,10 @@ The production composition is:
 application -> HKMS-backed encryption -> ConsensusConfigStore
             -> Openraft -> SQLite and Openraft snapshots
 ```
+
+In API terms, `EncryptingManagedDatastore` is outside
+`RaftManagedDatastore`, which in turn delegates wholesale to
+`ConsensusConfigStore`. The adapter owns no provider or key handle.
 
 The outer application layer encrypts configuration first. A successful
 encryption operation mints a one-shot, non-serializable claim bound to the
@@ -94,6 +108,13 @@ revision checks. Startup rejects unknown config-owned schema objects or a
 manifest/digest mismatch, verifies current audit HMACs using the deployment
 audit-key epoch/fingerprint, and bounds retained durable outcomes to the newest
 4,096 application sequences.
+
+Config command and config-specific RPC revision 3 add named rollback-point
+creation to the same applied mutation as the encrypted commit. Revisions 1 and
+2 remain readable only under their original semantics; a revision-1 or
+revision-2 command cannot claim the inline-label behavior. Exact formation and
+RPC checks reject mixed revisions, so this change requires a drained,
+coordinated stop/upgrade/start of the complete config voter set.
 
 The snapshot root is an exact private `0700`, non-symlink directory on the
 SQLite durable device. The adapter holds its opened directory descriptor,
@@ -205,6 +226,7 @@ explicitly accept that availability model.
 - `crates/opc-persist/src/consensus/raft_adapter.rs`
 - `crates/opc-persist/src/consensus/storage.rs`
 - `crates/opc-persist/src/consensus/sqlite.rs`
+- `crates/opc-config-bus-consensus/`
 - `crates/opc-persist/src/backend/ops.rs`
 - `crates/opc-persist/tests/consensus_openraft.rs`
 - `crates/opc-amf-lite/tests/config_consensus_encryption.rs`

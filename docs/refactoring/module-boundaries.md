@@ -63,6 +63,17 @@ The primary objectives achieved during this refactoring are:
   * [alarms.rs](../../crates/opc-config-bus/src/alarms.rs): Active transaction error alerts raising handler.
   * [metrics.rs](../../crates/opc-config-bus/src/metrics.rs): Bus operations performance counters.
 
+### 3a. `opc-config-bus-consensus`
+* **Facade**: [lib.rs](../../crates/opc-config-bus-consensus/src/lib.rs)
+* **Boundary**:
+  * `PersistManagedDatastore<C, S>` is the reusable sealed-record adapter for
+    `ConfigStore` implementations.
+  * `RaftManagedDatastore<C>` narrows production construction to the existing
+    `ConsensusConfigStore`; it delegates consensus wholesale and cannot accept
+    plaintext configuration or a key provider.
+  * Named rollback labels and product-neutral redacted root audit metadata are
+    attached before the single atomic persistence mutation.
+
 ### 4. `opc-alarm`
 * **Facade**: [src/lib.rs](../../crates/opc-alarm/src/lib.rs)
 * **Manager Modules**:

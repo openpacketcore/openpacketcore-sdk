@@ -458,7 +458,7 @@ fn validate_history_shape(history: &str, schema: &Value) -> Result<(), String> {
 }
 
 #[test]
-fn exact_profile_matches_the_compiled_consensus_and_store_contract() {
+fn frozen_v2_profile_matches_its_declared_consensus_and_store_contract() {
     let profile_value: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("profile JSON");
     let profile_schema: Value =
         serde_json::from_str(SESSION_HA_PROFILE_SCHEMA_JSON).expect("profile schema JSON");
@@ -835,6 +835,7 @@ fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     ));
     for manifest in [
         include_str!("../../opc-alarm/Cargo.toml"),
+        include_str!("../../opc-config-bus-consensus/Cargo.toml"),
         include_str!("../../opc-consensus/Cargo.toml"),
         include_str!("../../opc-persist/Cargo.toml"),
         include_str!("../../opc-sdk/Cargo.toml"),
@@ -923,6 +924,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         "opc-amf-lite",
         "opc-amf-lite-testkit",
         "opc-config-bus",
+        "opc-config-bus-consensus",
         "opc-consensus",
         "opc-gnmi-server",
         "opc-ipsec-lb",
@@ -943,6 +945,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         "operator-lifecycle",
         "operator-lifecycle-cli",
     ]);
+    assert_eq!(source_build_only.len(), 27);
     let mut computed_source_closure =
         BTreeSet::from(["opc-consensus", "opc-persist", "opc-session-store"]);
     loop {

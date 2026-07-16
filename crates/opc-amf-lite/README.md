@@ -14,8 +14,10 @@ testbed boundaries.
 - `AmfConfig` is the typed AMF-lite configuration and implements
   `opc_config_model::OpcConfig`.
 - `UeSessionContext` is the stored UE-context payload used by the slice.
-- `PersistDatastore<C, S>` adapts `opc_persist::ConfigStore` to the
-  `opc-config-bus` `ManagedDatastore` shape for sealed config.
+- `PersistDatastore<C, S>` is a compatibility re-export of the shared
+  `opc-config-bus-consensus` adapter from `opc_persist::ConfigStore` to the
+  sealed `opc-config-bus` `ManagedDatastore` port. AMF-lite no longer owns a
+  product-local persistence adapter.
 - `NacmConfigAuthorizer` adapts `opc-nacm` policy evaluation to config-bus
   authorization.
 - `AmfLite::start` and `start_with_clock` launch the slice with config store,
@@ -38,8 +40,8 @@ assert_eq!(AMF_SCHEMA_DIGEST.len(), 64);
 ## Relationships
 
 - Uses `opc-runtime` for lifecycle, readiness, shutdown, and supervision.
-- Uses `opc-config-bus`, `opc-config-model`, and `opc-persist` for transactional
-  encrypted config commits.
+- Uses `opc-config-bus`, `opc-config-bus-consensus`, `opc-config-model`, and
+  `opc-persist` for transactional encrypted config commits.
 - Uses `opc-session-store` validated topology/quorum/fencing plus
   `EncryptingSessionBackend` for UE session state. Backend wrapping preserves
   and revalidates the admitted topology metadata.
