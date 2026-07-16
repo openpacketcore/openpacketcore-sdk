@@ -228,14 +228,19 @@ pub enum VipAdvertiserKind {
     Bgp,
     /// VRRP advertiser.
     Vrrp,
+    /// VIP delivery is supplied by an external load balancer.
+    ///
+    /// Advertisement mutations are intentional no-ops in this tier; a
+    /// coordinator can track fenced ownership without local route changes.
+    ExternalLb,
 }
 
 /// VIP advertisement request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VipAdvertisement {
-    /// SWu VIP.
+    /// Virtual IP address.
     pub vip: IpAddress,
-    /// Node advertising the VIP.
+    /// Node owning or advertising the VIP.
     pub node: ClusterNode,
 }
 
@@ -244,15 +249,32 @@ pub struct VipAdvertisement {
 pub struct VipProbe {
     /// Advertiser kind.
     pub kind: VipAdvertiserKind,
-    /// Platform can advertise a VIP.
+    /// Advertiser tier is available in this deployment.
     pub platform_supported: bool,
-    /// Advertiser can mutate route state.
+    /// Advertiser can satisfy advertisement mutation requests.
+    ///
+    /// For [`VipAdvertiserKind::ExternalLb`], requests are intentional no-ops
+    /// because the external load balancer supplies delivery.
     pub mutation_ready: bool,
     /// Optional static detail.
     pub details: Option<&'static str>,
 }
 
 impl VipProbe {
+    /// Probe result for externally supplied VIP delivery.
+    ///
+    /// This tier satisfies advertisement requests as intentional no-ops and
+    /// never claims local route programming.
+    #[must_use]
+    pub const fn external_lb() -> Self {
+        Self {
+            kind: VipAdvertiserKind::ExternalLb,
+            platform_supported: true,
+            mutation_ready: true,
+            details: Some("external LB supplies delivery; VIP advertisement is a no-op"),
+        }
+    }
+
     /// Probe result for a mock advertiser.
     #[must_use]
     pub const fn mock() -> Self {
@@ -302,6 +324,20 @@ mod tests {
         assert_eq!(
             probe.details,
             Some("floating VIP supplies packet delivery; steering mutations are no-ops")
+        );
+    }
+
+    #[test]
+    fn external_lb_probe_is_ready_without_route_mutation_claims() {
+        let probe = VipProbe::external_lb();
+
+        assert_eq!(probe.kind, VipAdvertiserKind::ExternalLb);
+        assert_ne!(probe.kind, VipAdvertiserKind::Mock);
+        assert!(probe.platform_supported);
+        assert!(probe.mutation_ready);
+        assert_eq!(
+            probe.details,
+            Some("external LB supplies delivery; VIP advertisement is a no-op")
         );
     }
 

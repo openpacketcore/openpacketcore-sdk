@@ -14,6 +14,10 @@ steer layer:
 - failover safety guards for IV-counter and replay-window restoration;
 - audited same-SPI re-pin coordination with monotonic ownership fencing;
 - BGP route-export VIP advertisement through the safe route-steering backend;
+- protocol-neutral VIP ownership reconciliation gated by caller-supplied
+  leadership, quorum health, listener health, and a monotonic fence;
+- an external-load-balancer advertiser tier that composes with fenced ownership
+  while intentionally performing no local route mutation;
 - session-store backed ownership reads and fenced SA-owner promotion;
 - Host-XDP cross-node redirect config that fails closed unless mTLS/SPIFFE
   with no plaintext fallback is declared;
@@ -24,6 +28,68 @@ steer layer:
   FIPS/HSM key-custody scope;
 - reusable ports for steering backends, VIP advertisement, ownership reads,
   ownership fencing, and re-pin audit.
+
+## Leadership-gated VIP ownership
+
+`VipOwnershipCoordinator` applies one reusable fail-closed state machine to a
+management or dataplane VIP. It advertises only while the caller reports
+leader, live quorum, healthy northbound listeners, and a non-zero leadership
+fence. A new leadership epoch—including an ABA return to the same node—must use
+a strictly newer, deployment-unique `LeadershipFence`. After any withdrawal,
+the old fence cannot re-advertise the VIP.
+
+A new coordinator begins in `VipOwnershipState::Uninitialized`; it does not
+assume that process-local construction means the provider is clean. Its first
+reconcile always withdraws the exact advertisement, accepting `NotFound` as
+known absence, before it may advertise a valid first intent. This removes stale
+routes left by an earlier process incarnation.
+
+Provider failures and cancellation are represented as
+`VipOwnershipState::ProviderStateUnknown`; they are not mistaken for either a
+successful advertisement or a clean withdrawal. The next reconcile first
+withdraws the exact request to reach known-absent state, accepting `NotFound`
+as convergence, before retrying an epoch that is still authorized. Losing any
+owner signal revokes that retry, so an ambiguous operation cannot preserve
+stale authority. If a confirmed advertisement receives a strictly newer
+complete fence, only the coordinator's accepted epoch advances: the identical
+VIP route is already installed and no duplicate provider mutation is needed.
+`AlreadyExists` is not proof of advertisement ownership: the BGP adapter maps
+raw Linux `EEXIST` without route readback, so that result remains provider-
+unknown and must pass through withdrawal cleanup before retry.
+
+```rust,no_run
+use opc_ipsec_lb::{
+    ClusterNode, ExternalLbVipAdvertiser, IpAddress, LeadershipFence,
+    VipAdvertisement, VipOwnershipCoordinator, VipOwnershipIntent,
+};
+
+# async fn reconcile_management_vip() -> Result<(), opc_ipsec_lb::IpsecLbError> {
+let advertisement = VipAdvertisement {
+    vip: IpAddress::V4([192, 0, 2, 40]),
+    node: ClusterNode::new("control-a"),
+};
+let mut coordinator = VipOwnershipCoordinator::new(
+    advertisement,
+    ExternalLbVipAdvertiser::new(),
+);
+
+coordinator
+    .reconcile(VipOwnershipIntent {
+        leader: true,
+        quorum_available: true,
+        healthy: true,
+        fence: Some(LeadershipFence::new(42)?),
+    })
+    .await?;
+# Ok(())
+# }
+```
+
+The `ExternalLbVipAdvertiser` probe reports that an external load balancer
+supplies delivery. Its advertise and withdraw operations are intentional
+no-ops: it cannot program a local route. The same coordinator can instead own
+any `VipAdvertiser`, including the BGP route-export adapter. The intent contains
+no SA, shard, IKE, ESP, key, or other protocol-specific material.
 
 It intentionally does not decrypt ESP, derive IPsec keys, open BGP sessions,
 shell out to routing daemons, implement VRRP, or claim packet forwarding.

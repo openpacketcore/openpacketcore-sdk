@@ -1,6 +1,6 @@
 //! BGP VIP advertisement through route export.
 //!
-//! This adapter programs a host route for the SWu VIP into an
+//! This adapter programs a host route for the VIP into an
 //! operator-selected Linux routing table. A local BGP speaker such as FRR,
 //! BIRD, or GoBGP can then redistribute that table by policy. The SDK does not
 //! shell out to daemon CLIs or open a direct BGP session from this crate.
@@ -47,7 +47,7 @@ impl BgpRouteVipAdvertiserConfig {
     }
 }
 
-/// VIP advertiser that exposes SWu VIPs to a local BGP speaker via host routes.
+/// VIP advertiser that exposes VIPs to a local BGP speaker via host routes.
 #[derive(Debug, Clone)]
 pub struct BgpRouteVipAdvertiser<B = LinuxRouteSteeringBackend> {
     backend: B,
@@ -204,6 +204,26 @@ mod tests {
                 MockOperation::RemoveRoute(route),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn existing_linux_route_remains_unproven_already_exists() {
+        let backend = MockRouteSteeringBackend::new();
+        let route = RouteRequest {
+            destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 32),
+            oif_ifindex: 42,
+            table: 100,
+            priority: Some(10),
+        };
+        backend.install_route(route).await.unwrap();
+        let advertiser = BgpRouteVipAdvertiser::with_backend(backend, config()).unwrap();
+
+        let error = advertiser
+            .advertise(advertisement(IpAddress::V4([203, 0, 113, 10])))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, IpsecLbError::AlreadyExists);
     }
 
     #[tokio::test]
