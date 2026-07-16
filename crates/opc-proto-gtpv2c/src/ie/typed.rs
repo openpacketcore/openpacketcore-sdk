@@ -1,7 +1,7 @@
 //! Typed GTPv2-C Information Elements used by the S2b procedure views.
 //!
 //! This module intentionally implements a narrow Release 18 subset that is
-//! needed by the S2b Echo/Create/Modify/Delete/Update Session message views.
+//! needed by the S2b Echo/session and dedicated-bearer message views.
 //! Unsupported IEs remain available as raw-preserving [`RawIe`] fallbacks.
 //!
 //! @spec 3GPP TS29274 R18 8.2
@@ -10,7 +10,7 @@
 use core::fmt;
 
 use bytes::{BufMut, BytesMut};
-use opc_proto_tft::TrafficFlowTemplate;
+use opc_proto_tft::{TftError, TftErrorKind, TrafficFlowTemplate};
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, DuplicateIePolicy, EncodeContext, EncodeError,
     EncodeErrorCode, SpecRef, UnknownIePolicy,
@@ -62,8 +62,15 @@ pub const IE_TYPE_APN_RESTRICTION: u8 = 127;
 pub const IE_TYPE_SELECTION_MODE: u8 = 128;
 /// GTPv2-C Additional Protocol Configuration Options IE type.
 pub const IE_TYPE_APCO: u8 = 163;
+/// GTPv2-C Overload Control Information IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_OVERLOAD_CONTROL_INFORMATION: u8 = 180;
+/// GTPv2-C Load Control Information IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_LOAD_CONTROL_INFORMATION: u8 = 181;
+/// GTPv2-C PGW Change Info IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_PGW_CHANGE_INFO: u8 = 214;
 
-const MAX_40BIT_BEARER_RATE: u64 = 0x00ff_ffff_ffff;
+/// Largest integer-kbps rate representable by a Bearer QoS u40 field.
+pub const MAX_BEARER_QOS_BITRATE_KBPS: u64 = 0x00ff_ffff_ffff;
 
 fn spec_ref() -> SpecRef {
     SpecRef::new("3gpp", "TS29274", "8.2")
@@ -73,6 +80,45 @@ fn checked_add_offset(base: usize, delta: usize) -> Result<usize, DecodeError> {
     base.checked_add(delta).ok_or_else(|| {
         DecodeError::new(DecodeErrorCode::LengthOverflow, base).with_spec_ref(spec_ref())
     })
+}
+
+pub(crate) const TFT_OPERATION_SYNTAX_ERROR_REASON: &str =
+    "Bearer TFT IE has a syntactically invalid TFT operation";
+pub(crate) const PACKET_FILTER_SYNTAX_ERROR_REASON: &str =
+    "Bearer TFT IE has syntactically invalid packet filters";
+pub(crate) const PACKET_FILTER_SEMANTIC_ERROR_REASON: &str =
+    "Bearer TFT IE has semantically invalid packet filters";
+
+fn bearer_tft_decode_error(error: TftError, value_offset: usize) -> DecodeError {
+    let error_offset = error
+        .offset()
+        .and_then(|relative| value_offset.checked_add(relative))
+        .unwrap_or(value_offset);
+    let reason = match error.kind() {
+        TftErrorKind::ConflictingComponents { .. } => PACKET_FILTER_SEMANTIC_ERROR_REASON,
+        TftErrorKind::Truncated { field } if field.starts_with("packet filter") => {
+            PACKET_FILTER_SYNTAX_ERROR_REASON
+        }
+        TftErrorKind::InvalidPacketFilterIdentifier { .. }
+        | TftErrorKind::DuplicatePacketFilterIdentifier { .. }
+        | TftErrorKind::DuplicateEvaluationPrecedence { .. }
+        | TftErrorKind::EmptyPacketFilterContents
+        | TftErrorKind::PacketFilterContentsTooLong { .. }
+        | TftErrorKind::ReservedComponentType { .. }
+        | TftErrorKind::InvalidComponentLength { .. }
+        | TftErrorKind::DuplicateComponent { .. }
+        | TftErrorKind::InvalidIpv6PrefixLength { .. }
+        | TftErrorKind::InvalidPortRange
+        | TftErrorKind::InvalidFlowLabel { .. }
+        | TftErrorKind::InvalidVlanIdentifier { .. }
+        | TftErrorKind::InvalidVlanPriority { .. } => PACKET_FILTER_SYNTAX_ERROR_REASON,
+        TftErrorKind::NonZeroSpareBits {
+            field: "packet-filter-identifier parameter",
+        } => TFT_OPERATION_SYNTAX_ERROR_REASON,
+        TftErrorKind::NonZeroSpareBits { .. } => PACKET_FILTER_SYNTAX_ERROR_REASON,
+        _ => TFT_OPERATION_SYNTAX_ERROR_REASON,
+    };
+    DecodeError::new(DecodeErrorCode::Structural { reason }, error_offset).with_spec_ref(spec_ref())
 }
 
 fn require_exact_len(
@@ -115,7 +161,7 @@ fn decode_u40(value: &[u8]) -> u64 {
 }
 
 fn encode_u40(value: u64, dst: &mut BytesMut) -> Result<(), EncodeError> {
-    if value > MAX_40BIT_BEARER_RATE {
+    if value > MAX_BEARER_QOS_BITRATE_KBPS {
         return Err(encode_structural_error(
             "Bearer QoS bitrate exceeds 40 bits",
         ));
@@ -774,43 +820,345 @@ impl fmt::Debug for ProtocolConfigurationOptions {
     }
 }
 
+/// Typed Allocation and Retention Priority carried by Bearer QoS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocationRetentionPriority {
+    priority_level: u8,
+    preemption_capability: bool,
+    preemption_vulnerability: bool,
+}
+
+impl AllocationRetentionPriority {
+    /// Construct a typed ARP value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BearerQosValidationError::InvalidPriorityLevel`] unless the
+    /// priority level is in the TS 29.212 range 1 through 15.
+    pub const fn new(
+        priority_level: u8,
+        preemption_capability: bool,
+        preemption_vulnerability: bool,
+    ) -> Result<Self, BearerQosValidationError> {
+        if priority_level == 0 || priority_level > 15 {
+            return Err(BearerQosValidationError::InvalidPriorityLevel);
+        }
+        Ok(Self {
+            priority_level,
+            preemption_capability,
+            preemption_vulnerability,
+        })
+    }
+
+    /// Decode the TS 29.274 ARP octet, requiring spare bits 8 and 2 to be zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable validation error for spare bits or priority level zero.
+    pub const fn from_octet(octet: u8) -> Result<Self, BearerQosValidationError> {
+        if octet & 0x82 != 0 {
+            return Err(BearerQosValidationError::InvalidArpSpareBits);
+        }
+        Self::new((octet >> 2) & 0x0f, octet & 0x40 != 0, octet & 0x01 != 0)
+    }
+
+    /// Encode the canonical TS 29.274 ARP octet with both spare bits zero.
+    pub const fn to_octet(self) -> u8 {
+        ((self.preemption_capability as u8) << 6)
+            | (self.priority_level << 2)
+            | self.preemption_vulnerability as u8
+    }
+
+    /// Allocation and Retention Priority level (1 is highest, 15 lowest).
+    pub const fn priority_level(self) -> u8 {
+        self.priority_level
+    }
+
+    /// Whether the bearer may pre-empt another bearer.
+    pub const fn preemption_capability(self) -> bool {
+        self.preemption_capability
+    }
+
+    /// Whether the bearer may be pre-empted by another bearer.
+    pub const fn preemption_vulnerability(self) -> bool {
+        self.preemption_vulnerability
+    }
+}
+
+/// GBR classification used to validate Bearer QoS rate fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BearerQosResourceType {
+    /// Guaranteed-bit-rate bearer.
+    Gbr,
+    /// Non-guaranteed-bit-rate bearer.
+    NonGbr,
+}
+
+/// Stable, redaction-safe Bearer QoS validation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BearerQosValidationError {
+    /// ARP spare bit 8 or bit 2 was non-zero.
+    InvalidArpSpareBits,
+    /// ARP priority level was outside 1 through 15.
+    InvalidPriorityLevel,
+    /// QCI is reserved or unsupported by the Release 18 classification table.
+    UnsupportedQci,
+    /// Operator-specific QCI 128 through 254 needs caller-supplied classification.
+    OperatorResourceTypeRequired,
+    /// Caller-supplied resource type conflicts with a standardized QCI.
+    ResourceTypeMismatch,
+    /// A bitrate exceeded the five-octet unsigned integer range.
+    BitrateExceedsU40,
+    /// A standardized or explicitly classified non-GBR bearer had non-zero rates.
+    NonGbrRatesMustBeZero,
+    /// A GBR bearer had zero maximum bitrate in both directions.
+    GbrMaximumBitratesMustNotBothBeZero,
+    /// A guaranteed rate exceeded its same-direction maximum rate.
+    GuaranteedBitrateExceedsMaximum,
+}
+
+impl BearerQosValidationError {
+    /// Stable machine-readable label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidArpSpareBits => "gtpv2c_bearer_qos_arp_spare_bits",
+            Self::InvalidPriorityLevel => "gtpv2c_bearer_qos_priority_level",
+            Self::UnsupportedQci => "gtpv2c_bearer_qos_qci_unsupported",
+            Self::OperatorResourceTypeRequired => "gtpv2c_bearer_qos_resource_type_required",
+            Self::ResourceTypeMismatch => "gtpv2c_bearer_qos_resource_type_mismatch",
+            Self::BitrateExceedsU40 => "gtpv2c_bearer_qos_bitrate_u40",
+            Self::NonGbrRatesMustBeZero => "gtpv2c_bearer_qos_non_gbr_rates_nonzero",
+            Self::GbrMaximumBitratesMustNotBothBeZero => {
+                "gtpv2c_bearer_qos_gbr_maximum_bitrates_zero"
+            }
+            Self::GuaranteedBitrateExceedsMaximum => "gtpv2c_bearer_qos_guaranteed_exceeds_maximum",
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::InvalidArpSpareBits => "Bearer QoS ARP spare bits must be zero",
+            Self::InvalidPriorityLevel => "Bearer QoS ARP priority level must be 1 through 15",
+            Self::UnsupportedQci => "Bearer QoS QCI is reserved or unsupported",
+            Self::OperatorResourceTypeRequired => {
+                "operator-specific Bearer QoS QCI requires explicit resource type"
+            }
+            Self::ResourceTypeMismatch => {
+                "Bearer QoS resource type conflicts with standardized QCI"
+            }
+            Self::BitrateExceedsU40 => "Bearer QoS bitrate exceeds 40 bits",
+            Self::NonGbrRatesMustBeZero => "non-GBR Bearer QoS rates must all be zero",
+            Self::GbrMaximumBitratesMustNotBothBeZero => {
+                "GBR Bearer QoS maximum bitrates must not both be zero"
+            }
+            Self::GuaranteedBitrateExceedsMaximum => {
+                "Bearer QoS guaranteed bitrate exceeds maximum bitrate"
+            }
+        }
+    }
+}
+
+impl fmt::Display for BearerQosValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for BearerQosValidationError {}
+
 /// Bearer QoS IE (type 80).
 ///
-/// The S2b subset exposes the fixed-width Bearer QoS shape and preserves the
-/// ARP priority/flag octet for callers that need exact TS 29.274 bit handling.
+/// The four rate fields are unsigned 40-bit integer kilobits per second.
+/// Standardized QCI semantics are checked on decode and encode. Operator-
+/// specific QCIs remain wire-preservable but require an explicit resource
+/// type through [`BearerQos::validate_with_resource_type`] before policy use.
 ///
 /// @spec 3GPP TS29274 R18 8.15
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-BEARER-QOS-001
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BearerQos {
-    /// Raw allocation/retention priority flag octet.
+    /// Raw allocation/retention priority octet retained for source compatibility.
+    ///
+    /// Use [`Self::allocation_retention_priority`] for typed PCI/PVI/PL access.
+    /// Encode rejects non-zero spare bits and an invalid priority level.
     pub priority_flags: u8,
     /// QoS Class Identifier.
     pub qci: u8,
-    /// Maximum bit rate for uplink, encoded as a 40-bit unsigned integer.
+    /// Maximum uplink bitrate as a 40-bit unsigned integer in kbps.
     pub maximum_bitrate_uplink: u64,
-    /// Maximum bit rate for downlink, encoded as a 40-bit unsigned integer.
+    /// Maximum downlink bitrate as a 40-bit unsigned integer in kbps.
     pub maximum_bitrate_downlink: u64,
-    /// Guaranteed bit rate for uplink, encoded as a 40-bit unsigned integer.
+    /// Guaranteed uplink bitrate as a 40-bit unsigned integer in kbps.
     pub guaranteed_bitrate_uplink: u64,
-    /// Guaranteed bit rate for downlink, encoded as a 40-bit unsigned integer.
+    /// Guaranteed downlink bitrate as a 40-bit unsigned integer in kbps.
     pub guaranteed_bitrate_downlink: u64,
 }
 
 impl BearerQos {
+    /// Construct and validate a Bearer QoS value.
+    ///
+    /// The rate arguments are integer kilobits per second. For operator-
+    /// specific QCIs, call [`Self::validate_with_resource_type`] before using
+    /// the value for bearer policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable error for invalid ARP/QCI/rate relationships.
+    pub fn new(
+        allocation_retention_priority: AllocationRetentionPriority,
+        qci: u8,
+        maximum_bitrate_uplink: u64,
+        maximum_bitrate_downlink: u64,
+        guaranteed_bitrate_uplink: u64,
+        guaranteed_bitrate_downlink: u64,
+    ) -> Result<Self, BearerQosValidationError> {
+        let value = Self {
+            priority_flags: allocation_retention_priority.to_octet(),
+            qci,
+            maximum_bitrate_uplink,
+            maximum_bitrate_downlink,
+            guaranteed_bitrate_uplink,
+            guaranteed_bitrate_downlink,
+        };
+        value.validate_wire()?;
+        Ok(value)
+    }
+
+    /// Return typed Allocation and Retention Priority fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable error if a directly constructed value contains spare
+    /// bits or an invalid priority level.
+    pub const fn allocation_retention_priority(
+        &self,
+    ) -> Result<AllocationRetentionPriority, BearerQosValidationError> {
+        AllocationRetentionPriority::from_octet(self.priority_flags)
+    }
+
+    /// Return the standardized QCI resource type.
+    ///
+    /// # Errors
+    ///
+    /// Operator-specific QCI 128 through 254 returns
+    /// [`BearerQosValidationError::OperatorResourceTypeRequired`]. Reserved
+    /// QCI values return [`BearerQosValidationError::UnsupportedQci`].
+    pub fn resource_type(&self) -> Result<BearerQosResourceType, BearerQosValidationError> {
+        match qci_resource_type(self.qci)? {
+            Some(resource_type) => Ok(resource_type),
+            None => Err(BearerQosValidationError::OperatorResourceTypeRequired),
+        }
+    }
+
+    /// Validate all standardized QCI, ARP, and bitrate semantics.
+    ///
+    /// # Errors
+    ///
+    /// Operator-specific QCIs require [`Self::validate_with_resource_type`].
+    pub fn validate(&self) -> Result<(), BearerQosValidationError> {
+        self.validate_common()?;
+        let resource_type = self.resource_type()?;
+        self.validate_rates(resource_type)
+    }
+
+    /// Validate using an explicit resource type for operator-specific QCIs.
+    ///
+    /// Standardized QCIs must agree with the supplied type; operator-specific
+    /// QCIs 128 through 254 use it without inferring product policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable error for a standardized mismatch or invalid rates.
+    pub fn validate_with_resource_type(
+        &self,
+        resource_type: BearerQosResourceType,
+    ) -> Result<(), BearerQosValidationError> {
+        self.validate_common()?;
+        if qci_resource_type(self.qci)?.is_some_and(|expected| expected != resource_type) {
+            return Err(BearerQosValidationError::ResourceTypeMismatch);
+        }
+        self.validate_rates(resource_type)
+    }
+
+    fn validate_common(&self) -> Result<(), BearerQosValidationError> {
+        let _arp = self.allocation_retention_priority()?;
+        let _classification = qci_resource_type(self.qci)?;
+        if [
+            self.maximum_bitrate_uplink,
+            self.maximum_bitrate_downlink,
+            self.guaranteed_bitrate_uplink,
+            self.guaranteed_bitrate_downlink,
+        ]
+        .into_iter()
+        .any(|rate| rate > MAX_BEARER_QOS_BITRATE_KBPS)
+        {
+            return Err(BearerQosValidationError::BitrateExceedsU40);
+        }
+        Ok(())
+    }
+
+    fn validate_rates(
+        &self,
+        resource_type: BearerQosResourceType,
+    ) -> Result<(), BearerQosValidationError> {
+        match resource_type {
+            BearerQosResourceType::NonGbr => {
+                if self.maximum_bitrate_uplink != 0
+                    || self.maximum_bitrate_downlink != 0
+                    || self.guaranteed_bitrate_uplink != 0
+                    || self.guaranteed_bitrate_downlink != 0
+                {
+                    return Err(BearerQosValidationError::NonGbrRatesMustBeZero);
+                }
+            }
+            BearerQosResourceType::Gbr => {
+                if self.maximum_bitrate_uplink == 0 && self.maximum_bitrate_downlink == 0 {
+                    return Err(BearerQosValidationError::GbrMaximumBitratesMustNotBothBeZero);
+                }
+                if self.guaranteed_bitrate_uplink > self.maximum_bitrate_uplink
+                    || self.guaranteed_bitrate_downlink > self.maximum_bitrate_downlink
+                {
+                    return Err(BearerQosValidationError::GuaranteedBitrateExceedsMaximum);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_wire(&self) -> Result<(), BearerQosValidationError> {
+        self.validate_common()?;
+        if let Some(resource_type) = qci_resource_type(self.qci)? {
+            self.validate_rates(resource_type)?;
+        }
+        Ok(())
+    }
+
     fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
         require_exact_len(value, 22, offset, "Bearer QoS IE must be twenty-two octets")?;
-        Ok(Self {
+        let decoded = Self {
             priority_flags: value[0],
             qci: value[1],
             maximum_bitrate_uplink: decode_u40(&value[2..7]),
             maximum_bitrate_downlink: decode_u40(&value[7..12]),
             guaranteed_bitrate_uplink: decode_u40(&value[12..17]),
             guaranteed_bitrate_downlink: decode_u40(&value[17..22]),
-        })
+        };
+        decoded.validate_wire().map_err(|error| {
+            DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: error.reason(),
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref())
+        })?;
+        Ok(decoded)
     }
 
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        self.validate_wire()
+            .map_err(|error| encode_structural_error(error.reason()))?;
         dst.put_u8(self.priority_flags);
         dst.put_u8(self.qci);
         encode_u40(self.maximum_bitrate_uplink, dst)?;
@@ -818,6 +1166,36 @@ impl BearerQos {
         encode_u40(self.guaranteed_bitrate_uplink, dst)?;
         encode_u40(self.guaranteed_bitrate_downlink, dst)?;
         Ok(())
+    }
+}
+
+impl fmt::Debug for BearerQos {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BearerQos")
+            .field("qci", &self.qci)
+            .field(
+                "allocation_retention_priority_valid",
+                &self.allocation_retention_priority().is_ok(),
+            )
+            .field(
+                "maximum_bitrates_present",
+                &(self.maximum_bitrate_uplink != 0 || self.maximum_bitrate_downlink != 0),
+            )
+            .field(
+                "guaranteed_bitrates_present",
+                &(self.guaranteed_bitrate_uplink != 0 || self.guaranteed_bitrate_downlink != 0),
+            )
+            .finish()
+    }
+}
+
+fn qci_resource_type(qci: u8) -> Result<Option<BearerQosResourceType>, BearerQosValidationError> {
+    match qci {
+        1..=4 | 65..=67 | 71..=76 | 82..=85 => Ok(Some(BearerQosResourceType::Gbr)),
+        5..=10 | 69..=70 | 79..=80 => Ok(Some(BearerQosResourceType::NonGbr)),
+        128..=254 => Ok(None),
+        _ => Err(BearerQosValidationError::UnsupportedQci),
     }
 }
 
@@ -1453,7 +1831,13 @@ impl<'a> BearerContext<'a> {
             );
         }
         Ok(Self {
-            members: decode_typed_ie_sequence_at(value, ctx, depth.saturating_add(1), base_offset)?,
+            members: decode_typed_ie_sequence_at(
+                value,
+                ctx,
+                depth.saturating_add(1),
+                base_offset,
+                false,
+            )?,
         })
     }
 
@@ -1669,21 +2053,8 @@ impl<'a> TypedIe<'a> {
                 TypedIeValue::ServingNetwork(ServingNetwork::decode_value(raw.value, value_offset)?)
             }
             IE_TYPE_BEARER_TFT => TypedIeValue::BearerTft(
-                TrafficFlowTemplate::decode_value_with_context(raw.value, ctx).map_err(
-                    |error| {
-                        let error_offset = error
-                            .offset()
-                            .and_then(|relative| value_offset.checked_add(relative))
-                            .unwrap_or(value_offset);
-                        DecodeError::new(
-                            DecodeErrorCode::Structural {
-                                reason: "Bearer TFT IE failed TS 24.008 validation",
-                            },
-                            error_offset,
-                        )
-                        .with_spec_ref(spec_ref())
-                    },
-                )?,
+                TrafficFlowTemplate::decode_value_with_context(raw.value, ctx)
+                    .map_err(|error| bearer_tft_decode_error(error, value_offset))?,
             ),
             IE_TYPE_F_TEID => TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid::decode_value(
                 raw.value,
@@ -1904,7 +2275,20 @@ pub fn decode_typed_ie_sequence<'a>(
     ctx: DecodeContext,
     depth: usize,
 ) -> Result<Vec<TypedIe<'a>>, DecodeError> {
-    decode_typed_ie_sequence_at(input, ctx, depth, 0)
+    decode_typed_ie_sequence_at(input, ctx, depth, 0, false)
+}
+
+/// Decode the top-level IE sequence of a PGW-triggered bearer request.
+///
+/// TS 29.274 tables 7.2.3-1, 7.2.15-1, and 7.2.9.2-1 declare three
+/// additional repeated type/instance pairs for requests 95, 97, and 99.
+/// Keeping this profile request-specific prevents the same duplicates from
+/// being silently accepted in responses 96, 98, and 100.
+pub(crate) fn decode_pgw_triggered_request_ie_sequence<'a>(
+    input: &'a [u8],
+    ctx: DecodeContext,
+) -> Result<Vec<TypedIe<'a>>, DecodeError> {
+    decode_typed_ie_sequence_at(input, ctx, 0, 0, true)
 }
 
 /// Decode a sequence of GTPv2-C IEs into typed values with raw fallback,
@@ -1921,6 +2305,7 @@ fn decode_typed_ie_sequence_at<'a>(
     ctx: DecodeContext,
     depth: usize,
     base_offset: usize,
+    pgw_triggered_request: bool,
 ) -> Result<Vec<TypedIe<'a>>, DecodeError> {
     if depth > ctx.max_depth {
         return Err(
@@ -1934,7 +2319,14 @@ fn decode_typed_ie_sequence_at<'a>(
         match iter.next() {
             Some(Ok(raw)) => {
                 let typed = TypedIe::decode_from_raw(raw, ctx, depth, offset)?;
-                apply_duplicate_policy(&mut ies, typed, ctx.duplicate_ie_policy, depth, offset)?;
+                apply_duplicate_policy(
+                    &mut ies,
+                    typed,
+                    ctx.duplicate_ie_policy,
+                    depth,
+                    offset,
+                    pgw_triggered_request,
+                )?;
             }
             Some(Err(error)) => return Err(error),
             None => break,
@@ -1949,6 +2341,7 @@ fn apply_duplicate_policy<'a>(
     policy: DuplicateIePolicy,
     depth: usize,
     offset: usize,
+    pgw_triggered_request: bool,
 ) -> Result<(), DecodeError> {
     // TS 29.274 procedure tables explicitly use these type/instance pairs as
     // lists. Treating them as singleton duplicates would either discard
@@ -1959,7 +2352,14 @@ fn apply_duplicate_policy<'a>(
     // silently weaken `DuplicateIePolicy::Reject` for the whole crate.
     let repeatable = depth == 0
         && ((typed.ie_type() == IE_TYPE_BEARER_CONTEXT && typed.instance == 0)
-            || (typed.ie_type() == IE_TYPE_EBI && typed.instance == 1));
+            || (typed.ie_type() == IE_TYPE_EBI && typed.instance == 1)
+            || (pgw_triggered_request
+                && matches!(
+                    (typed.ie_type(), typed.instance),
+                    (IE_TYPE_LOAD_CONTROL_INFORMATION, 1)
+                        | (IE_TYPE_OVERLOAD_CONTROL_INFORMATION, 0)
+                        | (IE_TYPE_PGW_CHANGE_INFO, 0)
+                )));
     if repeatable {
         ies.push(typed);
         return Ok(());
@@ -1989,6 +2389,95 @@ fn apply_duplicate_policy<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn arp() -> AllocationRetentionPriority {
+        let Ok(value) = AllocationRetentionPriority::new(3, true, true) else {
+            panic!("test ARP must be valid");
+        };
+        value
+    }
+
+    #[test]
+    fn bearer_qos_validates_typed_arp_and_standardized_resource_semantics() {
+        assert_eq!(arp().to_octet(), 0x4d);
+        assert_eq!(AllocationRetentionPriority::from_octet(0x4d), Ok(arp()));
+        assert_eq!(
+            AllocationRetentionPriority::from_octet(0x4f),
+            Err(BearerQosValidationError::InvalidArpSpareBits)
+        );
+        assert_eq!(
+            AllocationRetentionPriority::new(0, false, false),
+            Err(BearerQosValidationError::InvalidPriorityLevel)
+        );
+
+        let Ok(voice) = BearerQos::new(arp(), 1, 128, 128, 64, 64) else {
+            panic!("standardized GBR voice QoS must validate");
+        };
+        assert_eq!(voice.resource_type(), Ok(BearerQosResourceType::Gbr));
+        assert_eq!(voice.validate(), Ok(()));
+
+        let Ok(downlink_only_gbr) = BearerQos::new(arp(), 1, 0, 128, 0, 64) else {
+            panic!("a zero-rate uplink direction must remain valid");
+        };
+        assert_eq!(downlink_only_gbr.validate(), Ok(()));
+        assert_eq!(
+            BearerQos::new(arp(), 1, 0, 0, 0, 0),
+            Err(BearerQosValidationError::GbrMaximumBitratesMustNotBothBeZero)
+        );
+
+        let Ok(non_gbr) = BearerQos::new(arp(), 9, 0, 0, 0, 0) else {
+            panic!("standardized non-GBR QoS must use zero rates");
+        };
+        assert_eq!(non_gbr.resource_type(), Ok(BearerQosResourceType::NonGbr));
+        assert_eq!(
+            BearerQos::new(arp(), 9, 1, 0, 0, 0),
+            Err(BearerQosValidationError::NonGbrRatesMustBeZero)
+        );
+        assert_eq!(
+            BearerQos::new(arp(), 1, 64, 64, 65, 64),
+            Err(BearerQosValidationError::GuaranteedBitrateExceedsMaximum)
+        );
+        assert_eq!(
+            BearerQos::new(arp(), 11, 0, 0, 0, 0),
+            Err(BearerQosValidationError::UnsupportedQci)
+        );
+    }
+
+    #[test]
+    fn operator_specific_bearer_qos_requires_explicit_resource_type() {
+        let Ok(operator_qos) = BearerQos::new(arp(), 200, 128, 128, 64, 64) else {
+            panic!("operator-specific QCI remains wire representable");
+        };
+        assert_eq!(
+            operator_qos.validate(),
+            Err(BearerQosValidationError::OperatorResourceTypeRequired)
+        );
+        assert_eq!(
+            operator_qos.validate_with_resource_type(BearerQosResourceType::Gbr),
+            Ok(())
+        );
+        assert_eq!(
+            operator_qos.validate_with_resource_type(BearerQosResourceType::NonGbr),
+            Err(BearerQosValidationError::NonGbrRatesMustBeZero)
+        );
+    }
+
+    #[test]
+    fn bearer_qos_decode_rejects_arp_spare_bits() {
+        let mut value = [0u8; 22];
+        value[0] = 0x4f;
+        value[1] = 9;
+        let Err(error) = BearerQos::decode_value(&value, 7) else {
+            panic!("ARP spare bit 2 must fail at the untrusted boundary");
+        };
+        assert!(matches!(
+            error.code(),
+            DecodeErrorCode::Structural {
+                reason: "Bearer QoS ARP spare bits must be zero"
+            }
+        ));
+        assert_eq!(error.offset(), 7);
+    }
 
     #[test]
     fn internal_raw_value_encode_fails_structurally_without_panicking() {

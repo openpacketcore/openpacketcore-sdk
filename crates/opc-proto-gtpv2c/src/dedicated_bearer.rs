@@ -1,26 +1,33 @@
-//! Typed S2b Create Bearer and Delete Bearer procedure models.
+//! Typed S2b Create, Update, and Delete Bearer procedure models.
 //!
 //! This module implements TS 29.274 Release 18 procedure tables 7.2.3,
-//! 7.2.4, 7.2.9.2, and 7.2.10.2 for the S2b interface. Product policy,
-//! identifier allocation, and dataplane programming remain outside the
-//! protocol boundary.
+//! 7.2.4, 7.2.15, 7.2.16, 7.2.9.2, and 7.2.10.2 for the S2b interface.
+//! Product policy, identifier allocation, and dataplane programming remain
+//! outside the protocol boundary.
 
 use core::fmt;
 
-use opc_proto_tft::TrafficFlowTemplate;
+use opc_proto_tft::{PacketFilterDirection, TftOperation, TrafficFlowTemplate};
 use opc_protocol::{DecodeError, DecodeErrorCode, SpecRef};
 
+use crate::ie::typed::{
+    PACKET_FILTER_SEMANTIC_ERROR_REASON, PACKET_FILTER_SYNTAX_ERROR_REASON,
+    TFT_OPERATION_SYNTAX_ERROR_REASON,
+};
 use crate::ie::{
-    BearerContext, BearerQos, CauseValue, ChargingId, EpsBearerId, FullyQualifiedTeid, TypedIe,
-    TypedIeValue, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE,
-    IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
+    AggregateMaximumBitRate, BearerContext, BearerQos, CauseValue, ChargingId, EpsBearerId,
+    FullyQualifiedTeid, TypedIe, TypedIeValue, IE_TYPE_AMBR, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
+    IE_TYPE_BEARER_QOS, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI,
+    IE_TYPE_F_TEID, IE_TYPE_LOAD_CONTROL_INFORMATION, IE_TYPE_OVERLOAD_CONTROL_INFORMATION,
+    IE_TYPE_PCO, IE_TYPE_PGW_CHANGE_INFO,
 };
 use crate::s2b::{
     build_s2b_profile_message, cause, typed_ie, MessageDirection, Procedure, S2bProcedureMessage,
     S2bProfileBuildResult, CREATE_BEARER_REQUEST, CREATE_BEARER_RESPONSE, DELETE_BEARER_REQUEST,
     DELETE_BEARER_RESPONSE, INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    UPDATE_BEARER_REQUEST, UPDATE_BEARER_RESPONSE,
 };
-use crate::{Header, OwnedMessage};
+use crate::{Header, MessagePriority, OwnedMessage};
 
 /// Maximum bearer contexts retained by one dedicated-bearer procedure.
 ///
@@ -28,6 +35,15 @@ use crate::{Header, OwnedMessage};
 /// Request as the "allocate" marker. This bound also prevents a procedure
 /// model from allocating an unbounded list independently of `DecodeContext`.
 pub const MAX_DEDICATED_BEARER_CONTEXTS: usize = 15;
+
+/// Maximum repeated PGW APN-level Load Control Information IEs in one request.
+pub const MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES: usize = 10;
+
+/// Maximum PGW Overload Control Information IEs in one request.
+///
+/// One occurrence may carry node-level information and up to ten additional
+/// occurrences may carry APN-level information.
+pub const MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES: usize = 11;
 
 /// Stable validation category for a dedicated-bearer message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,10 +66,18 @@ pub enum DedicatedBearerErrorKind {
     MissingBearerContexts,
     /// Bearer-context list exceeds the bounded EBI space.
     TooManyBearerContexts,
+    /// Repeated PGW APN-level Load Control Information exceeds the table bound.
+    TooManyPgwApnLoadControlInformation,
+    /// Repeated PGW Overload Control Information exceeds the table bound.
+    TooManyPgwOverloadControlInformation,
     /// A required nested EBI is missing.
     MissingBearerEbi,
     /// A required TFT is missing.
     MissingBearerTft,
+    /// Create Bearer carried a TFT operation other than Create New.
+    InvalidCreateBearerTftOperation,
+    /// Create Bearer TFT has no filter that can select uplink traffic.
+    MissingCreateBearerUplinkFilter,
     /// A required Bearer QoS is missing.
     MissingBearerQos,
     /// A required S2b-U PGW F-TEID is missing.
@@ -62,6 +86,10 @@ pub enum DedicatedBearerErrorKind {
     MissingChargingId,
     /// A required S2b-U ePDG F-TEID is missing.
     MissingEpdgFTeid,
+    /// Update Bearer Request omitted its mandatory APN-AMBR.
+    MissingApnAmbr,
+    /// A context in a multi-context Update carried no TFT or QoS modification.
+    MultipleUpdateContextsWithoutBearerModification,
     /// An IE used an instance not assigned by the S2b procedure table.
     WrongIeInstance,
     /// An F-TEID used an interface type not assigned to its S2b position.
@@ -104,12 +132,26 @@ impl DedicatedBearerErrorKind {
             Self::CreateRequestEbiNotZero => "gtpv2c_create_bearer_request_ebi_not_zero",
             Self::MissingBearerContexts => "gtpv2c_dedicated_bearer_context_missing",
             Self::TooManyBearerContexts => "gtpv2c_dedicated_bearer_context_count_exceeded",
+            Self::TooManyPgwApnLoadControlInformation => {
+                "gtpv2c_dedicated_pgw_apn_load_control_count_exceeded"
+            }
+            Self::TooManyPgwOverloadControlInformation => {
+                "gtpv2c_dedicated_pgw_overload_control_count_exceeded"
+            }
             Self::MissingBearerEbi => "gtpv2c_dedicated_bearer_ebi_missing",
             Self::MissingBearerTft => "gtpv2c_create_bearer_tft_missing",
+            Self::InvalidCreateBearerTftOperation => "gtpv2c_create_bearer_tft_operation_invalid",
+            Self::MissingCreateBearerUplinkFilter => {
+                "gtpv2c_create_bearer_tft_uplink_filter_missing"
+            }
             Self::MissingBearerQos => "gtpv2c_create_bearer_qos_missing",
             Self::MissingPgwFTeid => "gtpv2c_create_bearer_pgw_fteid_missing",
             Self::MissingChargingId => "gtpv2c_create_bearer_charging_id_missing",
             Self::MissingEpdgFTeid => "gtpv2c_create_bearer_epdg_fteid_missing",
+            Self::MissingApnAmbr => "gtpv2c_update_bearer_apn_ambr_missing",
+            Self::MultipleUpdateContextsWithoutBearerModification => {
+                "gtpv2c_update_bearer_multiple_contexts_without_modification"
+            }
             Self::WrongIeInstance => "gtpv2c_dedicated_ie_instance_invalid",
             Self::WrongFTeidInterface => "gtpv2c_dedicated_fteid_interface_invalid",
             Self::DuplicateSingleton => "gtpv2c_dedicated_singleton_duplicate",
@@ -141,9 +183,21 @@ impl DedicatedBearerErrorKind {
             }
             Self::MissingBearerContexts => "dedicated-bearer message requires bearer contexts",
             Self::TooManyBearerContexts => "dedicated-bearer context count exceeds EBI space",
+            Self::TooManyPgwApnLoadControlInformation => {
+                "PGW APN-level Load Control Information count exceeds ten"
+            }
+            Self::TooManyPgwOverloadControlInformation => {
+                "PGW Overload Control Information count exceeds eleven"
+            }
             Self::MissingBearerEbi => "dedicated-bearer context requires EBI instance 0",
             Self::MissingBearerTft => {
                 "Create Bearer Request context requires Bearer TFT instance 0"
+            }
+            Self::InvalidCreateBearerTftOperation => {
+                "Create Bearer Request TFT operation must be Create New"
+            }
+            Self::MissingCreateBearerUplinkFilter => {
+                "Create Bearer Request TFT requires an uplink-applicable packet filter"
             }
             Self::MissingBearerQos => {
                 "Create Bearer Request context requires Bearer QoS instance 0"
@@ -154,6 +208,10 @@ impl DedicatedBearerErrorKind {
             }
             Self::MissingEpdgFTeid => {
                 "accepted Create Bearer Response context requires S2b-U ePDG F-TEID"
+            }
+            Self::MissingApnAmbr => "Update Bearer Request requires APN-AMBR instance 0",
+            Self::MultipleUpdateContextsWithoutBearerModification => {
+                "every multi-context Update Bearer entry requires a TFT or QoS modification"
             }
             Self::WrongIeInstance => "dedicated-bearer IE uses an invalid instance",
             Self::WrongFTeidInterface => "dedicated-bearer F-TEID interface type is invalid",
@@ -224,6 +282,24 @@ impl DedicatedBearerError {
         self.kind.as_str()
     }
 
+    /// Return the normative GTP Cause for a Create Bearer TFT semantic failure.
+    ///
+    /// Other validation failures intentionally return `None`: their response
+    /// Cause can depend on procedure position and product policy, which this
+    /// protocol boundary does not infer.
+    #[must_use]
+    pub const fn request_rejection_cause(self) -> Option<CauseValue> {
+        match self.kind {
+            DedicatedBearerErrorKind::InvalidCreateBearerTftOperation => {
+                Some(CauseValue::SemanticErrorInTftOperation)
+            }
+            DedicatedBearerErrorKind::MissingCreateBearerUplinkFilter => {
+                Some(CauseValue::SemanticErrorsInPacketFilters)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn to_decode_error(self) -> DecodeError {
         DecodeError::new(
             DecodeErrorCode::Structural {
@@ -232,6 +308,25 @@ impl DedicatedBearerError {
             0,
         )
         .with_spec_ref(spec_ref())
+    }
+}
+
+/// Map a structured Bearer TFT decode failure to its normative response Cause.
+///
+/// This complements [`DedicatedBearerError::request_rejection_cause`]: wire
+/// syntax failures occur before a typed dedicated-bearer view can be built,
+/// while operation/state semantics are checked by the typed projector.
+/// Returns `None` for decode errors unrelated to the Bearer TFT.
+#[must_use]
+pub fn dedicated_bearer_decode_rejection_cause(error: &DecodeError) -> Option<CauseValue> {
+    let DecodeErrorCode::Structural { reason } = error.code() else {
+        return None;
+    };
+    match *reason {
+        TFT_OPERATION_SYNTAX_ERROR_REASON => Some(CauseValue::SyntacticErrorInTftOperation),
+        PACKET_FILTER_SEMANTIC_ERROR_REASON => Some(CauseValue::SemanticErrorsInPacketFilters),
+        PACKET_FILTER_SYNTAX_ERROR_REASON => Some(CauseValue::SyntacticErrorsInPacketFilters),
+        _ => None,
     }
 }
 
@@ -254,7 +349,7 @@ impl fmt::Display for DedicatedBearerError {
 impl std::error::Error for DedicatedBearerError {}
 
 fn spec_ref() -> SpecRef {
-    SpecRef::new("3gpp", "TS29274", "7.2.3-7.2.10.2")
+    SpecRef::new("3gpp", "TS29274", "7.2.3-7.2.16")
 }
 
 /// One Bearer Context in an S2b Create Bearer Request.
@@ -292,6 +387,8 @@ pub struct S2bCreateBearerRequest<'a> {
     pub sequence_number: u32,
     /// Receiver control-plane TEID in the request header.
     pub teid: u32,
+    /// Optional relative Message Priority carried by the request header.
+    pub message_priority: Option<MessagePriority>,
     /// Default bearer associated with the PDN connection (EBI instance 0).
     pub linked_ebi: EpsBearerId,
     /// One or more requested dedicated bearer contexts.
@@ -402,6 +499,11 @@ pub struct S2bCreateBearerResponse<'a> {
     pub sequence_number: u32,
     /// Receiver control-plane TEID in the response header.
     pub teid: u32,
+    /// Optional response Message Priority, normally copied from the request.
+    ///
+    /// Inter-PLMN policy may explicitly strip or override this value; it is
+    /// therefore not part of bearer response correlation.
+    pub message_priority: Option<MessagePriority>,
     /// Message-level acceptance, partial acceptance, or rejection Cause.
     pub cause: CauseValue,
     /// One result for every request Bearer Context.
@@ -419,6 +521,140 @@ impl fmt::Debug for S2bCreateBearerResponse<'_> {
             .count();
         formatter
             .debug_struct("S2bCreateBearerResponse")
+            .field("cause", &self.cause)
+            .field("bearer_context_count", &self.bearer_contexts.len())
+            .field("accepted_count", &accepted_count)
+            .field(
+                "rejected_count",
+                &self.bearer_contexts.len().saturating_sub(accepted_count),
+            )
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
+/// One Bearer Context in an S2b Update Bearer Request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bUpdateBearerRequestContext<'a> {
+    /// Existing non-zero bearer identity (EBI instance 0).
+    pub ebi: EpsBearerId,
+    /// Canonical TS 24.008 TFT change, when requested.
+    pub tft: Option<TrafficFlowTemplate>,
+    /// Bearer-level QoS change, when requested.
+    pub bearer_qos: Option<BearerQos>,
+    /// Other conditional or extension nested IEs retained in original order.
+    ///
+    /// On S2b this may include APCO instance 0 for P-CSCF restoration.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+impl fmt::Debug for S2bUpdateBearerRequestContext<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bUpdateBearerRequestContext")
+            .field("tft_present", &self.tft.is_some())
+            .field("bearer_qos_present", &self.bearer_qos.is_some())
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
+/// Typed S2b Update Bearer Request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bUpdateBearerRequest<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// Receiver control-plane TEID in the request header.
+    pub teid: u32,
+    /// Optional relative Message Priority carried by the request header.
+    pub message_priority: Option<MessagePriority>,
+    /// Mandatory APN aggregate maximum bit rate (AMBR instance 0).
+    pub apn_ambr: AggregateMaximumBitRate,
+    /// One or more existing bearer contexts to update.
+    pub bearer_contexts: Vec<S2bUpdateBearerRequestContext<'a>>,
+    /// Other conditional or extension top-level IEs retained in order.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+impl fmt::Debug for S2bUpdateBearerRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bUpdateBearerRequest")
+            .field("message_priority_present", &self.message_priority.is_some())
+            .field("apn_ambr_present", &true)
+            .field("bearer_context_count", &self.bearer_contexts.len())
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
+/// One bearer-level result in an S2b Update Bearer Response.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bUpdateBearerResult<'a> {
+    /// EBI copied from the corresponding request context.
+    pub ebi: EpsBearerId,
+    /// Bearer-level acceptance or rejection Cause.
+    pub cause: CauseValue,
+    /// Other conditional or extension nested IEs retained in original order.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+impl fmt::Debug for S2bUpdateBearerResult<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bUpdateBearerResult")
+            .field(
+                "outcome",
+                &if self.cause == CauseValue::RequestAccepted {
+                    "accepted"
+                } else {
+                    "rejected"
+                },
+            )
+            .field("cause", &self.cause)
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
+impl S2bUpdateBearerResult<'_> {
+    /// Return `true` when the bearer modification was accepted.
+    #[must_use]
+    pub const fn is_accepted(&self) -> bool {
+        matches!(self.cause, CauseValue::RequestAccepted)
+    }
+}
+
+/// Typed S2b Update Bearer Response.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bUpdateBearerResponse<'a> {
+    /// GTPv2-C sequence number copied from the request.
+    pub sequence_number: u32,
+    /// Receiver control-plane TEID in the response header.
+    pub teid: u32,
+    /// Optional response Message Priority, normally copied from the request.
+    ///
+    /// Inter-PLMN policy may explicitly strip or override this value; it is
+    /// therefore not part of bearer response correlation.
+    pub message_priority: Option<MessagePriority>,
+    /// Message-level acceptance, partial acceptance, or rejection Cause.
+    pub cause: CauseValue,
+    /// One result for every request Bearer Context.
+    pub bearer_contexts: Vec<S2bUpdateBearerResult<'a>>,
+    /// Other conditional or extension top-level IEs retained in order.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+impl fmt::Debug for S2bUpdateBearerResponse<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let accepted_count = self
+            .bearer_contexts
+            .iter()
+            .filter(|result| result.is_accepted())
+            .count();
+        formatter
+            .debug_struct("S2bUpdateBearerResponse")
+            .field("message_priority_present", &self.message_priority.is_some())
             .field("cause", &self.cause)
             .field("bearer_context_count", &self.bearer_contexts.len())
             .field("accepted_count", &accepted_count)
@@ -459,6 +695,8 @@ pub struct S2bDeleteBearerRequest<'a> {
     pub sequence_number: u32,
     /// Receiver control-plane TEID in the request header.
     pub teid: u32,
+    /// Optional relative Message Priority carried by the request header.
+    pub message_priority: Option<MessagePriority>,
     /// Exactly one delete target form.
     pub target: S2bDeleteBearerTarget,
     /// Optional initial-message Cause defined by Table 7.2.9.2-1.
@@ -541,6 +779,11 @@ pub struct S2bDeleteBearerResponse<'a> {
     pub sequence_number: u32,
     /// Receiver control-plane TEID in the response header.
     pub teid: u32,
+    /// Optional response Message Priority, normally copied from the request.
+    ///
+    /// Inter-PLMN policy may explicitly strip or override this value; it is
+    /// therefore not part of bearer response correlation.
+    pub message_priority: Option<MessagePriority>,
     /// Message-level acceptance, partial acceptance, or rejection Cause.
     pub cause: CauseValue,
     /// Response form corresponding to the request form.
@@ -590,6 +833,32 @@ impl S2bProcedureMessage<'_> {
         &self,
     ) -> Result<S2bCreateBearerResponse<'_>, DedicatedBearerError> {
         project_create_bearer_response(self)
+    }
+
+    /// Project a validated S2b Update Bearer Request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for an incorrect procedure/header, missing
+    /// APN-AMBR, invalid bearer-context cardinality, duplicate EBI, or
+    /// mis-instanced TFT, QoS, PCO, or APCO IE.
+    pub fn update_bearer_request(
+        &self,
+    ) -> Result<S2bUpdateBearerRequest<'_>, DedicatedBearerError> {
+        project_update_bearer_request(self)
+    }
+
+    /// Project a validated S2b Update Bearer Response.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for an incorrect procedure/header, invalid
+    /// message/bearer Cause relationship, duplicate EBI, or a missing result
+    /// context.
+    pub fn update_bearer_response(
+        &self,
+    ) -> Result<S2bUpdateBearerResponse<'_>, DedicatedBearerError> {
+        project_update_bearer_response(self)
     }
 
     /// Project a validated S2b Delete Bearer Request.
@@ -756,6 +1025,55 @@ fn bearer_contexts<'b, 'a>(
     Ok(contexts)
 }
 
+fn validate_pgw_triggered_request_control_lists(
+    ies: &[TypedIe<'_>],
+) -> Result<(), DedicatedBearerError> {
+    let mut node_load_count = 0usize;
+    let mut apn_load_count = 0usize;
+    let mut overload_count = 0usize;
+    for ie in ies {
+        match (ie.ie_type(), ie.instance) {
+            (IE_TYPE_LOAD_CONTROL_INFORMATION, 0) => {
+                node_load_count = node_load_count.saturating_add(1);
+            }
+            (IE_TYPE_LOAD_CONTROL_INFORMATION, 1) => {
+                apn_load_count = apn_load_count.saturating_add(1);
+            }
+            (IE_TYPE_OVERLOAD_CONTROL_INFORMATION, 0) => {
+                overload_count = overload_count.saturating_add(1);
+            }
+            (IE_TYPE_PGW_CHANGE_INFO, 0) => {}
+            (
+                IE_TYPE_LOAD_CONTROL_INFORMATION
+                | IE_TYPE_OVERLOAD_CONTROL_INFORMATION
+                | IE_TYPE_PGW_CHANGE_INFO,
+                _,
+            ) => {
+                return Err(DedicatedBearerError::message(
+                    DedicatedBearerErrorKind::WrongIeInstance,
+                ));
+            }
+            _ => {}
+        }
+    }
+    if node_load_count > 1 {
+        return Err(DedicatedBearerError::message(
+            DedicatedBearerErrorKind::DuplicateSingleton,
+        ));
+    }
+    if apn_load_count > MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES {
+        return Err(DedicatedBearerError::message(
+            DedicatedBearerErrorKind::TooManyPgwApnLoadControlInformation,
+        ));
+    }
+    if overload_count > MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES {
+        return Err(DedicatedBearerError::message(
+            DedicatedBearerErrorKind::TooManyPgwOverloadControlInformation,
+        ));
+    }
+    Ok(())
+}
+
 fn top_level_additional<'a>(ies: &[TypedIe<'a>], excluded_types: &[u8]) -> Vec<TypedIe<'a>> {
     ies.iter()
         .filter(|ie| !excluded_types.contains(&ie.ie_type()))
@@ -851,6 +1169,38 @@ const fn valid_create_bearer_context_cause(cause: CauseValue) -> bool {
     matches!(cause, CauseValue::RequestAccepted) || is_create_bearer_response_rejection(cause)
 }
 
+const fn is_update_bearer_response_rejection(cause: CauseValue) -> bool {
+    // TS 29.274 R18 clause 7.2.16 plus the common response causes above.
+    is_common_response_rejection(cause)
+        || matches!(
+            cause,
+            CauseValue::ContextNotFound
+                | CauseValue::SemanticErrorInTftOperation
+                | CauseValue::SyntacticErrorInTftOperation
+                | CauseValue::SemanticErrorsInPacketFilters
+                | CauseValue::SyntacticErrorsInPacketFilters
+                | CauseValue::DeniedInRat
+                | CauseValue::UeRefuses
+                | CauseValue::UnableToPageUe
+                | CauseValue::UeNotResponding
+                | CauseValue::UnableToPageUeDueToSuspension
+                | CauseValue::TemporarilyRejectedForMobilityProcedure
+                | CauseValue::RefusedDueToVplmnPolicy
+                | CauseValue::UeTemporarilyUnreachableDueToPowerSaving
+        )
+}
+
+const fn valid_update_bearer_message_cause(cause: CauseValue) -> bool {
+    matches!(
+        cause,
+        CauseValue::RequestAccepted | CauseValue::RequestAcceptedPartially
+    ) || is_update_bearer_response_rejection(cause)
+}
+
+const fn valid_update_bearer_context_cause(cause: CauseValue) -> bool {
+    matches!(cause, CauseValue::RequestAccepted) || is_update_bearer_response_rejection(cause)
+}
+
 const fn is_delete_bearer_response_rejection(cause: CauseValue) -> bool {
     // TS 29.274 R18 clause 7.2.10.2 plus the common response causes above.
     is_common_response_rejection(cause)
@@ -902,6 +1252,7 @@ fn project_create_bearer_request<'a>(
     view: &S2bProcedureMessage<'a>,
 ) -> Result<S2bCreateBearerRequest<'a>, DedicatedBearerError> {
     let teid = ensure_request_header(view, Procedure::CreateBearer)?;
+    validate_pgw_triggered_request_control_lists(&view.ies)?;
     let linked_ebi = nonzero_ebi(
         typed_ebi(
             single_ie(
@@ -955,6 +1306,26 @@ fn project_create_bearer_request<'a>(
                 ));
             }
         };
+        if tft.operation() != TftOperation::CreateNew {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::InvalidCreateBearerTftOperation,
+                index,
+            ));
+        }
+        let has_uplink_filter = tft.packet_filters().filters().is_some_and(|filters| {
+            filters.iter().any(|filter| {
+                matches!(
+                    filter.direction(),
+                    PacketFilterDirection::UplinkOnly | PacketFilterDirection::Bidirectional
+                )
+            })
+        });
+        if !has_uplink_filter {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::MissingCreateBearerUplinkFilter,
+                index,
+            ));
+        }
         let bearer_qos = match &single_ie(
             &context.members,
             IE_TYPE_BEARER_QOS,
@@ -1025,6 +1396,7 @@ fn project_create_bearer_request<'a>(
     Ok(S2bCreateBearerRequest {
         sequence_number: view.header.sequence_number,
         teid,
+        message_priority: view.header.message_priority(),
         linked_ebi,
         bearer_contexts: projected,
         additional_ies: top_level_additional(&view.ies, &[IE_TYPE_EBI, IE_TYPE_BEARER_CONTEXT]),
@@ -1207,6 +1579,238 @@ fn project_create_bearer_response<'a>(
     Ok(S2bCreateBearerResponse {
         sequence_number: view.header.sequence_number,
         teid,
+        message_priority: view.header.message_priority(),
+        cause: message_cause,
+        bearer_contexts: projected,
+        additional_ies: top_level_additional(&view.ies, &[IE_TYPE_CAUSE, IE_TYPE_BEARER_CONTEXT]),
+    })
+}
+
+fn project_update_bearer_request<'a>(
+    view: &S2bProcedureMessage<'a>,
+) -> Result<S2bUpdateBearerRequest<'a>, DedicatedBearerError> {
+    let teid = ensure_request_header(view, Procedure::UpdateSession)?;
+    validate_pgw_triggered_request_control_lists(&view.ies)?;
+    let apn_ambr = match &single_ie(
+        &view.ies,
+        IE_TYPE_AMBR,
+        0,
+        DedicatedBearerErrorKind::MissingApnAmbr,
+        None,
+    )?
+    .value
+    {
+        TypedIeValue::AggregateMaximumBitRate(ambr) => *ambr,
+        _ => {
+            return Err(DedicatedBearerError::message(
+                DedicatedBearerErrorKind::MissingApnAmbr,
+            ));
+        }
+    };
+    if view.ies.iter().any(|ie| {
+        matches!(
+            ie.ie_type(),
+            IE_TYPE_EBI | IE_TYPE_BEARER_TFT | IE_TYPE_BEARER_QOS | IE_TYPE_PCO | IE_TYPE_APCO
+        )
+    }) {
+        return Err(DedicatedBearerError::message(
+            DedicatedBearerErrorKind::WrongIeInstance,
+        ));
+    }
+
+    let contexts = bearer_contexts(&view.ies)?;
+    let has_multiple_contexts = contexts.len() > 1;
+    let mut projected = Vec::with_capacity(contexts.len());
+    let mut ebis = Vec::with_capacity(contexts.len());
+    for (index, context) in contexts.into_iter().enumerate() {
+        ensure_only_f_teid_instances(&context.members, &[], index)?;
+        if context.members.iter().any(|ie| {
+            matches!(
+                ie.ie_type(),
+                IE_TYPE_AMBR | IE_TYPE_BEARER_CONTEXT | IE_TYPE_CAUSE | IE_TYPE_PCO
+            )
+        }) {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::WrongIeInstance,
+                index,
+            ));
+        }
+        let ebi = nonzero_ebi(
+            typed_ebi(
+                single_ie(
+                    &context.members,
+                    IE_TYPE_EBI,
+                    0,
+                    DedicatedBearerErrorKind::MissingBearerEbi,
+                    Some(index),
+                )?,
+                Some(index),
+            )?,
+            Some(index),
+        )?;
+        if ebis.contains(&ebi) {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::DuplicateBearerCorrelation,
+                index,
+            ));
+        }
+        ebis.push(ebi);
+
+        let tft = optional_single_ie(&context.members, IE_TYPE_BEARER_TFT, 0, Some(index))?
+            .map(|ie| match &ie.value {
+                TypedIeValue::BearerTft(tft) => Ok(tft.clone()),
+                _ => Err(DedicatedBearerError::bearer(
+                    DedicatedBearerErrorKind::MissingBearerTft,
+                    index,
+                )),
+            })
+            .transpose()?;
+        let bearer_qos = optional_single_ie(&context.members, IE_TYPE_BEARER_QOS, 0, Some(index))?
+            .map(|ie| match &ie.value {
+                TypedIeValue::BearerQos(qos) => Ok(qos.clone()),
+                _ => Err(DedicatedBearerError::bearer(
+                    DedicatedBearerErrorKind::MissingBearerQos,
+                    index,
+                )),
+            })
+            .transpose()?;
+        let _apco = optional_single_ie(&context.members, IE_TYPE_APCO, 0, Some(index))?;
+        if has_multiple_contexts && tft.is_none() && bearer_qos.is_none() {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::MultipleUpdateContextsWithoutBearerModification,
+                index,
+            ));
+        }
+
+        projected.push(S2bUpdateBearerRequestContext {
+            ebi,
+            tft,
+            bearer_qos,
+            additional_ies: nested_additional(
+                &context.members,
+                &[IE_TYPE_EBI, IE_TYPE_BEARER_TFT, IE_TYPE_BEARER_QOS],
+            ),
+        });
+    }
+    Ok(S2bUpdateBearerRequest {
+        sequence_number: view.header.sequence_number,
+        teid,
+        message_priority: view.header.message_priority(),
+        apn_ambr,
+        bearer_contexts: projected,
+        additional_ies: top_level_additional(&view.ies, &[IE_TYPE_AMBR, IE_TYPE_BEARER_CONTEXT]),
+    })
+}
+
+fn project_update_bearer_response<'a>(
+    view: &S2bProcedureMessage<'a>,
+) -> Result<S2bUpdateBearerResponse<'a>, DedicatedBearerError> {
+    let teid = ensure_procedure(view, Procedure::UpdateSession, MessageDirection::Response)?;
+    let message_cause = typed_cause(
+        single_ie(
+            &view.ies,
+            IE_TYPE_CAUSE,
+            0,
+            DedicatedBearerErrorKind::MissingCause,
+            None,
+        )?,
+        None,
+    )?;
+    if !valid_update_bearer_message_cause(message_cause) {
+        return Err(DedicatedBearerError::message(
+            DedicatedBearerErrorKind::InvalidResponseCause,
+        ));
+    }
+    if message_cause.is_accepted() && teid == 0 {
+        return Err(DedicatedBearerError::message(
+            DedicatedBearerErrorKind::ZeroAcceptedResponseTeid,
+        ));
+    }
+    if view.ies.iter().any(|ie| {
+        matches!(
+            ie.ie_type(),
+            IE_TYPE_AMBR
+                | IE_TYPE_APCO
+                | IE_TYPE_BEARER_QOS
+                | IE_TYPE_BEARER_TFT
+                | IE_TYPE_EBI
+                | IE_TYPE_PCO
+        )
+    }) {
+        return Err(DedicatedBearerError::message(
+            DedicatedBearerErrorKind::WrongIeInstance,
+        ));
+    }
+
+    let contexts = bearer_contexts(&view.ies)?;
+    let mut projected = Vec::with_capacity(contexts.len());
+    let mut ebis = Vec::with_capacity(contexts.len());
+    for (index, context) in contexts.into_iter().enumerate() {
+        ensure_only_f_teid_instances(&context.members, &[], index)?;
+        if context.members.iter().any(|ie| {
+            matches!(
+                ie.ie_type(),
+                IE_TYPE_AMBR
+                    | IE_TYPE_APCO
+                    | IE_TYPE_BEARER_CONTEXT
+                    | IE_TYPE_BEARER_QOS
+                    | IE_TYPE_BEARER_TFT
+                    | IE_TYPE_PCO
+            )
+        }) {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::WrongIeInstance,
+                index,
+            ));
+        }
+        let ebi = nonzero_ebi(
+            typed_ebi(
+                single_ie(
+                    &context.members,
+                    IE_TYPE_EBI,
+                    0,
+                    DedicatedBearerErrorKind::MissingBearerEbi,
+                    Some(index),
+                )?,
+                Some(index),
+            )?,
+            Some(index),
+        )?;
+        if ebis.contains(&ebi) {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::DuplicateBearerCorrelation,
+                index,
+            ));
+        }
+        ebis.push(ebi);
+        let bearer_cause = typed_cause(
+            single_ie(
+                &context.members,
+                IE_TYPE_CAUSE,
+                0,
+                DedicatedBearerErrorKind::MissingCause,
+                Some(index),
+            )?,
+            Some(index),
+        )?;
+        if !valid_update_bearer_context_cause(bearer_cause) {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::InvalidResponseCause,
+                index,
+            ));
+        }
+        projected.push(S2bUpdateBearerResult {
+            ebi,
+            cause: bearer_cause,
+            additional_ies: nested_additional(&context.members, &[IE_TYPE_EBI, IE_TYPE_CAUSE]),
+        });
+    }
+    ensure_outcome_consistency(message_cause, projected.iter().map(|result| result.cause))?;
+
+    Ok(S2bUpdateBearerResponse {
+        sequence_number: view.header.sequence_number,
+        teid,
+        message_priority: view.header.message_priority(),
         cause: message_cause,
         bearer_contexts: projected,
         additional_ies: top_level_additional(&view.ies, &[IE_TYPE_CAUSE, IE_TYPE_BEARER_CONTEXT]),
@@ -1236,6 +1840,7 @@ fn project_delete_bearer_request<'a>(
     view: &S2bProcedureMessage<'a>,
 ) -> Result<S2bDeleteBearerRequest<'a>, DedicatedBearerError> {
     let teid = ensure_request_header(view, Procedure::DeleteBearer)?;
+    validate_pgw_triggered_request_control_lists(&view.ies)?;
     let mut linked = None;
     let mut dedicated = Vec::new();
     for ie in view.ies.iter().filter(|ie| ie.ie_type() == IE_TYPE_EBI) {
@@ -1296,6 +1901,7 @@ fn project_delete_bearer_request<'a>(
     Ok(S2bDeleteBearerRequest {
         sequence_number: view.header.sequence_number,
         teid,
+        message_priority: view.header.message_priority(),
         target,
         cause: request_cause,
         additional_ies: top_level_additional(&view.ies, &[IE_TYPE_EBI, IE_TYPE_CAUSE]),
@@ -1440,6 +2046,7 @@ fn project_delete_bearer_response<'a>(
     Ok(S2bDeleteBearerResponse {
         sequence_number: view.header.sequence_number,
         teid,
+        message_priority: view.header.message_priority(),
         cause: message_cause,
         body,
         additional_ies: top_level_additional(
@@ -1475,7 +2082,8 @@ pub fn s2b_create_bearer_request(
     }
     ies.extend(request.additional_ies);
     build_s2b_profile_message(
-        Header::with_teid(CREATE_BEARER_REQUEST, request.teid, request.sequence_number),
+        Header::with_teid(CREATE_BEARER_REQUEST, request.teid, request.sequence_number)
+            .with_optional_message_priority(request.message_priority),
         ies,
     )
 }
@@ -1532,7 +2140,77 @@ pub fn s2b_create_bearer_response(
             CREATE_BEARER_RESPONSE,
             response.teid,
             response.sequence_number,
-        ),
+        )
+        .with_optional_message_priority(response.message_priority),
+        ies,
+    )
+}
+
+/// Build and procedure-validate an S2b Update Bearer Request.
+///
+/// # Errors
+///
+/// Returns [`crate::s2b::S2bProfileBuildError`] when APN-AMBR, bearer
+/// cardinality, a nested TFT/QoS value, or another IE violates Tables
+/// 7.2.15-1 and 7.2.15-2.
+pub fn s2b_update_bearer_request(
+    request: S2bUpdateBearerRequest<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    let mut ies = vec![typed_ie(
+        0,
+        TypedIeValue::AggregateMaximumBitRate(request.apn_ambr),
+    )];
+    for context in request.bearer_contexts {
+        let mut members = vec![typed_ie(0, TypedIeValue::EpsBearerId(context.ebi))];
+        if let Some(tft) = context.tft {
+            members.push(typed_ie(0, TypedIeValue::BearerTft(tft)));
+        }
+        if let Some(bearer_qos) = context.bearer_qos {
+            members.push(typed_ie(0, TypedIeValue::BearerQos(bearer_qos)));
+        }
+        members.extend(context.additional_ies);
+        ies.push(typed_ie(
+            0,
+            TypedIeValue::BearerContext(BearerContext { members }),
+        ));
+    }
+    ies.extend(request.additional_ies);
+    build_s2b_profile_message(
+        Header::with_teid(UPDATE_BEARER_REQUEST, request.teid, request.sequence_number)
+            .with_optional_message_priority(request.message_priority),
+        ies,
+    )
+}
+
+/// Build and procedure-validate an S2b Update Bearer Response.
+///
+/// # Errors
+///
+/// Returns [`crate::s2b::S2bProfileBuildError`] when the message/bearer Cause
+/// hierarchy, EBI set, or another IE violates Tables 7.2.16-1 and 7.2.16-2.
+pub fn s2b_update_bearer_response(
+    response: S2bUpdateBearerResponse<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    let mut ies = vec![typed_ie(0, TypedIeValue::Cause(cause(response.cause)))];
+    for result in response.bearer_contexts {
+        let mut members = vec![
+            typed_ie(0, TypedIeValue::EpsBearerId(result.ebi)),
+            typed_ie(0, TypedIeValue::Cause(cause(result.cause))),
+        ];
+        members.extend(result.additional_ies);
+        ies.push(typed_ie(
+            0,
+            TypedIeValue::BearerContext(BearerContext { members }),
+        ));
+    }
+    ies.extend(response.additional_ies);
+    build_s2b_profile_message(
+        Header::with_teid(
+            UPDATE_BEARER_RESPONSE,
+            response.teid,
+            response.sequence_number,
+        )
+        .with_optional_message_priority(response.message_priority),
         ies,
     )
 }
@@ -1560,7 +2238,8 @@ pub fn s2b_delete_bearer_request(
     }
     ies.extend(request.additional_ies);
     build_s2b_profile_message(
-        Header::with_teid(DELETE_BEARER_REQUEST, request.teid, request.sequence_number),
+        Header::with_teid(DELETE_BEARER_REQUEST, request.teid, request.sequence_number)
+            .with_optional_message_priority(request.message_priority),
         ies,
     )
 }
@@ -1599,7 +2278,8 @@ pub fn s2b_delete_bearer_response(
             DELETE_BEARER_RESPONSE,
             response.teid,
             response.sequence_number,
-        ),
+        )
+        .with_optional_message_priority(response.message_priority),
         ies,
     )
 }
@@ -1658,6 +2338,65 @@ pub fn correlate_create_bearer_response(
     }
 }
 
+/// Correlate every Update Bearer result with one request context.
+///
+/// Correlation requires the same sequence number and exact EBI set. Message
+/// Priority is deliberately not a correlation key: TS 29.274 recommends
+/// copying it into a Triggered Reply but permits inter-PLMN policy to strip or
+/// change it.
+///
+/// # Errors
+///
+/// Returns a stable error for sequence, count, or EBI-set mismatches.
+pub fn correlate_update_bearer_response(
+    request: &S2bUpdateBearerRequest<'_>,
+    response: &S2bUpdateBearerResponse<'_>,
+) -> Result<(), DedicatedBearerError> {
+    if request.sequence_number != response.sequence_number {
+        return Err(DedicatedBearerError::message(
+            DedicatedBearerErrorKind::CorrelationMismatch,
+        ));
+    }
+    if request.bearer_contexts.len() != response.bearer_contexts.len() {
+        return Err(DedicatedBearerError::message(
+            DedicatedBearerErrorKind::CorrelationCountMismatch,
+        ));
+    }
+
+    let mut request_ebis = Vec::with_capacity(request.bearer_contexts.len());
+    for (index, context) in request.bearer_contexts.iter().enumerate() {
+        if request_ebis.contains(&context.ebi) {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::DuplicateBearerCorrelation,
+                index,
+            ));
+        }
+        request_ebis.push(context.ebi);
+    }
+
+    let mut response_ebis = Vec::with_capacity(response.bearer_contexts.len());
+    for (index, result) in response.bearer_contexts.iter().enumerate() {
+        if response_ebis.contains(&result.ebi) {
+            return Err(DedicatedBearerError::bearer(
+                DedicatedBearerErrorKind::DuplicateBearerCorrelation,
+                index,
+            ));
+        }
+        response_ebis.push(result.ebi);
+    }
+
+    if request_ebis
+        .iter()
+        .all(|request_ebi| response_ebis.contains(request_ebi))
+    {
+        return Ok(());
+    }
+
+    Err(DedicatedBearerError::message(
+        DedicatedBearerErrorKind::CorrelationMismatch,
+    ))
+}
+
 /// Correlate a Delete Bearer Response with the request target form.
 ///
 /// # Errors
@@ -1687,16 +2426,39 @@ pub fn correlate_delete_bearer_response(
                     DedicatedBearerErrorKind::CorrelationCountMismatch,
                 ));
             }
-            if request_ebis
-                .iter()
-                .all(|ebi| results.iter().any(|result| result.ebi == *ebi))
-            {
-                Ok(())
-            } else {
-                Err(DedicatedBearerError::message(
-                    DedicatedBearerErrorKind::CorrelationMismatch,
-                ))
+
+            let mut unique_request_ebis = Vec::with_capacity(request_ebis.len());
+            for (index, ebi) in request_ebis.iter().copied().enumerate() {
+                if unique_request_ebis.contains(&ebi) {
+                    return Err(DedicatedBearerError::bearer(
+                        DedicatedBearerErrorKind::DuplicateBearerCorrelation,
+                        index,
+                    ));
+                }
+                unique_request_ebis.push(ebi);
             }
+
+            let mut unique_response_ebis = Vec::with_capacity(results.len());
+            for (index, result) in results.iter().enumerate() {
+                if unique_response_ebis.contains(&result.ebi) {
+                    return Err(DedicatedBearerError::bearer(
+                        DedicatedBearerErrorKind::DuplicateBearerCorrelation,
+                        index,
+                    ));
+                }
+                unique_response_ebis.push(result.ebi);
+            }
+
+            if unique_request_ebis
+                .iter()
+                .all(|ebi| unique_response_ebis.contains(ebi))
+            {
+                return Ok(());
+            }
+
+            Err(DedicatedBearerError::message(
+                DedicatedBearerErrorKind::CorrelationMismatch,
+            ))
         }
         _ => Err(DedicatedBearerError::message(
             DedicatedBearerErrorKind::CorrelationMismatch,
@@ -1713,6 +2475,12 @@ pub(crate) fn validate_procedure_message(
         }
         (Procedure::CreateBearer, MessageDirection::Response) => {
             project_create_bearer_response(view).map(|_| ())
+        }
+        (Procedure::UpdateSession, MessageDirection::Request) => {
+            project_update_bearer_request(view).map(|_| ())
+        }
+        (Procedure::UpdateSession, MessageDirection::Response) => {
+            project_update_bearer_response(view).map(|_| ())
         }
         (Procedure::DeleteBearer, MessageDirection::Request) => {
             project_delete_bearer_request(view).map(|_| ())

@@ -81,6 +81,7 @@ name = "opc-proto-gtpv2c"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "opc-proto-tft",
  "opc-protocol",
 ]
 
@@ -92,6 +93,15 @@ dependencies = [
  "libfuzzer-sys",
  "opc-proto-gtpv2c",
  "opc-protocol",
+]
+
+[[package]]
+name = "opc-proto-tft"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-protocol",
+ "thiserror",
 ]
 
 [[package]]

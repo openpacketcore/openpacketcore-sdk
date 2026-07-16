@@ -1,7 +1,7 @@
 //! S2b-oriented GTPv2-C message views.
 //!
 //! The S2b surface in this crate is intentionally a typed subset: it decodes
-//! Echo plus Create/Modify/Delete/Update Session-oriented GTPv2-C messages,
+//! Echo plus Create/Modify/Delete Session and triggered bearer GTPv2-C messages,
 //! exposes mandatory S2b IE examples through typed values, and keeps
 //! unsupported IEs as raw-preserving fallbacks. It is not a full ePDG or PGW
 //! control-plane implementation.
@@ -19,6 +19,7 @@ use opc_protocol::{
 
 use crate::header::Header;
 pub use crate::header::MessageType;
+use crate::ie::typed::decode_pgw_triggered_request_ie_sequence;
 use crate::ie::{
     decode_typed_ie_sequence, encode_typed_ie_sequence, AccessPointName, BearerContext, Cause,
     CauseValue, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation, PdnType,
@@ -59,10 +60,10 @@ pub const CREATE_BEARER_REQUEST: u8 = 95;
 /// Create Bearer Response message type.
 pub const CREATE_BEARER_RESPONSE: u8 = 96;
 
-/// Update Bearer Request message type used by the S2b Update Session view.
+/// Update Bearer Request message type.
 pub const UPDATE_BEARER_REQUEST: u8 = 97;
 
-/// Update Bearer Response message type used by the S2b Update Session view.
+/// Update Bearer Response message type.
 pub const UPDATE_BEARER_RESPONSE: u8 = 98;
 
 /// Delete Bearer Request message type.
@@ -230,32 +231,6 @@ pub struct S2bDeleteSessionRequest<'a> {
 /// Input for building an S2b Production Profile v1 Delete Session Response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S2bDeleteSessionResponse<'a> {
-    /// GTPv2-C sequence number.
-    pub sequence_number: u32,
-    /// TEID carried in the response common header.
-    pub teid: u32,
-    /// Cause value.
-    pub cause: CauseValue,
-    /// Additional typed IEs to append after Cause.
-    pub additional_ies: Vec<TypedIe<'a>>,
-}
-
-/// Input for building an S2b Production Profile v1 Update Bearer Request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct S2bUpdateBearerRequest<'a> {
-    /// GTPv2-C sequence number.
-    pub sequence_number: u32,
-    /// TEID carried in the request common header.
-    pub teid: u32,
-    /// Bearer Context IE.
-    pub bearer_context: BearerContext<'a>,
-    /// Additional typed IEs to append after Bearer Context.
-    pub additional_ies: Vec<TypedIe<'a>>,
-}
-
-/// Input for building an S2b Production Profile v1 Update Bearer Response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct S2bUpdateBearerResponse<'a> {
     /// GTPv2-C sequence number.
     pub sequence_number: u32,
     /// TEID carried in the response common header.
@@ -439,42 +414,6 @@ pub fn s2b_delete_session_response(
 ) -> S2bProfileBuildResult<OwnedMessage> {
     build_cause_response(
         DELETE_SESSION_RESPONSE,
-        response.sequence_number,
-        response.teid,
-        response.cause,
-        response.additional_ies,
-    )
-}
-
-/// Build an S2b Production Profile v1 Update Bearer Request.
-///
-/// # Errors
-///
-/// Returns [`S2bProfileBuildError`] when Bearer Context cannot encode or the
-/// constructed request fails procedure-aware validation.
-pub fn s2b_update_bearer_request(
-    request: S2bUpdateBearerRequest<'_>,
-) -> S2bProfileBuildResult<OwnedMessage> {
-    build_bearer_context_request(
-        UPDATE_BEARER_REQUEST,
-        request.sequence_number,
-        request.teid,
-        request.bearer_context,
-        request.additional_ies,
-    )
-}
-
-/// Build an S2b Production Profile v1 Update Bearer Response.
-///
-/// # Errors
-///
-/// Returns [`S2bProfileBuildError`] when Cause cannot encode or the response
-/// fails procedure-aware validation.
-pub fn s2b_update_bearer_response(
-    response: S2bUpdateBearerResponse<'_>,
-) -> S2bProfileBuildResult<OwnedMessage> {
-    build_cause_response(
-        UPDATE_BEARER_RESPONSE,
         response.sequence_number,
         response.teid,
         response.cause,
@@ -2085,7 +2024,10 @@ pub enum Procedure {
     DeleteSession,
     /// PGW-triggered Create Bearer request/response exchange.
     CreateBearer,
-    /// Update Bearer request/response exchange, exposed as the S2b Update Session view.
+    /// Update Bearer request/response exchange.
+    ///
+    /// The `UpdateSession` variant name is retained for source compatibility;
+    /// the wire procedure is the PGW-triggered Update Bearer exchange.
     UpdateSession,
     /// PGW-triggered Delete Bearer request/response exchange.
     DeleteBearer,
@@ -2324,9 +2266,9 @@ pub enum S2bMessage<'a> {
     CreateBearerRequest(S2bProcedureMessage<'a>),
     /// PGW-triggered Create Bearer Response view.
     CreateBearerResponse(S2bProcedureMessage<'a>),
-    /// Update Bearer / S2b Update Session Request view.
+    /// Update Bearer Request view (legacy `UpdateSessionRequest` variant name).
     UpdateSessionRequest(S2bProcedureMessage<'a>),
-    /// Update Bearer / S2b Update Session Response view.
+    /// Update Bearer Response view (legacy `UpdateSessionResponse` variant name).
     UpdateSessionResponse(S2bProcedureMessage<'a>),
     /// PGW-triggered Delete Bearer Request view.
     DeleteBearerRequest(S2bProcedureMessage<'a>),
@@ -2408,7 +2350,14 @@ impl<'a> S2bMessage<'a> {
             // second occurrence of every known singleton.
             typed_ctx.duplicate_ie_policy = DuplicateIePolicy::Reject;
         }
-        let ies = decode_typed_ie_sequence(message.raw_ies, typed_ctx, 0)?;
+        let ies = if matches!(
+            message_type.as_u8(),
+            CREATE_BEARER_REQUEST | UPDATE_BEARER_REQUEST | DELETE_BEARER_REQUEST
+        ) {
+            decode_pgw_triggered_request_ie_sequence(message.raw_ies, typed_ctx)?
+        } else {
+            decode_typed_ie_sequence(message.raw_ies, typed_ctx, 0)?
+        };
         let view = S2bProcedureMessage {
             header: message.header,
             procedure,
@@ -2959,19 +2908,9 @@ fn validate_required_ies(
             IE_TYPE_CAUSE,
             "Delete Session Response requires Cause IE",
         ),
-        (Procedure::UpdateSession, MessageDirection::Request) => require_ie(
-            &view.ies,
-            IE_TYPE_BEARER_CONTEXT,
-            "Update Bearer Request requires Bearer Context IE",
-        ),
-        (Procedure::UpdateSession, MessageDirection::Response) => require_ie(
-            &view.ies,
-            IE_TYPE_CAUSE,
-            "Update Bearer Response requires Cause IE",
-        ),
-        (Procedure::CreateBearer, _) | (Procedure::DeleteBearer, _) => {
-            crate::dedicated_bearer::validate_procedure_message(view)
-        }
+        (Procedure::CreateBearer, _)
+        | (Procedure::UpdateSession, _)
+        | (Procedure::DeleteBearer, _) => crate::dedicated_bearer::validate_procedure_message(view),
     }
 }
 

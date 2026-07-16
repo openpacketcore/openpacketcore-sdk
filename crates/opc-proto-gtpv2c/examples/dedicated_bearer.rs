@@ -63,6 +63,7 @@ fn handle_create(
     let response = S2bCreateBearerResponse {
         sequence_number: request.sequence_number,
         teid: RESPONSE_TEID,
+        message_priority: request.message_priority,
         cause: CauseValue::RequestAccepted,
         bearer_contexts: vec![S2bCreateBearerResult::Accepted {
             ebi: EpsBearerId { value: 6 },
@@ -129,6 +130,7 @@ fn handle_delete(
     let response = S2bDeleteBearerResponse {
         sequence_number: request.sequence_number,
         teid: RESPONSE_TEID,
+        message_priority: request.message_priority,
         cause: CauseValue::RequestAcceptedPartially,
         body: S2bDeleteBearerResponseBody::Dedicated(vec![
             S2bDeleteBearerResult {

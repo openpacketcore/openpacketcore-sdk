@@ -7,7 +7,7 @@ S2b-focused GTPv2-C codec for OpenPacketCore.
 `opc-proto-gtpv2c` implements a bounded GTPv2-C subset for ePDG/PGW S2b work.
 It combines a raw-preserving common-header and TLIV IE layer with typed S2b IE
 and message views for Echo, session-oriented procedures, and the PGW-triggered
-Create Bearer and Delete Bearer procedures.
+Create Bearer, Update Bearer, and Delete Bearer procedures.
 
 It is not a complete GTPv2-C implementation and not an ePDG or PGW
 control-plane stack.
@@ -26,13 +26,29 @@ control-plane stack.
   shells and implement the shared `opc-protocol` codec traits.
 - `S2bMessage<'a>` and `S2bProcedureMessage<'a>` provide typed S2b views and
   raw fallback for unsupported message types.
-- `S2bCreateBearerRequest`, `S2bCreateBearerResponse`,
-  `S2bDeleteBearerRequest`, and `S2bDeleteBearerResponse` project the complete
-  S2b dedicated-bearer shapes claimed by this crate. Their builders enforce
-  mandatory/conditional IE instances, mutually exclusive delete forms, S2b-U
-  F-TEID roles, per-bearer Causes, and request/response correlation.
+- `S2bCreateBearerRequest`/`Response`, `S2bUpdateBearerRequest`/`Response`,
+  and `S2bDeleteBearerRequest`/`Response` project the complete S2b
+  dedicated-bearer shapes claimed by this crate. Their builders enforce
+  mandatory/conditional IE instances, APN-AMBR and per-bearer Update changes,
+  mutually exclusive Delete forms, S2b-U F-TEID roles, per-bearer Causes, and
+  exact request/response correlation.
 - Bearer TFT IE values use the canonical `opc-proto-tft`
-  `TrafficFlowTemplate`; GTPv2-C does not maintain a second TFT parser.
+  `TrafficFlowTemplate`; GTPv2-C does not maintain a second TFT parser. Create
+  Bearer additionally requires a Create-new TFT with at least one filter that
+  definitely applies to uplink traffic. Projected semantic failures expose
+  the applicable TS 29.274 Cause 74 or 76, while
+  `dedicated_bearer_decode_rejection_cause` classifies malformed TFT wire
+  values as Cause 75, 76, or 77 without exposing packet contents.
+- PGW-triggered requests preserve the standardized request-only Load Control
+  Information, Overload Control Information, and PGW Change Info IEs in wire
+  order. Their Release 18 cardinalities are bounded before typed projection;
+  responses retain strict singleton handling for these keys.
+- `BearerQos` exposes typed allocation/retention priority and resource-type
+  validation. GBR QCIs require a maximum rate in at least one direction and
+  enforce each guaranteed rate no greater than its same-direction maximum;
+  zero-rate directions remain representable. Standardized non-GBR QCIs require
+  zero GBR/MBR fields. Operator-specific QCIs require an explicit
+  caller-provided GBR/non-GBR classification.
 - `PcoRequest` and `PcoAddressConfiguration` provide a bounded TS 24.008 inner
   codec for IPv4/IPv6 DNS and P-CSCF containers while the outer PCO/APCO IE
   transport remains opaque and byte-preserving.
@@ -48,11 +64,14 @@ control-plane stack.
   transport-neutral state helpers; callers still own UDP, timers, persistence,
   and product policy.
 - `Gtpv2cTriggeredTransactions` provides a bounded, transport-neutral inbound
-  transaction boundary for Create Bearer and Delete Bearer. First observations
-  dispatch application work once, pending duplicates do not dispatch again,
-  and committed duplicates replay the exact retained response bytes. Every
-  observation requires the non-zero remote response TEID; response routing
-  correlation cannot be disabled.
+  transaction boundary for Create, Update, and Delete Bearer. First
+  observations dispatch generation-bound application work once, pending
+  duplicates do not dispatch again, and committed duplicates replay the exact
+  retained response bytes. A pending timeout becomes a retained
+  cancellation-required tombstone; the application must cancel or roll back
+  the identified generation and acknowledge it before that identity may
+  dispatch again. Every observation requires the non-zero remote response
+  TEID; response routing correlation cannot be disabled.
 
 ## Example
 
@@ -106,6 +125,28 @@ priority without MP. Canonical encode emits the typed value and zero spare
 bits; raw-preserving encode retains ignored/spare wire bits without changing
 the typed priority. Priority validation errors contain scheduling metadata
 only and never include payloads, subscriber identifiers, TEIDs, or addresses.
+For a Triggered Reply, TS 29.274 says the request priority should normally be
+copied. The typed response builders accept that conventional copy, while
+response correlation deliberately permits an explicit PLMN policy to strip or
+override priority. Exact retransmission replay always returns the byte-identical
+committed response.
+
+## Migration notes
+
+The former loose Update Bearer shell with a single `bearer_context` has been
+replaced by the strict dedicated-bearer API. Construct
+`S2bUpdateBearerRequest` with mandatory `apn_ambr` and one to fifteen
+`bearer_contexts`; each context identifies an EBI and may carry typed TFT and
+Bearer QoS changes. `S2bUpdateBearerResponse` now requires one correlated
+per-bearer result even when the whole message is rejected. The historical
+`Procedure::UpdateSession` and `S2bMessage::UpdateSession*` variant names remain
+as source-compatible names for wire message types 97/98; their strict typed
+projection is Update Bearer.
+
+Triggered transaction callers must retain the `Gtpv2cTriggeredWorkToken`
+returned by `Dispatch` and pass it to `commit_response`. If the registry
+returns `CancellationRequired`, cancel or roll back exactly that work
+generation and call `acknowledge_cancellation` before accepting redispatch.
 
 ## Relationships
 
@@ -123,9 +164,9 @@ approval, and the crate remains `publish = false`.
 Known limits include no full Release 18 GTPv2-C matrix, no independent-peer
 interoperability claim, and no product bearer-policy/dataplane state machine.
 The triggered transaction helper is in-memory and transport-neutral; callers
-own UDP I/O, persistence across process loss, and the monotonic clock. The PCO inner codec is
-limited to DNS/P-CSCF address projection and safely skips other well-formed
-containers.
+own UDP I/O, persistence across process loss, cancellation/rollback of timed-out
+application work, and the monotonic clock. The PCO inner codec is limited to
+DNS/P-CSCF address projection and safely skips other well-formed containers.
 
 ## Roadmap
 

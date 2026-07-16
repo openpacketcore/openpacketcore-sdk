@@ -4,13 +4,14 @@ use opc_proto_gtpv2c::{
     s2b_create_session_rejected_response, s2b_create_session_request, s2b_delete_session_request,
     s2b_delete_session_response, s2b_echo_request, s2b_echo_response, s2b_modify_bearer_request,
     s2b_modify_bearer_response, s2b_update_bearer_request, s2b_update_bearer_response,
-    AccessPointName, BearerContext, Cause, CauseValue, EpsBearerId, FullyQualifiedTeid,
-    MessageDirection, PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId, RatType, RatTypeValue,
-    Recovery, S2bCreateSessionAcceptedResponse, S2bCreateSessionRejectedResponse,
-    S2bCreateSessionRequest, S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage,
-    S2bModifyBearerRequest, S2bModifyBearerResponse, S2bProfileBuildError, S2bUpdateBearerRequest,
-    S2bUpdateBearerResponse, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits,
-    TypedIe, TypedIeValue, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    AccessPointName, AggregateMaximumBitRate, BearerContext, Cause, CauseValue, EpsBearerId,
+    FullyQualifiedTeid, MessageDirection, PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId,
+    RatType, RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse,
+    S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bDeleteSessionRequest,
+    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerRequest, S2bModifyBearerResponse,
+    S2bProfileBuildError, S2bUpdateBearerRequest, S2bUpdateBearerRequestContext,
+    S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode, SelectionModeValue,
+    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{DecodeContext, DecodeErrorCode, Encode, EncodeContext, ValidationLevel};
 
@@ -266,7 +267,17 @@ fn lifecycle_request_builders_roundtrip_without_raw_byte_assembly() {
     let update = s2b_update_bearer_request(S2bUpdateBearerRequest {
         sequence_number: 0x010208,
         teid: 0x0102_0304,
-        bearer_context: bearer_context(8),
+        message_priority: None,
+        apn_ambr: AggregateMaximumBitRate {
+            uplink: 64_000,
+            downlink: 128_000,
+        },
+        bearer_contexts: vec![S2bUpdateBearerRequestContext {
+            ebi: EpsBearerId { value: 8 },
+            tft: None,
+            bearer_qos: None,
+            additional_ies: Vec::new(),
+        }],
         additional_ies: Vec::new(),
     })
     .expect("update bearer request builds");
@@ -302,7 +313,13 @@ fn lifecycle_response_builders_roundtrip_without_raw_byte_assembly() {
     let update = s2b_update_bearer_response(S2bUpdateBearerResponse {
         sequence_number: 0x01020b,
         teid: 0x0102_0304,
+        message_priority: None,
         cause: CauseValue::RequestAccepted,
+        bearer_contexts: vec![S2bUpdateBearerResult {
+            ebi: EpsBearerId { value: 8 },
+            cause: CauseValue::RequestAccepted,
+            additional_ies: Vec::new(),
+        }],
         additional_ies: Vec::new(),
     })
     .expect("update bearer response builds");
@@ -316,7 +333,13 @@ fn lifecycle_response_builder_rejects_duplicate_cause() {
     let error = s2b_update_bearer_response(S2bUpdateBearerResponse {
         sequence_number: 0x01020c,
         teid: 0x0102_0304,
+        message_priority: None,
         cause: CauseValue::RequestAccepted,
+        bearer_contexts: vec![S2bUpdateBearerResult {
+            ebi: EpsBearerId { value: 8 },
+            cause: CauseValue::RequestAccepted,
+            additional_ies: Vec::new(),
+        }],
         additional_ies: vec![accepted_cause_ie()],
     })
     .expect_err("duplicate Cause is rejected");

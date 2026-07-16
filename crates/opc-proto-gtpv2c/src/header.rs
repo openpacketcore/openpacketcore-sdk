@@ -134,9 +134,9 @@ pub enum MessageType {
     CreateBearerRequest,
     /// Create Bearer Response (96).
     CreateBearerResponse,
-    /// Update Bearer Request (97), used by the S2b Update Session view.
+    /// Update Bearer Request (97).
     UpdateBearerRequest,
-    /// Update Bearer Response (98), used by the S2b Update Session view.
+    /// Update Bearer Response (98).
     UpdateBearerResponse,
     /// Delete Bearer Request (99).
     DeleteBearerRequest,

@@ -5,9 +5,12 @@
 //! bearer policy and side effects. A first request returns
 //! [`Gtpv2cTriggeredRequestDisposition::Dispatch`]. An exact retransmission
 //! while the application is working returns `Pending`, and one received after
-//! commit returns the exact committed response bytes for replay.
+//! commit returns the exact committed response bytes for replay. A pending
+//! timeout is retained as generation-bound `CancellationRequired` state until
+//! the application cancels or rolls back that exact work and acknowledges the
+//! cancellation; timeout alone never permits a second side-effect dispatch.
 //!
-//! @spec 3GPP TS29274 R18 7.2.3, 7.2.4, 7.2.9.2, 7.2.10.2
+//! @spec 3GPP TS29274 R18 7.2.3, 7.2.4, 7.2.9.2, 7.2.10.2, 7.2.15, 7.2.16
 
 use core::fmt;
 use std::collections::HashMap;
@@ -18,7 +21,10 @@ use opc_protocol::{DecodeContext, DuplicateIePolicy, ValidationLevel};
 use crate::header::{MessageType, MAX_SEQUENCE_NUMBER};
 use crate::ie::{CauseValue, TypedIeValue, IE_TYPE_CAUSE};
 use crate::s2b::{Gtpv2cPeerToken, MessageDirection, Procedure, S2bMessage, S2bProcedureMessage};
-use crate::{correlate_create_bearer_response, correlate_delete_bearer_response};
+use crate::{
+    correlate_create_bearer_response, correlate_delete_bearer_response,
+    correlate_update_bearer_response,
+};
 
 /// Caller-supplied monotonic time used by the triggered-transaction registry.
 ///
@@ -201,6 +207,29 @@ impl fmt::Debug for Gtpv2cTriggeredTransactionKey {
     }
 }
 
+/// Generation-bound ownership token for one application invocation.
+///
+/// A transaction key may be safely reused only after the previous owner has
+/// acknowledged cancellation. The generation prevents a late completion from
+/// an old owner from committing into a later redispatch of the same wire key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Gtpv2cTriggeredWorkToken {
+    /// Triggered transaction identity.
+    pub key: Gtpv2cTriggeredTransactionKey,
+    /// Registry-local, monotonically increasing ownership generation.
+    pub generation: u64,
+}
+
+impl fmt::Debug for Gtpv2cTriggeredWorkToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Gtpv2cTriggeredWorkToken")
+            .field("key", &self.key)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
 /// Application-declared outcome paired with encoded response bytes.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Gtpv2cTriggeredCompletion {
@@ -284,10 +313,16 @@ impl Gtpv2cTriggeredOutcome {
 /// Result of observing one decoded and validated triggered request.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Gtpv2cTriggeredRequestDisposition {
-    /// First observation; invoke application policy exactly once for this key.
-    Dispatch(Gtpv2cTriggeredTransactionKey),
+    /// First observation; invoke application policy at most once for this generation.
+    Dispatch(Gtpv2cTriggeredWorkToken),
     /// Exact retransmission while the first application invocation is pending.
-    Pending(Gtpv2cTriggeredTransactionKey),
+    Pending(Gtpv2cTriggeredWorkToken),
+    /// The invocation timed out and still owns the side-effect boundary.
+    ///
+    /// The application must cancel or roll back that exact generation, then
+    /// call [`Gtpv2cTriggeredTransactions::acknowledge_cancellation`] before a
+    /// retransmission can be dispatched safely.
+    CancellationRequired(Gtpv2cTriggeredWorkToken),
     /// Exact retransmission after commit; send these exact response bytes.
     Replay {
         /// Transaction identity.
@@ -302,6 +337,10 @@ impl fmt::Debug for Gtpv2cTriggeredRequestDisposition {
         match self {
             Self::Dispatch(key) => formatter.debug_tuple("Dispatch").field(key).finish(),
             Self::Pending(key) => formatter.debug_tuple("Pending").field(key).finish(),
+            Self::CancellationRequired(key) => formatter
+                .debug_tuple("CancellationRequired")
+                .field(key)
+                .finish(),
             Self::Replay { key, response } => formatter
                 .debug_struct("Replay")
                 .field("key", key)
@@ -314,8 +353,8 @@ impl fmt::Debug for Gtpv2cTriggeredRequestDisposition {
 /// Result of committing an application response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gtpv2cTriggeredCommit {
-    /// Committed transaction identity.
-    pub key: Gtpv2cTriggeredTransactionKey,
+    /// Generation-bound work that committed.
+    pub work: Gtpv2cTriggeredWorkToken,
     /// Validated application outcome.
     pub outcome: Gtpv2cTriggeredOutcome,
     /// Encoded response length retained for replay.
@@ -333,11 +372,14 @@ pub enum Gtpv2cTriggeredTransactionError {
     MalformedRequest,
     /// Bytes followed the declared request boundary.
     TrailingRequestBytes,
-    /// Request was not a PGW-triggered Create Bearer or Delete Bearer request.
+    /// Request was not a PGW-triggered Create, Update, or Delete Bearer request.
     UnsupportedRequest,
     /// Request header did not carry a TEID.
     MissingRequestTeid,
-    /// Registry capacity was reached after expired entries were removed.
+    /// Registry capacity was reached after expired replay entries were removed.
+    ///
+    /// Timed-out work awaiting cancellation acknowledgement deliberately
+    /// retains capacity so the registry fails closed instead of redispatching.
     CapacityExceeded,
     /// Same active identity was reused with different bytes or response routing.
     ConflictingRequest,
@@ -355,8 +397,14 @@ pub enum Gtpv2cTriggeredTransactionError {
     CompletionCauseMismatch,
     /// No pending transaction exists for this identity.
     TransactionNotFound,
-    /// Pending application deadline elapsed before commit.
-    TransactionExpired,
+    /// Pending application work timed out and requires cancellation.
+    WorkTimedOut,
+    /// A completion or cancellation acknowledgement used an old generation.
+    StaleGeneration,
+    /// Cancellation acknowledgement was attempted for non-timed-out work.
+    CancellationNotRequired,
+    /// The registry-local generation space was exhausted.
+    GenerationExhausted,
     /// A response was already committed and cannot be replaced.
     ResponseAlreadyCommitted,
 }
@@ -381,7 +429,10 @@ impl Gtpv2cTriggeredTransactionError {
             Self::ResponseMismatch => "gtpv2c_triggered_response_mismatch",
             Self::CompletionCauseMismatch => "gtpv2c_triggered_completion_cause_mismatch",
             Self::TransactionNotFound => "gtpv2c_triggered_transaction_not_found",
-            Self::TransactionExpired => "gtpv2c_triggered_transaction_expired",
+            Self::WorkTimedOut => "gtpv2c_triggered_work_timed_out",
+            Self::StaleGeneration => "gtpv2c_triggered_stale_generation",
+            Self::CancellationNotRequired => "gtpv2c_triggered_cancellation_not_required",
+            Self::GenerationExhausted => "gtpv2c_triggered_generation_exhausted",
             Self::ResponseAlreadyCommitted => "gtpv2c_triggered_response_already_committed",
         }
     }
@@ -398,6 +449,7 @@ impl std::error::Error for Gtpv2cTriggeredTransactionError {}
 #[derive(Clone)]
 enum TriggeredEntryState {
     Pending,
+    CancellationRequired,
     Committed {
         response: Bytes,
         outcome: Gtpv2cTriggeredOutcome,
@@ -408,6 +460,7 @@ impl fmt::Debug for TriggeredEntryState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pending => formatter.write_str("Pending"),
+            Self::CancellationRequired => formatter.write_str("CancellationRequired"),
             Self::Committed { response, outcome } => formatter
                 .debug_struct("Committed")
                 .field("response_len", &response.len())
@@ -421,6 +474,7 @@ impl fmt::Debug for TriggeredEntryState {
 struct TriggeredEntry {
     request: Bytes,
     expected_response_teid: u32,
+    generation: u64,
     expires_at: Gtpv2cMonotonicMillis,
     state: TriggeredEntryState,
 }
@@ -431,6 +485,7 @@ impl fmt::Debug for TriggeredEntry {
             .debug_struct("TriggeredEntry")
             .field("request_len", &self.request.len())
             .field("expected_response_teid_present", &true)
+            .field("generation", &self.generation)
             .field("expires_at", &self.expires_at)
             .field("state", &self.state)
             .finish()
@@ -441,6 +496,7 @@ impl fmt::Debug for TriggeredEntry {
 pub struct Gtpv2cTriggeredTransactions {
     policy: Gtpv2cTriggeredTransactionPolicy,
     entries: HashMap<Gtpv2cTriggeredTransactionKey, TriggeredEntry>,
+    next_generation: Option<u64>,
 }
 
 impl fmt::Debug for Gtpv2cTriggeredTransactions {
@@ -460,6 +516,7 @@ impl Gtpv2cTriggeredTransactions {
         Self {
             policy,
             entries: HashMap::new(),
+            next_generation: Some(1),
         }
     }
 
@@ -469,7 +526,7 @@ impl Gtpv2cTriggeredTransactions {
         self.policy
     }
 
-    /// Return the number of retained pending and committed transactions.
+    /// Return the number of retained pending, cancellation, and replay entries.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -481,17 +538,85 @@ impl Gtpv2cTriggeredTransactions {
         self.entries.is_empty()
     }
 
-    /// Remove expired pending work and replay entries.
+    /// Transition expired pending work and remove expired replay entries.
     ///
-    /// Returns the number of removed entries. Deadlines are fixed at initial
-    /// observation or commit; retransmissions do not prolong them.
+    /// Pending work becomes cancellation-required and remains retained until
+    /// its exact owner acknowledges rollback. This prevents timeout from
+    /// causing duplicate side effects. Returns the number of state transitions
+    /// plus removed replay entries. Deadlines are fixed at observation or
+    /// commit; retransmissions do not prolong them.
     pub fn cleanup_expired(&mut self, now: Gtpv2cMonotonicMillis) -> usize {
-        let before = self.entries.len();
-        self.entries.retain(|_, entry| now < entry.expires_at);
-        before.saturating_sub(self.entries.len())
+        let mut changed = 0usize;
+        self.entries.retain(|_, entry| {
+            if now < entry.expires_at {
+                return true;
+            }
+            match entry.state {
+                TriggeredEntryState::Pending => {
+                    entry.state = TriggeredEntryState::CancellationRequired;
+                    changed = changed.saturating_add(1);
+                    true
+                }
+                TriggeredEntryState::CancellationRequired => true,
+                TriggeredEntryState::Committed { .. } => {
+                    changed = changed.saturating_add(1);
+                    false
+                }
+            }
+        });
+        changed
     }
 
-    /// Observe one complete encoded Create Bearer or Delete Bearer request.
+    /// Iterate over timed-out work awaiting owner cancellation acknowledgement.
+    ///
+    /// The iterator borrows the registry and allocates no unbounded side list.
+    /// Owners must roll back the exact generation before acknowledging it.
+    pub fn cancellation_required(&self) -> impl Iterator<Item = Gtpv2cTriggeredWorkToken> + '_ {
+        self.entries.iter().filter_map(|(key, entry)| {
+            matches!(entry.state, TriggeredEntryState::CancellationRequired).then_some(
+                Gtpv2cTriggeredWorkToken {
+                    key: *key,
+                    generation: entry.generation,
+                },
+            )
+        })
+    }
+
+    /// Acknowledge that timed-out application work was cancelled or rolled back.
+    ///
+    /// After this succeeds, an exact retransmission may be dispatched with a
+    /// fresh generation. A late completion using the old token is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable error when the key is absent, the generation is stale,
+    /// or the work has not reached cancellation-required state.
+    pub fn acknowledge_cancellation(
+        &mut self,
+        work: Gtpv2cTriggeredWorkToken,
+    ) -> Result<(), Gtpv2cTriggeredTransactionError> {
+        let Some(entry) = self.entries.get(&work.key) else {
+            return Err(Gtpv2cTriggeredTransactionError::TransactionNotFound);
+        };
+        if entry.generation != work.generation {
+            return Err(Gtpv2cTriggeredTransactionError::StaleGeneration);
+        }
+        if !matches!(entry.state, TriggeredEntryState::CancellationRequired) {
+            return Err(Gtpv2cTriggeredTransactionError::CancellationNotRequired);
+        }
+        self.entries.remove(&work.key);
+        Ok(())
+    }
+
+    fn allocate_generation(&mut self) -> Result<u64, Gtpv2cTriggeredTransactionError> {
+        let generation = self
+            .next_generation
+            .ok_or(Gtpv2cTriggeredTransactionError::GenerationExhausted)?;
+        self.next_generation = generation.checked_add(1);
+        Ok(generation)
+    }
+
+    /// Observe one complete encoded Create, Update, or Delete Bearer request.
     ///
     /// `expected_response_teid` is the non-zero remote control-plane TEID that
     /// the eventual response must carry. The registry never disables response
@@ -528,7 +653,7 @@ impl Gtpv2cTriggeredTransactions {
         if view.direction != MessageDirection::Request
             || !matches!(
                 view.procedure,
-                Procedure::CreateBearer | Procedure::DeleteBearer
+                Procedure::CreateBearer | Procedure::UpdateSession | Procedure::DeleteBearer
             )
         {
             return Err(Gtpv2cTriggeredTransactionError::UnsupportedRequest);
@@ -551,8 +676,15 @@ impl Gtpv2cTriggeredTransactions {
             {
                 return Err(Gtpv2cTriggeredTransactionError::ConflictingRequest);
             }
+            let work = Gtpv2cTriggeredWorkToken {
+                key,
+                generation: existing.generation,
+            };
             return Ok(match &existing.state {
-                TriggeredEntryState::Pending => Gtpv2cTriggeredRequestDisposition::Pending(key),
+                TriggeredEntryState::Pending => Gtpv2cTriggeredRequestDisposition::Pending(work),
+                TriggeredEntryState::CancellationRequired => {
+                    Gtpv2cTriggeredRequestDisposition::CancellationRequired(work)
+                }
                 TriggeredEntryState::Committed { response, .. } => {
                     Gtpv2cTriggeredRequestDisposition::Replay {
                         key,
@@ -565,16 +697,20 @@ impl Gtpv2cTriggeredTransactions {
         if self.entries.len() >= self.policy.max_transactions {
             return Err(Gtpv2cTriggeredTransactionError::CapacityExceeded);
         }
+        let generation = self.allocate_generation()?;
         self.entries.insert(
             key,
             TriggeredEntry {
                 request: encoded_request,
                 expected_response_teid,
+                generation,
                 expires_at: now.deadline_after(self.policy.pending_timeout_millis),
                 state: TriggeredEntryState::Pending,
             },
         );
-        Ok(Gtpv2cTriggeredRequestDisposition::Dispatch(key))
+        Ok(Gtpv2cTriggeredRequestDisposition::Dispatch(
+            Gtpv2cTriggeredWorkToken { key, generation },
+        ))
     }
 
     /// Validate and commit an application response for exact replay.
@@ -584,12 +720,12 @@ impl Gtpv2cTriggeredTransactions {
     ///
     /// # Errors
     ///
-    /// Returns a stable error if the transaction is absent/expired/already
-    /// committed, the response is malformed or mismatched, or its Cause does
-    /// not match the explicitly declared completion.
+    /// Returns a stable error if the work token is absent, stale, timed out, or
+    /// already committed; the response is malformed or mismatched; or its
+    /// Cause does not match the explicitly declared completion.
     pub fn commit_response(
         &mut self,
-        key: Gtpv2cTriggeredTransactionKey,
+        work: Gtpv2cTriggeredWorkToken,
         completion: Gtpv2cTriggeredCompletion,
         now: Gtpv2cMonotonicMillis,
         ctx: DecodeContext,
@@ -599,15 +735,21 @@ impl Gtpv2cTriggeredTransactions {
             return Err(Gtpv2cTriggeredTransactionError::ResponseTooLarge);
         }
 
-        let Some(entry) = self.entries.get(&key) else {
+        let _changed = self.cleanup_expired(now);
+        let Some(entry) = self.entries.get(&work.key) else {
             return Err(Gtpv2cTriggeredTransactionError::TransactionNotFound);
         };
-        if now >= entry.expires_at {
-            self.entries.remove(&key);
-            return Err(Gtpv2cTriggeredTransactionError::TransactionExpired);
+        if entry.generation != work.generation {
+            return Err(Gtpv2cTriggeredTransactionError::StaleGeneration);
         }
-        if matches!(&entry.state, TriggeredEntryState::Committed { .. }) {
-            return Err(Gtpv2cTriggeredTransactionError::ResponseAlreadyCommitted);
+        match &entry.state {
+            TriggeredEntryState::Pending => {}
+            TriggeredEntryState::CancellationRequired => {
+                return Err(Gtpv2cTriggeredTransactionError::WorkTimedOut);
+            }
+            TriggeredEntryState::Committed { .. } => {
+                return Err(Gtpv2cTriggeredTransactionError::ResponseAlreadyCommitted);
+            }
         }
 
         let (tail, decoded) = S2bMessage::decode(completion.response(), procedure_context(ctx))
@@ -618,10 +760,10 @@ impl Gtpv2cTriggeredTransactions {
         let view = decoded
             .as_view()
             .ok_or(Gtpv2cTriggeredTransactionError::ResponseMismatch)?;
-        if !response_matches(key, entry.expected_response_teid, view) {
+        if !response_matches(work.key, entry.expected_response_teid, view) {
             return Err(Gtpv2cTriggeredTransactionError::ResponseMismatch);
         }
-        correlate_response_to_request(&entry.request, key, view, ctx)?;
+        correlate_response_to_request(&entry.request, work.key, view, ctx)?;
         let encoded_cause =
             message_cause(view).ok_or(Gtpv2cTriggeredTransactionError::MalformedResponse)?;
         if encoded_cause != declared_outcome.cause() {
@@ -630,16 +772,19 @@ impl Gtpv2cTriggeredTransactions {
 
         let response = completion.response().clone();
         let response_len = response.len();
-        let Some(entry) = self.entries.get_mut(&key) else {
+        let Some(entry) = self.entries.get_mut(&work.key) else {
             return Err(Gtpv2cTriggeredTransactionError::TransactionNotFound);
         };
+        if entry.generation != work.generation {
+            return Err(Gtpv2cTriggeredTransactionError::StaleGeneration);
+        }
         entry.expires_at = now.deadline_after(self.policy.replay_retention_millis);
         entry.state = TriggeredEntryState::Committed {
             response,
             outcome: declared_outcome,
         };
         Ok(Gtpv2cTriggeredCommit {
-            key,
+            work,
             outcome: declared_outcome,
             response_len,
         })
@@ -718,6 +863,16 @@ fn correlate_response_to_request(
             correlate_delete_bearer_response(&request, &response)
                 .map_err(|_| Gtpv2cTriggeredTransactionError::ResponseMismatch)
         }
+        Procedure::UpdateSession => {
+            let request = request
+                .update_bearer_request()
+                .map_err(|_| Gtpv2cTriggeredTransactionError::MalformedRequest)?;
+            let response = response
+                .update_bearer_response()
+                .map_err(|_| Gtpv2cTriggeredTransactionError::MalformedResponse)?;
+            correlate_update_bearer_response(&request, &response)
+                .map_err(|_| Gtpv2cTriggeredTransactionError::ResponseMismatch)
+        }
         _ => Err(Gtpv2cTriggeredTransactionError::UnsupportedRequest),
     }
 }
@@ -729,4 +884,27 @@ fn message_cause(view: &S2bProcedureMessage<'_>) -> Option<CauseValue> {
         }
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_allocator_fails_closed_at_u64_exhaustion() {
+        let mut transactions = Gtpv2cTriggeredTransactions {
+            next_generation: Some(u64::MAX),
+            ..Gtpv2cTriggeredTransactions::default()
+        };
+        assert_eq!(
+            transactions.allocate_generation(),
+            Ok(u64::MAX),
+            "the final unique generation remains usable"
+        );
+        assert_eq!(
+            transactions.allocate_generation(),
+            Err(Gtpv2cTriggeredTransactionError::GenerationExhausted),
+            "generation wrap must never create an ABA token"
+        );
+    }
 }

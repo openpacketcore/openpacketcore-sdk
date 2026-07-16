@@ -27,7 +27,7 @@ are used only to select the message type and mandatory-IE examples claimed by
 this crate; the fixtures are not a complete procedure matrix.
 
 Clause abbreviations used in the tables: IMSI §8.3.2, Cause §8.4, Recovery
-§8.5, APN §8.6, EBI §8.8, Indication §8.12, PCO §8.13, PAA §8.14, Bearer QoS
+§8.5, APN §8.6, APN-AMBR §8.7, EBI §8.8, Indication §8.12, PCO §8.13, PAA §8.14, Bearer QoS
 §8.15, RAT Type §8.17, Serving Network/PLMN §8.18, F-TEID §8.22, Bearer Context
 §8.28, Charging ID §8.29, PDN Type §8.34, Selection Mode §8.58, Bearer TFT
 §8.28 plus TS 24.008 §10.5.6.12, and APCO §8.104.
@@ -113,7 +113,7 @@ reviewable without a binary viewer.
 | 93..96 | `5d 00 27 00` | Bearer Context grouped IE TLIV header (§8.2, §8.28). |
 | 97..101 | `49 00 01 00 05` | Nested EBI TLIV/value: EPS Bearer ID 5 (§8.2, §8.8, §8.28). |
 | 102..105 | `50 00 16 00` | Nested Bearer QoS IE TLIV header (§8.2, §8.15, §8.28). |
-| 106..107 | `49 09` | Bearer QoS priority/flags and QCI 9 (§8.15). |
+| 106..107 | `49 01` | Bearer QoS ARP octet (PCI=1, PL=2, PVI=1, spare bits zero) and GBR QCI 1 (§8.15). |
 | 108..112 | `00 00 00 10 00` | Bearer QoS MBR uplink 4096 (§8.15). |
 | 113..117 | `00 00 00 20 00` | Bearer QoS MBR downlink 8192 (§8.15). |
 | 118..122 | `00 00 00 04 00` | Bearer QoS GBR uplink 1024 (§8.15). |
@@ -160,7 +160,7 @@ reviewable without a binary viewer.
 | 21..25 | `49 00 01 00 00` | Nested request EBI has the required value 0 (Table 7.2.3-2). |
 | 26..29 | `54 00 09 00` | Bearer TFT instance 0, value length 9 (§8.28). |
 | 30..38 | `21 31 0a 05 30 11 50 11 94` | TS 24.008 Create-new TFT: one bidirectional filter, precedence 10, UDP next-header 17, remote port 4500 (§10.5.6.12). |
-| 39..64 | `50 00 16 00 4f 01 00 00 0f 42 40 00 00 1e 84 80 00 00 07 d0 00 00 00 0b b8` | Bearer QoS instance 0: QCI 1 with bounded 40-bit MBR/GBR values (§8.15). |
+| 39..64 | `50 00 16 00 4d 01 00 00 0f 42 40 00 00 1e 84 80 00 00 07 d0 00 00 00 0b b8` | Bearer QoS instance 0: ARP PCI=1/PL=3/PVI=1 with spare bits zero, QCI 1, and bounded 40-bit integer-kbps MBR/GBR values (§8.15). |
 | 65..77 | `57 00 09 04 a1 10 00 00 01 c0 00 02 0b` | S2b-U PGW F-TEID instance 4, interface type 33, TEID `0x10000001`, IPv4 `192.0.2.11` (Table 7.2.3-2, §8.22). |
 | 78..85 | `5e 00 04 00 20 00 00 01` | Charging ID instance 0, required for S2b (Table 7.2.3-2, §8.29). |
 
@@ -246,11 +246,12 @@ reviewable without a binary viewer.
 | --- | --- | --- |
 | 0 | `48` | Common header flags: version 2, TEID present (§5.1). |
 | 1 | `61` | Message Type: Update Bearer Request in the common-header message-type field (§5.1). |
-| 2..3 | `00 11` | Length: TEID/sequence/spare (8) + Bearer Context IE (9), excluding first four octets (§5.1). |
+| 2..3 | `00 1d` | Length: TEID/sequence/spare (8) + APN-AMBR IE (12) + Bearer Context IE (9), excluding first four octets (§5.1, Table 7.2.15-1). |
 | 4..7 | `01 02 03 04` | Header TEID (§5.1). |
 | 8..11 | `00 10 07 00` | Sequence number `0x001007`, spare 0 (§5.1). |
-| 12..15 | `5d 00 05 00` | Bearer Context grouped IE TLIV header (§8.2, §8.28). |
-| 16..20 | `49 00 01 00 05` | Nested EBI TLIV/value: EPS Bearer ID 5 (§8.2, §8.8, §8.28). |
+| 12..23 | `48 00 08 00 00 00 fa 00 00 01 f4 00` | Mandatory APN-AMBR instance 0: uplink 64,000 kbps and downlink 128,000 kbps (§8.7, Table 7.2.15-1). |
+| 24..27 | `5d 00 05 00` | Bearer Context instance 0, value length 5 (Tables 7.2.15-1 and 7.2.15-2). |
+| 28..32 | `49 00 01 00 05` | Mandatory nested EBI instance 0: EPS Bearer ID 5 (§8.8, Table 7.2.15-2). |
 
 ### `update_bearer_response_cause.bin`
 
@@ -258,10 +259,13 @@ reviewable without a binary viewer.
 | --- | --- | --- |
 | 0 | `48` | Common header flags: version 2, TEID present (§5.1). |
 | 1 | `62` | Message Type: Update Bearer Response in the common-header message-type field (§5.1). |
-| 2..3 | `00 0e` | Length: TEID/sequence/spare (8) + Cause IE (6), excluding first four octets (§5.1). |
+| 2..3 | `00 1d` | Length: TEID/sequence/spare (8) + Cause IE (6) + Bearer Context IE (15), excluding first four octets (§5.1, Table 7.2.16-1). |
 | 4..7 | `01 02 03 04` | Header TEID (§5.1). |
 | 8..11 | `00 10 08 00` | Sequence number `0x001008`, spare 0 (§5.1). |
 | 12..17 | `02 00 02 00 10 00` | Cause IE TLIV/value: Request accepted, flags 0 (§8.2, §8.4). |
+| 18..21 | `5d 00 0b 00` | Mandatory response Bearer Context instance 0, value length 11 (Tables 7.2.16-1 and 7.2.16-2). |
+| 22..26 | `49 00 01 00 05` | Mandatory nested EBI instance 0: EPS Bearer ID 5 (§8.8, Table 7.2.16-2). |
+| 27..32 | `02 00 02 00 10 00` | Mandatory nested Cause instance 0: Request accepted (§8.4, Table 7.2.16-2). |
 
 ## `epdg-parity/` fixtures
 

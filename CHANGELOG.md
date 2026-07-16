@@ -19,12 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence. Transport wrappers and state-dependent bearer policy remain with
   the consuming GTPv2-C and IKEv2 procedure boundaries.
 - **S2b dedicated-bearer GTPv2-C — `opc-proto-gtpv2c`:** typed and
-  procedure-aware Create Bearer (95/96) and Delete Bearer (99/100) support now
-  validates mandatory nested IEs, canonical shared TFT values, S2b-U F-TEID
-  roles, mutually exclusive delete forms, partial results, and exact
-  request/response bearer correlation. A bounded transport-neutral triggered
-  transaction registry prevents duplicate application dispatch and replays
-  exact committed response bytes across retransmissions.
+  procedure-aware Create Bearer (95/96), Update Bearer (97/98), and Delete
+  Bearer (99/100) support now validates mandatory nested IEs, APN-AMBR,
+  canonical shared Create-new/uplink TFT semantics, typed Bearer QoS/ARP and
+  standardized QCI rate rules, S2b-U F-TEID roles, mutually exclusive Delete
+  forms, partial results, Message Priority propagation, exact request/response
+  bearer correlation, bounded ordered request-only Load/Overload/PGW Change
+  IEs, and precise TFT syntax/semantic rejection Causes. The bounded
+  transport-neutral triggered transaction registry uses generation-bound work
+  tokens, fences timed-out side effects until explicit cancellation
+  acknowledgement, prevents duplicate application dispatch, and replays exact
+  committed response bytes across retransmissions.
 - **3GPP dedicated-bearer IKEv2 primitives — `opc-proto-ikev2`:** typed TS
   24.302 R17 multiple-bearer QoS, TFT, modified-bearer, AMBR, and private-error
   Notify codecs now compose with strict opened-payload builders/views for new
