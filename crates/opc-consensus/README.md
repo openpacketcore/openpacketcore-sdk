@@ -41,10 +41,35 @@ commit authority.
 preflight through exactly one supervisor-owned Openraft check per node and at
 most 64 total callers across the active and waiting cohorts. Callers collected
 before dispatch may share that exact result; later callers await a subsequent
-check under their original deadlines.
-Once dispatched, caller cancellation or timeout cannot cancel the check or
-start an overlapping one. Openraft still supplies every quorum proof; this is
-not a cached lease or alternate authority.
+check under their original deadlines. Once dispatched, caller cancellation or
+timeout cannot cancel the check or start an overlapping one.
+
+`LinearizableReadBarrier` is the reusable local-snapshot gate over that
+supervisor. A successful `admit(deadline)` waits for the caller-supplied
+Openraft metrics watch to report `last_applied >= read_log_id.index` before it
+returns `LinearizableReadAdmit`. A deposed node receives the typed
+`LinearizableReadBarrierError::NotLeader`; lost quorum, a closed apply watch,
+or an expired deadline returns the typed fail-closed `Unavailable`. A consumer
+that obtains a barrier from a remote leader uses `wait_for_applied_index` on
+its own barrier before reading local state.
+
+The optional `LinearizableReadLease::Enabled` mode reuses a prior successful
+Openraft quorum proof only while Openraft still reports the same local leader
+and term. Its fixed maximum lifetime is derived from the smaller of the shared
+heartbeat interval and read-barrier deadline, remains below the minimum
+election timeout, and starts no later than dispatch of the proving round so
+delayed task scheduling cannot extend it. The default is `Disabled`, which
+retains a fresh coalesced quorum round for every barrier cohort; consumers
+cannot supply a lease duration.
+
+New leaders can use `open_leader(projection, deadline)` with a
+`LeaderReadProjection` implementation. The helper executes the barrier,
+drives the consumer-owned projection to Openraft's applied log ID, independently
+waits for the projection watch to match that exact ID, and rechecks the same
+leader term before returning `LeaderOpenAdmit`. Advertising the node as a read
+target is a consumer responsibility and must occur only after that success.
+Openraft still supplies every quorum, leadership, term, commit, and apply
+signal; these helpers are scheduling and gating, not a parallel authority.
 
 ## Interim source-build gate
 

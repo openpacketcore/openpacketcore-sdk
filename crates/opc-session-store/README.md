@@ -690,8 +690,12 @@ Slow consumers are evicted when the live channel fills, and closed or
 cancelled registrations are pruned without unbounded accumulation.
 
 `ConsensusSessionStore` completes a linearizable read barrier before the
-atomic local handoff, and only Openraft state-machine apply publishes live
-entries. Merely appending a local Openraft log record cannot make it visible.
+atomic local handoff using `opc-consensus::LinearizableReadBarrier` in its
+default full-round mode. The shared gate waits for the serving node's local
+Openraft apply after either a local or remote-leader fence; session-store adds
+only membership, recovery, and route adapters. Only Openraft state-machine
+apply publishes live entries. Merely appending a local Openraft log record
+cannot make it visible.
 Raw append/rebuild remains rejected beside that authority. The quarantined
 session-net client performs the dedicated watch handshake before returning a
 stream, so an initial typed rejection is returned exactly and is never

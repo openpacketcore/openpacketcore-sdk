@@ -6,6 +6,8 @@
 //! Consumers still own their deterministic state machine and durable storage,
 //! but must not implement alternate election, term, vote, replication, commit,
 //! membership, read-index, or snapshot-authority algorithms.
+//! [`LinearizableReadBarrier`] composes Openraft's read fence, local apply
+//! watch, optional fixed same-term lease, and leader-open projection gate.
 
 #![forbid(unsafe_code)]
 
@@ -33,9 +35,11 @@ pub use identity::{
     CONSENSUS_MEMBER_ID_MAX_BYTES, CONSENSUS_NODE_ID_MAX,
 };
 pub use linearizability::{
-    EnsureLinearizableOutcome, EnsureLinearizableSupervisor,
+    EnsureLinearizableOutcome, EnsureLinearizableSupervisor, LeaderOpenAdmit, LeaderReadProjection,
+    LinearizableReadAdmit, LinearizableReadBarrier, LinearizableReadBarrierError,
+    LinearizableReadLease, ReadProjectionRebuildError,
     DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY,
-    DURABLE_OPENRAFT_LINEARIZABILITY_WORKER_COUNT,
+    DURABLE_OPENRAFT_LINEARIZABILITY_WORKER_COUNT, DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE,
 };
 pub use profile::{
     durable_openraft_config, validate_durable_consensus_timing_profile,

@@ -324,6 +324,18 @@ mod tests {
             profile.server_handler_timeout(),
             Duration::from_millis(30_000)
         );
+        assert!(
+            crate::DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE
+                <= Duration::from_millis(DURABLE_OPENRAFT_PROFILE.heartbeat_interval_millis)
+        );
+        assert!(
+            crate::DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE
+                <= profile.rpc_timeout(ConsensusRpcFamily::ReadBarrier)
+        );
+        assert!(
+            crate::DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE
+                < Duration::from_millis(profile.election_timeout_min_millis)
+        );
         validate_durable_consensus_timing_profile(profile).expect("fixed timing profile");
     }
 
