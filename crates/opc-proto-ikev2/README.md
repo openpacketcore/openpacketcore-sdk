@@ -160,12 +160,14 @@ for APN-AMBR, including Extended APN-AMBR above 65,280 Mbps. See
 [`examples/dedicated_bearer_qos_mapping.rs`](examples/dedicated_bearer_qos_mapping.rs).
 
 The compact-code constructors remain available for lossless compatibility, but
-they are not a way around the production profile. Strict decoders, typed Notify
-builders, and `CREATE_CHILD_SA`/`INFORMATIONAL` builders revalidate standardized
-QCI resource shape, reserved code points (including network-to-UE base code 0),
-lower-tier saturation, maximum/guaranteed relationships, assigned external
-units, extension thresholds, and compact sentinels. Manually supplied canonical
-codes are accepted; malformed or non-canonical profiles fail closed before any
+they are not a way around the production profile. Strict decoders apply the TS
+24.301 receiver interpretation for APN-AMBR compact aliases and extended-unit
+aliases, then expose and re-encode their canonical equivalents. Reserved base
+code 0 and inconsistent profiles still fail closed. Typed Notify builders and
+`CREATE_CHILD_SA`/`INFORMATIONAL` builders accept manually supplied canonical
+values but reject raw aliases, QCI resource mismatches, lower-tier saturation
+errors, invalid maximum/guaranteed relationships, non-canonical units,
+extension-threshold misuse, and inconsistent compact sentinels before any
 payload bytes are returned.
 
 ## Example

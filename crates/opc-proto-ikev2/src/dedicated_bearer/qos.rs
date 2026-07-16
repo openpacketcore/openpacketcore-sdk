@@ -871,16 +871,10 @@ fn validate_extended_pair(
     threshold: u64,
     first_unit: u8,
 ) -> Result<[Option<u64>; 2], Ikev2DedicatedBearerError> {
+    let unit_kbps = validate_extended_unit(unit, left_field, first_unit)?;
     if left == 0 && right == 0 {
-        if unit.wire_value() != 0 {
-            return Err(Ikev2DedicatedBearerError::InvalidExtendedQosUnit {
-                field: left_field,
-                value: unit.wire_value(),
-            });
-        }
         return Ok([None, None]);
     }
-    let unit_kbps = validate_extended_unit(unit, left_field, first_unit)?;
     Ok([
         validate_extended_multiplier(left, left_field, threshold, unit_kbps)?,
         validate_extended_multiplier(right, right_field, threshold, unit_kbps)?,
@@ -894,16 +888,10 @@ fn validate_extended_direction_profile(
     threshold: u64,
     first_unit: u8,
 ) -> Result<Option<u64>, Ikev2DedicatedBearerError> {
+    let unit_kbps = validate_extended_unit(unit, field, first_unit)?;
     if multiplier == 0 {
-        if unit.wire_value() != 0 {
-            return Err(Ikev2DedicatedBearerError::InvalidExtendedQosUnit {
-                field,
-                value: unit.wire_value(),
-            });
-        }
         return Ok(None);
     }
-    let unit_kbps = validate_extended_unit(unit, field, first_unit)?;
     validate_extended_multiplier(multiplier, field, threshold, unit_kbps)
 }
 
@@ -1152,7 +1140,7 @@ fn encode_extended_pair(
 ) -> Result<EncodedExtendedPair, Ikev2QosMappingError> {
     if left <= threshold && right <= threshold {
         return Ok(EncodedExtendedPair {
-            unit: 0,
+            unit: first_unit,
             left_multiplier: 0,
             right_multiplier: 0,
             left_represented: None,
@@ -1206,7 +1194,7 @@ fn encode_extended_direction(
 ) -> Result<EncodedExtendedDirection, Ikev2QosMappingError> {
     if value <= threshold {
         return Ok(EncodedExtendedDirection {
-            unit: 0,
+            unit: first_unit,
             multiplier: 0,
             represented: None,
         });
@@ -1484,7 +1472,7 @@ mod tests {
         assert_eq!(extended.maximum_unit.wire_value(), 1);
         assert_eq!(extended.maximum_uplink, 50_001);
         assert_eq!(extended.maximum_downlink, 0);
-        assert_eq!(extended.guaranteed_unit.wire_value(), 0);
+        assert_eq!(extended.guaranteed_unit.wire_value(), 1);
         assert_eq!(extended.guaranteed_uplink, 0);
         assert_eq!(extended.guaranteed_downlink, 0);
         assert_eq!(
@@ -1553,7 +1541,7 @@ mod tests {
         };
         assert_eq!(extended.downlink_unit.wire_value(), 3);
         assert_eq!(extended.downlink, 16_321);
-        assert_eq!(extended.uplink_unit.wire_value(), 0);
+        assert_eq!(extended.uplink_unit.wire_value(), 3);
         assert_eq!(extended.uplink, 0);
         assert_eq!(above.represented_rates().downlink, 65_284_000);
         assert_eq!(
@@ -1730,7 +1718,7 @@ mod tests {
             maximum_unit: Ikev2ExtendedBitRateUnit::new(1),
             maximum_uplink: 1,
             maximum_downlink: 0,
-            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(0),
+            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(1),
             guaranteed_uplink: 0,
             guaranteed_downlink: 0,
         };
@@ -1744,10 +1732,10 @@ mod tests {
         );
 
         let no_rates = Ikev2ExtendedEpsQos {
-            maximum_unit: Ikev2ExtendedBitRateUnit::new(0),
+            maximum_unit: Ikev2ExtendedBitRateUnit::new(1),
             maximum_uplink: 0,
             maximum_downlink: 0,
-            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(0),
+            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(1),
             guaranteed_uplink: 0,
             guaranteed_downlink: 0,
         };
@@ -1771,7 +1759,7 @@ mod tests {
             maximum_unit: Ikev2ExtendedBitRateUnit::new(7),
             maximum_uplink: 11,
             maximum_downlink: 0,
-            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(0),
+            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(1),
             guaranteed_uplink: 0,
             guaranteed_downlink: 0,
         };
@@ -1784,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_apn_profile_rejects_aliases_tiers_and_external_mismatch() {
+    fn strict_apn_outbound_profile_rejects_aliases_tiers_and_external_mismatch() {
         let must_apn =
             |base, extended, extended_2| must_codec(Ikev2ApnAmbr::new(base, extended, extended_2));
         let pair = |downlink, uplink| Ikev2ApnAmbrRateCodes { downlink, uplink };
@@ -1822,7 +1810,7 @@ mod tests {
         let invalid_external_unit = Ikev2ExtendedApnAmbr {
             downlink_unit: Ikev2ExtendedBitRateUnit::new(2),
             downlink: u16::MAX,
-            uplink_unit: Ikev2ExtendedBitRateUnit::new(0),
+            uplink_unit: Ikev2ExtendedBitRateUnit::new(3),
             uplink: 0,
         };
         assert_eq!(
@@ -1834,9 +1822,9 @@ mod tests {
         );
 
         let no_external_rates = Ikev2ExtendedApnAmbr {
-            downlink_unit: Ikev2ExtendedBitRateUnit::new(0),
+            downlink_unit: Ikev2ExtendedBitRateUnit::new(3),
             downlink: 0,
-            uplink_unit: Ikev2ExtendedBitRateUnit::new(0),
+            uplink_unit: Ikev2ExtendedBitRateUnit::new(3),
             uplink: 0,
         };
         assert_eq!(
@@ -1848,7 +1836,7 @@ mod tests {
         let external = Ikev2ExtendedApnAmbr {
             downlink_unit: Ikev2ExtendedBitRateUnit::new(7),
             downlink: 66,
-            uplink_unit: Ikev2ExtendedBitRateUnit::new(0),
+            uplink_unit: Ikev2ExtendedBitRateUnit::new(3),
             uplink: 0,
         };
         assert_eq!(

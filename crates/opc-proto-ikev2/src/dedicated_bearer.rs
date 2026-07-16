@@ -278,8 +278,8 @@ impl Ikev2EpsQos {
 /// Unit code used by TS 24.301 extended bit-rate values.
 ///
 /// Codes beyond the explicitly assigned Release 17 range can be retained in a
-/// raw value. Strict decode and production builders require canonical assigned
-/// network-to-UE units.
+/// raw value. Strict decode applies the specified receiver interpretation and
+/// stores the canonical assigned unit; production builders reject raw aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ikev2ExtendedBitRateUnit(u8);
 
@@ -292,6 +292,16 @@ impl Ikev2ExtendedBitRateUnit {
     /// Return the one-octet wire code.
     pub const fn wire_value(self) -> u8 {
         self.0
+    }
+
+    const fn canonicalize_received(self, first_assigned: u8) -> Self {
+        if self.0 < first_assigned {
+            Self(first_assigned)
+        } else if self.0 > 21 {
+            Self(21)
+        } else {
+            self
+        }
     }
 }
 
@@ -317,8 +327,11 @@ impl Ikev2ExtendedEpsQos {
     ///
     /// # Errors
     ///
+    /// Receiver aliases for the unit octets are normalized to their assigned
+    /// equivalents: zero becomes one and values above 21 become 21.
+    ///
     /// Returns [`Ikev2DedicatedBearerError`] when the value is not ten octets
-    /// or does not carry a canonical rate above 10 Gbps.
+    /// or does not carry a rate above 10 Gbps.
     pub fn decode_value(value: &[u8]) -> Result<Self, Ikev2DedicatedBearerError> {
         if value.len() != EXTENDED_EPS_QOS_LEN {
             return Err(Ikev2DedicatedBearerError::InvalidExtendedEpsQosLength {
@@ -326,10 +339,10 @@ impl Ikev2ExtendedEpsQos {
             });
         }
         let decoded = Self {
-            maximum_unit: Ikev2ExtendedBitRateUnit::new(value[0]),
+            maximum_unit: Ikev2ExtendedBitRateUnit::new(value[0]).canonicalize_received(1),
             maximum_uplink: u16::from_be_bytes([value[1], value[2]]),
             maximum_downlink: u16::from_be_bytes([value[3], value[4]]),
-            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(value[5]),
+            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(value[5]).canonicalize_received(1),
             guaranteed_uplink: u16::from_be_bytes([value[6], value[7]]),
             guaranteed_downlink: u16::from_be_bytes([value[8], value[9]]),
         };
@@ -370,6 +383,30 @@ pub struct Ikev2ApnAmbrRateCodes {
     pub uplink: u8,
 }
 
+impl Ikev2ApnAmbrRateCodes {
+    const fn canonicalize_received_extended(self) -> Self {
+        Self {
+            downlink: if self.downlink > 250 {
+                250
+            } else {
+                self.downlink
+            },
+            uplink: if self.uplink > 250 { 250 } else { self.uplink },
+        }
+    }
+
+    const fn canonicalize_received_extended_2(self) -> Self {
+        Self {
+            downlink: if self.downlink == 255 {
+                0
+            } else {
+                self.downlink
+            },
+            uplink: if self.uplink == 255 { 0 } else { self.uplink },
+        }
+    }
+}
+
 /// Typed TS 24.301 APN aggregate maximum bit-rate value part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ikev2ApnAmbr {
@@ -407,10 +444,13 @@ impl Ikev2ApnAmbr {
 
     /// Decode a TS 24.301 APN-AMBR value part.
     ///
+    /// Extended codes 251 through 255 are normalized to 250 and extended-2
+    /// code 255 is normalized to zero, as required for receiver interpretation.
+    ///
     /// # Errors
     ///
     /// Returns [`Ikev2DedicatedBearerError`] for an invalid length, reserved
-    /// compact code, or non-canonical tier relationship.
+    /// base code, or invalid tier relationship.
     pub fn decode_value(value: &[u8]) -> Result<Self, Ikev2DedicatedBearerError> {
         if !APN_AMBR_LENGTHS.contains(&value.len()) {
             return Err(Ikev2DedicatedBearerError::InvalidApnAmbrLength {
@@ -423,8 +463,8 @@ impl Ikev2ApnAmbr {
         };
         let decoded = Self::new(
             pair(0),
-            (value.len() >= 4).then(|| pair(2)),
-            (value.len() == 6).then(|| pair(4)),
+            (value.len() >= 4).then(|| pair(2).canonicalize_received_extended()),
+            (value.len() == 6).then(|| pair(4).canonicalize_received_extended_2()),
         )?;
         qos::validate_apn_ambr_wire_profile(decoded)?;
         Ok(decoded)
@@ -486,8 +526,11 @@ impl Ikev2ExtendedApnAmbr {
     ///
     /// # Errors
     ///
+    /// Receiver unit aliases zero through two are normalized to three and
+    /// values above 21 are normalized to 21.
+    ///
     /// Returns [`Ikev2DedicatedBearerError`] when the value is not six octets
-    /// or does not carry a canonical rate above 65,280 Mbps.
+    /// or does not carry a rate above 65,280 Mbps.
     pub fn decode_value(value: &[u8]) -> Result<Self, Ikev2DedicatedBearerError> {
         if value.len() != EXTENDED_APN_AMBR_LEN {
             return Err(Ikev2DedicatedBearerError::InvalidExtendedApnAmbrLength {
@@ -495,9 +538,9 @@ impl Ikev2ExtendedApnAmbr {
             });
         }
         let decoded = Self {
-            downlink_unit: Ikev2ExtendedBitRateUnit::new(value[0]),
+            downlink_unit: Ikev2ExtendedBitRateUnit::new(value[0]).canonicalize_received(3),
             downlink: u16::from_be_bytes([value[1], value[2]]),
-            uplink_unit: Ikev2ExtendedBitRateUnit::new(value[3]),
+            uplink_unit: Ikev2ExtendedBitRateUnit::new(value[3]).canonicalize_received(3),
             uplink: u16::from_be_bytes([value[4], value[5]]),
         };
         qos::validate_extended_apn_ambr_wire_profile(decoded)?;

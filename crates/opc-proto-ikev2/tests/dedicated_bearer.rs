@@ -510,6 +510,150 @@ fn strict_network_profile_rejects_reserved_rate_codes_on_decode_and_encode() {
 }
 
 #[test]
+fn receive_rate_aliases_normalize_before_canonical_encode_and_build() {
+    for alias in 251_u8..=255 {
+        let decoded = must_ok(Ikev2ApnAmbr::decode_value(&[
+            254, 254, alias, alias, 255, 1,
+        ]));
+        assert_eq!(
+            decoded.extended(),
+            Some(Ikev2ApnAmbrRateCodes {
+                downlink: 250,
+                uplink: 250,
+            })
+        );
+        assert_eq!(
+            decoded.extended_2(),
+            Some(Ikev2ApnAmbrRateCodes {
+                downlink: 0,
+                uplink: 1,
+            })
+        );
+        assert_eq!(decoded.encode_value(), [254, 254, 250, 250, 0, 1]);
+        let body = must_ok(build_ikev2_dedicated_bearer_notify(
+            &Ikev2DedicatedBearerNotify::ApnAmbr(decoded),
+        ))
+        .body;
+        assert_eq!(&body[4..], &[6, 254, 254, 250, 250, 0, 1]);
+    }
+
+    let extended_eps = must_ok(Ikev2ExtendedEpsQos::decode_value(&[
+        0, 0xc3, 0x51, 0, 0, 22, 0, 0, 0, 0,
+    ]));
+    assert_eq!(extended_eps.maximum_unit.wire_value(), 1);
+    assert_eq!(extended_eps.guaranteed_unit.wire_value(), 21);
+    assert_eq!(
+        extended_eps.encode_value(),
+        [1, 0xc3, 0x51, 0, 0, 21, 0, 0, 0, 0]
+    );
+    let body = must_ok(build_ikev2_dedicated_bearer_notify(
+        &Ikev2DedicatedBearerNotify::ExtendedEpsQos(extended_eps),
+    ))
+    .body;
+    assert_eq!(&body[4..], &[10, 1, 0xc3, 0x51, 0, 0, 21, 0, 0, 0, 0]);
+
+    for alias in 0_u8..=2 {
+        let extended_apn = must_ok(Ikev2ExtendedApnAmbr::decode_value(&[
+            alias, 0x3f, 0xc1, 22, 0, 1,
+        ]));
+        assert_eq!(extended_apn.downlink_unit.wire_value(), 3);
+        assert_eq!(extended_apn.uplink_unit.wire_value(), 21);
+        assert_eq!(extended_apn.encode_value(), [3, 0x3f, 0xc1, 21, 0, 1]);
+        let body = must_ok(build_ikev2_dedicated_bearer_notify(
+            &Ikev2DedicatedBearerNotify::ExtendedApnAmbr(extended_apn),
+        ))
+        .body;
+        assert_eq!(&body[4..], &[6, 3, 0x3f, 0xc1, 21, 0, 1]);
+    }
+}
+
+#[test]
+fn production_notify_builders_reject_raw_receive_aliases() {
+    for alias in 251_u8..=255 {
+        let raw = must_ok(Ikev2ApnAmbr::new(
+            Ikev2ApnAmbrRateCodes {
+                downlink: 254,
+                uplink: 254,
+            },
+            Some(Ikev2ApnAmbrRateCodes {
+                downlink: alias,
+                uplink: 250,
+            }),
+            None,
+        ));
+        assert!(matches!(
+            build_ikev2_dedicated_bearer_notify(&Ikev2DedicatedBearerNotify::ApnAmbr(raw)),
+            Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field: Ikev2QosRateField::ApnAmbrDownlink,
+                tier: Ikev2QosRateCodeTier::Extended,
+                value,
+            }) if value == alias
+        ));
+    }
+
+    let raw_extended_2 = must_ok(Ikev2ApnAmbr::new(
+        Ikev2ApnAmbrRateCodes {
+            downlink: 254,
+            uplink: 254,
+        },
+        Some(Ikev2ApnAmbrRateCodes {
+            downlink: 250,
+            uplink: 250,
+        }),
+        Some(Ikev2ApnAmbrRateCodes {
+            downlink: 255,
+            uplink: 0,
+        }),
+    ));
+    assert!(matches!(
+        build_ikev2_dedicated_bearer_notify(&Ikev2DedicatedBearerNotify::ApnAmbr(raw_extended_2)),
+        Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+            field: Ikev2QosRateField::ApnAmbrDownlink,
+            tier: Ikev2QosRateCodeTier::Extended2,
+            value: 255,
+        })
+    ));
+
+    for alias in [0_u8, 22, 255] {
+        let raw = Ikev2ExtendedEpsQos {
+            maximum_unit: Ikev2ExtendedBitRateUnit::new(alias),
+            maximum_uplink: 50_001,
+            maximum_downlink: 0,
+            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(1),
+            guaranteed_uplink: 0,
+            guaranteed_downlink: 0,
+        };
+        assert!(matches!(
+            build_ikev2_dedicated_bearer_notify(
+                &Ikev2DedicatedBearerNotify::ExtendedEpsQos(raw),
+            ),
+            Err(Ikev2DedicatedBearerError::InvalidExtendedQosUnit {
+                field: Ikev2QosRateField::MaximumUplink,
+                value,
+            }) if value == alias
+        ));
+    }
+
+    for alias in [0_u8, 1, 2, 22, 255] {
+        let raw = Ikev2ExtendedApnAmbr {
+            downlink_unit: Ikev2ExtendedBitRateUnit::new(alias),
+            downlink: 16_321,
+            uplink_unit: Ikev2ExtendedBitRateUnit::new(3),
+            uplink: 0,
+        };
+        assert!(matches!(
+            build_ikev2_dedicated_bearer_notify(
+                &Ikev2DedicatedBearerNotify::ExtendedApnAmbr(raw),
+            ),
+            Err(Ikev2DedicatedBearerError::InvalidExtendedQosUnit {
+                field: Ikev2QosRateField::ApnAmbrDownlink,
+                value,
+            }) if value == alias
+        ));
+    }
+}
+
+#[test]
 fn production_builders_revalidate_manual_qos_resource_tiers_and_external_sentinels() {
     let mut request = create_request_build();
     request.eps_qos = must_ok(Ikev2EpsQos::new(1, None, None, None));
@@ -557,10 +701,10 @@ fn production_builders_revalidate_manual_qos_resource_tiers_and_external_sentine
     ));
 
     let empty_extended = Ikev2ExtendedEpsQos {
-        maximum_unit: Ikev2ExtendedBitRateUnit::new(0),
+        maximum_unit: Ikev2ExtendedBitRateUnit::new(1),
         maximum_uplink: 0,
         maximum_downlink: 0,
-        guaranteed_unit: Ikev2ExtendedBitRateUnit::new(0),
+        guaranteed_unit: Ikev2ExtendedBitRateUnit::new(1),
         guaranteed_uplink: 0,
         guaranteed_downlink: 0,
     };

@@ -42,12 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact error/success separation. A checked integer-kbps bridge maps typed
   GBR/non-GBR bearer QoS and APN-AMBR onto the complete TS 24.301 normal and
   extended rate grids with explicit exact/ceiling quantization and reports the
-  values represented on the wire. Strict decoding and every production
-  Notify/exchange builder also revalidate manually supplied compact codes,
-  rejecting reserved network values, QCI/resource mismatches, invalid tier
-  saturation, GBR ordering, and inconsistent external-rate sentinels before
-  encoding. Admission, SPI allocation, retransmission timers, cryptographic
-  sealing, and dataplane installation remain with the product.
+  values represented on the wire. Strict decoding applies the TS 24.301
+  receiver interpretation for compact-rate and extended-unit aliases and
+  stores their canonical equivalents. Every production Notify/exchange builder
+  rejects those aliases when supplied manually, along with reserved network
+  values, QCI/resource mismatches, invalid tier saturation, GBR ordering, and
+  inconsistent external-rate sentinels. Admission, SPI allocation,
+  retransmission timers, cryptographic sealing, and dataplane installation
+  remain with the product.
 - `opc-proto-gtpv2c`: TEID-present EPC headers now expose the TS 29.274 R18
   Message Priority flag and a bounded `MessagePriority` value (`0` highest,
   `15` lowest). Strict decode accepts valid MP-bearing headers while rejecting
