@@ -71,3 +71,14 @@ projected-Secret update behavior, DNS behavior, storage class durability,
 NetworkPolicy enforcement, alert firing/clearing, and three/five-node fault and
 rotation schedules. The current qualification node still uses its documented
 `MemoryKeyProvider` wrapper, so this manifest is not remote-HKMS evidence.
+
+A controller retaining a candidate run must emit the closed
+`qualification/v4/session-ha-candidate-manifest.schema.json` contract. It must
+digest-bind the exact profile, source revision, release binary and OCI image,
+feature/configuration/environment inventories, fault and workload schedules,
+bounded diagnostic/resource manifests, v1 sequential history and checker
+output, and v3 concurrent evidence/history and checker output from the same
+campaign. The renderer alone satisfies none of the eight v4 acceptance gates;
+each remains `unproven` unless separately collected candidate evidence is
+bound. Even a complete candidate manifest remains explicitly experimental and
+cannot count as production qualification.

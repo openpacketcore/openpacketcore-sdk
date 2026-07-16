@@ -1,0 +1,270 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-candidate-manifest/v4",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "experimental",
+    "qualification_complete",
+    "counts_for_production",
+    "source_revision",
+    "source_tree_status",
+    "profile",
+    "artifact",
+    "campaign",
+    "bindings",
+    "sequential",
+    "concurrent",
+    "acceptance"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-candidate-manifest/v4" },
+    "profile_id": { "const": "opc-session-openraft-ha/v4-candidate" },
+    "experimental": { "const": true },
+    "qualification_complete": { "const": false },
+    "counts_for_production": { "const": false },
+    "source_revision": { "$ref": "#/$defs/revision" },
+    "source_tree_status": { "enum": ["clean", "dirty_unqualified"] },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "sha256"],
+      "properties": {
+        "schema_version": { "const": "opc-session-ha-profile/v4-candidate" },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "binary_sha256",
+        "container_image_sha256",
+        "feature_inventory_sha256",
+        "cargo_profile",
+        "exact_release_artifact",
+        "foundation_insecure_enabled",
+        "legacy_session_net_compat_enabled"
+      ],
+      "properties": {
+        "name": { "const": "opc-session-quorum-node" },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[0-9A-Za-z.+_-]+$"
+        },
+        "binary_sha256": { "$ref": "#/$defs/digest" },
+        "container_image_sha256": {
+          "oneOf": [
+            { "const": null },
+            { "$ref": "#/$defs/digest" }
+          ]
+        },
+        "feature_inventory_sha256": { "$ref": "#/$defs/digest" },
+        "cargo_profile": { "enum": ["debug", "release"] },
+        "exact_release_artifact": { "type": "boolean" },
+        "foundation_insecure_enabled": { "const": false },
+        "legacy_session_net_compat_enabled": { "const": false }
+      }
+    },
+    "campaign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "campaign_id_sha256",
+        "topology_members",
+        "target",
+        "started_at_utc",
+        "completed_at_utc",
+        "transport_mode",
+        "independent_processes",
+        "independent_disks",
+        "canonical_spiffe_identities",
+        "canonical_fqdn_routes"
+      ],
+      "properties": {
+        "campaign_id_sha256": { "$ref": "#/$defs/digest" },
+        "topology_members": { "enum": [3, 5] },
+        "target": {
+          "enum": ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+        },
+        "started_at_utc": { "$ref": "#/$defs/utcSeconds" },
+        "completed_at_utc": { "$ref": "#/$defs/utcSeconds" },
+        "transport_mode": { "const": "mtls" },
+        "independent_processes": { "const": true },
+        "independent_disks": { "const": true },
+        "canonical_spiffe_identities": { "const": true },
+        "canonical_fqdn_routes": { "const": true }
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "environment_sha256",
+        "configuration_sha256",
+        "fault_schedule_sha256",
+        "logs_manifest_sha256",
+        "metrics_manifest_sha256",
+        "resource_results_sha256"
+      ],
+      "properties": {
+        "environment_sha256": { "$ref": "#/$defs/digest" },
+        "configuration_sha256": { "$ref": "#/$defs/digest" },
+        "fault_schedule_sha256": { "$ref": "#/$defs/digest" },
+        "logs_manifest_sha256": { "$ref": "#/$defs/digest" },
+        "metrics_manifest_sha256": { "$ref": "#/$defs/digest" },
+        "resource_results_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "sequential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schedule_schema_version",
+        "schedule_sha256",
+        "history_schema_version",
+        "history_sha256",
+        "checker"
+      ],
+      "properties": {
+        "schedule_schema_version": { "const": "opc-session-ha-schedule/v1" },
+        "schedule_sha256": { "$ref": "#/$defs/digest" },
+        "history_schema_version": { "const": "opc-session-ha-history/v1" },
+        "history_sha256": { "$ref": "#/$defs/digest" },
+        "checker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "version",
+            "sha256",
+            "output_sha256",
+            "exit_code",
+            "status",
+            "violation_count",
+            "inconclusive_count"
+          ],
+          "properties": {
+            "name": { "const": "check-session-ha-history.py" },
+            "version": { "const": "1" },
+            "sha256": { "$ref": "#/$defs/digest" },
+            "output_sha256": { "$ref": "#/$defs/digest" },
+            "exit_code": { "const": 0 },
+            "status": { "const": "pass" },
+            "violation_count": { "const": 0 },
+            "inconclusive_count": { "const": 0 }
+          }
+        }
+      }
+    },
+    "concurrent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_schema_version",
+        "evidence_sha256",
+        "workload_schedule_sha256",
+        "history_schema_version",
+        "history_sha256",
+        "checker"
+      ],
+      "properties": {
+        "evidence_schema_version": { "const": "opc-session-ha-candidate-evidence/v3" },
+        "evidence_sha256": { "$ref": "#/$defs/digest" },
+        "workload_schedule_sha256": { "$ref": "#/$defs/digest" },
+        "history_schema_version": { "const": "opc-session-ha-concurrent-history/v3" },
+        "history_sha256": { "$ref": "#/$defs/digest" },
+        "checker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "version",
+            "sha256",
+            "output_sha256",
+            "exit_code",
+            "status",
+            "violation_count",
+            "inconclusive_count"
+          ],
+          "properties": {
+            "name": { "const": "check-session-ha-concurrent-history.py" },
+            "version": { "const": "3" },
+            "sha256": { "$ref": "#/$defs/digest" },
+            "output_sha256": { "$ref": "#/$defs/digest" },
+            "exit_code": { "const": 0 },
+            "status": { "const": "pass" },
+            "violation_count": { "const": 0 },
+            "inconclusive_count": { "const": 0 }
+          }
+        }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deployed_kubernetes_3_5",
+        "real_network_and_storage_faults",
+        "crash_point_matrix",
+        "version_migration_and_rollback",
+        "platform_resource_soak",
+        "remote_hkms_rotation",
+        "live_alert_fire_and_clear",
+        "signed_release_bundle"
+      ],
+      "properties": {
+        "deployed_kubernetes_3_5": { "$ref": "#/$defs/acceptanceGate" },
+        "real_network_and_storage_faults": { "$ref": "#/$defs/acceptanceGate" },
+        "crash_point_matrix": { "$ref": "#/$defs/acceptanceGate" },
+        "version_migration_and_rollback": { "$ref": "#/$defs/acceptanceGate" },
+        "platform_resource_soak": { "$ref": "#/$defs/acceptanceGate" },
+        "remote_hkms_rotation": { "$ref": "#/$defs/acceptanceGate" },
+        "live_alert_fire_and_clear": { "$ref": "#/$defs/acceptanceGate" },
+        "signed_release_bundle": { "$ref": "#/$defs/acceptanceGate" }
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "utcSeconds": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "acceptanceGate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "evidence_sha256"],
+          "properties": {
+            "status": { "const": "unproven" },
+            "evidence_sha256": { "const": null }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "evidence_sha256"],
+          "properties": {
+            "status": { "const": "candidate_evidence" },
+            "evidence_sha256": { "$ref": "#/$defs/digest" }
+          }
+        }
+      ]
+    }
+  }
+}
