@@ -437,6 +437,23 @@ and the exact test canary bytes remain absent from SQLite/WAL/SHM. This is
 MemoryKeyProvider wrapper evidence, not remote-HKMS or deployed evidence. The
 immutable v1 candidate schema and the broader profile deliberately retain
 `counts_for_seamless_tls_rotation = false` and `qualification_complete = false`.
+The separate v2 candidate schema now digest-binds each successful local
+rotation-core, fault/expiry-recovery, or traffic/resource run to its exact
+pre-execution source state, child and parent harness artifacts, generated
+configuration, ordered public certificate/trust publication manifest, exact
+declared orchestration schedule, 3/5-member topology, directed-path count, and
+ordered coverage. The pre-execution bindings are verified unchanged after the
+campaign. Emission is rejected with insecure test support compiled, and it is
+ephemeral unless the existing evidence-output contract is explicitly set. Its
+public decoder rejects over-limit bytes before closed-JSON parsing and applies
+the cross-field validator before returning. The preserved bundle contains only
+the bounded typed record and immutable schema, published from a private fsynced
+staging directory with atomic no-replace rename. It cannot carry material,
+private-key digests, identities, addresses, paths, payloads, or backend text.
+Its production-credit fields remain fixed false; deployed
+network/storage faults, CNF/Kubernetes execution, supported-platform soak,
+remote-HKMS, live metrics/alerts, independently signed evidence, and HA-profile
+graduation remain explicit gates, so #164/#158 stay open.
 The non-ignored single-host 3/5-process slice now covers one unavailable member
 plus a different member's malformed retained-last-good reload, short-lived-SVID
 expiry/hard drain, exact-address watcher restart/catch-up, one unclean

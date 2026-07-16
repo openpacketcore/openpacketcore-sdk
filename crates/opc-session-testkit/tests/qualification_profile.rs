@@ -18,9 +18,12 @@ use opc_session_store::{
     SESSION_CONSENSUS_SCHEMA_VERSION, STABLE_ID_MAX_BYTES,
 };
 use opc_session_testkit::qualification::{
-    SessionHaQualificationProfile, SESSION_HA_EVIDENCE_SCHEMA_JSON, SESSION_HA_HISTORY_SCHEMA_JSON,
-    SESSION_HA_PROFILE_JSON, SESSION_HA_PROFILE_SCHEMA_JSON, SESSION_HA_SCHEDULE_SCHEMA_JSON,
-    SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON,
+    session_mtls_candidate_evidence_v2_schema_sha256, session_mtls_candidate_schedule_sha256,
+    SessionHaQualificationProfile, SessionMtlsCandidateCampaign, SessionMtlsCandidateEvidenceError,
+    SessionMtlsCandidateEvidenceV2, SESSION_HA_EVIDENCE_SCHEMA_JSON,
+    SESSION_HA_HISTORY_SCHEMA_JSON, SESSION_HA_PROFILE_JSON, SESSION_HA_PROFILE_SCHEMA_JSON,
+    SESSION_HA_SCHEDULE_SCHEMA_JSON, SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON,
+    SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES, SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use serde_json::Value;
 
@@ -29,6 +32,8 @@ const HISTORY_FIXTURE: &str = include_str!("fixtures/session-ha/history-valid.js
 const SCHEDULE_FIXTURE: &str = include_str!("fixtures/session-ha/schedule-valid.jsonl");
 const OMITTED_HISTORY_FIXTURE: &str =
     include_str!("fixtures/session-ha/history-invalid-omitted.jsonl");
+const MTLS_CANDIDATE_V2_FIXTURE: &str =
+    include_str!("fixtures/session-mtls/candidate-evidence-v2.json");
 const MTLS_CANDIDATE_REMAINING_ACCEPTANCE: [&str; 7] = [
     "five_member_mtls_matrix",
     "projected_material_rotation_under_continuous_traffic",
@@ -135,6 +140,16 @@ fn validate_mtls_candidate_evidence(schema: &Value, evidence: &Value) -> Result<
         return Err("mTLS remaining acceptance is not exact and unique".to_owned());
     }
     Ok(())
+}
+
+fn validate_mtls_candidate_evidence_v2(
+    schema: &Value,
+    evidence: &Value,
+) -> Result<SessionMtlsCandidateEvidenceV2, String> {
+    validate_structural_schema(schema, evidence)?;
+    let encoded = serde_json::to_vec(evidence).map_err(|_| "invalid typed v2 evidence")?;
+    SessionMtlsCandidateEvidenceV2::from_json(&encoded)
+        .map_err(|_| "invalid v2 evidence binding".to_owned())
 }
 
 fn is_lower_hex(value: &str, width: usize) -> bool {
@@ -1252,4 +1267,408 @@ fn mtls_candidate_checkpoint_is_strictly_incomplete_and_excludes_insecure_test()
     let duplicate = evidence["remaining_acceptance"][0].clone();
     evidence["remaining_acceptance"][6] = duplicate;
     assert!(validate_mtls_candidate_evidence(&schema, &evidence).is_err());
+}
+
+fn mtls_candidate_v2_document(campaign: SessionMtlsCandidateCampaign, members: usize) -> Value {
+    let mut document: Value =
+        serde_json::from_str(MTLS_CANDIDATE_V2_FIXTURE).expect("v2 mTLS candidate fixture JSON");
+    document["source"]["tree_status"] = "dirty_unqualified".into();
+    document["campaign"] = serde_json::to_value(campaign).expect("encode candidate campaign");
+    document["topology"]["members"] = members.into();
+    document["topology"]["directed_path_count"] = members
+        .checked_mul(members.saturating_sub(1))
+        .expect("bounded candidate directed path count")
+        .into();
+    document["bindings"]["workload_schedule_sha256"] =
+        session_mtls_candidate_schedule_sha256(campaign, members)
+            .expect("supported candidate topology")
+            .into();
+    document["coverage"] =
+        serde_json::to_value(campaign.coverage()).expect("encode candidate coverage");
+    document
+}
+
+#[test]
+fn mtls_candidate_v2_fixture_is_typed_and_exactly_digest_bound() {
+    let schema: Value = serde_json::from_str(SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON)
+        .expect("v2 mTLS candidate evidence schema JSON");
+    let evidence: Value =
+        serde_json::from_str(MTLS_CANDIDATE_V2_FIXTURE).expect("v2 mTLS candidate fixture JSON");
+    let decoded = validate_mtls_candidate_evidence_v2(&schema, &evidence)
+        .expect("v2 candidate fixture satisfies schema and typed validator");
+
+    assert_eq!(
+        decoded.bindings().evidence_schema_sha256(),
+        session_mtls_candidate_evidence_v2_schema_sha256()
+    );
+    assert_eq!(
+        decoded.bindings().workload_schedule_sha256(),
+        session_mtls_candidate_schedule_sha256(SessionMtlsCandidateCampaign::RotationCore, 3,)
+            .expect("supported candidate topology")
+    );
+    assert_eq!(
+        decoded.campaign(),
+        SessionMtlsCandidateCampaign::RotationCore
+    );
+    assert_eq!(decoded.topology().members(), 3);
+    assert_eq!(decoded.source().revision().len(), 40);
+    assert!(!decoded.artifact().insecure_test_enabled());
+    let encoded = serde_json::to_vec(&decoded).expect("encode typed candidate evidence");
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&encoded)
+            .expect("bounded decode typed candidate evidence"),
+        decoded
+    );
+}
+
+#[test]
+fn mtls_candidate_v2_public_decoder_is_bounded_closed_and_validating() {
+    let fixture = MTLS_CANDIDATE_V2_FIXTURE.as_bytes();
+    assert!(fixture.len() < SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES);
+    SessionMtlsCandidateEvidenceV2::from_json(fixture)
+        .expect("bounded decoder accepts the canonical fixture");
+
+    let mut exact_limit = fixture.to_vec();
+    exact_limit.resize(SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES, b' ');
+    SessionMtlsCandidateEvidenceV2::from_json(&exact_limit)
+        .expect("bounded decoder accepts valid JSON at the exact limit");
+
+    let mut oversized = exact_limit;
+    oversized.push(b' ');
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&oversized),
+        Err(SessionMtlsCandidateEvidenceError::DocumentTooLarge)
+    );
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(b"{"),
+        Err(SessionMtlsCandidateEvidenceError::InvalidDocument)
+    );
+
+    let mut trailing = fixture.to_vec();
+    trailing.push(b'x');
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&trailing),
+        Err(SessionMtlsCandidateEvidenceError::InvalidDocument)
+    );
+
+    let mut unknown: Value =
+        serde_json::from_slice(fixture).expect("v2 mTLS candidate fixture JSON");
+    unknown["unreviewed"] = true.into();
+    let encoded = serde_json::to_vec(&unknown).expect("encode unknown-field mutation");
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&encoded),
+        Err(SessionMtlsCandidateEvidenceError::InvalidDocument)
+    );
+
+    let mut invalid_claim: Value =
+        serde_json::from_slice(fixture).expect("v2 mTLS candidate fixture JSON");
+    invalid_claim["qualification_complete"] = true.into();
+    let encoded = serde_json::to_vec(&invalid_claim).expect("encode invalid claim mutation");
+    assert_eq!(
+        SessionMtlsCandidateEvidenceV2::from_json(&encoded),
+        Err(SessionMtlsCandidateEvidenceError::Claim)
+    );
+}
+
+#[test]
+fn mtls_candidate_v2_schema_and_typed_model_cover_every_campaign_topology() {
+    let schema: Value = serde_json::from_str(SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON)
+        .expect("v2 mTLS candidate evidence schema JSON");
+    for campaign in [
+        SessionMtlsCandidateCampaign::RotationCore,
+        SessionMtlsCandidateCampaign::FaultExpiryRecovery,
+        SessionMtlsCandidateCampaign::TrafficResourceBounds,
+    ] {
+        for members in [3, 5] {
+            let encoded = mtls_candidate_v2_document(campaign, members);
+            let evidence: SessionMtlsCandidateEvidenceV2 = serde_json::from_value(encoded.clone())
+                .expect("decode supported candidate evidence");
+            evidence
+                .validate()
+                .expect("validate supported candidate evidence");
+            assert_eq!(
+                validate_mtls_candidate_evidence_v2(&schema, &encoded)
+                    .expect("typed candidate satisfies the external schema"),
+                evidence
+            );
+        }
+    }
+}
+
+#[test]
+fn mtls_candidate_v2_rejects_claim_and_digest_mismatches() {
+    let fixture: Value =
+        serde_json::from_str(MTLS_CANDIDATE_V2_FIXTURE).expect("v2 mTLS candidate fixture JSON");
+    let decode = |document: Value| {
+        serde_json::from_value::<SessionMtlsCandidateEvidenceV2>(document)
+            .expect("decode structurally valid candidate evidence")
+    };
+
+    let mut changed = fixture.clone();
+    changed["experimental"] = false.into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Claim)
+    );
+
+    let mut changed = fixture.clone();
+    changed["qualification_complete"] = true.into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Claim)
+    );
+
+    let mut changed = fixture.clone();
+    changed["topology"]["counts_for_seamless_tls_rotation"] = true.into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Claim)
+    );
+
+    let mut changed = fixture.clone();
+    changed["artifact"]["insecure_test_enabled"] = true.into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Artifact)
+    );
+
+    let mut changed = fixture.clone();
+    changed["source"]["revision"] = "ABC".into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Source)
+    );
+
+    let mut changed = fixture.clone();
+    changed["source"]["worktree_sha256"] = "sha256:invalid".into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Source)
+    );
+
+    let mut changed = fixture.clone();
+    changed["artifact"]["sha256"] = "sha256:invalid".into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Artifact)
+    );
+
+    let mut changed = fixture.clone();
+    changed["topology"]["members"] = 5.into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Topology)
+    );
+
+    let mut changed = fixture.clone();
+    changed["bindings"]["evidence_schema_sha256"] =
+        changed["bindings"]["configuration_sha256"].clone();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Binding)
+    );
+
+    let mut changed = fixture.clone();
+    changed["bindings"]["workload_schedule_sha256"] =
+        changed["bindings"]["configuration_sha256"].clone();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Binding)
+    );
+
+    let mut changed = fixture.clone();
+    changed["bindings"]["configuration_sha256"] = "sha256:invalid".into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Binding)
+    );
+
+    let mut changed = fixture.clone();
+    changed["bindings"]["public_material_manifest_sha256"] = "sha256:invalid".into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Binding)
+    );
+
+    let mut changed = fixture.clone();
+    changed["campaign"] = "fault_expiry_recovery".into();
+    changed["bindings"]["workload_schedule_sha256"] = session_mtls_candidate_schedule_sha256(
+        SessionMtlsCandidateCampaign::FaultExpiryRecovery,
+        3,
+    )
+    .expect("supported candidate topology")
+    .into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Coverage)
+    );
+
+    let mut changed = fixture;
+    changed["observations"]["encrypted_canary_verified"] = false.into();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Observations)
+    );
+}
+
+#[test]
+fn mtls_candidate_v2_requires_exact_ordered_coverage_and_remaining_acceptance() {
+    let fixture: Value =
+        serde_json::from_str(MTLS_CANDIDATE_V2_FIXTURE).expect("v2 mTLS candidate fixture JSON");
+    let decode = |document: Value| {
+        serde_json::from_value::<SessionMtlsCandidateEvidenceV2>(document)
+            .expect("decode structurally valid candidate evidence")
+    };
+
+    let mut changed = fixture.clone();
+    changed["coverage"]
+        .as_array_mut()
+        .expect("coverage array")
+        .pop();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Coverage)
+    );
+
+    let mut changed = fixture.clone();
+    changed["coverage"][1] = changed["coverage"][0].clone();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Coverage)
+    );
+
+    let mut changed = fixture.clone();
+    changed["coverage"]
+        .as_array_mut()
+        .expect("coverage array")
+        .swap(0, 1);
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::Coverage)
+    );
+
+    let mut changed = fixture.clone();
+    changed["remaining_acceptance"]
+        .as_array_mut()
+        .expect("remaining acceptance array")
+        .pop();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::RemainingAcceptance)
+    );
+
+    let mut changed = fixture.clone();
+    changed["remaining_acceptance"][1] = changed["remaining_acceptance"][0].clone();
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::RemainingAcceptance)
+    );
+
+    let mut changed = fixture;
+    changed["remaining_acceptance"]
+        .as_array_mut()
+        .expect("remaining acceptance array")
+        .swap(0, 1);
+    assert_eq!(
+        decode(changed).validate(),
+        Err(SessionMtlsCandidateEvidenceError::RemainingAcceptance)
+    );
+}
+
+#[test]
+fn mtls_candidate_v2_schema_rejects_cross_field_mismatches_directly() {
+    let schema: Value = serde_json::from_str(SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON)
+        .expect("v2 mTLS candidate evidence schema JSON");
+    let fixture: Value =
+        serde_json::from_str(MTLS_CANDIDATE_V2_FIXTURE).expect("v2 mTLS candidate fixture JSON");
+
+    let mut changed = fixture.clone();
+    changed["topology"]["members"] = 5.into();
+    assert!(validate_structural_schema(&schema, &changed).is_err());
+
+    let mut changed = fixture.clone();
+    changed["campaign"] = "fault_expiry_recovery".into();
+    assert!(validate_structural_schema(&schema, &changed).is_err());
+
+    let mut changed = fixture;
+    changed["remaining_acceptance"]
+        .as_array_mut()
+        .expect("remaining acceptance array")
+        .swap(0, 1);
+    assert!(validate_structural_schema(&schema, &changed).is_err());
+}
+
+#[test]
+fn mtls_candidate_v2_schema_excludes_sensitive_or_unbounded_fields() {
+    let schema: Value = serde_json::from_str(SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON)
+        .expect("v2 mTLS candidate evidence schema JSON");
+    let fixture: Value =
+        serde_json::from_str(MTLS_CANDIDATE_V2_FIXTURE).expect("v2 mTLS candidate fixture JSON");
+
+    for (container, field) in [
+        ("topology", "peer_address"),
+        ("source", "spiffe_id"),
+        ("artifact", "certificate_material"),
+        ("artifact", "private_key"),
+        ("observations", "payload"),
+        ("bindings", "backend_error"),
+    ] {
+        let mut changed = fixture.clone();
+        changed[container][field] = "must-not-be-admitted".into();
+        assert!(validate_structural_schema(&schema, &changed).is_err());
+        let encoded = serde_json::to_vec(&changed).expect("encode unknown-field mutation");
+        assert_eq!(
+            SessionMtlsCandidateEvidenceV2::from_json(&encoded),
+            Err(SessionMtlsCandidateEvidenceError::InvalidDocument)
+        );
+    }
+}
+
+#[test]
+fn mtls_candidate_v2_debug_redacts_source_and_digest_bindings() {
+    let evidence: SessionMtlsCandidateEvidenceV2 =
+        serde_json::from_str(MTLS_CANDIDATE_V2_FIXTURE).expect("v2 mTLS candidate fixture JSON");
+    let revision = evidence.source().revision().to_owned();
+    let worktree_sha256 = evidence.source().worktree_sha256().to_owned();
+    let artifact_sha256 = evidence.artifact().sha256().to_owned();
+    let harness_sha256 = evidence.artifact().harness_sha256().to_owned();
+    let schema_sha256 = evidence.bindings().evidence_schema_sha256().to_owned();
+    let configuration_sha256 = evidence.bindings().configuration_sha256().to_owned();
+    let public_material_sha256 = evidence
+        .bindings()
+        .public_material_manifest_sha256()
+        .to_owned();
+    let schedule_sha256 = evidence.bindings().workload_schedule_sha256().to_owned();
+    let rendered = [
+        format!("{evidence:?}"),
+        format!("{:?}", evidence.source()),
+        format!("{:?}", evidence.artifact()),
+        format!("{:?}", evidence.bindings()),
+    ]
+    .join("\n");
+
+    for value in [
+        revision.as_str(),
+        worktree_sha256.as_str(),
+        artifact_sha256.as_str(),
+        harness_sha256.as_str(),
+        schema_sha256.as_str(),
+        configuration_sha256.as_str(),
+        public_material_sha256.as_str(),
+        schedule_sha256.as_str(),
+    ] {
+        assert!(!rendered.contains(value));
+    }
+    for forbidden in [
+        "spiffe://",
+        "127.0.0.1",
+        "certificate_material",
+        "private_key",
+        "payload",
+        "backend_error",
+    ] {
+        assert!(!rendered.contains(forbidden));
+    }
+    assert!(rendered.contains("<digest-bound>"));
+    assert!(rendered.contains("<sha256>"));
 }
