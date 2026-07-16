@@ -53,15 +53,17 @@ watch tasks are active. Survivors advance committed canary and mixed traffic;
 the same-disk, exact-address restart must reconcile a bounded gap-free journal,
 prove the exact generation/owner/fence/payload, and resume at a strictly higher
 same-owner fence under the versioned
-`same-disk-exact-address-active-mutator/v2` profile. That profile independently
+`same-disk-exact-address-active-mutator/v3` profile. That profile independently
 bounds termination/reaping at 5 seconds, outage/survivor progress at 26
 seconds, replacement-child startup at 45 seconds, Openraft
-readiness/catch-up at 26 seconds, journal reconciliation at 25 seconds, and
-higher-fence mutation resume at 26 seconds. The sequential stages compose to a
-153-second crash-to-resume ceiling, but each stage fails at its own deadline.
-This corrects the under-composed v1 qualification clock, which charged all six
-stages to one 26-second deadline; it does not qualify a broader restart matrix
-or deployed production readiness.
+recovery/readiness observation at 37 seconds (a 26-second recovery envelope
+plus one reserved 11-second final all-voter readiness round comprising a
+10-second backend operation and 1 second of bounded local result delivery),
+journal reconciliation at 25 seconds, and higher-fence mutation resume at 26 seconds.
+The sequential stages compose to a 164-second crash-to-resume ceiling, but each
+stage fails at its own deadline. This retains the v1 deadline-composition fix
+and corrects v2's stranded readiness-observation tail; it does not qualify a
+broader restart matrix or deployed production readiness.
 The tests do not cover deployed partitions, a broader restart/fault matrix,
 resource/soak, remote HKMS, deployed CNFs, or signed release evidence. Generic
 CRL/OCSP/denylist revocation is not implemented.
@@ -1303,8 +1305,8 @@ readiness, and connection-recycling traffic remains active. After repair, one
 stable follower is also killed uncleanly with active mutation/watch tasks;
 survivors commit during the outage and its same-disk, exact-address restart
 must reconcile the exact record/watch state and resume at a higher fence under
-the v2 stage bounds described above. The six sequential stage bounds compose
-to a 153-second crash-to-resume ceiling; the total does not replace any
+the v3 stage bounds described above. The six sequential stage bounds compose
+to a 164-second crash-to-resume ceiling; the total does not replace any
 individual stage deadline. Other active-mutator restart patterns, a
 real/deployed partition, a broader restart/fault matrix, resource/soak,
 remote-HKMS, deployed-CNF, signed release, and
@@ -1867,7 +1869,7 @@ fencing.
   node. The reverse probe fails local material preflight without dialing.
   Terminal outcomes may
   additionally include only the exact attempts already outstanding at the
-  baseline and must satisfy interval conservation; Schedule v5 binds
+  baseline and must satisfy interval conservation; Schedule v6 binds
   `new-attempts-plus-baseline-outstanding/v1` and
   `common-key-pulse-all-active-key-coverage/v1`.
   Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
