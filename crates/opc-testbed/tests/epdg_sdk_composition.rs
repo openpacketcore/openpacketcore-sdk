@@ -52,6 +52,9 @@ impl S2bMessageView for Gtpv2cS2bView<'_> {
             Some(Gtpv2cProcedure::ModifyBearer) => S2bProcedure::ModifyBearer,
             Some(Gtpv2cProcedure::DeleteSession) => S2bProcedure::DeleteSession,
             Some(Gtpv2cProcedure::UpdateSession) => S2bProcedure::UpdateSession,
+            Some(Gtpv2cProcedure::CreateBearer | Gtpv2cProcedure::DeleteBearer) => {
+                S2bProcedure::Unsupported(self.0.message_type().as_u8())
+            }
             None => S2bProcedure::Unsupported(self.0.message_type().as_u8()),
         }
     }
@@ -98,6 +101,8 @@ fn direction_from_raw_gtpv2c_header(message_type: Gtpv2cMessageType) -> PeerMess
         | Gtpv2cMessageType::CreateSessionResponse
         | Gtpv2cMessageType::ModifyBearerResponse
         | Gtpv2cMessageType::DeleteSessionResponse
+        | Gtpv2cMessageType::CreateBearerResponse
+        | Gtpv2cMessageType::DeleteBearerResponse
         | Gtpv2cMessageType::UpdateBearerResponse => PeerMessageDirection::Response,
         _ => PeerMessageDirection::Request,
     }
