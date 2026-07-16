@@ -57,7 +57,14 @@ impl<C: OpcConfig> SubscriberState<C> {
             return;
         }
 
-        let mut queue = self.queue.lock().expect("subscriber queue mutex poisoned");
+        let mut queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                crate::metrics::record_subscriber_notification_failure();
+                tracing::error!("recovering poisoned config subscriber queue");
+                poisoned.into_inner()
+            }
+        };
         if queue.len() < self.capacity {
             queue.push_back(event);
             drop(queue);
@@ -98,17 +105,23 @@ impl<C: OpcConfig> SubscriberState<C> {
     }
 
     pub(crate) fn pop(&self) -> Option<ConfigEvent<C>> {
-        self.queue
-            .lock()
-            .expect("subscriber queue mutex poisoned")
-            .pop_front()
+        match self.queue.lock() {
+            Ok(mut queue) => queue.pop_front(),
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned config subscriber queue");
+                poisoned.into_inner().pop_front()
+            }
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.queue
-            .lock()
-            .expect("subscriber queue mutex poisoned")
-            .len()
+        match self.queue.lock() {
+            Ok(queue) => queue.len(),
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned config subscriber queue");
+                poisoned.into_inner().len()
+            }
+        }
     }
 }
 

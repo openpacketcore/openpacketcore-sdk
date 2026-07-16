@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use opc_config_bus::{ConfigBus, ConfigEvent, InMemoryManagedDatastore, ManagedDatastore};
+use opc_config_bus::{
+    ConfigBus, ConfigEvent, ConfirmedCommitResolution, InMemoryManagedDatastore, ManagedDatastore,
+};
 use opc_config_model::{CommitMode, CommitRequest, IdempotencyKey, RollbackTarget};
 use opc_types::ConfigVersion;
 
@@ -204,7 +206,7 @@ async fn in_memory_datastore_preserves_recovery_marker_behavior() {
     );
     record.recovery_required = true;
     store
-        .append_commit(record)
+        .append_commit_write(CommitWrite::new(record))
         .await
         .expect("direct append succeeds");
 
@@ -217,6 +219,101 @@ async fn in_memory_datastore_preserves_recovery_marker_behavior() {
         };
 
     assert_eq!(err.code, StoreErrorCode::RestoreRecoveryRequired);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_memory_confirm_and_rollback_cas_admits_exactly_one_decision() {
+    let store = Arc::new(InMemoryManagedDatastore::new());
+    let initial_tx_id = opc_types::TxId::new();
+    store
+        .seed(StoredConfig::new(
+            initial_tx_id,
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+
+    let pending_tx_id = opc_types::TxId::new();
+    let mut pending = StoredConfig::new(
+        pending_tx_id,
+        ConfigVersion::new(2),
+        principal(),
+        RequestSource::Northbound,
+        TestConfig::new("tentative"),
+    );
+    pending.parent_tx_id = Some(initial_tx_id);
+    pending.confirmed_deadline = Some(Timestamp::now_utc());
+    store
+        .append_commit_write(CommitWrite::new(pending))
+        .await
+        .expect("pending commit appends");
+
+    let confirm_tx_id = opc_types::TxId::new();
+    let mut confirm_record = StoredConfig::new(
+        confirm_tx_id,
+        ConfigVersion::new(3),
+        principal(),
+        RequestSource::Northbound,
+        TestConfig::new("tentative"),
+    );
+    confirm_record.parent_tx_id = Some(pending_tx_id);
+    let confirm = CommitWrite::resolving(
+        confirm_record,
+        ConfirmedCommitResolution::Confirm { pending_tx_id },
+    )
+    .expect("valid confirm command");
+
+    let rollback_tx_id = opc_types::TxId::new();
+    let mut rollback_record = StoredConfig::new(
+        rollback_tx_id,
+        ConfigVersion::new(3),
+        principal(),
+        RequestSource::Internal,
+        TestConfig::new("initial"),
+    );
+    rollback_record.parent_tx_id = Some(pending_tx_id);
+    let rollback = CommitWrite::resolving(
+        rollback_record,
+        ConfirmedCommitResolution::Rollback { pending_tx_id },
+    )
+    .expect("valid rollback command");
+
+    let (confirm_result, rollback_result) = tokio::join!(
+        store.append_commit_write(confirm),
+        store.append_commit_write(rollback)
+    );
+    assert_ne!(confirm_result.is_ok(), rollback_result.is_ok());
+
+    let losing_error = confirm_result
+        .err()
+        .or_else(|| rollback_result.err())
+        .expect("one competing decision loses");
+    assert!(matches!(
+        losing_error.code,
+        StoreErrorCode::Internal | StoreErrorCode::Unavailable
+    ));
+
+    let history = store.history().await;
+    assert_eq!(history.len(), 3);
+    let pending_after = history
+        .iter()
+        .find(|record| record.tx_id == pending_tx_id)
+        .expect("pending record remains in history");
+    let latest = store
+        .load_latest()
+        .await
+        .expect("latest lookup")
+        .expect("latest record");
+    if latest.tx_id == confirm_tx_id {
+        assert_eq!(latest.config.name, "tentative");
+        assert!(pending_after.confirmed_deadline.is_none());
+    } else {
+        assert_eq!(latest.tx_id, rollback_tx_id);
+        assert_eq!(latest.config.name, "initial");
+        assert!(pending_after.confirmed_deadline.is_some());
+    }
 }
 
 async fn begin_confirmed(

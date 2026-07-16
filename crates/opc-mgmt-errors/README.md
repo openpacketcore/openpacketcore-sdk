@@ -13,7 +13,8 @@ Public API:
 
 - `MgmtStatus`, a compact status enum for gNMI-like responses.
 - `NetconfErrorType`, `NetconfErrorTag`, and `NetconfError`.
-- `commit_error_to_status` and `commit_error_to_netconf`.
+- `commit_error_to_status`, `commit_error_to_netconf`, and
+  `commit_error_to_netconf_app_tag`.
 - `nacm_denied_status` and `nacm_denied_netconf`.
 
 Example:
@@ -23,12 +24,17 @@ use opc_mgmt_errors::commit_error_to_status;
 use opc_config_model::CommitError;
 
 fn status_for(error: &CommitError) -> opc_mgmt_errors::MgmtStatus {
-    commit_error_to_status(error)
+    commit_error_to_status(error.code)
 }
 ```
 
 The mapping is based on `CommitErrorCode`. It intentionally does not copy
 validation messages, paths, or rejected values into protocol errors.
+`OutcomeUnknown` maps to gNMI `FAILED_PRECONDITION` and NETCONF application
+`operation-failed` with the stable, redaction-safe `outcome-unknown`
+`error-app-tag`: clients must perform authoritative request/idempotency readback
+before retrying, so it is deliberately not mapped to automatically retryable
+`UNAVAILABLE` or collapsed into an indistinguishable persistence failure.
 
 ## Relationships
 

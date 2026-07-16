@@ -95,6 +95,14 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
         CREATE INDEX IF NOT EXISTS audit_trail_tx_id_idx ON audit_trail(tx_id);
         CREATE INDEX IF NOT EXISTS config_history_rollback_idx ON config_history(version, rollback_point);
+        CREATE UNIQUE INDEX IF NOT EXISTS config_history_replay_lookup_idx
+            ON config_history(
+                CASE
+                    WHEN json_valid(principal)
+                    THEN json_extract(principal, '$.replay_lookup_digest')
+                    ELSE NULL
+                END
+            );
 
         CREATE TABLE IF NOT EXISTS config_lifecycle_audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,6 +201,26 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         "#,
     )?;
+    validate_config_replay_lookup_index(conn)?;
+    Ok(())
+}
+
+fn validate_config_replay_lookup_index(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'config_history_replay_lookup_idx'",
+        [],
+        |row| row.get(0),
+    )?;
+    let normalized = sql
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .replace("ifnotexists", "");
+    const EXPECTED: &str = "createuniqueindexconfig_history_replay_lookup_idxonconfig_history(casewhenjson_valid(principal)thenjson_extract(principal,'$.replay_lookup_digest')elsenullend)";
+    if normalized != EXPECTED {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     Ok(())
 }
 
@@ -503,11 +531,18 @@ pub fn get_schema_digest(conn: &Connection) -> Result<Option<String>, rusqlite::
 
 /// Derive the schema digest from the live SQLite schema catalog.
 pub fn current_schema_digest(conn: &Connection) -> Result<String, rusqlite::Error> {
+    // The replay index is an additive, derived lookup accelerator introduced
+    // without changing the logical row schema, so it must not invalidate the
+    // digest already stored by nodes during a rolling upgrade. Its exact
+    // unique expression is validated independently by
+    // `validate_config_replay_lookup_index`; a missing or shadow index still
+    // fails startup rather than silently degrading correctness.
     let mut stmt = conn.prepare(
         "SELECT type, name, sql FROM sqlite_master \
          WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
            AND name NOT LIKE 'consensus_%' \
            AND name NOT LIKE 'config_raft_%' \
+           AND name != 'config_history_replay_lookup_idx' \
          ORDER BY type, name",
     )?;
     let mut rows = stmt.query([])?;
@@ -783,7 +818,10 @@ pub fn check_fsync_available(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod fixture_tests {
-    use super::{current_schema_digest, initialize_schema, SCHEMA_VERSION};
+    use super::{
+        current_schema_digest, initialize_schema, validate_config_replay_lookup_index,
+        SCHEMA_VERSION,
+    };
     use rusqlite::{params, Connection};
     use std::env;
     use std::path::PathBuf;
@@ -876,6 +914,39 @@ mod fixture_tests {
         .expect("insert alarm_audit");
 
         conn.close().expect("close fixture cleanly");
+    }
+
+    #[test]
+    fn replay_lookup_index_is_exact_unique_and_selected_by_sqlite() {
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_schema(&conn).expect("initialize schema");
+        validate_config_replay_lookup_index(&conn).expect("exact replay index");
+
+        let detail: String = conn
+            .query_row(
+                r#"EXPLAIN QUERY PLAN
+                   SELECT tx_id FROM config_history
+                   WHERE CASE
+                           WHEN json_valid(principal)
+                           THEN json_extract(principal, '$.replay_lookup_digest')
+                           ELSE NULL
+                         END = ?1
+                   LIMIT 1"#,
+                ["0".repeat(64)],
+                |row| row.get(3),
+            )
+            .expect("query plan");
+        assert!(detail.contains("config_history_replay_lookup_idx"));
+
+        conn.execute("DROP INDEX config_history_replay_lookup_idx", [])
+            .expect("drop exact index");
+        conn.execute(
+            "CREATE UNIQUE INDEX config_history_replay_lookup_idx ON config_history(version)",
+            [],
+        )
+        .expect("install shadow index");
+        assert!(validate_config_replay_lookup_index(&conn).is_err());
+        assert!(initialize_schema(&conn).is_err());
     }
 
     #[test]

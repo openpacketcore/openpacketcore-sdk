@@ -394,6 +394,13 @@ pub enum CommitErrorCode {
     RecoveryRequired,
     StateMachineFault,
     AuthorizationDenied,
+    /// The durable write may have committed, but its acknowledgement was
+    /// lost. Callers must resolve the result through an authoritative read
+    /// using the request id or idempotency key before retrying.
+    ///
+    /// Kept after every original variant to preserve binary serde enum
+    /// discriminants for existing SDK consumers.
+    OutcomeUnknown,
 }
 
 impl CommitErrorCode {
@@ -407,6 +414,7 @@ impl CommitErrorCode {
             Self::SemanticValidationFailed => "semantic_validation_failed",
             Self::DiffFailed => "diff_failed",
             Self::PersistFailed => "persist_failed",
+            Self::OutcomeUnknown => "outcome_unknown",
             Self::VersionExhausted => "version_exhausted",
             Self::RollbackNotFound => "rollback_not_found",
             Self::RollbackUnavailable => "rollback_unavailable",
@@ -488,6 +496,14 @@ impl CommitError {
 
     pub fn persist_failed(message: impl Into<String>) -> Self {
         Self::new(CommitErrorCode::PersistFailed, message)
+    }
+
+    /// Builds an ambiguous durable-outcome error.
+    ///
+    /// This is distinct from [`Self::persist_failed`]: it means the caller
+    /// must read the authoritative state before deciding whether to retry.
+    pub fn outcome_unknown(message: impl Into<String>) -> Self {
+        Self::new(CommitErrorCode::OutcomeUnknown, message)
     }
 
     pub fn rollback_unavailable(message: impl Into<String>) -> Self {

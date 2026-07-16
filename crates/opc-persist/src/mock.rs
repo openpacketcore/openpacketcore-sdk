@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use super::preflight::PersistCapabilities;
-use super::types::{AuditRecord, CommitRecord, RollbackTarget, StoredConfig};
+use super::types::{
+    AuditRecord, CommitRecord, ConfirmedCommitResolution, RollbackTarget, StoredConfig,
+};
 use super::{ConfigStore, PersistError};
 
 /// An in-memory mock ConfigStore for unit tests.
@@ -59,6 +61,102 @@ impl MockConfigStore {
     pub fn preflight_was_called(&self) -> bool {
         *self.preflight_called.read().unwrap()
     }
+
+    fn append_write(
+        &self,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        resolution: Option<ConfirmedCommitResolution>,
+    ) -> Result<(), PersistError> {
+        if !super::types::config_principal_metadata_is_valid(&record.principal) {
+            return Err(PersistError::constraint_violation(
+                "config principal metadata is invalid",
+            ));
+        }
+        let tx_id_bytes = record.tx_id.as_uuid().as_bytes().to_vec();
+        let mut latest = self
+            .latest_tx_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut commits = self
+            .commits
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut confirmed = self
+            .confirmed_tx_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if commits.contains_key(&tx_id_bytes)
+            || commits
+                .values()
+                .any(|stored| stored.record.version == record.version)
+        {
+            return Err(PersistError::constraint_violation(
+                "duplicate config transaction or version",
+            ));
+        }
+        if let Some(digest) = super::types::config_replay_lookup_digest(&record.principal)? {
+            for stored in commits.values() {
+                if super::types::config_replay_lookup_digest(&stored.record.principal)?.as_deref()
+                    == Some(digest.as_str())
+                {
+                    return Err(PersistError::constraint_violation(
+                        "config replay lookup digest is not unique",
+                    ));
+                }
+            }
+        }
+        let current = latest.as_ref().and_then(|key| commits.get(key));
+        match (current, record.parent_tx_id) {
+            (None, None) => {}
+            (Some(current), Some(parent_tx_id))
+                if current.record.tx_id == parent_tx_id
+                    && current
+                        .record
+                        .version
+                        .get()
+                        .checked_add(1)
+                        .is_some_and(|next| next == record.version.get()) => {}
+            _ => {
+                return Err(PersistError::constraint_violation(
+                    "config commit parent is not the applied head",
+                ));
+            }
+        }
+        let current_key = latest.clone();
+        let current_is_pending = current_key.as_ref().is_some_and(|key| {
+            commits
+                .get(key)
+                .is_some_and(|stored| stored.record.confirmed_deadline.is_some())
+                && !confirmed.contains(key)
+        });
+        match (current_is_pending, resolution) {
+            (false, None) => {}
+            (true, Some(resolution))
+                if record.parent_tx_id == Some(resolution.pending_tx_id())
+                    && record.confirmed_deadline.is_none() =>
+            {
+                if matches!(resolution, ConfirmedCommitResolution::Confirm { .. }) {
+                    let current_key = current_key.ok_or_else(|| {
+                        PersistError::constraint_violation("pending config head is missing")
+                    })?;
+                    let current = commits.get_mut(&current_key).ok_or_else(|| {
+                        PersistError::constraint_violation("pending config head is missing")
+                    })?;
+                    current.record.confirmed_deadline = None;
+                    confirmed.insert(current_key);
+                }
+            }
+            _ => {
+                return Err(PersistError::constraint_violation(
+                    "pending commit requires one atomic current-parent decision",
+                ));
+            }
+        }
+        commits.insert(tx_id_bytes.clone(), StoredConfig { record, audit });
+        *latest = Some(tx_id_bytes);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -97,34 +195,98 @@ impl ConfigStore for MockConfigStore {
         Ok(config)
     }
 
+    async fn load_by_replay_lookup_digest(
+        &self,
+        digest: &str,
+    ) -> Result<Option<StoredConfig>, PersistError> {
+        super::types::validate_replay_lookup_digest(digest)?;
+        let commits = self
+            .commits
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut found = None;
+        for stored in commits.values() {
+            if super::types::config_replay_lookup_digest(&stored.record.principal)?.as_deref()
+                == Some(digest)
+            {
+                if found.is_some() {
+                    return Err(PersistError::inconsistent_state(
+                        "config replay lookup digest is not unique",
+                    ));
+                }
+                found = Some(stored.clone());
+            }
+        }
+        Ok(found)
+    }
+
     async fn append_commit(
         &self,
         record: CommitRecord,
         audit: Vec<AuditRecord>,
     ) -> Result<(), PersistError> {
-        let tx_id_bytes = record.tx_id.as_uuid().as_bytes().to_vec();
-        let stored = StoredConfig { record, audit };
-        {
-            let mut commits = self.commits.write().unwrap();
-            commits.insert(tx_id_bytes.clone(), stored);
+        self.append_write(record, audit, None)
+    }
+
+    async fn append_commit_resolving(
+        &self,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        resolution: ConfirmedCommitResolution,
+    ) -> Result<(), PersistError> {
+        self.append_write(record, audit, Some(resolution))
+    }
+
+    async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), PersistError> {
+        let key = tx_id.as_uuid().as_bytes().to_vec();
+        let latest = self
+            .latest_tx_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if latest.as_ref() != Some(&key) {
+            return Err(PersistError::rollback_not_found());
         }
+        let mut commits = self
+            .commits
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stored = commits
+            .get_mut(&key)
+            .ok_or_else(PersistError::rollback_not_found)?;
+        if let Some(encoded) =
+            super::types::clear_config_recovery_required(&stored.record.principal)?
         {
-            let mut latest = self.latest_tx_id.write().unwrap();
-            *latest = Some(tx_id_bytes);
+            stored.record.principal = encoded;
         }
         Ok(())
     }
 
     async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), PersistError> {
         let key = tx_id.as_uuid().as_bytes().to_vec();
+        let latest = self
+            .latest_tx_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if latest.as_ref() != Some(&key) {
+            return Err(PersistError::rollback_not_found());
+        }
         {
-            let mut commits = self.commits.write().unwrap();
+            let mut commits = self
+                .commits
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let stored = commits
                 .get_mut(&key)
                 .ok_or_else(PersistError::rollback_not_found)?;
+            if stored.record.confirmed_deadline.is_none() {
+                return Err(PersistError::rollback_not_found());
+            }
             stored.record.confirmed_deadline = None;
         }
-        let mut confirmed = self.confirmed_tx_ids.write().unwrap();
+        let mut confirmed = self
+            .confirmed_tx_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         confirmed.insert(key);
         Ok(())
     }
@@ -228,6 +390,8 @@ pub enum FaultType {
     FailedRollbackLoad,
     /// Failure while marking transaction as confirmed.
     MarkConfirmedFailure,
+    /// Failure while durably clearing a committed record's recovery marker.
+    ClearRecoveryRequiredFailure,
     /// Failure while creating rollback point.
     CreateRollbackPointFailure,
 }
@@ -346,6 +510,13 @@ impl<S: ConfigStore> ConfigStore for FaultInjectingStore<S> {
         self.inner.load_rollback(target).await
     }
 
+    async fn load_by_replay_lookup_digest(
+        &self,
+        digest: &str,
+    ) -> Result<Option<StoredConfig>, PersistError> {
+        self.inner.load_by_replay_lookup_digest(digest).await
+    }
+
     async fn append_commit(
         &self,
         record: CommitRecord,
@@ -375,6 +546,62 @@ impl<S: ConfigStore> ConfigStore for FaultInjectingStore<S> {
         }
 
         self.inner.append_commit(record, audit).await
+    }
+
+    async fn append_commit_resolving(
+        &self,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        resolution: ConfirmedCommitResolution,
+    ) -> Result<(), PersistError> {
+        if self.is_fault_enabled(FaultType::DiskFull) {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(PersistError::out_of_space(0, 1024));
+        }
+        if self.is_fault_enabled(FaultType::FsyncFailure) {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(PersistError::io(
+                "fsync failed: path=/var/lib/opc/tenant-a/secret-key.db, error=broken pipe key=config-key-2026-secret",
+            ));
+        }
+        if self.is_fault_enabled(FaultType::PartialAuditWrite) {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(PersistError::sqlite(
+                "SQLite error: partial write occurred on audit table: path=/var/lib/opc/tenant-a/secret-key.db key=config-key-2026-secret",
+            ));
+        }
+        if self.is_fault_enabled(FaultType::MarkConfirmedFailure)
+            && matches!(resolution, ConfirmedCommitResolution::Confirm { .. })
+        {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(PersistError::sqlite(
+                "SQLite error: failed to atomically confirm the pending commit",
+            ));
+        }
+
+        self.inner
+            .append_commit_resolving(record, audit, resolution)
+            .await
+    }
+
+    async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), PersistError> {
+        if self.is_fault_enabled(FaultType::ClearRecoveryRequiredFailure) {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(PersistError::sqlite(
+                "SQLite error: failed to clear the config recovery marker",
+            ));
+        }
+        self.inner.clear_recovery_required(tx_id).await
     }
 
     async fn mark_confirmed(&self, tx_id: opc_types::TxId) -> Result<(), PersistError> {

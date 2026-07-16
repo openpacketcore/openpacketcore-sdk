@@ -11,7 +11,8 @@
 //! - [`NetconfErrorType`] / [`NetconfErrorTag`] / [`NetconfError`] — the
 //!   `<rpc-error>` `error-type`/`error-tag` values the NETCONF server emits
 //!   (RFC 6241).
-//! - [`commit_error_to_status`] / [`commit_error_to_netconf`] — the mappings from
+//! - [`commit_error_to_status`] / [`commit_error_to_netconf`] /
+//!   [`commit_error_to_netconf_app_tag`] — the mappings from
 //!   [`opc_config_model::CommitErrorCode`], written as exhaustive `match`es so a
 //!   new SDK error code forces both transport mappings to be updated.
 //!
@@ -22,6 +23,12 @@
 #![forbid(unsafe_code)]
 
 use opc_config_model::CommitErrorCode;
+
+/// Stable NETCONF `error-app-tag` for a write whose durable outcome is unknown.
+///
+/// Clients must reconcile the request or idempotency identity before retrying.
+/// The tag carries no request, configuration, backend, or peer detail.
+pub const NETCONF_OUTCOME_UNKNOWN_APP_TAG: &str = "outcome-unknown";
 
 /// gRPC-aligned status taxonomy for management-plane responses.
 ///
@@ -201,6 +208,9 @@ pub const fn commit_error_to_status(code: CommitErrorCode) -> MgmtStatus {
         CommitErrorCode::DiffFailed => MgmtStatus::InvalidArgument,
         // Durable append failed — backend problem, not the client's fault.
         CommitErrorCode::PersistFailed => MgmtStatus::Internal,
+        // A generic UNAVAILABLE response invites blind retries. Force the
+        // client to reconcile by request/idempotency identity first.
+        CommitErrorCode::OutcomeUnknown => MgmtStatus::FailedPrecondition,
         CommitErrorCode::VersionExhausted => MgmtStatus::Internal,
         CommitErrorCode::RollbackNotFound => MgmtStatus::NotFound,
         CommitErrorCode::RollbackUnavailable => MgmtStatus::Unavailable,
@@ -237,6 +247,7 @@ pub const fn commit_error_to_netconf(code: CommitErrorCode) -> NetconfError {
         }
         CommitErrorCode::DiffFailed => NetconfError::new(Ty::Application, Tag::OperationFailed),
         CommitErrorCode::PersistFailed => NetconfError::new(Ty::Application, Tag::OperationFailed),
+        CommitErrorCode::OutcomeUnknown => NetconfError::new(Ty::Application, Tag::OperationFailed),
         CommitErrorCode::VersionExhausted => {
             NetconfError::new(Ty::Application, Tag::OperationFailed)
         }
@@ -254,6 +265,32 @@ pub const fn commit_error_to_netconf(code: CommitErrorCode) -> NetconfError {
             NetconfError::new(Ty::Application, Tag::OperationFailed)
         }
         CommitErrorCode::AuthorizationDenied => NetconfError::new(Ty::Protocol, Tag::AccessDenied),
+    }
+}
+
+/// Maps an `opc-config-bus` [`CommitErrorCode`] to an optional stable NETCONF
+/// `<error-app-tag>`.
+///
+/// This supplements [`commit_error_to_netconf`] without changing its
+/// classification-only return type. The mapping deliberately carries only
+/// bounded static strings and never copies an error message or rejected value.
+pub const fn commit_error_to_netconf_app_tag(code: CommitErrorCode) -> Option<&'static str> {
+    match code {
+        CommitErrorCode::OutcomeUnknown => Some(NETCONF_OUTCOME_UNKNOWN_APP_TAG),
+        CommitErrorCode::AdmissionRejected
+        | CommitErrorCode::ApplyPlanRejected
+        | CommitErrorCode::DeadlineExceeded
+        | CommitErrorCode::MissingCandidate
+        | CommitErrorCode::SyntaxValidationFailed
+        | CommitErrorCode::SemanticValidationFailed
+        | CommitErrorCode::DiffFailed
+        | CommitErrorCode::PersistFailed
+        | CommitErrorCode::VersionExhausted
+        | CommitErrorCode::RollbackNotFound
+        | CommitErrorCode::RollbackUnavailable
+        | CommitErrorCode::RecoveryRequired
+        | CommitErrorCode::StateMachineFault
+        | CommitErrorCode::AuthorizationDenied => None,
     }
 }
 
@@ -276,7 +313,7 @@ mod tests {
     /// Every `CommitErrorCode` the SDK defines today; if a variant is added the
     /// match in the mapping functions stops compiling, and this list (used to
     /// assert totality of the mapping at runtime) is the place to extend.
-    const ALL_CODES: [CommitErrorCode; 14] = [
+    const ALL_CODES: [CommitErrorCode; 15] = [
         CommitErrorCode::AdmissionRejected,
         CommitErrorCode::ApplyPlanRejected,
         CommitErrorCode::DeadlineExceeded,
@@ -285,6 +322,7 @@ mod tests {
         CommitErrorCode::SemanticValidationFailed,
         CommitErrorCode::DiffFailed,
         CommitErrorCode::PersistFailed,
+        CommitErrorCode::OutcomeUnknown,
         CommitErrorCode::VersionExhausted,
         CommitErrorCode::RollbackNotFound,
         CommitErrorCode::RollbackUnavailable,
@@ -302,6 +340,7 @@ mod tests {
             // error-tag/type strings are non-empty and stable.
             assert!(!nc.tag.as_str().is_empty());
             assert!(!nc.error_type.as_str().is_empty());
+            let _app_tag = commit_error_to_netconf_app_tag(code);
         }
     }
 
@@ -322,6 +361,10 @@ mod tests {
         );
         assert_eq!(
             commit_error_to_status(CommitErrorCode::RecoveryRequired),
+            MgmtStatus::FailedPrecondition
+        );
+        assert_eq!(
+            commit_error_to_status(CommitErrorCode::OutcomeUnknown),
             MgmtStatus::FailedPrecondition
         );
         assert_eq!(
@@ -365,6 +408,13 @@ mod tests {
             )
         );
         assert_eq!(
+            commit_error_to_netconf(CommitErrorCode::OutcomeUnknown),
+            NetconfError::new(
+                NetconfErrorType::Application,
+                NetconfErrorTag::OperationFailed
+            )
+        );
+        assert_eq!(
             commit_error_to_netconf(CommitErrorCode::ApplyPlanRejected),
             NetconfError::new(
                 NetconfErrorType::Application,
@@ -395,5 +445,18 @@ mod tests {
             "operation-failed"
         );
         assert_eq!(NetconfErrorType::Protocol.as_str(), "protocol");
+    }
+
+    #[test]
+    fn outcome_unknown_has_distinct_redaction_safe_netconf_app_tag() {
+        assert_eq!(
+            commit_error_to_netconf_app_tag(CommitErrorCode::OutcomeUnknown),
+            Some(NETCONF_OUTCOME_UNKNOWN_APP_TAG)
+        );
+        assert_eq!(NETCONF_OUTCOME_UNKNOWN_APP_TAG, "outcome-unknown");
+        assert_eq!(
+            commit_error_to_netconf_app_tag(CommitErrorCode::PersistFailed),
+            None
+        );
     }
 }

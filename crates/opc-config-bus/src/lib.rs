@@ -32,7 +32,7 @@ pub use datastore::{
 };
 pub use subscribers::{ConfigReceiver, SubscriberLagPolicy};
 pub use types::{
-    AtomicConfigSnapshot, AuthorityMode, ConfigChange, ConfigEvent, ConfigSnapshot, DriftState,
-    PublishedSnapshot, SealedConfig, StoreError, StoreErrorCode, StoredConfig,
-    StoredRequestFingerprint, StoredRequestMode,
+    AtomicConfigSnapshot, AuthorityMode, CommitWrite, ConfigChange, ConfigEvent, ConfigSnapshot,
+    ConfirmedCommitResolution, DriftState, PublishedSnapshot, SealedConfig, StoreError,
+    StoreErrorCode, StoredConfig, StoredRequestFingerprint, StoredRequestMode,
 };

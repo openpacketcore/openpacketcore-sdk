@@ -300,8 +300,17 @@ backend recovery logic before the next commit is accepted.
 pub trait ConfigStore: Send + Sync {
     async fn load_latest(&self) -> Result<Option<StoredConfig>, PersistError>;
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError>;
+    async fn load_by_replay_lookup_digest(&self, digest: &str)
+        -> Result<Option<StoredConfig>, PersistError>;
     async fn append_commit(&self, record: CommitRecord, audit: Vec<AuditRecord>)
         -> Result<(), PersistError>;
+    async fn append_commit_resolving(
+        &self,
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        resolution: ConfirmedCommitResolution,
+    ) -> Result<(), PersistError>;
+    async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), PersistError>;
     async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), PersistError>;
     async fn create_rollback_point(&self, tx_id: TxId, label: Option<String>)
         -> Result<(), PersistError>;
@@ -311,6 +320,27 @@ pub trait ConfigStore: Send + Sync {
 
 `append_commit` MUST be atomic: either the commit record and its audit records
 are durable together, or neither is visible during recovery.
+`append_commit_resolving` additionally MUST compare the current applied head,
+resolve the exact pending commit-confirmed parent, and append its successor in
+one state-machine operation. Splitting those actions permits two leaders to
+make conflicting decisions and is prohibited. `load_by_replay_lookup_digest`
+MUST be one authoritative lookup;
+production stores must not walk a bounded ancestor prefix because history
+length cannot become an availability limit for outcome reconciliation.
+
+Once append admission may have reached durable authority, loss of the response
+MUST be reported as `OutcomeUnknown`, not as a definite persistence or deadline
+failure. The commit bus fences subsequent writes until an authoritative lookup
+by request ID establishes an unkeyed result, or an exact same-key replay
+establishes a keyed result. A request that changes mode, candidate, rollback
+selector, confirmation timeout, caller-asserted base-version precondition, or
+authenticated caller context is a collision, not a replay. The fenced bus may
+answer the exact replay without performing a mutation, but it remains fenced
+until its local snapshot is rebuilt from the authoritative store. If
+authorities race after both miss the replay index, the compare-and-append loser
+MUST reconcile the winner through that index; an unreadable winner is
+`OutcomeUnknown`, never a definite persistence failure. Blind or semantically
+changed retry is not a valid recovery strategy.
 
 ### 7.2 Commit Record
 

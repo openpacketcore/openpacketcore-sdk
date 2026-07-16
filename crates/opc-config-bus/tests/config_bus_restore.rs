@@ -422,6 +422,65 @@ async fn restore_or_new_preserves_request_id_in_validation_context() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_preserves_commit_confirmed_mode_and_timeout() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let timeout = Duration::from_secs(37);
+    let config =
+        ContextBoundConfig::new("pending").expect_mode(CommitMode::CommitConfirmed { timeout });
+    let mut stored = StoredConfig::new(
+        opc_types::TxId::new(),
+        ConfigVersion::new(3),
+        principal(),
+        RequestSource::Northbound,
+        config,
+    );
+    stored.request_fingerprint = Some(opc_config_bus::StoredRequestFingerprint {
+        operation: ConfigOperation::Replace,
+        mode: opc_config_bus::StoredRequestMode::CommitConfirmed { timeout },
+        transport: TransportType::Internal,
+        changed_paths: vec![changed_path()],
+        base_version: Some(ConfigVersion::new(2)),
+    });
+    stored.confirmed_deadline = Some(Timestamp::from_offset_datetime(
+        OffsetDateTime::now_utc() + time::Duration::minutes(1),
+    ));
+    store.seed(stored).await;
+
+    let restored =
+        ConfigBus::restore_or_new_dev_only(ContextBoundConfig::new("fallback"), Arc::clone(&store))
+            .await
+            .expect("restore preserves commit-confirmed mode");
+    assert_eq!(restored.version(), ConfigVersion::new(3));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_preserves_cancel_confirmed_mode() {
+    let store = Arc::new(MockManagedDatastore::new());
+    let config = ContextBoundConfig::new("restored").expect_mode(CommitMode::CancelConfirmed);
+    let mut stored = StoredConfig::new(
+        opc_types::TxId::new(),
+        ConfigVersion::new(4),
+        principal(),
+        RequestSource::Northbound,
+        config,
+    );
+    stored.request_fingerprint = Some(opc_config_bus::StoredRequestFingerprint {
+        operation: ConfigOperation::Rollback,
+        mode: opc_config_bus::StoredRequestMode::CancelConfirmed,
+        transport: TransportType::Internal,
+        changed_paths: vec![changed_path()],
+        base_version: Some(ConfigVersion::new(3)),
+    });
+    store.seed(stored).await;
+
+    let restored =
+        ConfigBus::restore_or_new_dev_only(ContextBoundConfig::new("fallback"), Arc::clone(&store))
+            .await
+            .expect("restore preserves cancel-confirmed mode");
+    assert_eq!(restored.version(), ConfigVersion::new(4));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_or_new_legacy_no_fingerprint_record_uses_version_minus_one_base() {
     let store = Arc::new(MockManagedDatastore::new());
     let stored_version = ConfigVersion::new(5);

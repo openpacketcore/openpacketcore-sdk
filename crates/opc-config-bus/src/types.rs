@@ -49,6 +49,10 @@ pub enum StoreErrorCode {
     /// The backend is temporarily unable to serve the request (for example a
     /// rollback target that is still pending confirmation); retryable.
     Unavailable,
+    /// The backend may have durably applied a write but lost the authoritative
+    /// acknowledgement. The caller must resolve the result by reading with
+    /// the request id or idempotency key before retrying.
+    OutcomeUnknown,
     /// Store invariant violation or serialization failure (duplicate tx id or
     /// version, envelope encode failure); not retryable without intervention.
     Internal,
@@ -84,6 +88,7 @@ impl StoreErrorCode {
         match self {
             Self::NotFound => "not_found",
             Self::Unavailable => "unavailable",
+            Self::OutcomeUnknown => "outcome_unknown",
             Self::Internal => "internal",
             Self::Crypto => "crypto",
             Self::RestoreSchemaMismatch => "restore_schema_mismatch",
@@ -158,6 +163,12 @@ impl StoreError {
     /// commit-confirmed record.
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(StoreErrorCode::Unavailable, message)
+    }
+
+    /// Builds an `OutcomeUnknown` error for an append whose durable result
+    /// cannot be proven from the acknowledgement path.
+    pub fn outcome_unknown(message: impl Into<String>) -> Self {
+        Self::new(StoreErrorCode::OutcomeUnknown, message)
     }
 
     /// Builds an `Internal` error: a store invariant was violated (duplicate
@@ -269,14 +280,123 @@ pub struct StoredConfig<C: OpcConfig> {
     pub rollback_label: Option<String>,
 }
 
+/// Durable resolution applied atomically with a successor config record.
+///
+/// Both variants carry the exact pending transaction that the write expects
+/// to remain current. A datastore must compare that id with its applied latest
+/// record before changing state, so confirm and rollback cannot both win after
+/// a leader change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmedCommitResolution {
+    /// Permanently confirms the pending commit and clears its deadline.
+    Confirm {
+        /// Exact pending transaction that must still be current.
+        pending_tx_id: TxId,
+    },
+    /// Supersedes the pending commit with the rollback record in the same
+    /// atomic datastore operation.
+    Rollback {
+        /// Exact pending transaction that must still be current.
+        pending_tx_id: TxId,
+    },
+}
+
+impl ConfirmedCommitResolution {
+    /// Returns the pending transaction guarded by this resolution.
+    pub const fn pending_tx_id(self) -> TxId {
+        match self {
+            Self::Confirm { pending_tx_id } | Self::Rollback { pending_tx_id } => pending_tx_id,
+        }
+    }
+}
+
+/// One atomic durable config write with an applied-state compare condition.
+///
+/// The record's `parent_tx_id` is the expected current durable transaction.
+/// Datastores must compare it at apply time, then append the record and apply
+/// any [`ConfirmedCommitResolution`] as one indivisible state-machine update.
+/// This prevents two leaders from committing sibling versions or deciding a
+/// pending commit in opposite ways.
+#[derive(Clone)]
+pub struct CommitWrite<C: OpcConfig> {
+    record: StoredConfig<C>,
+    confirmed_resolution: Option<ConfirmedCommitResolution>,
+}
+
+impl<C: OpcConfig> CommitWrite<C> {
+    /// Builds an ordinary compare-and-append write. The record's
+    /// `parent_tx_id` is used as the expected current transaction.
+    pub fn new(record: StoredConfig<C>) -> Self {
+        Self {
+            record,
+            confirmed_resolution: None,
+        }
+    }
+
+    /// Builds a write that atomically confirms or rolls back the exact current
+    /// pending transaction.
+    pub fn resolving(
+        record: StoredConfig<C>,
+        resolution: ConfirmedCommitResolution,
+    ) -> Result<Self, StoreError> {
+        if record.parent_tx_id != Some(resolution.pending_tx_id()) {
+            return Err(StoreError::internal(
+                "confirmed resolution does not match the commit parent",
+            ));
+        }
+        if record.confirmed_deadline.is_some() {
+            return Err(StoreError::internal(
+                "confirmed resolution successor cannot itself be pending",
+            ));
+        }
+        Ok(Self {
+            record,
+            confirmed_resolution: Some(resolution),
+        })
+    }
+
+    /// Returns the config record to append.
+    pub fn record(&self) -> &StoredConfig<C> {
+        &self.record
+    }
+
+    /// Returns the applied latest transaction required before this write can
+    /// commit. `None` requires an empty datastore.
+    pub fn expected_current_tx_id(&self) -> Option<TxId> {
+        self.record.parent_tx_id
+    }
+
+    /// Returns the optional pending commit decision carried by this write.
+    pub fn confirmed_resolution(&self) -> Option<ConfirmedCommitResolution> {
+        self.confirmed_resolution
+    }
+
+    /// Splits the write into the persisted record and its atomic resolution
+    /// metadata for datastore adapters.
+    pub fn into_parts(self) -> (StoredConfig<C>, Option<ConfirmedCommitResolution>) {
+        (self.record, self.confirmed_resolution)
+    }
+}
+
+impl<C: OpcConfig> std::fmt::Debug for CommitWrite<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitWrite")
+            .field("tx_id", &self.record.tx_id)
+            .field("version", &self.record.version)
+            .field("expected_current_tx_id", &self.record.parent_tx_id)
+            .field("confirmed_resolution", &self.confirmed_resolution)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Persisted request metadata used to safely replay idempotent writes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredRequestFingerprint {
     /// Operation the original caller requested; a retry with a different
     /// operation is treated as an idempotency-key collision, not a replay.
     pub operation: ConfigOperation,
-    /// Persisted commit/rollback mode. Validate-only and commit-confirmed
-    /// requests are never fingerprinted, so they cannot be replayed.
+    /// Persisted mode of the durable request. Validate-only requests do not
+    /// create records and therefore are never fingerprinted.
     pub mode: StoredRequestMode,
     /// Northbound transport of the original request; replays must arrive over
     /// the same transport to match.
@@ -291,7 +411,8 @@ pub struct StoredRequestFingerprint {
     pub base_version: Option<ConfigVersion>,
 }
 
-/// Persisted mode for idempotent commit/rollback replay.
+/// Persisted mode for authoritative request reconciliation and idempotent
+/// replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoredRequestMode {
     /// The record was produced by an ordinary (unconfirmed) commit; replay
@@ -305,6 +426,23 @@ pub enum StoredRequestMode {
         /// request, compared exactly on idempotent replay.
         target: RollbackTarget,
     },
+    /// The record started a commit-confirmed window. The original timeout is
+    /// retained so a retry with the same key but different semantics is
+    /// rejected as a collision. Kept after the original variants so binary
+    /// serde discriminants remain compatible with pre-extension records.
+    CommitConfirmed {
+        /// Requested confirmation window.
+        timeout: std::time::Duration,
+    },
+    /// The record cancelled the then-current pending commit and restored its
+    /// parent configuration. Kept after the original variants for binary
+    /// serde compatibility.
+    CancelConfirmed,
+    /// An ordinary `Commit` request with no candidate that explicitly
+    /// confirmed the then-current pending commit. Kept distinct from a
+    /// candidate-bearing commit so an idempotency key cannot be replayed with
+    /// different semantics.
+    ConfirmPending,
 }
 
 impl<C: OpcConfig> StoredConfig<C> {
@@ -373,6 +511,7 @@ pub struct SealedConfig<C: OpcConfig> {
     schema_digest: SchemaDigest,
     legacy_plaintext: Option<C>,
     fresh_envelope: Option<opc_crypto::AuthenticatedEnvelope>,
+    aad_principal: Option<Arc<str>>,
     marker: PhantomData<fn() -> C>,
 }
 
@@ -385,8 +524,30 @@ impl<C: OpcConfig> SealedConfig<C> {
             schema_digest,
             legacy_plaintext: None,
             fresh_envelope: None,
+            aad_principal: None,
             marker: PhantomData,
         }
+    }
+
+    /// Builds a persisted sealed marker while retaining the exact principal
+    /// JSON bytes that were bound into the envelope AAD.
+    ///
+    /// Persistence adapters must use this constructor instead of reserializing
+    /// the decoded principal: JSON member ordering is semantically irrelevant
+    /// but the authenticated AAD bytes are exact.
+    pub fn from_persisted_aad_principal(
+        schema_digest: SchemaDigest,
+        aad_principal: String,
+    ) -> Result<Self, StoreError> {
+        serde_json::from_str::<TrustedPrincipal>(&aad_principal)
+            .map_err(|_| StoreError::crypto("stored config AAD principal is invalid"))?;
+        Ok(Self {
+            schema_digest,
+            legacy_plaintext: None,
+            fresh_envelope: None,
+            aad_principal: Some(Arc::<str>::from(aad_principal)),
+            marker: PhantomData,
+        })
     }
 
     pub(crate) fn newly_encrypted(
@@ -397,8 +558,13 @@ impl<C: OpcConfig> SealedConfig<C> {
             schema_digest,
             legacy_plaintext: None,
             fresh_envelope: Some(envelope),
+            aad_principal: None,
             marker: PhantomData,
         }
+    }
+
+    pub(crate) fn aad_principal(&self) -> Option<&str> {
+        self.aad_principal.as_deref()
     }
 
     /// Consume evidence that this exact record was produced by the live
@@ -422,6 +588,7 @@ impl<C: OpcConfig> SealedConfig<C> {
             schema_digest: config.schema_digest(),
             legacy_plaintext: Some(config),
             fresh_envelope: None,
+            aad_principal: None,
             marker: PhantomData,
         }
     }

@@ -1,7 +1,7 @@
 mod persist_common;
 
 use opc_persist::{AuditKey, ConfigStore, MockConfigStore, PersistErrorKind, SqliteBackend};
-use opc_types::TxId;
+use opc_types::{Timestamp, TxId};
 
 use persist_common::{make_audit_record, make_commit_record, test_audit_key};
 
@@ -837,8 +837,10 @@ async fn load_latest_fails_closed_on_corrupt_confirmed_deadline() {
             .await
             .expect("open backend");
         let tx_id = TxId::new();
+        let mut record = make_commit_record(tx_id, 1);
+        record.confirmed_deadline = Some(Timestamp::now_utc());
         backend
-            .append_commit(make_commit_record(tx_id, 1), vec![])
+            .append_commit(record, vec![])
             .await
             .expect("append valid commit");
         backend
@@ -877,8 +879,10 @@ async fn load_latest_fails_closed_on_corrupt_confirmed_at() {
             .await
             .expect("open backend");
         let tx_id = TxId::new();
+        let mut record = make_commit_record(tx_id, 1);
+        record.confirmed_deadline = Some(Timestamp::now_utc());
         backend
-            .append_commit(make_commit_record(tx_id, 1), vec![])
+            .append_commit(record, vec![])
             .await
             .expect("append valid commit");
         backend

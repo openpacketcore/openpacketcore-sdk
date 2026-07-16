@@ -18,8 +18,9 @@ use opc_persist::{
     ApprovedLegacyConfigRecovery, AttestedConfigCommit, AuditKey, AuditOpType, AuditRecord,
     CommitRecord, CommitSource, ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch,
     ConfigConsensusConfigurationId, ConfigConsensusIdentity, ConfigConsensusNodeId,
-    ConfigConsensusRequestId, ConfigConsensusTopology, ConfigStore, ConsensusConfigStore,
-    LegacyConfigTailDisposition, PersistErrorKind, RollbackTarget, SqliteBackend,
+    ConfigConsensusRequestId, ConfigConsensusTopology, ConfigStore, ConfirmedCommitResolution,
+    ConsensusConfigStore, LegacyConfigTailDisposition, PersistErrorKind, RollbackTarget,
+    SqliteBackend,
 };
 use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
 use sha2::{Digest, Sha256};
@@ -408,6 +409,30 @@ fn attested(record: CommitRecord, audit: Vec<AuditRecord>) -> AttestedConfigComm
     );
     AttestedConfigCommit::try_new(record, audit, envelope.claim().expect("fresh claim"))
         .expect("attested config commit")
+}
+
+fn attested_resolving(
+    record: CommitRecord,
+    audit: Vec<AuditRecord>,
+    resolution: ConfirmedCommitResolution,
+) -> AttestedConfigCommit {
+    let seed = record.schema_digest.as_bytes()[0];
+    let envelope = envelope(
+        seed,
+        record.tx_id,
+        record.parent_tx_id,
+        record.version.get(),
+        record.committed_at,
+        &record.principal,
+        record.schema_digest,
+    );
+    AttestedConfigCommit::try_new_resolving(
+        record,
+        audit,
+        envelope.claim().expect("fresh claim"),
+        resolution,
+    )
+    .expect("attested resolving config commit")
 }
 
 fn audit(tx_id: TxId) -> Vec<AuditRecord> {
@@ -1295,13 +1320,17 @@ async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
     let request_id = ConfigConsensusRequestId::from_bytes([0x33; 16]);
     let third_record = commit(third_id, Some(second_id), 3, 12);
     let third_audit = audit(third_id);
-    assert!(cluster.stores[follower]
+    let third_error = cluster.stores[follower]
         .append_commit_idempotent(
             request_id,
             attested(third_record.clone(), third_audit.clone()),
         )
         .await
-        .is_err());
+        .expect_err("lost forwarded response is ambiguous");
+    assert!(matches!(
+        third_error.kind(),
+        PersistErrorKind::OutcomeUnknown
+    ));
     for target in 0..3 {
         if target != follower {
             cluster
@@ -1326,12 +1355,17 @@ async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
         }
     }
     let fourth_id = TxId::new();
-    let fourth_record = commit(fourth_id, Some(third_id), 4, 13);
+    let mut fourth_record = commit(fourth_id, Some(third_id), 4, 13);
+    fourth_record.confirmed_deadline = Some(Timestamp::now_utc());
     let fourth_audit = audit(fourth_id);
-    assert!(cluster.stores[follower]
+    let fourth_error = cluster.stores[follower]
         .append_attested_commit(attested(fourth_record.clone(), fourth_audit.clone()))
         .await
-        .is_err());
+        .expect_err("lost derived-ID response is ambiguous");
+    assert!(matches!(
+        fourth_error.kind(),
+        PersistErrorKind::OutcomeUnknown
+    ));
     for target in 0..3 {
         if target != follower {
             cluster
@@ -1395,6 +1429,207 @@ async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
             deterministic_authority_row_ids(&cluster.database_path(node)),
             "replicas must assign identical deterministic authority row IDs"
         );
+    }
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn lost_commit_ack_is_outcome_unknown_and_same_id_replays_after_leader_loss() {
+    let cluster = ThreeNodeCluster::start().await;
+    let leader = cluster.leader();
+    let follower = (0..3).find(|node| *node != leader).expect("follower");
+    let request_id = ConfigConsensusRequestId::from_bytes([0xA4; 16]);
+    let tx_id = TxId::new();
+    let record = commit(tx_id, None, 1, 0xA4);
+    let records_audit = audit(tx_id);
+
+    for target in 0..3 {
+        if target != follower {
+            cluster
+                .paths
+                .get(&(follower, target))
+                .expect("forward path")
+                .drop_forward_responses(usize::MAX);
+        }
+    }
+    let error = cluster.stores[follower]
+        .append_commit_idempotent(request_id, attested(record.clone(), records_audit.clone()))
+        .await
+        .expect_err("a lost post-commit acknowledgement must be explicit");
+    assert!(matches!(error.kind(), PersistErrorKind::OutcomeUnknown));
+
+    let authoritative = cluster.stores[follower]
+        .load_latest()
+        .await
+        .expect("authoritative read resolves ambiguous outcome")
+        .expect("ambiguous write committed");
+    assert_eq!(tx_id, authoritative.record.tx_id);
+    assert_eq!(ConfigVersion::new(1), authoritative.record.version);
+
+    let old_leader_id = cluster.stores[leader].status().node_id;
+    let old_term = cluster.stores[leader].status().term;
+    cluster.isolate(leader);
+    for target in 0..3 {
+        if target != follower {
+            cluster
+                .paths
+                .get(&(follower, target))
+                .expect("forward path")
+                .drop_forward_responses(0);
+        }
+    }
+    let survivors = (0..3).filter(|node| *node != leader).collect::<Vec<_>>();
+    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        loop {
+            let statuses = survivors
+                .iter()
+                .map(|node| cluster.stores[*node].status())
+                .collect::<Vec<_>>();
+            if statuses.iter().all(|status| {
+                status
+                    .leader_id
+                    .is_some_and(|new_leader| new_leader != old_leader_id)
+                    && status.term > old_term
+                    && status.leader_id == statuses[0].leader_id
+                    && status.term == statuses[0].term
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("survivors elect replacement leader");
+
+    cluster.stores[follower]
+        .append_commit_idempotent(request_id, attested(record, records_audit))
+        .await
+        .expect("same durable request ID replays committed outcome");
+    for survivor in &survivors {
+        let latest = cluster.stores[*survivor]
+            .load_latest()
+            .await
+            .expect("survivor read")
+            .expect("survivor head");
+        assert_eq!(tx_id, latest.record.tx_id);
+        assert_eq!(ConfigVersion::new(1), latest.record.version);
+    }
+
+    cluster.heal(leader);
+    cluster.wait_ready().await;
+    for store in &cluster.stores {
+        let latest = store
+            .load_latest()
+            .await
+            .expect("converged read")
+            .expect("converged head");
+        assert_eq!(tx_id, latest.record.tx_id);
+        assert_eq!(ConfigVersion::new(1), latest.record.version);
+    }
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn replacement_leader_cannot_flip_an_atomic_confirmed_commit_decision() {
+    let cluster = ThreeNodeCluster::start().await;
+    let pending_tx_id = TxId::new();
+    let mut pending = commit(pending_tx_id, None, 1, 0xB1);
+    pending.confirmed_deadline = Some(Timestamp::now_utc());
+    cluster.stores[0]
+        .append_attested_commit(attested(pending, audit(pending_tx_id)))
+        .await
+        .expect("replicate pending commit");
+
+    let old_leader = cluster.leader();
+    let old_leader_id = cluster.stores[old_leader].status().node_id;
+    let old_term = cluster.stores[old_leader].status().term;
+    let survivors = (0..3)
+        .filter(|node| *node != old_leader)
+        .collect::<Vec<_>>();
+    cluster.isolate(old_leader);
+
+    let confirm_tx_id = TxId::new();
+    let confirm_record = commit(confirm_tx_id, Some(pending_tx_id), 2, 0xB2);
+    let confirm_audit = audit(confirm_tx_id);
+    let isolated_store = cluster.stores[old_leader].clone();
+    let attempted_record = confirm_record.clone();
+    let attempted_audit = confirm_audit.clone();
+    let isolated_confirm = tokio::spawn(async move {
+        isolated_store
+            .append_attested_commit(attested_resolving(
+                attempted_record,
+                attempted_audit,
+                ConfirmedCommitResolution::Confirm { pending_tx_id },
+            ))
+            .await
+    });
+
+    let replacement = tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        loop {
+            let statuses = survivors
+                .iter()
+                .map(|node| cluster.stores[*node].status())
+                .collect::<Vec<_>>();
+            if let Some(replacement_id) = statuses[0].leader_id {
+                if replacement_id != old_leader_id
+                    && statuses.iter().all(|status| {
+                        status.leader_id == Some(replacement_id)
+                            && status.term > old_term
+                            && status.term == statuses[0].term
+                    })
+                {
+                    return survivors
+                        .iter()
+                        .copied()
+                        .find(|node| cluster.stores[*node].status().node_id == replacement_id)
+                        .expect("replacement leader index");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("survivors elect replacement leader");
+
+    let rollback_tx_id = TxId::new();
+    let rollback_record = commit(rollback_tx_id, Some(pending_tx_id), 2, 0xB3);
+    cluster.stores[replacement]
+        .append_attested_commit(attested_resolving(
+            rollback_record,
+            audit(rollback_tx_id),
+            ConfirmedCommitResolution::Rollback { pending_tx_id },
+        ))
+        .await
+        .expect("replacement leader commits rollback decision");
+
+    let isolated_result = isolated_confirm.await.expect("isolated proposal task");
+    assert!(
+        isolated_result.is_err(),
+        "isolated leader cannot commit confirm"
+    );
+    cluster.heal(old_leader);
+    cluster.wait_ready().await;
+
+    let stale_confirm = cluster.stores[replacement]
+        .append_attested_commit(attested_resolving(
+            confirm_record,
+            confirm_audit,
+            ConfirmedCommitResolution::Confirm { pending_tx_id },
+        ))
+        .await
+        .expect_err("committed rollback decision cannot be flipped after healing");
+    assert!(matches!(
+        stale_confirm.kind(),
+        PersistErrorKind::ConstraintViolation(_)
+    ));
+    for store in &cluster.stores {
+        let latest = store
+            .load_latest()
+            .await
+            .expect("converged decision read")
+            .expect("converged decision head");
+        assert_eq!(rollback_tx_id, latest.record.tx_id);
+        assert_eq!(ConfigVersion::new(2), latest.record.version);
     }
     cluster.shutdown().await;
 }
