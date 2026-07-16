@@ -10,11 +10,15 @@
   boundary validation, raw-preserving encode/decode, provenance-labeled fixture
   corpus replay, independent-capture intake checks, malformed-input replay,
   profile-critical negative fixture replay, typed S2b IE examples, and typed S2b
-  views for Echo plus Create/Modify/Delete/Update Session-oriented procedures.
+  views for Echo, Create/Modify/Delete/Update Session-oriented procedures, and
+  PGW-triggered Create Bearer/Delete Bearer procedures.
   The transport-neutral Echo peer helper also tracks Recovery restart counters
   and rejects new Echo exchanges while restart reconciliation is required.
   Public profile constructors cover Echo, Create Session, Modify Bearer,
-  Delete Session, and Update Bearer profile-owned request/response shapes.
+  Delete Session, Update Bearer, Create Bearer, and Delete Bearer
+  profile-owned request/response shapes. A bounded in-memory transaction
+  registry provides exactly-once dispatch and exact committed-response replay
+  for the two inbound triggered procedures.
 
 ## S2b Production Profile v1 — Experimental Target Boundary
 
@@ -37,6 +41,8 @@ validation for these S2b procedure messages:
 | Modify Bearer / S2b Modify Session | Request (34), Response (35) | Bearer Context request validation and Cause-bearing response validation. |
 | Delete Session | Request (36), Response (37) | Linked EPS Bearer ID request validation and Cause-bearing response validation. |
 | Update Bearer / S2b Update Session | Request (97), Response (98) | Bearer Context request validation and Cause-bearing response validation. |
+| Create Bearer | Request (95), Response (96) | One or more correlated Bearer Contexts; typed Bearer TFT/QoS/Charging ID; S2b-U PGW/ePDG F-TEID instance and interface validation; message/bearer Cause hierarchy; partial acceptance. |
+| Delete Bearer | Request (99), Response (100) | Mutually exclusive linked/default-bearer and repeated dedicated-EBI request forms; correlated linked or per-bearer response form; partial failure. |
 
 ### Profile-owned IE families
 
@@ -46,7 +52,8 @@ The profile owns the typed IE families required by the S2b messages above:
 - Subscriber/session IEs: IMSI, APN, PDN Type, PAA, Selection Mode, RAT Type,
   Serving Network, MEI, MSISDN.
 - Tunnel and bearer IEs: Sender F-TEID, Bearer Context, EPS Bearer ID, Bearer
-  QoS, Charging ID, AMBR, APN Restriction.
+  QoS, Charging ID, AMBR, APN Restriction, and Bearer TFT backed by the shared
+  `opc-proto-tft` TS 24.008 codec.
 - Response and policy containers: Cause, Indication, PCO, APCO.
 - Unknown, private, and unsupported future IEs remain raw-preserved and are not
   interpreted as product policy.
@@ -68,6 +75,22 @@ failures and must cover at least these rules:
 - Delete Session Request must include linked EPS Bearer ID.
 - Procedure responses must include Cause where the profile claims response
   semantics.
+- Create Bearer Request must carry a linked EBI instance 0 and one to fifteen
+  Bearer Contexts instance 0. Every context must contain request EBI value 0,
+  Bearer TFT instance 0, Bearer QoS instance 0, S2b-U PGW F-TEID instance 4
+  with interface type 33, and Charging ID instance 0.
+- Create Bearer Response must contain one result for every request context.
+  Accepted contexts require a newly allocated EBI, bearer Cause 16, S2b-U
+  ePDG F-TEID instance 8/interface 31, and the correlated request PGW F-TEID
+  instance 9/interface 33. Rejected contexts prohibit the ePDG endpoint and
+  carry a rejection Cause. Message Cause 17 is valid only for mixed results.
+- Delete Bearer Request must use exactly one target shape: one linked EBI at
+  instance 0, or one to fifteen dedicated EBIs at instance 1. Responses must
+  use the corresponding linked or grouped per-bearer form and account for
+  every requested EBI exactly once.
+- Dedicated-bearer correlation checks sequence number, list cardinality,
+  request PGW F-TEID or EBI identity, response shape, and bearer Cause/F-TEID
+  hierarchy. Malformed contexts are rejected rather than skipped.
 - F-TEID and PAA typed validation must reject ambiguous malformed address
   shapes instead of silently canonicalizing them.
 - Duplicate singleton IEs must be rejected according to the selected
@@ -84,6 +107,15 @@ failures and must cover at least these rules:
 - Product code must continue to enforce APN/DNN policy, bearer policy, roaming
   policy, charging policy, persistence, and transport behavior outside this
   crate.
+- Unknown well-formed top-level and nested optional IEs are preserved in order
+  through the typed dedicated-bearer projections/builders. Unknown duplicate
+  IE keys still obey the caller's `DuplicateIePolicy`; only the standardized
+  repeatable Bearer Context and dedicated-EBI keys are cardinality-aware.
+- `Gtpv2cTriggeredTransactions` keys requests by peer token, request TEID,
+  24-bit sequence number, message type, and procedure. It retains bounded
+  request/response bytes, rejects conflicting identity reuse, expires pending
+  and committed state on caller-supplied monotonic deadlines, and never
+  invokes application work itself. Its state is not crash-persistent.
 
 ### Graduation status
 
@@ -129,6 +161,9 @@ coverage.
    - Bearer QoS decodes the fixed 22-octet shape into priority/QCI plus
      40-bit maximum and guaranteed bit-rate fields; Charging ID decodes as a
      four-octet identifier.
+   - Bearer TFT (type 84) decodes to the canonical `opc-proto-tft`
+     `TrafficFlowTemplate`; the same value codec is consumed by IKEv2, avoiding
+     divergent protocol-specific TFT representations.
    - Cause decoding preserves the mandatory flags/locality octet and opaque
      offending-IE bytes; one-octet Cause values are rejected as malformed.
    - F-TEID uses the TS 29.274 V4/V6 flag bits (`0x80`/`0x40`) and rejects
@@ -147,8 +182,9 @@ coverage.
 4. **S2b message views**
    - `S2bMessage` decodes Echo Request/Response, Create Session
      Request/Response, Modify Bearer Request/Response (the S2b Modify Session
-     view), Delete Session Request/Response, and Update Bearer
-     Request/Response (the S2b Update Session view).
+     view), Delete Session Request/Response, Update Bearer Request/Response
+     (the S2b Update Session view), Create Bearer Request/Response, and Delete
+     Bearer Request/Response.
    - `ValidationLevel::ProcedureAware` checks the required IE subset claimed
      by this crate's S2b examples: Echo Request/Response Recovery; Create
      Session Request IMSI or emergency MEI plus UIMSI Indication, followed by
@@ -158,7 +194,22 @@ coverage.
      request linked EBI; and response Cause IEs.
    - Non-S2b message types fall back to the raw `Message` shell.
 
-5. **Echo peer helper**
+5. **Dedicated-bearer transaction helper**
+   - `Gtpv2cTriggeredTransactions` accepts complete, procedure-aware Create
+     Bearer and Delete Bearer requests and returns `Dispatch` only for their
+     first observation.
+   - An exact duplicate while application work is active returns `Pending`;
+     after a correlated response is committed, it returns the exact retained
+     bytes in `Replay` without re-running the application side effect.
+   - Commit validates procedure, direction, message type, sequence number,
+     configured response TEID, message Cause, response form, every requested
+     bearer, and PGW F-TEID correlation before retaining the response.
+   - Conflicting identity reuse, invalid completion/Cause declarations,
+     oversized retained bytes, capacity exhaustion, and expired transactions
+     return stable redaction-safe errors. Sequence 0 and `0x00ff_ffff` are
+     independent keys, so wrap does not alias active transactions.
+
+6. **Echo peer helper**
    - `Gtpv2cEchoPeer` tracks Echo request/response liveness, sequence mismatch,
      missed-response degradation/failure, peer Recovery restart-counter changes,
      and redaction-safe readiness blockers.
@@ -170,7 +221,7 @@ coverage.
    - With restart reconciliation disabled, restart-counter changes remain
      observable but do not fence Echo traffic.
 
-6. **OpenPacketCore protocol framework fit**
+7. **OpenPacketCore protocol framework fit**
    - `Message<'_>` implements `BorrowDecode`, `Encode`, and `ToOwnedPdu`.
    - `OwnedMessage` implements `OwnedDecode` and `Encode`.
    - `MessageType` provides a public typed message-type enum with
@@ -182,7 +233,7 @@ coverage.
    - `Debug` output for S2b typed message views redacts IMSI/MEI/MSISDN digits
      and summarizes raw IE buffers by length.
 
-7. **Fixture and corpus replay**
+8. **Fixture and corpus replay**
    - `tests/fixtures/spec/` contains the ADR 0015 conformance fixtures for the
      S2b subset. The accompanying `tests/fixtures/README.md` records
      octet-level comments for each spec-authored fixture.
@@ -201,7 +252,7 @@ coverage.
      IE iteration, raw-preserving encode, and truncation/adversarial no-panic
      checks.
 
-8. **Fuzz shell**
+9. **Fuzz shell**
    - `fuzz/Cargo.toml`, `fuzz/fuzz_targets/decode_message.rs`,
      `fuzz/fuzz_targets/decode_s2b.rs`, and
      `fuzz/fuzz_targets/roundtrip.rs` compile decode, typed S2b, owned-decode,
@@ -230,10 +281,9 @@ coverage.
 
 - A full Release 18 GTPv2-C implementation or a complete S2b IE/procedure
   matrix beyond the typed subset listed above.
-- Conditional IE, cross-message state-machine, peer-role, charging, QoS policy,
-  or bearer lifecycle semantic validation beyond the Create Session identity
-  alternative, ProcedureAware required subset, and transport-neutral
-  Echo/client-transaction helpers claimed here.
+- Product bearer admission, EBI/TEID/SPI allocation, Child-SA/XFRM/eBPF
+  programming, crash-persistent transaction storage, charging/QoS policy, and
+  UDP transport remain outside this codec/transaction boundary.
 - GTPv1-C, GTP-U, Diameter, S1AP, PMIP, or a production ePDG/PGW control plane.
 - Claims of carrier acceptance or interoperability beyond this production
   profile boundary until independent, licensed captures exist.
@@ -267,6 +317,15 @@ The committed fixture corpus is split by provenance class:
   - Modify Bearer, Delete Session, and Update Bearer fixtures validate the S2b
     Modify/Delete/Update Session-oriented views and ProcedureAware mandatory
     checks.
+  - Create Bearer Request validates linked EBI instance 0 plus a grouped
+    request EBI value 0, canonical Bearer TFT, Bearer QoS, S2b-U PGW F-TEID
+    instance 4/interface 33, and Charging ID.
+  - Create Bearer Response validates message/bearer Cause hierarchy, allocated
+    EBI, S2b-U ePDG F-TEID instance 8/interface 31, and correlated PGW F-TEID
+    instance 9/interface 33.
+  - Delete Bearer Request validates repeated dedicated EBI instance-1 targets;
+    Delete Bearer Response validates a partially accepted grouped result for
+    every request EBI.
 
 - **Independent-capture fixtures** live in `tests/fixtures/independent/` once
   available. The replay harness requires a finalized metadata sidecar before any

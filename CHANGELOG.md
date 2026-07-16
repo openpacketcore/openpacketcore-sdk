@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diagnostics, and scheduled decode/round-trip fuzz targets define the codec
   evidence. Transport wrappers and state-dependent bearer policy remain with
   the consuming GTPv2-C and IKEv2 procedure boundaries.
+- **S2b dedicated-bearer GTPv2-C — `opc-proto-gtpv2c`:** typed and
+  procedure-aware Create Bearer (95/96) and Delete Bearer (99/100) support now
+  validates mandatory nested IEs, canonical shared TFT values, S2b-U F-TEID
+  roles, mutually exclusive delete forms, partial results, and exact
+  request/response bearer correlation. A bounded transport-neutral triggered
+  transaction registry prevents duplicate application dispatch and replays
+  exact committed response bytes across retransmissions.
 - `opc-sctp`: an explicit, default-off `DiameterInboundPpidPolicy` escape hatch
   can accept inbound PPID 0 from a configured legacy clear-text Diameter peer.
   Standard PPID 46 remains accepted and is always used outbound; DTLS remains
