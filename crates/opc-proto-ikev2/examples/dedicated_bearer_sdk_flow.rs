@@ -28,9 +28,10 @@ use opc_proto_ikev2::{
     validate_ikev2_dedicated_bearer_create_child_sa_response_correlation,
     validate_ikev2_dedicated_bearer_delete_response_correlation, Header, HeaderFlags,
     Ikev2DedicatedBearerCreateChildSaRequestBuild, Ikev2DedicatedBearerCreateChildSaResponseBuild,
-    Ikev2DedicatedBearerDeleteResponseExpectation, Ikev2DedicatedBearerEspSpi, Ikev2EpsQos,
-    Ikev2NoncePayloadBuild, Ikev2SaPayloadBuild, Ikev2SaProposalBuild, Ikev2SaTransformBuild,
-    Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayloadBuild, Ikev2TransformAttributeBuild,
+    Ikev2DedicatedBearerDeleteResponseExpectation, Ikev2DedicatedBearerEspSpi, Ikev2EpsQosKbps,
+    Ikev2EpsQosMapping, Ikev2NoncePayloadBuild, Ikev2QosQuantization, Ikev2SaPayloadBuild,
+    Ikev2SaProposalBuild, Ikev2SaTransformBuild, Ikev2TrafficSelectorBuild,
+    Ikev2TrafficSelectorPayloadBuild, Ikev2TransformAttributeBuild,
     Ikev2TransformAttributeBuildValue, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
     EXCHANGE_TYPE_INFORMATIONAL, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_TS_IPV4_ADDR_RANGE,
 };
@@ -102,6 +103,12 @@ fn create_dedicated_bearer(
 
     // Admission and identifier allocation happen once, only after Dispatch.
     // The typed GTP TFT is passed unchanged into the typed IKEv2 Notify.
+    let mapped_qos = Ikev2EpsQosMapping::from_kbps(
+        Ikev2EpsQosKbps::NonGbr {
+            qci: context.bearer_qos.qci,
+        },
+        Ikev2QosQuantization::Exact,
+    )?;
     let ike_request_build = Ikev2DedicatedBearerCreateChildSaRequestBuild {
         // An SA proposal carries the sending endpoint's inbound SPI. This
         // request is sent by the ePDG, so it advertises the ePDG-owned SPI.
@@ -112,8 +119,8 @@ fn create_dedicated_bearer(
         key_exchange: None,
         traffic_selectors_initiator: selectors(),
         traffic_selectors_responder: selectors(),
-        eps_qos: Ikev2EpsQos::new(context.bearer_qos.qci, None, None, None)?,
-        extended_eps_qos: None,
+        eps_qos: mapped_qos.eps_qos().clone(),
+        extended_eps_qos: mapped_qos.extended_eps_qos(),
         tft: context.tft.clone(),
         apn_ambr: None,
         extended_apn_ambr: None,

@@ -28,6 +28,7 @@ use crate::{
     },
 };
 
+use super::qos::{validate_apn_ambr_notify_profile, validate_eps_qos_notify_profile};
 use super::{
     build_ikev2_dedicated_bearer_notify, decode_ikev2_dedicated_bearer_notify, Ikev2ApnAmbr,
     Ikev2DedicatedBearerError, Ikev2DedicatedBearerEspSpi, Ikev2DedicatedBearerNotify,
@@ -381,13 +382,18 @@ impl fmt::Debug for Ikev2DedicatedBearerCreateChildSaResponse<'_> {
 /// # Errors
 ///
 /// Returns [`Ikev2DedicatedBearerExchangeError`] for an invalid Child-SA
-/// proposal, KE relationship, TFT operation, AMBR dependency, or payload size.
+/// proposal, KE relationship, TFT operation, network-to-UE QoS/AMBR profile,
+/// optional-value dependency, or payload size.
 pub fn build_ikev2_dedicated_bearer_create_child_sa_request(
     input: &Ikev2DedicatedBearerCreateChildSaRequestBuild,
 ) -> Result<Ikev2DedicatedBearerCleartextPayloads, Ikev2DedicatedBearerExchangeError> {
     validate_sa_build(&input.security_association, false)?;
     validate_create_tft(&input.tft)?;
     validate_extended_ambr_dependency(input.apn_ambr, input.extended_apn_ambr)?;
+    validate_eps_qos_notify_profile(&input.eps_qos, input.extended_eps_qos)?;
+    if let Some(apn_ambr) = input.apn_ambr {
+        validate_apn_ambr_notify_profile(apn_ambr, input.extended_apn_ambr)?;
+    }
 
     let common =
         build_create_child_sa_rekey_response_payloads(&Ikev2CreateChildSaRekeyResponseBuild {
@@ -714,6 +720,10 @@ impl<'a> CreateChildSaParts<'a> {
         validate_ke_view(&security_association, self.key_exchange.as_ref())?;
         validate_create_tft(&tft)?;
         validate_extended_ambr_dependency(self.apn_ambr, self.extended_apn_ambr)?;
+        validate_eps_qos_notify_profile(&eps_qos, self.extended_eps_qos)?;
+        if let Some(apn_ambr) = self.apn_ambr {
+            validate_apn_ambr_notify_profile(apn_ambr, self.extended_apn_ambr)?;
+        }
         Ok(Ikev2DedicatedBearerCreateChildSaRequest {
             security_association,
             nonce,
@@ -2565,6 +2575,12 @@ fn validate_modification_shape(
         return Err(Ikev2DedicatedBearerExchangeError::ExtendedEpsQosWithoutEpsQos);
     }
     validate_extended_ambr_dependency(apn_ambr, extended_apn_ambr)?;
+    if let Some(eps_qos) = eps_qos {
+        validate_eps_qos_notify_profile(eps_qos, extended_eps_qos)?;
+    }
+    if let Some(apn_ambr) = apn_ambr {
+        validate_apn_ambr_notify_profile(apn_ambr, extended_apn_ambr)?;
+    }
     if eps_qos.is_none() && tft.is_none() && apn_ambr.is_none() {
         return Err(Ikev2DedicatedBearerExchangeError::ModificationHasNoUpdates);
     }

@@ -22,11 +22,12 @@ use opc_proto_ikev2::{
         Ikev2DedicatedBearerDeleteResponse, Ikev2DedicatedBearerDeleteResponseExpectation,
         Ikev2DedicatedBearerError, Ikev2DedicatedBearerEspSpi, Ikev2DedicatedBearerExchangeError,
         Ikev2DedicatedBearerModificationRequestBuild, Ikev2DedicatedBearerNotify,
-        Ikev2DedicatedBearerProtocolError, Ikev2DedicatedBearerResponseError, Ikev2EpsQos,
+        Ikev2DedicatedBearerProtocolError, Ikev2DedicatedBearerResponseError,
+        Ikev2EpsBearerBitRatesKbps, Ikev2EpsQos, Ikev2EpsQosKbps, Ikev2EpsQosMapping,
         Ikev2EpsQosRateCodes, Ikev2ExtendedApnAmbr, Ikev2ExtendedBitRateUnit, Ikev2ExtendedEpsQos,
-        IKEV2_NOTIFY_APN_AMBR, IKEV2_NOTIFY_EPS_QOS, IKEV2_NOTIFY_EXTENDED_APN_AMBR,
-        IKEV2_NOTIFY_EXTENDED_EPS_QOS, IKEV2_NOTIFY_MODIFIED_BEARER,
-        IKEV2_NOTIFY_MULTIPLE_BEARER_PDN_CONNECTIVITY,
+        Ikev2QosQuantization, Ikev2QosRateCodeTier, Ikev2QosRateField, IKEV2_NOTIFY_APN_AMBR,
+        IKEV2_NOTIFY_EPS_QOS, IKEV2_NOTIFY_EXTENDED_APN_AMBR, IKEV2_NOTIFY_EXTENDED_EPS_QOS,
+        IKEV2_NOTIFY_MODIFIED_BEARER, IKEV2_NOTIFY_MULTIPLE_BEARER_PDN_CONNECTIVITY,
         IKEV2_NOTIFY_SEMANTIC_ERRORS_IN_PACKET_FILTERS,
         IKEV2_NOTIFY_SEMANTIC_ERROR_IN_THE_TFT_OPERATION,
         IKEV2_NOTIFY_SYNTACTICAL_ERRORS_IN_PACKET_FILTERS,
@@ -104,7 +105,17 @@ fn response_header(exchange_type: u8, message_id: u32) -> Header {
 }
 
 fn eps_qos() -> Ikev2EpsQos {
-    must_ok(Ikev2EpsQos::new(1, None, None, None))
+    must_ok(Ikev2EpsQos::new(
+        1,
+        Some(Ikev2EpsQosRateCodes {
+            maximum_uplink: 128,
+            maximum_downlink: 128,
+            guaranteed_uplink: 64,
+            guaranteed_downlink: 64,
+        }),
+        None,
+        None,
+    ))
 }
 
 fn full_eps_qos() -> Ikev2EpsQos {
@@ -112,21 +123,21 @@ fn full_eps_qos() -> Ikev2EpsQos {
         1,
         Some(Ikev2EpsQosRateCodes {
             maximum_uplink: 0xfe,
-            maximum_downlink: 0xfd,
-            guaranteed_uplink: 0x80,
-            guaranteed_downlink: 0x7f,
+            maximum_downlink: 0xfe,
+            guaranteed_uplink: 0xfe,
+            guaranteed_downlink: 0xfe,
         }),
         Some(Ikev2EpsQosRateCodes {
             maximum_uplink: 0xfa,
-            maximum_downlink: 0xb9,
-            guaranteed_uplink: 0x4a,
-            guaranteed_downlink: 1,
+            maximum_downlink: 0xfa,
+            guaranteed_uplink: 0xfa,
+            guaranteed_downlink: 0xfa,
         }),
         Some(Ikev2EpsQosRateCodes {
             maximum_uplink: 0xf6,
-            maximum_downlink: 0xa2,
-            guaranteed_uplink: 0x3e,
-            guaranteed_downlink: 1,
+            maximum_downlink: 0xf6,
+            guaranteed_uplink: 0xf6,
+            guaranteed_downlink: 0xf6,
         }),
     ))
 }
@@ -136,9 +147,9 @@ fn extended_eps_qos() -> Ikev2ExtendedEpsQos {
         maximum_unit: Ikev2ExtendedBitRateUnit::new(7),
         maximum_uplink: 11,
         maximum_downlink: 12,
-        guaranteed_unit: Ikev2ExtendedBitRateUnit::new(8),
-        guaranteed_uplink: 13,
-        guaranteed_downlink: 14,
+        guaranteed_unit: Ikev2ExtendedBitRateUnit::new(7),
+        guaranteed_uplink: 11,
+        guaranteed_downlink: 11,
     }
 }
 
@@ -146,15 +157,15 @@ fn apn_ambr() -> Ikev2ApnAmbr {
     must_ok(Ikev2ApnAmbr::new(
         Ikev2ApnAmbrRateCodes {
             downlink: 0xfe,
-            uplink: 0xfd,
+            uplink: 0xfe,
         },
         Some(Ikev2ApnAmbrRateCodes {
             downlink: 0xfa,
-            uplink: 0xb9,
+            uplink: 0xfa,
         }),
         Some(Ikev2ApnAmbrRateCodes {
             downlink: 0xfe,
-            uplink: 1,
+            uplink: 0xfe,
         }),
     ))
 }
@@ -262,7 +273,7 @@ fn create_request_build() -> Ikev2DedicatedBearerCreateChildSaRequestBuild {
         key_exchange: None,
         traffic_selectors_initiator: broad_ts(),
         traffic_selectors_responder: broad_ts(),
-        eps_qos: eps_qos(),
+        eps_qos: full_eps_qos(),
         extended_eps_qos: Some(extended_eps_qos()),
         tft: create_tft(),
         apn_ambr: None,
@@ -422,6 +433,143 @@ fn typed_notify_rejects_wrong_shape_length_qci_and_zero_spi() {
         decode_ikev2_dedicated_bearer_notify(must_ok(Ikev2NotifyPayload::decode_body(&zero_spi))),
         Err(Ikev2DedicatedBearerError::ZeroEspSpi)
     ));
+}
+
+#[test]
+fn strict_network_profile_rejects_reserved_rate_codes_on_decode_and_encode() {
+    let reserved_eps_value = [1, 0, 1, 1, 1];
+    assert_eq!(
+        Ikev2EpsQos::decode_value(&reserved_eps_value),
+        Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+            field: Ikev2QosRateField::MaximumUplink,
+            tier: Ikev2QosRateCodeTier::Base,
+            value: 0,
+        })
+    );
+    let reserved_eps = must_ok(Ikev2EpsQos::new(
+        1,
+        Some(Ikev2EpsQosRateCodes {
+            maximum_uplink: 0,
+            maximum_downlink: 1,
+            guaranteed_uplink: 1,
+            guaranteed_downlink: 1,
+        }),
+        None,
+        None,
+    ));
+    assert_eq!(
+        build_ikev2_dedicated_bearer_notify(&Ikev2DedicatedBearerNotify::EpsQos(
+            reserved_eps.clone(),
+        )),
+        Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+            field: Ikev2QosRateField::MaximumUplink,
+            tier: Ikev2QosRateCodeTier::Base,
+            value: 0,
+        })
+    );
+
+    let reserved_apn_value = [0, 1];
+    assert_eq!(
+        Ikev2ApnAmbr::decode_value(&reserved_apn_value),
+        Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+            field: Ikev2QosRateField::ApnAmbrDownlink,
+            tier: Ikev2QosRateCodeTier::Base,
+            value: 0,
+        })
+    );
+    let reserved_apn = must_ok(Ikev2ApnAmbr::new(
+        Ikev2ApnAmbrRateCodes {
+            downlink: 0,
+            uplink: 1,
+        },
+        None,
+        None,
+    ));
+    assert_eq!(
+        build_ikev2_dedicated_bearer_notify(&Ikev2DedicatedBearerNotify::ApnAmbr(reserved_apn)),
+        Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+            field: Ikev2QosRateField::ApnAmbrDownlink,
+            tier: Ikev2QosRateCodeTier::Base,
+            value: 0,
+        })
+    );
+
+    let mut request = create_request_build();
+    request.eps_qos = reserved_eps;
+    request.extended_eps_qos = None;
+    assert_eq!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&request),
+        Err(Ikev2DedicatedBearerExchangeError::ThreeGpp(
+            Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field: Ikev2QosRateField::MaximumUplink,
+                tier: Ikev2QosRateCodeTier::Base,
+                value: 0,
+            }
+        ))
+    );
+}
+
+#[test]
+fn production_builders_revalidate_manual_qos_resource_tiers_and_external_sentinels() {
+    let mut request = create_request_build();
+    request.eps_qos = must_ok(Ikev2EpsQos::new(1, None, None, None));
+    request.extended_eps_qos = None;
+    assert!(matches!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&request),
+        Err(Ikev2DedicatedBearerExchangeError::ThreeGpp(
+            Ikev2DedicatedBearerError::QosResourceProfileMismatch { qci: 1, .. }
+        ))
+    ));
+
+    request.eps_qos = must_ok(Ikev2EpsQos::new(
+        1,
+        Some(Ikev2EpsQosRateCodes {
+            maximum_uplink: 1,
+            maximum_downlink: 1,
+            guaranteed_uplink: 1,
+            guaranteed_downlink: 1,
+        }),
+        Some(Ikev2EpsQosRateCodes {
+            maximum_uplink: 1,
+            maximum_downlink: 0,
+            guaranteed_uplink: 0,
+            guaranteed_downlink: 0,
+        }),
+        None,
+    ));
+    assert!(matches!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&request),
+        Err(Ikev2DedicatedBearerExchangeError::ThreeGpp(
+            Ikev2DedicatedBearerError::QosTierSaturationRequired {
+                field: Ikev2QosRateField::MaximumUplink,
+                tier: Ikev2QosRateCodeTier::Extended,
+            }
+        ))
+    ));
+
+    request.eps_qos = eps_qos();
+    request.extended_eps_qos = Some(extended_eps_qos());
+    assert!(matches!(
+        build_ikev2_dedicated_bearer_create_child_sa_request(&request),
+        Err(Ikev2DedicatedBearerExchangeError::ThreeGpp(
+            Ikev2DedicatedBearerError::ExtendedQosSentinelRequired { .. }
+        ))
+    ));
+
+    let empty_extended = Ikev2ExtendedEpsQos {
+        maximum_unit: Ikev2ExtendedBitRateUnit::new(0),
+        maximum_uplink: 0,
+        maximum_downlink: 0,
+        guaranteed_unit: Ikev2ExtendedBitRateUnit::new(0),
+        guaranteed_uplink: 0,
+        guaranteed_downlink: 0,
+    };
+    assert_eq!(
+        build_ikev2_dedicated_bearer_notify(&Ikev2DedicatedBearerNotify::ExtendedEpsQos(
+            empty_extended,
+        )),
+        Err(Ikev2DedicatedBearerError::ExtendedEpsQosHasNoRates)
+    );
 }
 
 #[test]
@@ -1194,7 +1342,7 @@ fn response_correlation_rejects_unoffered_proposal_and_transform() {
 fn modification_roundtrip_and_dependencies_are_strict() {
     let input = Ikev2DedicatedBearerModificationRequestBuild {
         modified_bearer: must_ok(Ikev2DedicatedBearerEspSpi::new(0x1020_3040)),
-        eps_qos: Some(eps_qos()),
+        eps_qos: Some(full_eps_qos()),
         extended_eps_qos: Some(extended_eps_qos()),
         tft: Some(replacement_tft()),
         apn_ambr: Some(apn_ambr()),
@@ -1438,30 +1586,38 @@ fn redaction_safe_debug_omits_spi_and_unknown_bytes() {
 }
 
 quickcheck! {
-    fn eps_qos_value_roundtrips(
+    fn mapped_gbr_eps_qos_value_roundtrips(
         qci_selector: u8,
-        a: u8,
-        b: u8,
-        c: u8,
-        d: u8
+        a: u32,
+        b: u32,
+        c: u32,
+        d: u32
     ) -> bool {
-        let qcis = [1u8, 5, 9, 65, 69, 79, 82, 128, 200, 254];
+        let qcis = [1u8, 65, 71, 82, 128, 200, 254];
         let qci = qcis[usize::from(qci_selector) % qcis.len()];
-        let value = match Ikev2EpsQos::new(
-            qci,
-            Some(Ikev2EpsQosRateCodes {
-                maximum_uplink: a,
-                maximum_downlink: b,
-                guaranteed_uplink: c,
-                guaranteed_downlink: d,
-            }),
-            None,
-            None,
+        let maximum_uplink = u64::from(a % 20_000_000).saturating_add(1);
+        let maximum_downlink = u64::from(b % 20_000_000).saturating_add(1);
+        let mapping = match Ikev2EpsQosMapping::from_kbps(
+            Ikev2EpsQosKbps::Gbr {
+                qci,
+                rates: Ikev2EpsBearerBitRatesKbps {
+                    maximum_uplink,
+                    maximum_downlink,
+                    guaranteed_uplink: u64::from(c) % maximum_uplink.saturating_add(1),
+                    guaranteed_downlink: u64::from(d) % maximum_downlink.saturating_add(1),
+                },
+            },
+            Ikev2QosQuantization::Ceiling,
         ) {
-            Ok(value) => value,
+            Ok(mapping) => mapping,
             Err(_) => return false,
         };
-        Ikev2EpsQos::decode_value(&value.encode_value()) == Ok(value)
+        let value = mapping.eps_qos().clone();
+        let eps_roundtrips = Ikev2EpsQos::decode_value(&value.encode_value()) == Ok(value);
+        let extended_roundtrips = mapping.extended_eps_qos().is_none_or(|extended| {
+            Ikev2ExtendedEpsQos::decode_value(&extended.encode_value()) == Ok(extended)
+        });
+        eps_roundtrips && extended_roundtrips
     }
 }
 
@@ -1470,11 +1626,11 @@ fn specification_authored_opened_payload_fixtures_are_byte_exact() {
     // RFC 7296 generic payload framing combined with TS 24.302 R17 7.2.7,
     // 7.4.6.3 and 8.2.9.10-8.2.9.12. The first octet is the SK Next Payload;
     // the remaining octets are the already-authenticated cleartext chain.
-    const CREATE_REQUEST: &str = "21280000240000002001030402010203040300000c01000014800e010000000008050000002c00002411111111111111111111111111111111111111111111111111111111111111112d00001801000000070000100000ffff00000000ffffffff2900001801000000070000100000ffff00000000ffffffff2900000a0000a41e0101290000130000a41f0a07000b000c08000d000e000000120000a4210921330a053011501194";
+    const CREATE_REQUEST: &str = "21280000240000002001030402010203040300000c01000014800e010000000008050000002c00002411111111111111111111111111111111111111111111111111111111111111112d00001801000000070000100000ffff00000000ffffffff2900001801000000070000100000ffff00000000ffffffff290000160000a41e0d01fefefefefafafafaf6f6f6f6290000130000a41f0a07000b000c07000b000b000000120000a4210921330a053011501194";
     const CREATE_RESPONSE: &str = "21280000240000002001030402050607080300000c01000014800e010000000008050000002c00002422222222222222222222222222222222222222222222222222222222222222222d0000180100000007000010119411940a0000010a00000a000000180100000007000010119411940a0000010a00000a";
     const CREATE_ERROR: &str = "290000000800002035";
     const MODIFICATION: &str =
-        "292900000c0304a424102030402900000a0000a41e0101000000100000a4210781330a03501388";
+        "292900000c0304a424102030402900000e0000a41e050180804040000000100000a4210781330a03501388";
     const DELETION: &str = "2a0000000c0304000110203040";
 
     let create_request = decode_hex_fixture(CREATE_REQUEST);

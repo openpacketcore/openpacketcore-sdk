@@ -56,7 +56,7 @@ pub use exchange::{
 pub use qos::{
     Ikev2ApnAmbrKbps, Ikev2ApnAmbrMapping, Ikev2EpsBearerBitRatesKbps, Ikev2EpsQosKbps,
     Ikev2EpsQosMapping, Ikev2QosDirection, Ikev2QosMappingError, Ikev2QosQuantization,
-    Ikev2QosRateField, Ikev2QosResourceType,
+    Ikev2QosRateCodeTier, Ikev2QosRateField, Ikev2QosResourceType,
 };
 
 /// Private error Notify for a semantic error in a TFT operation.
@@ -171,7 +171,12 @@ pub struct Ikev2EpsQos {
 }
 
 impl Ikev2EpsQos {
-    /// Construct an EPS QoS value.
+    /// Construct a structurally contiguous EPS QoS value.
+    ///
+    /// This compatibility constructor retains caller-supplied compact codes.
+    /// Strict decode and [`build_ikev2_dedicated_bearer_notify`] additionally
+    /// enforce the complete Release 17 network-to-UE wire profile. The checked
+    /// [`Ikev2EpsQosMapping`] API is preferred for production construction.
     ///
     /// # Errors
     ///
@@ -202,7 +207,8 @@ impl Ikev2EpsQos {
     ///
     /// # Errors
     ///
-    /// Returns [`Ikev2DedicatedBearerError`] for an invalid length or QCI.
+    /// Returns [`Ikev2DedicatedBearerError`] for an invalid length, QCI,
+    /// resource shape, reserved code, tier relationship, or GBR relationship.
     pub fn decode_value(value: &[u8]) -> Result<Self, Ikev2DedicatedBearerError> {
         if !EPS_QOS_LENGTHS.contains(&value.len()) {
             return Err(Ikev2DedicatedBearerError::InvalidEpsQosLength {
@@ -213,10 +219,15 @@ impl Ikev2EpsQos {
         let base_rates = value.get(1..5).map(Ikev2EpsQosRateCodes::from_slice);
         let extended_rates = value.get(5..9).map(Ikev2EpsQosRateCodes::from_slice);
         let extended_2_rates = value.get(9..13).map(Ikev2EpsQosRateCodes::from_slice);
-        Self::new(qci, base_rates, extended_rates, extended_2_rates)
+        let decoded = Self::new(qci, base_rates, extended_rates, extended_2_rates)?;
+        qos::validate_eps_qos_wire_profile(&decoded)?;
+        Ok(decoded)
     }
 
-    /// Encode the TS 24.301 value part without a NAS IEI or length octet.
+    /// Encode the retained TS 24.301 value part without validation.
+    ///
+    /// Production callers should use [`build_ikev2_dedicated_bearer_notify`]
+    /// or an exchange builder, which revalidates the network-to-UE profile.
     pub fn encode_value(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_value_len());
         out.push(self.qci);
@@ -266,8 +277,9 @@ impl Ikev2EpsQos {
 
 /// Unit code used by TS 24.301 extended bit-rate values.
 ///
-/// Codes beyond the explicitly assigned Release 17 range are retained because
-/// TS 24.301 defines their receiver interpretation rather than reserving them.
+/// Codes beyond the explicitly assigned Release 17 range can be retained in a
+/// raw value. Strict decode and production builders require canonical assigned
+/// network-to-UE units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ikev2ExtendedBitRateUnit(u8);
 
@@ -305,24 +317,30 @@ impl Ikev2ExtendedEpsQos {
     ///
     /// # Errors
     ///
-    /// Returns [`Ikev2DedicatedBearerError`] when the value is not ten octets.
+    /// Returns [`Ikev2DedicatedBearerError`] when the value is not ten octets
+    /// or does not carry a canonical rate above 10 Gbps.
     pub fn decode_value(value: &[u8]) -> Result<Self, Ikev2DedicatedBearerError> {
         if value.len() != EXTENDED_EPS_QOS_LEN {
             return Err(Ikev2DedicatedBearerError::InvalidExtendedEpsQosLength {
                 actual: value.len(),
             });
         }
-        Ok(Self {
+        let decoded = Self {
             maximum_unit: Ikev2ExtendedBitRateUnit::new(value[0]),
             maximum_uplink: u16::from_be_bytes([value[1], value[2]]),
             maximum_downlink: u16::from_be_bytes([value[3], value[4]]),
             guaranteed_unit: Ikev2ExtendedBitRateUnit::new(value[5]),
             guaranteed_uplink: u16::from_be_bytes([value[6], value[7]]),
             guaranteed_downlink: u16::from_be_bytes([value[8], value[9]]),
-        })
+        };
+        qos::validate_extended_eps_qos_wire_profile(decoded)?;
+        Ok(decoded)
     }
 
-    /// Encode the ten-octet TS 24.301 value part.
+    /// Encode the retained ten-octet TS 24.301 value part without validation.
+    ///
+    /// Production callers should use [`build_ikev2_dedicated_bearer_notify`]
+    /// or an exchange builder.
     pub fn encode_value(self) -> [u8; EXTENDED_EPS_QOS_LEN] {
         let maximum_uplink = self.maximum_uplink.to_be_bytes();
         let maximum_downlink = self.maximum_downlink.to_be_bytes();
@@ -363,6 +381,11 @@ pub struct Ikev2ApnAmbr {
 impl Ikev2ApnAmbr {
     /// Construct APN-AMBR with structurally contiguous optional tiers.
     ///
+    /// This compatibility constructor retains caller-supplied compact codes.
+    /// Strict decode and production Notify/exchange builders additionally
+    /// enforce the complete Release 17 network-to-UE wire profile. The checked
+    /// [`Ikev2ApnAmbrMapping`] API is preferred for production construction.
+    ///
     /// # Errors
     ///
     /// Returns [`Ikev2DedicatedBearerError`] if extended-2 is present without
@@ -386,7 +409,8 @@ impl Ikev2ApnAmbr {
     ///
     /// # Errors
     ///
-    /// Returns [`Ikev2DedicatedBearerError`] for an invalid length.
+    /// Returns [`Ikev2DedicatedBearerError`] for an invalid length, reserved
+    /// compact code, or non-canonical tier relationship.
     pub fn decode_value(value: &[u8]) -> Result<Self, Ikev2DedicatedBearerError> {
         if !APN_AMBR_LENGTHS.contains(&value.len()) {
             return Err(Ikev2DedicatedBearerError::InvalidApnAmbrLength {
@@ -397,14 +421,19 @@ impl Ikev2ApnAmbr {
             downlink: value[offset],
             uplink: value[offset + 1],
         };
-        Self::new(
+        let decoded = Self::new(
             pair(0),
             (value.len() >= 4).then(|| pair(2)),
             (value.len() == 6).then(|| pair(4)),
-        )
+        )?;
+        qos::validate_apn_ambr_wire_profile(decoded)?;
+        Ok(decoded)
     }
 
-    /// Encode the TS 24.301 value part.
+    /// Encode the retained TS 24.301 value part without validation.
+    ///
+    /// Production callers should use [`build_ikev2_dedicated_bearer_notify`]
+    /// or an exchange builder.
     pub fn encode_value(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_value_len());
         out.extend_from_slice(&[self.base.downlink, self.base.uplink]);
@@ -457,22 +486,28 @@ impl Ikev2ExtendedApnAmbr {
     ///
     /// # Errors
     ///
-    /// Returns [`Ikev2DedicatedBearerError`] when the value is not six octets.
+    /// Returns [`Ikev2DedicatedBearerError`] when the value is not six octets
+    /// or does not carry a canonical rate above 65,280 Mbps.
     pub fn decode_value(value: &[u8]) -> Result<Self, Ikev2DedicatedBearerError> {
         if value.len() != EXTENDED_APN_AMBR_LEN {
             return Err(Ikev2DedicatedBearerError::InvalidExtendedApnAmbrLength {
                 actual: value.len(),
             });
         }
-        Ok(Self {
+        let decoded = Self {
             downlink_unit: Ikev2ExtendedBitRateUnit::new(value[0]),
             downlink: u16::from_be_bytes([value[1], value[2]]),
             uplink_unit: Ikev2ExtendedBitRateUnit::new(value[3]),
             uplink: u16::from_be_bytes([value[4], value[5]]),
-        })
+        };
+        qos::validate_extended_apn_ambr_wire_profile(decoded)?;
+        Ok(decoded)
     }
 
-    /// Encode the six-octet TS 24.301 value part.
+    /// Encode the retained six-octet TS 24.301 value part without validation.
+    ///
+    /// Production callers should use [`build_ikev2_dedicated_bearer_notify`]
+    /// or an exchange builder.
     pub fn encode_value(self) -> [u8; EXTENDED_APN_AMBR_LEN] {
         let downlink = self.downlink.to_be_bytes();
         let uplink = self.uplink.to_be_bytes();
@@ -724,8 +759,9 @@ pub fn decode_ikev2_dedicated_bearer_notify(
 ///
 /// # Errors
 ///
-/// Returns [`Ikev2DedicatedBearerError`] if the TFT cannot be encoded or a
-/// one-octet TS 24.302 inner length would overflow.
+/// Returns [`Ikev2DedicatedBearerError`] if a QoS/AMBR value violates the
+/// Release 17 network-to-UE profile, the TFT cannot be encoded, or a one-octet
+/// TS 24.302 inner length would overflow.
 pub fn build_ikev2_dedicated_bearer_notify(
     value: &Ikev2DedicatedBearerNotify,
 ) -> Result<Ikev2IkeAuthPayloadBuild, Ikev2DedicatedBearerError> {
@@ -734,16 +770,22 @@ pub fn build_ikev2_dedicated_bearer_notify(
         | Ikev2DedicatedBearerNotify::ProtocolError(_) => {
             (IKEV2_NOTIFY_PROTOCOL_ID_NONE, Vec::new(), Vec::new())
         }
-        Ikev2DedicatedBearerNotify::EpsQos(value) => (
-            IKEV2_NOTIFY_PROTOCOL_ID_NONE,
-            Vec::new(),
-            encode_length_prefixed_value(&value.encode_value())?,
-        ),
-        Ikev2DedicatedBearerNotify::ExtendedEpsQos(value) => (
-            IKEV2_NOTIFY_PROTOCOL_ID_NONE,
-            Vec::new(),
-            encode_length_prefixed_value(&value.encode_value())?,
-        ),
+        Ikev2DedicatedBearerNotify::EpsQos(value) => {
+            qos::validate_eps_qos_wire_profile(value)?;
+            (
+                IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+                Vec::new(),
+                encode_length_prefixed_value(&value.encode_value())?,
+            )
+        }
+        Ikev2DedicatedBearerNotify::ExtendedEpsQos(value) => {
+            qos::validate_extended_eps_qos_wire_profile(*value)?;
+            (
+                IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+                Vec::new(),
+                encode_length_prefixed_value(&value.encode_value())?,
+            )
+        }
         Ikev2DedicatedBearerNotify::Tft(value) => {
             let mut encoded = BytesMut::with_capacity(value.encoded_value_len()?);
             value.encode_value(&mut encoded)?;
@@ -758,16 +800,22 @@ pub fn build_ikev2_dedicated_bearer_notify(
             spi.to_be_bytes().to_vec(),
             Vec::new(),
         ),
-        Ikev2DedicatedBearerNotify::ApnAmbr(value) => (
-            IKEV2_NOTIFY_PROTOCOL_ID_NONE,
-            Vec::new(),
-            encode_length_prefixed_value(&value.encode_value())?,
-        ),
-        Ikev2DedicatedBearerNotify::ExtendedApnAmbr(value) => (
-            IKEV2_NOTIFY_PROTOCOL_ID_NONE,
-            Vec::new(),
-            encode_length_prefixed_value(&value.encode_value())?,
-        ),
+        Ikev2DedicatedBearerNotify::ApnAmbr(value) => {
+            qos::validate_apn_ambr_wire_profile(*value)?;
+            (
+                IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+                Vec::new(),
+                encode_length_prefixed_value(&value.encode_value())?,
+            )
+        }
+        Ikev2DedicatedBearerNotify::ExtendedApnAmbr(value) => {
+            qos::validate_extended_apn_ambr_wire_profile(*value)?;
+            (
+                IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+                Vec::new(),
+                encode_length_prefixed_value(&value.encode_value())?,
+            )
+        }
     };
     let input = Ikev2NotifyPayloadBuild {
         protocol_id,
@@ -896,10 +944,63 @@ pub enum Ikev2DedicatedBearerError {
     },
     /// An EPS QoS optional tier was present without its predecessor.
     EpsQosTierGap,
+    /// A compact QoS/APN-AMBR rate code is reserved or non-canonical for a network sender.
+    InvalidQosRateCode {
+        /// Rate field containing the invalid code.
+        field: Ikev2QosRateField,
+        /// Compact-code tier containing the invalid code.
+        tier: Ikev2QosRateCodeTier,
+        /// Invalid one-octet code.
+        value: u8,
+    },
+    /// A standardized QCI used the wrong GBR/non-GBR wire shape.
+    QosResourceProfileMismatch {
+        /// Standardized QCI supplied on the wire.
+        qci: u8,
+        /// Resource type assigned by TS 23.203.
+        expected: Ikev2QosResourceType,
+        /// Resource type implied by presence or absence of rate octets.
+        actual: Ikev2QosResourceType,
+    },
+    /// Both maximum rates in a GBR EPS QoS value represent zero kbps.
+    EpsQosMaximumRatesZero,
+    /// A guaranteed EPS bearer rate exceeds its corresponding maximum rate.
+    EpsQosGuaranteedRateExceedsMaximum {
+        /// Direction containing the invalid relationship.
+        direction: Ikev2QosDirection,
+    },
+    /// A higher compact rate tier was used without saturating its lower tier.
+    QosTierSaturationRequired {
+        /// Rate field containing the inconsistent tier.
+        field: Ikev2QosRateField,
+        /// Higher tier that requires saturated lower tiers.
+        tier: Ikev2QosRateCodeTier,
+    },
     /// Extended EPS QoS value was not ten octets.
     InvalidExtendedEpsQosLength {
         /// Received length.
         actual: usize,
+    },
+    /// An external extended-rate value used a non-canonical unit code.
+    InvalidExtendedQosUnit {
+        /// First field governed by the unit code.
+        field: Ikev2QosRateField,
+        /// Invalid unit code.
+        value: u8,
+    },
+    /// Extended EPS QoS carried no rate above its 10 Gbps threshold.
+    ExtendedEpsQosHasNoRates,
+    /// Extended APN-AMBR carried no rate above its 65,280 Mbps threshold.
+    ExtendedApnAmbrHasNoRates,
+    /// A non-zero external rate does not exceed the threshold requiring that IE.
+    ExtendedQosRateNotAboveThreshold {
+        /// Rate field containing the value.
+        field: Ikev2QosRateField,
+    },
+    /// An external rate was present without the required saturated compact-code sentinel.
+    ExtendedQosSentinelRequired {
+        /// Rate field whose compact-code tiers are inconsistent.
+        field: Ikev2QosRateField,
     },
     /// APN-AMBR value length was not 2, 4, or 6 octets.
     InvalidApnAmbrLength {
@@ -939,9 +1040,23 @@ impl Ikev2DedicatedBearerError {
             Self::InvalidEpsQosLength { .. } => "ikev2_3gpp_eps_qos_length_invalid",
             Self::InvalidQci { .. } => "ikev2_3gpp_eps_qos_qci_invalid",
             Self::EpsQosTierGap => "ikev2_3gpp_eps_qos_tier_gap",
+            Self::InvalidQosRateCode { .. } => "ikev2_3gpp_qos_rate_code_invalid",
+            Self::QosResourceProfileMismatch { .. } => "ikev2_3gpp_qos_resource_profile_mismatch",
+            Self::EpsQosMaximumRatesZero => "ikev2_3gpp_eps_qos_maximum_rates_zero",
+            Self::EpsQosGuaranteedRateExceedsMaximum { .. } => {
+                "ikev2_3gpp_eps_qos_guaranteed_exceeds_maximum"
+            }
+            Self::QosTierSaturationRequired { .. } => "ikev2_3gpp_qos_tier_saturation_required",
             Self::InvalidExtendedEpsQosLength { .. } => {
                 "ikev2_3gpp_extended_eps_qos_length_invalid"
             }
+            Self::InvalidExtendedQosUnit { .. } => "ikev2_3gpp_extended_qos_unit_invalid",
+            Self::ExtendedEpsQosHasNoRates => "ikev2_3gpp_extended_eps_qos_rates_missing",
+            Self::ExtendedApnAmbrHasNoRates => "ikev2_3gpp_extended_apn_ambr_rates_missing",
+            Self::ExtendedQosRateNotAboveThreshold { .. } => {
+                "ikev2_3gpp_extended_qos_rate_below_threshold"
+            }
+            Self::ExtendedQosSentinelRequired { .. } => "ikev2_3gpp_extended_qos_sentinel_required",
             Self::InvalidApnAmbrLength { .. } => "ikev2_3gpp_apn_ambr_length_invalid",
             Self::ApnAmbrTierGap => "ikev2_3gpp_apn_ambr_tier_gap",
             Self::InvalidExtendedApnAmbrLength { .. } => {

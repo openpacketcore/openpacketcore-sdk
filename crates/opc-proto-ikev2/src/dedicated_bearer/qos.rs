@@ -92,6 +92,17 @@ pub enum Ikev2QosRateField {
     ApnAmbrUplink,
 }
 
+/// TS 24.301 octet tier containing a compact bit-rate code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ikev2QosRateCodeTier {
+    /// Base one-octet rate code.
+    Base,
+    /// First extended one-octet rate code.
+    Extended,
+    /// Second extended one-octet rate code.
+    Extended2,
+}
+
 /// Four integer-kbps rates for a GBR bearer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ikev2EpsBearerBitRatesKbps {
@@ -404,7 +415,7 @@ impl Ikev2ApnAmbrMapping {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Ikev2QosMappingError {
-    /// The QCI is reserved or unsupported by the Release 18 profile.
+    /// The QCI is reserved or unsupported by the Release 17 profile.
     UnsupportedQci {
         /// QCI supplied by the caller.
         qci: u8,
@@ -521,12 +532,8 @@ fn validate_qci_resource(
     qci: u8,
     actual: Ikev2QosResourceType,
 ) -> Result<(), Ikev2QosMappingError> {
-    let expected = match qci {
-        1..=4 | 65..=67 | 71..=76 | 82..=85 => Some(Ikev2QosResourceType::Gbr),
-        5..=10 | 69..=70 | 79..=80 => Some(Ikev2QosResourceType::NonGbr),
-        128..=254 => None,
-        _ => return Err(Ikev2QosMappingError::UnsupportedQci { qci }),
-    };
+    let expected =
+        standardized_qci_resource(qci).ok_or(Ikev2QosMappingError::UnsupportedQci { qci })?;
     match expected {
         Some(expected) if expected != actual => {
             Err(Ikev2QosMappingError::StandardizedQciResourceMismatch {
@@ -537,6 +544,395 @@ fn validate_qci_resource(
         }
         _ => Ok(()),
     }
+}
+
+fn standardized_qci_resource(qci: u8) -> Option<Option<Ikev2QosResourceType>> {
+    match qci {
+        1..=4 | 65..=67 | 71..=76 | 82..=85 => Some(Some(Ikev2QosResourceType::Gbr)),
+        5..=10 | 69..=70 | 79..=80 => Some(Some(Ikev2QosResourceType::NonGbr)),
+        128..=254 => Some(None),
+        _ => None,
+    }
+}
+
+const EPS_RATE_FIELDS: [Ikev2QosRateField; 4] = [
+    Ikev2QosRateField::MaximumUplink,
+    Ikev2QosRateField::MaximumDownlink,
+    Ikev2QosRateField::GuaranteedUplink,
+    Ikev2QosRateField::GuaranteedDownlink,
+];
+
+fn eps_rate_codes(codes: Ikev2EpsQosRateCodes) -> [u8; 4] {
+    [
+        codes.maximum_uplink,
+        codes.maximum_downlink,
+        codes.guaranteed_uplink,
+        codes.guaranteed_downlink,
+    ]
+}
+
+fn apn_rate_codes(codes: Ikev2ApnAmbrRateCodes) -> [u8; 2] {
+    [codes.downlink, codes.uplink]
+}
+
+pub(super) fn validate_eps_qos_wire_profile(
+    value: &Ikev2EpsQos,
+) -> Result<Option<[u64; 4]>, Ikev2DedicatedBearerError> {
+    super::validate_qci(value.qci())?;
+    let actual = if value.base_rates().is_some() {
+        Ikev2QosResourceType::Gbr
+    } else {
+        Ikev2QosResourceType::NonGbr
+    };
+    if let Some(expected) = standardized_qci_resource(value.qci()).and_then(core::convert::identity)
+    {
+        if expected != actual {
+            return Err(Ikev2DedicatedBearerError::QosResourceProfileMismatch {
+                qci: value.qci(),
+                expected,
+                actual,
+            });
+        }
+    }
+
+    let Some(base_rates) = value.base_rates() else {
+        if value.extended_rates().is_some() || value.extended_2_rates().is_some() {
+            return Err(Ikev2DedicatedBearerError::EpsQosTierGap);
+        }
+        return Ok(None);
+    };
+    if value.extended_2_rates().is_some() && value.extended_rates().is_none() {
+        return Err(Ikev2DedicatedBearerError::EpsQosTierGap);
+    }
+
+    let base = eps_rate_codes(base_rates);
+    let extended = value.extended_rates().map(eps_rate_codes);
+    let extended_2 = value.extended_2_rates().map(eps_rate_codes);
+    let mut represented = [0_u64; 4];
+    for (index, field) in EPS_RATE_FIELDS.into_iter().enumerate() {
+        let base_code = base[index];
+        if base_code == 0 {
+            return Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field,
+                tier: Ikev2QosRateCodeTier::Base,
+                value: base_code,
+            });
+        }
+        let extended_code = extended.map_or(0, |codes| codes[index]);
+        if extended_code > 250 {
+            return Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field,
+                tier: Ikev2QosRateCodeTier::Extended,
+                value: extended_code,
+            });
+        }
+        let extended_2_code = extended_2.map_or(0, |codes| codes[index]);
+        if extended_2_code > 246 {
+            return Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field,
+                tier: Ikev2QosRateCodeTier::Extended2,
+                value: extended_2_code,
+            });
+        }
+        if extended_code != 0 && base_code != 254 {
+            return Err(Ikev2DedicatedBearerError::QosTierSaturationRequired {
+                field,
+                tier: Ikev2QosRateCodeTier::Extended,
+            });
+        }
+        if extended_2_code != 0 && (base_code != 254 || extended_code != 250) {
+            return Err(Ikev2DedicatedBearerError::QosTierSaturationRequired {
+                field,
+                tier: Ikev2QosRateCodeTier::Extended2,
+            });
+        }
+        represented[index] = if extended_2_code != 0 {
+            extended_2_rate(extended_2_code)
+        } else if extended_code != 0 {
+            extended_rate(extended_code)
+        } else {
+            base_rate(base_code)
+        };
+    }
+
+    validate_eps_rate_relationships(represented)?;
+    Ok(Some(represented))
+}
+
+pub(super) fn validate_extended_eps_qos_wire_profile(
+    value: Ikev2ExtendedEpsQos,
+) -> Result<[Option<u64>; 4], Ikev2DedicatedBearerError> {
+    let maximum = validate_extended_pair(
+        value.maximum_unit,
+        value.maximum_uplink,
+        value.maximum_downlink,
+        Ikev2QosRateField::MaximumUplink,
+        Ikev2QosRateField::MaximumDownlink,
+        EPS_EXTENDED_THRESHOLD_KBPS,
+        1,
+    )?;
+    let guaranteed = validate_extended_pair(
+        value.guaranteed_unit,
+        value.guaranteed_uplink,
+        value.guaranteed_downlink,
+        Ikev2QosRateField::GuaranteedUplink,
+        Ikev2QosRateField::GuaranteedDownlink,
+        EPS_EXTENDED_THRESHOLD_KBPS,
+        1,
+    )?;
+    let rates = [maximum[0], maximum[1], guaranteed[0], guaranteed[1]];
+    if rates.iter().all(Option::is_none) {
+        return Err(Ikev2DedicatedBearerError::ExtendedEpsQosHasNoRates);
+    }
+    Ok(rates)
+}
+
+pub(super) fn validate_eps_qos_notify_profile(
+    eps_qos: &Ikev2EpsQos,
+    extended_eps_qos: Option<Ikev2ExtendedEpsQos>,
+) -> Result<(), Ikev2DedicatedBearerError> {
+    let compact_rates = validate_eps_qos_wire_profile(eps_qos)?;
+    let Some(extended) = extended_eps_qos else {
+        return Ok(());
+    };
+    let external_rates = validate_extended_eps_qos_wire_profile(extended)?;
+    let Some(mut represented) = compact_rates else {
+        return Err(Ikev2DedicatedBearerError::ExtendedQosSentinelRequired {
+            field: EPS_RATE_FIELDS[0],
+        });
+    };
+    let base = eps_rate_codes(eps_qos.base_rates().ok_or(
+        Ikev2DedicatedBearerError::ExtendedQosSentinelRequired {
+            field: EPS_RATE_FIELDS[0],
+        },
+    )?);
+    let extended_codes = eps_qos.extended_rates().map(eps_rate_codes);
+    let extended_2_codes = eps_qos.extended_2_rates().map(eps_rate_codes);
+    for (index, field) in EPS_RATE_FIELDS.into_iter().enumerate() {
+        if let Some(rate) = external_rates[index] {
+            let sentinel = base[index] == 254
+                && extended_codes.is_some_and(|codes| codes[index] == 250)
+                && extended_2_codes.is_some_and(|codes| codes[index] == 246);
+            if !sentinel {
+                return Err(Ikev2DedicatedBearerError::ExtendedQosSentinelRequired { field });
+            }
+            represented[index] = rate;
+        }
+    }
+    validate_eps_rate_relationships(represented)
+}
+
+pub(super) fn validate_apn_ambr_wire_profile(
+    value: Ikev2ApnAmbr,
+) -> Result<[u64; 2], Ikev2DedicatedBearerError> {
+    if value.extended_2().is_some() && value.extended().is_none() {
+        return Err(Ikev2DedicatedBearerError::ApnAmbrTierGap);
+    }
+    let fields = [
+        Ikev2QosRateField::ApnAmbrDownlink,
+        Ikev2QosRateField::ApnAmbrUplink,
+    ];
+    let base = apn_rate_codes(value.base());
+    let extended = value.extended().map(apn_rate_codes);
+    let extended_2 = value.extended_2().map(apn_rate_codes);
+    let mut represented = [0_u64; 2];
+    for (index, field) in fields.into_iter().enumerate() {
+        let base_code = base[index];
+        if base_code == 0 {
+            return Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field,
+                tier: Ikev2QosRateCodeTier::Base,
+                value: base_code,
+            });
+        }
+        let extended_code = extended.map_or(0, |codes| codes[index]);
+        if extended_code > 250 {
+            return Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field,
+                tier: Ikev2QosRateCodeTier::Extended,
+                value: extended_code,
+            });
+        }
+        let extended_2_code = extended_2.map_or(0, |codes| codes[index]);
+        if extended_2_code == 255 {
+            return Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field,
+                tier: Ikev2QosRateCodeTier::Extended2,
+                value: extended_2_code,
+            });
+        }
+        if extended_code != 0 && base_code != 254 {
+            return Err(Ikev2DedicatedBearerError::QosTierSaturationRequired {
+                field,
+                tier: Ikev2QosRateCodeTier::Extended,
+            });
+        }
+        if extended_2_code != 0 && base_code != 254 {
+            return Err(Ikev2DedicatedBearerError::QosTierSaturationRequired {
+                field,
+                tier: Ikev2QosRateCodeTier::Extended2,
+            });
+        }
+        let lower = if extended_code != 0 {
+            extended_rate(extended_code)
+        } else {
+            base_rate(base_code)
+        };
+        represented[index] = if extended_2_code == 0 {
+            lower
+        } else {
+            u64::from(extended_2_code)
+                .saturating_mul(APN_EXTENDED_2_INCREMENT_KBPS)
+                .saturating_add(lower)
+        };
+    }
+    Ok(represented)
+}
+
+pub(super) fn validate_extended_apn_ambr_wire_profile(
+    value: Ikev2ExtendedApnAmbr,
+) -> Result<[Option<u64>; 2], Ikev2DedicatedBearerError> {
+    let downlink = validate_extended_direction_profile(
+        value.downlink_unit,
+        value.downlink,
+        Ikev2QosRateField::ApnAmbrDownlink,
+        APN_EXTENDED_THRESHOLD_KBPS,
+        3,
+    )?;
+    let uplink = validate_extended_direction_profile(
+        value.uplink_unit,
+        value.uplink,
+        Ikev2QosRateField::ApnAmbrUplink,
+        APN_EXTENDED_THRESHOLD_KBPS,
+        3,
+    )?;
+    if downlink.is_none() && uplink.is_none() {
+        return Err(Ikev2DedicatedBearerError::ExtendedApnAmbrHasNoRates);
+    }
+    Ok([downlink, uplink])
+}
+
+pub(super) fn validate_apn_ambr_notify_profile(
+    apn_ambr: Ikev2ApnAmbr,
+    extended_apn_ambr: Option<Ikev2ExtendedApnAmbr>,
+) -> Result<(), Ikev2DedicatedBearerError> {
+    validate_apn_ambr_wire_profile(apn_ambr)?;
+    let Some(extended_value) = extended_apn_ambr else {
+        return Ok(());
+    };
+    let external_rates = validate_extended_apn_ambr_wire_profile(extended_value)?;
+    let base = apn_rate_codes(apn_ambr.base());
+    let extended = apn_ambr.extended().map(apn_rate_codes);
+    let extended_2 = apn_ambr.extended_2().map(apn_rate_codes);
+    let fields = [
+        Ikev2QosRateField::ApnAmbrDownlink,
+        Ikev2QosRateField::ApnAmbrUplink,
+    ];
+    for (index, field) in fields.into_iter().enumerate() {
+        if external_rates[index].is_some() {
+            let sentinel = base[index] == 254
+                && extended.is_some_and(|codes| codes[index] == 250)
+                && extended_2.is_some_and(|codes| codes[index] == 254);
+            if !sentinel {
+                return Err(Ikev2DedicatedBearerError::ExtendedQosSentinelRequired { field });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_eps_rate_relationships(rates: [u64; 4]) -> Result<(), Ikev2DedicatedBearerError> {
+    if rates[0] == 0 && rates[1] == 0 {
+        return Err(Ikev2DedicatedBearerError::EpsQosMaximumRatesZero);
+    }
+    if rates[2] > rates[0] {
+        return Err(
+            Ikev2DedicatedBearerError::EpsQosGuaranteedRateExceedsMaximum {
+                direction: Ikev2QosDirection::Uplink,
+            },
+        );
+    }
+    if rates[3] > rates[1] {
+        return Err(
+            Ikev2DedicatedBearerError::EpsQosGuaranteedRateExceedsMaximum {
+                direction: Ikev2QosDirection::Downlink,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_extended_pair(
+    unit: Ikev2ExtendedBitRateUnit,
+    left: u16,
+    right: u16,
+    left_field: Ikev2QosRateField,
+    right_field: Ikev2QosRateField,
+    threshold: u64,
+    first_unit: u8,
+) -> Result<[Option<u64>; 2], Ikev2DedicatedBearerError> {
+    if left == 0 && right == 0 {
+        if unit.wire_value() != 0 {
+            return Err(Ikev2DedicatedBearerError::InvalidExtendedQosUnit {
+                field: left_field,
+                value: unit.wire_value(),
+            });
+        }
+        return Ok([None, None]);
+    }
+    let unit_kbps = validate_extended_unit(unit, left_field, first_unit)?;
+    Ok([
+        validate_extended_multiplier(left, left_field, threshold, unit_kbps)?,
+        validate_extended_multiplier(right, right_field, threshold, unit_kbps)?,
+    ])
+}
+
+fn validate_extended_direction_profile(
+    unit: Ikev2ExtendedBitRateUnit,
+    multiplier: u16,
+    field: Ikev2QosRateField,
+    threshold: u64,
+    first_unit: u8,
+) -> Result<Option<u64>, Ikev2DedicatedBearerError> {
+    if multiplier == 0 {
+        if unit.wire_value() != 0 {
+            return Err(Ikev2DedicatedBearerError::InvalidExtendedQosUnit {
+                field,
+                value: unit.wire_value(),
+            });
+        }
+        return Ok(None);
+    }
+    let unit_kbps = validate_extended_unit(unit, field, first_unit)?;
+    validate_extended_multiplier(multiplier, field, threshold, unit_kbps)
+}
+
+fn validate_extended_unit(
+    unit: Ikev2ExtendedBitRateUnit,
+    field: Ikev2QosRateField,
+    first_unit: u8,
+) -> Result<u64, Ikev2DedicatedBearerError> {
+    let code = unit.wire_value();
+    if !(first_unit..=21).contains(&code) {
+        return Err(Ikev2DedicatedBearerError::InvalidExtendedQosUnit { field, value: code });
+    }
+    unit_kbps(code).ok_or(Ikev2DedicatedBearerError::InvalidExtendedQosUnit { field, value: code })
+}
+
+fn validate_extended_multiplier(
+    multiplier: u16,
+    field: Ikev2QosRateField,
+    threshold: u64,
+    unit_kbps: u64,
+) -> Result<Option<u64>, Ikev2DedicatedBearerError> {
+    if multiplier == 0 {
+        return Ok(None);
+    }
+    let represented = u64::from(multiplier).saturating_mul(unit_kbps);
+    if represented <= threshold {
+        return Err(Ikev2DedicatedBearerError::ExtendedQosRateNotAboveThreshold { field });
+    }
+    Ok(Some(represented))
 }
 
 fn validate_gbr_rates(rates: Ikev2EpsBearerBitRatesKbps) -> Result<(), Ikev2QosMappingError> {
@@ -877,6 +1273,13 @@ fn unit_kbps(code: u8) -> Option<u64> {
 mod tests {
     use super::*;
 
+    fn must_codec<T>(result: Result<T, Ikev2DedicatedBearerError>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("dedicated-bearer value construction failed: {error:?}"),
+        }
+    }
+
     fn must_map_eps(
         rates: Ikev2EpsBearerBitRatesKbps,
         quantization: Ikev2QosQuantization,
@@ -1203,6 +1606,255 @@ mod tests {
                 direction: Ikev2QosDirection::Uplink,
                 maximum_kbps: 100,
                 guaranteed_kbps: 101,
+            })
+        );
+    }
+
+    #[test]
+    fn strict_eps_profile_rejects_resource_codes_tiers_and_rate_relationships() {
+        let rate_codes =
+            |maximum_uplink, maximum_downlink, guaranteed_uplink, guaranteed_downlink| {
+                Ikev2EpsQosRateCodes {
+                    maximum_uplink,
+                    maximum_downlink,
+                    guaranteed_uplink,
+                    guaranteed_downlink,
+                }
+            };
+
+        let non_gbr_with_rates = must_codec(Ikev2EpsQos::new(
+            9,
+            Some(rate_codes(1, 1, 1, 1)),
+            None,
+            None,
+        ));
+        assert_eq!(
+            validate_eps_qos_wire_profile(&non_gbr_with_rates),
+            Err(Ikev2DedicatedBearerError::QosResourceProfileMismatch {
+                qci: 9,
+                expected: Ikev2QosResourceType::NonGbr,
+                actual: Ikev2QosResourceType::Gbr,
+            })
+        );
+
+        let zero_maximums = must_codec(Ikev2EpsQos::new(
+            1,
+            Some(rate_codes(255, 255, 255, 255)),
+            None,
+            None,
+        ));
+        assert_eq!(
+            validate_eps_qos_wire_profile(&zero_maximums),
+            Err(Ikev2DedicatedBearerError::EpsQosMaximumRatesZero)
+        );
+
+        let guarantee_above_maximum = must_codec(Ikev2EpsQos::new(
+            1,
+            Some(rate_codes(1, 1, 2, 1)),
+            None,
+            None,
+        ));
+        assert_eq!(
+            validate_eps_qos_wire_profile(&guarantee_above_maximum),
+            Err(
+                Ikev2DedicatedBearerError::EpsQosGuaranteedRateExceedsMaximum {
+                    direction: Ikev2QosDirection::Uplink,
+                }
+            )
+        );
+
+        let invalid_extended_code = must_codec(Ikev2EpsQos::new(
+            1,
+            Some(rate_codes(254, 1, 1, 1)),
+            Some(rate_codes(251, 0, 0, 0)),
+            None,
+        ));
+        assert_eq!(
+            validate_eps_qos_wire_profile(&invalid_extended_code),
+            Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field: Ikev2QosRateField::MaximumUplink,
+                tier: Ikev2QosRateCodeTier::Extended,
+                value: 251,
+            })
+        );
+
+        let invalid_extended_2_code = must_codec(Ikev2EpsQos::new(
+            1,
+            Some(rate_codes(254, 1, 1, 1)),
+            Some(rate_codes(250, 0, 0, 0)),
+            Some(rate_codes(247, 0, 0, 0)),
+        ));
+        assert_eq!(
+            validate_eps_qos_wire_profile(&invalid_extended_2_code),
+            Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field: Ikev2QosRateField::MaximumUplink,
+                tier: Ikev2QosRateCodeTier::Extended2,
+                value: 247,
+            })
+        );
+
+        let unsaturated_extended_tier = must_codec(Ikev2EpsQos::new(
+            1,
+            Some(rate_codes(1, 1, 1, 1)),
+            Some(rate_codes(1, 0, 0, 0)),
+            None,
+        ));
+        assert_eq!(
+            validate_eps_qos_wire_profile(&unsaturated_extended_tier),
+            Err(Ikev2DedicatedBearerError::QosTierSaturationRequired {
+                field: Ikev2QosRateField::MaximumUplink,
+                tier: Ikev2QosRateCodeTier::Extended,
+            })
+        );
+    }
+
+    #[test]
+    fn strict_extended_eps_profile_rejects_units_thresholds_and_missing_sentinel() {
+        let invalid_unit = Ikev2ExtendedEpsQos {
+            maximum_unit: Ikev2ExtendedBitRateUnit::new(0),
+            maximum_uplink: 50_001,
+            maximum_downlink: 0,
+            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(0),
+            guaranteed_uplink: 0,
+            guaranteed_downlink: 0,
+        };
+        assert_eq!(
+            validate_extended_eps_qos_wire_profile(invalid_unit),
+            Err(Ikev2DedicatedBearerError::InvalidExtendedQosUnit {
+                field: Ikev2QosRateField::MaximumUplink,
+                value: 0,
+            })
+        );
+
+        let below_threshold = Ikev2ExtendedEpsQos {
+            maximum_unit: Ikev2ExtendedBitRateUnit::new(1),
+            maximum_uplink: 1,
+            maximum_downlink: 0,
+            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(0),
+            guaranteed_uplink: 0,
+            guaranteed_downlink: 0,
+        };
+        assert_eq!(
+            validate_extended_eps_qos_wire_profile(below_threshold),
+            Err(
+                Ikev2DedicatedBearerError::ExtendedQosRateNotAboveThreshold {
+                    field: Ikev2QosRateField::MaximumUplink,
+                }
+            )
+        );
+
+        let no_rates = Ikev2ExtendedEpsQos {
+            maximum_unit: Ikev2ExtendedBitRateUnit::new(0),
+            maximum_uplink: 0,
+            maximum_downlink: 0,
+            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(0),
+            guaranteed_uplink: 0,
+            guaranteed_downlink: 0,
+        };
+        assert_eq!(
+            validate_extended_eps_qos_wire_profile(no_rates),
+            Err(Ikev2DedicatedBearerError::ExtendedEpsQosHasNoRates)
+        );
+
+        let compact = must_codec(Ikev2EpsQos::new(
+            1,
+            Some(Ikev2EpsQosRateCodes {
+                maximum_uplink: 128,
+                maximum_downlink: 128,
+                guaranteed_uplink: 64,
+                guaranteed_downlink: 64,
+            }),
+            None,
+            None,
+        ));
+        let external = Ikev2ExtendedEpsQos {
+            maximum_unit: Ikev2ExtendedBitRateUnit::new(7),
+            maximum_uplink: 11,
+            maximum_downlink: 0,
+            guaranteed_unit: Ikev2ExtendedBitRateUnit::new(0),
+            guaranteed_uplink: 0,
+            guaranteed_downlink: 0,
+        };
+        assert_eq!(
+            validate_eps_qos_notify_profile(&compact, Some(external)),
+            Err(Ikev2DedicatedBearerError::ExtendedQosSentinelRequired {
+                field: Ikev2QosRateField::MaximumUplink,
+            })
+        );
+    }
+
+    #[test]
+    fn strict_apn_profile_rejects_aliases_tiers_and_external_mismatch() {
+        let must_apn =
+            |base, extended, extended_2| must_codec(Ikev2ApnAmbr::new(base, extended, extended_2));
+        let pair = |downlink, uplink| Ikev2ApnAmbrRateCodes { downlink, uplink };
+
+        let invalid_extended_code = must_apn(pair(254, 1), Some(pair(251, 0)), None);
+        assert_eq!(
+            validate_apn_ambr_wire_profile(invalid_extended_code),
+            Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field: Ikev2QosRateField::ApnAmbrDownlink,
+                tier: Ikev2QosRateCodeTier::Extended,
+                value: 251,
+            })
+        );
+
+        let invalid_extended_2_alias =
+            must_apn(pair(254, 1), Some(pair(250, 0)), Some(pair(255, 0)));
+        assert_eq!(
+            validate_apn_ambr_wire_profile(invalid_extended_2_alias),
+            Err(Ikev2DedicatedBearerError::InvalidQosRateCode {
+                field: Ikev2QosRateField::ApnAmbrDownlink,
+                tier: Ikev2QosRateCodeTier::Extended2,
+                value: 255,
+            })
+        );
+
+        let unsaturated = must_apn(pair(1, 1), Some(pair(1, 0)), None);
+        assert_eq!(
+            validate_apn_ambr_wire_profile(unsaturated),
+            Err(Ikev2DedicatedBearerError::QosTierSaturationRequired {
+                field: Ikev2QosRateField::ApnAmbrDownlink,
+                tier: Ikev2QosRateCodeTier::Extended,
+            })
+        );
+
+        let invalid_external_unit = Ikev2ExtendedApnAmbr {
+            downlink_unit: Ikev2ExtendedBitRateUnit::new(2),
+            downlink: u16::MAX,
+            uplink_unit: Ikev2ExtendedBitRateUnit::new(0),
+            uplink: 0,
+        };
+        assert_eq!(
+            validate_extended_apn_ambr_wire_profile(invalid_external_unit),
+            Err(Ikev2DedicatedBearerError::InvalidExtendedQosUnit {
+                field: Ikev2QosRateField::ApnAmbrDownlink,
+                value: 2,
+            })
+        );
+
+        let no_external_rates = Ikev2ExtendedApnAmbr {
+            downlink_unit: Ikev2ExtendedBitRateUnit::new(0),
+            downlink: 0,
+            uplink_unit: Ikev2ExtendedBitRateUnit::new(0),
+            uplink: 0,
+        };
+        assert_eq!(
+            validate_extended_apn_ambr_wire_profile(no_external_rates),
+            Err(Ikev2DedicatedBearerError::ExtendedApnAmbrHasNoRates)
+        );
+
+        let compact = must_apn(pair(128, 128), None, None);
+        let external = Ikev2ExtendedApnAmbr {
+            downlink_unit: Ikev2ExtendedBitRateUnit::new(7),
+            downlink: 66,
+            uplink_unit: Ikev2ExtendedBitRateUnit::new(0),
+            uplink: 0,
+        };
+        assert_eq!(
+            validate_apn_ambr_notify_profile(compact, Some(external)),
+            Err(Ikev2DedicatedBearerError::ExtendedQosSentinelRequired {
+                field: Ikev2QosRateField::ApnAmbrDownlink,
             })
         );
     }

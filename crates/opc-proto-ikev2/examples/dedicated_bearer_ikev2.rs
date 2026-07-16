@@ -12,8 +12,9 @@ use opc_proto_ikev2::{
     validate_ikev2_dedicated_bearer_create_child_sa_response_correlation,
     validate_ikev2_dedicated_bearer_delete_response_correlation, Header, HeaderFlags,
     Ikev2DedicatedBearerCreateChildSaRequestBuild, Ikev2DedicatedBearerCreateChildSaResponseBuild,
-    Ikev2DedicatedBearerDeleteResponseExpectation, Ikev2DedicatedBearerEspSpi, Ikev2EpsQos,
-    Ikev2NoncePayloadBuild, Ikev2SaPayloadBuild, Ikev2SaProposalBuild, Ikev2SaTransformBuild,
+    Ikev2DedicatedBearerDeleteResponseExpectation, Ikev2DedicatedBearerEspSpi,
+    Ikev2EpsBearerBitRatesKbps, Ikev2EpsQosKbps, Ikev2EpsQosMapping, Ikev2NoncePayloadBuild,
+    Ikev2QosQuantization, Ikev2SaPayloadBuild, Ikev2SaProposalBuild, Ikev2SaTransformBuild,
     Ikev2TrafficSelectorBuild, Ikev2TrafficSelectorPayloadBuild, Ikev2TransformAttributeBuild,
     Ikev2TransformAttributeBuildValue, PayloadType, EXCHANGE_TYPE_CREATE_CHILD_SA,
     EXCHANGE_TYPE_INFORMATIONAL, IKEV2_SECURITY_PROTOCOL_ID_ESP, IKEV2_TS_IPV4_ADDR_RANGE,
@@ -83,6 +84,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         vec![PacketFilterComponent::ProtocolIdentifierNextHeader(17)],
     )?;
     let tft = TrafficFlowTemplate::create_new(vec![filter], vec![])?;
+    let voice_qos = Ikev2EpsQosMapping::from_kbps(
+        Ikev2EpsQosKbps::Gbr {
+            qci: 1,
+            rates: Ikev2EpsBearerBitRatesKbps {
+                maximum_uplink: 128,
+                maximum_downlink: 128,
+                guaranteed_uplink: 64,
+                guaranteed_downlink: 64,
+            },
+        },
+        Ikev2QosQuantization::Exact,
+    )?;
     let request_build = Ikev2DedicatedBearerCreateChildSaRequestBuild {
         security_association: child_sa(EPDG_INBOUND_CHILD_SPI),
         nonce: Ikev2NoncePayloadBuild {
@@ -91,8 +104,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         key_exchange: None,
         traffic_selectors_initiator: selectors(),
         traffic_selectors_responder: selectors(),
-        eps_qos: Ikev2EpsQos::new(1, None, None, None)?,
-        extended_eps_qos: None,
+        eps_qos: voice_qos.eps_qos().clone(),
+        extended_eps_qos: voice_qos.extended_eps_qos(),
         tft,
         apn_ambr: None,
         extended_apn_ambr: None,
