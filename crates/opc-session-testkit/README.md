@@ -182,7 +182,7 @@ at the interval baseline, with interval conservation enforced. The schedule
 binds this accounting as `new-attempts-plus-baseline-outstanding/v1`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns retain a zero budget throughout the fault and clean intervals.
-The private Schedule v5 binds this procedure as
+The private Schedule v6 binds this procedure as
 `member-scoped-reauth-settled-baseline/v3` with progress profile
 `common-key-pulse-all-active-key-coverage/v1`. Every epoch-changing interval
 allows `superseded` only up to the existing per-node connection-attempt bound
@@ -223,16 +223,21 @@ canary and mixed workload during the outage. The same-disk, exact-address
 process must then reconcile at most 262,144 committed journal entries, prove
 the exact latest generation/owner/fence/payload with a linearizable read, catch
 its watch up without a gap, and resume mutation at a strictly higher same-owner
-fence under the `same-disk-exact-address-active-mutator/v2` stage-bounded
+fence under the `same-disk-exact-address-active-mutator/v3` stage-bounded
 profile. Its independent bounds are 5 seconds for termination/reaping, 26
 seconds for outage/survivor progress, 45 seconds for replacement-child startup,
-26 seconds for Openraft readiness/catch-up, 25 seconds for journal
-reconciliation, and 26 seconds for higher-fence mutation resume. Those
-sequential stages compose to a 153-second crash-to-resume ceiling; each stage
-still fails at its own bound and cannot borrow from the total. Schedule v5
-binds the count, profile, six bounds, and total so old results cannot masquerade
-as this evidence. This fixes the under-composed v1 qualification deadline that
-incorrectly placed all six stages inside one 26-second clock. This scenario
+37 seconds for Openraft recovery and readiness observation (the existing
+26-second recovery envelope followed by one reserved 11-second final all-voter
+readiness round: 10 seconds for the backend operation and 1 second for bounded
+local result delivery), 25 seconds for journal reconciliation, and 26 seconds
+for higher-fence mutation resume. Those sequential stages compose to a
+164-second crash-to-resume ceiling; each stage still fails at its own bound and
+cannot borrow from the total. Schedule v6 binds the count, profile, recovery
+envelope, delivery allowance, final observation reserve, six bounds, and total
+so old results cannot masquerade as this evidence. This retains the v1
+deadline-composition fix and corrects v2's free-running readiness loop, which
+could strand the last six seconds without admitting a complete observation
+round. This scenario
 does not provide a broader
 restart/fault matrix, resource or soak qualification, remote-HKMS evidence,
 deployed-CNF evidence, deployed production readiness, signed release evidence,
@@ -330,7 +335,7 @@ backend operation after joining their owned task. Normal status commands remain
 authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
 
-Schedule v5 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
+Schedule v6 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
 recovery operation finishes after its fixed deadline, the campaign remains
 failed and reports only the closed deadline code, the terminal operation stage,
 and elapsed milliseconds. It does not replace the failure with the earlier

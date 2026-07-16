@@ -381,7 +381,7 @@ five-second refresh rounds over four/eight incident paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved
 node). The reverse probe fails local material preflight without dialing. Terminal
 outcomes may additionally contain only the exact attempts already outstanding
-at the interval baseline, and must satisfy interval conservation; Schedule v5
+at the interval baseline, and must satisfy interval conservation; Schedule v6
 binds `new-attempts-plus-baseline-outstanding/v1` and
 `common-key-pulse-all-active-key-coverage/v1`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
@@ -421,8 +421,8 @@ exactly one stable follower is killed uncleanly with active mutation and watch
 tasks. Survivor commits must advance during the outage, and the same-disk,
 exact-address restart must reconcile the bounded committed journal, prove the
 exact current record, catch its watch up, and resume under a strictly higher
-same-owner fence. Schedule v5 binds this one
-`same-disk-exact-address-active-mutator/v2` profile and independently enforces
+same-owner fence. Schedule v6 binds this one
+`same-disk-exact-address-active-mutator/v3` profile and independently enforces
 the following stage deadlines:
 
 | Restart stage | Bound |
@@ -430,15 +430,18 @@ the following stage deadlines:
 | SIGKILL termination and process reaping | 5 seconds |
 | Outage work and survivor progress | 26 seconds |
 | Replacement-child startup | 45 seconds |
-| Openraft all-voter readiness and catch-up | 26 seconds |
+| Openraft recovery and all-voter readiness observation | 37 seconds |
 | Bounded journal reconciliation | 25 seconds |
 | Higher-fence mutation resume | 26 seconds |
 
-The sequential stages compose to a 153-second crash-to-resume ceiling. Each
+The sequential stages compose to a 164-second crash-to-resume ceiling. Each
 stage fails independently and cannot borrow unused time from another stage or
-use the total as its timer. This fixes an under-composed v1 qualification
-deadline that placed termination, outage work, startup, Raft catch-up, journal
-reconciliation, and higher-fence resume inside one 26-second clock. A broader
+use the total as its timer. The 37-second readiness stage is the 26-second
+recovery envelope followed by one 11-second final round: a 10-second backend
+operation plus 1 second of bounded local result delivery. This retains the v1
+deadline-composition fix and corrects v2's free-running probe admission, which
+could strand the final six seconds without one complete all-voter readiness
+round. A broader
 restart/fault matrix, resource/soak, remote-HKMS, deployed-CNF, signed release,
 and evidence-schema/production-profile results remain open; the correction
 does not prove deployed production readiness. This does not alter the

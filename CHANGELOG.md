@@ -132,10 +132,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expired-to-survivor probe fails local material preflight without dialing.
   Terminal outcomes may additionally
   contain only the exact attempts already outstanding at the interval baseline;
-  the connection conservation equation remains mandatory. Schedule v5 binds
+  the connection conservation equation remains mandatory. Schedule v6 binds
   this as `new-attempts-plus-baseline-outstanding/v1`. Cancellation-classified
   `abandoned` outcomes, protocol/backend outcomes, and drain overruns remain
-  forbidden throughout the fault and clean intervals. Schedule v5 advances the
+  forbidden throughout the fault and clean intervals. Schedule v6 advances the
   checkpoint to `member-scoped-reauth-settled-baseline/v3` and binds its rolling
   proof as `common-key-pulse-all-active-key-coverage/v1`. Recovery continuity
   polls use a
@@ -169,22 +169,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stable follower is killed uncleanly while its mutation and watch tasks are
   active. The survivor majority advances both the encrypted canary and mixed
   traffic during the outage. The corrected
-  `same-disk-exact-address-active-mutator/v2` profile checks six sequential
+  `same-disk-exact-address-active-mutator/v3` profile checks six sequential
   stages independently: termination and process reaping within 5 seconds,
   outage/survivor progress within 26 seconds, replacement-child startup within
-  45 seconds, Openraft readiness/catch-up within 26 seconds, reconciliation of
-  at most 262,144 exact journal entries within 25 seconds, and mutation resume
-  under a strictly higher same-owner fence within 26 seconds. The composed
-  crash-to-resume ceiling is 153 seconds, but no stage may borrow unused time
-  from another stage or substitute that total for its own bound. Schedule v5
-  binds the scenario, count, six bounds, and total, so v1 evidence cannot
-  satisfy the new assertions. This corrects the under-composed v1
-  qualification deadline, which incorrectly charged termination, outage work,
-  startup, Raft catch-up, journal reconciliation, and higher-fence resume to
-  one 26-second clock. A stage that finishes after its fixed deadline fails
+  45 seconds, Openraft recovery and readiness observation within 37 seconds
+  (the existing 26-second recovery envelope plus one reserved 11-second final
+  all-voter readiness round: 10 seconds for the backend operation and 1 second
+  for bounded local result delivery), reconciliation of at most 262,144 exact
+  journal entries within 25 seconds, and mutation resume under a strictly
+  higher same-owner fence within 26 seconds. The composed crash-to-resume
+  ceiling is 164 seconds, but no stage may borrow unused time from another
+  stage or substitute that total for its own bound. Schedule v6 binds the scenario,
+  count, recovery envelope, delivery allowance, final observation reserve, six
+  bounds, and total, so older evidence cannot satisfy the new assertions. This retains the v1
+  deadline-composition correction and fixes v2's free-running probe admission,
+  which could strand the final six seconds without a complete readiness round.
+  A stage that finishes after its fixed deadline fails
   with a closed terminal-stage plus elapsed-millisecond diagnostic rather than
   preserving an earlier ambiguous error that hides where the overrun occurred;
-  Schedule v5 binds this as `terminal-stage-elapsed-millis/v1`. A child that
+  Schedule v6 binds this as `terminal-stage-elapsed-millis/v1`. A child that
   exits during restart configuration now reports only the fixed `transport`,
   `sqlite`, `consensus`, or `listener` startup stage; underlying errors, paths,
   and identities remain redacted.

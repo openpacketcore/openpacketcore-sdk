@@ -480,17 +480,20 @@ node; the reverse probe fails local material preflight without dialing).
 Terminal outcomes
 may additionally contain only the exact attempts already outstanding at the
 baseline, with interval conservation enforced under the schedule-bound
-`new-attempts-plus-baseline-outstanding/v1` profile. Schedule v5 also binds the
+`new-attempts-plus-baseline-outstanding/v1` profile. Schedule v6 also binds the
 rolling proof as `common-key-pulse-all-active-key-coverage/v1`. It requires zero
 cancellation-classified `abandoned`, protocol/backend, or drain-overrun
 evidence. Recovery polling is
 non-intrusive; final watch-head settlement retains its fail-closed
-authoritative replication-head read. Schedule v5 now binds the active-mutator
+authoritative replication-head read. Schedule v6 now binds the active-mutator
 scenario as
-`same-disk-exact-address-active-mutator/v2`: independent 5-second termination,
-26-second outage/survivor-progress, 45-second startup, 26-second Openraft
-readiness/catch-up, 25-second journal-reconciliation, and 26-second
-higher-fence-resume deadlines compose to a 153-second crash-to-resume ceiling.
+`same-disk-exact-address-active-mutator/v3`: independent 5-second termination,
+26-second outage/survivor-progress, 45-second startup, 37-second Openraft
+recovery/readiness-observation (a 26-second recovery envelope plus one reserved
+11-second final all-voter readiness round: 10 seconds for the backend operation
+and 1 second for bounded local result delivery), 25-second
+journal-reconciliation, and 26-second higher-fence-resume deadlines compose to a 164-second
+crash-to-resume ceiling.
 Each stage fails independently; the total is not a shared timer. This fixes an
 under-composed v1 qualification deadline that charged all six stages to one
 26-second clock without changing the separate 26-second survivor-availability

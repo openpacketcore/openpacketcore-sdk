@@ -903,16 +903,19 @@ performs exactly one unclean same-disk, exact-address restart of a stable
 follower while that member's mutation and watch tasks are active. Survivors
 must advance committed canary and mixed traffic during the outage; the returned
 member must reconcile the exact bounded journal/current record and resume at a
-strictly higher same-owner fence. Schedule v5 binds
-`same-disk-exact-address-active-mutator/v2`. The independently checked stages
+strictly higher same-owner fence. Schedule v6 binds
+`same-disk-exact-address-active-mutator/v3`. The independently checked stages
 are termination/reaping (5 seconds), outage/survivor progress (26 seconds),
-replacement-child startup (45 seconds), Openraft readiness/catch-up (26
-seconds), journal reconciliation (25 seconds), and higher-fence resume (26
-seconds). The composed crash-to-resume ceiling is 153 seconds; it is not a
-shared timer, and each stage fails at its own deadline. This corrects the
-under-composed v1 qualification deadline, which charged all six sequential
-stages to one 26-second clock, rather than relaxing any separate 26-second
-survivor-availability or operation-recovery SLO. It then
+replacement-child startup (45 seconds), Openraft recovery and readiness
+observation (37 seconds: the 26-second recovery envelope plus one reserved
+11-second final all-voter readiness round comprising a 10-second backend
+operation and 1 second of bounded local result delivery), journal
+reconciliation (25 seconds), and higher-fence resume (26 seconds). The composed
+crash-to-resume ceiling is 164 seconds; it is not a shared timer, and each stage
+fails at its own deadline. This retains the v1 deadline-composition correction and fixes
+v2's readiness admission loop, which could leave its last six seconds unusable
+without weakening the separate 26-second survivor-availability or recovery
+envelopes. It then
 publishes a same-issuer leaf with a 75-second remaining-validity/expiry budget.
 With the default 30-second drain window, its fixed soft-retirement boundary is
 `not_after - 30 seconds`: every incident directed path is refreshed below the
@@ -945,7 +948,7 @@ five-second refresh rounds over four/eight incident paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved
 node. The reverse probe fails local material preflight without dialing. Terminal outcomes
 may additionally include only the exact attempts already outstanding at the
-baseline and must satisfy interval conservation; Schedule v5 binds this as
+baseline and must satisfy interval conservation; Schedule v6 binds this as
 `new-attempts-plus-baseline-outstanding/v1` and binds recovery progress as
 `common-key-pulse-all-active-key-coverage/v1`. Cancellation-classified
 `abandoned` outcomes, protocol/backend outcomes,

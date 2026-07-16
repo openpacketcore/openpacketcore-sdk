@@ -73,8 +73,10 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_REAUTHENTICATIONS_PER_ROUND, QUALIFICATION_TRAFFIC_ROTATIONS_PER_MEMBER,
     QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
     QUALIFICATION_TRAFFIC_TRANSITION_MILLIS, QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
@@ -1413,6 +1415,49 @@ fn deadline_admits_complete_operation(now: Instant, deadline: Instant) -> bool {
         QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
     ))
     .is_some_and(|operation_deadline| operation_deadline <= deadline)
+}
+
+fn deadline_admits_complete_restart_readiness_round(now: Instant, deadline: Instant) -> bool {
+    now.checked_add(Duration::from_millis(
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS,
+    ))
+    .is_some_and(|round_deadline| round_deadline <= deadline)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveRestartReadinessRound {
+    Recovery { deadline: Instant },
+    WaitForFinal { dispatch_at: Instant },
+    Final { deadline: Instant },
+    Exhausted,
+}
+
+fn active_restart_readiness_round(
+    now: Instant,
+    recovery_deadline: Instant,
+    catchup_deadline: Instant,
+    final_round_started: bool,
+) -> ActiveRestartReadinessRound {
+    if deadline_admits_complete_restart_readiness_round(now, recovery_deadline) {
+        return ActiveRestartReadinessRound::Recovery {
+            deadline: now
+                + Duration::from_millis(
+                    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS,
+                ),
+        };
+    }
+    if now < recovery_deadline {
+        return ActiveRestartReadinessRound::WaitForFinal {
+            dispatch_at: recovery_deadline,
+        };
+    }
+    if final_round_started {
+        ActiveRestartReadinessRound::Exhausted
+    } else {
+        ActiveRestartReadinessRound::Final {
+            deadline: catchup_deadline,
+        }
+    }
 }
 
 fn assert_transition_completed_by(started: Instant, deadline: Instant, phase: &str) {
@@ -2827,7 +2872,7 @@ impl Fleet {
     fn restart_active_mutator_at_manifest_address(&mut self, node_index: usize) {
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
-            "same-disk-exact-address-active-mutator/v2"
+            "same-disk-exact-address-active-mutator/v3"
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_SYNTHETIC_INTERRUPTION_RESTART_PROFILE,
@@ -2912,18 +2957,43 @@ impl Fleet {
         );
 
         let catchup_started_at = Instant::now();
-        let catchup_deadline = catchup_started_at
-            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS);
-        let mut last_complete_reports: Option<Vec<FleetReadiness>> = None;
-        loop {
-            assert!(
-                deadline_admits_complete_operation(Instant::now(), catchup_deadline),
-                "active-mutator restart exhausted readiness-probe admission budget: node={node_index}, total_elapsed_millis={}, catchup_elapsed_millis={}, readiness_before={readiness_before:?}, last_complete_reports={last_complete_reports:?}, stderr={:?}",
-                restart_started_at.elapsed().as_millis(),
-                catchup_started_at.elapsed().as_millis(),
-                self.stderr_diagnostics()
+        let recovery_deadline = catchup_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS);
+        let catchup_deadline = recovery_deadline
+            + Duration::from_millis(
+                QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS,
             );
-            let reports = self.readiness_reports_by(&all_node_indices, catchup_deadline);
+        assert_eq!(
+            catchup_deadline.duration_since(catchup_started_at),
+            Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS)
+        );
+        let mut last_complete_reports: Option<Vec<FleetReadiness>> = None;
+        let mut final_readiness_round_started = false;
+        loop {
+            let now = Instant::now();
+            let (probe_deadline, is_final_readiness_round) = match active_restart_readiness_round(
+                now,
+                recovery_deadline,
+                catchup_deadline,
+                final_readiness_round_started,
+            ) {
+                ActiveRestartReadinessRound::Recovery { deadline } => (deadline, false),
+                ActiveRestartReadinessRound::WaitForFinal { dispatch_at } => {
+                    thread::sleep(dispatch_at.duration_since(now));
+                    continue;
+                }
+                ActiveRestartReadinessRound::Final { deadline } => {
+                    final_readiness_round_started = true;
+                    (deadline, true)
+                }
+                ActiveRestartReadinessRound::Exhausted => panic!(
+                    "active-mutator restart exhausted its final readiness round: node={node_index}, total_elapsed_millis={}, catchup_elapsed_millis={}, readiness_before={readiness_before:?}, last_complete_reports={last_complete_reports:?}, stderr={:?}",
+                    restart_started_at.elapsed().as_millis(),
+                    catchup_started_at.elapsed().as_millis(),
+                    self.stderr_diagnostics()
+                ),
+            };
+            let reports = self.readiness_reports_by(&all_node_indices, probe_deadline);
             let required_quorum = self.required_quorum();
             if reports.iter().all(|report| {
                 report.ready
@@ -2934,13 +3004,13 @@ impl Fleet {
                     && report.required_quorum == required_quorum
             }) {
                 assert!(
-                    deadline_allows_completion(Instant::now(), catchup_deadline),
-                    "active-mutator all-voter readiness completed after its catch-up bound"
+                    deadline_allows_completion(Instant::now(), probe_deadline),
+                    "active-mutator all-voter readiness round completed after its bound"
                 );
                 break;
             }
             last_complete_reports = Some(reports);
-            if !deadline_allows_completion(Instant::now(), catchup_deadline) {
+            if is_final_readiness_round {
                 panic!(
                     "active-mutator restart did not regain all-voter readiness: node={node_index}, total_elapsed_millis={}, catchup_elapsed_millis={}, readiness_before={readiness_before:?}, last_complete_reports={last_complete_reports:?}, stderr={:?}",
                     restart_started_at.elapsed().as_millis(),
@@ -9157,6 +9227,77 @@ fn transition_deadline_never_accepts_a_late_success() {
         started,
         started + operation_timeout - Duration::from_nanos(1)
     ));
+}
+
+#[test]
+fn active_restart_reserves_one_final_readiness_round_after_recovery() {
+    let started = Instant::now();
+    let readiness_round =
+        Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS);
+    let recovery_deadline =
+        started + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS);
+    let catchup_deadline = recovery_deadline
+        + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS);
+
+    assert_eq!(
+        active_restart_readiness_round(started, recovery_deadline, catchup_deadline, false),
+        ActiveRestartReadinessRound::Recovery {
+            deadline: started + readiness_round,
+        }
+    );
+    assert_eq!(
+        active_restart_readiness_round(
+            recovery_deadline - readiness_round,
+            recovery_deadline,
+            catchup_deadline,
+            false,
+        ),
+        ActiveRestartReadinessRound::Recovery {
+            deadline: recovery_deadline,
+        }
+    );
+    assert_eq!(
+        active_restart_readiness_round(
+            recovery_deadline - readiness_round + Duration::from_nanos(1),
+            recovery_deadline,
+            catchup_deadline,
+            false,
+        ),
+        ActiveRestartReadinessRound::WaitForFinal {
+            dispatch_at: recovery_deadline,
+        }
+    );
+    assert_eq!(
+        active_restart_readiness_round(
+            started + Duration::from_millis(20_200),
+            recovery_deadline,
+            catchup_deadline,
+            false,
+        ),
+        ActiveRestartReadinessRound::WaitForFinal {
+            dispatch_at: recovery_deadline,
+        }
+    );
+    assert_eq!(
+        active_restart_readiness_round(
+            recovery_deadline,
+            recovery_deadline,
+            catchup_deadline,
+            false,
+        ),
+        ActiveRestartReadinessRound::Final {
+            deadline: catchup_deadline,
+        }
+    );
+    assert_eq!(
+        active_restart_readiness_round(
+            recovery_deadline,
+            recovery_deadline,
+            catchup_deadline,
+            true,
+        ),
+        ActiveRestartReadinessRound::Exhausted
+    );
 }
 
 #[test]

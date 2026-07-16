@@ -226,7 +226,7 @@ pub const QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_PROFILE: &str = "bounded-du
 /// campaign. This is one same-disk, exact-address active-mutator restart, not
 /// a deployed host or network-partition matrix.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE: &str =
-    "same-disk-exact-address-active-mutator/v2";
+    "same-disk-exact-address-active-mutator/v3";
 /// Maximum time for SIGKILL and process reaping before the exact manifest
 /// address is reused.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS: u64 = 5_000;
@@ -239,11 +239,28 @@ pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS: u64 =
 /// initialize its existing membership, and enable its consensus RPC path.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS: u64 =
     QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS;
-/// Maximum time after replacement startup for Openraft to regain all-voter
-/// readiness and apply the committed state on the restarted member.
-pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS: u64 =
+/// Maximum time after replacement startup for Openraft to regain the committed
+/// state on the restarted member before the final readiness observation.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
+/// Parent-side delivery allowance after a child readiness operation reaches
+/// its fixed backend timeout. This bounds local IPC and JSON framing without
+/// changing the backend operation deadline.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_READINESS_DELIVERY_MILLIS: u64 = 1_000;
+/// Reserved duration for exactly one final all-voter readiness round after
+/// the Openraft recovery envelope has elapsed: one backend operation timeout
+/// plus its bounded parent-side result delivery.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_READINESS_DELIVERY_MILLIS;
+/// Maximum Openraft recovery-and-observation stage. The recovery envelope is
+/// followed by one complete final all-voter readiness round (the operation
+/// timeout plus bounded result delivery); readiness probes therefore never
+/// consume the recovery budget they are intended to observe.
+pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS: u64 =
+    QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS
+        + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS;
 /// Maximum time after journal reconciliation for the restarted mutator to
 /// commit under a strictly higher same-owner fence.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS: u64 =
@@ -2293,7 +2310,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v5\n",
+            "opc-session-ha/traffic-resource/v6\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -2338,6 +2355,9 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
             "unclean_restart_termination_millis={}\n",
             "unclean_restart_outage_millis={}\n",
             "unclean_restart_startup_millis={}\n",
+            "unclean_restart_recovery_millis={}\n",
+            "unclean_restart_readiness_delivery_millis={}\n",
+            "unclean_restart_final_readiness_probe_millis={}\n",
             "unclean_restart_catchup_millis={}\n",
             "unclean_restart_resume_millis={}\n",
             "unclean_restart_total_millis={}\n",
@@ -2403,6 +2423,9 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS,
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_READINESS_DELIVERY_MILLIS,
+        QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS,
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS,
         QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
@@ -3626,7 +3649,7 @@ mod tests {
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE,
-            "same-disk-exact-address-active-mutator/v2"
+            "same-disk-exact-address-active-mutator/v3"
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
@@ -3634,9 +3657,26 @@ mod tests {
         );
         assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS, 26_000);
         assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS, 45_000);
-        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS, 26_000);
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS,
+            26_000
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_READINESS_DELIVERY_MILLIS,
+            1_000
+        );
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS,
+            11_000
+        );
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS, 37_000);
+        assert_eq!(
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
+            QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS
+                + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS
+        );
         assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS, 26_000);
-        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS, 153_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS, 164_000);
         const {
             assert!(
                 QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS
@@ -3698,8 +3738,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:82da3c6fc69650e902dfb84d9ada35891a769432d40d2640f259845517a6aa01",
-                "sha256:1dcbd963848025c58fed0688dd55b77acc41ae26ee385d29328e4483f4f064d0",
+                "sha256:183eb4141c72f8b105f61fb2a07f599821d1ecc12916e21688f3c850fa3f3cf1",
+                "sha256:d15831b43f5a0a2c7142be434bf0f19ae09a28e57433ccda235e29d738b9238c",
             )
         );
         assert!(is_exact_sha256(&three));
@@ -4074,32 +4114,32 @@ mod tests {
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 3,
-                "sha256:af929a4f7cdd5422eae4c3110859e7230be6b47b30a50f1bcc4b01d35c9f74fa",
+                "sha256:61350dd7d94e11afebccf36861dc218ade25f91f941bd05102e1453de353c21f",
             ),
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 5,
-                "sha256:ae2815d6f6c8fa6c66fad6b0967ce9a990604fe4c07f09c0c5b61185e08f57d2",
+                "sha256:953548e31843d7c5e72e07bc9437cf5cae6fb01cdf845674317cb99c4e0dda79",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 3,
-                "sha256:99172e01703cf31f95b9d076c35be59c1328f9bf099a3ed103c7d29c86ab2033",
+                "sha256:33094a539667a1d6500e29d732c932db89440cd92810b50d333a28930ae7309b",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 5,
-                "sha256:1bc286b52b643cb360e3e34f15499890af0a955cb70185b75ee17ed65ed79cc5",
+                "sha256:4aeac6e2194bcbfa109070cd5b0c85200d70f3d4d5da95687cd48767c366498d",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 3,
-                "sha256:de3291e3e24dd24d20096503006c9b92d3bcbffb0504ee8d5392183e5584cadf",
+                "sha256:8f61f7a13d640e32a3a7be22c312368cbab1826615bbf08624336e4c4aa2b5a0",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 5,
-                "sha256:e4df715259edc1c1eb574c07bfb81594b23ab1ef2405730808a2b647a277a241",
+                "sha256:bbf5d11cea3c2ee9b87bd2412aeca846b89ac7e24f27c49b203e921e7fb75ab4",
             ),
         ];
         for (campaign, member_count, expected) in vectors {
