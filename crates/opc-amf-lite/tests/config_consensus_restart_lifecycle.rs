@@ -15,7 +15,7 @@ use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_K
 use opc_types::{ConfigVersion, TenantId, Timestamp, TxId};
 
 mod config_consensus_common;
-use config_consensus_common::ConfigCluster;
+use config_consensus_common::{ConfigCluster, ConfigClusterLifecycleError, ConfigNodeLifecycle};
 
 type EncryptedConfigStore =
     EncryptingManagedDatastore<AmfConfig, MemoryKeyProvider, RaftManagedDatastore<AmfConfig>>;
@@ -177,10 +177,85 @@ fn assert_exact_record(expected: &StoredConfig<AmfConfig>, actual: &StoredConfig
     );
 }
 
+fn assert_exact_history(expected: &[StoredConfig<AmfConfig>], actual: &[StoredConfig<AmfConfig>]) {
+    assert_eq!(expected.len(), actual.len(), "history length");
+    for (expected_record, actual_record) in expected.iter().zip(actual) {
+        assert_exact_record(expected_record, actual_record);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableReopenEvidenceError {
+    EmptyExpectedHistory,
+    EmptyReopenedHistory,
+    HistoryMismatch,
+}
+
+fn records_match_exactly(
+    expected: &StoredConfig<AmfConfig>,
+    actual: &StoredConfig<AmfConfig>,
+) -> bool {
+    expected.tx_id == actual.tx_id
+        && expected.parent_tx_id == actual.parent_tx_id
+        && expected.version == actual.version
+        && expected.committed_at == actual.committed_at
+        && expected.principal == actual.principal
+        && expected.source == actual.source
+        && expected.schema_digest == actual.schema_digest
+        && expected.plaintext_digest == actual.plaintext_digest
+        && expected.config == actual.config
+        && expected.encrypted_blob == actual.encrypted_blob
+        && expected.idempotency_key == actual.idempotency_key
+        && expected.apply_plan == actual.apply_plan
+        && expected.request_fingerprint == actual.request_fingerprint
+        && expected.request_id == actual.request_id
+        && expected.recovery_required == actual.recovery_required
+        && expected.confirmed_deadline == actual.confirmed_deadline
+        && expected.rollback_label == actual.rollback_label
+}
+
+fn verify_nonempty_exact_reopened_history(
+    expected: &[StoredConfig<AmfConfig>],
+    actual: &[StoredConfig<AmfConfig>],
+) -> Result<(), DurableReopenEvidenceError> {
+    if expected.is_empty() {
+        return Err(DurableReopenEvidenceError::EmptyExpectedHistory);
+    }
+    if actual.is_empty() {
+        return Err(DurableReopenEvidenceError::EmptyReopenedHistory);
+    }
+    if expected.len() != actual.len()
+        || expected
+            .iter()
+            .zip(actual)
+            .any(|(expected_record, actual_record)| {
+                !records_match_exactly(expected_record, actual_record)
+            })
+    {
+        return Err(DurableReopenEvidenceError::HistoryMismatch);
+    }
+    Ok(())
+}
+
+#[test]
+fn durable_reopen_evidence_rejects_fresh_empty_state() {
+    let expected = [record(
+        tx_id("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        None,
+        1,
+        timestamp("2026-07-16T18:59:00Z"),
+        config("must-exist-on-reopened-disk", 512),
+    )];
+    assert_eq!(
+        Err(DurableReopenEvidenceError::EmptyReopenedHistory),
+        verify_nonempty_exact_reopened_history(&expected, &[])
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn encrypted_record_metadata_and_payload_survive_full_consensus_restart_exactly() {
     let temp = tempfile::tempdir().expect("config cluster tempdir");
-    let cluster = ConfigCluster::start(temp.path()).await;
+    let mut cluster = ConfigCluster::start(temp.path()).await;
     let provider = provider();
     let encrypted = encrypted_store(&cluster, 0, &provider);
     let changed_path = YangPath::new("/amf/hostname").expect("changed path");
@@ -235,10 +310,10 @@ async fn encrypted_record_metadata_and_payload_survive_full_consensus_restart_ex
     assert!(!before_restart.encrypted_blob.is_empty());
 
     drop(encrypted);
-    cluster.shutdown().await;
+    cluster.shutdown().await.expect("shutdown config cluster");
     drop(cluster);
 
-    let restarted = ConfigCluster::start(temp.path()).await;
+    let mut restarted = ConfigCluster::start(temp.path()).await;
     let restarted_encrypted = encrypted_store(&restarted, 1, &provider);
     let after_restart = restarted_encrypted
         .load_latest()
@@ -247,13 +322,16 @@ async fn encrypted_record_metadata_and_payload_survive_full_consensus_restart_ex
         .expect("rich record after restart");
     assert_exact_record(&before_restart, &after_restart);
 
-    restarted.shutdown().await;
+    restarted
+        .shutdown()
+        .await
+        .expect("shutdown restarted config cluster");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_same_parent_appends_have_one_state_machine_winner() {
     let temp = tempfile::tempdir().expect("config cluster tempdir");
-    let cluster = ConfigCluster::start(temp.path()).await;
+    let mut cluster = ConfigCluster::start(temp.path()).await;
     let provider = provider();
     let genesis_tx = tx_id("55555555-5555-4555-8555-555555555555");
     let contender_a_tx = tx_id("66666666-6666-4666-8666-666666666666");
@@ -324,13 +402,270 @@ async fn concurrent_same_parent_appends_have_one_state_machine_winner() {
         assert!(history.iter().all(|record| record.tx_id != loser_tx));
     }
 
-    cluster.shutdown().await;
+    cluster.shutdown().await.expect("shutdown config cluster");
+    for node in 0..3 {
+        assert_eq!(
+            ConfigNodeLifecycle::Shutdown,
+            cluster.node_lifecycle(node).expect("final node lifecycle")
+        );
+    }
+    cluster
+        .shutdown()
+        .await
+        .expect("final shutdown must not stop an engine twice");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopped_follower_reopens_same_disk_and_rejoins_live_encrypted_lineage() {
+    let temp = tempfile::tempdir().expect("config cluster tempdir");
+    let mut cluster = ConfigCluster::start(temp.path()).await;
+    let provider = provider();
+    let genesis_tx = tx_id("88888888-8888-4888-8888-888888888888");
+    let outage_tx = tx_id("99999999-9999-4999-8999-999999999999");
+    let rejoined_tx = tx_id("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    let leader = cluster.leader();
+    let stopped_follower = (0..3)
+        .find(|node| *node != leader)
+        .expect("follower to stop");
+    let survivors = (0..3)
+        .filter(|node| *node != stopped_follower)
+        .collect::<Vec<_>>();
+    let stopped_identity = cluster.stores[stopped_follower].status().node_id;
+    let stopped_database = cluster.database_path(stopped_follower);
+    assert_eq!(
+        ConfigClusterLifecycleError::InvalidState {
+            expected: ConfigNodeLifecycle::Stopped,
+            actual: ConfigNodeLifecycle::Running,
+        },
+        cluster
+            .reopen_node_disconnected(stopped_follower)
+            .await
+            .expect_err("a running identity cannot be reopened")
+    );
+
+    let genesis = record(
+        genesis_tx,
+        None,
+        1,
+        timestamp("2026-07-16T19:00:00Z"),
+        config("PAYLOAD-CANARY-REJOIN-GENESIS-0xA1", 1_024),
+    );
+    encrypted_store(&cluster, leader, &provider)
+        .append_commit_write(CommitWrite::new(genesis))
+        .await
+        .expect("append encrypted genesis");
+    cluster.wait_ready().await;
+    assert!(stopped_database.is_file(), "follower database must exist");
+    let pre_stop_status = cluster.stores[stopped_follower].status();
+    assert!(pre_stop_status.applied_index.is_some_and(|index| index > 0));
+    assert!(pre_stop_status
+        .committed_index
+        .is_some_and(|index| index > 0));
+    let pre_stop_history = encrypted_store(&cluster, stopped_follower, &provider)
+        .load_since(ConfigVersion::INITIAL, 8)
+        .await
+        .expect("load follower-local history before stop");
+    assert_eq!(1, pre_stop_history.len());
+    assert_eq!(genesis_tx, pre_stop_history[0].tx_id);
+
+    cluster
+        .stop_node(stopped_follower)
+        .await
+        .expect("stop actual follower engine");
+    assert_eq!(
+        ConfigNodeLifecycle::Stopped,
+        cluster
+            .node_lifecycle(stopped_follower)
+            .expect("stopped lifecycle")
+    );
+    assert!(cluster
+        .node_transport_is_disconnected(stopped_follower)
+        .await
+        .expect("stopped transport state"));
+    assert_eq!(
+        ConfigClusterLifecycleError::InvalidState {
+            expected: ConfigNodeLifecycle::Running,
+            actual: ConfigNodeLifecycle::Stopped,
+        },
+        cluster
+            .stop_node(stopped_follower)
+            .await
+            .expect_err("the stopped engine cannot be stopped twice")
+    );
+    assert!(cluster.stores[stopped_follower]
+        .probe_durable_readiness()
+        .await
+        .is_err());
+    let (first_survivor_ready, second_survivor_ready) = tokio::join!(
+        cluster.stores[survivors[0]].probe_durable_readiness(),
+        cluster.stores[survivors[1]].probe_durable_readiness(),
+    );
+    first_survivor_ready.expect("first survivor remains durable-ready");
+    second_survivor_ready.expect("second survivor remains durable-ready");
+
+    let mut outage = record(
+        outage_tx,
+        Some(genesis_tx),
+        2,
+        timestamp("2026-07-16T19:01:00Z"),
+        config("PAYLOAD-CANARY-REJOIN-OUTAGE-0xB2", 2_048),
+    );
+    outage.idempotency_key =
+        Some(IdempotencyKey::new("single-rejoin-outage").expect("idempotency key"));
+    outage.rollback_label = Some("single-rejoin-outage-head".to_owned());
+    encrypted_store(&cluster, survivors[0], &provider)
+        .append_commit_write(CommitWrite::new(outage))
+        .await
+        .expect("surviving quorum appends while follower is stopped");
+    let outage_head = encrypted_store(&cluster, survivors[1], &provider)
+        .load_latest()
+        .await
+        .expect("surviving quorum reads while follower is stopped")
+        .expect("outage head");
+    assert_eq!(outage_tx, outage_head.tx_id);
+    assert_eq!(Some(genesis_tx), outage_head.parent_tx_id);
+    assert_eq!(ConfigVersion::new(2), outage_head.version);
+    assert_eq!(
+        Some("single-rejoin-outage-head"),
+        outage_head.rollback_label.as_deref()
+    );
+
+    cluster
+        .reopen_node_disconnected(stopped_follower)
+        .await
+        .expect("reopen same disk with transport disconnected");
+    assert_eq!(
+        ConfigNodeLifecycle::ReopenedDisconnected,
+        cluster
+            .node_lifecycle(stopped_follower)
+            .expect("disconnected reopened lifecycle")
+    );
+    assert!(cluster
+        .node_transport_is_disconnected(stopped_follower)
+        .await
+        .expect("reopened transport state"));
+    assert_eq!(
+        ConfigClusterLifecycleError::InvalidState {
+            expected: ConfigNodeLifecycle::Stopped,
+            actual: ConfigNodeLifecycle::ReopenedDisconnected,
+        },
+        cluster
+            .reopen_node_disconnected(stopped_follower)
+            .await
+            .expect_err("one stable identity cannot be opened twice")
+    );
+    let disconnected_status = cluster.stores[stopped_follower].status();
+    assert_eq!(
+        stopped_identity, disconnected_status.node_id,
+        "same stable node identity must reopen"
+    );
+    assert_eq!(
+        pre_stop_status.applied_index,
+        disconnected_status.applied_index
+    );
+    assert_eq!(
+        pre_stop_status.committed_index,
+        disconnected_status.committed_index
+    );
+    assert!(!disconnected_status.admitted);
+    assert_eq!(stopped_database, cluster.database_path(stopped_follower));
+    let disconnected_history = encrypted_store(&cluster, stopped_follower, &provider)
+        .load_since(ConfigVersion::INITIAL, 8)
+        .await
+        .expect("load disconnected same-disk history");
+    verify_nonempty_exact_reopened_history(&pre_stop_history, &disconnected_history)
+        .expect("same-disk state must exist before network catch-up");
+    assert!(disconnected_history
+        .iter()
+        .all(|record| record.tx_id != outage_tx));
+    assert!(cluster.stores[stopped_follower]
+        .probe_durable_readiness()
+        .await
+        .is_err());
+
+    cluster
+        .reconnect_node(stopped_follower)
+        .await
+        .expect("reconnect and re-admit reopened follower");
+    assert_eq!(
+        ConfigNodeLifecycle::Running,
+        cluster
+            .node_lifecycle(stopped_follower)
+            .expect("reconnected lifecycle")
+    );
+    cluster.wait_ready().await;
+
+    let caught_up_history = encrypted_store(&cluster, survivors[0], &provider)
+        .load_since(ConfigVersion::INITIAL, 8)
+        .await
+        .expect("load survivor history after follower rejoin");
+    assert_eq!(2, caught_up_history.len());
+    assert_eq!(genesis_tx, caught_up_history[0].tx_id);
+    assert_eq!(None, caught_up_history[0].parent_tx_id);
+    assert_eq!(outage_tx, caught_up_history[1].tx_id);
+    assert_eq!(Some(genesis_tx), caught_up_history[1].parent_tx_id);
+    for node in 0..3 {
+        let replica_history = encrypted_store(&cluster, node, &provider)
+            .load_since(ConfigVersion::INITIAL, 8)
+            .await
+            .expect("load caught-up replica history");
+        assert_exact_history(&caught_up_history, &replica_history);
+    }
+
+    let mut continued = record(
+        rejoined_tx,
+        Some(outage_tx),
+        3,
+        timestamp("2026-07-16T19:02:00Z"),
+        config("PAYLOAD-CANARY-REJOIN-CONTINUED-0xC3", 4_096),
+    );
+    continued.idempotency_key =
+        Some(IdempotencyKey::new("single-rejoin-continued").expect("idempotency key"));
+    continued.rollback_label = Some("single-rejoin-continued-head".to_owned());
+    encrypted_store(&cluster, stopped_follower, &provider)
+        .append_commit_write(CommitWrite::new(continued))
+        .await
+        .expect("rejoined follower forwards continued commit");
+    let continued_head = encrypted_store(&cluster, survivors[1], &provider)
+        .load_latest()
+        .await
+        .expect("read continued commit from survivor")
+        .expect("continued head");
+    assert_eq!(rejoined_tx, continued_head.tx_id);
+    assert_eq!(Some(outage_tx), continued_head.parent_tx_id);
+    assert_eq!(ConfigVersion::new(3), continued_head.version);
+    cluster.wait_ready().await;
+
+    let complete_history = encrypted_store(&cluster, stopped_follower, &provider)
+        .load_since(ConfigVersion::INITIAL, 8)
+        .await
+        .expect("load complete history from rejoined follower");
+    assert_eq!(3, complete_history.len());
+    for node in 0..3 {
+        let replica_history = encrypted_store(&cluster, node, &provider)
+            .load_since(ConfigVersion::INITIAL, 8)
+            .await
+            .expect("load complete replica history");
+        assert_exact_history(&complete_history, &replica_history);
+    }
+
+    for plaintext in [
+        b"PAYLOAD-CANARY-REJOIN-GENESIS-0xA1".as_slice(),
+        b"PAYLOAD-CANARY-REJOIN-OUTAGE-0xB2".as_slice(),
+        b"PAYLOAD-CANARY-REJOIN-CONTINUED-0xC3".as_slice(),
+    ] {
+        assert!(cluster.captured_frames().iter().all(|frame| !frame
+            .windows(plaintext.len())
+            .any(|window| window == plaintext)));
+    }
+
+    cluster.shutdown().await.expect("shutdown config cluster");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_restart() {
     let temp = tempfile::tempdir().expect("config cluster tempdir");
-    let cluster = ConfigCluster::start(temp.path()).await;
+    let mut cluster = ConfigCluster::start(temp.path()).await;
     let provider = provider();
     let initial_store = encrypted_store(&cluster, 0, &provider);
     let stable_tx = tx_id("22222222-2222-4222-8222-222222222222");
@@ -473,10 +808,10 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
 
     drop(initial_store);
     drop(replacement_store);
-    cluster.shutdown().await;
+    cluster.shutdown().await.expect("shutdown config cluster");
     drop(cluster);
 
-    let restarted = ConfigCluster::start(temp.path()).await;
+    let mut restarted = ConfigCluster::start(temp.path()).await;
     for index in 0..3 {
         let restarted_store = encrypted_store(&restarted, index, &provider);
         let restarted_latest = restarted_store
@@ -500,5 +835,8 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
         assert_eq!(StoreErrorCode::NotFound, pending_error.code);
     }
 
-    restarted.shutdown().await;
+    restarted
+        .shutdown()
+        .await
+        .expect("shutdown restarted config cluster");
 }

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -28,6 +28,30 @@ pub(super) fn cluster_transition_timeout() -> Duration {
         .saturating_add(profile.operation_timeout())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigNodeLifecycle {
+    Running,
+    Stopping,
+    Stopped,
+    ReopeningDisconnected,
+    ReopenedDisconnected,
+    Reconnecting,
+    Finalizing,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigClusterLifecycleError {
+    InvalidNode,
+    InvalidState {
+        expected: ConfigNodeLifecycle,
+        actual: ConfigNodeLifecycle,
+    },
+    TransportStillConnected,
+    DeadlineExceeded(&'static str),
+    OperationFailed(&'static str),
+}
+
 #[derive(Clone)]
 struct LoopbackPeer {
     target: ConfigConsensusNodeId,
@@ -50,8 +74,20 @@ impl LoopbackPeer {
         *self.handler.write().await = Some(handler);
     }
 
+    async fn uninstall(&self) {
+        *self.handler.write().await = None;
+    }
+
     fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Release);
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    async fn has_handler(&self) -> bool {
+        self.handler.read().await.is_some()
     }
 }
 
@@ -93,7 +129,10 @@ impl ConsensusPeer for LoopbackPeer {
 
 pub struct ConfigCluster {
     pub stores: Vec<ConsensusConfigStore>,
+    root: PathBuf,
     identity: ConfigConsensusIdentity,
+    nodes: [ConfigConsensusNodeId; 3],
+    lifecycle: [ConfigNodeLifecycle; 3],
     paths: BTreeMap<(usize, usize), Arc<LoopbackPeer>>,
     captured_frames: Arc<StdMutex<Vec<Vec<u8>>>>,
 }
@@ -166,7 +205,10 @@ impl ConfigCluster {
         three.expect("initialize node three");
         let cluster = Self {
             stores,
+            root: root.to_path_buf(),
             identity,
+            nodes,
+            lifecycle: [ConfigNodeLifecycle::Running; 3],
             paths,
             captured_frames,
         };
@@ -212,6 +254,293 @@ impl ConfigCluster {
         self.captured_frames.lock().expect("capture mutex").clone()
     }
 
+    pub fn database_path(&self, node: usize) -> PathBuf {
+        self.root.join(format!("config-{node}.sqlite"))
+    }
+
+    pub fn node_lifecycle(
+        &self,
+        node: usize,
+    ) -> Result<ConfigNodeLifecycle, ConfigClusterLifecycleError> {
+        self.lifecycle
+            .get(node)
+            .copied()
+            .ok_or(ConfigClusterLifecycleError::InvalidNode)
+    }
+
+    fn require_node_lifecycle(
+        &self,
+        node: usize,
+        expected: ConfigNodeLifecycle,
+    ) -> Result<(), ConfigClusterLifecycleError> {
+        let actual = self.node_lifecycle(node)?;
+        if actual != expected {
+            return Err(ConfigClusterLifecycleError::InvalidState { expected, actual });
+        }
+        Ok(())
+    }
+
+    fn set_node_lifecycle(
+        &mut self,
+        node: usize,
+        next: ConfigNodeLifecycle,
+    ) -> Result<(), ConfigClusterLifecycleError> {
+        *self
+            .lifecycle
+            .get_mut(node)
+            .ok_or(ConfigClusterLifecycleError::InvalidNode)? = next;
+        Ok(())
+    }
+
+    async fn disconnect_node_transport(&self, node: usize) {
+        for peer in 0..self.stores.len() {
+            if peer != node {
+                self.paths
+                    .get(&(node, peer))
+                    .expect("outbound cluster path")
+                    .set_enabled(false);
+                let inbound = self.paths.get(&(peer, node)).expect("inbound cluster path");
+                inbound.set_enabled(false);
+                inbound.uninstall().await;
+            }
+        }
+    }
+
+    async fn inspect_node_transport_disconnected(&self, node: usize) -> bool {
+        for peer in 0..self.stores.len() {
+            if peer != node {
+                let outbound = self
+                    .paths
+                    .get(&(node, peer))
+                    .expect("outbound cluster path");
+                let inbound = self.paths.get(&(peer, node)).expect("inbound cluster path");
+                if outbound.is_enabled() || inbound.is_enabled() || inbound.has_handler().await {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub async fn node_transport_is_disconnected(
+        &self,
+        node: usize,
+    ) -> Result<bool, ConfigClusterLifecycleError> {
+        self.node_lifecycle(node)?;
+        tokio::time::timeout(
+            cluster_transition_timeout(),
+            self.inspect_node_transport_disconnected(node),
+        )
+        .await
+        .map_err(|_| ConfigClusterLifecycleError::DeadlineExceeded("transport-state inspection"))
+    }
+
+    async fn require_node_transport_disconnected(
+        &self,
+        node: usize,
+        operation: &'static str,
+    ) -> Result<(), ConfigClusterLifecycleError> {
+        match self.node_transport_is_disconnected(node).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ConfigClusterLifecycleError::TransportStillConnected),
+            Err(ConfigClusterLifecycleError::DeadlineExceeded(_)) => {
+                Err(ConfigClusterLifecycleError::DeadlineExceeded(operation))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn stop_node(&mut self, node: usize) -> Result<(), ConfigClusterLifecycleError> {
+        self.require_node_lifecycle(node, ConfigNodeLifecycle::Running)?;
+        self.set_node_lifecycle(node, ConfigNodeLifecycle::Stopping)?;
+        let result = tokio::time::timeout(cluster_transition_timeout(), async {
+            self.disconnect_node_transport(node).await;
+            self.stores[node]
+                .shutdown()
+                .await
+                .map_err(|_| ConfigClusterLifecycleError::OperationFailed("node shutdown"))
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                self.set_node_lifecycle(node, ConfigNodeLifecycle::Stopped)?;
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(ConfigClusterLifecycleError::DeadlineExceeded(
+                "node shutdown",
+            )),
+        }
+    }
+
+    pub async fn reopen_node_disconnected(
+        &mut self,
+        node: usize,
+    ) -> Result<(), ConfigClusterLifecycleError> {
+        self.require_node_lifecycle(node, ConfigNodeLifecycle::Stopped)?;
+        self.set_node_lifecycle(node, ConfigNodeLifecycle::ReopeningDisconnected)?;
+        if let Err(error) = self
+            .require_node_transport_disconnected(node, "disconnected node reopen precondition")
+            .await
+        {
+            self.set_node_lifecycle(node, ConfigNodeLifecycle::Stopped)?;
+            return Err(error);
+        }
+        let members = self.nodes.iter().copied().collect::<BTreeSet<_>>();
+        let topology = ConfigConsensusTopology::try_new(self.identity, self.nodes[node], members)
+            .expect("reopened topology");
+        let database = self.database_path(node);
+        let snapshots = self.root.join(format!("snapshots-{node}"));
+        let peers = self
+            .nodes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(target, _)| *target != node)
+            .map(|(target, target_node)| {
+                let peer = self
+                    .paths
+                    .get(&(node, target))
+                    .expect("reopened peer path")
+                    .clone();
+                let peer: Arc<dyn ConsensusPeer> = peer;
+                (target_node, peer)
+            })
+            .collect();
+        let reopened = tokio::time::timeout(cluster_transition_timeout(), async {
+            let backend = SqliteBackend::open_with_audit_key(
+                database,
+                true,
+                0,
+                AuditKey::new([0x55; 32]).expect("reopened audit key"),
+            )
+            .await
+            .map_err(|_| ConfigClusterLifecycleError::OperationFailed("reopened config backend"))?;
+            ConsensusConfigStore::open_with_operation_timeout(
+                topology,
+                backend,
+                snapshots,
+                peers,
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|_| ConfigClusterLifecycleError::OperationFailed("reopened consensus store"))
+        })
+        .await;
+        let reopened = match reopened {
+            Ok(Ok(store)) => store,
+            Ok(Err(error)) => {
+                self.set_node_lifecycle(node, ConfigNodeLifecycle::Stopped)?;
+                return Err(error);
+            }
+            Err(_) => {
+                self.set_node_lifecycle(node, ConfigNodeLifecycle::Stopped)?;
+                return Err(ConfigClusterLifecycleError::DeadlineExceeded(
+                    "disconnected node reopen",
+                ));
+            }
+        };
+        if let Err(error) = self
+            .require_node_transport_disconnected(node, "disconnected node reopen verification")
+            .await
+        {
+            match tokio::time::timeout(cluster_transition_timeout(), reopened.shutdown()).await {
+                Ok(Ok(())) => {
+                    self.set_node_lifecycle(node, ConfigNodeLifecycle::Stopped)?;
+                    return Err(error);
+                }
+                Ok(Err(_)) => {
+                    return Err(ConfigClusterLifecycleError::OperationFailed(
+                        "failed reopened-node quarantine",
+                    ))
+                }
+                Err(_) => {
+                    return Err(ConfigClusterLifecycleError::DeadlineExceeded(
+                        "reopened-node quarantine",
+                    ));
+                }
+            }
+        }
+        self.stores[node] = reopened;
+        self.set_node_lifecycle(node, ConfigNodeLifecycle::ReopenedDisconnected)
+    }
+
+    pub async fn reconnect_node(&mut self, node: usize) -> Result<(), ConfigClusterLifecycleError> {
+        self.require_node_lifecycle(node, ConfigNodeLifecycle::ReopenedDisconnected)?;
+        self.set_node_lifecycle(node, ConfigNodeLifecycle::Reconnecting)?;
+        if let Err(error) = self
+            .require_node_transport_disconnected(node, "node reconnect precondition")
+            .await
+        {
+            self.set_node_lifecycle(node, ConfigNodeLifecycle::ReopenedDisconnected)?;
+            return Err(error);
+        }
+        let result = tokio::time::timeout(cluster_transition_timeout(), async {
+            let handler = self.stores[node].rpc_handler();
+            for peer in 0..self.stores.len() {
+                if peer != node {
+                    self.paths
+                        .get(&(peer, node))
+                        .ok_or(ConfigClusterLifecycleError::OperationFailed(
+                            "missing inbound reconnect path",
+                        ))?
+                        .install(handler.clone())
+                        .await;
+                }
+            }
+            for peer in 0..self.stores.len() {
+                if peer != node {
+                    self.paths
+                        .get(&(node, peer))
+                        .ok_or(ConfigClusterLifecycleError::OperationFailed(
+                            "missing outbound reconnect path",
+                        ))?
+                        .set_enabled(true);
+                    self.paths
+                        .get(&(peer, node))
+                        .ok_or(ConfigClusterLifecycleError::OperationFailed(
+                            "missing inbound reconnect path",
+                        ))?
+                        .set_enabled(true);
+                }
+            }
+            self.stores[node]
+                .initialize_cluster()
+                .await
+                .map_err(|_| ConfigClusterLifecycleError::OperationFailed("node re-admission"))
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => self.set_node_lifecycle(node, ConfigNodeLifecycle::Running),
+            Ok(Err(error)) => {
+                if tokio::time::timeout(
+                    cluster_transition_timeout(),
+                    self.disconnect_node_transport(node),
+                )
+                .await
+                .is_ok()
+                {
+                    self.set_node_lifecycle(node, ConfigNodeLifecycle::ReopenedDisconnected)?;
+                }
+                Err(error)
+            }
+            Err(_) => {
+                if tokio::time::timeout(
+                    cluster_transition_timeout(),
+                    self.disconnect_node_transport(node),
+                )
+                .await
+                .is_ok()
+                {
+                    self.set_node_lifecycle(node, ConfigNodeLifecycle::ReopenedDisconnected)?;
+                }
+                Err(ConfigClusterLifecycleError::DeadlineExceeded(
+                    "node reconnect",
+                ))
+            }
+        }
+    }
+
     pub fn isolate(&self, node: usize) {
         for peer in 0..self.stores.len() {
             if peer != node {
@@ -248,11 +577,74 @@ impl ConfigCluster {
         .expect("survivor config leader")
     }
 
-    pub async fn shutdown(&self) {
-        let _ = tokio::join!(
-            self.stores[0].shutdown(),
-            self.stores[1].shutdown(),
-            self.stores[2].shutdown(),
-        );
+    pub async fn shutdown(&mut self) -> Result<(), ConfigClusterLifecycleError> {
+        let mut active = [false; 3];
+        for (node, is_active) in active.iter_mut().enumerate().take(self.stores.len()) {
+            let state = self.node_lifecycle(node)?;
+            match state {
+                ConfigNodeLifecycle::Running | ConfigNodeLifecycle::ReopenedDisconnected => {
+                    *is_active = true;
+                }
+                ConfigNodeLifecycle::Stopped | ConfigNodeLifecycle::Shutdown => {}
+                actual => {
+                    return Err(ConfigClusterLifecycleError::InvalidState {
+                        expected: ConfigNodeLifecycle::Running,
+                        actual,
+                    });
+                }
+            }
+        }
+        for (node, is_active) in active.iter().copied().enumerate() {
+            if is_active {
+                self.set_node_lifecycle(node, ConfigNodeLifecycle::Finalizing)?;
+            }
+        }
+        let result = tokio::time::timeout(cluster_transition_timeout(), async {
+            tokio::join!(
+                async {
+                    if active[0] {
+                        self.stores[0].shutdown().await
+                    } else {
+                        Ok(())
+                    }
+                },
+                async {
+                    if active[1] {
+                        self.stores[1].shutdown().await
+                    } else {
+                        Ok(())
+                    }
+                },
+                async {
+                    if active[2] {
+                        self.stores[2].shutdown().await
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        })
+        .await;
+        let outcomes = match result {
+            Ok(outcomes) => outcomes,
+            Err(_) => {
+                return Err(ConfigClusterLifecycleError::DeadlineExceeded(
+                    "final shutdown",
+                ))
+            }
+        };
+        let mut first_error = None;
+        for (node, outcome) in [outcomes.0, outcomes.1, outcomes.2].into_iter().enumerate() {
+            if active[node] {
+                if outcome.is_ok() {
+                    self.set_node_lifecycle(node, ConfigNodeLifecycle::Shutdown)?;
+                } else {
+                    first_error.get_or_insert(ConfigClusterLifecycleError::OperationFailed(
+                        "final shutdown",
+                    ));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }

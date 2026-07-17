@@ -358,7 +358,7 @@ async fn test_amf_lite_config_ha_failover_and_session_recovery() {
     // 2. Three-member Openraft config group. The SDK-facing store forwards
     // writes to the current leader, so the AMF does not own election logic.
     println!("[HA] Building 3-node Openraft config group");
-    let config_cluster = ConfigCluster::start(temp_dir.path()).await;
+    let mut config_cluster = ConfigCluster::start(temp_dir.path()).await;
     let original_leader = config_cluster.leader();
 
     // 3. Real three-member Openraft session fleet.
@@ -578,7 +578,10 @@ async fn test_amf_lite_config_ha_failover_and_session_recovery() {
 
     // Clean up
     wait_for_shutdown(&amf_1).await;
-    config_cluster.shutdown().await;
+    config_cluster
+        .shutdown()
+        .await
+        .expect("shutdown config cluster");
     println!(
         "[HA] Test test_amf_lite_config_ha_failover_and_session_recovery passed successfully!"
     );

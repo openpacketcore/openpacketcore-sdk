@@ -182,7 +182,7 @@ fn assert_live_artifacts_forbidden_absent(root: &Path, cluster: &ConfigCluster) 
 #[tokio::test]
 async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let cluster = ConfigCluster::start(temp.path()).await;
+    let mut cluster = ConfigCluster::start(temp.path()).await;
     let tenant = TenantId::new("tenant-a").expect("tenant");
     let provider = Arc::new(CountingKeyProvider::new());
     provider.insert_active_key("config-key-a", &tenant, FIRST_KEY_MATERIAL);
@@ -363,9 +363,9 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
     );
     assert_live_artifacts_forbidden_absent(temp.path(), &cluster);
 
-    cluster.shutdown().await;
+    cluster.shutdown().await.expect("shutdown config cluster");
     drop(cluster);
-    let restarted = ConfigCluster::start(temp.path()).await;
+    let mut restarted = ConfigCluster::start(temp.path()).await;
     for store in &restarted.stores {
         assert_eq!(
             second_tx,
@@ -406,7 +406,10 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
     );
     assert_eq!(Some(request_id), restarted_replay.request_id);
     assert_live_artifacts_forbidden_absent(temp.path(), &restarted);
-    restarted.shutdown().await;
+    restarted
+        .shutdown()
+        .await
+        .expect("shutdown restarted config cluster");
     drop(restarted);
 
     assert_forbidden_absent(temp.path());

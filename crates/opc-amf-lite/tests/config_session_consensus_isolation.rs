@@ -144,7 +144,7 @@ fn assert_config_head_unchanged(before: &StoredConfig<AmfConfig>, after: &Stored
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn config_and_session_groups_reject_cross_scope_without_state_change() {
     let temp = tempfile::tempdir().expect("config cluster tempdir");
-    let config_cluster = ConfigCluster::start(temp.path()).await;
+    let mut config_cluster = ConfigCluster::start(temp.path()).await;
     let session_cluster = ConsensusTestCluster::start(3).await;
     let provider = provider();
 
@@ -328,5 +328,8 @@ async fn config_and_session_groups_reject_cross_scope_without_state_change() {
             .expect("session after cross-route write")
     );
 
-    config_cluster.shutdown().await;
+    config_cluster
+        .shutdown()
+        .await
+        .expect("shutdown config cluster");
 }
