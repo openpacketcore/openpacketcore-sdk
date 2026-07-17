@@ -1,14 +1,22 @@
-//! Bounded deployed-Kubernetes readiness campaign for the experimental
+//! Bounded deployed-Kubernetes sequential-HA campaign for the experimental
 //! session-HA candidate profile.
 //!
 //! This module drives the private same-binary control client merged for #143.
 //! It does not implement consensus, infer readiness from a listener, grant
-//! Kubernetes authority, or claim production qualification. A sample is ready
-//! only when the exact rendered node and voter identities return a fresh,
-//! internally consistent Openraft durable-barrier report. The external custom
-//! condition is an AND-only evidence gate: kubelet independently invokes the
-//! local UDS readiness client so readiness self-expires on quorum loss, a hung
-//! probe, or process termination even if an external condition becomes stale.
+//! Kubernetes authority, or claim production qualification. It reuses the
+//! frozen v1 lease/fence/CAS/read schedule and sends each mutation at most
+//! once. Each unique history ID derives a domain-separated durable run scope;
+//! the checked long lease covers the serialized subprocess envelope and a
+//! shorter phase deadline preserves its margin. Process-local lease handles
+//! are reclaimed once without replaying durable mutations. Artifact
+//! persistence independently reconstructs the exact schedule, history prefix,
+//! phases, and completion claims. A sample is ready only when the exact
+//! rendered node and voter identities return a fresh, internally consistent
+//! Openraft durable-barrier report. The external custom condition is an
+//! AND-only evidence gate: kubelet
+//! independently invokes the local UDS readiness client so readiness
+//! self-expires on quorum loss, a hung probe, or process termination even if
+//! an external condition becomes stale.
 //! Every bounded campaign first resets all custom conditions, latches and
 //! aborts on its first failure, and attempts a final all-false cleanup.
 
@@ -31,6 +39,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Notify};
 
+#[cfg(test)]
+use crate::qualification::{qualification_owner_sha256, qualification_value_sha256};
 use crate::qualification::{
     read_bounded_json_line, write_json_line, QualificationNodeCommand, QualificationNodeReply,
     QualificationReadinessCode, QualificationSha256, QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
@@ -42,15 +52,22 @@ use crate::qualification_kubernetes::{
     QUALIFICATION_KUBERNETES_CONTROL_SOCKET_PATH,
     QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION, QUALIFICATION_KUBERNETES_FLEET_NAME,
 };
+use crate::qualification_sequential::{
+    qualification_sequential_workload_for_run, QualificationSequentialHistoryBuilder,
+    QualificationSequentialHistoryRecord, QualificationSequentialInvocation,
+    QualificationSequentialOperation, QualificationSequentialRunScope,
+    QUALIFICATION_LEASE_EXPIRY_WAIT, QUALIFICATION_SEQUENTIAL_HISTORY_SCHEMA_V1,
+    QUALIFICATION_SEQUENTIAL_OPERATION_COUNT, QUALIFICATION_SEQUENTIAL_SCHEDULE_SCHEMA_V1,
+};
 
 /// Schema identifier for the bounded command/reply transcript.
 pub const QUALIFICATION_KUBERNETES_CAMPAIGN_TRANSCRIPT_SCHEMA: &str =
-    "opc-session-kubernetes-campaign-transcript/v1";
+    "opc-session-kubernetes-campaign-transcript/v2";
 /// Schema identifier used by each emitted readiness history fragment row.
 pub const QUALIFICATION_CONCURRENT_HISTORY_SCHEMA_V3: &str = "opc-session-ha-concurrent-history/v3";
 /// Schema identifier for the candidate-only probe-campaign summary.
 pub const QUALIFICATION_KUBERNETES_CAMPAIGN_SUMMARY_SCHEMA: &str =
-    "opc-session-kubernetes-probe-campaign/v1";
+    "opc-session-kubernetes-campaign/v2";
 /// Maximum probe samples emitted by one bounded runner invocation.
 pub const QUALIFICATION_KUBERNETES_MAX_CAMPAIGN_SAMPLES: usize = 10_000;
 /// Minimum supported gap between complete fleet probe rounds.
@@ -66,9 +83,15 @@ pub const QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT: Duration =
 const KUBECTL_STDOUT_MAX_BYTES: usize = QUALIFICATION_MAX_CONTROL_LINE_BYTES;
 const KUBECTL_STDERR_MAX_BYTES: usize = 4 * 1024;
 const KUBECTL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const KUBECTL_PHASE_ABORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const KUBECTL_CALLS_PER_READINESS_MEMBER: usize = 2;
+const LONG_LEASE_PROTECTED_SCHEDULE_TRANSITIONS: usize = 6;
+const LONG_LEASE_MARGIN_KUBECTL_CALLS: usize = 2;
 const CAMPAIGN_ARTIFACT_MAX_BYTES: usize = 32 * 1024 * 1024;
 const CAMPAIGN_TRANSCRIPT_FILE: &str = "transcript.jsonl";
 const CAMPAIGN_READINESS_HISTORY_FILE: &str = "readiness-v3-fragment.jsonl";
+const CAMPAIGN_SEQUENTIAL_SCHEDULE_FILE: &str = "schedule-v1.jsonl";
+const CAMPAIGN_SEQUENTIAL_HISTORY_FILE: &str = "history-v1.jsonl";
 const CAMPAIGN_SUMMARY_FILE: &str = "summary.json";
 
 /// Shared, asynchronously observable cancellation state for one campaign.
@@ -116,7 +139,7 @@ impl QualificationKubernetesCampaignCancellation {
     }
 }
 
-/// Fixed, validated input for one deployed readiness campaign.
+/// Fixed, validated input for one deployed sequential-HA campaign.
 #[derive(Clone, PartialEq, Eq)]
 pub struct QualificationKubernetesCampaignConfig {
     /// Namespace containing the rendered qualification fleet.
@@ -127,7 +150,11 @@ pub struct QualificationKubernetesCampaignConfig {
     pub rounds: usize,
     /// Gap between complete fleet probe rounds.
     pub probe_interval: Duration,
-    /// Bounded identifier shared by emitted v3 readiness rows.
+    /// Unique bounded run nonce shared by emitted v3 readiness rows and used
+    /// to derive the domain-separated sequential workload scope.
+    ///
+    /// A new value is required for every attempt, including retries after an
+    /// ambiguous or cancelled campaign.
     pub history_id: String,
 }
 
@@ -156,8 +183,11 @@ impl QualificationKubernetesCampaignConfig {
         }
         qualification_kubernetes_readiness_expectations(self.member_count)
             .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidIdentityContract)?;
-        let sample_count = self
+        let readiness_rounds = self
             .rounds
+            .checked_add(QUALIFICATION_SEQUENTIAL_OPERATION_COUNT)
+            .ok_or(QualificationKubernetesCampaignConfigError::InvalidRounds)?;
+        let sample_count = readiness_rounds
             .checked_mul(self.member_count)
             .ok_or(QualificationKubernetesCampaignConfigError::InvalidRounds)?;
         if self.rounds == 0 || sample_count > QUALIFICATION_KUBERNETES_MAX_CAMPAIGN_SAMPLES {
@@ -172,12 +202,66 @@ impl QualificationKubernetesCampaignConfig {
         if !is_bounded_identifier(&self.history_id) {
             return Err(QualificationKubernetesCampaignConfigError::InvalidHistoryId);
         }
+        QualificationSequentialRunScope::derive(&self.history_id)
+            .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidHistoryId)?;
+        qualification_kubernetes_long_lease_ttl_millis(self.member_count)
+            .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
         Ok(())
     }
 
     fn sample_count(&self) -> usize {
-        self.rounds.saturating_mul(self.member_count)
+        self.rounds
+            .saturating_add(QUALIFICATION_SEQUENTIAL_OPERATION_COUNT)
+            .saturating_mul(self.member_count)
     }
+}
+
+fn qualification_kubernetes_long_lease_call_count(
+    member_count: usize,
+) -> Result<usize, QualificationKubernetesCampaignConfigError> {
+    if !matches!(member_count, 3 | 5) {
+        return Err(QualificationKubernetesCampaignConfigError::InvalidTopology);
+    }
+    let readiness_calls = member_count
+        .checked_mul(KUBECTL_CALLS_PER_READINESS_MEMBER)
+        .ok_or(QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+    readiness_calls
+        .checked_add(1)
+        .and_then(|calls| calls.checked_mul(LONG_LEASE_PROTECTED_SCHEDULE_TRANSITIONS))
+        .ok_or(QualificationKubernetesCampaignConfigError::InvalidWorkload)
+}
+
+fn qualification_kubernetes_long_lease_ttl_millis(
+    member_count: usize,
+) -> Result<u64, QualificationKubernetesCampaignConfigError> {
+    let protected_calls = qualification_kubernetes_long_lease_call_count(member_count)?;
+    let admitted_calls = protected_calls
+        .checked_add(LONG_LEASE_MARGIN_KUBECTL_CALLS)
+        .ok_or(QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+    let timeout_millis = u64::try_from(QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT.as_millis())
+        .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+    let ttl_millis = u64::try_from(admitted_calls)
+        .ok()
+        .and_then(|calls| calls.checked_mul(timeout_millis))
+        .ok_or(QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+    let maximum_millis = u64::try_from(opc_session_store::MAX_SESSION_TTL.as_millis())
+        .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+    if ttl_millis == 0 || ttl_millis > maximum_millis {
+        return Err(QualificationKubernetesCampaignConfigError::InvalidWorkload);
+    }
+    Ok(ttl_millis)
+}
+
+fn qualification_kubernetes_long_lease_phase_budget(
+    member_count: usize,
+) -> Result<Duration, QualificationKubernetesCampaignConfigError> {
+    let admitted_calls = qualification_kubernetes_long_lease_call_count(member_count)?;
+    QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT
+        .checked_mul(
+            u32::try_from(admitted_calls)
+                .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?,
+        )
+        .ok_or(QualificationKubernetesCampaignConfigError::InvalidWorkload)
 }
 
 /// Redaction-safe campaign configuration rejection.
@@ -202,6 +286,9 @@ pub enum QualificationKubernetesCampaignConfigError {
     /// The fixed cluster/member names did not derive one exact voter set.
     #[error("qualification Kubernetes readiness identity contract is invalid")]
     InvalidIdentityContract,
+    /// The internally fixed sequential workload could not be constructed or bound.
+    #[error("qualification Kubernetes sequential workload is invalid")]
+    InvalidWorkload,
 }
 
 /// Fixed error classes from the Kubernetes command boundary.
@@ -295,11 +382,16 @@ pub enum QualificationKubernetesReadinessReason {
 /// Port used by the pure campaign state machine.
 #[async_trait]
 pub trait QualificationKubernetesCampaignPort: Send + Sync {
-    /// Execute one `Probe` through the private same-binary control client.
-    async fn invoke_probe(
+    /// Execute one typed command through the private same-binary control client.
+    ///
+    /// The adapter sends the command at most once. Callers must treat a
+    /// missing reply to a mutating command as indeterminate and must never
+    /// retry it within the campaign.
+    async fn invoke_command(
         &self,
         namespace: &str,
         pod_name: &str,
+        command: &QualificationNodeCommand,
         cancellation: &QualificationKubernetesCampaignCancellation,
     ) -> Result<QualificationNodeReply, QualificationKubernetesPortError>;
 
@@ -355,7 +447,7 @@ impl QualificationKubernetesCampaignClock for QualificationKubernetesSystemClock
     }
 }
 
-/// Overall result of this bounded candidate-only probe campaign.
+/// Overall result of this bounded candidate-only sequential-HA campaign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualificationKubernetesCampaignStatus {
@@ -375,6 +467,10 @@ pub enum QualificationKubernetesCampaignAction {
     Reset,
     /// One private control-client `Probe` followed by a status update.
     Probe,
+    /// One scheduled lease, CAS, read, or release command without retry.
+    SequentialOperation,
+    /// One process-local lease-handle reclamation command without retry.
+    LeaseHandleCleanup,
     /// Final fail-closed status cleanup without a node command.
     Cleanup,
 }
@@ -403,6 +499,16 @@ pub enum QualificationKubernetesCampaignRecordOutcome {
     ResetPublished,
     /// Initial fail-closed condition reset could not be published.
     ResetFailed,
+    /// The scheduled operation returned its exact expected typed result.
+    SequentialOperationAccepted,
+    /// The stale-fence operation returned its exact expected rejection.
+    SequentialOperationRejected,
+    /// The operation did not return a result that can be safely classified.
+    SequentialOperationIndeterminate,
+    /// One process-local lease handle was conclusively reclaimed.
+    LeaseHandleForgotten,
+    /// Lease-handle cleanup had no classifiable terminal reply.
+    LeaseHandleCleanupIndeterminate,
 }
 
 /// One deterministic, redaction-safe command/reply transcript row.
@@ -425,13 +531,16 @@ pub struct QualificationKubernetesCampaignRecord {
     pub completed_ns: u64,
     /// Exact typed command, absent for cleanup.
     pub command: Option<QualificationNodeCommand>,
+    /// Frozen schedule operation ID, present only for sequential operations.
+    pub schedule_operation_id: Option<String>,
     /// Exact typed reply, admitted only after bounded decoding.
     pub reply: Option<QualificationNodeReply>,
     /// Fixed control-boundary error class, without subprocess diagnostics.
     pub control_error: Option<QualificationKubernetesPortError>,
     /// Fixed status-subresource error class, without Kubernetes diagnostics.
     pub readiness_update_error: Option<QualificationKubernetesPortError>,
-    /// Published or attempted condition.
+    /// Published/attempted condition, or the last strict readiness context for
+    /// a sequential operation.
     pub condition: QualificationKubernetesReadinessCondition,
     /// Fixed operation outcome.
     pub outcome: QualificationKubernetesCampaignRecordOutcome,
@@ -497,22 +606,90 @@ pub struct QualificationKubernetesReadinessHistoryV3 {
 #[derive(Debug, Clone)]
 pub struct QualificationKubernetesCampaignOutcome {
     /// Candidate-only campaign status.
-    pub status: QualificationKubernetesCampaignStatus,
+    status: QualificationKubernetesCampaignStatus,
     /// Number of complete fleet rounds.
-    pub completed_rounds: usize,
+    completed_rounds: usize,
     /// Whether every final false-condition update succeeded.
-    pub cleanup_complete: bool,
+    cleanup_complete: bool,
+    /// Whether every invoked acquisition handle was conclusively forgotten.
+    lease_handle_cleanup_complete: bool,
     /// Ordered command/reply and cleanup transcript.
-    pub transcript: Vec<QualificationKubernetesCampaignRecord>,
+    transcript: Vec<QualificationKubernetesCampaignRecord>,
     /// Ordered readiness-only v3 history fragment.
-    pub readiness_history: Vec<QualificationKubernetesReadinessHistoryV3>,
+    readiness_history: Vec<QualificationKubernetesReadinessHistoryV3>,
+    /// Exact frozen v1 schedule executed by the deployed campaign.
+    sequential_schedule: Vec<QualificationSequentialInvocation>,
+    /// Ordered digest-only v1 results emitted for commands actually invoked.
+    sequential_history: Vec<QualificationSequentialHistoryRecord>,
+    /// Whether all 15 commands and their post-operation readiness samples
+    /// completed with exact expected results.
+    sequential_history_complete: bool,
 }
 
-/// Run one bounded deployed probe campaign.
+impl QualificationKubernetesCampaignOutcome {
+    /// Terminal status independently revalidated before artifact publication.
+    #[must_use]
+    pub const fn status(&self) -> QualificationKubernetesCampaignStatus {
+        self.status
+    }
+
+    /// Number of configured fleet rounds completed successfully.
+    #[must_use]
+    pub const fn completed_rounds(&self) -> usize {
+        self.completed_rounds
+    }
+
+    /// Whether final fail-closed Pod-condition cleanup completed.
+    #[must_use]
+    pub const fn cleanup_complete(&self) -> bool {
+        self.cleanup_complete
+    }
+
+    /// Whether every invoked process-local lease handle was reclaimed.
+    #[must_use]
+    pub const fn lease_handle_cleanup_complete(&self) -> bool {
+        self.lease_handle_cleanup_complete
+    }
+
+    /// Ordered, redaction-safe campaign transcript.
+    #[must_use]
+    pub fn transcript(&self) -> &[QualificationKubernetesCampaignRecord] {
+        &self.transcript
+    }
+
+    /// Readiness-only concurrent-history fragment.
+    #[must_use]
+    pub fn readiness_history(&self) -> &[QualificationKubernetesReadinessHistoryV3] {
+        &self.readiness_history
+    }
+
+    /// Exact deployed frozen-v1 schedule instance.
+    #[must_use]
+    pub fn sequential_schedule(&self) -> &[QualificationSequentialInvocation] {
+        &self.sequential_schedule
+    }
+
+    /// Exact digest-only frozen-v1 history prefix.
+    #[must_use]
+    pub fn sequential_history(&self) -> &[QualificationSequentialHistoryRecord] {
+        &self.sequential_history
+    }
+
+    /// Whether the exact sequential schedule and every post-operation sample completed.
+    #[must_use]
+    pub const fn sequential_history_complete(&self) -> bool {
+        self.sequential_history_complete
+    }
+}
+
+/// Run one bounded deployed sequential-HA campaign.
 ///
-/// The returned readiness rows are a fragment for the existing v3 checker. A
-/// complete candidate must combine them with real batch, watch, and restore
-/// rows and rewrite the full history count before invoking that checker.
+/// The campaign first proves a fresh all-member readiness baseline, then
+/// executes the shared 15-operation lease/fence/CAS/read schedule exactly once
+/// across its designated Pods. A complete all-member readiness sample follows
+/// every operation. A missing mutation reply is recorded as indeterminate and
+/// is never retried. The returned readiness rows remain only a fragment for the
+/// existing v3 checker; batch, watch, and restore coverage remain separate.
 pub async fn run_qualification_kubernetes_probe_campaign<P, C>(
     config: &QualificationKubernetesCampaignConfig,
     port: &P,
@@ -526,9 +703,33 @@ where
     config.validate()?;
     let expectations = qualification_kubernetes_readiness_expectations(config.member_count)
         .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidIdentityContract)?;
-    let mut transcript =
-        Vec::with_capacity(config.sample_count() + config.member_count.saturating_mul(2));
+    let run_scope = QualificationSequentialRunScope::derive(&config.history_id)
+        .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+    let long_lease_ttl_millis =
+        qualification_kubernetes_long_lease_ttl_millis(config.member_count)?;
+    let sequential_schedule = qualification_sequential_workload_for_run(
+        config.member_count,
+        &run_scope,
+        long_lease_ttl_millis,
+    )
+    .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+    let schedule_bytes = encode_json_lines(&sequential_schedule)
+        .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+    let schedule_sha256 = QualificationSha256::digest(&schedule_bytes);
+    let mut sequential_history_builder =
+        QualificationSequentialHistoryBuilder::new(&sequential_schedule)
+            .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+    if sequential_history_builder.schedule_sha256() != schedule_sha256.as_str() {
+        return Err(QualificationKubernetesCampaignConfigError::InvalidWorkload);
+    }
+    let mut transcript = Vec::with_capacity(
+        config
+            .sample_count()
+            .saturating_add(QUALIFICATION_SEQUENTIAL_OPERATION_COUNT)
+            .saturating_add(config.member_count.saturating_mul(2)),
+    );
     let mut readiness_history = Vec::with_capacity(config.sample_count());
+    let mut sequential_history = Vec::with_capacity(QUALIFICATION_SEQUENTIAL_OPERATION_COUNT);
     let mut status = QualificationKubernetesCampaignStatus::Passed;
     let mut completed_rounds = 0;
     let mut abort = !publish_fail_closed_conditions(
@@ -549,123 +750,150 @@ where
         };
     }
     let mut last_started_ns = vec![None; config.member_count];
+    let mut sample_sequences = vec![0usize; config.member_count];
+    let mut sampling_round = 0usize;
+    let mut last_sequential_completed_ns = None;
+    let mut sequential_history_complete = false;
+    let mut long_lease_deadline = None;
 
-    for round in 0..config.rounds {
-        if abort {
-            break;
+    if !abort {
+        status = sample_readiness_round(
+            config,
+            port,
+            clock,
+            cancellation,
+            &expectations,
+            sampling_round,
+            &mut sample_sequences,
+            &mut last_started_ns,
+            &mut transcript,
+            &mut readiness_history,
+            None,
+        )
+        .await;
+        abort = status != QualificationKubernetesCampaignStatus::Passed;
+        if !abort {
+            completed_rounds = 1;
+            sampling_round = sampling_round.saturating_add(1);
         }
-        if cancellation.is_cancelled() {
-            status = QualificationKubernetesCampaignStatus::Cancelled;
-            break;
-        }
-        for (member_index, (last_started_ns, expectation)) in
-            last_started_ns.iter_mut().zip(&expectations).enumerate()
-        {
+    }
+
+    if !abort {
+        for scheduled in &sequential_schedule {
+            if scheduled.operation_index == 2 {
+                let slept = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => false,
+                    () = clock.sleep(QUALIFICATION_LEASE_EXPIRY_WAIT) => true,
+                };
+                if !slept {
+                    status = QualificationKubernetesCampaignStatus::Cancelled;
+                    break;
+                }
+            }
             if cancellation.is_cancelled() {
                 status = QualificationKubernetesCampaignStatus::Cancelled;
-                abort = true;
                 break;
             }
-            let started_ns = monotonic_after(clock.elapsed_ns(), *last_started_ns);
-            *last_started_ns = Some(started_ns);
+            let member_index = scheduled
+                .member_index()
+                .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+            if member_index >= config.member_count {
+                return Err(QualificationKubernetesCampaignConfigError::InvalidWorkload);
+            }
             let pod_name = qualification_pod_name(member_index);
-            let reply = port
-                .invoke_probe(&config.namespace, &pod_name, cancellation)
-                .await;
+            let command = scheduled.command();
+            let started_ns = monotonic_after(clock.elapsed_ns(), last_sequential_completed_ns);
+            let reply = invoke_campaign_command(
+                port,
+                &config.namespace,
+                &pod_name,
+                &command,
+                cancellation,
+                long_lease_deadline,
+            )
+            .await;
+            let completed_ns = clock.elapsed_ns().max(started_ns);
+            last_sequential_completed_ns = Some(completed_ns);
             let control_error = reply.as_ref().err().copied();
-            let cancelled_after_probe = cancellation.is_cancelled()
+            let observation = sequential_history_builder
+                .observe(scheduled, started_ns, completed_ns, reply.as_ref().ok())
+                .map_err(|_| QualificationKubernetesCampaignConfigError::InvalidWorkload)?;
+            let expected = observation.expected;
+            sequential_history.push(observation.history);
+            let cancelled = cancellation.is_cancelled()
                 || matches!(
                     control_error,
                     Some(QualificationKubernetesPortError::Cancelled)
                 );
-            let mut classified = if cancelled_after_probe {
-                not_ready_probe(
-                    QualificationKubernetesReadinessReason::CampaignStopped,
-                    QualificationKubernetesCampaignRecordOutcome::CampaignCancelled,
-                )
+            let record_outcome = if cancelled {
+                QualificationKubernetesCampaignRecordOutcome::CampaignCancelled
+            } else if !expected {
+                QualificationKubernetesCampaignRecordOutcome::SequentialOperationIndeterminate
+            } else if scheduled.operation_index == 10 {
+                QualificationKubernetesCampaignRecordOutcome::SequentialOperationRejected
             } else {
-                classify_probe(reply.as_ref().ok(), expectation)
+                QualificationKubernetesCampaignRecordOutcome::SequentialOperationAccepted
             };
-            classified.history.sample_sequence = round + 1;
-            let mut record_outcome = classified.outcome;
-            let condition_result = if cancelled_after_probe {
-                None
-            } else {
-                Some(
-                    port.publish_readiness(
-                        &config.namespace,
-                        &pod_name,
-                        &classified.condition,
-                        cancellation,
-                    )
-                    .await,
-                )
-            };
-            let readiness_update_error = condition_result
-                .as_ref()
-                .and_then(|result| result.as_ref().err().copied());
-            let cancelled_during_publication = cancellation.is_cancelled()
-                || matches!(
-                    readiness_update_error,
-                    Some(QualificationKubernetesPortError::Cancelled)
-                );
-            if cancelled_after_probe || cancelled_during_publication {
-                record_outcome = QualificationKubernetesCampaignRecordOutcome::CampaignCancelled;
-                status = QualificationKubernetesCampaignStatus::Cancelled;
-                abort = true;
-            } else if condition_result.as_ref().is_some_and(Result::is_err) {
-                record_outcome =
-                    QualificationKubernetesCampaignRecordOutcome::ReadinessUpdateFailed;
-                status = QualificationKubernetesCampaignStatus::Failed;
-                abort = true;
-            } else if !classified.ready {
-                status = QualificationKubernetesCampaignStatus::Failed;
-                abort = true;
-            }
-            if cancellation.is_cancelled() {
-                if status == QualificationKubernetesCampaignStatus::Passed {
-                    status = QualificationKubernetesCampaignStatus::Cancelled;
-                }
-                abort = true;
-            }
-            let completed_ns = clock.elapsed_ns().max(started_ns);
-            let retained_reply = reply.ok().and_then(|reply| {
-                matches!(&reply, QualificationNodeReply::Readiness { .. }).then_some(reply)
-            });
             transcript.push(QualificationKubernetesCampaignRecord {
                 schema_version: QUALIFICATION_KUBERNETES_CAMPAIGN_TRANSCRIPT_SCHEMA.to_owned(),
-                round,
+                round: sampling_round,
                 member_index,
-                pod_name: pod_name.clone(),
-                action: QualificationKubernetesCampaignAction::Probe,
+                pod_name,
+                action: QualificationKubernetesCampaignAction::SequentialOperation,
                 started_ns,
                 completed_ns,
-                command: Some(QualificationNodeCommand::Probe),
-                reply: retained_reply,
+                command: Some(command),
+                schedule_operation_id: Some(scheduled.operation_id.clone()),
+                reply: reply.ok(),
                 control_error,
-                readiness_update_error,
-                condition: classified.condition,
+                readiness_update_error: None,
+                condition: QualificationKubernetesReadinessCondition::ready(),
                 outcome: record_outcome,
             });
-            readiness_history.push(QualificationKubernetesReadinessHistoryV3 {
-                schema_version: QUALIFICATION_CONCURRENT_HISTORY_SCHEMA_V3.to_owned(),
-                history_id: config.history_id.clone(),
-                history_operation_count: 0,
-                operation_id: format!("readiness-{}-{}", round + 1, member_index),
-                process_id: format!("node-{member_index}"),
-                started_ns,
-                completed_ns,
-                operation: classified.history,
-            });
-            if abort {
+            if cancelled {
+                status = QualificationKubernetesCampaignStatus::Cancelled;
                 break;
             }
+            if !expected {
+                status = QualificationKubernetesCampaignStatus::Failed;
+                break;
+            }
+            if scheduled.operation_index == 8 {
+                let budget = qualification_kubernetes_long_lease_phase_budget(config.member_count)?;
+                long_lease_deadline = tokio::time::Instant::now().checked_add(budget);
+                if long_lease_deadline.is_none() {
+                    return Err(QualificationKubernetesCampaignConfigError::InvalidWorkload);
+                }
+            } else if scheduled.operation_index == 14 {
+                long_lease_deadline = None;
+            }
+
+            status = sample_readiness_round(
+                config,
+                port,
+                clock,
+                cancellation,
+                &expectations,
+                sampling_round,
+                &mut sample_sequences,
+                &mut last_started_ns,
+                &mut transcript,
+                &mut readiness_history,
+                long_lease_deadline,
+            )
+            .await;
+            if status != QualificationKubernetesCampaignStatus::Passed {
+                break;
+            }
+            sampling_round = sampling_round.saturating_add(1);
         }
-        if abort {
-            break;
-        }
-        completed_rounds = round + 1;
-        if completed_rounds < config.rounds {
+        sequential_history_complete = status == QualificationKubernetesCampaignStatus::Passed
+            && sequential_history.len() == sequential_schedule.len();
+    }
+
+    if status == QualificationKubernetesCampaignStatus::Passed {
+        for configured_round in 1..config.rounds {
             let slept = tokio::select! {
                 biased;
                 () = cancellation.cancelled() => false,
@@ -675,6 +903,25 @@ where
                 status = QualificationKubernetesCampaignStatus::Cancelled;
                 break;
             }
+            status = sample_readiness_round(
+                config,
+                port,
+                clock,
+                cancellation,
+                &expectations,
+                sampling_round,
+                &mut sample_sequences,
+                &mut last_started_ns,
+                &mut transcript,
+                &mut readiness_history,
+                None,
+            )
+            .await;
+            if status != QualificationKubernetesCampaignStatus::Passed {
+                break;
+            }
+            completed_rounds = configured_round + 1;
+            sampling_round = sampling_round.saturating_add(1);
         }
     }
 
@@ -684,12 +931,26 @@ where
     }
 
     let cleanup_cancellation = QualificationKubernetesCampaignCancellation::new();
+    let lease_handle_cleanup_complete = cleanup_invoked_lease_handles(
+        config,
+        port,
+        clock,
+        &cleanup_cancellation,
+        sampling_round,
+        &sequential_schedule,
+        sequential_history.len(),
+        &mut transcript,
+    )
+    .await;
+    if !lease_handle_cleanup_complete {
+        status = QualificationKubernetesCampaignStatus::Failed;
+    }
     let cleanup_complete = publish_fail_closed_conditions(
         config,
         port,
         clock,
         &cleanup_cancellation,
-        completed_rounds,
+        sampling_round,
         FailClosedPhase::Cleanup,
         &mut transcript,
     )
@@ -702,9 +963,283 @@ where
         status,
         completed_rounds,
         cleanup_complete,
+        lease_handle_cleanup_complete,
         transcript,
         readiness_history,
+        sequential_schedule,
+        sequential_history,
+        sequential_history_complete,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cleanup_invoked_lease_handles<P, C>(
+    config: &QualificationKubernetesCampaignConfig,
+    port: &P,
+    clock: &C,
+    cancellation: &QualificationKubernetesCampaignCancellation,
+    round: usize,
+    schedule: &[QualificationSequentialInvocation],
+    invoked_operation_count: usize,
+    transcript: &mut Vec<QualificationKubernetesCampaignRecord>,
+) -> bool
+where
+    P: QualificationKubernetesCampaignPort,
+    C: QualificationKubernetesCampaignClock,
+{
+    let mut complete = true;
+    for scheduled in schedule.iter().take(invoked_operation_count) {
+        if !matches!(
+            scheduled.operation,
+            QualificationSequentialOperation::LeaseAcquire { .. }
+        ) {
+            continue;
+        }
+        let Ok(member_index) = scheduled.member_index() else {
+            return false;
+        };
+        if member_index >= config.member_count {
+            return false;
+        }
+        let pod_name = qualification_pod_name(member_index);
+        let command = QualificationNodeCommand::ForgetLease {
+            lease_handle: scheduled.operation_id.clone(),
+        };
+        let started_ns = clock.elapsed_ns();
+        let Some(deadline) =
+            tokio::time::Instant::now().checked_add(QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT)
+        else {
+            return false;
+        };
+        let reply = invoke_campaign_command(
+            port,
+            &config.namespace,
+            &pod_name,
+            &command,
+            cancellation,
+            Some(deadline),
+        )
+        .await;
+        let completed_ns = clock.elapsed_ns().max(started_ns);
+        let control_error = reply.as_ref().err().copied();
+        let forgotten = matches!(reply, Ok(QualificationNodeReply::LeaseHandleForgotten));
+        complete &= forgotten;
+        transcript.push(QualificationKubernetesCampaignRecord {
+            schema_version: QUALIFICATION_KUBERNETES_CAMPAIGN_TRANSCRIPT_SCHEMA.to_owned(),
+            round,
+            member_index,
+            pod_name,
+            action: QualificationKubernetesCampaignAction::LeaseHandleCleanup,
+            started_ns,
+            completed_ns,
+            command: Some(command),
+            schedule_operation_id: Some(scheduled.operation_id.clone()),
+            reply: reply.ok(),
+            control_error,
+            readiness_update_error: None,
+            condition: QualificationKubernetesReadinessCondition::not_ready(
+                QualificationKubernetesReadinessReason::CampaignStopped,
+            ),
+            outcome: if forgotten {
+                QualificationKubernetesCampaignRecordOutcome::LeaseHandleForgotten
+            } else {
+                QualificationKubernetesCampaignRecordOutcome::LeaseHandleCleanupIndeterminate
+            },
+        });
+    }
+    complete
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sample_readiness_round<P, C>(
+    config: &QualificationKubernetesCampaignConfig,
+    port: &P,
+    clock: &C,
+    cancellation: &QualificationKubernetesCampaignCancellation,
+    expectations: &[QualificationKubernetesReadinessExpectation],
+    round: usize,
+    sample_sequences: &mut [usize],
+    last_started_ns: &mut [Option<u64>],
+    transcript: &mut Vec<QualificationKubernetesCampaignRecord>,
+    readiness_history: &mut Vec<QualificationKubernetesReadinessHistoryV3>,
+    deadline: Option<tokio::time::Instant>,
+) -> QualificationKubernetesCampaignStatus
+where
+    P: QualificationKubernetesCampaignPort,
+    C: QualificationKubernetesCampaignClock,
+{
+    for member_index in 0..config.member_count {
+        if cancellation.is_cancelled() {
+            return QualificationKubernetesCampaignStatus::Cancelled;
+        }
+        let Some(expectation) = expectations.get(member_index) else {
+            return QualificationKubernetesCampaignStatus::Failed;
+        };
+        let Some(last_started) = last_started_ns.get_mut(member_index) else {
+            return QualificationKubernetesCampaignStatus::Failed;
+        };
+        let Some(sample_sequence) = sample_sequences.get_mut(member_index) else {
+            return QualificationKubernetesCampaignStatus::Failed;
+        };
+        let started_ns = monotonic_after(clock.elapsed_ns(), *last_started);
+        *last_started = Some(started_ns);
+        *sample_sequence = sample_sequence.saturating_add(1);
+        let pod_name = qualification_pod_name(member_index);
+        let command = QualificationNodeCommand::Probe;
+        let reply = invoke_campaign_command(
+            port,
+            &config.namespace,
+            &pod_name,
+            &command,
+            cancellation,
+            deadline,
+        )
+        .await;
+        let control_error = reply.as_ref().err().copied();
+        let cancelled_after_probe = cancellation.is_cancelled()
+            || matches!(
+                control_error,
+                Some(QualificationKubernetesPortError::Cancelled)
+            );
+        let mut classified = if cancelled_after_probe {
+            not_ready_probe(
+                QualificationKubernetesReadinessReason::CampaignStopped,
+                QualificationKubernetesCampaignRecordOutcome::CampaignCancelled,
+            )
+        } else {
+            classify_probe(reply.as_ref().ok(), expectation)
+        };
+        classified.history.sample_sequence = *sample_sequence;
+        let mut record_outcome = classified.outcome;
+        let condition_result = if cancelled_after_probe {
+            None
+        } else {
+            Some(
+                publish_campaign_readiness(
+                    port,
+                    &config.namespace,
+                    &pod_name,
+                    &classified.condition,
+                    cancellation,
+                    deadline,
+                )
+                .await,
+            )
+        };
+        let readiness_update_error = condition_result
+            .as_ref()
+            .and_then(|result| result.as_ref().err().copied());
+        let cancelled_during_publication = cancellation.is_cancelled()
+            || matches!(
+                readiness_update_error,
+                Some(QualificationKubernetesPortError::Cancelled)
+            );
+        let status = if cancelled_after_probe || cancelled_during_publication {
+            record_outcome = QualificationKubernetesCampaignRecordOutcome::CampaignCancelled;
+            QualificationKubernetesCampaignStatus::Cancelled
+        } else if condition_result.as_ref().is_some_and(Result::is_err) {
+            record_outcome = QualificationKubernetesCampaignRecordOutcome::ReadinessUpdateFailed;
+            QualificationKubernetesCampaignStatus::Failed
+        } else if !classified.ready {
+            QualificationKubernetesCampaignStatus::Failed
+        } else {
+            QualificationKubernetesCampaignStatus::Passed
+        };
+        let completed_ns = clock.elapsed_ns().max(started_ns);
+        let retained_reply = reply.ok().and_then(|reply| {
+            matches!(&reply, QualificationNodeReply::Readiness { .. }).then_some(reply)
+        });
+        transcript.push(QualificationKubernetesCampaignRecord {
+            schema_version: QUALIFICATION_KUBERNETES_CAMPAIGN_TRANSCRIPT_SCHEMA.to_owned(),
+            round,
+            member_index,
+            pod_name,
+            action: QualificationKubernetesCampaignAction::Probe,
+            started_ns,
+            completed_ns,
+            command: Some(command),
+            schedule_operation_id: None,
+            reply: retained_reply,
+            control_error,
+            readiness_update_error,
+            condition: classified.condition,
+            outcome: record_outcome,
+        });
+        readiness_history.push(QualificationKubernetesReadinessHistoryV3 {
+            schema_version: QUALIFICATION_CONCURRENT_HISTORY_SCHEMA_V3.to_owned(),
+            history_id: config.history_id.clone(),
+            history_operation_count: 0,
+            operation_id: format!("readiness-{}-{member_index}", *sample_sequence),
+            process_id: format!("node-{member_index}"),
+            started_ns,
+            completed_ns,
+            operation: classified.history,
+        });
+        if status != QualificationKubernetesCampaignStatus::Passed {
+            return status;
+        }
+    }
+    QualificationKubernetesCampaignStatus::Passed
+}
+
+async fn invoke_campaign_command<P>(
+    port: &P,
+    namespace: &str,
+    pod_name: &str,
+    command: &QualificationNodeCommand,
+    cancellation: &QualificationKubernetesCampaignCancellation,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<QualificationNodeReply, QualificationKubernetesPortError>
+where
+    P: QualificationKubernetesCampaignPort,
+{
+    let Some(deadline) = deadline else {
+        return port
+            .invoke_command(namespace, pod_name, command, cancellation)
+            .await;
+    };
+    let phase_cancellation = QualificationKubernetesCampaignCancellation::new();
+    let invocation = port.invoke_command(namespace, pod_name, command, &phase_cancellation);
+    tokio::pin!(invocation);
+    let terminal_error = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => QualificationKubernetesPortError::Cancelled,
+        result = &mut invocation => return result,
+        () = tokio::time::sleep_until(deadline) => QualificationKubernetesPortError::Timeout,
+    };
+    phase_cancellation.cancel();
+    let _ = tokio::time::timeout(KUBECTL_PHASE_ABORT_DRAIN_TIMEOUT, &mut invocation).await;
+    Err(terminal_error)
+}
+
+async fn publish_campaign_readiness<P>(
+    port: &P,
+    namespace: &str,
+    pod_name: &str,
+    condition: &QualificationKubernetesReadinessCondition,
+    cancellation: &QualificationKubernetesCampaignCancellation,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), QualificationKubernetesPortError>
+where
+    P: QualificationKubernetesCampaignPort,
+{
+    let Some(deadline) = deadline else {
+        return port
+            .publish_readiness(namespace, pod_name, condition, cancellation)
+            .await;
+    };
+    let phase_cancellation = QualificationKubernetesCampaignCancellation::new();
+    let publication = port.publish_readiness(namespace, pod_name, condition, &phase_cancellation);
+    tokio::pin!(publication);
+    let terminal_error = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => QualificationKubernetesPortError::Cancelled,
+        result = &mut publication => return result,
+        () = tokio::time::sleep_until(deadline) => QualificationKubernetesPortError::Timeout,
+    };
+    phase_cancellation.cancel();
+    let _ = tokio::time::timeout(KUBECTL_PHASE_ABORT_DRAIN_TIMEOUT, &mut publication).await;
+    Err(terminal_error)
 }
 
 #[derive(Clone, Copy)]
@@ -769,6 +1304,7 @@ where
             started_ns,
             completed_ns: clock.elapsed_ns().max(started_ns),
             command: None,
+            schedule_operation_id: None,
             reply: None,
             control_error: None,
             readiness_update_error,
@@ -923,6 +1459,8 @@ fn is_bounded_identifier(value: &str) -> bool {
 #[derive(Clone)]
 pub struct KubectlQualificationKubernetesCampaignPort {
     executable: OsString,
+    #[cfg(test)]
+    argument_prefix: Vec<OsString>,
     command_timeout: Duration,
 }
 
@@ -942,15 +1480,32 @@ impl KubectlQualificationKubernetesCampaignPort {
     pub fn new() -> Self {
         Self {
             executable: OsString::from("kubectl"),
+            #[cfg(test)]
+            argument_prefix: Vec::new(),
             command_timeout: QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT,
         }
     }
 
-    #[cfg(test)]
-    fn with_executable(executable: OsString, command_timeout: Duration) -> Self {
+    #[cfg(all(test, unix))]
+    fn with_test_script(script: OsString, command_timeout: Duration) -> Self {
         Self {
-            executable,
+            executable: OsString::from("/bin/sh"),
+            argument_prefix: vec![script],
             command_timeout,
+        }
+    }
+
+    fn command_arguments(&self, arguments: Vec<OsString>) -> Vec<OsString> {
+        #[cfg(test)]
+        {
+            let mut prefixed = Vec::with_capacity(self.argument_prefix.len() + arguments.len());
+            prefixed.extend(self.argument_prefix.iter().cloned());
+            prefixed.extend(arguments);
+            prefixed
+        }
+        #[cfg(not(test))]
+        {
+            arguments
         }
     }
 }
@@ -963,18 +1518,20 @@ impl Default for KubectlQualificationKubernetesCampaignPort {
 
 #[async_trait]
 impl QualificationKubernetesCampaignPort for KubectlQualificationKubernetesCampaignPort {
-    async fn invoke_probe(
+    async fn invoke_command(
         &self,
         namespace: &str,
         pod_name: &str,
+        command: &QualificationNodeCommand,
         cancellation: &QualificationKubernetesCampaignCancellation,
     ) -> Result<QualificationNodeReply, QualificationKubernetesPortError> {
         let mut input = Vec::new();
-        write_json_line(&mut input, &QualificationNodeCommand::Probe)
+        write_json_line(&mut input, command)
             .map_err(|_| QualificationKubernetesPortError::Unavailable)?;
+        let arguments = self.command_arguments(control_client_arguments(namespace, pod_name));
         let output = run_kubectl(
             &self.executable,
-            &control_client_arguments(namespace, pod_name),
+            &arguments,
             &input,
             self.command_timeout,
             KUBECTL_STDOUT_MAX_BYTES,
@@ -1009,9 +1566,10 @@ impl QualificationKubernetesCampaignPort for KubectlQualificationKubernetesCampa
             "status": { "conditions": [condition] },
         }))
         .map_err(|_| QualificationKubernetesPortError::Unavailable)?;
+        let arguments = self.command_arguments(status_patch_arguments(namespace, pod_name, &patch));
         let output = run_kubectl(
             &self.executable,
-            &status_patch_arguments(namespace, pod_name, &patch),
+            &arguments,
             &[],
             self.command_timeout,
             4 * 1024,
@@ -1257,70 +1815,791 @@ where
     })
 }
 
-/// Fixed candidate-only summary written beside the transcript and readiness
-/// history fragment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Copy)]
+struct ValidatedCampaignOutcome {
+    status: QualificationKubernetesCampaignStatus,
+    completed_rounds: usize,
+    cleanup_complete: bool,
+    lease_handle_cleanup_complete: bool,
+    sequential_history_complete: bool,
+}
+
+fn validate_campaign_outcome(
+    config: &QualificationKubernetesCampaignConfig,
+    outcome: &QualificationKubernetesCampaignOutcome,
+) -> Result<ValidatedCampaignOutcome, QualificationKubernetesCampaignArtifactError> {
+    let scope = QualificationSequentialRunScope::derive(&config.history_id)
+        .map_err(|_| QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    let long_ttl = qualification_kubernetes_long_lease_ttl_millis(config.member_count)
+        .map_err(|_| QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    let expected_schedule =
+        qualification_sequential_workload_for_run(config.member_count, &scope, long_ttl)
+            .map_err(|_| QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    if outcome.sequential_schedule != expected_schedule
+        || outcome.sequential_history.len() > expected_schedule.len()
+        || outcome.readiness_history.len() > config.sample_count()
+    {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+
+    let maximum_transcript_records = config
+        .sample_count()
+        .checked_add(QUALIFICATION_SEQUENTIAL_OPERATION_COUNT)
+        .and_then(|count| count.checked_add(4))
+        .and_then(|count| count.checked_add(config.member_count.checked_mul(2)?))
+        .ok_or(QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    if outcome.transcript.len() > maximum_transcript_records {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    validate_transcript_envelopes(config, &outcome.transcript)?;
+
+    let mut reset_end = 0usize;
+    while outcome
+        .transcript
+        .get(reset_end)
+        .is_some_and(|record| record.action == QualificationKubernetesCampaignAction::Reset)
+    {
+        reset_end = reset_end.saturating_add(1);
+    }
+    if reset_end > config.member_count
+        || outcome.transcript[reset_end..]
+            .iter()
+            .any(|record| record.action == QualificationKubernetesCampaignAction::Reset)
+    {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    let mut explicit_failure = false;
+    for (member_index, record) in outcome.transcript[..reset_end].iter().enumerate() {
+        validate_condition_only_record(
+            config,
+            record,
+            member_index,
+            QualificationKubernetesCampaignAction::Reset,
+        )?;
+        match record.outcome {
+            QualificationKubernetesCampaignRecordOutcome::ResetPublished
+                if record.readiness_update_error.is_none() => {}
+            QualificationKubernetesCampaignRecordOutcome::ResetFailed
+                if record.readiness_update_error.is_some() =>
+            {
+                explicit_failure = true
+            }
+            _ => return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome),
+        }
+    }
+    let reset_complete = reset_end == config.member_count && !explicit_failure;
+
+    let cleanup_start = outcome
+        .transcript
+        .len()
+        .checked_sub(config.member_count)
+        .ok_or(QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    let cleanup_records = &outcome.transcript[cleanup_start..];
+    let mut cleanup_complete = true;
+    for (member_index, record) in cleanup_records.iter().enumerate() {
+        validate_condition_only_record(
+            config,
+            record,
+            member_index,
+            QualificationKubernetesCampaignAction::Cleanup,
+        )?;
+        match record.outcome {
+            QualificationKubernetesCampaignRecordOutcome::CleanupPublished
+                if record.readiness_update_error.is_none() => {}
+            QualificationKubernetesCampaignRecordOutcome::CleanupFailed
+                if record.readiness_update_error.is_some() =>
+            {
+                cleanup_complete = false
+            }
+            _ => return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome),
+        }
+    }
+    if outcome.transcript[..cleanup_start]
+        .iter()
+        .any(|record| record.action == QualificationKubernetesCampaignAction::Cleanup)
+    {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+
+    let mut handle_cleanup_start = cleanup_start;
+    while handle_cleanup_start > reset_end
+        && outcome.transcript[handle_cleanup_start - 1].action
+            == QualificationKubernetesCampaignAction::LeaseHandleCleanup
+    {
+        handle_cleanup_start -= 1;
+    }
+    if outcome.transcript[reset_end..handle_cleanup_start]
+        .iter()
+        .any(|record| record.action == QualificationKubernetesCampaignAction::LeaseHandleCleanup)
+    {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+
+    let middle = &outcome.transcript[reset_end..handle_cleanup_start];
+    if !reset_complete && !middle.is_empty() {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    let mut builder = QualificationSequentialHistoryBuilder::new(&expected_schedule)
+        .map_err(|_| QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    let mut history_offset = 0usize;
+    let mut readiness_offset = 0usize;
+    let mut readiness_sequences = vec![0usize; config.member_count];
+    let mut cursor = 0usize;
+    let mut completed_rounds = 0usize;
+    let mut cancelled = false;
+
+    if reset_complete && !middle.is_empty() {
+        let group_start = cursor;
+        let (next, full_ready) = validate_probe_group(
+            config,
+            middle,
+            cursor,
+            &outcome.readiness_history,
+            &mut readiness_offset,
+            &mut readiness_sequences,
+        )?;
+        cursor = next;
+        if full_ready {
+            completed_rounds = 1;
+        } else {
+            explicit_failure |= middle[group_start..cursor].iter().any(|record| {
+                !matches!(
+                    record.outcome,
+                    QualificationKubernetesCampaignRecordOutcome::Ready
+                        | QualificationKubernetesCampaignRecordOutcome::CampaignCancelled
+                )
+            });
+            cancelled |= middle[group_start..cursor].iter().any(|record| {
+                record.outcome == QualificationKubernetesCampaignRecordOutcome::CampaignCancelled
+            }) || !explicit_failure;
+            if cursor != middle.len() {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+        }
+    } else if reset_complete || !explicit_failure {
+        cancelled = true;
+    }
+
+    let mut sequential_post_sample_complete = false;
+    while cursor < middle.len() && history_offset < expected_schedule.len() {
+        let record = &middle[cursor];
+        if record.action != QualificationKubernetesCampaignAction::SequentialOperation {
+            break;
+        }
+        let scheduled = &expected_schedule[history_offset];
+        let observation = validate_sequential_record(config, record, scheduled, &mut builder)?;
+        let retained = outcome
+            .sequential_history
+            .get(history_offset)
+            .ok_or(QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+        if retained != &observation.history {
+            return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+        }
+        history_offset += 1;
+        cursor += 1;
+        if record.outcome == QualificationKubernetesCampaignRecordOutcome::CampaignCancelled {
+            cancelled = true;
+            if cursor != middle.len() {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+            break;
+        }
+        if !observation.expected {
+            explicit_failure = true;
+            if cursor != middle.len() {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+            break;
+        }
+        let group_start = cursor;
+        let (next, full_ready) = validate_probe_group(
+            config,
+            middle,
+            cursor,
+            &outcome.readiness_history,
+            &mut readiness_offset,
+            &mut readiness_sequences,
+        )?;
+        cursor = next;
+        sequential_post_sample_complete = full_ready;
+        if !full_ready {
+            explicit_failure |= middle[group_start..cursor].iter().any(|record| {
+                !matches!(
+                    record.outcome,
+                    QualificationKubernetesCampaignRecordOutcome::Ready
+                        | QualificationKubernetesCampaignRecordOutcome::CampaignCancelled
+                )
+            });
+            cancelled |= middle[group_start..cursor].iter().any(|record| {
+                record.outcome == QualificationKubernetesCampaignRecordOutcome::CampaignCancelled
+            }) || !explicit_failure;
+            if cursor != middle.len() {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+            break;
+        }
+    }
+    if history_offset != outcome.sequential_history.len() {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+
+    let sequential_history_complete = builder.is_complete() && sequential_post_sample_complete;
+    if sequential_history_complete {
+        for _ in 1..config.rounds {
+            if cursor == middle.len() {
+                cancelled = true;
+                break;
+            }
+            let group_start = cursor;
+            let (next, full_ready) = validate_probe_group(
+                config,
+                middle,
+                cursor,
+                &outcome.readiness_history,
+                &mut readiness_offset,
+                &mut readiness_sequences,
+            )?;
+            cursor = next;
+            if full_ready {
+                completed_rounds = completed_rounds.saturating_add(1);
+            } else {
+                explicit_failure |= middle[group_start..cursor].iter().any(|record| {
+                    !matches!(
+                        record.outcome,
+                        QualificationKubernetesCampaignRecordOutcome::Ready
+                            | QualificationKubernetesCampaignRecordOutcome::CampaignCancelled
+                    )
+                });
+                cancelled |= middle[group_start..cursor].iter().any(|record| {
+                    record.outcome
+                        == QualificationKubernetesCampaignRecordOutcome::CampaignCancelled
+                }) || !explicit_failure;
+                break;
+            }
+        }
+    }
+    if cursor != middle.len() || readiness_offset != outcome.readiness_history.len() {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+
+    let invoked_acquisitions = expected_schedule
+        .iter()
+        .take(history_offset)
+        .filter(|invocation| {
+            matches!(
+                invocation.operation,
+                QualificationSequentialOperation::LeaseAcquire { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let handle_cleanup_records = &outcome.transcript[handle_cleanup_start..cleanup_start];
+    if handle_cleanup_records.len() != invoked_acquisitions.len() {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    let mut lease_handle_cleanup_complete = true;
+    for (record, scheduled) in handle_cleanup_records.iter().zip(invoked_acquisitions) {
+        let forgotten = validate_handle_cleanup_record(config, record, scheduled)?;
+        lease_handle_cleanup_complete &= forgotten;
+    }
+
+    if outcome.cleanup_complete != cleanup_complete
+        || outcome.lease_handle_cleanup_complete != lease_handle_cleanup_complete
+        || outcome.sequential_history_complete != sequential_history_complete
+        || outcome.completed_rounds != completed_rounds
+    {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    let operational_complete = reset_complete
+        && sequential_history_complete
+        && completed_rounds == config.rounds
+        && !explicit_failure
+        && !cancelled;
+    let status = if !cleanup_complete || !lease_handle_cleanup_complete || explicit_failure {
+        QualificationKubernetesCampaignStatus::Failed
+    } else if operational_complete {
+        QualificationKubernetesCampaignStatus::Passed
+    } else {
+        QualificationKubernetesCampaignStatus::Cancelled
+    };
+    if outcome.status != status {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    Ok(ValidatedCampaignOutcome {
+        status,
+        completed_rounds,
+        cleanup_complete,
+        lease_handle_cleanup_complete,
+        sequential_history_complete,
+    })
+}
+
+fn validate_transcript_envelopes(
+    config: &QualificationKubernetesCampaignConfig,
+    transcript: &[QualificationKubernetesCampaignRecord],
+) -> Result<(), QualificationKubernetesCampaignArtifactError> {
+    let mut previous_round = 0usize;
+    for record in transcript {
+        if record.schema_version != QUALIFICATION_KUBERNETES_CAMPAIGN_TRANSCRIPT_SCHEMA
+            || record.member_index >= config.member_count
+            || record.pod_name != qualification_pod_name(record.member_index)
+            || record.completed_ns < record.started_ns
+            || record.round < previous_round
+            || record.condition.condition_type
+                != QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION
+        {
+            return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+        }
+        previous_round = record.round;
+    }
+    Ok(())
+}
+
+fn validate_condition_only_record(
+    config: &QualificationKubernetesCampaignConfig,
+    record: &QualificationKubernetesCampaignRecord,
+    member_index: usize,
+    action: QualificationKubernetesCampaignAction,
+) -> Result<(), QualificationKubernetesCampaignArtifactError> {
+    if record.action != action
+        || record.member_index != member_index
+        || record.pod_name != qualification_pod_name(member_index)
+        || record.command.is_some()
+        || record.schedule_operation_id.is_some()
+        || record.reply.is_some()
+        || record.control_error.is_some()
+        || record.condition
+            != QualificationKubernetesReadinessCondition::not_ready(
+                QualificationKubernetesReadinessReason::CampaignStopped,
+            )
+        || config.member_count == 0
+    {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    Ok(())
+}
+
+fn validate_probe_group(
+    config: &QualificationKubernetesCampaignConfig,
+    records: &[QualificationKubernetesCampaignRecord],
+    start: usize,
+    readiness_history: &[QualificationKubernetesReadinessHistoryV3],
+    readiness_offset: &mut usize,
+    readiness_sequences: &mut [usize],
+) -> Result<(usize, bool), QualificationKubernetesCampaignArtifactError> {
+    let mut cursor = start;
+    let mut member_index = 0usize;
+    let mut full_ready = true;
+    while member_index < config.member_count
+        && records
+            .get(cursor)
+            .is_some_and(|record| record.action == QualificationKubernetesCampaignAction::Probe)
+    {
+        let history = readiness_history
+            .get(*readiness_offset)
+            .ok_or(QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+        let sequence = readiness_sequences
+            .get_mut(member_index)
+            .ok_or(QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+        *sequence = sequence
+            .checked_add(1)
+            .ok_or(QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+        validate_probe_record(
+            config,
+            &records[cursor],
+            history,
+            member_index,
+            *sequence,
+            readiness_history.len(),
+        )?;
+        full_ready &=
+            records[cursor].outcome == QualificationKubernetesCampaignRecordOutcome::Ready;
+        *readiness_offset = readiness_offset
+            .checked_add(1)
+            .ok_or(QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+        cursor += 1;
+        member_index += 1;
+    }
+    Ok((cursor, member_index == config.member_count && full_ready))
+}
+
+fn validate_probe_record(
+    config: &QualificationKubernetesCampaignConfig,
+    record: &QualificationKubernetesCampaignRecord,
+    history: &QualificationKubernetesReadinessHistoryV3,
+    member_index: usize,
+    expected_sequence: usize,
+    history_operation_count: usize,
+) -> Result<(), QualificationKubernetesCampaignArtifactError> {
+    if record.action != QualificationKubernetesCampaignAction::Probe
+        || record.member_index != member_index
+        || !matches!(record.command, Some(QualificationNodeCommand::Probe))
+        || record.schedule_operation_id.is_some()
+        || history.schema_version != QUALIFICATION_CONCURRENT_HISTORY_SCHEMA_V3
+        || history.history_id != config.history_id
+        || history.history_operation_count != history_operation_count
+        || history.process_id != format!("node-{member_index}")
+        || history.started_ns != record.started_ns
+        || history.completed_ns != record.completed_ns
+        || history.operation.kind != "readiness"
+        || !history.operation.expected_quorum
+        || history.operation.sample_sequence != expected_sequence
+        || history.operation_id
+            != format!(
+                "readiness-{}-{member_index}",
+                history.operation.sample_sequence
+            )
+        || (record.reply.is_some() && record.control_error.is_some())
+    {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    let expectations = qualification_kubernetes_readiness_expectations(config.member_count)
+        .map_err(|_| QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    let expectation = expectations
+        .get(member_index)
+        .ok_or(QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    let ready_shape = history.operation.state == "ready"
+        && history.operation.term.is_some()
+        && history.operation.commit_index.is_some()
+        && history.operation.applied_index.is_some()
+        && record.condition.status == QualificationKubernetesConditionStatus::True;
+    let not_ready_shape = history.operation.state == "not_ready"
+        && history.operation.term.is_none()
+        && history.operation.commit_index.is_none()
+        && history.operation.applied_index.is_none()
+        && record.condition.status == QualificationKubernetesConditionStatus::False;
+    if !(ready_shape || not_ready_shape) {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    match record.outcome {
+        QualificationKubernetesCampaignRecordOutcome::Ready => {
+            let classified = classify_probe(record.reply.as_ref(), expectation);
+            if classified.outcome != QualificationKubernetesCampaignRecordOutcome::Ready
+                || !probe_binding_matches(classified, record, history, expected_sequence)
+                || !ready_shape
+                || record.control_error.is_some()
+                || record.readiness_update_error.is_some()
+            {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+        }
+        QualificationKubernetesCampaignRecordOutcome::ReadinessUpdateFailed => {
+            let classified = retained_probe_classification(record, expectation);
+            if record.readiness_update_error.is_none()
+                || classified.is_none_or(|classified| {
+                    !probe_binding_matches(classified, record, history, expected_sequence)
+                })
+            {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+        }
+        QualificationKubernetesCampaignRecordOutcome::NotReady => {
+            let classified = record
+                .reply
+                .as_ref()
+                .map(|reply| classify_probe(Some(reply), expectation));
+            if record.control_error.is_some()
+                || record.readiness_update_error.is_some()
+                || classified.is_none_or(|classified| {
+                    classified.outcome != QualificationKubernetesCampaignRecordOutcome::NotReady
+                        || !probe_binding_matches(classified, record, history, expected_sequence)
+                })
+                || !not_ready_shape
+            {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+        }
+        QualificationKubernetesCampaignRecordOutcome::ControlUnavailable => {
+            let classified = classify_probe(None, expectation);
+            if record.reply.is_some()
+                || record.control_error.is_none()
+                || record.control_error == Some(QualificationKubernetesPortError::Cancelled)
+                || record.readiness_update_error.is_some()
+                || classified.outcome
+                    != QualificationKubernetesCampaignRecordOutcome::ControlUnavailable
+                || !probe_binding_matches(classified, record, history, expected_sequence)
+                || !not_ready_shape
+            {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+        }
+        QualificationKubernetesCampaignRecordOutcome::InvalidReply => {
+            let classified = retained_probe_classification(record, expectation);
+            if record.control_error.is_some()
+                || record.readiness_update_error.is_some()
+                || classified.is_none_or(|classified| {
+                    classified.outcome != QualificationKubernetesCampaignRecordOutcome::InvalidReply
+                        || !probe_binding_matches(classified, record, history, expected_sequence)
+                })
+                || !not_ready_shape
+            {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+        }
+        QualificationKubernetesCampaignRecordOutcome::CampaignCancelled => {
+            let stopped = not_ready_probe(
+                QualificationKubernetesReadinessReason::CampaignStopped,
+                QualificationKubernetesCampaignRecordOutcome::CampaignCancelled,
+            );
+            let binding_is_stopped = record.readiness_update_error.is_none()
+                && probe_binding_matches(stopped, record, history, expected_sequence);
+            let binding_is_classified = retained_probe_classification(record, expectation)
+                .is_some_and(|classified| {
+                    probe_binding_matches(classified, record, history, expected_sequence)
+                });
+            if !not_ready_shape && !ready_shape {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+            if !binding_is_stopped && !binding_is_classified {
+                return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+            }
+        }
+        _ => return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome),
+    }
+    Ok(())
+}
+
+fn retained_probe_classification(
+    record: &QualificationKubernetesCampaignRecord,
+    expectation: &QualificationKubernetesReadinessExpectation,
+) -> Option<ClassifiedProbe> {
+    match (&record.reply, record.control_error) {
+        (Some(reply), None) => Some(classify_probe(Some(reply), expectation)),
+        (None, Some(error)) if error != QualificationKubernetesPortError::Cancelled => {
+            Some(classify_probe(None, expectation))
+        }
+        (None, None) => Some(not_ready_probe(
+            QualificationKubernetesReadinessReason::ProbeRejected,
+            QualificationKubernetesCampaignRecordOutcome::InvalidReply,
+        )),
+        _ => None,
+    }
+}
+
+fn probe_binding_matches(
+    mut classified: ClassifiedProbe,
+    record: &QualificationKubernetesCampaignRecord,
+    history: &QualificationKubernetesReadinessHistoryV3,
+    expected_sequence: usize,
+) -> bool {
+    classified.history.sample_sequence = expected_sequence;
+    record.condition == classified.condition && history.operation == classified.history
+}
+
+fn validate_sequential_record(
+    config: &QualificationKubernetesCampaignConfig,
+    record: &QualificationKubernetesCampaignRecord,
+    scheduled: &QualificationSequentialInvocation,
+    builder: &mut QualificationSequentialHistoryBuilder,
+) -> Result<
+    crate::qualification_sequential::QualificationSequentialObservation,
+    QualificationKubernetesCampaignArtifactError,
+> {
+    let member_index = scheduled
+        .member_index()
+        .map_err(|_| QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    let expected_command = scheduled.command();
+    if record.action != QualificationKubernetesCampaignAction::SequentialOperation
+        || record.member_index != member_index
+        || record.pod_name != qualification_pod_name(member_index)
+        || record.schedule_operation_id.as_deref() != Some(scheduled.operation_id.as_str())
+        || record.readiness_update_error.is_some()
+        || record.condition != QualificationKubernetesReadinessCondition::ready()
+        || !record
+            .command
+            .as_ref()
+            .is_some_and(|command| serialized_equal(command, &expected_command))
+        || record.reply.is_some() == record.control_error.is_some()
+        || config.member_count == 0
+    {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    let observation = builder
+        .observe(
+            scheduled,
+            record.started_ns,
+            record.completed_ns,
+            record.reply.as_ref(),
+        )
+        .map_err(|_| QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    let expected_outcome =
+        if record.outcome == QualificationKubernetesCampaignRecordOutcome::CampaignCancelled {
+            QualificationKubernetesCampaignRecordOutcome::CampaignCancelled
+        } else if !observation.expected {
+            QualificationKubernetesCampaignRecordOutcome::SequentialOperationIndeterminate
+        } else if scheduled.operation_index == 10 {
+            QualificationKubernetesCampaignRecordOutcome::SequentialOperationRejected
+        } else {
+            QualificationKubernetesCampaignRecordOutcome::SequentialOperationAccepted
+        };
+    if record.outcome != expected_outcome {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    Ok(observation)
+}
+
+fn validate_handle_cleanup_record(
+    config: &QualificationKubernetesCampaignConfig,
+    record: &QualificationKubernetesCampaignRecord,
+    scheduled: &QualificationSequentialInvocation,
+) -> Result<bool, QualificationKubernetesCampaignArtifactError> {
+    let member_index = scheduled
+        .member_index()
+        .map_err(|_| QualificationKubernetesCampaignArtifactError::InvalidOutcome)?;
+    let expected_command = QualificationNodeCommand::ForgetLease {
+        lease_handle: scheduled.operation_id.clone(),
+    };
+    if record.action != QualificationKubernetesCampaignAction::LeaseHandleCleanup
+        || record.member_index != member_index
+        || record.pod_name != qualification_pod_name(member_index)
+        || record.schedule_operation_id.as_deref() != Some(scheduled.operation_id.as_str())
+        || record.readiness_update_error.is_some()
+        || record.condition
+            != QualificationKubernetesReadinessCondition::not_ready(
+                QualificationKubernetesReadinessReason::CampaignStopped,
+            )
+        || !record
+            .command
+            .as_ref()
+            .is_some_and(|command| serialized_equal(command, &expected_command))
+        || record.reply.is_some() == record.control_error.is_some()
+        || config.member_count == 0
+    {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    let forgotten = matches!(
+        record.reply,
+        Some(QualificationNodeReply::LeaseHandleForgotten)
+    ) && record.control_error.is_none();
+    let expected_outcome = if forgotten {
+        QualificationKubernetesCampaignRecordOutcome::LeaseHandleForgotten
+    } else {
+        QualificationKubernetesCampaignRecordOutcome::LeaseHandleCleanupIndeterminate
+    };
+    if record.outcome != expected_outcome {
+        return Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome);
+    }
+    Ok(forgotten)
+}
+
+fn serialized_equal<T: Serialize>(left: &T, right: &T) -> bool {
+    match (serde_json::to_vec(left), serde_json::to_vec(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Fixed candidate-only summary written beside the transcript and both
+/// history artifacts.
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationKubernetesCampaignSummary {
     /// Summary schema identifier.
-    pub schema_version: String,
+    schema_version: String,
     /// This slice remains experimental.
-    pub experimental: bool,
+    experimental: bool,
     /// This slice never claims complete production qualification.
-    pub qualification_complete: bool,
+    qualification_complete: bool,
     /// This slice never counts as production evidence by itself.
-    pub counts_for_production: bool,
+    counts_for_production: bool,
     /// Bounded probe-campaign outcome.
-    pub status: QualificationKubernetesCampaignStatus,
+    status: QualificationKubernetesCampaignStatus,
     /// Configured voter count.
-    pub topology_members: usize,
+    topology_members: usize,
     /// Configured complete fleet rounds.
-    pub rounds_planned: usize,
+    rounds_planned: usize,
     /// Fully completed fleet rounds.
-    pub rounds_completed: usize,
+    rounds_completed: usize,
     /// Readiness samples retained in the fragment.
-    pub readiness_samples: usize,
+    readiness_samples: usize,
     /// Whether every final false-condition update succeeded.
-    pub cleanup_complete: bool,
+    cleanup_complete: bool,
+    /// Whether every invoked process-local lease handle was reclaimed.
+    lease_handle_cleanup_complete: bool,
     /// Existing v3 history schema consumed by these readiness rows.
-    pub readiness_history_schema: String,
+    readiness_history_schema: String,
     /// Digest of the exact bounded command/reply transcript bytes.
-    pub transcript_sha256: QualificationSha256,
+    transcript_sha256: QualificationSha256,
     /// Digest of the exact readiness-only v3 fragment bytes.
-    pub readiness_history_sha256: QualificationSha256,
+    readiness_history_sha256: QualificationSha256,
     /// This output intentionally lacks batch/watch/restore rows.
-    pub concurrent_history_complete: bool,
-    /// This slice does not produce the independent v1 workload history.
-    pub sequential_history_complete: bool,
+    concurrent_history_complete: bool,
+    /// Frozen sequential schedule schema emitted beside this summary.
+    sequential_schedule_schema: String,
+    /// Frozen digest-only sequential history schema.
+    sequential_history_schema: String,
+    /// Exact fixed number of deployed operations planned.
+    sequential_operations_planned: usize,
+    /// Number of deployed operations actually invoked and recorded.
+    sequential_operations_completed: usize,
+    /// Digest of the exact frozen v1 schedule bytes.
+    sequential_schedule_sha256: QualificationSha256,
+    /// Digest of the exact emitted v1 history bytes.
+    sequential_history_sha256: QualificationSha256,
+    /// Whether every scheduled operation and its readiness sample completed.
+    sequential_history_complete: bool,
     /// Complete fixed remaining #143 gate inventory.
-    pub remaining_acceptance: Vec<String>,
+    remaining_acceptance: Vec<String>,
 }
 
 impl QualificationKubernetesCampaignSummary {
+    /// Revalidated terminal campaign status.
+    #[must_use]
+    pub const fn status(&self) -> QualificationKubernetesCampaignStatus {
+        self.status
+    }
+
+    /// Whether the complete frozen v1 schedule and post-operation samples passed.
+    #[must_use]
+    pub const fn sequential_history_complete(&self) -> bool {
+        self.sequential_history_complete
+    }
+
+    /// Digest of the exact persisted frozen v1 schedule bytes.
+    #[must_use]
+    pub const fn sequential_schedule_sha256(&self) -> &QualificationSha256 {
+        &self.sequential_schedule_sha256
+    }
+
+    /// Digest of the exact persisted frozen v1 history bytes.
+    #[must_use]
+    pub const fn sequential_history_sha256(&self) -> &QualificationSha256 {
+        &self.sequential_history_sha256
+    }
+
     /// Construct an honest candidate-only summary from one completed run.
     #[must_use]
-    pub fn from_outcome(
+    fn from_validated_outcome(
         config: &QualificationKubernetesCampaignConfig,
         outcome: &QualificationKubernetesCampaignOutcome,
+        validated: ValidatedCampaignOutcome,
         transcript_sha256: QualificationSha256,
         readiness_history_sha256: QualificationSha256,
+        sequential_schedule_sha256: QualificationSha256,
+        sequential_history_sha256: QualificationSha256,
     ) -> Self {
         Self {
             schema_version: QUALIFICATION_KUBERNETES_CAMPAIGN_SUMMARY_SCHEMA.to_owned(),
             experimental: true,
             qualification_complete: false,
             counts_for_production: false,
-            status: outcome.status,
+            status: validated.status,
             topology_members: config.member_count,
             rounds_planned: config.rounds,
-            rounds_completed: outcome.completed_rounds,
+            rounds_completed: validated.completed_rounds,
             readiness_samples: outcome.readiness_history.len(),
-            cleanup_complete: outcome.cleanup_complete,
+            cleanup_complete: validated.cleanup_complete,
+            lease_handle_cleanup_complete: validated.lease_handle_cleanup_complete,
             readiness_history_schema: QUALIFICATION_CONCURRENT_HISTORY_SCHEMA_V3.to_owned(),
             transcript_sha256,
             readiness_history_sha256,
             concurrent_history_complete: false,
-            sequential_history_complete: false,
+            sequential_schedule_schema: QUALIFICATION_SEQUENTIAL_SCHEDULE_SCHEMA_V1.to_owned(),
+            sequential_history_schema: QUALIFICATION_SEQUENTIAL_HISTORY_SCHEMA_V1.to_owned(),
+            sequential_operations_planned: QUALIFICATION_SEQUENTIAL_OPERATION_COUNT,
+            sequential_operations_completed: outcome.sequential_history.len(),
+            sequential_schedule_sha256,
+            sequential_history_sha256,
+            sequential_history_complete: validated.sequential_history_complete,
             remaining_acceptance: SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4
                 .iter()
                 .map(|gate| (*gate).to_owned())
@@ -1336,6 +2615,9 @@ pub enum QualificationKubernetesCampaignArtifactError {
     /// The supplied campaign configuration did not satisfy its closed bounds.
     #[error("qualification Kubernetes campaign configuration is invalid")]
     InvalidCampaign,
+    /// The in-memory outcome contradicted its canonical schedule or transcript.
+    #[error("qualification Kubernetes campaign outcome is invalid")]
+    InvalidOutcome,
     /// The destination was relative, non-canonical, or otherwise unsafe.
     #[error("qualification Kubernetes artifact destination is invalid")]
     InvalidDestination,
@@ -1353,7 +2635,8 @@ pub enum QualificationKubernetesCampaignArtifactError {
     Publication,
 }
 
-/// Atomically persist the bounded transcript, readiness fragment, and summary.
+/// Atomically persist the bounded transcript, readiness fragment, frozen v1
+/// schedule/history pair, and summary.
 ///
 /// `output_directory` must be a new absolute direct child of an existing,
 /// canonical directory. Existing paths are never replaced. Files are private
@@ -1366,14 +2649,20 @@ pub fn persist_qualification_kubernetes_campaign(
     config
         .validate()
         .map_err(|_| QualificationKubernetesCampaignArtifactError::InvalidCampaign)?;
+    let validated = validate_campaign_outcome(config, outcome)?;
     let (parent, destination_name) = validate_artifact_destination(output_directory)?;
     let transcript = encode_json_lines(&outcome.transcript)?;
     let readiness_history = encode_json_lines(&outcome.readiness_history)?;
-    let summary = QualificationKubernetesCampaignSummary::from_outcome(
+    let sequential_schedule = encode_json_lines(&outcome.sequential_schedule)?;
+    let sequential_history = encode_json_lines(&outcome.sequential_history)?;
+    let summary = QualificationKubernetesCampaignSummary::from_validated_outcome(
         config,
         outcome,
+        validated,
         QualificationSha256::digest(&transcript),
         QualificationSha256::digest(&readiness_history),
+        QualificationSha256::digest(&sequential_schedule),
+        QualificationSha256::digest(&sequential_history),
     );
     let mut summary_bytes = serde_json::to_vec_pretty(&summary)
         .map_err(|_| QualificationKubernetesCampaignArtifactError::Encoding)?;
@@ -1392,6 +2681,16 @@ pub fn persist_qualification_kubernetes_campaign(
         staging.path(),
         CAMPAIGN_READINESS_HISTORY_FILE,
         &readiness_history,
+    )?;
+    write_private_artifact(
+        staging.path(),
+        CAMPAIGN_SEQUENTIAL_SCHEDULE_FILE,
+        &sequential_schedule,
+    )?;
+    write_private_artifact(
+        staging.path(),
+        CAMPAIGN_SEQUENTIAL_HISTORY_FILE,
+        &sequential_history,
     )?;
     write_private_artifact(staging.path(), CAMPAIGN_SUMMARY_FILE, &summary_bytes)?;
     sync_directory(staging.path())?;
@@ -1548,26 +2847,39 @@ mod tests {
 
     struct FakePort {
         replies: Mutex<VecDeque<Result<QualificationNodeReply, QualificationKubernetesPortError>>>,
+        forget_replies:
+            Mutex<VecDeque<Result<QualificationNodeReply, QualificationKubernetesPortError>>>,
+        invoked_commands: Mutex<Vec<QualificationNodeCommand>>,
+        invoked_pods: Mutex<Vec<String>>,
         published: Mutex<Vec<QualificationKubernetesReadinessCondition>>,
         fail_publish_at: Option<usize>,
         cancel_on_probe: Option<Arc<QualificationKubernetesCampaignCancellation>>,
     }
 
     impl FakePort {
-        fn ready(rounds: usize, member_count: usize) -> Self {
-            let expectations = qualification_kubernetes_readiness_expectations(member_count)
+        fn ready(config: &QualificationKubernetesCampaignConfig) -> Self {
+            let expectations = qualification_kubernetes_readiness_expectations(config.member_count)
                 .expect("fixed readiness expectations");
             let leader_id = expectations[0].expected_node_id();
+            let readiness_replies = || {
+                expectations
+                    .iter()
+                    .map(|expectation| Ok(ready_reply(expectation, leader_id)))
+                    .collect::<Vec<_>>()
+            };
+            let mut replies = VecDeque::from(readiness_replies());
+            for reply in sequential_replies(config) {
+                replies.push_back(Ok(reply));
+                replies.extend(readiness_replies());
+            }
+            for _ in 1..config.rounds {
+                replies.extend(readiness_replies());
+            }
             Self {
-                replies: Mutex::new(
-                    (0..rounds)
-                        .flat_map(|_| {
-                            expectations
-                                .iter()
-                                .map(|expectation| Ok(ready_reply(expectation, leader_id)))
-                        })
-                        .collect(),
-                ),
+                replies: Mutex::new(replies),
+                forget_replies: Mutex::new(VecDeque::new()),
+                invoked_commands: Mutex::new(Vec::new()),
+                invoked_pods: Mutex::new(Vec::new()),
                 published: Mutex::new(Vec::new()),
                 fail_publish_at: None,
                 cancel_on_probe: None,
@@ -1577,20 +2889,38 @@ mod tests {
 
     #[async_trait]
     impl QualificationKubernetesCampaignPort for FakePort {
-        async fn invoke_probe(
+        async fn invoke_command(
             &self,
             _namespace: &str,
-            _pod_name: &str,
+            pod_name: &str,
+            command: &QualificationNodeCommand,
             _cancellation: &QualificationKubernetesCampaignCancellation,
         ) -> Result<QualificationNodeReply, QualificationKubernetesPortError> {
-            let reply = self
-                .replies
+            self.invoked_commands
                 .lock()
-                .expect("reply lock")
-                .pop_front()
-                .unwrap_or(Err(QualificationKubernetesPortError::Unavailable));
-            if let Some(cancellation) = &self.cancel_on_probe {
-                cancellation.cancel();
+                .expect("invoked command lock")
+                .push(command.clone());
+            self.invoked_pods
+                .lock()
+                .expect("invoked pod lock")
+                .push(pod_name.to_owned());
+            let reply = if matches!(command, QualificationNodeCommand::ForgetLease { .. }) {
+                self.forget_replies
+                    .lock()
+                    .expect("forget reply lock")
+                    .pop_front()
+                    .unwrap_or(Ok(QualificationNodeReply::LeaseHandleForgotten))
+            } else {
+                self.replies
+                    .lock()
+                    .expect("reply lock")
+                    .pop_front()
+                    .unwrap_or(Err(QualificationKubernetesPortError::Unavailable))
+            };
+            if matches!(command, QualificationNodeCommand::Probe) {
+                if let Some(cancellation) = &self.cancel_on_probe {
+                    cancellation.cancel();
+                }
             }
             reply
         }
@@ -1686,15 +3016,114 @@ mod tests {
         }
     }
 
+    fn sequential_replies(
+        config: &QualificationKubernetesCampaignConfig,
+    ) -> Vec<QualificationNodeReply> {
+        let scope = QualificationSequentialRunScope::derive(&config.history_id)
+            .expect("valid test run scope");
+        let schedule = qualification_sequential_workload_for_run(
+            config.member_count,
+            &scope,
+            qualification_kubernetes_long_lease_ttl_millis(config.member_count)
+                .expect("valid test lease TTL"),
+        )
+        .expect("valid test schedule");
+        let owner = |index: usize| match &schedule[index].operation {
+            QualificationSequentialOperation::LeaseAcquire { owner, .. } => owner.clone(),
+            _ => panic!("test schedule owner operation is fixed"),
+        };
+        let owner_a = qualification_owner_sha256(&owner(3));
+        let owner_b = qualification_owner_sha256(&owner(7));
+        let value_1 = qualification_value_sha256(b"qualification-value-1");
+        let value_2 = qualification_value_sha256(b"qualification-value-2");
+        let value_3 = qualification_value_sha256(b"qualification-value-3");
+        vec![
+            QualificationNodeReply::LeaseAcquired { fence: 10 },
+            QualificationNodeReply::LeaseAcquired { fence: 11 },
+            QualificationNodeReply::Released,
+            QualificationNodeReply::LeaseAcquired { fence: 20 },
+            QualificationNodeReply::CompareAndSet {
+                applied: true,
+                current_generation: Some(1),
+            },
+            QualificationNodeReply::Record {
+                present: true,
+                generation: Some(1),
+                owner_sha256: Some(owner_a),
+                fence: Some(20),
+                value_sha256: Some(value_1),
+            },
+            QualificationNodeReply::Released,
+            QualificationNodeReply::LeaseAcquired { fence: 21 },
+            QualificationNodeReply::CompareAndSet {
+                applied: true,
+                current_generation: Some(2),
+            },
+            QualificationNodeReply::Error {
+                code: crate::qualification::QualificationNodeErrorCode::MutationRejected,
+            },
+            QualificationNodeReply::Record {
+                present: true,
+                generation: Some(2),
+                owner_sha256: Some(owner_b.clone()),
+                fence: Some(21),
+                value_sha256: Some(value_2),
+            },
+            QualificationNodeReply::CompareAndSet {
+                applied: true,
+                current_generation: Some(3),
+            },
+            QualificationNodeReply::Record {
+                present: true,
+                generation: Some(3),
+                owner_sha256: Some(owner_b.clone()),
+                fence: Some(21),
+                value_sha256: Some(value_3.clone()),
+            },
+            QualificationNodeReply::Released,
+            QualificationNodeReply::Record {
+                present: true,
+                generation: Some(3),
+                owner_sha256: Some(owner_b),
+                fence: Some(21),
+                value_sha256: Some(value_3),
+            },
+        ]
+    }
+
     #[cfg(unix)]
     fn write_fake_kubectl(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().expect("fake kubectl directory");
-        let executable = directory.path().join("kubectl");
-        fs::write(&executable, format!("#!/bin/sh\nset -eu\n{body}\n"))
-            .expect("write fake kubectl");
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
-            .expect("make fake kubectl executable");
-        (directory, executable)
+        let script = directory.path().join("kubectl");
+        fs::write(&script, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake kubectl");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o600))
+            .expect("make fake kubectl script private");
+        (directory, script)
+    }
+
+    #[cfg(unix)]
+    async fn run_fake_kubectl(
+        script: &Path,
+        arguments: &[OsString],
+        stdin_bytes: &[u8],
+        timeout: Duration,
+        stdout_max_bytes: usize,
+        stderr_max_bytes: usize,
+        cancellation: &QualificationKubernetesCampaignCancellation,
+    ) -> Result<KubectlOutput, QualificationKubernetesPortError> {
+        let mut shell_arguments = Vec::with_capacity(arguments.len() + 1);
+        shell_arguments.push(script.as_os_str().to_os_string());
+        shell_arguments.extend(arguments.iter().cloned());
+        run_kubectl(
+            std::ffi::OsStr::new("/bin/sh"),
+            &shell_arguments,
+            stdin_bytes,
+            timeout,
+            stdout_max_bytes,
+            stderr_max_bytes,
+            cancellation,
+        )
+        .await
     }
 
     #[cfg(unix)]
@@ -1758,8 +3187,8 @@ mod tests {
 exec sleep 30"#,
         );
         let cancellation = QualificationKubernetesCampaignCancellation::new();
-        let result = run_kubectl(
-            executable.as_os_str(),
+        let result = run_fake_kubectl(
+            &executable,
             &[],
             &[],
             Duration::from_millis(250),
@@ -1795,8 +3224,8 @@ exec sleep 30"#,
         let task_cancellation = Arc::clone(&cancellation);
         let task_executable = executable.clone();
         let task = tokio::spawn(async move {
-            run_kubectl(
-                task_executable.as_os_str(),
+            run_fake_kubectl(
+                &task_executable,
                 &[],
                 &[],
                 Duration::from_secs(30),
@@ -1835,6 +3264,45 @@ exec sleep 30"#,
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn phase_deadline_cancels_and_reaps_the_exact_kubectl_process() {
+        let (_directory, executable) = write_fake_kubectl(
+            r#"printf '%s\n' "$$" > "${0}.pid"
+exec sleep 30"#,
+        );
+        let pid_path = appended_path(&executable, ".pid");
+        let port = KubectlQualificationKubernetesCampaignPort::with_test_script(
+            executable.into_os_string(),
+            Duration::from_secs(30),
+        );
+        let cancellation = QualificationKubernetesCampaignCancellation::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let result = invoke_campaign_command(
+            &port,
+            "qualification",
+            "opc-session-ha-0-0",
+            &QualificationNodeCommand::Probe,
+            &cancellation,
+            Some(deadline),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(QualificationKubernetesPortError::Timeout)
+        ));
+        let pid = fs::read_to_string(pid_path)
+            .expect("fake kubectl PID")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric fake kubectl PID");
+        assert!(
+            !std::path::PathBuf::from(format!("/proc/{pid}")).exists(),
+            "phase-deadline kubectl must be reaped before return"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn kubectl_output_overflow_and_nonzero_exit_fail_closed() {
@@ -1842,8 +3310,8 @@ exec sleep 30"#,
         let oversized = "x".repeat(2_049);
         let (_overflow_directory, overflow_executable) =
             write_fake_kubectl(&format!("printf '%s' '{oversized}'"));
-        let overflow = run_kubectl(
-            overflow_executable.as_os_str(),
+        let overflow = run_fake_kubectl(
+            &overflow_executable,
             &[],
             &[],
             Duration::from_secs(2),
@@ -1858,8 +3326,8 @@ exec sleep 30"#,
         ));
 
         let (_failure_directory, failure_executable) = write_fake_kubectl("exit 9");
-        let failure = run_kubectl(
-            failure_executable.as_os_str(),
+        let failure = run_fake_kubectl(
+            &failure_executable,
             &[],
             &[],
             Duration::from_secs(2),
@@ -1880,11 +3348,16 @@ exec sleep 30"#,
         let cancellation = QualificationKubernetesCampaignCancellation::new();
         let (_malformed_directory, malformed_executable) =
             write_fake_kubectl("IFS= read -r _\nprintf '%s\\n' 'not-json'");
-        let malformed = KubectlQualificationKubernetesCampaignPort::with_executable(
+        let malformed = KubectlQualificationKubernetesCampaignPort::with_test_script(
             malformed_executable.into_os_string(),
             Duration::from_secs(2),
         )
-        .invoke_probe("qualification", "opc-session-ha-0-0", &cancellation)
+        .invoke_command(
+            "qualification",
+            "opc-session-ha-0-0",
+            &QualificationNodeCommand::Probe,
+            &cancellation,
+        )
         .await;
         assert!(matches!(
             malformed,
@@ -1894,11 +3367,16 @@ exec sleep 30"#,
         let (_duplicate_directory, duplicate_executable) = write_fake_kubectl(
             "IFS= read -r _\nprintf '%s\\n%s\\n' '{\"reply\":\"initialized\"}' '{\"reply\":\"initialized\"}'",
         );
-        let duplicate = KubectlQualificationKubernetesCampaignPort::with_executable(
+        let duplicate = KubectlQualificationKubernetesCampaignPort::with_test_script(
             duplicate_executable.into_os_string(),
             Duration::from_secs(2),
         )
-        .invoke_probe("qualification", "opc-session-ha-0-0", &cancellation)
+        .invoke_command(
+            "qualification",
+            "opc-session-ha-0-0",
+            &QualificationNodeCommand::Probe,
+            &cancellation,
+        )
         .await;
         assert!(matches!(
             duplicate,
@@ -1908,9 +3386,46 @@ exec sleep 30"#,
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn kubectl_control_adapter_forwards_one_typed_mutation_unchanged() {
+        let (_directory, executable) = write_fake_kubectl(
+            r#"IFS= read -r input
+printf '%s\n' "$input" > "${0}.stdin"
+printf '%s\n' '{"reply":"lease_acquired","fence":7}'"#,
+        );
+        let port = KubectlQualificationKubernetesCampaignPort::with_test_script(
+            executable.clone().into_os_string(),
+            Duration::from_secs(2),
+        );
+        let command = QualificationNodeCommand::Acquire {
+            lease_handle: "op-1".to_owned(),
+            stable_id: "session-a".to_owned(),
+            owner: "owner-a".to_owned(),
+            ttl_millis: 60_000,
+        };
+        let reply = port
+            .invoke_command(
+                "qualification",
+                "opc-session-ha-0-0",
+                &command,
+                &QualificationKubernetesCampaignCancellation::new(),
+            )
+            .await
+            .expect("typed mutation reply");
+        assert!(matches!(
+            reply,
+            QualificationNodeReply::LeaseAcquired { fence: 7 }
+        ));
+        let forwarded =
+            fs::read(appended_path(&executable, ".stdin")).expect("captured control command");
+        let expected = serde_json::to_vec(&command).expect("encode expected command");
+        assert_eq!(forwarded, [expected, b"\n".to_vec()].concat());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn kubectl_status_adapter_uses_only_the_status_subresource_command() {
         let (_directory, executable) = write_fake_kubectl(r#"printf '%s\n' "$@" > "${0}.args""#);
-        let port = KubectlQualificationKubernetesCampaignPort::with_executable(
+        let port = KubectlQualificationKubernetesCampaignPort::with_test_script(
             executable.clone().into_os_string(),
             Duration::from_secs(2),
         );
@@ -1976,6 +3491,15 @@ exec sleep 30"#,
             invalid.validate(),
             Err(QualificationKubernetesCampaignConfigError::InvalidRounds)
         );
+        let mut exact_sample_bound = config.clone();
+        exact_sample_bound.member_count = 5;
+        exact_sample_bound.rounds = 1_985;
+        assert_eq!(exact_sample_bound.validate(), Ok(()));
+        exact_sample_bound.rounds = 1_986;
+        assert_eq!(
+            exact_sample_bound.validate(),
+            Err(QualificationKubernetesCampaignConfigError::InvalidRounds)
+        );
         invalid = config.clone();
         invalid.namespace = "Bad_Namespace".to_owned();
         assert_eq!(
@@ -1988,6 +3512,77 @@ exec sleep 30"#,
             invalid.validate(),
             Err(QualificationKubernetesCampaignConfigError::InvalidHistoryId)
         );
+    }
+
+    #[test]
+    fn deployed_long_lease_covers_the_exact_admitted_kubectl_envelope() {
+        assert_eq!(qualification_kubernetes_long_lease_call_count(3), Ok(42));
+        assert_eq!(qualification_kubernetes_long_lease_call_count(5), Ok(66));
+        let timeout_millis = u64::try_from(QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT.as_millis())
+            .expect("timeout fits u64");
+        assert_eq!(timeout_millis, 50_000);
+        for members in [3, 5] {
+            let protected_calls =
+                qualification_kubernetes_long_lease_call_count(members).expect("call count");
+            let ttl = qualification_kubernetes_long_lease_ttl_millis(members).expect("lease TTL");
+            let phase =
+                qualification_kubernetes_long_lease_phase_budget(members).expect("phase budget");
+            assert_eq!(
+                ttl,
+                u64::try_from(protected_calls + LONG_LEASE_MARGIN_KUBECTL_CALLS)
+                    .expect("bounded calls")
+                    * timeout_millis
+            );
+            assert_eq!(
+                phase,
+                QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT
+                    .checked_mul(u32::try_from(protected_calls).expect("bounded calls"))
+                    .expect("bounded phase")
+            );
+            let ttl = Duration::from_millis(ttl);
+            let margin = ttl.checked_sub(phase).expect("positive lease margin");
+            assert_eq!(
+                margin,
+                QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT
+                    .checked_mul(
+                        u32::try_from(LONG_LEASE_MARGIN_KUBECTL_CALLS)
+                            .expect("bounded margin calls"),
+                    )
+                    .expect("bounded margin")
+            );
+            assert!(margin > KUBECTL_PHASE_ABORT_DRAIN_TIMEOUT);
+            assert!(ttl <= opc_session_store::MAX_SESSION_TTL);
+
+            let config = QualificationKubernetesCampaignConfig {
+                member_count: members,
+                ..campaign_config(1)
+            };
+            let scope =
+                QualificationSequentialRunScope::derive(&config.history_id).expect("run scope");
+            let schedule = qualification_sequential_workload_for_run(
+                members,
+                &scope,
+                u64::try_from(ttl.as_millis()).expect("bounded TTL"),
+            )
+            .expect("scoped schedule");
+            for (offset, invocation) in schedule.iter().enumerate() {
+                if let QualificationSequentialOperation::LeaseAcquire { ttl_millis, .. } =
+                    invocation.operation
+                {
+                    if offset == 0 {
+                        assert_eq!(
+                            ttl_millis,
+                            crate::qualification_sequential::QUALIFICATION_SHORT_LEASE_MILLIS
+                        );
+                    } else {
+                        assert_eq!(
+                            ttl_millis,
+                            u64::try_from(ttl.as_millis()).expect("bounded TTL")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2047,7 +3642,7 @@ exec sleep 30"#,
     #[tokio::test]
     async fn complete_campaign_publishes_only_fresh_readiness_then_clears_it() {
         let config = campaign_config(2);
-        let port = FakePort::ready(2, 3);
+        let port = FakePort::ready(&config);
         let outcome = run_qualification_kubernetes_probe_campaign(
             &config,
             &port,
@@ -2063,10 +3658,17 @@ exec sleep 30"#,
         );
         assert_eq!(outcome.completed_rounds, 2);
         assert!(outcome.cleanup_complete);
-        assert_eq!(outcome.transcript.len(), 12);
-        assert_eq!(outcome.readiness_history.len(), 6);
+        assert!(outcome.lease_handle_cleanup_complete);
+        assert!(outcome.sequential_history_complete);
+        assert_eq!(outcome.sequential_history.len(), 15);
+        assert_eq!(outcome.transcript.len(), 76);
+        assert!(outcome
+            .transcript
+            .windows(2)
+            .all(|rows| rows[0].round <= rows[1].round));
+        assert_eq!(outcome.readiness_history.len(), 51);
         for (index, row) in outcome.readiness_history.iter().enumerate() {
-            assert_eq!(row.history_operation_count, 6);
+            assert_eq!(row.history_operation_count, 51);
             assert_eq!(row.operation.sample_sequence, index / 3 + 1);
             assert_eq!(row.operation.state, "ready");
             assert_eq!(row.operation.term, Some(2));
@@ -2075,18 +3677,176 @@ exec sleep 30"#,
         assert!(published[..3]
             .iter()
             .all(|condition| condition.status == QualificationKubernetesConditionStatus::False));
-        assert!(published[3..9]
+        assert!(published[3..54]
             .iter()
             .all(|condition| condition.status == QualificationKubernetesConditionStatus::True));
-        assert!(published[9..]
+        assert!(published[54..]
             .iter()
             .all(|condition| condition.status == QualificationKubernetesConditionStatus::False));
+
+        let commands = port.invoked_commands.lock().expect("command lock");
+        let pods = port.invoked_pods.lock().expect("pod lock");
+        let sequential_invocations = commands
+            .iter()
+            .zip(pods.iter())
+            .filter(|(command, _)| {
+                !matches!(
+                    command,
+                    QualificationNodeCommand::Probe | QualificationNodeCommand::ForgetLease { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequential_invocations.len(), 15);
+        for ((actual_command, actual_pod), scheduled) in sequential_invocations
+            .into_iter()
+            .zip(outcome.sequential_schedule.iter())
+        {
+            assert_eq!(
+                serde_json::to_value(actual_command).expect("actual command"),
+                serde_json::to_value(scheduled.command()).expect("scheduled command")
+            );
+            assert_eq!(
+                actual_pod,
+                &qualification_pod_name(scheduled.member_index().expect("member index"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_mutation_is_recorded_once_and_never_retried() {
+        let config = campaign_config(1);
+        let mut port = FakePort::ready(&config);
+        *port
+            .replies
+            .get_mut()
+            .expect("reply queue")
+            .get_mut(3)
+            .expect("first operation reply") = Err(QualificationKubernetesPortError::Timeout);
+        let outcome = run_qualification_kubernetes_probe_campaign(
+            &config,
+            &port,
+            &FakeClock::new(),
+            &QualificationKubernetesCampaignCancellation::new(),
+        )
+        .await
+        .expect("valid campaign");
+
+        assert_eq!(
+            outcome.status,
+            QualificationKubernetesCampaignStatus::Failed
+        );
+        assert!(!outcome.sequential_history_complete);
+        assert_eq!(outcome.sequential_history.len(), 1);
+        assert!(matches!(
+            outcome.sequential_history[0].operation,
+            crate::qualification_sequential::QualificationSequentialHistoryOperation::LeaseAcquire {
+                outcome: crate::qualification_sequential::QualificationSequentialLeaseOutcome::Indeterminate,
+                fence: None,
+                ..
+            }
+        ));
+        let commands = port.invoked_commands.lock().expect("command lock");
+        assert_eq!(commands.len(), 5);
+        assert!(matches!(
+            commands[3],
+            QualificationNodeCommand::Acquire { .. }
+        ));
+        assert_eq!(
+            outcome
+                .transcript
+                .iter()
+                .filter(|record| {
+                    record.action == QualificationKubernetesCampaignAction::SequentialOperation
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcome.transcript[6].outcome,
+            QualificationKubernetesCampaignRecordOutcome::SequentialOperationIndeterminate
+        );
+        assert_eq!(
+            outcome.transcript[6].control_error,
+            Some(QualificationKubernetesPortError::Timeout)
+        );
+        assert!(matches!(
+            commands[4],
+            QualificationNodeCommand::ForgetLease { .. }
+        ));
+        assert!(validate_campaign_outcome(&config, &outcome).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_handle_cleanup_is_recorded_once_and_never_retried() {
+        let config = campaign_config(1);
+        let port = FakePort::ready(&config);
+        port.forget_replies
+            .lock()
+            .expect("forget reply lock")
+            .push_back(Err(QualificationKubernetesPortError::Timeout));
+        let outcome = run_qualification_kubernetes_probe_campaign(
+            &config,
+            &port,
+            &FakeClock::new(),
+            &QualificationKubernetesCampaignCancellation::new(),
+        )
+        .await
+        .expect("valid campaign");
+
+        assert_eq!(
+            outcome.status,
+            QualificationKubernetesCampaignStatus::Failed
+        );
+        assert!(outcome.sequential_history_complete);
+        assert!(!outcome.lease_handle_cleanup_complete);
+        let expected_handles = outcome
+            .sequential_schedule
+            .iter()
+            .filter(|scheduled| {
+                matches!(
+                    scheduled.operation,
+                    QualificationSequentialOperation::LeaseAcquire { .. }
+                )
+            })
+            .map(|scheduled| scheduled.operation_id.as_str())
+            .collect::<Vec<_>>();
+        let commands = port.invoked_commands.lock().expect("command lock");
+        let actual_handles = commands
+            .iter()
+            .filter_map(|command| match command {
+                QualificationNodeCommand::ForgetLease { lease_handle } => {
+                    Some(lease_handle.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_handles, expected_handles);
+        let cleanup = outcome
+            .transcript
+            .iter()
+            .filter(|record| {
+                record.action == QualificationKubernetesCampaignAction::LeaseHandleCleanup
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cleanup.len(), expected_handles.len());
+        assert_eq!(
+            cleanup[0].outcome,
+            QualificationKubernetesCampaignRecordOutcome::LeaseHandleCleanupIndeterminate
+        );
+        assert_eq!(
+            cleanup[0].control_error,
+            Some(QualificationKubernetesPortError::Timeout)
+        );
+        assert!(cleanup[1..].iter().all(|record| {
+            record.outcome == QualificationKubernetesCampaignRecordOutcome::LeaseHandleForgotten
+        }));
+        assert!(validate_campaign_outcome(&config, &outcome).is_ok());
     }
 
     #[tokio::test]
     async fn contradictory_reply_fails_closed_without_authority_fields() {
         let config = campaign_config(1);
-        let mut port = FakePort::ready(1, 3);
+        let mut port = FakePort::ready(&config);
         let first_expectation = readiness_expectation(3, 0);
         let second_expectation = readiness_expectation(3, 1);
         let leader_id = first_expectation.expected_voter_ids()[0];
@@ -2130,12 +3890,13 @@ exec sleep 30"#,
             .expect("published lock")
             .iter()
             .all(|condition| condition.status == QualificationKubernetesConditionStatus::False));
+        assert!(validate_campaign_outcome(&config, &outcome).is_ok());
     }
 
     #[tokio::test]
     async fn cancellation_returns_partial_artifacts_and_clears_every_member() {
         let config = campaign_config(2);
-        let port = FakePort::ready(2, 3);
+        let port = FakePort::ready(&config);
         let cancellation = Arc::new(QualificationKubernetesCampaignCancellation::new());
         let clock = FakeClock {
             elapsed: std::sync::atomic::AtomicU64::new(0),
@@ -2155,9 +3916,13 @@ exec sleep 30"#,
             QualificationKubernetesCampaignStatus::Cancelled
         );
         assert_eq!(outcome.completed_rounds, 1);
-        assert_eq!(outcome.readiness_history.len(), 3);
+        assert_eq!(outcome.readiness_history.len(), 6);
+        assert_eq!(outcome.sequential_history.len(), 1);
+        assert!(!outcome.sequential_history_complete);
         assert!(outcome.cleanup_complete);
-        assert_eq!(port.published.lock().expect("published lock").len(), 9);
+        assert!(outcome.lease_handle_cleanup_complete);
+        assert_eq!(port.published.lock().expect("published lock").len(), 12);
+        assert!(validate_campaign_outcome(&config, &outcome).is_ok());
     }
 
     #[tokio::test]
@@ -2167,6 +3932,9 @@ exec sleep 30"#,
         let leader_id = expectation.expected_voter_ids()[0];
         let port = FakePort {
             replies: Mutex::new(VecDeque::from([Ok(ready_reply(&expectation, leader_id))])),
+            forget_replies: Mutex::new(VecDeque::new()),
+            invoked_commands: Mutex::new(Vec::new()),
+            invoked_pods: Mutex::new(Vec::new()),
             published: Mutex::new(Vec::new()),
             fail_publish_at: Some(3),
             cancel_on_probe: None,
@@ -2188,12 +3956,13 @@ exec sleep 30"#,
         assert_eq!(outcome.transcript.len(), 7);
         assert!(outcome.cleanup_complete);
         assert_eq!(port.published.lock().expect("published lock").len(), 7);
+        assert!(validate_campaign_outcome(&config, &outcome).is_ok());
     }
 
     #[tokio::test]
     async fn incomplete_initial_reset_never_invokes_or_publishes_a_ready_probe() {
         let config = campaign_config(2);
-        let port = FakePort::ready(2, 3);
+        let port = FakePort::ready(&config);
         let port = FakePort {
             fail_publish_at: Some(0),
             ..port
@@ -2218,17 +3987,18 @@ exec sleep 30"#,
             outcome.transcript[0].outcome,
             QualificationKubernetesCampaignRecordOutcome::ResetFailed
         );
-        assert_eq!(
-            port.replies.lock().expect("reply lock").len(),
-            6,
-            "failed reset must abort before any probe"
-        );
+        assert!(port
+            .invoked_commands
+            .lock()
+            .expect("invoked command lock")
+            .is_empty());
         assert!(port
             .published
             .lock()
             .expect("published lock")
             .iter()
             .all(|condition| condition.status == QualificationKubernetesConditionStatus::False));
+        assert!(validate_campaign_outcome(&config, &outcome).is_ok());
     }
 
     #[tokio::test]
@@ -2239,6 +4009,9 @@ exec sleep 30"#,
         let leader_id = expectation.expected_voter_ids()[0];
         let port = FakePort {
             replies: Mutex::new(VecDeque::from([Ok(ready_reply(&expectation, leader_id))])),
+            forget_replies: Mutex::new(VecDeque::new()),
+            invoked_commands: Mutex::new(Vec::new()),
+            invoked_pods: Mutex::new(Vec::new()),
             published: Mutex::new(Vec::new()),
             fail_publish_at: None,
             cancel_on_probe: Some(Arc::clone(&cancellation)),
@@ -2266,6 +4039,7 @@ exec sleep 30"#,
             port.published.lock().expect("published lock")[3].status,
             QualificationKubernetesConditionStatus::False
         );
+        assert!(validate_campaign_outcome(&config, &outcome).is_ok());
     }
 
     #[cfg(unix)]
@@ -2275,7 +4049,7 @@ exec sleep 30"#,
         let canonical_root = fs::canonicalize(root.path()).expect("canonical root");
         let output = canonical_root.join("campaign-1");
         let config = campaign_config(1);
-        let port = FakePort::ready(1, 3);
+        let port = FakePort::ready(&config);
         let outcome = run_qualification_kubernetes_probe_campaign(
             &config,
             &port,
@@ -2298,6 +4072,10 @@ exec sleep 30"#,
         let transcript = fs::read(output.join(CAMPAIGN_TRANSCRIPT_FILE)).expect("transcript");
         let history =
             fs::read(output.join(CAMPAIGN_READINESS_HISTORY_FILE)).expect("readiness history");
+        let sequential_schedule =
+            fs::read(output.join(CAMPAIGN_SEQUENTIAL_SCHEDULE_FILE)).expect("sequential schedule");
+        let sequential_history =
+            fs::read(output.join(CAMPAIGN_SEQUENTIAL_HISTORY_FILE)).expect("sequential history");
         assert_eq!(
             summary.transcript_sha256,
             QualificationSha256::digest(&transcript)
@@ -2306,9 +4084,40 @@ exec sleep 30"#,
             summary.readiness_history_sha256,
             QualificationSha256::digest(&history)
         );
+        assert_eq!(
+            summary.sequential_schedule_sha256,
+            QualificationSha256::digest(&sequential_schedule)
+        );
+        assert_eq!(
+            summary.sequential_history_sha256,
+            QualificationSha256::digest(&sequential_history)
+        );
+        assert!(summary.experimental);
+        assert!(!summary.qualification_complete);
+        assert!(!summary.counts_for_production);
+        assert!(!summary.concurrent_history_complete);
+        assert!(summary.sequential_history_complete);
+        let checker =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-session-ha-history.py");
+        let checker_output = Command::new("python3")
+            .arg(checker)
+            .arg("--schedule")
+            .arg(output.join(CAMPAIGN_SEQUENTIAL_SCHEDULE_FILE))
+            .arg("--history")
+            .arg(output.join(CAMPAIGN_SEQUENTIAL_HISTORY_FILE))
+            .output()
+            .await
+            .expect("run independent sequential checker");
+        assert!(checker_output.status.success());
+        let checker_document: serde_json::Value = serde_json::from_slice(&checker_output.stdout)
+            .expect("decode independent checker output");
+        assert_eq!(checker_document["status"], "pass");
+        assert_eq!(checker_document["operations_checked"], 15);
         for name in [
             CAMPAIGN_TRANSCRIPT_FILE,
             CAMPAIGN_READINESS_HISTORY_FILE,
+            CAMPAIGN_SEQUENTIAL_SCHEDULE_FILE,
+            CAMPAIGN_SEQUENTIAL_HISTORY_FILE,
             CAMPAIGN_SUMMARY_FILE,
         ] {
             assert_eq!(
@@ -2324,5 +4133,129 @@ exec sleep 30"#,
             persist_qualification_kubernetes_campaign(&output, &config, &outcome),
             Err(QualificationKubernetesCampaignArtifactError::DestinationExists)
         ));
+    }
+
+    #[tokio::test]
+    async fn persistence_rejects_forged_or_noncontiguous_outcomes_before_publication() {
+        let root = tempfile::tempdir().expect("artifact root");
+        let canonical_root = fs::canonicalize(root.path()).expect("canonical root");
+        let config = campaign_config(1);
+        let port = FakePort::ready(&config);
+        let outcome = run_qualification_kubernetes_probe_campaign(
+            &config,
+            &port,
+            &FakeClock::new(),
+            &QualificationKubernetesCampaignCancellation::new(),
+        )
+        .await
+        .expect("valid campaign");
+        assert!(validate_campaign_outcome(&config, &outcome).is_ok());
+
+        let assert_rejected = |name: &str, forged: &QualificationKubernetesCampaignOutcome| {
+            let destination = canonical_root.join(name);
+            assert!(matches!(
+                persist_qualification_kubernetes_campaign(&destination, &config, forged),
+                Err(QualificationKubernetesCampaignArtifactError::InvalidOutcome)
+            ));
+            assert!(!destination.exists());
+        };
+
+        let mut empty_pass = outcome.clone();
+        empty_pass.transcript.clear();
+        empty_pass.readiness_history.clear();
+        empty_pass.sequential_schedule.clear();
+        empty_pass.sequential_history.clear();
+        empty_pass.status = QualificationKubernetesCampaignStatus::Passed;
+        empty_pass.completed_rounds = config.rounds;
+        empty_pass.cleanup_complete = true;
+        empty_pass.lease_handle_cleanup_complete = true;
+        empty_pass.sequential_history_complete = true;
+        assert_rejected("empty-pass", &empty_pass);
+
+        let mut missing_schedule = outcome.clone();
+        missing_schedule.sequential_schedule.pop();
+        assert_rejected("missing-schedule", &missing_schedule);
+
+        let mut reordered_schedule = outcome.clone();
+        reordered_schedule.sequential_schedule.swap(0, 1);
+        assert_rejected("reordered-schedule", &reordered_schedule);
+
+        let mut duplicate_history = outcome.clone();
+        duplicate_history.sequential_history[1] = duplicate_history.sequential_history[0].clone();
+        assert_rejected("duplicate-history", &duplicate_history);
+
+        let mut reordered_history = outcome.clone();
+        reordered_history.sequential_history.swap(0, 1);
+        assert_rejected("reordered-history", &reordered_history);
+
+        let mut substituted_transcript = outcome.clone();
+        let sequential = substituted_transcript
+            .transcript
+            .iter_mut()
+            .find(|record| {
+                record.action == QualificationKubernetesCampaignAction::SequentialOperation
+            })
+            .expect("sequential record");
+        sequential.schedule_operation_id = Some("substituted-operation".to_owned());
+        assert_rejected("substituted-transcript", &substituted_transcript);
+
+        let mut duplicate_transcript = outcome.clone();
+        let sequential_index = duplicate_transcript
+            .transcript
+            .iter()
+            .position(|record| {
+                record.action == QualificationKubernetesCampaignAction::SequentialOperation
+            })
+            .expect("sequential record");
+        let duplicate = duplicate_transcript.transcript[sequential_index].clone();
+        duplicate_transcript
+            .transcript
+            .insert(sequential_index + 1, duplicate);
+        assert_rejected("duplicate-transcript", &duplicate_transcript);
+
+        let mut missing_post_operation_sample = outcome.clone();
+        missing_post_operation_sample
+            .transcript
+            .remove(sequential_index + 1);
+        missing_post_operation_sample
+            .readiness_history
+            .remove(config.member_count);
+        assert_rejected(
+            "missing-post-operation-sample",
+            &missing_post_operation_sample,
+        );
+
+        let mut mismatched_reply = outcome.clone();
+        mismatched_reply.transcript[sequential_index].reply =
+            Some(QualificationNodeReply::LeaseAcquired { fence: 999 });
+        assert_rejected("mismatched-reply", &mismatched_reply);
+
+        let mut forged_term = outcome.clone();
+        let term = forged_term.readiness_history[0]
+            .operation
+            .term
+            .expect("ready term");
+        forged_term.readiness_history[0].operation.term = Some(term.wrapping_add(1));
+        assert_rejected("forged-readiness-term", &forged_term);
+
+        let mut forged_commit = outcome.clone();
+        let commit = forged_commit.readiness_history[0]
+            .operation
+            .commit_index
+            .expect("ready commit index");
+        forged_commit.readiness_history[0].operation.commit_index = Some(commit.wrapping_add(1));
+        assert_rejected("forged-readiness-commit", &forged_commit);
+
+        let mut forged_applied = outcome.clone();
+        let applied = forged_applied.readiness_history[0]
+            .operation
+            .applied_index
+            .expect("ready applied index");
+        forged_applied.readiness_history[0].operation.applied_index = Some(applied.wrapping_add(1));
+        assert_rejected("forged-readiness-applied", &forged_applied);
+
+        let mut forged_completion = outcome;
+        forged_completion.sequential_history_complete = false;
+        assert_rejected("forged-completion", &forged_completion);
     }
 }

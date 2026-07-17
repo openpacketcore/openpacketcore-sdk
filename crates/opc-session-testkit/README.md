@@ -87,22 +87,38 @@ foundation does not constitute deployed evidence and does not change the
 experimental profile.
 
 `opc-session-kubernetes-campaign` is the bounded external companion for the
-first deployed vertical: it drives each private same-binary control socket via
-direct `kubectl exec`, updates only the custom Pod readiness-gate condition
-from a freshly validated Openraft barrier report, and atomically retains a
-private command/reply transcript plus a digest-bound readiness-only v3 history
-fragment. The runner resets every condition before sampling, aborts and
-latches the first failure, and attempts an all-false final cleanup. The custom
-condition is an AND-only evidence gate: each rendered container also has a
-kubelet exec probe that calls the same node over its private UDS and admits
-only the exact stable local and fleet voter identities. This local probe makes
-readiness self-expire on quorum loss, probe timeout, or process termination
-without depending on external-runner cleanup. The runner uses caller-owned,
-externally audited `pods/exec` and `pods/status` authority; the rendered fleet
-still receives no token or RBAC. This fragment omits the v1 workload and v3
-batch/watch/restore evidence, so it remains candidate-only and cannot claim a
-completed #143 campaign. See the Kubernetes qualification README for the
-exact invocation and gate contract.
+first deployed vertical. After one fresh all-member readiness baseline, it
+drives the shared frozen 15-operation lease/fence/CAS/read schedule across the
+designated Pods via direct `kubectl exec` and samples every member after each
+operation. `--history-id` must be unique for every campaign attempt; its
+domain-separated digest namespaces every durable key, owner, schedule ID,
+operation ID, and lease handle, allowing retained PVCs and live processes to
+run later campaigns without colliding. Mutations and local handle cleanup are
+sent once only: an absent terminal reply is retained as indeterminate and
+fails the campaign. The five-node long lease covers the checked 66-command
+post-acquisition op-8-to-op-14 envelope plus two command-deadline margins, and
+a hard phase deadline admits only the exact envelope. A bounded cancellation
+and reap allowance follows a deadline and remains inside those margins. The
+short-expiry proof is unchanged. Every invoked acquisition handle is then
+forgotten through a typed idempotent process-local command that never releases
+or replays a durable lease mutation; the node also reclaims expired crash
+residue and bounds released stale-probe retention before later acquisitions.
+The runner atomically retains the private command/reply transcript, frozen v1
+schedule/history pair, readiness-only v3 fragment, and their digests only after
+independently revalidating their exact schedule, contiguous prefix, phase
+order, bindings, status, and completion. It resets every condition before
+sampling, aborts and latches the first failure, and attempts an all-false final
+cleanup. The custom condition is an AND-only
+evidence gate: each rendered container also has a kubelet exec probe that
+calls the same node over its private UDS and admits only the exact stable local
+and fleet voter identities. This local probe makes readiness self-expire on
+quorum loss, probe timeout, or process termination without depending on
+external-runner cleanup. The runner uses caller-owned, externally audited
+`pods/exec` and `pods/status` authority; the rendered fleet still receives no
+token or RBAC. The v1 history is checker-ready, but the v3 fragment still
+omits batch/watch/restore and all real fault/platform evidence, so the runner
+remains candidate-only and cannot claim a completed #143 campaign. See the
+Kubernetes qualification README for the exact invocation and gate contract.
 
 The node's original stdin/stdout JSON-line transport remains available for the
 single-host harnesses. Readiness replies add optional-on-decode exact voter IDs;

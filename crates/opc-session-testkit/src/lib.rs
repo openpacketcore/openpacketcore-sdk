@@ -6,6 +6,7 @@
 pub mod qualification;
 pub mod qualification_kubernetes;
 pub mod qualification_kubernetes_campaign;
+pub mod qualification_sequential;
 
 use std::collections::BTreeMap;
 use std::fmt;

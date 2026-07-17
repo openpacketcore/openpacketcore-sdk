@@ -109,12 +109,34 @@ const QUALIFICATION_CONTROL_DIRECTORY_MODE: u32 = 0o700;
 const QUALIFICATION_CONTROL_SOCKET_MODE: u32 = 0o600;
 #[cfg(unix)]
 const QUALIFICATION_CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const QUALIFICATION_RETAINED_RELEASED_LEASE_HANDLES: usize = 4;
 
 type ProtectedStore = EncryptingSessionBackend<ConsensusSessionStore, MemoryKeyProvider>;
 
 struct QualificationLease {
     guard: LeaseGuard,
     released: bool,
+    retention_sequence: u64,
+}
+
+trait QualificationLeaseRetention {
+    fn is_released(&self) -> bool;
+    fn expires_at(&self) -> opc_types::Timestamp;
+    fn retention_sequence(&self) -> u64;
+}
+
+impl QualificationLeaseRetention for QualificationLease {
+    fn is_released(&self) -> bool {
+        self.released
+    }
+
+    fn expires_at(&self) -> opc_types::Timestamp {
+        self.guard.expires_at()
+    }
+
+    fn retention_sequence(&self) -> u64 {
+        self.retention_sequence
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -292,6 +314,7 @@ struct QualificationNode {
     server: Option<SessionConsensusServerHandle>,
     transport: QualificationTransportRuntime,
     leases: HashMap<String, QualificationLease>,
+    next_lease_retention_sequence: u64,
     node_index: usize,
     member_count: usize,
     configured_voter_ids: Vec<u64>,
@@ -786,6 +809,7 @@ impl QualificationNode {
             server: Some(server),
             transport,
             leases: HashMap::new(),
+            next_lease_retention_sequence: 1,
             node_index: config.node_index,
             member_count: config.members.len(),
             configured_voter_ids,
@@ -847,6 +871,7 @@ impl QualificationNode {
                 owner,
                 ttl_millis,
             } => {
+                reclaim_safe_lease_handles(&mut self.leases, opc_types::Timestamp::now_utc());
                 if let Err(code) = validate_new_lease_handle(&self.leases, &lease_handle) {
                     return QualificationNodeReply::Error { code };
                 }
@@ -873,11 +898,15 @@ impl QualificationNode {
                 {
                     Ok(lease) => {
                         let fence = lease.fence().get();
+                        let retention_sequence = self.next_lease_retention_sequence;
+                        self.next_lease_retention_sequence =
+                            self.next_lease_retention_sequence.saturating_add(1);
                         self.leases.insert(
                             lease_handle,
                             QualificationLease {
                                 guard: lease,
                                 released: false,
+                                retention_sequence,
                             },
                         );
                         QualificationNodeReply::LeaseAcquired { fence }
@@ -997,6 +1026,10 @@ impl QualificationNode {
                         code: map_lease_error(&error),
                     },
                 }
+            }
+            QualificationNodeCommand::ForgetLease { lease_handle } => {
+                forget_lease_handle(&mut self.leases, &lease_handle);
+                QualificationNodeReply::LeaseHandleForgotten
             }
             QualificationNodeCommand::Shutdown => QualificationNodeReply::ShuttingDown,
         }
@@ -3248,6 +3281,32 @@ fn mark_released_lease(released: &mut bool, release_succeeded: bool) {
     }
 }
 
+fn forget_lease_handle<T>(leases: &mut HashMap<String, T>, lease_handle: &str) {
+    leases.remove(lease_handle);
+}
+
+fn reclaim_safe_lease_handles<T>(leases: &mut HashMap<String, T>, now: opc_types::Timestamp)
+where
+    T: QualificationLeaseRetention,
+{
+    leases.retain(|_, lease| lease.expires_at() > now);
+    let mut released = leases
+        .iter()
+        .filter(|(_, lease)| lease.is_released())
+        .map(|(handle, lease)| (handle.clone(), lease.retention_sequence()))
+        .collect::<Vec<_>>();
+    if released.len() <= QUALIFICATION_RETAINED_RELEASED_LEASE_HANDLES {
+        return;
+    }
+    released.sort_unstable_by_key(|(_, sequence)| *sequence);
+    let remove_count = released
+        .len()
+        .saturating_sub(QUALIFICATION_RETAINED_RELEASED_LEASE_HANDLES);
+    for (handle, _) in released.into_iter().take(remove_count) {
+        leases.remove(&handle);
+    }
+}
+
 fn qualification_key(stable_id: &str) -> Result<SessionKey, ()> {
     Ok(SessionKey {
         tenant: TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?,
@@ -4619,6 +4678,81 @@ mod tests {
             validate_new_lease_handle(&leases, "lease"),
             Err(QualificationNodeErrorCode::LeaseHandleDuplicate)
         );
+    }
+
+    #[test]
+    fn typed_lease_handle_cleanup_is_bounded_and_idempotent() {
+        let mut leases = HashMap::from([("lease".to_owned(), ())]);
+        forget_lease_handle(&mut leases, "lease");
+        assert!(leases.is_empty());
+        assert_eq!(validate_new_lease_handle(&leases, "lease"), Ok(()));
+        forget_lease_handle(&mut leases, "lease");
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn automatic_handle_reclamation_drops_expired_and_old_released_entries() {
+        struct Retained {
+            released: bool,
+            expires_at: opc_types::Timestamp,
+            sequence: u64,
+        }
+
+        impl QualificationLeaseRetention for Retained {
+            fn is_released(&self) -> bool {
+                self.released
+            }
+
+            fn expires_at(&self) -> opc_types::Timestamp {
+                self.expires_at
+            }
+
+            fn retention_sequence(&self) -> u64 {
+                self.sequence
+            }
+        }
+
+        let now = opc_types::Timestamp::now_utc();
+        let future = now.add_seconds(60).expect("future timestamp");
+        let past = now.add_seconds(-60).expect("past timestamp");
+        let mut leases = (1..=6)
+            .map(|sequence| {
+                (
+                    format!("released-{sequence}"),
+                    Retained {
+                        released: true,
+                        expires_at: future,
+                        sequence,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        leases.insert(
+            "expired".to_owned(),
+            Retained {
+                released: false,
+                expires_at: past,
+                sequence: 7,
+            },
+        );
+        leases.insert(
+            "active".to_owned(),
+            Retained {
+                released: false,
+                expires_at: future,
+                sequence: 8,
+            },
+        );
+
+        reclaim_safe_lease_handles(&mut leases, now);
+
+        assert!(!leases.contains_key("expired"));
+        assert!(!leases.contains_key("released-1"));
+        assert!(!leases.contains_key("released-2"));
+        assert!(leases.contains_key("active"));
+        for sequence in 3..=6 {
+            assert!(leases.contains_key(&format!("released-{sequence}")));
+        }
     }
 
     #[test]

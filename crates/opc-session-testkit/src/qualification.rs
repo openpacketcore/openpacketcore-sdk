@@ -2626,6 +2626,16 @@ pub enum QualificationNodeCommand {
     Release {
         lease_handle: String,
     },
+    /// Forget one process-local qualification lease handle without issuing a
+    /// durable backend mutation.
+    ///
+    /// This bounded housekeeping command is idempotent. Dropping an active
+    /// guard does not release its durable lease; that lease remains fenced and
+    /// expires normally. Campaigns still send this command once only and fail
+    /// closed if its terminal reply is ambiguous.
+    ForgetLease {
+        lease_handle: String,
+    },
     Shutdown,
 }
 
@@ -2685,6 +2695,9 @@ impl fmt::Debug for QualificationNodeCommand {
                 .finish(),
             Self::Get { .. } => formatter.write_str("QualificationNodeCommand::Get"),
             Self::Release { .. } => formatter.write_str("QualificationNodeCommand::Release"),
+            Self::ForgetLease { .. } => {
+                formatter.write_str("QualificationNodeCommand::ForgetLease")
+            }
             Self::Shutdown => formatter.write_str("QualificationNodeCommand::Shutdown"),
         }
     }
@@ -2752,7 +2765,9 @@ impl QualificationNodeCommand {
                 Ok(())
             }
             Self::Get { stable_id } => validate_stable_id(stable_id),
-            Self::Release { lease_handle } => validate_handle(lease_handle),
+            Self::Release { lease_handle } | Self::ForgetLease { lease_handle } => {
+                validate_handle(lease_handle)
+            }
         }
     }
 }
@@ -2875,6 +2890,8 @@ pub enum QualificationNodeReply {
         value_sha256: Option<String>,
     },
     Released,
+    /// The requested process-local lease handle is absent after cleanup.
+    LeaseHandleForgotten,
     ShuttingDown,
     Error {
         code: QualificationNodeErrorCode,
