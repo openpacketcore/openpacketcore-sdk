@@ -600,10 +600,21 @@ async fn actual_encryption_wrapper_survives_snapshot_restart_and_key_rotation() 
 }
 
 const REMOTE_ROTATION_MEMBER_COUNT: usize = 3;
-const REMOTE_ROTATION_SURVIVING_MEMBERS: [usize; 2] = [1, 2];
 const REMOTE_ROTATION_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const REMOTE_ROTATION_TRANSITION_TIMEOUT: Duration = CONSENSUS_READY_TIMEOUT;
 const REMOTE_ROTATION_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RemoteRotationPartition {
+    lagging_follower: usize,
+    surviving_members: [usize; REMOTE_ROTATION_MEMBER_COUNT - 1],
+}
+
+impl RemoteRotationPartition {
+    fn writer(self) -> usize {
+        self.surviving_members[0]
+    }
+}
 
 #[derive(Clone)]
 struct RemoteRotationPeer {
@@ -789,9 +800,65 @@ impl RemoteRotationCluster {
             .await;
     }
 
-    async fn wait_surviving_majority_ready(&self) {
+    fn observed_follower_partition(&self) -> RemoteRotationPartition {
+        let members = (0..REMOTE_ROTATION_MEMBER_COUNT).collect::<Vec<_>>();
+        let statuses = self.statuses(&members);
+        assert_eq!(
+            statuses.len(),
+            REMOTE_ROTATION_MEMBER_COUNT,
+            "remote rotation membership changed unexpectedly"
+        );
+
+        let leader = statuses
+            .first()
+            .and_then(|status| status.leader_id)
+            .expect("ready remote rotation members report a leader");
+        let term = statuses
+            .first()
+            .map(|status| status.term)
+            .expect("remote rotation status");
+        assert!(
+            statuses.iter().all(|status| {
+                status.admitted && status.leader_id == Some(leader) && status.term == term
+            }),
+            "ready remote rotation members must agree on an admitted leader and term: {statuses:?}"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| status.node_id == leader)
+                .count(),
+            1,
+            "agreed remote rotation leader must identify exactly one member: {statuses:?}"
+        );
+
+        let lagging_follower = statuses
+            .iter()
+            .enumerate()
+            .find_map(|(member, status)| (status.node_id != leader).then_some(member))
+            .expect("three-member remote rotation cluster has a follower");
+        let surviving_members: [usize; REMOTE_ROTATION_MEMBER_COUNT - 1] = members
+            .into_iter()
+            .filter(|member| *member != lagging_follower)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("isolating one member leaves a two-member majority");
+        assert!(
+            surviving_members
+                .iter()
+                .any(|member| statuses[*member].node_id == leader),
+            "remote rotation survivors must include the observed leader"
+        );
+
+        RemoteRotationPartition {
+            lagging_follower,
+            surviving_members,
+        }
+    }
+
+    async fn wait_surviving_majority_ready(&self, members: &[usize]) {
         self.wait_ready_members(
-            &REMOTE_ROTATION_SURVIVING_MEMBERS,
+            members,
             "surviving remote rotation majority reaches readiness",
         )
         .await;
@@ -907,8 +974,9 @@ impl RemoteRotationCluster {
         }
     }
 
-    async fn snapshot_surviving_majority(&self, lagging_applied: u64) {
-        for store in &self.stores[1..] {
+    async fn snapshot_surviving_majority(&self, surviving_members: &[usize], lagging_applied: u64) {
+        for member in surviving_members {
+            let store = &self.stores[*member];
             let applied = store
                 .inner
                 .raft
@@ -941,7 +1009,8 @@ impl RemoteRotationCluster {
 
         tokio::time::timeout(REMOTE_ROTATION_SNAPSHOT_TIMEOUT, async {
             loop {
-                let compacted = self.stores[1..].iter().all(|store| {
+                let compacted = surviving_members.iter().all(|member| {
+                    let store = &self.stores[*member];
                     let metrics = store.inner.raft.metrics();
                     let metrics = metrics.borrow();
                     metrics
@@ -1036,7 +1105,8 @@ impl RemoteSealProvider for CountingRemoteSealProvider {
 #[tokio::test]
 async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart() {
     let cluster = RemoteRotationCluster::start().await;
-    let lagging_applied = cluster.stores[0]
+    let partition = cluster.observed_follower_partition();
+    let lagging_applied = cluster.stores[partition.lagging_follower]
         .inner
         .raft
         .metrics()
@@ -1044,8 +1114,10 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
         .last_applied
         .expect("initial follower applied log")
         .index;
-    cluster.isolate(0);
-    cluster.wait_surviving_majority_ready().await;
+    cluster.isolate(partition.lagging_follower);
+    cluster
+        .wait_surviving_majority_ready(&partition.surviving_members)
+        .await;
 
     let material = Arc::new(MemoryRemoteSealProvider::new(
         KeyId::new("consensus-remote-key-2026-01").expect("key ID"),
@@ -1055,7 +1127,7 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
     ));
     let provider = Arc::new(CountingRemoteSealProvider::new(Arc::clone(&material)));
     let writer = RemoteSealingSessionBackend::new(
-        Arc::new(cluster.stores[1].clone()),
+        Arc::new(cluster.stores[partition.writer()].clone()),
         Arc::clone(&provider),
         ENCRYPTION_NAMESPACE,
     );
@@ -1108,16 +1180,21 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
     assert_ne!(old_key_id, new_key_id);
     assert_eq!(provider.call_counts(), (2, 0));
 
-    cluster.snapshot_surviving_majority(lagging_applied).await;
+    cluster
+        .snapshot_surviving_majority(&partition.surviving_members, lagging_applied)
+        .await;
     assert_eq!(
         provider.call_counts(),
         (2, 0),
         "replication or snapshot construction called remote provider"
     );
 
-    cluster.heal(0);
+    cluster.heal(partition.lagging_follower);
     cluster.wait_all_ready().await;
-    let recovered_metrics = cluster.stores[0].inner.raft.metrics();
+    let recovered_metrics = cluster.stores[partition.lagging_follower]
+        .inner
+        .raft
+        .metrics();
     let recovered_metrics = recovered_metrics.borrow();
     assert!(recovered_metrics
         .snapshot
@@ -1130,7 +1207,7 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
         (&before_key, &old_key_id, PLAINTEXT_BEFORE_ROTATION),
         (&after_key, &new_key_id, PLAINTEXT_AFTER_ROTATION),
     ] {
-        let raw = cluster.stores[0]
+        let raw = cluster.stores[partition.lagging_follower]
             .get(session_key)
             .await
             .expect("raw read after snapshot install")
@@ -1154,7 +1231,7 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
         "shutdown, replay, quorum formation, or recovery called remote provider"
     );
     let reader = RemoteSealingSessionBackend::new(
-        Arc::new(cluster.stores[1].clone()),
+        Arc::new(cluster.stores[partition.writer()].clone()),
         Arc::clone(&provider),
         ENCRYPTION_NAMESPACE,
     );
