@@ -14,6 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SHA-256}` on successful writes. Default authoritative/no-port replies remain
   byte-identical; stale or absent durable heads and legacy digest-less replays
   fail closed instead of serving a local projection or fabricating a hash.
+- **Follower-local committed config recovery — `opc-config-bus`:** bounded,
+  transport-neutral committed-revision pages and exclusive `ConfigVersion`
+  cursors now provide gap-free `watch_committed` streams and atomic
+  snapshot-plus-tail `recover_from` recovery. SQLite, in-memory, encrypted, and
+  Openraft-backed adapters implement ordered durable history; consensus reads
+  only the contiguous local committed/applied and recovery-cleared state
+  machine prefix without a leader/read-index round; an applied fenced tail
+  remains invisible until its clear mutation applies. Notifications are wake
+  hints followed by authoritative repaging. The explicit
+  `CommittedRevisionSource` marker gates read-only
+  Shadow construction, which rejects writes before I/O. Typed future-cursor,
+  compaction, sequence, and page-bound errors fail closed. The authenticated
+  remote config-watch RPC boundary is not included and remains open under
+  #256, so this change provides the prerequisite local/follower API rather
+  than claiming out-of-process completion.
 - **Shared Raft-managed config datastore — `opc-config-bus-consensus`:** a
   source-build-only adapter now connects `opc-config-bus` to the existing
   `opc-persist::ConsensusConfigStore` without adding another election,

@@ -277,6 +277,38 @@ async fn encrypting_store_binds_parent_tx_id_and_rolls_back_via_decrypted_checkp
 }
 
 #[tokio::test]
+async fn encrypting_store_decrypts_ordered_committed_history_pages() {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let provider = test_provider();
+    let store = Arc::new(EncryptingManagedDatastore::new(
+        Arc::clone(&inner),
+        Arc::clone(&provider),
+    ));
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), Arc::clone(&store))
+        .await
+        .expect("bus");
+
+    submit_commit(&bus, "first").await;
+    submit_commit(&bus, "second").await;
+    submit_commit(&bus, "third").await;
+
+    let page = store
+        .load_since(ConfigVersion::new(1), 2)
+        .await
+        .expect("decrypted committed history page");
+    assert_eq!(2, page.len());
+    assert_eq!(ConfigVersion::new(2), page[0].version);
+    assert_eq!("second", page[0].config.name);
+    assert_eq!(ConfigVersion::new(3), page[1].version);
+    assert_eq!("third", page[1].config.name);
+    assert!(inner
+        .history()
+        .await
+        .iter()
+        .all(|record| !record.encrypted_blob.is_empty()));
+}
+
+#[tokio::test]
 async fn encrypted_latest_restores_and_preserves_parent_tx_id_on_next_commit() {
     let inner = Arc::new(MockManagedDatastore::new());
     let provider = test_provider();

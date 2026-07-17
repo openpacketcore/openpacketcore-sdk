@@ -2,9 +2,9 @@ mod persist_common;
 
 use opc_persist::{
     ConfigStore, ConfirmedCommitResolution, MockConfigStore, PersistErrorKind, RollbackTarget,
-    SqliteBackend,
+    SqliteBackend, CONFIG_HISTORY_PAGE_MAX_ENTRIES,
 };
-use opc_types::{Timestamp, TxId};
+use opc_types::{ConfigVersion, Timestamp, TxId};
 use std::sync::Arc;
 
 use persist_common::{make_audit_record, make_commit_record};
@@ -109,6 +109,227 @@ async fn append_commit_multiple_versions_can_be_loaded() {
         .await
         .expect("load_rollback by tx_id should succeed");
     assert_eq!(by_tx.record.version.get(), 1);
+}
+
+async fn assert_ordered_bounded_history_pages(store: &dyn ConfigStore) {
+    let mut parent = None;
+    for version in 1..=5 {
+        let tx_id = TxId::new();
+        let mut record = make_commit_record(tx_id, version);
+        record.parent_tx_id = parent;
+        store
+            .append_commit(record, Vec::new())
+            .await
+            .expect("append page fixture");
+        parent = Some(tx_id);
+    }
+
+    let page = store
+        .load_since(ConfigVersion::new(1), 2)
+        .await
+        .expect("bounded middle page");
+    assert_eq!(2, page.len());
+    assert_eq!(ConfigVersion::new(2), page[0].record.version);
+    assert_eq!(ConfigVersion::new(3), page[1].record.version);
+
+    let tail = store
+        .load_since(ConfigVersion::new(3), CONFIG_HISTORY_PAGE_MAX_ENTRIES)
+        .await
+        .expect("ordered tail page");
+    assert_eq!(2, tail.len());
+    assert_eq!(ConfigVersion::new(4), tail[0].record.version);
+    assert_eq!(ConfigVersion::new(5), tail[1].record.version);
+
+    let empty = store
+        .load_since(ConfigVersion::new(5), CONFIG_HISTORY_PAGE_MAX_ENTRIES)
+        .await
+        .expect("page at head");
+    assert!(empty.is_empty());
+
+    let oversized = store
+        .load_since(ConfigVersion::INITIAL, CONFIG_HISTORY_PAGE_MAX_ENTRIES + 1)
+        .await
+        .expect_err("over-contract page rejected");
+    assert!(matches!(
+        oversized.kind(),
+        PersistErrorKind::ConstraintViolation(_)
+    ));
+}
+
+async fn append_cleared_prefix_and_fenced_tail(store: &dyn ConfigStore) -> (TxId, TxId) {
+    let cleared_tx_id = TxId::new();
+    store
+        .append_commit(make_commit_record(cleared_tx_id, 1), Vec::new())
+        .await
+        .expect("append cleared prefix");
+
+    let fenced_tx_id = TxId::new();
+    let mut fenced = make_commit_record(fenced_tx_id, 2);
+    fenced.parent_tx_id = Some(cleared_tx_id);
+    fenced.confirmed_deadline = Some(Timestamp::now_utc());
+    fenced.principal = serde_json::json!({
+        "principal": fenced.principal,
+        "recovery_required": true,
+    })
+    .to_string();
+    store
+        .append_commit(fenced, Vec::new())
+        .await
+        .expect("append fenced tail");
+    (cleared_tx_id, fenced_tx_id)
+}
+
+async fn assert_fenced_tail_visibility(store: &dyn ConfigStore) {
+    let (cleared_tx_id, fenced_tx_id) = append_cleared_prefix_and_fenced_tail(store).await;
+    let durable = store
+        .load_latest()
+        .await
+        .expect("durable head")
+        .expect("fenced durable tail");
+    assert_eq!(fenced_tx_id, durable.record.tx_id);
+    let visible = store
+        .load_committed_latest()
+        .await
+        .expect("publish-safe head")
+        .expect("cleared prefix");
+    assert_eq!(cleared_tx_id, visible.record.tx_id);
+    assert!(store
+        .load_since(ConfigVersion::new(1), CONFIG_HISTORY_PAGE_MAX_ENTRIES)
+        .await
+        .expect("publish-safe page")
+        .is_empty());
+
+    store
+        .clear_recovery_required(fenced_tx_id)
+        .await
+        .expect("clear fenced tail");
+    let visible = store
+        .load_committed_latest()
+        .await
+        .expect("publish-safe head")
+        .expect("cleared tail");
+    assert_eq!(fenced_tx_id, visible.record.tx_id);
+    assert!(visible.record.confirmed_deadline.is_some());
+    let page = store
+        .load_since(ConfigVersion::new(1), CONFIG_HISTORY_PAGE_MAX_ENTRIES)
+        .await
+        .expect("cleared tail page");
+    assert_eq!(1, page.len());
+    assert_eq!(fenced_tx_id, page[0].record.tx_id);
+}
+
+async fn assert_publication_fence_blocks_a_successor(store: &dyn ConfigStore) {
+    let first_id = TxId::new();
+    store
+        .append_commit(make_commit_record(first_id, 1), Vec::new())
+        .await
+        .expect("append cleared prefix");
+    let fenced_id = TxId::new();
+    let mut fenced = make_commit_record(fenced_id, 2);
+    fenced.parent_tx_id = Some(first_id);
+    fenced.principal = serde_json::json!({
+        "principal": fenced.principal,
+        "recovery_required": true,
+    })
+    .to_string();
+    store
+        .append_commit(fenced, Vec::new())
+        .await
+        .expect("append fenced tail");
+
+    let successor_id = TxId::new();
+    let mut successor = make_commit_record(successor_id, 3);
+    successor.parent_tx_id = Some(fenced_id);
+    let error = store
+        .append_commit(successor, Vec::new())
+        .await
+        .expect_err("a successor cannot skip the publication fence");
+    assert!(matches!(
+        error.kind(),
+        PersistErrorKind::ConstraintViolation(_)
+    ));
+}
+
+#[tokio::test]
+async fn sqlite_history_pages_are_ordered_and_bounded() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let backend = SqliteBackend::open(temp_dir.path().join("history-page.db"), true, 0)
+        .await
+        .expect("open backend");
+    assert_ordered_bounded_history_pages(&backend).await;
+}
+
+#[tokio::test]
+async fn mock_history_pages_match_the_sqlite_contract() {
+    assert_ordered_bounded_history_pages(&MockConfigStore::new()).await;
+}
+
+#[tokio::test]
+async fn sqlite_committed_history_stops_at_the_publication_fence() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let backend = SqliteBackend::open(temp_dir.path().join("fenced-history.db"), true, 0)
+        .await
+        .expect("open backend");
+    assert_fenced_tail_visibility(&backend).await;
+}
+
+#[tokio::test]
+async fn mock_committed_history_stops_at_the_publication_fence() {
+    assert_fenced_tail_visibility(&MockConfigStore::new()).await;
+}
+
+#[tokio::test]
+async fn sqlite_publication_fence_blocks_a_successor() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let backend = SqliteBackend::open(temp_dir.path().join("fenced-successor.db"), true, 0)
+        .await
+        .expect("open backend");
+    assert_publication_fence_blocks_a_successor(&backend).await;
+}
+
+#[tokio::test]
+async fn mock_publication_fence_blocks_a_successor() {
+    assert_publication_fence_blocks_a_successor(&MockConfigStore::new()).await;
+}
+
+#[tokio::test]
+async fn sqlite_restart_keeps_a_fenced_tail_out_of_the_visible_prefix() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let path = temp_dir.path().join("fenced-restart.db");
+    let backend = SqliteBackend::open(&path, true, 0)
+        .await
+        .expect("open backend");
+    let (cleared_tx_id, fenced_tx_id) = append_cleared_prefix_and_fenced_tail(&backend).await;
+    drop(backend);
+
+    let reopened = SqliteBackend::open(&path, true, 0)
+        .await
+        .expect("reopen backend");
+    let visible = reopened
+        .load_committed_latest()
+        .await
+        .expect("publish-safe head after restart")
+        .expect("cleared prefix after restart");
+    assert_eq!(cleared_tx_id, visible.record.tx_id);
+    assert!(reopened
+        .load_since(ConfigVersion::new(1), CONFIG_HISTORY_PAGE_MAX_ENTRIES)
+        .await
+        .expect("publish-safe page after restart")
+        .is_empty());
+    reopened
+        .clear_recovery_required(fenced_tx_id)
+        .await
+        .expect("operator reconciliation clears tail");
+    assert_eq!(
+        fenced_tx_id,
+        reopened
+            .load_committed_latest()
+            .await
+            .expect("publish-safe head after reconciliation")
+            .expect("cleared tail")
+            .record
+            .tx_id
+    );
 }
 
 #[tokio::test]

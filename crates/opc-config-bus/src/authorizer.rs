@@ -89,3 +89,15 @@ impl ConfigAuthorizer for AllowAllAuthorizer {
         Ok(())
     }
 }
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DenyAllAuthorizer;
+
+#[async_trait]
+impl ConfigAuthorizer for DenyAllAuthorizer {
+    async fn authorize(&self, _ctx: &AuthorizationContext) -> Result<(), AuthorizationError> {
+        Err(AuthorizationError::new(
+            "config mutations are disabled on this bus",
+        ))
+    }
+}

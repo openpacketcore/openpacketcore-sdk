@@ -19,6 +19,9 @@ Main exports:
 - Snapshot/event types:
   `ConfigSnapshot`, `AtomicConfigSnapshot`, `PublishedSnapshot`,
   `ConfigChange`, `ConfigEvent`, and `ConfigReceiver`.
+- Committed-revision recovery types:
+  `CommittedConfigHistoryEntry`, `ConfigRevisionCursor`, `ConfigHistoryPage`,
+  `ConfigRecovery`, and `ConfigRevisionStream`.
 - Store and recovery types:
   `StoredConfig`, `CommitWrite`, `CommitWriteReceipt`,
   `ConfirmedCommitResolution`, `SealedConfig`, `StoredRequestFingerprint`,
@@ -63,6 +66,58 @@ serialized config, request source, idempotency key, apply plan, request
 fingerprint, and request ID. It is not a hash of the naked config and must not
 be used to compare config equality across otherwise different requests.
 
+## Committed Revision Recovery
+
+`ConfigBus::recover_from(known)` returns a complete locally committed snapshot
+at version `V` and a stream positioned strictly after `V`. Install the snapshot
+before polling the stream. A commit that races snapshot selection is recovered
+by paging the durable history again, so the handoff has neither a gap nor an
+overlap:
+
+```rust,ignore
+use futures_util::StreamExt;
+
+let recovery = bus.recover_from(last_installed_version).await?;
+let (snapshot, mut revisions) = recovery.into_parts();
+consumer.install_snapshot(snapshot)?;
+
+while let Some(revision) = revisions.next().await {
+    consumer.apply_revision(revision?)?;
+}
+```
+
+`watch_committed(from)` uses an exclusive `ConfigVersion` cursor. Every
+non-empty page must begin at `from + 1` and remain contiguous; duplicates,
+reordering, and gaps fail closed with `InvalidHistorySequence`. Pages contain
+at most `MAX_CONFIG_HISTORY_PAGE_ENTRIES` complete revisions. A stalled stream
+buffers no more than one page and cannot block commits or another consumer.
+Store notifications are wake hints only: the stream always repages durable
+history after waking.
+
+If a caller's known version is newer than the local applied head, recovery
+returns `HistoryCursorAhead` instead of moving backward. A store that has
+discarded the requested prefix must return `HistoryCompacted`; the consumer
+then calls `recover_from` to install a new complete snapshot rather than
+silently skipping revisions.
+
+`ConfigBus::restore_shadow` creates a read-only bus from an explicit
+`CommittedRevisionSource`. The marker has no blanket implementation. A
+consensus adapter implements it only for records visible in that node's local
+Openraft-applied state machine whose `recovery_required` publication fence is
+durably clear, and the encrypting wrapper preserves that provenance while
+decrypting each page. An applied fenced tail stays invisible and blocks every
+later revision until its clear operation applies; confirmed-deadline rows are
+still visible once that publication fence is clear. Shadow submissions are
+rejected before datastore I/O.
+
+This crate now supplies the transport-neutral records, cursors, validated
+pages, local follower serving, and recovery algorithm. It does not yet supply
+an authenticated config-watch RPC client/server. A consumer in another process
+still needs a bounded transport adapter that carries these types to a local
+follower and preserves the same cursor/error contract. That remaining remote
+boundary is part of issue #256; the local API alone must not be described as
+out-of-process config-watch support.
+
 ## Relationships
 
 - Consumes `OpcConfig` models from `opc-config-model`.
@@ -83,6 +138,8 @@ Current scope:
   `DropOldest`, `DropNewest`, `DisconnectOnLag`, and `ForceResync`.
 - Idempotency and rollback support through the datastore trait.
 - Atomic confirm-or-rollback plus successor append for commit-confirmed state.
+- Bounded, gap-free committed-revision history and atomic snapshot-plus-tail
+  recovery from standalone or follower-local applied storage.
 
 Production notes:
 
@@ -91,8 +148,10 @@ Production notes:
 - Constructors with `*_dev_only` install `AllowAllAuthorizer` and must stay out
   of production wiring.
 - Built-in constructors are authoritative. A management server presented with
-  `AuthorityMode::Shadow` and no authority port rejects writes and
-  linearizable reads; it never treats the local mirror as writer of record.
+  `AuthorityMode::Shadow` and no authority port rejects writes and linearizable
+  reads; it never treats the local mirror as writer of record.
+  `restore_shadow` is the read-only constructor for an explicitly trusted
+  committed-revision source.
 - Encrypted v2 config envelopes keep the original request source, idempotency
   key, request ID, request fingerprint, and apply plan inside AEAD ciphertext.
   Only a domain-separated lookup digest is stored in clear metadata. Legacy
@@ -134,6 +193,8 @@ fenced until restore.
 ## Roadmap
 
 - Keep storage and authority admission behind their narrow ports.
+- Add the authenticated bounded remote config-watch adapter required to carry
+  committed revisions across a process boundary.
 
 ## Verification
 

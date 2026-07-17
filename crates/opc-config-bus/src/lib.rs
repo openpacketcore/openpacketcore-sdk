@@ -3,6 +3,10 @@
 //!
 //! `ConfigBus` owns a single logical commit worker, publishes immutable running
 //! snapshots, and isolates slow subscribers with bounded queues.
+//! It also exposes bounded follower-local committed history and an atomic
+//! snapshot-plus-tail recovery surface. The committed watch repages durable
+//! state after every wake and rejects cursor gaps before config reaches a
+//! consumer.
 //!
 //! Candidate-bearing commit and validate-only requests produce an
 //! `opc_config_model::ApplyPlan` after validation and before durable side
@@ -16,6 +20,7 @@ pub mod alarms;
 pub mod authority;
 pub mod authorizer;
 pub mod commit;
+pub mod committed;
 pub mod datastore;
 pub mod metrics;
 pub mod restore;
@@ -32,8 +37,13 @@ pub use authorizer::{
     AllowAllAuthorizer, AuthorizationContext, AuthorizationError, ConfigAuthorizer,
 };
 pub use commit::ConfigBus;
+pub use committed::{
+    CommittedConfigHistoryEntry, ConfigHistoryPage, ConfigRecovery, ConfigRevisionCursor,
+    ConfigRevisionStream, MAX_CONFIG_HISTORY_PAGE_ENTRIES,
+};
 pub use datastore::{
-    EncryptingManagedDatastore, InMemoryManagedDatastore, ManagedDatastore, MockManagedDatastore,
+    CommittedRevisionSource, EncryptingManagedDatastore, InMemoryManagedDatastore,
+    ManagedDatastore, MockManagedDatastore,
 };
 pub use subscribers::{ConfigReceiver, SubscriberLagPolicy};
 pub use types::{

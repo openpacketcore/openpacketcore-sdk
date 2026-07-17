@@ -118,10 +118,22 @@ pub(crate) struct SqliteConfigSnapshotBuilder {
     core: sqlite::ConfigConsensusCore,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ConfigDurableProgress {
     committed_present: AtomicBool,
     committed_index: AtomicU64,
+    applied_epoch: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for ConfigDurableProgress {
+    fn default() -> Self {
+        let (applied_epoch, _) = tokio::sync::watch::channel(0);
+        Self {
+            committed_present: AtomicBool::new(false),
+            committed_index: AtomicU64::new(0),
+            applied_epoch,
+        }
+    }
 }
 
 impl ConfigDurableProgress {
@@ -140,6 +152,15 @@ impl ConfigDurableProgress {
         self.committed_present
             .load(Ordering::Acquire)
             .then(|| self.committed_index.load(Ordering::Acquire))
+    }
+
+    fn notify_applied(&self) {
+        self.applied_epoch
+            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+    }
+
+    pub(crate) fn subscribe_applied(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.applied_epoch.subscribe()
     }
 }
 
@@ -828,7 +849,8 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         let members = self.core.expected_members.clone();
         let entries = collect_bounded_entries(entries)
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
-        self.core
+        let responses = self
+            .core
             .run_sqlite_cancellable(move |conn, cancellation| {
                 sqlite::apply_entries_cancellable_sync(
                     conn,
@@ -839,7 +861,9 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 )
             })
             .await
-            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))
+            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
+        self.core.durable_progress.notify_applied();
+        Ok(responses)
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -1025,6 +1049,8 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             opc_redaction::metrics::METRICS
                 .persist_snapshot_install_failures
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.core.durable_progress.notify_applied();
         }
         result
     }

@@ -411,6 +411,27 @@ fn attested(record: CommitRecord, audit: Vec<AuditRecord>) -> AttestedConfigComm
         .expect("attested config commit")
 }
 
+fn fenced_attested(mut record: CommitRecord, audit: Vec<AuditRecord>) -> AttestedConfigCommit {
+    let seed = record.schema_digest.as_bytes()[0];
+    let aad_principal = record.principal.clone();
+    let envelope = envelope(
+        seed,
+        record.tx_id,
+        record.parent_tx_id,
+        record.version.get(),
+        record.committed_at,
+        &aad_principal,
+        record.schema_digest,
+    );
+    record.principal = serde_json::json!({
+        "principal": aad_principal,
+        "recovery_required": true,
+    })
+    .to_string();
+    AttestedConfigCommit::try_new(record, audit, envelope.claim().expect("fresh fenced claim"))
+        .expect("attested fenced config commit")
+}
+
 fn attested_resolving(
     record: CommitRecord,
     audit: Vec<AuditRecord>,
@@ -1399,6 +1420,17 @@ async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
         let latest = store.load_latest().await.expect("load").expect("latest");
         assert_eq!(latest.record.tx_id, fourth_id);
         assert_eq!(latest.record.version, ConfigVersion::new(4));
+        let committed_page = store
+            .load_since(ConfigVersion::INITIAL, 64)
+            .await
+            .expect("follower-local committed history after leader change");
+        assert_eq!(reference_model.len(), committed_page.len());
+        for (record, (expected_version, expected_tx_id)) in
+            committed_page.iter().zip(reference_model)
+        {
+            assert_eq!(expected_version, record.record.version);
+            assert_eq!(expected_tx_id, record.record.tx_id);
+        }
         for (version, expected_tx_id) in reference_model {
             let modeled = store
                 .load_rollback(RollbackTarget::ByVersion(version))
@@ -1428,6 +1460,230 @@ async fn three_nodes_fail_over_replay_lost_responses_and_converge() {
             reference_ids,
             deterministic_authority_row_ids(&cluster.database_path(node)),
             "replicas must assign identical deterministic authority row IDs"
+        );
+    }
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn follower_committed_history_is_served_from_local_applied_state() {
+    let cluster = ThreeNodeCluster::start().await;
+    let leader = cluster.leader();
+    let follower = (0..3).find(|node| *node != leader).expect("follower");
+
+    let first_id = TxId::new();
+    cluster.stores[leader]
+        .append_attested_commit(attested(commit(first_id, None, 1, 0xA1), audit(first_id)))
+        .await
+        .expect("first quorum commit");
+
+    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        loop {
+            if cluster.stores[follower]
+                .load_committed_latest()
+                .await
+                .expect("follower-local head")
+                .is_some_and(|record| record.record.version == ConfigVersion::new(1))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first commit applied on follower");
+
+    let wait_store = cluster.stores[follower].clone();
+    let wait = tokio::spawn(async move {
+        wait_store
+            .wait_for_committed_change(ConfigVersion::new(1))
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let second_id = TxId::new();
+    cluster.stores[leader]
+        .append_attested_commit(attested(
+            commit(second_id, Some(first_id), 2, 0xA2),
+            audit(second_id),
+        ))
+        .await
+        .expect("second quorum commit");
+    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, wait)
+        .await
+        .expect("follower apply notification")
+        .expect("notification task")
+        .expect("notification succeeds");
+
+    cluster.isolate(follower);
+    let local_head = tokio::time::timeout(
+        Duration::from_millis(250),
+        cluster.stores[follower].load_committed_latest(),
+    )
+    .await
+    .expect("local committed head must not enter a leader/read-index path")
+    .expect("local committed head")
+    .expect("local head exists");
+    assert_eq!(ConfigVersion::new(2), local_head.record.version);
+
+    let local_page = tokio::time::timeout(
+        Duration::from_millis(250),
+        cluster.stores[follower].load_since(ConfigVersion::INITIAL, 64),
+    )
+    .await
+    .expect("local history page must not enter a leader/read-index path")
+    .expect("local history page");
+    assert_eq!(2, local_page.len());
+    assert_eq!(ConfigVersion::new(1), local_page[0].record.version);
+    assert_eq!(ConfigVersion::new(2), local_page[1].record.version);
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn leader_change_never_exposes_a_fenced_committed_tail() {
+    let cluster = ThreeNodeCluster::start().await;
+    let old_leader = cluster.leader();
+    let witness = (0..3)
+        .find(|node| *node != old_leader)
+        .expect("follower witness");
+    let first_id = TxId::new();
+    cluster.stores[0]
+        .append_attested_commit(attested(commit(first_id, None, 1, 0xB1), audit(first_id)))
+        .await
+        .expect("publish-safe quorum commit");
+    let wait_store = cluster.stores[witness].clone();
+    let mut publish_safe_wait = tokio::spawn(async move {
+        wait_store
+            .wait_for_committed_change(ConfigVersion::new(1))
+            .await
+    });
+    tokio::task::yield_now().await;
+    let fenced_id = TxId::new();
+    cluster.stores[0]
+        .append_attested_commit(fenced_attested(
+            commit(fenced_id, Some(first_id), 2, 0xB2),
+            audit(fenced_id),
+        ))
+        .await
+        .expect("fenced quorum commit");
+    let skipped_id = TxId::new();
+    let skipped = cluster.stores[0]
+        .append_attested_commit(attested(
+            commit(skipped_id, Some(fenced_id), 3, 0xB3),
+            audit(skipped_id),
+        ))
+        .await
+        .expect_err("consensus must reject a successor past the publication fence");
+    assert!(matches!(
+        skipped.kind(),
+        PersistErrorKind::ConstraintViolation(_)
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut publish_safe_wait)
+            .await
+            .is_err(),
+        "an applied but fenced append must not satisfy the publish-safe wait"
+    );
+
+    for store in &cluster.stores {
+        let durable = store
+            .load_latest()
+            .await
+            .expect("linearizable durable head")
+            .expect("fenced durable head");
+        assert_eq!(fenced_id, durable.record.tx_id);
+        let visible = store
+            .load_committed_latest()
+            .await
+            .expect("local publish-safe head")
+            .expect("cleared prefix");
+        assert_eq!(first_id, visible.record.tx_id);
+        assert!(store
+            .load_since(ConfigVersion::new(1), 64)
+            .await
+            .expect("local publish-safe tail")
+            .is_empty());
+    }
+
+    let old_leader_id = cluster.stores[old_leader].status().node_id;
+    let old_term = cluster.stores[old_leader].status().term;
+    cluster.isolate(old_leader);
+    let survivors = (0..3)
+        .filter(|node| *node != old_leader)
+        .collect::<Vec<_>>();
+    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        loop {
+            let statuses = survivors
+                .iter()
+                .map(|node| cluster.stores[*node].status())
+                .collect::<Vec<_>>();
+            if statuses.iter().all(|status| {
+                status
+                    .leader_id
+                    .is_some_and(|leader| leader != old_leader_id)
+                    && status.term > old_term
+                    && status.leader_id == statuses[0].leader_id
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement leader election");
+
+    for survivor in &survivors {
+        assert_eq!(
+            first_id,
+            cluster.stores[*survivor]
+                .load_committed_latest()
+                .await
+                .expect("survivor publish-safe head")
+                .expect("cleared survivor prefix")
+                .record
+                .tx_id
+        );
+    }
+    cluster.stores[survivors[0]]
+        .clear_recovery_required(fenced_id)
+        .await
+        .expect("replacement leader clears publication fence");
+    tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, &mut publish_safe_wait)
+        .await
+        .expect("clear apply wakes publish-safe waiter")
+        .expect("publish-safe waiter task")
+        .expect("publish-safe waiter succeeds");
+    for survivor in &survivors {
+        tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+            loop {
+                if cluster.stores[*survivor]
+                    .load_committed_latest()
+                    .await
+                    .expect("survivor publish-safe head")
+                    .is_some_and(|record| record.record.tx_id == fenced_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleared tail applies on survivor");
+    }
+
+    cluster.heal(old_leader);
+    cluster.wait_ready().await;
+    for store in &cluster.stores {
+        assert_eq!(
+            fenced_id,
+            store
+                .load_committed_latest()
+                .await
+                .expect("healed publish-safe head")
+                .expect("healed cleared tail")
+                .record
+                .tx_id
         );
     }
     cluster.shutdown().await;

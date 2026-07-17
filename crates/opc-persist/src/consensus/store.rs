@@ -1513,6 +1513,40 @@ impl ConfigStore for ConsensusConfigStore {
         self.inner.backend.load_latest().await
     }
 
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
+        self.inner.backend.load_committed_latest().await
+    }
+
+    async fn load_since(
+        &self,
+        version: opc_types::ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<StoredConfig>, PersistError> {
+        self.inner.backend.load_since(version, limit).await
+    }
+
+    async fn wait_for_committed_change(
+        &self,
+        version: opc_types::ConfigVersion,
+    ) -> Result<(), PersistError> {
+        let mut applied = self.inner.durable_progress.subscribe_applied();
+        loop {
+            if self
+                .inner
+                .backend
+                .load_committed_latest()
+                .await?
+                .is_some_and(|record| record.record.version > version)
+            {
+                return Ok(());
+            }
+            applied
+                .changed()
+                .await
+                .map_err(|_| PersistError::unavailable())?;
+        }
+    }
+
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError> {
         self.linearizable_barrier().await?;
         self.inner.backend.load_rollback(target).await

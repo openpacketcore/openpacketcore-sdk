@@ -8,7 +8,9 @@
 //! second consensus algorithm. Plaintext configuration and key-provider
 //! access stay in [`opc_config_bus::EncryptingManagedDatastore`], outside this
 //! crate and outside the Openraft command, log, snapshot, and transport
-//! boundary.
+//! boundary. Its committed-history read port is follower-local: it exposes
+//! only Openraft state-machine-applied rows and does not enter a leader read
+//! barrier.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -16,8 +18,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use opc_config_bus::{
-    CommitWrite as BusCommitWrite, ConfigAuthorityOperation, ConfigAuthorityOutcome,
-    ConfigAuthorityPort, ConfigLeaderHint, ConfigProjectionHead,
+    CommitWrite as BusCommitWrite, CommittedRevisionSource, ConfigAuthorityOperation,
+    ConfigAuthorityOutcome, ConfigAuthorityPort, ConfigLeaderHint, ConfigProjectionHead,
     ConfirmedCommitResolution as BusConfirmedCommitResolution, ManagedDatastore, SealedConfig,
     StoreError, StoredConfig as BusStoredConfig,
 };
@@ -31,12 +33,16 @@ use opc_persist::{
     ConfirmedCommitResolution as PersistConfirmedCommitResolution, ConsensusConfigStore,
     PersistError, PersistErrorKind, RollbackTarget, CONFIG_ROLLBACK_LABEL_MAX_BYTES,
 };
-use opc_types::TxId;
+use opc_types::{ConfigVersion, TxId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const REPLAY_LOOKUP_DIGEST_HEX_LEN: usize = 64;
 const ROOT_AUDIT_PATH: &str = "/";
+
+const _: () = assert!(
+    opc_config_bus::MAX_CONFIG_HISTORY_PAGE_ENTRIES == opc_persist::CONFIG_HISTORY_PAGE_MAX_ENTRIES
+);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,6 +157,9 @@ fn map_persist_error(error: PersistError) -> StoreError {
         PersistErrorKind::SchemaDigestMismatch { .. } => {
             StoreError::restore_schema_mismatch("durable config schema digest does not match")
         }
+        PersistErrorKind::ConfigHistoryCompacted => StoreError::history_compacted(
+            "requested committed config history is no longer retained",
+        ),
         PersistErrorKind::WalRecoveryFailed
         | PersistErrorKind::InconsistentState(_)
         | PersistErrorKind::ForeignKeyViolation
@@ -275,6 +284,38 @@ where
             .map_err(map_persist_error)?
             .map(adapt_stored_config)
             .transpose()
+    }
+
+    async fn load_committed_latest(
+        &self,
+    ) -> Result<Option<BusStoredConfig<SealedConfig<C>>>, StoreError> {
+        self.inner
+            .load_committed_latest()
+            .await
+            .map_err(map_persist_error)?
+            .map(adapt_stored_config)
+            .transpose()
+    }
+
+    async fn load_since(
+        &self,
+        version: ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<BusStoredConfig<SealedConfig<C>>>, StoreError> {
+        self.inner
+            .load_since(version, limit)
+            .await
+            .map_err(map_persist_error)?
+            .into_iter()
+            .map(adapt_stored_config)
+            .collect()
+    }
+
+    async fn wait_for_committed_change(&self, version: ConfigVersion) -> Result<(), StoreError> {
+        self.inner
+            .wait_for_committed_change(version)
+            .await
+            .map_err(map_persist_error)
     }
 
     async fn load_rollback(
@@ -428,7 +469,9 @@ where
 /// The newtype prevents accidentally presenting a process-local SQLite or mock
 /// store as a Raft-backed datastore. It implements only
 /// `ManagedDatastore<SealedConfig<C>>`, preserving the ciphertext boundary by
-/// construction.
+/// construction. Its explicit [`CommittedRevisionSource`] implementation lets
+/// a read-only Shadow bus serve this node's local committed/applied history
+/// without contacting the current writer.
 pub struct RaftManagedDatastore<C> {
     adapter: PersistManagedDatastore<C, ConsensusConfigStore>,
 }
@@ -553,6 +596,24 @@ where
         self.adapter.load_latest().await
     }
 
+    async fn load_committed_latest(
+        &self,
+    ) -> Result<Option<BusStoredConfig<SealedConfig<C>>>, StoreError> {
+        self.adapter.load_committed_latest().await
+    }
+
+    async fn load_since(
+        &self,
+        version: ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<BusStoredConfig<SealedConfig<C>>>, StoreError> {
+        self.adapter.load_since(version, limit).await
+    }
+
+    async fn wait_for_committed_change(&self, version: ConfigVersion) -> Result<(), StoreError> {
+        self.adapter.wait_for_committed_change(version).await
+    }
+
     async fn load_rollback(
         &self,
         target: BusRollbackTarget,
@@ -597,6 +658,11 @@ where
     async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), StoreError> {
         self.adapter.mark_confirmed(tx_id).await
     }
+}
+
+impl<C> CommittedRevisionSource<SealedConfig<C>> for RaftManagedDatastore<C> where
+    C: OpcConfig + Serialize + DeserializeOwned + Send + Sync + 'static
+{
 }
 
 #[cfg(test)]
@@ -743,5 +809,14 @@ mod tests {
             ConfigAuthorityOperation::LinearizableRead,
             durable
         ));
+    }
+
+    #[test]
+    fn compacted_persistence_history_remains_typed_at_the_bus_boundary() {
+        let mapped = map_persist_error(PersistError::config_history_compacted());
+        assert_eq!(
+            opc_config_bus::StoreErrorCode::HistoryCompacted,
+            mapped.code
+        );
     }
 }

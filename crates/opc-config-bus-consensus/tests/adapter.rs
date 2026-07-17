@@ -2,8 +2,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use opc_config_bus::{
-    CommitWrite, EncryptingManagedDatastore, ManagedDatastore, SealedConfig, StoreErrorCode,
-    StoredConfig,
+    CommitWrite, CommittedRevisionSource, EncryptingManagedDatastore, ManagedDatastore,
+    SealedConfig, StoreErrorCode, StoredConfig,
 };
 use opc_config_bus_consensus::{PersistManagedDatastore, RaftManagedDatastore};
 use opc_config_model::{
@@ -156,7 +156,9 @@ async fn named_rollback_label_and_root_audit_are_persisted_atomically() {
 #[test]
 fn raft_adapter_port_is_statically_ciphertext_only() {
     fn assert_sealed_port<T: ManagedDatastore<SealedConfig<TestConfig>>>() {}
+    fn assert_committed_source<T: CommittedRevisionSource<SealedConfig<TestConfig>>>() {}
     assert_sealed_port::<RaftManagedDatastore<TestConfig>>();
+    assert_committed_source::<RaftManagedDatastore<TestConfig>>();
 }
 
 #[tokio::test]

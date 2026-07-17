@@ -52,6 +52,24 @@ empty bootstrap head may attempt only a `Write` so the genesis commit can be
 created; `LinearizableRead` remains unavailable because no durable content yet
 proves that every pod bootstrapped the same payload.
 
+It also implements the explicit
+`CommittedRevisionSource<SealedConfig<C>>` trust marker. Its committed-head,
+ordered-history, and apply-notification methods read only the contiguous,
+publication-safe prefix of the local Openraft state-machine-applied SQLite
+view. A row remains hidden while its `recovery_required` marker is set; the
+locally applied clear wakes waiters, which then repage. These methods do not
+enter a linearizable read barrier, contact the leader, or fan out through the
+writer.
+A follower may therefore serve a gap-free local catch-up stream while
+temporarily behind the leader; it never serves an entry Openraft has not
+committed, applied, and cleared for publication locally. Durable repaging,
+rather than the notification, is the ordering authority.
+
+Composing `EncryptingManagedDatastore` outside this adapter propagates the
+marker and decrypts the locally applied head and history pages. The marker is
+not available for arbitrary `ManagedDatastore` implementations, so a Shadow
+`ConfigBus` cannot accidentally be restored from an unproven feed.
+
 Strict operational requirements:
 
 - use a config-specific `ConfigConsensusIdentity`, roster, listener port,
@@ -63,6 +81,9 @@ Strict operational requirements:
   lookup, not an unconditional retry;
 - keep rollback labels operator-safe and free of secrets because labels are
   clear lifecycle metadata used for indexed lookup;
+- serve committed watches from the local follower adapter and treat
+  `HistoryCursorAhead` as local lag, never as authority to move a consumer
+  backward;
 - for command/RPC revision 3, drain config writers, stop the complete config
   voter set, upgrade every member, and restart the set together. Revisions 1
   and 2 remain replayable only under their original semantics; there is no
@@ -76,3 +97,10 @@ they do not claim qualification for this adapter. A locked Cargo-metadata test
 checks the current 27-crate source-build closure independently. An additive
 follow-up qualification change under #250 must introduce candidate evidence
 before this adapter can inherit a session-HA qualification claim.
+
+The adapter does not expose a config-watch network protocol. It makes the
+ordered stream serviceable inside each authority process and exposes
+transport-neutral page/cursor types through `opc-config-bus`; a separate
+authenticated, bounded RPC adapter is still required for a remote dataplane
+process. Issue #256 remains open until that boundary and its process-level
+qualification exist.

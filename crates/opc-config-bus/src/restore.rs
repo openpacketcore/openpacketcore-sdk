@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock};
 use crate::alarms::{clear_config_alarm_type, preserve_startup_error};
 use crate::authorizer::{AllowAllAuthorizer, ConfigAuthorizer};
 use crate::commit::{ConfigBus, DEFAULT_COMMIT_QUEUE_CAPACITY};
-use crate::datastore::ManagedDatastore;
+use crate::datastore::{CommittedRevisionSource, ManagedDatastore};
 use crate::types::{
     AuthorityMode, CommitWrite, ConfirmedCommitResolution, StoreError, StoredConfig,
     StoredRequestMode,
@@ -206,6 +206,71 @@ pub(crate) fn validate_restored_confirmed_deadline<C: OpcConfig>(
 }
 
 impl<C: OpcConfig> ConfigBus<C> {
+    /// Restores a read-only Shadow bus from this node's locally committed,
+    /// state-machine-applied, publication-safe revision source.
+    ///
+    /// The explicit [`CommittedRevisionSource`] bound is the trust boundary:
+    /// an arbitrary datastore cannot masquerade as quorum-applied state merely
+    /// by implementing `ManagedDatastore`. The selected config is schema,
+    /// syntax, and semantics validated before publication. No commit worker or
+    /// commit-confirmed timer runs, and every call to [`ConfigBus::submit`] is
+    /// rejected before datastore I/O.
+    pub async fn restore_shadow<S>(store: S) -> Result<Self, StoreError>
+    where
+        S: CommittedRevisionSource<C> + 'static,
+    {
+        Self::restore_shadow_with_alarm_manager(store, SharedAlarmManager::default()).await
+    }
+
+    /// Restores a read-only Shadow bus while reporting startup validation
+    /// failures through the supplied alarm manager.
+    pub async fn restore_shadow_with_alarm_manager<S>(
+        store: S,
+        alarm_manager: SharedAlarmManager,
+    ) -> Result<Self, StoreError>
+    where
+        S: CommittedRevisionSource<C> + 'static,
+    {
+        let store: Arc<dyn ManagedDatastore<C>> = Arc::new(store);
+        let stored = store
+            .load_committed_latest()
+            .await
+            .map_err(|error| preserve_startup_error(&alarm_manager, error))?
+            .ok_or_else(|| {
+                preserve_startup_error(
+                    &alarm_manager,
+                    StoreError::not_found("shadow config source has no committed applied head"),
+                )
+            })?;
+        if stored.recovery_required {
+            return Err(preserve_startup_error(
+                &alarm_manager,
+                StoreError::restore_recovery_required(
+                    "shadow config source returned a publication-fenced head",
+                ),
+            ));
+        }
+        validate_stored_schema_digest(&stored)
+            .map_err(|error| preserve_startup_error(&alarm_manager, error))?;
+        let context = restore_validation_context(&stored);
+        let version = stored.version;
+        let tx_id = stored.tx_id;
+        let config = validate_startup_config(stored.config, context)
+            .await
+            .map_err(|error| preserve_startup_error(&alarm_manager, error))?;
+        clear_config_alarm_type(
+            &alarm_manager,
+            crate::alarms::CONFIG_BUS_STARTUP_FAILURE_ALARM_TYPE,
+        );
+        Ok(Self::spawn_shadow(
+            config,
+            version,
+            Some(tx_id),
+            store,
+            alarm_manager,
+        ))
+    }
+
     /// Builds a config bus with an internal alarm manager.
     pub async fn new<S>(
         initial: C,
