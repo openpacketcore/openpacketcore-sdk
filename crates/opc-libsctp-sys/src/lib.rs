@@ -227,6 +227,11 @@ pub fn peer_addresses(fd: BorrowedFd<'_>, assoc_id: AssocId) -> io::Result<Vec<S
     platform::peer_addresses(fd, assoc_id)
 }
 
+/// Return the current primary peer address for a one-to-one association.
+pub fn peer_primary_address(fd: BorrowedFd<'_>) -> io::Result<SocketAddr> {
+    platform::peer_primary_address(fd)
+}
+
 /// Return whether an I/O error means the kernel cannot provide static
 /// multihoming for this socket.
 #[must_use]
@@ -278,6 +283,9 @@ pub const SCTP_NOTIFICATION_FLAG: i32 = platform::SCTP_NOTIFICATION_FLAG;
 /// SCTP association-change notification type.
 pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = platform::SCTP_ASSOC_CHANGE_NOTIFICATION;
 
+/// SCTP peer-address-change notification type.
+pub const SCTP_PEER_ADDR_CHANGE_NOTIFICATION: u16 = platform::SCTP_PEER_ADDR_CHANGE_NOTIFICATION;
+
 /// SCTP shutdown notification type.
 pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = platform::SCTP_SHUTDOWN_EVENT_NOTIFICATION;
 
@@ -296,5 +304,12 @@ mod tests {
         assert!(events.address);
         assert!(events.shutdown);
         assert!(events.sender_dry);
+    }
+
+    #[test]
+    fn notification_types_match_linux_uapi_values() {
+        assert_eq!(SCTP_ASSOC_CHANGE_NOTIFICATION, 0x8001);
+        assert_eq!(SCTP_PEER_ADDR_CHANGE_NOTIFICATION, 0x8002);
+        assert_eq!(SCTP_SHUTDOWN_EVENT_NOTIFICATION, 0x8005);
     }
 }

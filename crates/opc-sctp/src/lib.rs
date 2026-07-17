@@ -8,8 +8,12 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+#[cfg(any(target_os = "linux", test))]
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(any(target_os = "linux", test))]
+use std::sync::RwLock;
 
 use bytes::Bytes;
 #[cfg(target_os = "linux")]
@@ -23,6 +27,9 @@ use tokio::io::unix::AsyncFd;
 
 #[cfg(target_os = "linux")]
 const SCTP_RECV_CHUNK_BYTES: usize = 64 * 1024;
+
+#[cfg(any(target_os = "linux", test))]
+const SCTP_PEER_ADDR_CHANGE_BYTES: usize = 148;
 
 /// Maximum number of addresses accepted in one static SCTP multihoming set.
 pub const MAX_STATIC_MULTIHOMING_ADDRESSES: usize = opc_libsctp_sys::MAX_SCTP_ADDRESSES;
@@ -508,6 +515,27 @@ impl DiameterSctpPeer {
     }
 }
 
+/// One item received from a live Diameter SCTP association.
+#[derive(Clone, PartialEq, Eq)]
+pub enum DiameterSctpInbound {
+    /// Diameter payload that passed notification, truncation, and PPID checks.
+    Payload(Bytes),
+    /// SCTP transport notification, decoded when its type is supported.
+    Notification(Option<SctpEvent>),
+}
+
+impl fmt::Debug for DiameterSctpInbound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Payload(payload) => f
+                .debug_struct("Payload")
+                .field("bytes", &payload.len())
+                .finish(),
+            Self::Notification(event) => f.debug_tuple("Notification").field(event).finish(),
+        }
+    }
+}
+
 /// Live Diameter SCTP association opened by SDK SCTP.
 #[derive(Debug)]
 pub struct DiameterSctpAssociation {
@@ -615,6 +643,39 @@ impl DiameterSctpAssociation {
             .map_err(DiameterSctpError::send)
     }
 
+    /// Receive one validated Diameter payload or SCTP transport notification.
+    ///
+    /// This event-capable boundary preserves wire ordering. Notifications are
+    /// returned before any payload truncation or PPID checks, matching the
+    /// existing [`Self::recv_diameter_payload`] filtering behavior. Payloads
+    /// are returned only after the same validation and legacy-PPID accounting
+    /// used by that convenience method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError`] when receive fails or non-notification
+    /// SCTP metadata is invalid for this peer's Diameter security profile.
+    pub async fn recv(&self) -> Result<DiameterSctpInbound, DiameterSctpError> {
+        let message = self
+            .association
+            .recv()
+            .await
+            .map_err(DiameterSctpError::recv)?;
+        if message.notification {
+            return Ok(DiameterSctpInbound::Notification(message.event));
+        }
+        let ppid_kind = self.peer.classify_inbound_message(&message)?;
+        if matches!(ppid_kind, DiameterInboundPpidKind::LegacyZero)
+            && self.legacy_zero_ppid_observer.record_accept()
+        {
+            tracing::warn!(
+                event = "diameter_sctp_legacy_zero_ppid_accepted",
+                "accepted legacy inbound Diameter SCTP PPID 0"
+            );
+        }
+        Ok(DiameterSctpInbound::Payload(message.payload))
+    }
+
     /// Receive one Diameter payload after SCTP metadata validation.
     ///
     /// SCTP event notifications (COMM_UP, peer address change, sender-dry,
@@ -628,27 +689,14 @@ impl DiameterSctpAssociation {
     /// not valid for this peer's Diameter security profile.
     pub async fn recv_diameter_payload(&self) -> Result<Bytes, DiameterSctpError> {
         loop {
-            let message = self
-                .association
-                .recv()
-                .await
-                .map_err(DiameterSctpError::recv)?;
-            if message.notification {
-                // A shutdown notification is followed by the association
-                // actually closing, so the next recv surfaces
-                // `SctpError::Closed` instead of spinning here.
-                continue;
+            match self.recv().await? {
+                DiameterSctpInbound::Payload(payload) => return Ok(payload),
+                DiameterSctpInbound::Notification(_) => {
+                    // A shutdown notification is followed by the association
+                    // actually closing, so the next recv surfaces
+                    // `SctpError::Closed` instead of spinning here.
+                }
             }
-            let ppid_kind = self.peer.classify_inbound_message(&message)?;
-            if matches!(ppid_kind, DiameterInboundPpidKind::LegacyZero)
-                && self.legacy_zero_ppid_observer.record_accept()
-            {
-                tracing::warn!(
-                    event = "diameter_sctp_legacy_zero_ppid_accepted",
-                    "accepted legacy inbound Diameter SCTP PPID 0"
-                );
-            }
-            return Ok(message.payload);
         }
     }
 
@@ -656,6 +704,16 @@ impl DiameterSctpAssociation {
     #[must_use]
     pub fn health(&self) -> SctpHealth {
         self.association.health()
+    }
+
+    /// Return bounded per-path health for this Diameter SCTP association.
+    ///
+    /// The snapshot is initialized from the distinct configured set, or the
+    /// bounded kernel-reported set for an accepted association, and updated
+    /// before [`Self::recv`] returns each peer-address-change notification.
+    #[must_use]
+    pub fn peer_path_health(&self) -> Vec<SctpPathHealth> {
+        self.association.peer_path_health()
     }
 
     /// Return SDK SCTP association metrics.
@@ -849,7 +907,7 @@ impl std::error::Error for DiameterSctpError {
 }
 
 /// Parsed SCTP notification event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SctpEvent {
     /// Association state changed.
     AssociationChange {
@@ -861,6 +919,17 @@ pub enum SctpEvent {
         outbound_streams: u16,
         /// Inbound stream count reported by the kernel.
         inbound_streams: u16,
+        /// Association identifier.
+        assoc_id: i32,
+    },
+    /// One peer path changed state.
+    PeerAddrChange {
+        /// Peer path address reported by the kernel.
+        peer_addr: SocketAddr,
+        /// Typed peer path transition.
+        state: SctpPeerAddrState,
+        /// Kernel error value associated with the transition.
+        error: i32,
         /// Association identifier.
         assoc_id: i32,
     },
@@ -876,8 +945,156 @@ pub enum SctpEvent {
     },
 }
 
+impl fmt::Debug for SctpEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AssociationChange {
+                state,
+                error,
+                outbound_streams,
+                inbound_streams,
+                assoc_id,
+            } => f
+                .debug_struct("AssociationChange")
+                .field("state", state)
+                .field("error", error)
+                .field("outbound_streams", outbound_streams)
+                .field("inbound_streams", inbound_streams)
+                .field("assoc_id", assoc_id)
+                .finish(),
+            Self::PeerAddrChange {
+                state,
+                error,
+                assoc_id,
+                ..
+            } => f
+                .debug_struct("PeerAddrChange")
+                .field("peer_addr", &"<redacted>")
+                .field("state", state)
+                .field("error", error)
+                .field("assoc_id", assoc_id)
+                .finish(),
+            Self::Shutdown { assoc_id } => f
+                .debug_struct("Shutdown")
+                .field("assoc_id", assoc_id)
+                .finish(),
+            Self::Unknown { notification_type } => f
+                .debug_struct("Unknown")
+                .field("notification_type", notification_type)
+                .finish(),
+        }
+    }
+}
+
+/// State carried by a Linux `SCTP_PEER_ADDR_CHANGE` notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SctpPeerAddrState {
+    /// The peer address became available.
+    Available,
+    /// The peer address became unreachable.
+    Unreachable,
+    /// The peer address was removed from the association.
+    Removed,
+    /// The peer address was added to the association.
+    Added,
+    /// The peer address became the primary path.
+    MadePrimary,
+    /// The peer address was confirmed by the SCTP stack.
+    Confirmed,
+    /// The peer address entered potentially-failed state.
+    PotentiallyFailed,
+    /// State value not recognized by this SDK version.
+    Unknown(i32),
+}
+
+impl SctpPeerAddrState {
+    #[cfg(any(target_os = "linux", test))]
+    const fn from_kernel(value: i32) -> Self {
+        match value {
+            0 => Self::Available,
+            1 => Self::Unreachable,
+            2 => Self::Removed,
+            3 => Self::Added,
+            4 => Self::MadePrimary,
+            5 => Self::Confirmed,
+            6 => Self::PotentiallyFailed,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Stable machine name for the transition.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unreachable => "unreachable",
+            Self::Removed => "removed",
+            Self::Added => "added",
+            Self::MadePrimary => "made_primary",
+            Self::Confirmed => "confirmed",
+            Self::PotentiallyFailed => "potentially_failed",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// Current health classification for one peer SCTP path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SctpPathStatus {
+    /// No reachability event has been observed yet.
+    Unknown,
+    /// The SCTP stack reports the path as available or confirmed.
+    Reachable,
+    /// The SCTP stack reports the path as potentially failed.
+    PotentiallyFailed,
+    /// The SCTP stack reports the path as unreachable.
+    Unreachable,
+    /// The path was removed from the association.
+    Removed,
+}
+
+impl SctpPathStatus {
+    /// Stable machine name for the path status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Reachable => "reachable",
+            Self::PotentiallyFailed => "potentially_failed",
+            Self::Unreachable => "unreachable",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+/// Redaction-safe health for one peer SCTP path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SctpPathHealth {
+    /// Peer address represented by this path.
+    pub peer_addr: SocketAddr,
+    /// Current reachability classification derived from kernel events.
+    pub status: SctpPathStatus,
+    /// Whether this is the initial or most recently selected primary path.
+    ///
+    /// The first configured or kernel-reported peer address initializes the
+    /// estimate. `SCTP_ADDR_MADE_PRIM` changes the designation; removal clears
+    /// it. Reachability transitions do not change which path is designated
+    /// primary.
+    pub primary: bool,
+}
+
+impl fmt::Debug for SctpPathHealth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SctpPathHealth")
+            .field("peer_addr", &"<redacted>")
+            .field("status", &self.status)
+            .field("primary", &self.primary)
+            .finish()
+    }
+}
+
 /// Inbound SCTP message metadata and payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InboundMessage {
     /// Payload bytes.
     pub payload: Bytes,
@@ -898,6 +1115,22 @@ pub struct InboundMessage {
     /// True when the kernel truncated ancillary control data. The payload is
     /// intact, but SCTP metadata (stream/PPID/association) may be incomplete.
     pub control_truncated: bool,
+}
+
+impl fmt::Debug for InboundMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InboundMessage")
+            .field("payload_bytes", &self.payload.len())
+            .field("stream_id", &self.stream_id)
+            .field("ppid", &self.ppid)
+            .field("order", &self.order)
+            .field("assoc_id", &self.assoc_id)
+            .field("notification", &self.notification)
+            .field("event", &self.event)
+            .field("truncated", &self.truncated)
+            .field("control_truncated", &self.control_truncated)
+            .finish()
+    }
 }
 
 /// Error type for safe SCTP operations. Display text is payload-free.
@@ -1048,6 +1281,143 @@ pub struct SctpHealth {
     pub mode: SctpMode,
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+struct SctpPathTracker {
+    paths: RwLock<Vec<SctpPathHealth>>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl SctpPathTracker {
+    fn new(peer_addrs: &[SocketAddr]) -> Self {
+        let mut paths = Vec::with_capacity(peer_addrs.len().min(MAX_STATIC_MULTIHOMING_ADDRESSES));
+        for peer_addr in peer_addrs
+            .iter()
+            .copied()
+            .take(MAX_STATIC_MULTIHOMING_ADDRESSES)
+        {
+            if paths
+                .iter()
+                .any(|path: &SctpPathHealth| same_sctp_path(path.peer_addr, peer_addr))
+            {
+                continue;
+            }
+            paths.push(SctpPathHealth {
+                peer_addr,
+                status: SctpPathStatus::Unknown,
+                primary: paths.is_empty(),
+            });
+        }
+        Self {
+            paths: RwLock::new(paths),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<SctpPathHealth> {
+        match self.paths.read() {
+            Ok(paths) => paths.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn record(&self, event: SctpEvent) {
+        let SctpEvent::PeerAddrChange {
+            peer_addr, state, ..
+        } = event
+        else {
+            return;
+        };
+        self.record_path_change(peer_addr, state);
+    }
+
+    fn mark_primary_reachable(&self, peer_addr: SocketAddr) {
+        self.record_path_change(peer_addr, SctpPeerAddrState::MadePrimary);
+    }
+
+    fn record_path_change(&self, peer_addr: SocketAddr, state: SctpPeerAddrState) {
+        let mut paths = match self.paths.write() {
+            Ok(paths) => paths,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let path_index = if let Some(path_index) = paths
+            .iter()
+            .position(|path| same_sctp_path(path.peer_addr, peer_addr))
+        {
+            path_index
+        } else if paths.len() < MAX_STATIC_MULTIHOMING_ADDRESSES {
+            let path_index = paths.len();
+            paths.push(SctpPathHealth {
+                peer_addr,
+                status: SctpPathStatus::Unknown,
+                primary: false,
+            });
+            path_index
+        } else if let Some(path_index) = paths
+            .iter()
+            .position(|path| path.status == SctpPathStatus::Removed)
+        {
+            paths[path_index] = SctpPathHealth {
+                peer_addr,
+                status: SctpPathStatus::Unknown,
+                primary: false,
+            };
+            path_index
+        } else if state == SctpPeerAddrState::MadePrimary {
+            let Some(path_index) = paths.iter().rposition(|path| !path.primary) else {
+                return;
+            };
+            paths[path_index] = SctpPathHealth {
+                peer_addr,
+                status: SctpPathStatus::Unknown,
+                primary: false,
+            };
+            path_index
+        } else {
+            return;
+        };
+        if state == SctpPeerAddrState::MadePrimary {
+            for path in paths.iter_mut() {
+                path.primary = false;
+            }
+        }
+        let path = &mut paths[path_index];
+        match state {
+            SctpPeerAddrState::Available
+            | SctpPeerAddrState::MadePrimary
+            | SctpPeerAddrState::Confirmed => path.status = SctpPathStatus::Reachable,
+            SctpPeerAddrState::Unreachable => {
+                path.status = SctpPathStatus::Unreachable;
+            }
+            SctpPeerAddrState::Removed => {
+                path.status = SctpPathStatus::Removed;
+                path.primary = false;
+            }
+            SctpPeerAddrState::PotentiallyFailed => {
+                path.status = SctpPathStatus::PotentiallyFailed;
+            }
+            SctpPeerAddrState::Added | SctpPeerAddrState::Unknown(_) => {
+                path.status = SctpPathStatus::Unknown;
+            }
+        }
+        if state == SctpPeerAddrState::MadePrimary {
+            path.primary = true;
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn same_sctp_path(left: SocketAddr, right: SocketAddr) -> bool {
+    match (left, right) {
+        (SocketAddr::V4(left), SocketAddr::V4(right)) => left == right,
+        (SocketAddr::V6(left), SocketAddr::V6(right)) => {
+            left.ip() == right.ip()
+                && left.port() == right.port()
+                && left.scope_id() == right.scope_id()
+        }
+        (SocketAddr::V4(_), SocketAddr::V6(_)) | (SocketAddr::V6(_), SocketAddr::V4(_)) => false,
+    }
+}
+
 /// Capabilities available from this build of the SCTP transport.
 ///
 /// A Linux kernel or container policy can still reject multihoming for a
@@ -1136,6 +1506,11 @@ impl SctpAssociation {
     }
 
     /// Receive one message.
+    ///
+    /// Concurrent active calls are serialized so path events are applied to
+    /// [`Self::peer_path_health`] in kernel receive order before this returns.
+    /// A receive future is not cancellation-safe after it starts consuming a
+    /// multi-chunk SCTP record.
     pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
         self.imp.recv().await
     }
@@ -1143,6 +1518,19 @@ impl SctpAssociation {
     /// Return association health.
     pub fn health(&self) -> SctpHealth {
         self.imp.health()
+    }
+
+    /// Return bounded peer-path health for this association.
+    ///
+    /// Non-primary paths begin as [`SctpPathStatus::Unknown`]; the connected
+    /// or accepted primary begins reachable when the kernel reports it.
+    /// Peer-address-change notifications update the snapshot before
+    /// [`Self::recv`] returns them. IPv6 flow information is deliberately not
+    /// part of path identity, following RFC 3493 guidance for system-produced
+    /// socket addresses.
+    #[must_use]
+    pub fn peer_path_health(&self) -> Vec<SctpPathHealth> {
+        self.imp.peer_path_health()
     }
 
     /// Return association metrics.
@@ -1338,9 +1726,16 @@ fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMes
 
 #[cfg(any(target_os = "linux", test))]
 fn parse_sctp_event(payload: &[u8]) -> Option<SctpEvent> {
+    let available_len = payload.len();
     let notification_type = read_u16_ne(payload, 0)?;
     let declared_len = read_u32_ne(payload, 4)? as usize;
     if declared_len < 8 || declared_len > payload.len() {
+        return None;
+    }
+    if notification_type == opc_libsctp_sys::SCTP_PEER_ADDR_CHANGE_NOTIFICATION
+        && (declared_len != SCTP_PEER_ADDR_CHANGE_BYTES
+            || available_len != SCTP_PEER_ADDR_CHANGE_BYTES)
+    {
         return None;
     }
     let payload = &payload[..declared_len];
@@ -1353,6 +1748,12 @@ fn parse_sctp_event(payload: &[u8]) -> Option<SctpEvent> {
             inbound_streams: read_u16_ne(payload, 14)?,
             assoc_id: read_i32_ne(payload, 16)?,
         }),
+        opc_libsctp_sys::SCTP_PEER_ADDR_CHANGE_NOTIFICATION => Some(SctpEvent::PeerAddrChange {
+            peer_addr: parse_peer_addr_change_socket_addr(payload)?,
+            state: SctpPeerAddrState::from_kernel(read_i32_ne(payload, 136)?),
+            error: read_i32_ne(payload, 140)?,
+            assoc_id: read_i32_ne(payload, 144)?,
+        }),
         opc_libsctp_sys::SCTP_SHUTDOWN_EVENT_NOTIFICATION => Some(SctpEvent::Shutdown {
             assoc_id: read_i32_ne(payload, 8)?,
         }),
@@ -1363,15 +1764,66 @@ fn parse_sctp_event(payload: &[u8]) -> Option<SctpEvent> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn parse_peer_addr_change_socket_addr(payload: &[u8]) -> Option<SocketAddr> {
+    const SOCKADDR_STORAGE_OFFSET: usize = 8;
+    const SOCKADDR_STORAGE_BYTES: usize = 128;
+    const LINUX_AF_INET: u16 = 2;
+    const LINUX_AF_INET6: u16 = 10;
+
+    if payload.len() != SCTP_PEER_ADDR_CHANGE_BYTES {
+        return None;
+    }
+    let storage = payload.get(
+        SOCKADDR_STORAGE_OFFSET..SOCKADDR_STORAGE_OFFSET.checked_add(SOCKADDR_STORAGE_BYTES)?,
+    )?;
+    match read_u16_ne(storage, 0)? {
+        LINUX_AF_INET => {
+            let port = read_u16_be(storage, 2)?;
+            let octets: [u8; 4] = storage.get(4..8)?.try_into().ok()?;
+            let address = Ipv4Addr::from(octets);
+            Some(SocketAddr::V4(SocketAddrV4::new(address, port)))
+        }
+        LINUX_AF_INET6 => {
+            let port = read_u16_be(storage, 2)?;
+            // Linux embeds `sockaddr_in6` in this notification. Its port and
+            // flowinfo fields are network-order, while scope_id is native.
+            // Existing getpeername/getpaddrs conversion intentionally mirrors
+            // std/libc's raw flowinfo representation; path identity therefore
+            // ignores flowinfo rather than conflating the two APIs.
+            let flowinfo = read_u32_be(storage, 4)?;
+            let octets: [u8; 16] = storage.get(8..24)?.try_into().ok()?;
+            let address = Ipv6Addr::from(octets);
+            let scope_id = read_u32_ne(storage, 24)?;
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                address, port, flowinfo, scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn read_u16_ne(bytes: &[u8], offset: usize) -> Option<u16> {
     let slice = bytes.get(offset..offset.checked_add(2)?)?;
     Some(u16::from_ne_bytes([slice[0], slice[1]]))
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn read_u16_be(bytes: &[u8], offset: usize) -> Option<u16> {
+    let slice = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_be_bytes([slice[0], slice[1]]))
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn read_u32_ne(bytes: &[u8], offset: usize) -> Option<u32> {
     let slice = bytes.get(offset..offset.checked_add(4)?)?;
     Some(u32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_u32_be(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1411,6 +1863,8 @@ mod platform {
     pub struct Association {
         socket: Arc<SctpSocket>,
         mode: SctpMode,
+        peer_paths: SctpPathTracker,
+        recv_gate: tokio::sync::Mutex<()>,
     }
 
     #[derive(Debug)]
@@ -1447,6 +1901,7 @@ mod platform {
 
     pub async fn connect_association(config: SctpConnectConfig) -> Result<Association, SctpError> {
         let remote = config.remote_addrs[0];
+        let peer_paths = SctpPathTracker::new(&config.remote_addrs);
         let fd = opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne))
             .map_err(|source| io_err("socket", source))?;
         configure_fd(fd.as_fd(), config.init, config.nodelay)?;
@@ -1474,9 +1929,15 @@ mod platform {
         if status == opc_libsctp_sys::ConnectStatus::InProgress {
             wait_connected(&socket).await?;
         }
+        if let Ok(primary_peer) = opc_libsctp_sys::peer_primary_address(socket.fd.get_ref().as_fd())
+        {
+            peer_paths.mark_primary_reachable(primary_peer);
+        }
         Ok(Association {
             socket,
             mode: SctpMode::OneToOne,
+            peer_paths,
+            recv_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -1496,7 +1957,22 @@ mod platform {
                     .await
                     .map_err(|source| io_err("accept_ready", source))?;
                 match guard.try_io(|inner| opc_libsctp_sys::accept(inner.get_ref().as_fd())) {
-                    Ok(Ok((fd, _peer))) => {
+                    Ok(Ok((fd, peer))) => {
+                        let mut peer_addrs = match opc_libsctp_sys::peer_addresses(fd.as_fd(), 0) {
+                            Ok(peer_addrs) if !peer_addrs.is_empty() => peer_addrs,
+                            Ok(_) | Err(_) => vec![peer],
+                        };
+                        if let Some(peer_index) = peer_addrs
+                            .iter()
+                            .position(|peer_addr| same_sctp_path(*peer_addr, peer))
+                        {
+                            peer_addrs.swap(0, peer_index);
+                        } else {
+                            peer_addrs.insert(0, peer);
+                            peer_addrs.truncate(MAX_STATIC_MULTIHOMING_ADDRESSES);
+                        }
+                        let peer_paths = SctpPathTracker::new(&peer_addrs);
+                        peer_paths.mark_primary_reachable(peer);
                         let async_fd =
                             AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
                         self.socket.metrics.record_accept();
@@ -1508,6 +1984,8 @@ mod platform {
                                 closed: AtomicBool::new(false),
                             }),
                             mode: SctpMode::OneToOne,
+                            peer_paths,
+                            recv_gate: tokio::sync::Mutex::new(()),
                         });
                     }
                     Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
@@ -1565,7 +2043,12 @@ mod platform {
         }
 
         pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
-            self.socket.recv().await
+            let _recv_guard = self.recv_gate.lock().await;
+            let message = self.socket.recv().await?;
+            if let Some(event) = message.event {
+                self.peer_paths.record(event);
+            }
+            Ok(message)
         }
 
         pub fn health(&self) -> SctpHealth {
@@ -1574,6 +2057,10 @@ mod platform {
                 socket_open: self.socket.is_open(),
                 mode: self.mode,
             }
+        }
+
+        pub fn peer_path_health(&self) -> Vec<SctpPathHealth> {
+            self.peer_paths.snapshot()
         }
 
         pub fn metrics(&self) -> SctpMetricsSnapshot {
@@ -1846,6 +2333,11 @@ mod platform {
             }
         }
 
+        pub fn peer_path_health(&self) -> Vec<SctpPathHealth> {
+            let _ = self;
+            Vec::new()
+        }
+
         pub fn metrics(&self) -> SctpMetricsSnapshot {
             let _ = self;
             SctpMetricsSnapshot::default()
@@ -1895,6 +2387,41 @@ mod tests {
 
     fn push_i32_ne(out: &mut Vec<u8>, value: i32) {
         out.extend_from_slice(&value.to_ne_bytes());
+    }
+
+    fn peer_addr_change_notification(
+        peer_addr: SocketAddr,
+        state: i32,
+        error: i32,
+        assoc_id: i32,
+    ) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(SCTP_PEER_ADDR_CHANGE_BYTES);
+        push_u16_ne(
+            &mut payload,
+            opc_libsctp_sys::SCTP_PEER_ADDR_CHANGE_NOTIFICATION,
+        );
+        push_u16_ne(&mut payload, 0);
+        push_u32_ne(&mut payload, SCTP_PEER_ADDR_CHANGE_BYTES as u32);
+        let mut storage = [0_u8; 128];
+        match peer_addr {
+            SocketAddr::V4(addr) => {
+                storage[0..2].copy_from_slice(&2_u16.to_ne_bytes());
+                storage[2..4].copy_from_slice(&addr.port().to_be_bytes());
+                storage[4..8].copy_from_slice(&addr.ip().octets());
+            }
+            SocketAddr::V6(addr) => {
+                storage[0..2].copy_from_slice(&10_u16.to_ne_bytes());
+                storage[2..4].copy_from_slice(&addr.port().to_be_bytes());
+                storage[4..8].copy_from_slice(&addr.flowinfo().to_be_bytes());
+                storage[8..24].copy_from_slice(&addr.ip().octets());
+                storage[24..28].copy_from_slice(&addr.scope_id().to_ne_bytes());
+            }
+        }
+        payload.extend_from_slice(&storage);
+        push_i32_ne(&mut payload, state);
+        push_i32_ne(&mut payload, error);
+        push_i32_ne(&mut payload, assoc_id);
+        payload
     }
 
     #[test]
@@ -1949,7 +2476,22 @@ mod tests {
     }
 
     #[test]
+    fn diameter_inbound_debug_does_not_expose_payload() {
+        let inbound = DiameterSctpInbound::Payload(Bytes::from_static(b"diameter-secret"));
+        let debug = format!("{inbound:?}");
+
+        assert!(debug.contains("bytes"));
+        assert!(!debug.contains("diameter-secret"));
+
+        let message = diameter_inbound(DIAMETER_SCTP_PPID);
+        let message_debug = format!("{message:?}");
+        assert!(message_debug.contains("payload_bytes"));
+        assert!(!message_debug.contains("diameter"));
+    }
+
+    #[test]
     fn parses_assoc_change_notification_event() {
+        assert_eq!(opc_libsctp_sys::SCTP_ASSOC_CHANGE_NOTIFICATION, 0x8001);
         let mut payload = Vec::new();
         push_u16_ne(
             &mut payload,
@@ -1977,6 +2519,7 @@ mod tests {
 
     #[test]
     fn parses_shutdown_notification_event() {
+        assert_eq!(opc_libsctp_sys::SCTP_SHUTDOWN_EVENT_NOTIFICATION, 0x8005);
         let mut payload = Vec::new();
         push_u16_ne(
             &mut payload,
@@ -1990,6 +2533,356 @@ mod tests {
             parse_sctp_event(&payload),
             Some(SctpEvent::Shutdown { assoc_id: 9 })
         );
+    }
+
+    #[test]
+    fn parses_ipv4_peer_addr_change_notification_event() {
+        assert_eq!(opc_libsctp_sys::SCTP_PEER_ADDR_CHANGE_NOTIFICATION, 0x8002);
+        let peer_addr = "192.0.2.10:3868".parse().unwrap();
+        let payload = peer_addr_change_notification(peer_addr, 1, 113, 17);
+
+        assert_eq!(
+            parse_sctp_event(&payload),
+            Some(SctpEvent::PeerAddrChange {
+                peer_addr,
+                state: SctpPeerAddrState::Unreachable,
+                error: 113,
+                assoc_id: 17,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_ipv6_peer_addr_change_notification_event() {
+        // Independently authored Linux `sctp_paddr_change` fixture. In
+        // particular, nonzero sin6_flowinfo is encoded in network order.
+        let mut payload = [0_u8; 148];
+        payload[0..2]
+            .copy_from_slice(&opc_libsctp_sys::SCTP_PEER_ADDR_CHANGE_NOTIFICATION.to_ne_bytes());
+        payload[4..8].copy_from_slice(&148_u32.to_ne_bytes());
+        payload[8..10].copy_from_slice(&10_u16.to_ne_bytes());
+        payload[10..12].copy_from_slice(&3868_u16.to_be_bytes());
+        payload[12..16].copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        payload[16..32].copy_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
+        ]);
+        payload[32..36].copy_from_slice(&3_u32.to_ne_bytes());
+        payload[136..140].copy_from_slice(&4_i32.to_ne_bytes());
+        payload[140..144].copy_from_slice(&0_i32.to_ne_bytes());
+        payload[144..148].copy_from_slice(&21_i32.to_ne_bytes());
+        let peer_addr = SocketAddr::V6(SocketAddrV6::new(
+            "2001:db8::20".parse().unwrap(),
+            3868,
+            0x0102_0304,
+            3,
+        ));
+
+        assert_eq!(
+            parse_sctp_event(payload.as_slice()),
+            Some(SctpEvent::PeerAddrChange {
+                peer_addr,
+                state: SctpPeerAddrState::MadePrimary,
+                error: 0,
+                assoc_id: 21,
+            })
+        );
+    }
+
+    #[test]
+    fn peer_addr_change_state_values_match_linux_uapi() {
+        assert_eq!(
+            SctpPeerAddrState::from_kernel(0),
+            SctpPeerAddrState::Available
+        );
+        assert_eq!(
+            SctpPeerAddrState::from_kernel(1),
+            SctpPeerAddrState::Unreachable
+        );
+        assert_eq!(
+            SctpPeerAddrState::from_kernel(2),
+            SctpPeerAddrState::Removed
+        );
+        assert_eq!(SctpPeerAddrState::from_kernel(3), SctpPeerAddrState::Added);
+        assert_eq!(
+            SctpPeerAddrState::from_kernel(4),
+            SctpPeerAddrState::MadePrimary
+        );
+        assert_eq!(
+            SctpPeerAddrState::from_kernel(5),
+            SctpPeerAddrState::Confirmed
+        );
+        assert_eq!(
+            SctpPeerAddrState::from_kernel(6),
+            SctpPeerAddrState::PotentiallyFailed
+        );
+        assert_eq!(
+            SctpPeerAddrState::from_kernel(77),
+            SctpPeerAddrState::Unknown(77)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_peer_addr_change_notifications() {
+        let peer_addr = "192.0.2.10:3868".parse().unwrap();
+        let payload = peer_addr_change_notification(peer_addr, 0, 0, 1);
+
+        assert_eq!(parse_sctp_event(&payload[..147]), None);
+
+        let mut oversized = payload.clone();
+        oversized.push(0);
+        oversized[4..8].copy_from_slice(&149_u32.to_ne_bytes());
+        assert_eq!(parse_sctp_event(&oversized), None);
+
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert_eq!(parse_sctp_event(&trailing), None);
+
+        let mut unknown_family = payload;
+        unknown_family[8..10].copy_from_slice(&99_u16.to_ne_bytes());
+        assert_eq!(parse_sctp_event(&unknown_family), None);
+    }
+
+    #[test]
+    fn peer_addr_event_and_health_debug_redact_addresses() {
+        let peer_addr: SocketAddr = "192.0.2.10:3868".parse().unwrap();
+        let event = SctpEvent::PeerAddrChange {
+            peer_addr,
+            state: SctpPeerAddrState::Available,
+            error: 0,
+            assoc_id: 7,
+        };
+        let event_debug = format!("{event:?}");
+        assert!(event_debug.contains("<redacted>"));
+        assert!(!event_debug.contains("192.0.2.10"));
+
+        let health = SctpPathHealth {
+            peer_addr,
+            status: SctpPathStatus::Reachable,
+            primary: true,
+        };
+        let health_debug = format!("{health:?}");
+        assert!(health_debug.contains("<redacted>"));
+        assert!(!health_debug.contains("192.0.2.10"));
+    }
+
+    #[test]
+    fn sctp_health_original_struct_literal_remains_source_compatible() {
+        let health = SctpHealth {
+            platform_supported: true,
+            socket_open: true,
+            mode: SctpMode::OneToOne,
+        };
+
+        assert!(health.platform_supported);
+        assert!(health.socket_open);
+        assert_eq!(health.mode, SctpMode::OneToOne);
+    }
+
+    #[test]
+    fn path_tracker_ignores_ipv6_flowinfo_for_identity() {
+        let address: Ipv6Addr = "2001:db8::20".parse().unwrap();
+        let configured = SocketAddr::V6(SocketAddrV6::new(address, 3868, 0, 3));
+        let raw_current = SocketAddr::V6(SocketAddrV6::new(address, 3868, 0x0403_0201, 3));
+        let notification = SocketAddr::V6(SocketAddrV6::new(address, 3868, 0x0102_0304, 3));
+        let tracker = SctpPathTracker::new(&[configured]);
+
+        tracker.mark_primary_reachable(raw_current);
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: notification,
+            state: SctpPeerAddrState::Confirmed,
+            error: 0,
+            assoc_id: 7,
+        });
+
+        assert_eq!(
+            tracker.snapshot(),
+            vec![SctpPathHealth {
+                peer_addr: configured,
+                status: SctpPathStatus::Reachable,
+                primary: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn path_tracker_preserves_order_and_applies_transitions() {
+        let first: SocketAddr = "192.0.2.10:3868".parse().unwrap();
+        let second: SocketAddr = "192.0.2.11:3868".parse().unwrap();
+        let tracker = SctpPathTracker::new(&[first, second]);
+        assert_eq!(
+            tracker.snapshot(),
+            vec![
+                SctpPathHealth {
+                    peer_addr: first,
+                    status: SctpPathStatus::Unknown,
+                    primary: true,
+                },
+                SctpPathHealth {
+                    peer_addr: second,
+                    status: SctpPathStatus::Unknown,
+                    primary: false,
+                },
+            ]
+        );
+
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: second,
+            state: SctpPeerAddrState::MadePrimary,
+            error: 0,
+            assoc_id: 7,
+        });
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: first,
+            state: SctpPeerAddrState::PotentiallyFailed,
+            error: 0,
+            assoc_id: 7,
+        });
+
+        let paths = tracker.snapshot();
+        assert_eq!(paths[0].status, SctpPathStatus::PotentiallyFailed);
+        assert!(!paths[0].primary);
+        assert_eq!(paths[1].status, SctpPathStatus::Reachable);
+        assert!(paths[1].primary);
+    }
+
+    #[test]
+    fn path_tracker_keeps_primary_designation_across_reachability_changes() {
+        let first: SocketAddr = "192.0.2.10:3868".parse().unwrap();
+        let second: SocketAddr = "192.0.2.11:3868".parse().unwrap();
+        let tracker = SctpPathTracker::new(&[first, second]);
+
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: first,
+            state: SctpPeerAddrState::Unreachable,
+            error: 113,
+            assoc_id: 7,
+        });
+        let paths = tracker.snapshot();
+        assert!(paths[0].primary);
+        assert_eq!(paths[0].status, SctpPathStatus::Unreachable);
+
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: first,
+            state: SctpPeerAddrState::Available,
+            error: 0,
+            assoc_id: 7,
+        });
+        let paths = tracker.snapshot();
+        assert!(paths[0].primary);
+        assert_eq!(paths[0].status, SctpPathStatus::Reachable);
+
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: first,
+            state: SctpPeerAddrState::PotentiallyFailed,
+            error: 0,
+            assoc_id: 7,
+        });
+        let paths = tracker.snapshot();
+        assert!(paths[0].primary);
+        assert_eq!(paths[0].status, SctpPathStatus::PotentiallyFailed);
+
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: second,
+            state: SctpPeerAddrState::MadePrimary,
+            error: 0,
+            assoc_id: 7,
+        });
+        let paths = tracker.snapshot();
+        assert!(!paths[0].primary);
+        assert!(paths[1].primary);
+        assert_eq!(paths[1].status, SctpPathStatus::Reachable);
+    }
+
+    #[test]
+    fn path_tracker_maps_reachability_and_removal_states() {
+        let peer_addr: SocketAddr = "192.0.2.10:3868".parse().unwrap();
+        let tracker = SctpPathTracker::new(&[peer_addr]);
+        for (state, expected_status) in [
+            (SctpPeerAddrState::Available, SctpPathStatus::Reachable),
+            (
+                SctpPeerAddrState::PotentiallyFailed,
+                SctpPathStatus::PotentiallyFailed,
+            ),
+            (SctpPeerAddrState::Unreachable, SctpPathStatus::Unreachable),
+            (SctpPeerAddrState::Added, SctpPathStatus::Unknown),
+            (SctpPeerAddrState::Confirmed, SctpPathStatus::Reachable),
+            (SctpPeerAddrState::Removed, SctpPathStatus::Removed),
+            (SctpPeerAddrState::Unknown(99), SctpPathStatus::Unknown),
+        ] {
+            tracker.record(SctpEvent::PeerAddrChange {
+                peer_addr,
+                state,
+                error: 0,
+                assoc_id: 7,
+            });
+            assert_eq!(tracker.snapshot()[0].status, expected_status);
+        }
+    }
+
+    #[test]
+    fn path_tracker_bounds_notification_discovered_paths() {
+        let configured: Vec<_> = (1..=MAX_STATIC_MULTIHOMING_ADDRESSES)
+            .map(|host| SocketAddr::from(([192, 0, 2, host as u8], 3868)))
+            .collect();
+        let tracker = SctpPathTracker::new(&configured);
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: "198.51.100.1:3868".parse().unwrap(),
+            state: SctpPeerAddrState::Available,
+            error: 0,
+            assoc_id: 7,
+        });
+
+        assert_eq!(tracker.snapshot().len(), MAX_STATIC_MULTIHOMING_ADDRESSES);
+    }
+
+    #[test]
+    fn path_tracker_reuses_removed_slot_for_new_kernel_path() {
+        let configured: Vec<_> = (1..=MAX_STATIC_MULTIHOMING_ADDRESSES)
+            .map(|host| SocketAddr::from(([192, 0, 2, host as u8], 3868)))
+            .collect();
+        let tracker = SctpPathTracker::new(&configured);
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: configured[0],
+            state: SctpPeerAddrState::Removed,
+            error: 0,
+            assoc_id: 7,
+        });
+        let replacement: SocketAddr = "198.51.100.1:3868".parse().unwrap();
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: replacement,
+            state: SctpPeerAddrState::Available,
+            error: 0,
+            assoc_id: 7,
+        });
+
+        let paths = tracker.snapshot();
+        assert_eq!(paths.len(), MAX_STATIC_MULTIHOMING_ADDRESSES);
+        assert!(paths.iter().any(|path| {
+            path.peer_addr == replacement && path.status == SctpPathStatus::Reachable
+        }));
+        assert!(!paths.iter().any(|path| path.peer_addr == configured[0]));
+    }
+
+    #[test]
+    fn path_tracker_prioritizes_new_primary_at_capacity() {
+        let configured: Vec<_> = (1..=MAX_STATIC_MULTIHOMING_ADDRESSES)
+            .map(|host| SocketAddr::from(([192, 0, 2, host as u8], 3868)))
+            .collect();
+        let tracker = SctpPathTracker::new(&configured);
+        let replacement: SocketAddr = "198.51.100.1:3868".parse().unwrap();
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: replacement,
+            state: SctpPeerAddrState::MadePrimary,
+            error: 0,
+            assoc_id: 7,
+        });
+
+        let paths = tracker.snapshot();
+        assert_eq!(paths.len(), MAX_STATIC_MULTIHOMING_ADDRESSES);
+        let primary_paths: Vec<_> = paths.iter().filter(|path| path.primary).collect();
+        assert_eq!(primary_paths.len(), 1);
+        assert_eq!(primary_paths[0].peer_addr, replacement);
+        assert_eq!(primary_paths[0].status, SctpPathStatus::Reachable);
     }
 
     #[test]
@@ -2142,12 +3035,13 @@ mod tests {
         let peer =
             diameter_peer().with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero);
 
-        let mut notification = diameter_inbound(PayloadProtocolIdentifier::new(0));
+        let mut notification = diameter_inbound(NGAP_PPID);
         notification.notification = true;
+        notification.truncated = true;
         let error = peer.validate_inbound_message(&notification).unwrap_err();
         assert_eq!(error.as_str(), "diameter_sctp_notification");
 
-        let mut truncated = diameter_inbound(PayloadProtocolIdentifier::new(0));
+        let mut truncated = diameter_inbound(NGAP_PPID);
         truncated.truncated = true;
         let error = peer.validate_inbound_message(&truncated).unwrap_err();
         assert_eq!(error.as_str(), "diameter_sctp_truncated_payload");
@@ -2639,6 +3533,56 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires Linux kernel SCTP support"]
+    async fn concurrent_association_receives_preserve_multi_chunk_messages() {
+        let server_addr: SocketAddr = "127.0.0.1:38421".parse().unwrap();
+        let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
+        let client = SctpAssociation::connect(SctpConnectConfig::new(server_addr))
+            .await
+            .unwrap();
+        let accepted = server.accept().await.unwrap();
+        let first_payload = Bytes::from(vec![0xA1_u8; 100_000]);
+        let second_payload = Bytes::from(vec![0xB2_u8; 100_000]);
+
+        let send_both = async {
+            client
+                .send(OutboundMessage::ordered(
+                    first_payload.clone(),
+                    1,
+                    DIAMETER_SCTP_PPID,
+                ))
+                .await
+                .unwrap();
+            client
+                .send(OutboundMessage::ordered(
+                    second_payload.clone(),
+                    2,
+                    DIAMETER_SCTP_PPID,
+                ))
+                .await
+                .unwrap();
+        };
+        let receive_both = async { tokio::join!(recv_data(&accepted), recv_data(&accepted)) };
+        let (_, (first_received, second_received)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(send_both, receive_both)
+            })
+            .await
+            .expect("concurrent multi-chunk receive timed out");
+
+        let mut received = [first_received, second_received];
+        received.sort_by_key(|message| message.payload.first().copied());
+        assert_eq!(received[0].payload, first_payload);
+        assert_eq!(received[0].stream_id, 1);
+        assert_eq!(received[1].payload, second_payload);
+        assert_eq!(received[1].stream_id, 2);
+        assert!(received.iter().all(|message| {
+            !message.truncated && !message.control_truncated && message.ppid == DIAMETER_SCTP_PPID
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
     async fn loopback_oversized_message_still_fails_closed() {
         let server_addr: SocketAddr = "127.0.0.1:38415".parse().unwrap();
         let mut config = SctpEndpointConfig::one_to_one(server_addr);
@@ -2684,6 +3628,24 @@ mod tests {
             .await
             .unwrap();
         let accepted = server.accept().await.unwrap();
+
+        assert_eq!(
+            client.peer_path_health(),
+            vec![SctpPathHealth {
+                peer_addr: server_addr,
+                status: SctpPathStatus::Reachable,
+                primary: true,
+            }]
+        );
+        let mut accepted_health_addrs: Vec<_> = accepted
+            .peer_path_health()
+            .into_iter()
+            .map(|path| path.peer_addr)
+            .collect();
+        accepted_health_addrs.sort_unstable();
+        let mut accepted_kernel_addrs = accepted.peer_addresses().unwrap();
+        accepted_kernel_addrs.sort_unstable();
+        assert_eq!(accepted_health_addrs, accepted_kernel_addrs);
 
         client
             .send(OutboundMessage::ordered(
@@ -2732,6 +3694,24 @@ mod tests {
             .await
             .expect("multihomed accept timed out")
             .unwrap();
+
+        let client_paths = client.peer_path_health();
+        assert_eq!(client_paths.len(), 2);
+        assert_eq!(client_paths[0].peer_addr, server_addresses[0]);
+        assert_eq!(client_paths[1].peer_addr, server_addresses[1]);
+        let primary_paths: Vec<_> = client_paths.iter().filter(|path| path.primary).collect();
+        assert_eq!(primary_paths.len(), 1);
+        assert_eq!(primary_paths[0].status, SctpPathStatus::Reachable);
+        assert!(server_addresses.contains(&primary_paths[0].peer_addr));
+        let mut accepted_health_addrs: Vec<_> = accepted
+            .peer_path_health()
+            .into_iter()
+            .map(|path| path.peer_addr)
+            .collect();
+        accepted_health_addrs.sort_unstable();
+        let mut accepted_kernel_addrs = accepted.peer_addresses().unwrap();
+        accepted_kernel_addrs.sort_unstable();
+        assert_eq!(accepted_health_addrs, accepted_kernel_addrs);
 
         let mut client_local = client.local_addresses().unwrap();
         client_local.sort_unstable();
@@ -2822,6 +3802,7 @@ mod tests {
         .unwrap();
         assert_eq!(received, inbound);
         assert_eq!(client.peer().remote_addr, server_addresses[0]);
+        assert_eq!(client.peer_path_health().len(), 2);
         assert_eq!(client.peer().security, DiameterSctpSecurity::ClearText);
         assert_eq!(
             client.peer().inbound_ppid_policy,
@@ -2996,6 +3977,25 @@ mod tests {
         .expect("recv_diameter_payload timed out")
         .unwrap();
         assert_eq!(received, payload);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn loopback_diameter_recv_surfaces_transport_notification() {
+        let server_addr: SocketAddr = "127.0.0.1:38420".parse().unwrap();
+        let (_server, client, _accepted) = diameter_loopback(server_addr).await;
+
+        let inbound = tokio::time::timeout(std::time::Duration::from_secs(5), client.recv())
+            .await
+            .expect("Diameter SCTP notification timed out")
+            .unwrap();
+        assert!(matches!(
+            inbound,
+            DiameterSctpInbound::Notification(Some(
+                SctpEvent::AssociationChange { .. } | SctpEvent::PeerAddrChange { .. }
+            ))
+        ));
     }
 
     #[cfg(target_os = "linux")]

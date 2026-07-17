@@ -20,8 +20,10 @@ const SCTP_GETADDRS_HEADER_BYTES: usize = mem::size_of::<i32>() + mem::size_of::
 
 pub const SCTP_UNORDERED_FLAG: u16 = libc::SCTP_UNORDERED as u16;
 pub const SCTP_NOTIFICATION_FLAG: i32 = libc::SCTP_NOTIFICATION;
-pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = 1;
-pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = 5;
+const SCTP_NOTIFICATION_TYPE_BASE: u16 = 1 << 15;
+pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 1;
+pub const SCTP_PEER_ADDR_CHANGE_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 2;
+pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 5;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -141,6 +143,23 @@ pub fn local_addresses(fd: BorrowedFd<'_>, assoc_id: i32) -> io::Result<Vec<Sock
 
 pub fn peer_addresses(fd: BorrowedFd<'_>, assoc_id: i32) -> io::Result<Vec<SocketAddr>> {
     get_addresses(fd, assoc_id, SCTP_GET_PEER_ADDRS)
+}
+
+pub fn peer_primary_address(fd: BorrowedFd<'_>) -> io::Result<SocketAddr> {
+    // SAFETY: A zeroed sockaddr_storage is a valid receive buffer for
+    // `getpeername`.
+    let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `storage` and `len` are valid writable buffers and `fd` remains
+    // borrowed by the caller for the duration of the call.
+    cvt(unsafe {
+        libc::getpeername(
+            fd.as_raw_fd(),
+            (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr>(),
+            &mut len,
+        )
+    })?;
+    raw_to_socket_addr(&storage, len)
 }
 
 pub fn is_multihoming_unavailable(error: &io::Error) -> bool {
