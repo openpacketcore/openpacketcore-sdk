@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -1213,6 +1213,30 @@ impl SessionConsensusRpcHandler for EchoHandler {
     }
 }
 
+#[derive(Debug, Default)]
+struct DynamicDelayEchoHandler {
+    delay_millis: AtomicU64,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for DynamicDelayEchoHandler {
+    async fn handle(
+        &self,
+        _authenticated_sender: opc_session_store::SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(
+            self.delay_millis.load(Ordering::SeqCst),
+        ))
+        .await;
+        SessionConsensusWireResponse {
+            result: Ok(request.payload),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct UnavailableHandler;
 
@@ -1960,6 +1984,180 @@ async fn profiled_cold_connection_is_a_contained_fifteen_hundred_millisecond_bou
 }
 
 #[tokio::test]
+async fn cancelled_callers_share_one_detached_cold_connection_without_dispatching() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-detached-cold-singleflight", 21, 1);
+    let handler = Arc::new(CountingEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("detached cold-connection listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let release_resolution = Arc::new(tokio::sync::Semaphore::new(0));
+    let blocked_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        let release_resolution = Arc::clone(&release_resolution);
+        Arc::new(move || {
+            let resolutions = Arc::clone(&resolutions);
+            let release_resolution = Arc::clone(&release_resolution);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                release_resolution
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| std::io::Error::other("resolver release closed"))?
+                    .forget();
+                Ok(addr)
+            })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        blocked_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(2)),
+    );
+
+    let first = peer.call_with_timeout(
+        request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"cancelled-primary".to_vec(),
+        ),
+        Duration::from_millis(60),
+    );
+    let second = peer.call_with_timeout(
+        request_for_family(
+            &manifest,
+            1,
+            SessionConsensusRpcFamily::AppendEntries,
+            b"cancelled-overflow".to_vec(),
+        ),
+        Duration::from_millis(90),
+    );
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(first, Err(SessionConsensusPeerError::Timeout));
+    assert_eq!(second, Err(SessionConsensusPeerError::Timeout));
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+
+    release_resolution.add_permits(1);
+    let payload = b"claimed-detached-connection".to_vec();
+    assert_eq!(
+        peer.call_with_timeout(
+            request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::AppendEntries,
+                payload.clone(),
+            ),
+            Duration::from_secs(1),
+        )
+        .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(payload),
+        })
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn material_rotation_supersedes_a_detached_cold_attempt_before_dispatch() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-detached-cold-rotation", 22, 1);
+    let handler = Arc::new(CountingEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("detached rotation listener");
+    let (client_tx, client_rx) = tokio::sync::watch::channel(Some(pki.identity_state(1)));
+    let client_config = TlsConfigBuilder::new(client_rx)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("rotating detached client config");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let epoch_sensitive_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if attempt == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(addr)
+            })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        epoch_sensitive_resolver,
+        client_config.clone(),
+        Some(Duration::from_secs(2)),
+    );
+
+    assert_eq!(
+        peer.call_with_timeout(
+            request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::AppendEntries,
+                b"old-material-must-not-dispatch".to_vec(),
+            ),
+            Duration::from_millis(200),
+        )
+        .await,
+        Err(SessionConsensusPeerError::Timeout)
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+
+    let previous_epoch = client_config.material_status().epoch();
+    client_tx.send_replace(Some(pki.identity_state(1)));
+    wait_for_material_epoch_change(|| client_config.material_status(), previous_epoch).await;
+
+    let payload = b"new-material-dispatch".to_vec();
+    assert_eq!(
+        peer.call_with_timeout(
+            request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::AppendEntries,
+                payload.clone(),
+            ),
+            Duration::from_secs(1),
+        )
+        .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(payload),
+        })
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn append_soft_ttl_reserves_post_handshake_rpc_time_and_reuses_the_socket() {
     let pki = TestPki::new();
     let manifest = manifest("consensus-append-soft-reserve", 18, 1);
@@ -2121,6 +2319,82 @@ async fn profiled_long_rpc_families_are_not_truncated_by_the_append_deadline() {
         2,
         "the timed-out AppendEntries socket is replaced once and longer families reuse it"
     );
+
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn append_timeout_boundary_drops_one_lane_per_slow_attempt() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-append-timeout-boundary", 9, 1);
+    let handler = Arc::new(DynamicDelayEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("append timeout-boundary listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+    );
+    let call = |payload: &'static [u8], timeout: Duration| {
+        peer.call_with_timeout(
+            request_for_family(
+                &manifest,
+                1,
+                SessionConsensusRpcFamily::AppendEntries,
+                payload.to_vec(),
+            ),
+            timeout,
+        )
+    };
+
+    assert!(call(b"warm", Duration::from_secs(2)).await.is_ok());
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+
+    handler.delay_millis.store(100, Ordering::SeqCst);
+    assert!(call(b"below-250", Duration::from_millis(250)).await.is_ok());
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "a response below 250 ms must preserve the cached lane"
+    );
+
+    handler.delay_millis.store(300, Ordering::SeqCst);
+    let started = Instant::now();
+    for payload in [b"slow-1".as_slice(), b"slow-2", b"slow-3", b"slow-4"] {
+        assert_eq!(
+            call(payload, Duration::from_millis(250)).await,
+            Err(SessionConsensusPeerError::Timeout)
+        );
+    }
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_secs(1));
+
+    handler.delay_millis.store(0, Ordering::SeqCst);
+    assert!(call(b"recover", Duration::from_millis(250)).await.is_ok());
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        5,
+        "each timed-out call must consume one authenticated lane and force one replacement"
+    );
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 7);
 
     server.abort_and_wait().await;
 }
