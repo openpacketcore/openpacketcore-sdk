@@ -302,15 +302,34 @@ impl ReconnectGate {
         generation: u64,
         material: Option<opc_tls::TlsMaterialEpoch>,
     ) -> Option<ReconnectAttempt> {
+        match self
+            .acquire_classified(deadline, generation, material)
+            .await
+        {
+            ReconnectAdmission::Admitted(attempt) => Some(attempt),
+            ReconnectAdmission::Cooldown
+            | ReconnectAdmission::Superseded
+            | ReconnectAdmission::Deadline => None,
+        }
+    }
+
+    pub(crate) async fn acquire_classified(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        generation: u64,
+        material: Option<opc_tls::TlsMaterialEpoch>,
+    ) -> ReconnectAdmission {
         let epoch = ReconnectEpoch {
             generation,
             material,
         };
         self.observe_epoch(generation, material);
-        let permit = tokio::time::timeout_at(deadline, Arc::clone(&self.serial).acquire_owned())
-            .await
-            .ok()?
-            .ok()?;
+        let permit =
+            match tokio::time::timeout_at(deadline, Arc::clone(&self.serial).acquire_owned()).await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => return ReconnectAdmission::Deadline,
+            };
 
         loop {
             // Register before inspecting state so an epoch publication cannot
@@ -324,7 +343,7 @@ impl ReconnectGate {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.epoch != Some(epoch) {
-                    return None;
+                    return ReconnectAdmission::Superseded;
                 }
                 state.next_attempt_at
             };
@@ -333,19 +352,19 @@ impl ReconnectGate {
                 break;
             };
             if wait_until >= deadline {
-                return None;
+                return ReconnectAdmission::Cooldown;
             }
             tokio::select! {
                 biased;
                 _ = &mut changed => continue,
                 _ = tokio::time::sleep_until(wait_until) => break,
-                _ = tokio::time::sleep_until(deadline) => return None,
+                _ = tokio::time::sleep_until(deadline) => return ReconnectAdmission::Deadline,
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            return ReconnectAdmission::Deadline;
         }
-        Some(ReconnectAttempt {
+        ReconnectAdmission::Admitted(ReconnectAttempt {
             gate: Arc::clone(self),
             epoch,
             _permit: permit,
@@ -372,6 +391,13 @@ impl ReconnectGate {
         state.next_attempt_at = Some(now.checked_add(state.backoff).unwrap_or(now));
         state.backoff = self.policy.next_backoff(state.backoff);
     }
+}
+
+pub(crate) enum ReconnectAdmission {
+    Admitted(ReconnectAttempt),
+    Cooldown,
+    Superseded,
+    Deadline,
 }
 
 #[must_use = "a reconnect attempt must be completed as succeeded or failed"]

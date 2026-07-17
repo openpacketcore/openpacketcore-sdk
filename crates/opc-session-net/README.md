@@ -41,6 +41,7 @@ Each directed consensus peer retains a fixed primary/overflow pool of at most
 two authenticated connections and allows at most one in-flight RPC on each.
 Sequential calls prefer the primary lane; a concurrent call may use overflow,
 and further calls wait for either lane under their existing absolute deadline.
+The two lanes also share at most one bounded cold-establishment singleflight.
 Establishment performs a fresh
 mutual-TLS handshake and binds the certificate SPIFFE identity, logical replica
 ID, stable node ID, expected server, cluster/configuration/epoch, exact
@@ -52,9 +53,12 @@ position but grants no success or authority. Cancellation, timeout, EOF,
 framing, `Protocol`, `Authentication`, `ScopeMismatch`, `Rejected`, evidence
 mismatch, lifecycle retirement, or any uncertain stream position drops it, so
 a late or partial response cannot be consumed by another Openraft RPC. The
-client applies one absolute logical deadline to lane acquisition and, when a
-connection is required, DNS, TCP, TLS, bootstrap, bounded encoding, write, and
-response read.
+client applies one absolute logical deadline to lane acquisition, waiting for a
+usable connection, bounded encoding, request write, and response read. Cold
+DNS/TCP/TLS/identity/bootstrap work admitted while that caller is waiting may
+continue independently to the fixed cold cap, but it creates no call ID and
+writes no Openraft request frame. Request bytes and response ownership remain
+strictly bound to the caller that claims the authenticated connection.
 
 For Openraft dispatch, the session-store adapter passes Openraft's soft TTL to
 the remote peer as that logical deadline and does not wrap the transport in a
@@ -71,13 +75,15 @@ path. A first call, dead cached socket, or replacement still performs DNS, TCP,
 mutual TLS, identity admission, and bootstrap. One absolute family deadline
 starts before lane acquisition. Direct calls use the fixed family ceiling;
 Openraft calls use its smaller supplied soft TTL, never more than that family
-ceiling. A fresh connection receives the lesser of the remaining budget and a
-1,500 ms cold-phase cap, and the cold phase may consume at most two thirds of
-that remaining budget. The reserved final third carries the first negotiated
-RPC, so an AppendEntries soft TTL cannot be exhausted by a successful
-handshake before the connection sends useful work. Cold time remains contained
-and never additive. A cached lane resets shared reconnect backoff only after a
-complete validated reusable response proves the connection usable.
+ceiling. One caller waits for cold work for at most two thirds of its remaining
+budget and never beyond the 1,500 ms cold cap. The singleflight itself has one
+fixed 1,500 ms lifetime from its original admission, so a later retry may join
+or claim completed authenticated work instead of restarting it. This does not
+extend either caller's logical deadline. The reserved final third carries the
+first negotiated RPC, so an AppendEntries soft TTL cannot be exhausted by a
+successful handshake before the connection sends useful work. A cached lane
+resets shared reconnect backoff only after a complete validated reusable
+response proves the connection usable.
 At the 31-member ceiling, one node has at most 30 remote peers: 60 steady-state
 outbound lanes. During one bounded retirement step, at most one retiring
 generation per lane may overlap its replacement, for up to 120 server-side
@@ -535,24 +541,32 @@ together.
 Cold-connection admission is shared per remote peer across logical calls. The
 two consensus lanes use one gate, and the legacy direct request and watch paths
 use another common gate for that backend. Only one resolver/TCP/TLS/bootstrap
-attempt may run at a time; a failed or cancelled attempt advances exponential
-backoff that later RPCs cannot reset. A connection whose authenticated evidence
-matches the current local generation/material epoch and is still dispatch-usable
-resets the gate. Publishing a newer material epoch or requesting explicit
-reauthentication supersedes old cooldowns and cancels an old-epoch handshake;
-the replacement still repeats every TLS, SPIFFE, ALPN, manifest-scope, and
-contract-profile check. Cached authenticated consensus lanes honor stable
+attempt may run at a time; a failed attempt advances exponential backoff that
+later RPCs cannot reset. Consensus caller cancellation leaves pre-request cold
+work supervised until its fixed cap, so a retry joins the same attempt and does
+not create a reconnect stampede. A completed singleflight stages at most one
+authenticated connection, bound to the immutable consensus/configuration
+identity, remote node, admitted TLS material epoch, and explicit
+reauthentication generation. It is monitored for evidence changes, lifecycle
+retirement, and pool shutdown. If a change races with a claim, the claimant
+revalidates and records retirement before dispatch. A connection whose
+authenticated evidence matches the current local generation/material epoch and
+is still dispatch-usable resets the gate. If reconnect cooldown extends beyond
+the admitted cold deadline, that caller returns `Timeout` without dialing or
+spinning; a later RPC may retry. Publishing a newer material epoch or requesting
+explicit reauthentication supersedes old cooldowns and cancels an old-epoch
+handshake; the replacement still repeats every TLS, SPIFFE, ALPN, manifest-scope,
+and contract-profile check. Cached authenticated consensus lanes honor stable
 jitter for material rotation; explicit reauthentication retires them
 immediately. A fresh handshake captured from an older epoch is rejected before
-any Openraft request bytes are written. Connection-attempt metrics use the
-fixed `superseded` terminal only when the transport observes a newer material
-or explicit-reauthentication epoch. If an attempt guard is dropped before any
-explicit terminal classification, caller abort or runtime teardown is recorded
-as `abandoned`. Both preserve started-attempt conservation once handlers are
-quiescent without misclassifying local lifecycle control as `timeout`; that
-outcome remains reserved for an actual resolver, TCP, TLS, bootstrap, or frame
-deadline. The separate relaxed counters are not an atomic concurrent-scrape
-snapshot, so enforce the conservation equation only after lifecycle settlement.
+any Openraft request bytes are written. Connection-attempt
+metrics use the fixed `superseded` terminal only when the transport observes a
+newer material or explicit-reauthentication epoch. A canceled consensus caller
+does not terminate or abandon its supervised pre-request attempt. Unexpected
+task destruction or pool/runtime teardown still records `abandoned`; an actual
+resolver, TCP, TLS, bootstrap, or frame deadline records `timeout`. The
+separate relaxed counters are not an atomic concurrent-scrape snapshot, so
+enforce the conservation equation only after lifecycle settlement.
 
 The bounded same-issuer credential-compromise/revocation mechanism is
 short-lived SVID expiry, not material rotation or connection reauthentication.

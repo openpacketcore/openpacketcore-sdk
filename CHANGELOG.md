@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Consensus cold-establishment liveness — `opc-session-net`:** one bounded
+  per-peer singleflight now carries DNS/TCP/mTLS/identity/bootstrap work across
+  a short Openraft caller deadline without carrying request bytes across that
+  cancellation boundary. Later callers can claim the staged authenticated
+  connection; configuration identity, TLS material, explicit reauthentication,
+  lifecycle expiry, and pool shutdown invalidate it before dispatch.
+
 ### Added
 - **Leader-aware management commits — gNMI/NETCONF/config bus:** an opt-in
   `ConfigAuthorityPort` projection fence redirects followers with bounded
