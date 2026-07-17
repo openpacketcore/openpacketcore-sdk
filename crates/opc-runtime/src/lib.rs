@@ -69,9 +69,11 @@ pub use task::{
 };
 pub use testkit::{fake_clock, Clock, FakeClock, RealClock, Timestamp};
 pub use udp::{
-    bind_udp_socket_with_destination_metadata, recv_udp_datagram_with_destination,
+    bind_udp_socket_with_destination_metadata,
+    bind_udp_socket_with_destination_metadata_and_options, recv_udp_datagram_with_destination,
     UdpDestinationMetadataSocket, UdpDestinationMetadataSupport, UdpLocalDestination,
     UdpLocalDestinationStatus, UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
+    UdpSocketOptions,
 };
 
 pub use builder::{Builder, StartupPhases, TryInitFn};

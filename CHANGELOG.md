@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle expiry, and pool shutdown invalidate it before dispatch.
 
 ### Added
+- **Device-scoped destination-metadata UDP sockets — `opc-runtime`:** an
+  explicit, default-off typed option can apply Linux/Android
+  `SO_BINDTODEVICE` before address bind, allowing listeners such as IKE and
+  NAT-T endpoints to remain inside a VRF or other L3 domain. Device names are
+  validated, unsupported platforms fail closed, and exact-source reply probes
+  inherit the listener's device scope. The existing constructor retains its
+  device-unscoped behavior.
 - **SCTP multihoming path control — `opc-sctp` / `opc-libsctp-sys`:** the
   existing RTO and heartbeat configuration now applies validated non-default
   values through exact, layout-asserted Linux `SCTP_RTOINFO` and

@@ -13,12 +13,45 @@ use tokio::net::UdpSocket;
 
 const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
 
+/// Longest accepted [`UdpSocketOptions::bind_device`] name in bytes: Linux
+/// `IFNAMSIZ` (16) minus the trailing NUL byte.
+const MAX_BIND_DEVICE_BYTES: usize = 15;
+
+/// Typed options for binding a destination-metadata UDP socket.
+///
+/// The struct is `#[non_exhaustive]` so future socket options can be added
+/// without breaking consumers: build it with [`UdpSocketOptions::default`] and
+/// set only the options you need.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UdpSocketOptions {
+    /// Linux or Android network device name the socket is scoped to with
+    /// `SO_BINDTODEVICE` before `bind(2)`, for example a VRF device carrying
+    /// IKE/NAT-T traffic. Must be non-empty, at most 15 bytes
+    /// (`IFNAMSIZ - 1`), and free of NUL bytes. On other platforms a
+    /// configured device makes binding fail closed with
+    /// [`io::ErrorKind::Unsupported`].
+    pub bind_device: Option<String>,
+}
+
+impl UdpSocketOptions {
+    /// Return these options with `bind_device` set to `device`.
+    #[must_use]
+    pub fn with_bind_device(mut self, device: impl Into<String>) -> Self {
+        self.bind_device = Some(device.into());
+        self
+    }
+}
+
 /// Bind a UDP socket that can report local destination metadata on receive.
 ///
 /// On Linux this enables packet-info ancillary metadata before converting the
 /// socket into Tokio's nonblocking socket type. Other platforms fall back to
 /// concrete `local_addr()` reporting when the socket was bound to a specific
 /// address.
+///
+/// Equivalent to [`bind_udp_socket_with_destination_metadata_and_options`]
+/// with default [`UdpSocketOptions`].
 ///
 /// # Errors
 ///
@@ -27,11 +60,68 @@ const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
 pub fn bind_udp_socket_with_destination_metadata(
     bind_addr: SocketAddr,
 ) -> io::Result<UdpDestinationMetadataSocket> {
-    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    bind_udp_socket_with_destination_metadata_and_options(bind_addr, &UdpSocketOptions::default())
+}
+
+/// Bind a UDP socket with destination metadata and typed socket options.
+///
+/// With [`UdpSocketOptions::bind_device`] set, the socket is created first and
+/// `SO_BINDTODEVICE` is applied before `bind(2)`, scoping the socket to that
+/// network device (for example a VRF) for the whole bind/receive/send
+/// lifecycle. This requires `CAP_NET_RAW` on Linux. On platforms without
+/// `SO_BINDTODEVICE` a configured device fails closed with
+/// [`io::ErrorKind::Unsupported`]; it is never silently ignored. With
+/// `bind_device` unset this behaves exactly like
+/// [`bind_udp_socket_with_destination_metadata`].
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] for an empty, over-long
+/// (more than 15 bytes), or NUL-containing device name,
+/// [`io::ErrorKind::Unsupported`] for a device on a platform without
+/// `SO_BINDTODEVICE`, and any operating-system error from socket creation,
+/// device binding, address binding, configuration, or conversion.
+pub fn bind_udp_socket_with_destination_metadata_and_options(
+    bind_addr: SocketAddr,
+    options: &UdpSocketOptions,
+) -> io::Result<UdpDestinationMetadataSocket> {
+    if let Some(device) = options.bind_device.as_deref() {
+        validate_bind_device(device)?;
+    }
+    let socket = match options.bind_device.as_deref() {
+        Some(device) => platform::bind_udp_socket_to_device(bind_addr, device)?,
+        None => std::net::UdpSocket::bind(bind_addr)?,
+    };
     socket.set_nonblocking(true)?;
     let support = platform::enable_destination_metadata(&socket)?;
     let socket = UdpSocket::from_std(socket)?;
-    Ok(UdpDestinationMetadataSocket { socket, support })
+    Ok(UdpDestinationMetadataSocket {
+        socket,
+        support,
+        bind_device: options.bind_device.clone(),
+    })
+}
+
+fn validate_bind_device(device: &str) -> io::Result<()> {
+    if device.is_empty() {
+        return Err(udp_error(
+            io::ErrorKind::InvalidInput,
+            "udp_bind_device_empty",
+        ));
+    }
+    if device.len() > MAX_BIND_DEVICE_BYTES {
+        return Err(udp_error(
+            io::ErrorKind::InvalidInput,
+            "udp_bind_device_too_long",
+        ));
+    }
+    if device.as_bytes().contains(&0) {
+        return Err(udp_error(
+            io::ErrorKind::InvalidInput,
+            "udp_bind_device_nul",
+        ));
+    }
+    Ok(())
 }
 
 /// Receive one UDP datagram and return source and local destination metadata.
@@ -56,6 +146,7 @@ pub async fn recv_udp_datagram_with_destination(
 pub struct UdpDestinationMetadataSocket {
     socket: UdpSocket,
     support: UdpDestinationMetadataSupport,
+    bind_device: Option<String>,
 }
 
 impl UdpDestinationMetadataSocket {
@@ -72,6 +163,13 @@ impl UdpDestinationMetadataSocket {
     #[must_use]
     pub const fn destination_metadata_support(&self) -> UdpDestinationMetadataSupport {
         self.support
+    }
+
+    /// Return the `SO_BINDTODEVICE` device name this socket is scoped to, when
+    /// one was configured at bind time.
+    #[must_use]
+    pub fn bind_device(&self) -> Option<&str> {
+        self.bind_device.as_deref()
     }
 
     /// Return the wrapped Tokio UDP socket.
@@ -121,7 +219,14 @@ impl UdpDestinationMetadataSocket {
     ) -> io::Result<usize> {
         let socket_local = self.socket.local_addr()?;
         validate_send_to_from(buffer.len(), socket_local, peer, local_source)?;
-        platform::send_udp_datagram_from(&self.socket, buffer, peer, local_source).await
+        platform::send_udp_datagram_from(
+            &self.socket,
+            buffer,
+            peer,
+            local_source,
+            self.bind_device.as_deref(),
+        )
+        .await
     }
 }
 
@@ -400,15 +505,17 @@ fn validate_complete_datagram(sent: usize, payload_len: usize) -> io::Result<usi
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod platform {
     use std::{
+        ffi::OsString,
         io,
         net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
         os::fd::AsRawFd,
     };
 
     use nix::sys::socket::{
-        recvmsg, sendmsg, setsockopt,
-        sockopt::{Ipv4PacketInfo, Ipv6RecvPacketInfo},
-        ControlMessage, ControlMessageOwned, MsgFlags, SockaddrIn, SockaddrIn6, SockaddrStorage,
+        bind, recvmsg, sendmsg, setsockopt, socket,
+        sockopt::{BindToDevice, Ipv4PacketInfo, Ipv6RecvPacketInfo},
+        AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
+        SockaddrIn, SockaddrIn6, SockaddrStorage,
     };
     use tokio::{io::Interest, net::UdpSocket};
 
@@ -417,6 +524,27 @@ mod platform {
         UdpDestinationMetadataSupport, UdpLocalDestination, UdpLocalDestinationUnavailableReason,
         UdpReceivedDatagram,
     };
+
+    /// Create a UDP socket scoped to `device` with `SO_BINDTODEVICE` applied
+    /// before `bind(2)`, matching the option's pre-bind requirement.
+    pub(super) fn bind_udp_socket_to_device(
+        bind_addr: SocketAddr,
+        device: &str,
+    ) -> io::Result<std::net::UdpSocket> {
+        let family = match bind_addr {
+            SocketAddr::V4(_) => AddressFamily::Inet,
+            SocketAddr::V6(_) => AddressFamily::Inet6,
+        };
+        let fd = socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)
+            .map_err(io::Error::from)?;
+        setsockopt(&fd, BindToDevice, &OsString::from(device)).map_err(io::Error::from)?;
+        match bind_addr {
+            SocketAddr::V4(addr) => bind(fd.as_raw_fd(), &SockaddrIn::from(addr)),
+            SocketAddr::V6(addr) => bind(fd.as_raw_fd(), &SockaddrIn6::from(addr)),
+        }
+        .map_err(io::Error::from)?;
+        Ok(std::net::UdpSocket::from(fd))
+    }
 
     pub(super) fn enable_destination_metadata(
         socket: &std::net::UdpSocket,
@@ -447,11 +575,19 @@ mod platform {
         buffer: &[u8],
         peer: SocketAddr,
         local_source: SocketAddr,
+        bind_device: Option<&str>,
     ) -> io::Result<usize> {
         let interface_index = local_source_interface(local_source);
         let sent = socket
             .async_io(Interest::WRITABLE, || {
-                send_packet_info(socket, buffer, peer, local_source, interface_index)
+                send_packet_info(
+                    socket,
+                    buffer,
+                    peer,
+                    local_source,
+                    interface_index,
+                    bind_device,
+                )
             })
             .await?;
         validate_complete_datagram(sent, buffer.len())
@@ -463,6 +599,7 @@ mod platform {
         peer: SocketAddr,
         local_source: SocketAddr,
         interface_index: u32,
+        bind_device: Option<&str>,
     ) -> io::Result<usize> {
         let iov = [io::IoSlice::new(buffer)];
         match (peer, local_source) {
@@ -486,7 +623,7 @@ mod platform {
                     MsgFlags::empty(),
                     Some(&peer),
                 )
-                .map_err(|error| map_send_error(error, local_source))
+                .map_err(|error| map_send_error(error, local_source, bind_device))
             }
             (SocketAddr::V6(peer), SocketAddr::V6(source)) => {
                 let packet_info = nix::libc::in6_pktinfo {
@@ -504,7 +641,7 @@ mod platform {
                     MsgFlags::empty(),
                     Some(&peer),
                 )
-                .map_err(|error| map_send_error(error, local_source))
+                .map_err(|error| map_send_error(error, local_source, bind_device))
             }
             _ => Err(udp_error(
                 io::ErrorKind::InvalidInput,
@@ -521,13 +658,17 @@ mod platform {
         }
     }
 
-    fn map_send_error(error: nix::errno::Errno, local_source: SocketAddr) -> io::Error {
+    fn map_send_error(
+        error: nix::errno::Errno,
+        local_source: SocketAddr,
+        bind_device: Option<&str>,
+    ) -> io::Error {
         match error {
             nix::errno::Errno::EADDRNOTAVAIL | nix::errno::Errno::ENODEV => {
                 udp_error(io::ErrorKind::AddrNotAvailable, "udp_source_not_local")
             }
             nix::errno::Errno::EINVAL | nix::errno::Errno::ENETUNREACH
-                if source_bind_probe(local_source) == Some(false) =>
+                if source_bind_probe(local_source, bind_device) == Some(false) =>
             {
                 udp_error(io::ErrorKind::AddrNotAvailable, "udp_source_not_local")
             }
@@ -544,14 +685,23 @@ mod platform {
         }
     }
 
-    fn source_bind_probe(mut local_source: SocketAddr) -> Option<bool> {
+    fn source_bind_probe(mut local_source: SocketAddr, bind_device: Option<&str>) -> Option<bool> {
         // Linux may report a non-local packet-info source as EINVAL or
         // ENETUNREACH, which are also valid peer/path errors. Probe only after
         // one of those failures so the success path remains one sendmsg and a
-        // reachable peer is not misreported as a source-selection failure.
+        // reachable peer is not misreported as a source-selection failure. The
+        // probe inherits this socket's `SO_BINDTODEVICE` scope because a
+        // VRF-local source is only bindable inside its VRF; probing the
+        // default routing instance would misreport it as not local. A probe
+        // that cannot re-apply the device (for example after privileges were
+        // dropped post-bind) stays inconclusive.
         local_source.set_port(0);
-        match std::net::UdpSocket::bind(local_source) {
-            Ok(_) => Some(true),
+        let probe = match bind_device {
+            Some(device) => bind_udp_socket_to_device(local_source, device).map(drop),
+            None => std::net::UdpSocket::bind(local_source).map(drop),
+        };
+        match probe {
+            Ok(()) => Some(true),
             Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => Some(false),
             Err(_) => None,
         }
@@ -638,7 +788,7 @@ mod platform {
 
         use nix::errno::Errno;
 
-        use super::map_send_error;
+        use super::{map_send_error, source_bind_probe};
 
         fn local_source() -> SocketAddr {
             "127.0.0.1:500".parse().expect("fixed local source")
@@ -646,7 +796,7 @@ mod platform {
 
         #[test]
         fn send_error_mapping_preserves_retry_and_normalizes_static_failures() {
-            let would_block = map_send_error(Errno::EAGAIN, local_source());
+            let would_block = map_send_error(Errno::EAGAIN, local_source(), None);
             assert_eq!(would_block.kind(), io::ErrorKind::WouldBlock);
 
             for errno in [
@@ -654,18 +804,36 @@ mod platform {
                 Errno::EPROTONOSUPPORT,
                 Errno::EOPNOTSUPP,
             ] {
-                let unsupported = map_send_error(errno, local_source());
+                let unsupported = map_send_error(errno, local_source(), None);
                 assert_eq!(unsupported.kind(), io::ErrorKind::Unsupported);
                 assert_eq!(unsupported.to_string(), "udp_source_selection_unsupported");
             }
 
-            let unavailable = map_send_error(Errno::EADDRNOTAVAIL, local_source());
+            let unavailable = map_send_error(Errno::EADDRNOTAVAIL, local_source(), None);
             assert_eq!(unavailable.kind(), io::ErrorKind::AddrNotAvailable);
             assert_eq!(unavailable.to_string(), "udp_source_not_local");
 
-            let oversized = map_send_error(Errno::EMSGSIZE, local_source());
+            let oversized = map_send_error(Errno::EMSGSIZE, local_source(), None);
             assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(oversized.to_string(), "udp_payload_too_large");
+        }
+
+        #[test]
+        fn source_bind_probe_without_device_matches_local_reality() {
+            assert_eq!(source_bind_probe(local_source(), None), Some(true));
+
+            // RFC 5737 TEST-NET-1 source is never locally assigned.
+            let doc_source: SocketAddr = "192.0.2.10:500".parse().expect("doc source");
+            assert_eq!(source_bind_probe(doc_source, None), Some(false));
+        }
+
+        #[test]
+        fn source_bind_probe_with_unusable_device_is_inconclusive() {
+            // The device cannot be applied to the probe socket (missing
+            // device as root: ENODEV; without CAP_NET_RAW: EPERM). Neither
+            // is evidence about source locality, so the probe must stay
+            // inconclusive instead of misreporting `udp_source_not_local`.
+            assert_eq!(source_bind_probe(local_source(), Some("opc-nodev0")), None);
         }
     }
 }
@@ -680,6 +848,19 @@ mod platform {
         fallback_local_destination, udp_error, validate_complete_datagram,
         UdpDestinationMetadataSupport, UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
     };
+
+    pub(super) fn bind_udp_socket_to_device(
+        _bind_addr: SocketAddr,
+        _device: &str,
+    ) -> io::Result<std::net::UdpSocket> {
+        // `SO_BINDTODEVICE` does not exist here. Fail closed instead of
+        // binding in the default routing instance and silently dropping the
+        // requested device scope.
+        Err(udp_error(
+            io::ErrorKind::Unsupported,
+            "udp_bind_device_unsupported",
+        ))
+    }
 
     pub(super) fn enable_destination_metadata(
         _socket: &std::net::UdpSocket,
@@ -707,6 +888,7 @@ mod platform {
         buffer: &[u8],
         peer: SocketAddr,
         local_source: SocketAddr,
+        _bind_device: Option<&str>,
     ) -> io::Result<usize> {
         if socket.local_addr()? != local_source {
             return Err(udp_error(
@@ -732,12 +914,129 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{
+        io,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+    };
 
     use super::{
-        fallback_local_destination, validate_complete_datagram, UdpLocalDestination,
+        bind_udp_socket_with_destination_metadata,
+        bind_udp_socket_with_destination_metadata_and_options, fallback_local_destination,
+        validate_bind_device, validate_complete_datagram, UdpLocalDestination,
         UdpLocalDestinationStatus, UdpLocalDestinationUnavailableReason, UdpReceivedDatagram,
+        UdpSocketOptions,
     };
+
+    fn loopback_any_port() -> SocketAddr {
+        "127.0.0.1:0".parse().expect("loopback bind addr")
+    }
+
+    #[test]
+    fn bind_device_names_are_validated() {
+        let empty = validate_bind_device("").unwrap_err();
+        assert_eq!(empty.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(empty.to_string(), "udp_bind_device_empty");
+
+        // 16 bytes: one over the Linux IFNAMSIZ - 1 limit.
+        let too_long = validate_bind_device("eth-test-0123456").unwrap_err();
+        assert_eq!(too_long.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(too_long.to_string(), "udp_bind_device_too_long");
+
+        let interior_nul = validate_bind_device("eth\0test").unwrap_err();
+        assert_eq!(interior_nul.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(interior_nul.to_string(), "udp_bind_device_nul");
+
+        assert!(validate_bind_device("vrf-test").is_ok());
+        // 15 bytes: the longest legal device name.
+        assert!(validate_bind_device("eth-test-012345").is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_bind_device_is_rejected_before_any_bind() {
+        let options = UdpSocketOptions::default().with_bind_device("");
+
+        let error =
+            bind_udp_socket_with_destination_metadata_and_options(loopback_any_port(), &options)
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "udp_bind_device_empty");
+    }
+
+    #[tokio::test]
+    async fn default_options_bind_matches_legacy_bind() {
+        let legacy =
+            bind_udp_socket_with_destination_metadata(loopback_any_port()).expect("legacy bind");
+        let with_options = bind_udp_socket_with_destination_metadata_and_options(
+            loopback_any_port(),
+            &UdpSocketOptions::default(),
+        )
+        .expect("default-options bind");
+
+        assert_eq!(
+            legacy.destination_metadata_support(),
+            with_options.destination_metadata_support()
+        );
+        assert_eq!(legacy.bind_device(), None);
+        assert_eq!(with_options.bind_device(), None);
+        assert!(with_options
+            .local_addr()
+            .expect("bound local addr")
+            .ip()
+            .is_loopback());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn bind_device_missing_or_unprivileged_fails_closed() {
+        // `SO_BINDTODEVICE` needs CAP_NET_RAW: without it the kernel returns
+        // EPERM before it even looks the device up; with it a nonexistent
+        // device is ENODEV. Either way the bind must fail instead of silently
+        // falling back to the default routing instance.
+        let options = UdpSocketOptions::default().with_bind_device("opc-nodev0");
+
+        let error =
+            bind_udp_socket_with_destination_metadata_and_options(loopback_any_port(), &options)
+                .unwrap_err();
+
+        let raw = error.raw_os_error();
+        assert!(
+            raw == Some(nix::libc::EPERM) || raw == Some(nix::libc::ENODEV),
+            "expected EPERM or ENODEV from SO_BINDTODEVICE, got {error:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    #[ignore = "needs CAP_NET_RAW; run: sudo -E $(command -v cargo) test -p opc-runtime --lib \
+                udp::tests::bind_device_loopback_scopes_the_socket -- --ignored"]
+    async fn bind_device_loopback_scopes_the_socket() {
+        let options = UdpSocketOptions::default().with_bind_device("lo");
+
+        let socket =
+            bind_udp_socket_with_destination_metadata_and_options(loopback_any_port(), &options)
+                .expect("SO_BINDTODEVICE lo before bind");
+
+        assert_eq!(socket.bind_device(), Some("lo"));
+        assert!(socket
+            .local_addr()
+            .expect("bound local addr")
+            .ip()
+            .is_loopback());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[tokio::test]
+    async fn bind_device_fails_closed_on_unsupported_platform() {
+        let options = UdpSocketOptions::default().with_bind_device("eth-test");
+
+        let error =
+            bind_udp_socket_with_destination_metadata_and_options(loopback_any_port(), &options)
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(error.to_string(), "udp_bind_device_unsupported");
+    }
 
     #[test]
     fn datagram_send_result_must_cover_the_complete_payload() {
