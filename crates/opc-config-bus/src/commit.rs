@@ -14,8 +14,9 @@ use tokio::sync::{mpsc, mpsc::error::TrySendError, oneshot};
 use opc_alarm::{ProbableCause, Severity, SharedAlarmManager};
 use opc_config_model::{
     ApplyPlan, CommitError, CommitErrorCode, CommitMode, CommitRequest, CommitResult, CommitStatus,
-    ConfigError, ConfigImpactClassifier, ConfigOperation, OpcConfig, RequestId, RequestSource,
-    RollbackTarget, TrustedPrincipal, ValidationContext, ValidationError, YangPath,
+    CommittedConfigRevision, ConfigError, ConfigImpactClassifier, ConfigOperation, OpcConfig,
+    RequestId, RequestSource, RollbackTarget, TrustedPrincipal, ValidationContext, ValidationError,
+    YangPath,
 };
 use opc_types::{redact, ConfigVersion, Timestamp, TxId};
 
@@ -36,6 +37,7 @@ use crate::types::{
     ConfirmedCommitResolution, DriftState, PublishedSnapshot, StoreError, StoreErrorCode,
     StoredConfig, StoredRequestFingerprint, StoredRequestMode,
 };
+use crate::ConfigProjectionHead;
 
 pub(crate) const DEFAULT_COMMIT_QUEUE_CAPACITY: usize = 32;
 const UNSUPPORTED_VALIDATE_ONLY_OPERATION_MESSAGE: &str =
@@ -335,6 +337,13 @@ impl<C: OpcConfig> ConfigBus<C> {
         self.snapshot.current_snapshot()
     }
 
+    /// Returns the exact transaction/version head represented by the local
+    /// projection without exposing config bytes to an authority adapter.
+    pub fn projection_head(&self) -> ConfigProjectionHead {
+        let snapshot = self.snapshot.current_snapshot();
+        ConfigProjectionHead::new(snapshot.tx_id, snapshot.version)
+    }
+
     /// Returns a shared handle to the publication slot for data-plane
     /// readers. Reads through it never touch the commit queue, the store, or
     /// any lock held across await points, and the handle keeps working even
@@ -348,6 +357,16 @@ impl<C: OpcConfig> ConfigBus<C> {
     /// constructors always create authoritative buses).
     pub fn authority_mode(&self) -> AuthorityMode {
         self.authority_mode
+    }
+
+    /// Reports whether every new successful mutation returns the exact
+    /// persisted plaintext-envelope digest needed for committed-revision
+    /// protocol responses.
+    ///
+    /// Legacy replay records may predate digests. Their replay result keeps
+    /// `committed_revision` absent so protocol adapters can fail closed.
+    pub fn committed_revision_supported(&self) -> bool {
+        self.store.commit_receipts_include_plaintext_digest()
     }
 
     /// Reports whether the recovery fence is raised. `RecoveryRequired` means
@@ -708,6 +727,7 @@ async fn process_commit<C: OpcConfig>(
                 new_version: None,
                 status: CommitStatus::Validated,
                 changed_paths,
+                committed_revision: None,
                 apply_plan: Some(apply_plan),
             }))
         }
@@ -896,7 +916,7 @@ async fn process_commit<C: OpcConfig>(
             };
 
             let persist_start = std::time::Instant::now();
-            match AssertUnwindSafe(store.append_commit_write(write))
+            let receipt = match AssertUnwindSafe(store.append_commit_write_with_receipt(write))
                 .catch_unwind()
                 .await
             {
@@ -947,8 +967,8 @@ async fn process_commit<C: OpcConfig>(
                     }
                     return Err(CommitError::persist_failed(PERSIST_FAILED_MESSAGE));
                 }
-                Ok(Ok(())) => {}
-            }
+                Ok(Ok(receipt)) => receipt,
+            };
 
             let current_config = Arc::new(candidate);
             let change = ConfigChange {
@@ -1004,6 +1024,9 @@ async fn process_commit<C: OpcConfig>(
                     new_version: Some(new_version),
                     status,
                     changed_paths,
+                    committed_revision: receipt
+                        .plaintext_digest()
+                        .map(|digest| CommittedConfigRevision::new(new_version, digest)),
                     apply_plan,
                 },
                 pending_timer_update: match confirmed_deadline {
@@ -1141,6 +1164,9 @@ fn replay_commit_result<C: OpcConfig>(
         new_version: Some(stored.version),
         status,
         changed_paths: fingerprint.changed_paths.clone(),
+        committed_revision: stored
+            .plaintext_digest
+            .map(|digest| CommittedConfigRevision::new(stored.version, digest)),
         apply_plan: stored.apply_plan.clone(),
     })
 }

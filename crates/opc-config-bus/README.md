@@ -20,9 +20,12 @@ Main exports:
   `ConfigSnapshot`, `AtomicConfigSnapshot`, `PublishedSnapshot`,
   `ConfigChange`, `ConfigEvent`, and `ConfigReceiver`.
 - Store and recovery types:
-  `StoredConfig`, `CommitWrite`, `ConfirmedCommitResolution`, `SealedConfig`,
-  `StoredRequestFingerprint`,
+  `StoredConfig`, `CommitWrite`, `CommitWriteReceipt`,
+  `ConfirmedCommitResolution`, `SealedConfig`, `StoredRequestFingerprint`,
   `StoreError`, `StoreErrorCode`, `DriftState`, and `AuthorityMode`.
+- Writer-of-record gate types: `ConfigAuthorityPort`,
+  `ConfigAuthorityOperation`, `ConfigAuthorityOutcome`,
+  `ConfigProjectionHead`, and the bounded, redaction-safe `ConfigLeaderHint`.
 - Subscriber behavior: `SubscriberLagPolicy`.
 
 Example imports:
@@ -45,6 +48,20 @@ fenced bus. That replay is read-only: it does not publish the missing local
 snapshot or clear the fence. A full queue fails admission immediately.
 Recovery fencing returns `RecoveryRequired` for every new mutation until the
 backing store is reconciled and the bus is rebuilt from authoritative state.
+
+`ConfigAuthorityPort` is the product-neutral management admission seam for an
+HA writer of record. gNMI and NETCONF servers consult it before a write or an
+opt-in linearizable read; `Retry` and `Unavailable` are fail-closed results.
+The port does not create another election, membership, or replication
+authority. `opc-config-bus-consensus` adapts the existing
+`ConsensusConfigStore` Openraft result to this port.
+
+`EncryptingManagedDatastore` returns a `CommitWriteReceipt` containing the
+exact digest persisted with each new encrypted record. That SHA-256 value
+covers the complete plaintext envelope bytes: the format marker plus the
+serialized config, request source, idempotency key, apply plan, request
+fingerprint, and request ID. It is not a hash of the naked config and must not
+be used to compare config equality across otherwise different requests.
 
 ## Relationships
 
@@ -73,24 +90,31 @@ Production notes:
   production stores.
 - Constructors with `*_dev_only` install `AllowAllAuthorizer` and must stay out
   of production wiring.
-- Built-in constructors are authoritative; `AuthorityMode::Shadow` is reserved
-  for future integration work.
+- Built-in constructors are authoritative. A management server presented with
+  `AuthorityMode::Shadow` and no authority port rejects writes and
+  linearizable reads; it never treats the local mirror as writer of record.
 - Encrypted v2 config envelopes keep the original request source, idempotency
   key, request ID, request fingerprint, and apply plan inside AEAD ciphertext.
   Only a domain-separated lookup digest is stored in clear metadata. Legacy
-  config-only envelopes remain readable.
+  config-only envelopes remain readable. A record written before
+  plaintext-digest persistence can also be restored and replayed, but its
+  replay result has no `committed_revision`. The SDK never reconstructs a hash
+  from reserialization. An authority-enabled management endpoint fails that
+  response closed until an explicitly reconciled new write/reseal exists.
 
 ### Datastore migration
 
 The existing `ManagedDatastore::append_commit(StoredConfig)` and
 `mark_confirmed` methods remain available for source compatibility. Config-bus
-workers now call `append_commit_write(CommitWrite)` so the durable backend can
-compare the current head and resolve a pending commit-confirmed decision in the
-same atomic mutation. The default implementation fails closed. External
-datastore implementations must override `append_commit_write` before upgrading
-a live writer; do not emulate it by calling `mark_confirmed` and `append_commit`
-as two operations. Built-in encrypted, in-memory, SQLite, and Openraft-backed
-paths implement the atomic contract.
+workers now call `append_commit_write_with_receipt(CommitWrite)`. Its default
+delegates to `append_commit_write(CommitWrite)`; receipt-capable wrappers opt in
+through `commit_receipts_include_plaintext_digest`. The durable backend still
+compares the current head and resolves a pending commit-confirmed decision in
+the same atomic mutation. External datastore implementations must override
+`append_commit_write` before upgrading a live writer; do not emulate it by
+calling `mark_confirmed` and `append_commit` as two operations. Built-in
+encrypted, in-memory, SQLite, and Openraft-backed paths implement the atomic
+contract.
 
 Treat `OutcomeUnknown` as a reconciliation result, not a blind retry hint. For
 an unkeyed request, call `resolve_request_id(original_request_id)` and require a
@@ -109,8 +133,7 @@ fenced until restore.
 
 ## Roadmap
 
-- Keep storage behind the datastore trait.
-- Add production authority modes only when a durable coordination design exists.
+- Keep storage and authority admission behind their narrow ports.
 
 ## Verification
 

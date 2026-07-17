@@ -14,6 +14,7 @@ use opc_consensus::{
     durable_openraft_config, encode_bounded, ConsensusNodeId, ConsensusPeer, ConsensusPeerError,
     ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
     DurableOpenraftDomain, EnsureLinearizableOutcome, EnsureLinearizableSupervisor,
+    LinearizableReadBarrier, LinearizableReadBarrierError, LinearizableReadLease,
     DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES,
     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
@@ -117,6 +118,53 @@ pub struct ConfigConsensusStatus {
     pub audit_key_fingerprint: [u8; 32],
     /// Whether exact configured membership has been admitted and remains live.
     pub admitted: bool,
+}
+
+/// Result of a local-only writer-of-record authority check.
+///
+/// Unlike ordinary consensus-store operations, this check never forwards to a
+/// peer. Management servers use it to redirect a request before touching a
+/// local config projection or submitting a local mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigLocalAuthorityOutcome {
+    /// Openraft proved local leadership and local apply caught up through the
+    /// returned read-index barrier.
+    LocalAuthority,
+    /// Openraft reports another current leader, when known.
+    Retry {
+        /// Canonical consensus node ID for the current leader.
+        leader_hint: Option<ConsensusNodeId>,
+    },
+    /// Local authority, exact membership, apply catch-up, or requested
+    /// projection-head equality was unavailable.
+    Unavailable,
+}
+
+fn map_local_authority_error(
+    error: LinearizableReadBarrierError<ConsensusNodeId>,
+) -> ConfigLocalAuthorityOutcome {
+    match error {
+        LinearizableReadBarrierError::NotLeader { leader } => ConfigLocalAuthorityOutcome::Retry {
+            leader_hint: leader,
+        },
+        LinearizableReadBarrierError::Unavailable => ConfigLocalAuthorityOutcome::Unavailable,
+        _ => ConfigLocalAuthorityOutcome::Unavailable,
+    }
+}
+
+fn config_projection_head_matches(
+    durable: Option<&StoredConfig>,
+    projected_tx_id: Option<opc_types::TxId>,
+    projected_version: opc_types::ConfigVersion,
+) -> bool {
+    match (durable, projected_tx_id) {
+        (None, None) => projected_version == opc_types::ConfigVersion::INITIAL,
+        (Some(durable), Some(projected_tx_id)) => {
+            durable.record.tx_id == projected_tx_id && durable.record.version == projected_version
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +541,99 @@ impl ConsensusConfigStore {
             audit_key_fingerprint: self.inner.backend.audit_key().fingerprint(),
             admitted,
         }
+    }
+
+    /// Proves that this node is the current writer of record without routing
+    /// the check to another member.
+    ///
+    /// A successful result includes the shared Openraft read-index and local
+    /// apply wait used by authoritative reads. Any unknown leadership,
+    /// membership drift, timeout, or apply lag fails closed.
+    pub async fn ensure_local_authority(&self) -> ConfigLocalAuthorityOutcome {
+        let Some(deadline) = tokio::time::Instant::now().checked_add(self.inner.operation_timeout)
+        else {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        };
+        let barrier = self.local_authority_barrier();
+        match barrier.admit(deadline).await {
+            Ok(_) if self.require_admission().is_ok() && self.exact_membership_is_admitted() => {
+                ConfigLocalAuthorityOutcome::LocalAuthority
+            }
+            Ok(_) => ConfigLocalAuthorityOutcome::Unavailable,
+            Err(error) => map_local_authority_error(error),
+        }
+    }
+
+    /// Proves local writer authority and that the canonical durable head is
+    /// exactly the head represented by a consumer's local config projection.
+    ///
+    /// The check drains the fixed proposal-admission cohort, takes a fresh
+    /// same-term Openraft barrier on both sides of the local durable-head read,
+    /// and verifies exact membership. It never routes to a peer. A newly
+    /// elected former follower therefore cannot serve or mutate through a
+    /// stale process-local projection merely because its Openraft state machine
+    /// has caught up.
+    pub async fn ensure_local_authority_at_config_head(
+        &self,
+        projected_tx_id: Option<opc_types::TxId>,
+        projected_version: opc_types::ConfigVersion,
+    ) -> ConfigLocalAuthorityOutcome {
+        let Some(deadline) = tokio::time::Instant::now().checked_add(self.inner.operation_timeout)
+        else {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        };
+        let Ok(slot_count) = u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS) else {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        };
+        let _proposal_guard = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.inner.proposal_admission).acquire_many_owned(slot_count),
+        )
+        .await
+        {
+            Ok(Ok(guard)) => guard,
+            Ok(Err(_)) | Err(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+        };
+        let barrier = self.local_authority_barrier();
+        let before = match barrier.admit(deadline).await {
+            Ok(admit)
+                if self.require_admission().is_ok() && self.exact_membership_is_admitted() =>
+            {
+                admit
+            }
+            Ok(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+            Err(error) => return map_local_authority_error(error),
+        };
+        let durable =
+            match tokio::time::timeout_at(deadline, self.inner.backend.load_latest()).await {
+                Ok(Ok(durable)) => durable,
+                Ok(Err(_)) | Err(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+            };
+        if !config_projection_head_matches(durable.as_ref(), projected_tx_id, projected_version) {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        }
+        let after = match barrier.admit(deadline).await {
+            Ok(admit)
+                if self.require_admission().is_ok() && self.exact_membership_is_admitted() =>
+            {
+                admit
+            }
+            Ok(_) => return ConfigLocalAuthorityOutcome::Unavailable,
+            Err(error) => return map_local_authority_error(error),
+        };
+        if before.term() != after.term() || before.read_log_id() != after.read_log_id() {
+            return ConfigLocalAuthorityOutcome::Unavailable;
+        }
+        ConfigLocalAuthorityOutcome::LocalAuthority
+    }
+
+    fn local_authority_barrier(&self) -> LinearizableReadBarrier<ConfigRaftTypeConfig> {
+        LinearizableReadBarrier::new(
+            self.inner.local_node_id,
+            self.inner.linearizability.clone(),
+            self.inner.raft.metrics(),
+            LinearizableReadLease::Disabled,
+        )
     }
 
     /// Prove quorum through the same read-index path used by authoritative reads.
@@ -1643,6 +1784,68 @@ mod tests {
             .await
             .expect("initialize cluster");
         (store, snapshots)
+    }
+
+    #[tokio::test]
+    async fn local_authority_requires_the_exact_consumer_projection_head() {
+        let (store, _snapshots) = singleton_store().await;
+        assert_eq!(
+            store
+                .ensure_local_authority_at_config_head(None, opc_types::ConfigVersion::INITIAL,)
+                .await,
+            ConfigLocalAuthorityOutcome::LocalAuthority
+        );
+        assert_eq!(
+            store
+                .ensure_local_authority_at_config_head(None, opc_types::ConfigVersion::new(1))
+                .await,
+            ConfigLocalAuthorityOutcome::Unavailable
+        );
+
+        store
+            .append_commit_idempotent(
+                opc_consensus::ConsensusRequestId::from_bytes([0xD4; 16]),
+                sized_attested_commit(128),
+            )
+            .await
+            .expect("append canonical config head");
+        let latest = store
+            .load_latest()
+            .await
+            .expect("load canonical head")
+            .expect("committed config");
+
+        assert_eq!(
+            store
+                .ensure_local_authority_at_config_head(None, opc_types::ConfigVersion::INITIAL,)
+                .await,
+            ConfigLocalAuthorityOutcome::Unavailable,
+            "a caught-up Openraft leader must reject a stale bootstrap projection"
+        );
+        assert_eq!(
+            store
+                .ensure_local_authority_at_config_head(
+                    Some(latest.record.tx_id),
+                    latest.record.version,
+                )
+                .await,
+            ConfigLocalAuthorityOutcome::LocalAuthority
+        );
+        assert_eq!(
+            store
+                .ensure_local_authority_at_config_head(
+                    Some(opc_types::TxId::new()),
+                    latest.record.version,
+                )
+                .await,
+            ConfigLocalAuthorityOutcome::Unavailable
+        );
+        assert_eq!(
+            store.inner.proposal_admission.available_permits(),
+            DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+            "authority checks must release every drained proposal permit"
+        );
+        store.shutdown().await.expect("shutdown");
     }
 
     fn forwarded_mutation(

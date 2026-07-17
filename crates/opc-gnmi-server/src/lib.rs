@@ -19,6 +19,13 @@
 //! authenticated `Set` applies generated patches through `opc-config-bus`, and
 //! authenticated `Subscribe` supports ONCE/POLL snapshots plus STREAM sample and
 //! config on-change delivery.
+//!
+//! [`GnmiServer::with_config_authority`] is the explicit HA profile: Set and
+//! Get fail closed unless the injected writer-of-record port proves local
+//! authority, follower hints are returned only in bounded gRPC metadata, and
+//! successful Set replies carry the exact datastore-attested committed
+//! revision. The default authoritative/no-port profile preserves legacy reply
+//! bytes.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
@@ -27,6 +34,7 @@ pub mod arbitration;
 mod audit;
 pub mod binding;
 pub mod capabilities;
+pub mod committed_revision;
 pub mod confirmed_commit;
 pub mod encoding;
 pub mod error;
@@ -48,6 +56,7 @@ pub mod value;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use opc_config_bus::{ConfigAuthorityOperation, ConfigAuthorityOutcome, ConfigAuthorityPort};
 use opc_config_model::OpcConfig;
 use opc_mgmt_audit::{AuditSink, TracingAuditSink};
 use opc_mgmt_limits::MgmtLimits;
@@ -60,6 +69,10 @@ pub use binding::{
     GnmiPatchApplicator, ReadSelection, ReadSelectionEntry,
 };
 pub use capabilities::{CapabilityProfile, GnmiCapabilities, GnmiModelData, GnmiVersion};
+pub use committed_revision::{
+    CommittedRevisionExtension, OPC_COMMITTED_REVISION_EXTENSION_ID,
+    OPC_COMMITTED_REVISION_EXTENSION_NAME,
+};
 pub use confirmed_commit::{
     CommitConfirmedAction, CommitConfirmedExtension, DEFAULT_COMMIT_CONFIRMED_TIMEOUT,
     OPC_COMMIT_CONFIRMED_EXTENSION_ID, OPC_COMMIT_CONFIRMED_EXTENSION_NAME,
@@ -77,7 +90,7 @@ pub use proto::GNMI_VERSION;
 pub use proto_adapter::{
     encoding_to_proto, extension_from_proto, path_from_proto, typed_value_from_proto,
 };
-pub use service::{AuthenticatedGnmiPrincipal, GnmiService};
+pub use service::{AuthenticatedGnmiPrincipal, GnmiService, GNMI_LEADER_HINT_METADATA_KEY};
 pub use set::{NormalizedSet, SetOperation};
 pub use smoke::{
     run_gnmi_mutating_smoke, run_gnmi_smoke, GnmiSmokeCapabilitySummary, GnmiSmokeClientConfig,
@@ -110,6 +123,7 @@ where
     profile: CapabilityProfile,
     extensions: ExtensionRegistry,
     arbitration: GnmiArbitrationState,
+    config_authority: Option<Arc<dyn ConfigAuthorityPort>>,
     audit: Arc<dyn AuditSink>,
     _config: PhantomData<C>,
 }
@@ -247,6 +261,7 @@ where
             profile,
             extensions,
             arbitration: GnmiArbitrationState::new(arbitration),
+            config_authority: None,
             audit,
             _config: PhantomData,
         })
@@ -275,6 +290,64 @@ where
     /// Master-arbitration state and configured enforcement mode.
     pub const fn arbitration(&self) -> &GnmiArbitrationState {
         &self.arbitration
+    }
+
+    /// Installs the writer-of-record gate used by Set and linearizable Get.
+    ///
+    /// Installing this port also opts successful Set replies into the
+    /// committed-revision response extension and treats every Get as a
+    /// linearizable config read. Without it, an authoritative bus keeps its
+    /// existing behavior and response bytes. A shadow bus without a port fails
+    /// closed.
+    ///
+    /// Construction verifies support for exact digests on new writes. A replay
+    /// of a legacy digest-less record is still rejected at response time; the
+    /// server never fabricates a hash from reserialized config.
+    pub fn with_config_authority(
+        mut self,
+        authority: Arc<dyn ConfigAuthorityPort>,
+    ) -> Result<Self, GnmiError> {
+        if !self.binding.config_bus().committed_revision_supported() {
+            return Err(GnmiError::failed_precondition(
+                "config datastore cannot attest committed revisions",
+            ));
+        }
+        self.config_authority = Some(authority);
+        Ok(self)
+    }
+
+    pub(crate) fn committed_revision_responses_enabled(&self) -> bool {
+        self.config_authority.is_some()
+    }
+
+    pub(crate) async fn ensure_config_authority(
+        &self,
+        operation: ConfigAuthorityOperation,
+    ) -> Result<(), GnmiError> {
+        let outcome = match self.config_authority.as_ref() {
+            Some(authority) => {
+                authority
+                    .ensure_local_authority(operation, self.binding.config_bus().projection_head())
+                    .await
+            }
+            None if self
+                .binding
+                .config_bus()
+                .authority_mode()
+                .requires_external_authority() =>
+            {
+                ConfigAuthorityOutcome::Unavailable
+            }
+            None => return Ok(()),
+        };
+        match outcome {
+            ConfigAuthorityOutcome::LocalAuthority => Ok(()),
+            ConfigAuthorityOutcome::Retry { leader_hint } => {
+                Err(GnmiError::not_leader(leader_hint))
+            }
+            ConfigAuthorityOutcome::Unavailable => Err(GnmiError::not_leader(None)),
+            _ => Err(GnmiError::not_leader(None)),
+        }
     }
 
     /// Audit sink used for management-plane operation records.

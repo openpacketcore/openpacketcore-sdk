@@ -2,6 +2,7 @@
 
 use std::{pin::Pin, sync::Arc};
 
+use opc_config_bus::ConfigAuthorityOperation;
 use opc_config_model::{AuthStrength, OpcConfig, RequestId, TrustedPrincipal};
 use opc_mgmt_audit::{AuditOperation, AuditOutcome};
 use opc_mgmt_limits::{LimitsError, MgmtLimits};
@@ -30,6 +31,9 @@ type SubscribeStream = Pin<
             + 'static,
     >,
 >;
+
+/// gRPC response-metadata key carrying an opaque current-leader hint.
+pub const GNMI_LEADER_HINT_METADATA_KEY: &str = "opc-leader-hint";
 
 /// Authenticated gNMI principal attached to each request by the TLS listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +324,24 @@ where
             record_rpc_error(GnmiOperation::Get, final_err.status(), start.elapsed());
             return Err(status_from_error(final_err));
         }
+        if let Err(err) = self
+            .server
+            .ensure_config_authority(ConfigAuthorityOperation::LinearizableRead)
+            .await
+        {
+            let final_err = record_audit(
+                self.server.audit(),
+                RequestId::new(),
+                principal.principal(),
+                AuditOperation::Read,
+                outcome_for_error(&err),
+                Vec::new(),
+            )
+            .err()
+            .unwrap_or(err);
+            record_rpc_error(GnmiOperation::Get, final_err.status(), start.elapsed());
+            return Err(status_from_error(final_err));
+        }
         match handle_get(&self.server, principal.principal(), request.get_ref()) {
             Ok(response) => {
                 record_rpc_success(GnmiOperation::Get, start.elapsed());
@@ -353,6 +375,24 @@ where
             &request.get_ref().extension,
             ExtensionOperation::Set,
         ) {
+            let final_err = record_audit(
+                self.server.audit(),
+                RequestId::new(),
+                principal.principal(),
+                AuditOperation::Update,
+                outcome_for_error(&err),
+                Vec::new(),
+            )
+            .err()
+            .unwrap_or(err);
+            record_rpc_error(GnmiOperation::Set, final_err.status(), start.elapsed());
+            return Err(status_from_error(final_err));
+        }
+        if let Err(err) = self
+            .server
+            .ensure_config_authority(ConfigAuthorityOperation::Write)
+            .await
+        {
             let final_err = record_audit(
                 self.server.audit(),
                 RequestId::new(),
@@ -515,7 +555,16 @@ fn master_arbitration_capability_extension() -> gnmi_ext::Extension {
 /// Converts a gNMI foundation error into a tonic status without surfacing local
 /// diagnostic detail.
 pub fn status_from_error(err: GnmiError) -> Status {
-    Status::new(code_from_status(err.status()), err.to_string())
+    let leader_hint = err.leader_hint().map(|hint| hint.as_str().to_owned());
+    let mut status = Status::new(code_from_status(err.status()), err.to_string());
+    if let Some(leader_hint) = leader_hint {
+        if let Ok(value) = tonic::metadata::MetadataValue::try_from(leader_hint.as_str()) {
+            status
+                .metadata_mut()
+                .insert(GNMI_LEADER_HINT_METADATA_KEY, value);
+        }
+    }
+    status
 }
 
 /// Maps the shared gRPC-aligned management status taxonomy to tonic codes.
@@ -544,12 +593,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use opc_config_bus::{
-        AuthorizationContext, AuthorizationError, ConfigAuthorizer, ConfigBus, MockManagedDatastore,
+        AuthorizationContext, AuthorizationError, ConfigAuthorityOperation, ConfigAuthorityOutcome,
+        ConfigAuthorityPort, ConfigAuthorizer, ConfigBus, ConfigLeaderHint, ConfigProjectionHead,
+        EncryptingManagedDatastore, MockManagedDatastore, SealedConfig,
     };
     use opc_config_model::{
         AuthStrength, ConfigError, RequestId, TrustedPrincipal, ValidationContext, ValidationError,
         WorkloadIdentity as ConfigWorkloadIdentity, YangPath,
     };
+    use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
     use opc_mgmt_audit::{
         AuditError, AuditEvent, AuditOutcome, AuditReasonCode, AuditSink, SchemaNodePath,
     };
@@ -576,11 +628,53 @@ mod tests {
         render_snapshot_responses, send_operational_event, serve_subscribe_stream, SubscribePlan,
     };
     use crate::{
-        CapabilityProfile, CommitConfirmedExtension, ExtensionRegistry, GnmiArbitrationConfig,
-        GnmiJsonProjectionError, GnmiJsonUpdate, GnmiPatchApplicator, GnmiVersion, ReadSelection,
-        GNMI_VERSION, OPC_COMMIT_CONFIRMED_EXTENSION_ID,
+        CapabilityProfile, CommitConfirmedExtension, CommittedRevisionExtension, ExtensionRegistry,
+        GnmiArbitrationConfig, GnmiJsonProjectionError, GnmiJsonUpdate, GnmiPatchApplicator,
+        GnmiVersion, ReadSelection, GNMI_LEADER_HINT_METADATA_KEY, GNMI_VERSION,
+        OPC_COMMITTED_REVISION_EXTENSION_ID, OPC_COMMIT_CONFIRMED_EXTENSION_ID,
     };
-    use opc_types::{SchemaDigest, TenantId};
+    use opc_types::{ConfigVersion, SchemaDigest, TenantId};
+
+    #[derive(Clone)]
+    struct FixedConfigAuthority {
+        outcome: ConfigAuthorityOutcome,
+        operations: Arc<Mutex<Vec<ConfigAuthorityOperation>>>,
+        projections: Arc<Mutex<Vec<ConfigProjectionHead>>>,
+    }
+
+    impl FixedConfigAuthority {
+        fn new(outcome: ConfigAuthorityOutcome) -> Self {
+            Self {
+                outcome,
+                operations: Arc::new(Mutex::new(Vec::new())),
+                projections: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn operations(&self) -> Vec<ConfigAuthorityOperation> {
+            self.operations.lock().expect("operations").clone()
+        }
+
+        fn projections(&self) -> Vec<ConfigProjectionHead> {
+            self.projections.lock().expect("projections").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigAuthorityPort for FixedConfigAuthority {
+        async fn ensure_local_authority(
+            &self,
+            operation: ConfigAuthorityOperation,
+            projection: ConfigProjectionHead,
+        ) -> ConfigAuthorityOutcome {
+            self.operations.lock().expect("operations").push(operation);
+            self.projections
+                .lock()
+                .expect("projections")
+                .push(projection);
+            self.outcome.clone()
+        }
+    }
 
     struct TestRegistry;
 
@@ -817,12 +911,12 @@ mod tests {
 
     struct UnitPatcher;
 
-    #[derive(Clone, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     struct DemoUser {
         role: String,
     }
 
-    #[derive(Clone, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     struct DemoConfig {
         hostname: String,
         users: BTreeMap<String, DemoUser>,
@@ -1225,6 +1319,58 @@ mod tests {
         } else {
             GnmiService::new_unauthenticated_dev_only(server)
         }
+    }
+
+    async fn authenticated_service_with_config_authority(
+        outcome: ConfigAuthorityOutcome,
+    ) -> (
+        GnmiService<DemoConfig, TestBinding>,
+        Arc<FixedConfigAuthority>,
+        Arc<ConfigBus<DemoConfig>>,
+        Arc<MockManagedDatastore<SealedConfig<DemoConfig>>>,
+    ) {
+        let inner = Arc::new(MockManagedDatastore::new());
+        let provider = Arc::new(MemoryKeyProvider::new());
+        provider
+            .insert_active_key(
+                KeyId::new("gnmi-config-key").expect("key id"),
+                KeyPurpose::Config,
+                TenantId::from_static("test"),
+                Zeroizing::new([0x5a; AES_256_GCM_SIV_KEY_LEN]),
+            )
+            .expect("config key");
+        let store = EncryptingManagedDatastore::new(Arc::clone(&inner), provider);
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(initial_config(), store)
+                .await
+                .expect("bus"),
+        );
+        let profile =
+            CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
+        let authority = Arc::new(FixedConfigAuthority::new(outcome));
+        let authority_port: Arc<dyn ConfigAuthorityPort> = authority.clone();
+        let server = GnmiServer::new_with_audit(
+            TestBinding {
+                bus: Arc::clone(&bus),
+                policy: Arc::new(FixedPolicy(allow_all_read_write_policy())),
+                operational: Arc::new(TestOperationalState),
+                events: None,
+                patcher: unit_patcher(),
+            },
+            MgmtLimits::default(),
+            profile,
+            ExtensionRegistry::default(),
+            Arc::new(CapturingAudit::default()),
+        )
+        .expect("server")
+        .with_config_authority(authority_port)
+        .expect("receipt-capable authority server");
+        (
+            GnmiService::new_authenticated(server),
+            authority,
+            bus,
+            inner,
+        )
     }
 
     fn authenticated_principal() -> AuthenticatedGnmiPrincipal {
@@ -3033,6 +3179,23 @@ mod tests {
             "sys:hostname"
         );
         assert!(response.timestamp > 0);
+        assert!(response.extension.is_empty());
+        let legacy_expected = gnmi::SetResponse {
+            prefix: None,
+            response: vec![gnmi::UpdateResult {
+                timestamp: 0,
+                path: Some(gnmi_path(vec![
+                    path_elem("sys:system"),
+                    path_elem("sys:hostname"),
+                ])),
+                message: None,
+                op: gnmi::update_result::Operation::Update as i32,
+            }],
+            message: None,
+            timestamp: response.timestamp,
+            extension: Vec::new(),
+        };
+        assert_eq!(response.encode_to_vec(), legacy_expected.encode_to_vec());
         assert_eq!(
             service
                 .server()
@@ -3043,6 +3206,151 @@ mod tests {
                 .hostname,
             "amf-2"
         );
+    }
+
+    #[tokio::test]
+    async fn config_authority_rejects_set_before_candidate_or_bus_mutation() {
+        let hint = ConfigLeaderHint::new("2").expect("leader hint");
+        let (service, authority, bus, inner) =
+            authenticated_service_with_config_authority(ConfigAuthorityOutcome::Retry {
+                leader_hint: Some(hint),
+            })
+            .await;
+
+        let status = service
+            .set(authenticated_set_request(hostname_set(
+                "must-not-apply",
+                Vec::new(),
+            )))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(
+            status
+                .metadata()
+                .get(GNMI_LEADER_HINT_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+        assert_eq!(
+            authority.operations(),
+            vec![ConfigAuthorityOperation::Write]
+        );
+        assert_eq!(
+            authority.projections(),
+            vec![ConfigProjectionHead::new(None, ConfigVersion::INITIAL)]
+        );
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+        assert!(inner.history().await.is_empty());
+        assert!(!status.message().contains('2'));
+    }
+
+    #[tokio::test]
+    async fn config_authority_rejects_get_without_serving_local_snapshot() {
+        let (service, authority, _bus, _inner) =
+            authenticated_service_with_config_authority(ConfigAuthorityOutcome::Unavailable).await;
+
+        let status = service
+            .get(authenticated_get_request(gnmi::GetRequest {
+                prefix: None,
+                path: vec![hostname_path()],
+                r#type: gnmi::get_request::DataType::Config as i32,
+                encoding: gnmi::Encoding::JsonIetf as i32,
+                use_models: Vec::new(),
+                extension: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(status
+            .metadata()
+            .get(GNMI_LEADER_HINT_METADATA_KEY)
+            .is_none());
+        assert_eq!(
+            authority.operations(),
+            vec![ConfigAuthorityOperation::LinearizableRead]
+        );
+        assert_eq!(
+            authority.projections(),
+            vec![ConfigProjectionHead::new(None, ConfigVersion::INITIAL)]
+        );
+    }
+
+    #[tokio::test]
+    async fn config_authority_set_returns_exact_persisted_revision() {
+        let (service, authority, _bus, inner) =
+            authenticated_service_with_config_authority(ConfigAuthorityOutcome::LocalAuthority)
+                .await;
+
+        let response = service
+            .set(authenticated_set_request(hostname_set("amf-2", Vec::new())))
+            .await
+            .expect("set")
+            .into_inner();
+
+        assert_eq!(
+            authority.operations(),
+            vec![ConfigAuthorityOperation::Write]
+        );
+        assert_eq!(response.extension.len(), 1);
+        let Some(gnmi_ext::extension::Ext::RegisteredExt(registered)) =
+            response.extension[0].ext.as_ref()
+        else {
+            panic!("registered committed-revision extension");
+        };
+        assert_eq!(registered.id, OPC_COMMITTED_REVISION_EXTENSION_ID as i32);
+        let revision = CommittedRevisionExtension::decode(registered.msg.as_slice())
+            .expect("committed revision payload");
+        let history = inner.history().await;
+        let persisted = history.last().expect("persisted commit");
+        assert_eq!(revision.version, persisted.version.get());
+        assert_eq!(
+            revision.content_hash,
+            persisted
+                .plaintext_digest
+                .expect("persisted plaintext digest")
+                .to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn config_authority_requires_digest_receipt_capability() {
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                .await
+                .expect("bus"),
+        );
+        let profile =
+            CapabilityProfile::json_only(GnmiVersion::new(GNMI_VERSION).expect("version"));
+        let server = GnmiServer::new_with_audit(
+            TestBinding {
+                bus,
+                policy: Arc::new(FixedPolicy(allow_all_read_write_policy())),
+                operational: Arc::new(TestOperationalState),
+                events: None,
+                patcher: unit_patcher(),
+            },
+            MgmtLimits::default(),
+            profile,
+            ExtensionRegistry::default(),
+            Arc::new(CapturingAudit::default()),
+        )
+        .expect("default server");
+        let authority: Arc<dyn ConfigAuthorityPort> = Arc::new(FixedConfigAuthority::new(
+            ConfigAuthorityOutcome::LocalAuthority,
+        ));
+
+        let error = match server.with_config_authority(authority) {
+            Ok(_) => panic!("plaintext datastore must reject committed revisions"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.status(),
+            opc_mgmt_errors::MgmtStatus::FailedPrecondition
+        );
+        assert!(!error.to_string().contains("digest"));
     }
 
     #[tokio::test]
@@ -5287,5 +5595,22 @@ mod tests {
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "invalid gNMI request");
         assert!(!status.message().contains("/secret:path"));
+    }
+
+    #[test]
+    fn not_leader_status_carries_hint_only_in_bounded_metadata() {
+        let hint = ConfigLeaderHint::new("node&<>\"'").expect("printable hint");
+        let status = status_from_error(GnmiError::not_leader(Some(hint)));
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(status.message(), "gNMI service unavailable");
+        assert_eq!(
+            status
+                .metadata()
+                .get(GNMI_LEADER_HINT_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some("node&<>\"'")
+        );
+        assert!(!status.message().contains("node"));
     }
 }

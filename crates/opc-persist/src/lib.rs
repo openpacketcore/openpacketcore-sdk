@@ -112,11 +112,11 @@ pub use consensus::{
     ConfigConsensusIdentity, ConfigConsensusIdentityError, ConfigConsensusNodeId,
     ConfigConsensusOpenError, ConfigConsensusPeer, ConfigConsensusRequestId,
     ConfigConsensusRpcHandler, ConfigConsensusStatus, ConfigConsensusTopology,
-    ConfigConsensusTopologyError, ConsensusConfigStore, LegacyConfigTailDisposition,
-    SharedConfigConsensusClock, SystemConfigConsensusClock, CONFIG_CONSENSUS_COMMAND_VERSION,
-    CONFIG_CONSENSUS_MAX_MEMBERS, CONFIG_CONSENSUS_SNAPSHOT_VERSION,
-    CONFIG_CONSENSUS_STORAGE_VERSION, CONFIG_CONSENSUS_WIRE_VERSION,
-    DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    ConfigConsensusTopologyError, ConfigLocalAuthorityOutcome, ConsensusConfigStore,
+    LegacyConfigTailDisposition, SharedConfigConsensusClock, SystemConfigConsensusClock,
+    CONFIG_CONSENSUS_COMMAND_VERSION, CONFIG_CONSENSUS_MAX_MEMBERS,
+    CONFIG_CONSENSUS_SNAPSHOT_VERSION, CONFIG_CONSENSUS_STORAGE_VERSION,
+    CONFIG_CONSENSUS_WIRE_VERSION, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use error::{PersistError, PersistErrorKind};
 #[cfg(feature = "dangerous-test-hooks")]

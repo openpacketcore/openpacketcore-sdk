@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod alarms;
+pub mod authority;
 pub mod authorizer;
 pub mod commit;
 pub mod datastore;
@@ -23,6 +24,10 @@ pub mod subscribers;
 pub mod types;
 
 // Public Re-exports
+pub use authority::{
+    ConfigAuthorityOperation, ConfigAuthorityOutcome, ConfigAuthorityPort, ConfigLeaderHint,
+    ConfigLeaderHintError, ConfigProjectionHead, MAX_CONFIG_LEADER_HINT_BYTES,
+};
 pub use authorizer::{
     AllowAllAuthorizer, AuthorizationContext, AuthorizationError, ConfigAuthorizer,
 };
@@ -32,7 +37,8 @@ pub use datastore::{
 };
 pub use subscribers::{ConfigReceiver, SubscriberLagPolicy};
 pub use types::{
-    AtomicConfigSnapshot, AuthorityMode, CommitWrite, ConfigChange, ConfigEvent, ConfigSnapshot,
-    ConfirmedCommitResolution, DriftState, PublishedSnapshot, SealedConfig, StoreError,
-    StoreErrorCode, StoredConfig, StoredRequestFingerprint, StoredRequestMode,
+    AtomicConfigSnapshot, AuthorityMode, CommitWrite, CommitWriteReceipt, ConfigChange,
+    ConfigEvent, ConfigSnapshot, ConfirmedCommitResolution, DriftState, PublishedSnapshot,
+    SealedConfig, StoreError, StoreErrorCode, StoredConfig, StoredRequestFingerprint,
+    StoredRequestMode,
 };

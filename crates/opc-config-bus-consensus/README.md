@@ -11,7 +11,7 @@ The production composition deliberately puts encryption above this crate:
 ```rust,ignore
 use std::sync::Arc;
 
-use opc_config_bus::EncryptingManagedDatastore;
+use opc_config_bus::{ConfigAuthorityPort, EncryptingManagedDatastore};
 use opc_config_bus_consensus::RaftManagedDatastore;
 
 // `consensus_store` was opened with a config-specific identity, voter set,
@@ -20,7 +20,11 @@ use opc_config_bus_consensus::RaftManagedDatastore;
 let durable = Arc::new(RaftManagedDatastore::<MyConfig>::new(Arc::new(
     consensus_store,
 )));
-let managed = EncryptingManagedDatastore::new(durable, key_provider);
+let authority: Arc<dyn ConfigAuthorityPort> = Arc::new(durable.config_authority());
+let managed = EncryptingManagedDatastore::new(Arc::clone(&durable), key_provider);
+
+// Build ConfigBus from `managed`, then install the same `authority` on both
+// the gNMI and NETCONF server cores with `with_config_authority(...)`.
 ```
 
 `RaftManagedDatastore<C>` implements only
@@ -28,6 +32,25 @@ let managed = EncryptingManagedDatastore::new(durable, key_provider);
 owns a `KeyProvider`; Openraft therefore receives authenticated ciphertext,
 lineage/lifecycle metadata, a digest-only replay index, and a product-neutral
 redacted root audit marker.
+
+`RaftManagedDatastore::config_authority()` returns a
+`ConsensusConfigAuthority` over that exact `ConsensusConfigStore`. The adapter
+uses its local-only Openraft read-index/apply barrier, never a second leader
+tracker. A local leader returns `LocalAuthority`; a follower returns `Retry`
+with the stable numeric consensus node ID when known; unavailable leadership,
+membership drift, or local apply lag fails closed. The numeric ID is only a
+routing hint. Products that need a network endpoint must resolve it through
+their fixed, authenticated roster rather than treating it as an address.
+
+The authority check also compares the config bus's payload-free
+`{tx_id, version}` projection head with the canonical local state-machine head
+while all fixed proposal-admission slots are drained under the existing
+operation deadline. A caught-up newly elected node with a stale process-local
+projection is therefore unavailable, not authoritative. The guard releases all
+proposal permits on every return path. When the canonical store is empty, an
+empty bootstrap head may attempt only a `Write` so the genesis commit can be
+created; `LinearizableRead` remains unavailable because no durable content yet
+proves that every pod bootstrapped the same payload.
 
 Strict operational requirements:
 

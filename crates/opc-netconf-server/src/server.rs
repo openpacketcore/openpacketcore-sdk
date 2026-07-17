@@ -6,10 +6,13 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use opc_config_bus::{ConfigChange, ConfigEvent, ConfigReceiver, SubscriberLagPolicy};
+use opc_config_bus::{
+    ConfigAuthorityOperation, ConfigAuthorityOutcome, ConfigAuthorityPort, ConfigChange,
+    ConfigEvent, ConfigReceiver, SubscriberLagPolicy,
+};
 use opc_config_model::{
-    CommitErrorCode, CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId,
-    RequestSource, TransportType, TrustedPrincipal, ValidationContext, YangPath,
+    CommitErrorCode, CommitMode, CommitRequest, CommitResult, ConfigOperation, OpcConfig,
+    RequestId, RequestSource, TransportType, TrustedPrincipal, ValidationContext, YangPath,
 };
 use opc_mgmt_audit::{
     AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink, SchemaNodePath,
@@ -32,8 +35,9 @@ use crate::binding::{
 };
 use crate::capabilities::{render_server_hello, ServerHelloCapabilities};
 use crate::error::{
-    rpc_error_reply_with_attrs, rpc_get_schema_reply_with_attrs, rpc_ok_empty_reply_with_attrs,
-    xml_escape, RpcError, RpcReplyAttributes,
+    rpc_error_reply_with_attrs, rpc_get_schema_reply_with_attrs, rpc_not_leader_reply_with_attrs,
+    rpc_ok_committed_revision_reply_with_attrs, rpc_ok_empty_reply_with_attrs, xml_escape,
+    RpcError, RpcReplyAttributes,
 };
 use crate::metrics::{
     record_notification, record_rpc_error, record_rpc_success, NetconfNotificationOutcome,
@@ -78,6 +82,9 @@ const NETCONF_EXEC_MODELS: &[ModelData] = &[
 const NETCONF_CLOSE_SESSION_PATH: &str = "/nc:close-session";
 const NETCONF_EDIT_CONFIG_PATH: &str = "/nc:edit-config";
 const NETCONF_EDIT_DATA_PATH: &str = "/ncds:edit-data";
+const NETCONF_GET_PATH: &str = "/nc:get";
+const NETCONF_GET_CONFIG_PATH: &str = "/nc:get-config";
+const NETCONF_GET_DATA_PATH: &str = "/ncds:get-data";
 const NETCONF_LOCK_PATH: &str = "/nc:lock";
 const NETCONF_UNLOCK_PATH: &str = "/nc:unlock";
 const NETCONF_KILL_SESSION_PATH: &str = "/nc:kill-session";
@@ -104,6 +111,10 @@ pub enum ServerInitError {
     /// Read authorizer could not be constructed.
     #[error("read authorizer initialization failed: {0}")]
     Authz(#[from] AuthzError),
+    /// The supplied datastore cannot attest the plaintext digest required by
+    /// opt-in committed-revision responses.
+    #[error("config datastore does not support committed revision receipts")]
+    CommittedRevisionUnsupported,
 }
 
 /// Result of handling one NETCONF RPC.
@@ -177,6 +188,57 @@ struct RpcExecContext<'a> {
 enum EditRpcKind {
     EditConfig,
     EditData,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConfigAuthorityGate {
+    operation: ConfigAuthorityOperation,
+    metric: NetconfOperation,
+    audit_operation: AuditOperation,
+    path: &'static str,
+}
+
+fn config_authority_gate(operation: &RpcOperation) -> Option<ConfigAuthorityGate> {
+    let gate = match operation {
+        RpcOperation::EditConfig(_) => ConfigAuthorityGate {
+            operation: ConfigAuthorityOperation::Write,
+            metric: NetconfOperation::EditConfig,
+            audit_operation: AuditOperation::Update,
+            path: NETCONF_EDIT_CONFIG_PATH,
+        },
+        RpcOperation::EditData(_) => ConfigAuthorityGate {
+            operation: ConfigAuthorityOperation::Write,
+            metric: NetconfOperation::EditData,
+            audit_operation: AuditOperation::Update,
+            path: NETCONF_EDIT_DATA_PATH,
+        },
+        RpcOperation::Commit(_) => ConfigAuthorityGate {
+            operation: ConfigAuthorityOperation::Write,
+            metric: NetconfOperation::Commit,
+            audit_operation: AuditOperation::Update,
+            path: NETCONF_COMMIT_PATH,
+        },
+        RpcOperation::Get(_) => ConfigAuthorityGate {
+            operation: ConfigAuthorityOperation::LinearizableRead,
+            metric: NetconfOperation::Get,
+            audit_operation: AuditOperation::Read,
+            path: NETCONF_GET_PATH,
+        },
+        RpcOperation::GetConfig(_) => ConfigAuthorityGate {
+            operation: ConfigAuthorityOperation::LinearizableRead,
+            metric: NetconfOperation::GetConfig,
+            audit_operation: AuditOperation::Read,
+            path: NETCONF_GET_CONFIG_PATH,
+        },
+        RpcOperation::GetData(_) => ConfigAuthorityGate {
+            operation: ConfigAuthorityOperation::LinearizableRead,
+            metric: NetconfOperation::GetData,
+            audit_operation: AuditOperation::Read,
+            path: NETCONF_GET_DATA_PATH,
+        },
+        _ => return None,
+    };
+    Some(gate)
 }
 
 impl EditRpcKind {
@@ -342,6 +404,7 @@ where
     transport: TransportType,
     candidate: Arc<Mutex<CandidateDatastore<C>>>,
     confirmed_commit: Arc<Mutex<ConfirmedCommitState>>,
+    config_authority: Option<Arc<dyn ConfigAuthorityPort>>,
     _config: PhantomData<C>,
 }
 
@@ -371,8 +434,113 @@ where
             transport,
             candidate: Arc::new(Mutex::new(CandidateDatastore::default())),
             confirmed_commit: Arc::new(Mutex::new(ConfirmedCommitState::default())),
+            config_authority: None,
             _config: PhantomData,
         })
+    }
+
+    /// Installs the writer-of-record gate used by management writes and
+    /// linearizable reads.
+    ///
+    /// Installing this port also opts durable write replies into the
+    /// committed-revision element. Construction fails before serving if the
+    /// datastore cannot attest an exact persisted plaintext-envelope digest
+    /// on new writes. A replay of a legacy digest-less record remains a
+    /// fail-closed response; no digest is fabricated.
+    ///
+    /// The async session path gates `<edit-config>`, `<edit-data>`, `<commit>`,
+    /// `<get>`, `<get-config>`, and `<get-data>`. The synchronous direct helpers
+    /// cannot await this port and reject those operations while it is installed.
+    pub fn with_config_authority(
+        mut self,
+        authority: Arc<dyn ConfigAuthorityPort>,
+    ) -> Result<Self, ServerInitError> {
+        if !self.binding.config_bus().committed_revision_supported() {
+            return Err(ServerInitError::CommittedRevisionUnsupported);
+        }
+        self.config_authority = Some(authority);
+        Ok(self)
+    }
+
+    fn committed_revision_responses_enabled(&self) -> bool {
+        self.config_authority.is_some()
+    }
+
+    async fn ensure_config_authority(
+        &self,
+        operation: ConfigAuthorityOperation,
+    ) -> Result<(), ConfigAuthorityOutcome> {
+        let outcome = match self.config_authority.as_ref() {
+            Some(authority) => {
+                authority
+                    .ensure_local_authority(operation, self.binding.config_bus().projection_head())
+                    .await
+            }
+            None if self
+                .binding
+                .config_bus()
+                .authority_mode()
+                .requires_external_authority() =>
+            {
+                ConfigAuthorityOutcome::Unavailable
+            }
+            None => return Ok(()),
+        };
+        match outcome {
+            ConfigAuthorityOutcome::LocalAuthority => Ok(()),
+            ConfigAuthorityOutcome::Retry { .. } | ConfigAuthorityOutcome::Unavailable => {
+                Err(outcome)
+            }
+            _ => Err(ConfigAuthorityOutcome::Unavailable),
+        }
+    }
+
+    fn authority_rejection_reply(
+        &self,
+        context: RpcExecContext<'_>,
+        gate: ConfigAuthorityGate,
+        outcome: ConfigAuthorityOutcome,
+    ) -> RpcHandlingResult {
+        let leader_hint = match outcome {
+            ConfigAuthorityOutcome::Retry { leader_hint } => leader_hint,
+            ConfigAuthorityOutcome::LocalAuthority | ConfigAuthorityOutcome::Unavailable => None,
+            _ => None,
+        };
+        if self
+            .audit
+            .record(
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    gate.audit_operation,
+                    audit_failed("not-leader"),
+                )
+                .with_paths([schema_node_path(gate.path)]),
+            )
+            .is_err()
+        {
+            record_rpc_error(
+                gate.metric,
+                NetconfErrorTag::OperationFailed,
+                context.started.elapsed(),
+            );
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(context.message_id),
+                context.reply_attrs,
+                RpcError::operation_failed(),
+            ));
+        }
+        record_rpc_error(
+            gate.metric,
+            NetconfErrorTag::OperationFailed,
+            context.started.elapsed(),
+        );
+        RpcHandlingResult::keep_open(rpc_not_leader_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            leader_hint.as_ref(),
+        ))
     }
 
     /// Returns the transport identity this server records in audit,
@@ -566,6 +734,28 @@ where
                 ));
             }
         };
+
+        if let Some(gate) = config_authority_gate(&parsed.operation) {
+            if self.config_authority.is_some()
+                || self
+                    .binding
+                    .config_bus()
+                    .authority_mode()
+                    .requires_external_authority()
+            {
+                return self.authority_rejection_reply(
+                    RpcExecContext {
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                    },
+                    gate,
+                    ConfigAuthorityOutcome::Unavailable,
+                );
+            }
+        }
 
         match &parsed.operation {
             RpcOperation::EditConfig(_) => self.handle_unsupported_operation(
@@ -841,6 +1031,24 @@ where
                 .into();
             }
         };
+
+        if let Some(gate) = config_authority_gate(&parsed.operation) {
+            if let Err(outcome) = self.ensure_config_authority(gate.operation).await {
+                return self
+                    .authority_rejection_reply(
+                        RpcExecContext {
+                            request_id,
+                            principal,
+                            message_id: &parsed.message_id,
+                            reply_attrs: &parsed.reply_attrs,
+                            started,
+                        },
+                        gate,
+                        outcome,
+                    )
+                    .into();
+            }
+        }
 
         let reply = match &parsed.operation {
             RpcOperation::EditConfig(request) => {
@@ -3154,11 +3362,7 @@ where
                         RpcError::operation_failed(),
                     ));
                 }
-                record_rpc_success(NetconfOperation::Commit, context.started.elapsed());
-                RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
-                    context.message_id,
-                    context.reply_attrs,
-                ))
+                self.committed_revision_success_reply(&context, NetconfOperation::Commit, &result)
             }
             Err(error) => self.exec_failure_reply(
                 &context,
@@ -4375,11 +4579,7 @@ where
                         RpcError::operation_failed(),
                     ));
                 }
-                record_rpc_success(kind.metric(), context.started.elapsed());
-                RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
-                    context.message_id,
-                    context.reply_attrs,
-                ))
+                self.committed_revision_success_reply(&context, kind.metric(), &result)
             }
             Err(error) => self.edit_config_failure_reply(
                 &context,
@@ -4388,6 +4588,37 @@ where
                 rpc_error_for_commit_error(error.code),
             ),
         }
+    }
+
+    fn committed_revision_success_reply(
+        &self,
+        context: &RpcExecContext<'_>,
+        operation: NetconfOperation,
+        result: &CommitResult,
+    ) -> RpcHandlingResult {
+        let reply = if self.committed_revision_responses_enabled() {
+            let Some(revision) = result.committed_revision else {
+                record_rpc_error(
+                    operation,
+                    NetconfErrorTag::OperationFailed,
+                    context.started.elapsed(),
+                );
+                return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                    Some(context.message_id),
+                    context.reply_attrs,
+                    RpcError::operation_failed(),
+                ));
+            };
+            rpc_ok_committed_revision_reply_with_attrs(
+                context.message_id,
+                context.reply_attrs,
+                revision,
+            )
+        } else {
+            rpc_ok_empty_reply_with_attrs(context.message_id, context.reply_attrs)
+        };
+        record_rpc_success(operation, context.started.elapsed());
+        RpcHandlingResult::keep_open(reply)
     }
 
     fn edit_config_failure_reply(
@@ -5696,7 +5927,7 @@ fn audit_failed(reason: &'static str) -> AuditOutcome {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
     use std::net::SocketAddr;
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -5704,17 +5935,20 @@ mod tests {
     use std::time::Duration;
 
     use opc_config_bus::{
-        AuthorizationContext, AuthorizationError, ConfigAuthorizer, ConfigBus,
-        MockManagedDatastore, StoredConfig,
+        AuthorizationContext, AuthorizationError, ConfigAuthorityOperation, ConfigAuthorityOutcome,
+        ConfigAuthorityPort, ConfigAuthorizer, ConfigBus, ConfigLeaderHint, ConfigProjectionHead,
+        EncryptingManagedDatastore, MockManagedDatastore, SealedConfig, StoredConfig,
     };
     use opc_config_model::{
-        AuthStrength, ConfigError, ConfigOperation, OpcConfig, RequestSource, TransportType,
-        TrustedPrincipal, ValidationContext, ValidationError, WorkloadIdentity, YangPath,
+        AuthStrength, CommittedConfigRevision, ConfigError, ConfigOperation, OpcConfig,
+        RequestSource, TransportType, TrustedPrincipal, ValidationContext, ValidationError,
+        WorkloadIdentity, YangPath,
     };
     use opc_identity::{
         parse_certs_pem, parse_key_pem, IdentityState, SvidDocument, TrustBundle, TrustBundleSet,
         TrustDomain, WorkloadIdentity as IdentityWorkloadIdentity,
     };
+    use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
     use opc_mgmt_audit::{AuditError, AuditEvent, AuditOperation, AuditOutcome, AuditSink};
     use opc_mgmt_authz::{AuthzError, PolicySource};
     use opc_mgmt_opstate::{
@@ -5793,6 +6027,68 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct ScriptedConfigAuthority {
+        outcomes: Arc<Mutex<VecDeque<ConfigAuthorityOutcome>>>,
+        fallback: ConfigAuthorityOutcome,
+        operations: Arc<Mutex<Vec<ConfigAuthorityOperation>>>,
+        projections: Arc<Mutex<Vec<ConfigProjectionHead>>>,
+    }
+
+    impl ScriptedConfigAuthority {
+        fn fixed(outcome: ConfigAuthorityOutcome) -> Self {
+            Self {
+                outcomes: Arc::new(Mutex::new(VecDeque::new())),
+                fallback: outcome,
+                operations: Arc::new(Mutex::new(Vec::new())),
+                projections: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn sequence(
+            outcomes: impl IntoIterator<Item = ConfigAuthorityOutcome>,
+            fallback: ConfigAuthorityOutcome,
+        ) -> Self {
+            Self {
+                outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+                fallback,
+                operations: Arc::new(Mutex::new(Vec::new())),
+                projections: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn operations(&self) -> Vec<ConfigAuthorityOperation> {
+            self.operations.lock().expect("operations mutex").clone()
+        }
+
+        fn projections(&self) -> Vec<ConfigProjectionHead> {
+            self.projections.lock().expect("projections mutex").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigAuthorityPort for ScriptedConfigAuthority {
+        async fn ensure_local_authority(
+            &self,
+            operation: ConfigAuthorityOperation,
+            projection: ConfigProjectionHead,
+        ) -> ConfigAuthorityOutcome {
+            self.operations
+                .lock()
+                .expect("operations mutex")
+                .push(operation);
+            self.projections
+                .lock()
+                .expect("projections mutex")
+                .push(projection);
+            self.outcomes
+                .lock()
+                .expect("outcomes mutex")
+                .pop_front()
+                .unwrap_or_else(|| self.fallback.clone())
+        }
+    }
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct DemoConfig {
         hostname: String,
         secret: String,
@@ -12851,6 +13147,62 @@ mod tests {
         )
     }
 
+    async fn encrypted_demo_bus() -> (
+        Arc<ConfigBus<DemoConfig>>,
+        Arc<MockManagedDatastore<SealedConfig<DemoConfig>>>,
+    ) {
+        let inner = Arc::new(MockManagedDatastore::new());
+        let provider = Arc::new(MemoryKeyProvider::new());
+        provider
+            .insert_active_key(
+                KeyId::new("netconf-config-key").expect("key id"),
+                KeyPurpose::Config,
+                TenantId::new("tenant-a").expect("tenant"),
+                Zeroizing::new([0x6b; AES_256_GCM_SIV_KEY_LEN]),
+            )
+            .expect("config key");
+        let store = EncryptingManagedDatastore::new(Arc::clone(&inner), provider);
+        let bus = Arc::new(
+            ConfigBus::new_dev_only(
+                DemoConfig {
+                    hostname: "amf-1".to_string(),
+                    secret: "do-not-leak".to_string(),
+                },
+                store,
+            )
+            .await
+            .expect("encrypted config bus"),
+        );
+        (bus, inner)
+    }
+
+    async fn generated_edit_authority_fixture(
+        authority: Arc<ScriptedConfigAuthority>,
+    ) -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
+        Arc<ConfigBus<DemoConfig>>,
+        Arc<MockManagedDatastore<SealedConfig<DemoConfig>>>,
+        CapturingAudit,
+    ) {
+        let (bus, inner) = encrypted_demo_bus().await;
+        let binding = GeneratedEditBinding {
+            bus: Arc::clone(&bus),
+            startup: None,
+        };
+        let audit = CapturingAudit::default();
+        let authority_port: Arc<dyn ConfigAuthorityPort> = authority;
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            audit.clone(),
+            TransportType::NetconfTls,
+        )
+        .expect("server")
+        .with_config_authority(authority_port)
+        .expect("receipt-capable authority server");
+        (server, bus, inner, audit)
+    }
+
     async fn generated_edit_server_fixture() -> (
         ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, CapturingAudit>,
         Arc<ConfigBus<DemoConfig>>,
@@ -12966,6 +13318,336 @@ mod tests {
         )
         .expect("server");
         (server, bus, startup, audit)
+    }
+
+    #[tokio::test]
+    async fn config_authority_rejects_edit_before_candidate_or_bus_mutation() {
+        let (bus, inner) = encrypted_demo_bus().await;
+        let candidate_builder_called = Arc::new(AtomicBool::new(false));
+        let binding = WritableCountingEditBinding {
+            bus: Arc::clone(&bus),
+            candidate_builder_called: Arc::clone(&candidate_builder_called),
+        };
+        let authority = Arc::new(ScriptedConfigAuthority::fixed(
+            ConfigAuthorityOutcome::Retry {
+                leader_hint: Some(ConfigLeaderHint::new("2").expect("leader hint")),
+            },
+        ));
+        let authority_port: Arc<dyn ConfigAuthorityPort> = authority.clone();
+        let server = ReadOnlyNetconfServer::new(
+            binding,
+            FixedPolicy(policy_allow_system_but_deny_secret()),
+            CapturingAudit::default(),
+            TransportType::NetconfTls,
+        )
+        .expect("server")
+        .with_config_authority(authority_port)
+        .expect("authority server");
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_rpc(
+                    r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>must-not-apply</sys:hostname></sys:system>"#,
+                    "merge",
+                ),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(result
+            .reply_xml
+            .contains("<error-tag>operation-failed</error-tag>"));
+        assert!(result
+            .reply_xml
+            .contains("<error-app-tag>not-leader</error-app-tag>"));
+        assert!(result.reply_xml.contains(">2</leader-hint>"));
+        assert!(!candidate_builder_called.load(Ordering::SeqCst));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+        assert!(inner.history().await.is_empty());
+        assert_eq!(
+            authority.operations(),
+            vec![ConfigAuthorityOperation::Write]
+        );
+        assert_eq!(
+            authority.projections(),
+            vec![ConfigProjectionHead::new(None, ConfigVersion::INITIAL)]
+        );
+    }
+
+    #[tokio::test]
+    async fn config_authority_rejects_commit_without_discarding_candidate() {
+        let authority = Arc::new(ScriptedConfigAuthority::sequence(
+            [
+                ConfigAuthorityOutcome::LocalAuthority,
+                ConfigAuthorityOutcome::Retry {
+                    leader_hint: Some(ConfigLeaderHint::new("3").expect("leader hint")),
+                },
+            ],
+            ConfigAuthorityOutcome::Unavailable,
+        ));
+        let (server, bus, inner, _audit) =
+            generated_edit_authority_fixture(Arc::clone(&authority)).await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session");
+        let candidate_rpc = edit_config_rpc_to(
+            "candidate",
+            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+            "merge",
+        );
+
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &candidate_rpc,
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+
+        let rejected = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &commit_rpc(),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(rejected
+            .reply_xml
+            .contains("<error-app-tag>not-leader</error-app-tag>"));
+        assert!(rejected.reply_xml.contains(">3</leader-hint>"));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+        assert!(inner.history().await.is_empty());
+        let candidate = server.candidate.lock().expect("candidate mutex");
+        assert_eq!(
+            candidate
+                .snapshot
+                .as_ref()
+                .expect("candidate retained")
+                .config
+                .hostname,
+            "amf-2"
+        );
+        assert_eq!(
+            authority.operations(),
+            vec![
+                ConfigAuthorityOperation::Write,
+                ConfigAuthorityOperation::Write
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn config_authority_rejects_linearizable_read_before_projection() {
+        let authority = Arc::new(ScriptedConfigAuthority::fixed(
+            ConfigAuthorityOutcome::Unavailable,
+        ));
+        let (server, _bus, _inner, _audit) =
+            generated_edit_authority_fixture(Arc::clone(&authority)).await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session");
+
+        let rejected = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &get_config_rpc("running"),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert!(rejected
+            .reply_xml
+            .contains("<error-app-tag>not-leader</error-app-tag>"));
+        assert!(!rejected.reply_xml.contains("amf-1"));
+        assert!(!rejected.reply_xml.contains("leader-hint"));
+        assert_eq!(
+            authority.operations(),
+            vec![ConfigAuthorityOperation::LinearizableRead]
+        );
+    }
+
+    #[tokio::test]
+    async fn config_authority_edit_returns_exact_persisted_revision() {
+        let authority = Arc::new(ScriptedConfigAuthority::fixed(
+            ConfigAuthorityOutcome::LocalAuthority,
+        ));
+        let (server, bus, inner, _audit) =
+            generated_edit_authority_fixture(Arc::clone(&authority)).await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_rpc(
+                    r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+                    "merge",
+                ),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        let history = inner.history().await;
+        let persisted = history.last().expect("persisted commit");
+        let digest = persisted
+            .plaintext_digest
+            .expect("persisted plaintext digest");
+        assert!(result.reply_xml.contains("<ok/>"));
+        assert!(result
+            .reply_xml
+            .contains(&format!("<version>{}</version>", persisted.version.get())));
+        assert!(result.reply_xml.contains(&format!(
+            "<content-hash algorithm=\"sha-256\">{}</content-hash>",
+            CommittedConfigRevision::new(persisted.version, digest).content_hash_hex()
+        )));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+        assert_eq!(
+            authority.operations(),
+            vec![ConfigAuthorityOperation::Write]
+        );
+    }
+
+    #[tokio::test]
+    async fn config_authority_commit_returns_exact_persisted_revision() {
+        let authority = Arc::new(ScriptedConfigAuthority::fixed(
+            ConfigAuthorityOutcome::LocalAuthority,
+        ));
+        let (server, bus, inner, _audit) =
+            generated_edit_authority_fixture(Arc::clone(&authority)).await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session");
+
+        let edited = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_rpc_to(
+                    "candidate",
+                    r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+                    "merge",
+                ),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+        assert!(edited.reply_xml.contains("<ok/>"), "{}", edited.reply_xml);
+        assert!(!edited.reply_xml.contains("<committed-revision"));
+        assert!(inner.history().await.is_empty());
+
+        let committed = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &commit_rpc(),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        let history = inner.history().await;
+        let persisted = history.last().expect("persisted commit");
+        let digest = persisted
+            .plaintext_digest
+            .expect("persisted plaintext digest");
+        assert!(committed.reply_xml.contains("<ok/>"));
+        assert!(committed
+            .reply_xml
+            .contains(&format!("<version>{}</version>", persisted.version.get())));
+        assert!(committed.reply_xml.contains(&format!(
+            "<content-hash algorithm=\"sha-256\">{}</content-hash>",
+            CommittedConfigRevision::new(persisted.version, digest).content_hash_hex()
+        )));
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-2");
+        assert_eq!(
+            authority.operations(),
+            vec![
+                ConfigAuthorityOperation::Write,
+                ConfigAuthorityOperation::Write
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_edit_reply_bytes_remain_legacy_ok_only() {
+        let (server, _bus, _audit) = generated_edit_server_fixture().await;
+        let registry = SessionRegistry::new();
+        let _registration = registry.register(1).expect("register session");
+
+        let result = server
+            .handle_rpc_for_session_async(
+                RequestId::new(),
+                &principal(),
+                &edit_config_rpc(
+                    r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
+                    "merge",
+                ),
+                &MgmtLimits::default(),
+                1,
+                &registry,
+            )
+            .await;
+
+        assert_eq!(
+            result.reply_xml,
+            format!(r#"<rpc-reply xmlns="{NETCONF_BASE_NS}" message-id="1"><ok/></rpc-reply>"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_helper_fails_closed_when_async_authority_is_configured() {
+        let authority = Arc::new(ScriptedConfigAuthority::fixed(
+            ConfigAuthorityOutcome::LocalAuthority,
+        ));
+        let (server, _bus, _inner, _audit) =
+            generated_edit_authority_fixture(Arc::clone(&authority)).await;
+
+        let reply = server.handle_rpc_xml(
+            RequestId::new(),
+            &principal(),
+            &get_config_rpc("running"),
+            &MgmtLimits::default(),
+        );
+
+        assert!(reply.contains("<error-app-tag>not-leader</error-app-tag>"));
+        assert!(!reply.contains("amf-1"));
+        assert!(authority.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_authority_requires_digest_receipt_capability() {
+        let (server, _bus, _audit) = generated_edit_server_fixture().await;
+        let authority: Arc<dyn ConfigAuthorityPort> = Arc::new(ScriptedConfigAuthority::fixed(
+            ConfigAuthorityOutcome::LocalAuthority,
+        ));
+
+        let error = match server.with_config_authority(authority) {
+            Ok(_) => panic!("plaintext datastore must reject committed revisions"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ServerInitError::CommittedRevisionUnsupported
+        ));
     }
 
     #[tokio::test]

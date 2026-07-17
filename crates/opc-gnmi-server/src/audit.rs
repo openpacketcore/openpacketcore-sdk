@@ -40,7 +40,7 @@ pub(crate) fn outcome_for_error(err: &GnmiError) -> AuditOutcome {
         GnmiError::Unimplemented { .. } => {
             AuditOutcome::failed_code(AuditReasonCode::OPERATION_NOT_SUPPORTED)
         }
-        GnmiError::Unavailable { .. } => {
+        GnmiError::Unavailable { .. } | GnmiError::NotLeader { .. } => {
             AuditOutcome::failed_code(AuditReasonCode::RESOURCE_DENIED)
         }
         GnmiError::InvalidArgument { detail } if detail.contains("management-plane limit") => {

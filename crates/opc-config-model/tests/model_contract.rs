@@ -1,9 +1,9 @@
 use opc_config_model::{
     ApplyPlan, ApplyPlanChange, ChangeImpact, ChangeImpactClass, CommitError, CommitErrorCode,
-    CommitMode, CommitRequest, CommitResult, CommitStatus, ConfigError, ConfigOperation,
-    ConfigWorkflowRequirement, IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget,
-    TransportType, TrustedPrincipal, ValidationContext, ValidationError, WorkloadIdentity,
-    YangPath, FORBIDDEN_LIVE_REQUIRES_MAINTENANCE_WORKFLOW,
+    CommitMode, CommitRequest, CommitResult, CommitStatus, CommittedConfigRevision, ConfigError,
+    ConfigOperation, ConfigWorkflowRequirement, IdempotencyKey, OpcConfig, RequestId,
+    RequestSource, RollbackTarget, TransportType, TrustedPrincipal, ValidationContext,
+    ValidationError, WorkloadIdentity, YangPath, FORBIDDEN_LIVE_REQUIRES_MAINTENANCE_WORKFLOW,
 };
 use opc_types::{ConfigVersion, SchemaDigest, TenantId, TxId};
 use std::{str::FromStr, time::Instant};
@@ -132,6 +132,10 @@ fn public_types_round_trip_through_serde() {
         new_version: Some(ConfigVersion::new(8)),
         status: CommitStatus::Committed,
         changed_paths: vec![YangPath::new("/interfaces/interface[name='n1']").expect("path")],
+        committed_revision: Some(CommittedConfigRevision::new(
+            ConfigVersion::new(8),
+            [0xa5; 32],
+        )),
         apply_plan: None,
     };
 
@@ -139,6 +143,13 @@ fn public_types_round_trip_through_serde() {
     let round: CommitResult = serde_json::from_str(&json).expect("deserialize commit result");
 
     assert_eq!(round, result);
+    assert_eq!(
+        round
+            .committed_revision
+            .expect("committed revision")
+            .content_hash_hex(),
+        "a5".repeat(32)
+    );
 }
 
 #[test]

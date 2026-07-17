@@ -841,6 +841,43 @@ impl<C: OpcConfig> CommitRequest<C> {
     }
 }
 
+/// Exact revision durably committed by a config mutation.
+///
+/// For the built-in encrypted datastore, `content_hash` covers the complete
+/// versioned plaintext envelope: its format marker, config serialization,
+/// request source, idempotency key, apply plan, request fingerprint, and
+/// request ID. It is the persisted record's integrity digest, not a hash of
+/// the naked config model, and must not be used as a config-equality token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedConfigRevision {
+    /// Monotonic running-config version assigned by the commit worker.
+    pub version: ConfigVersion,
+    /// SHA-256 digest of the exact plaintext envelope persisted for this
+    /// revision.
+    pub content_hash: [u8; 32],
+}
+
+impl CommittedConfigRevision {
+    /// Builds a revision from the durable version and plaintext digest.
+    pub const fn new(version: ConfigVersion, content_hash: [u8; 32]) -> Self {
+        Self {
+            version,
+            content_hash,
+        }
+    }
+
+    /// Returns the lowercase hexadecimal SHA-256 digest.
+    pub fn content_hash_hex(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(self.content_hash.len() * 2);
+        for byte in self.content_hash {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+}
+
 /// Commit result returned after validation, persistence, and publication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitResult {
@@ -849,6 +886,11 @@ pub struct CommitResult {
     pub new_version: Option<ConfigVersion>,
     pub status: CommitStatus,
     pub changed_paths: Vec<YangPath>,
+    /// Exact durable revision, when the datastore can attest its plaintext
+    /// digest. Absent for validate-only results and legacy/custom datastores
+    /// that do not return a digest receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_revision: Option<CommittedConfigRevision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply_plan: Option<ApplyPlan>,
 }
