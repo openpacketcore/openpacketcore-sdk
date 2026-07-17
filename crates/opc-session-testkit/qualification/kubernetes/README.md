@@ -78,7 +78,8 @@ printf '%s\n' '{"command":"probe"}' | kubectl exec -i POD -- \
   /var/lib/opc-session-qualification/control/node.sock
 ```
 
-The bounded external runner automates only the fresh readiness-probe slice:
+The bounded external runner automates the deployed sequential lease/fence/CAS
+slice plus fresh readiness sampling:
 
 ```console
 cargo run --locked -p opc-session-testkit \
@@ -91,19 +92,62 @@ cargo run --locked -p opc-session-testkit \
   --output-directory /var/lib/opc-qualification/candidate-readiness-001
 ```
 
+`--history-id` is a run nonce, not a reusable campaign label. Supply a unique
+value for every attempt, including retries after cancellation or uncertain
+delivery. The runner derives a domain-separated bounded scope from it and
+namespaces every durable key, owner, schedule/history ID, operation ID, and
+lease handle. This keeps retained PVC contents and a still-running node's local
+handle table disjoint across attempts without exposing the source identifier in
+the v1 durable workload.
+
 The destination must be a new absolute direct child of an existing canonical
 directory and use the same bounded identifier alphabet for its final name. The
-runner writes a private, atomically published
-`transcript.jsonl`, `readiness-v3-fragment.jsonl`, and digest-binding
-`summary.json`; it never overwrites a prior run. Each sample invokes the
-same-binary client through `kubectl exec`, admits only the exact typed
+runner writes a private, atomically published `transcript.jsonl`,
+`schedule-v1.jsonl`, `history-v1.jsonl`,
+`readiness-v3-fragment.jsonl`, and digest-binding `summary.json`; it never
+overwrites a prior run. It first requires one complete fresh all-member
+readiness baseline. It then executes the same frozen 15-operation schedule as
+the local multiprocess foundation: lease expiry and reacquisition, explicit
+lease handoff, fenced CAS generations, cross-Pod reads, one expected stale
+fence rejection, and final release/read. Every operation runs on its
+schedule-designated Pod and is followed by a complete all-member readiness
+sample. `--rounds` retains the configured number of complete fleet sampling
+rounds (including the baseline); the 15 post-operation rounds are additional
+and included in the global 10,000-sample bound.
+
+The deployed long lease is not the local foundation's 60-second value. It is
+checked from the admitted serialized subprocess envelope: after op 8 returns,
+the five-member op-8-through-op-14 path contains 66 bounded `kubectl` calls at
+50 seconds each. Two additional command-deadline windows provide explicit
+margin for acquisition-response delivery, scheduler overhead, and the bounded
+cancel-and-reap path, while a hard sequential-phase deadline admits only the
+exact post-acquisition envelope. The three-member calculation uses the same
+formula. Both remain below `MAX_SESSION_TTL`; the 1.2-second expiry and
+1.6-second wait used by the opening expiry/reacquisition proof are unchanged.
+
+Each command invokes the same-binary client through `kubectl exec`. A mutating
+command is sent once only: timeout, cancellation, malformed output, or any
+other missing terminal reply is recorded as `indeterminate`, aborts the
+campaign, and is never retried. Readiness samples admit only the exact typed
 Openraft barrier report for that Pod's stable local identity and the complete
-rendered voter-ID set, and patches only the custom Pod condition through the
+rendered voter-ID set, then patch only the custom Pod condition through the
 status subresource. A listener, successful exec, or process liveness is never
 sufficient. The runner resets all conditions before the first sample, latches
 and aborts on the first missing, malformed, contradictory, oversized,
 timed-out, or failed reply, then attempts an all-false final cleanup. A later
 sample can never republish `True` after a failure.
+
+Before the final Pod-condition cleanup, the runner sends one typed idempotent
+process-local `forget_lease` command for every acquisition command it invoked,
+including an acquisition whose reply was ambiguous. This drops only the local
+guard handle; it does not release, retry, or otherwise mutate the durable
+lease. Cleanup ambiguity is recorded once, never retried, and fails the
+campaign. Consequently successful retained-process campaigns return the local
+handle table to its pre-run cardinality instead of consuming the fixed 1,024
+handle bound. If a runner or host dies before cleanup, the node reclaims expired
+handles before the next acquisition and retains only the newest four released
+handles needed by the fixed stale-fence schedule, so crash residue cannot grow
+without bound.
 
 The custom condition is an external evidence gate, not the freshness
 authority. Kubernetes combines it with the container's generated exec
@@ -132,13 +176,22 @@ cleanup, so a deployment owner must still reset the external evidence gate
 before reusing a fleet; safety does not depend on that cleanup because kubelet's
 local UDS probe independently self-expires container readiness.
 
-The v3 file is deliberately a readiness-only fragment. It must be combined
-with real batch, watch, and restore operations from the same campaign and have
-its full operation count rebound before the independent v3 checker is run.
-The runner produces no v1 sequential workload history and its summary keeps
-`experimental`, `qualification_complete`, and `counts_for_production` fixed to
-`true`, `false`, and `false`. It therefore closes no #143 acceptance gate by
-itself.
+The emitted v1 schedule/history pair is directly consumable by
+`scripts/check-session-ha-history.py`; its history contains only digest-safe
+keys, owners, and values. Artifact publication does not trust an in-memory
+status or completion flag: it reconstructs the scoped canonical schedule,
+replays the exact sequential transcript into the history builder, validates
+the contiguous prefix and every readiness/cleanup phase, and derives status
+and completion before creating the destination. Empty, reordered, duplicated,
+substituted, or mismatched evidence fails closed. The v3 file remains
+deliberately a readiness-only fragment. It must be combined with real batch,
+watch, and restore operations from the same campaign and have its full
+operation count rebound before the independent v3 checker is run. The summary
+keeps `experimental`,
+`qualification_complete`, and `counts_for_production` fixed to `true`,
+`false`, and `false`. This sequential slice therefore does not claim the
+remaining #143 fault, concurrency, platform, HKMS, alerting, or signed-release
+acceptance by itself.
 
 The rendered ServiceAccount remains tokenless and the manifest grants no RBAC
 or controller identity. Kubernetes authorization to use `pods/exec` for this

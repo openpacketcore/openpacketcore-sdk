@@ -1,5 +1,5 @@
-//! Bounded external Kubernetes readiness campaign for the session-HA
-//! candidate profile.
+//! Bounded external Kubernetes sequential-HA campaign for the experimental
+//! session-HA candidate profile.
 
 use std::env;
 use std::path::PathBuf;
@@ -67,7 +67,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    match outcome.status {
+    match outcome.status() {
         QualificationKubernetesCampaignStatus::Passed => {}
         QualificationKubernetesCampaignStatus::Failed => {
             eprintln!("qualification Kubernetes campaign failed closed");

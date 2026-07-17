@@ -114,10 +114,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container stdin, and retains a tokenless ServiceAccount without adding RBAC,
   ports, identities, or controller authority. Kubernetes `pods/exec` access to
   the client is node-administrator-equivalent qualification authority.
-- **Bounded Kubernetes readiness campaign — `opc-session-testkit`:** a new
+- **Bounded Kubernetes sequential-HA campaign — `opc-session-testkit`:** the
   candidate-only external runner drives the private same-binary control client
-  with direct, time/output-bounded `kubectl` processes, continuously updates
-  the custom Pod condition only from strict fresh Openraft barrier replies,
+  with direct, time/output-bounded `kubectl` processes. After a fresh
+  all-member readiness baseline it executes the shared frozen 15-operation
+  lease/fence/CAS/read schedule once across designated Pods, sampling every
+  member after each operation. Ambiguous mutations are recorded as
+  indeterminate and never retried. Each operator-supplied unique history ID
+  derives a domain-separated bounded namespace for the durable keys, owners,
+  schedule ID, operation IDs, and lease handles, so retained PVCs and live
+  node processes can run later campaigns without colliding. The long lease is
+  checked from the exact 3/5-node serialized `kubectl` envelope (66 calls after
+  the five-node op-8 acquisition through op-14 release), two command-deadline
+  margins, and a hard phase deadline limited to that exact envelope; the short
+  expiry proof remains unchanged. A typed, idempotent local cleanup command
+  reclaims every invoked acquisition handle once, including ambiguous
+  acquisitions, without replaying a durable lease mutation. Before each
+  acquisition the node also reclaims expired crash residue and bounds released
+  stale-probe retention to the newest four handles. It updates the custom Pod
+  condition only from strict fresh Openraft barrier replies,
   resets all conditions before sampling, latches the first failure, and
   attempts all-false cleanup. A kubelet exec probe independently validates the
   exact local and fleet identities over the private UDS with layered deadlines,
@@ -127,10 +142,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded all-false cleanup. Exact voter IDs are additive and optional on
   decode: legacy readiness replies remain readable but cannot authorize the
   exact-ID Kubernetes gates.
-  It atomically publishes private digest-bound command/reply and readiness-v3
-  fragment artifacts without adding a port, token, or RBAC to the fleet. The
-  fragment intentionally omits v1 workload and v3 batch/watch/restore evidence,
-  so #143 and every production-qualification gate remain open.
+  It atomically publishes a private command/reply transcript, frozen v1
+  schedule/history pair, readiness-v3 fragment, summary, and exact digests
+  without adding a port, token, or RBAC to the fleet. The v1 pair is directly
+  consumable by the independent sequential checker. Before publication, a
+  sealed outcome is independently revalidated against the canonical scoped
+  schedule, exact contiguous history prefix, transcript phase/order, readiness
+  rows, cleanup results, and derived completion/status; caller-forged claims
+  fail before a destination is created. The v3 fragment still omits
+  batch/watch/restore and real fault/platform evidence, so the profile remains
+  experimental and #143 production qualification remains open.
 - **Canonical 3GPP TFT codec — `opc-proto-tft`:** one shared, bounded TS 24.008
   V18.8.0 value model now covers every operation, parameter, and Release 18
   packet-filter component for GTPv2-C Bearer TFT IEs and IKEv2 TFT Notify

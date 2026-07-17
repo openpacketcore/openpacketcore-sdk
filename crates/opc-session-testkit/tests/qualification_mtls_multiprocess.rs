@@ -1897,6 +1897,7 @@ enum PendingCommandKind {
     CompareAndSet,
     Get,
     Release,
+    ForgetLease,
     Shutdown,
 }
 
@@ -1929,6 +1930,7 @@ impl PendingCommandKind {
             QualificationNodeCommand::CompareAndSet { .. } => Self::CompareAndSet,
             QualificationNodeCommand::Get { .. } => Self::Get,
             QualificationNodeCommand::Release { .. } => Self::Release,
+            QualificationNodeCommand::ForgetLease { .. } => Self::ForgetLease,
             QualificationNodeCommand::Shutdown => Self::Shutdown,
         }
     }

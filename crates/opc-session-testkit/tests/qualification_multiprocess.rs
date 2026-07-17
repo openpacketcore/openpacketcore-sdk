@@ -14,12 +14,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use opc_session_testkit::qualification::{
-    qualification_key_sha256, qualification_owner_sha256, qualification_value_sha256,
     read_bounded_json_line, write_json_line, QualificationMember, QualificationNodeCommand,
     QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
     QualificationReadinessCode, QualificationTransportConfig, SessionHaQualificationProfile,
     QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
     SESSION_HA_EVIDENCE_SCHEMA_JSON, SESSION_HA_PROFILE_JSON,
+};
+use opc_session_testkit::qualification_sequential::{
+    qualification_sequential_workload, QualificationSequentialHistoryBuilder,
+    QualificationSequentialInvocation as ScheduledInvocation,
+    QualificationSequentialOperation as ScheduledOperation,
+    QUALIFICATION_LEASE_EXPIRY_WAIT as LEASE_EXPIRY_WAIT,
+    QUALIFICATION_LONG_LEASE_MILLIS as LONG_LEASE_MILLIS,
+    QUALIFICATION_SHORT_LEASE_MILLIS as SHORT_LEASE_MILLIS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -31,9 +38,6 @@ const CHILD_START_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 const FLEET_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const LEASE_EXPIRY_WAIT: Duration = Duration::from_millis(1_600);
-const SHORT_LEASE_MILLIS: u64 = 1_200;
-const LONG_LEASE_MILLIS: u64 = 60_000;
 const MAX_DATABASE_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PROVENANCE_COMMAND_BYTES: usize = 16 * 1024;
 const EVIDENCE_OUTPUT_DIRECTORY_ENV: &str = "OPC_SESSION_HA_EVIDENCE_DIR";
@@ -310,232 +314,8 @@ fn checker_stage_error(stage: HarnessStage, checker: CheckerDiagnostic) -> Harne
     ))
 }
 
-#[derive(Clone, Serialize)]
-struct ScheduledInvocation {
-    schema_version: &'static str,
-    schedule_id: String,
-    operation_index: usize,
-    schedule_operation_count: usize,
-    operation_id: String,
-    process_id: String,
-    operation: ScheduledOperation,
-}
-
-impl ScheduledInvocation {
-    fn node_index(&self) -> Result<usize, HarnessError> {
-        self.process_id
-            .strip_prefix("node-")
-            .and_then(|value| value.parse().ok())
-            .ok_or(HarnessError::Protocol)
-    }
-
-    fn command(&self) -> QualificationNodeCommand {
-        match &self.operation {
-            ScheduledOperation::LeaseAcquire {
-                key,
-                owner,
-                ttl_millis,
-            } => QualificationNodeCommand::Acquire {
-                lease_handle: self.operation_id.clone(),
-                stable_id: key.clone(),
-                owner: owner.clone(),
-                ttl_millis: *ttl_millis,
-            },
-            ScheduledOperation::CompareAndSet {
-                key,
-                lease_operation_id,
-                expected_generation,
-                new_generation,
-                value,
-            } => QualificationNodeCommand::CompareAndSet {
-                lease_handle: lease_operation_id.clone(),
-                stable_id: key.clone(),
-                expected_generation: *expected_generation,
-                new_generation: *new_generation,
-                value: value.clone(),
-            },
-            ScheduledOperation::Read { key } => QualificationNodeCommand::Get {
-                stable_id: key.clone(),
-            },
-            ScheduledOperation::LeaseRelease {
-                lease_operation_id, ..
-            } => QualificationNodeCommand::Release {
-                lease_handle: lease_operation_id.clone(),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ScheduledOperation {
-    LeaseAcquire {
-        key: String,
-        owner: String,
-        ttl_millis: u64,
-    },
-    CompareAndSet {
-        key: String,
-        lease_operation_id: String,
-        expected_generation: Option<u64>,
-        new_generation: u64,
-        value: String,
-    },
-    Read {
-        key: String,
-    },
-    LeaseRelease {
-        key: String,
-        lease_operation_id: String,
-    },
-}
-
-impl ScheduledOperation {
-    fn key(&self) -> &str {
-        match self {
-            Self::LeaseAcquire { key, .. }
-            | Self::CompareAndSet { key, .. }
-            | Self::Read { key }
-            | Self::LeaseRelease { key, .. } => key,
-        }
-    }
-}
-
 fn workload(member_count: usize) -> Vec<ScheduledInvocation> {
-    let schedule_id = format!("session-ha-{member_count}-process-foundation");
-    let operations = vec![
-        (
-            1,
-            ScheduledOperation::LeaseAcquire {
-                key: "session-expiry".to_owned(),
-                owner: "owner-expiry-a".to_owned(),
-                ttl_millis: SHORT_LEASE_MILLIS,
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::LeaseAcquire {
-                key: "session-expiry".to_owned(),
-                owner: "owner-expiry-b".to_owned(),
-                ttl_millis: LONG_LEASE_MILLIS,
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::LeaseRelease {
-                key: "session-expiry".to_owned(),
-                lease_operation_id: "op-2".to_owned(),
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::LeaseAcquire {
-                key: "session-a".to_owned(),
-                owner: "owner-a".to_owned(),
-                ttl_millis: LONG_LEASE_MILLIS,
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::CompareAndSet {
-                key: "session-a".to_owned(),
-                lease_operation_id: "op-4".to_owned(),
-                expected_generation: None,
-                new_generation: 1,
-                value: "qualification-value-1".to_owned(),
-            },
-        ),
-        (
-            2,
-            ScheduledOperation::Read {
-                key: "session-a".to_owned(),
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::LeaseRelease {
-                key: "session-a".to_owned(),
-                lease_operation_id: "op-4".to_owned(),
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::LeaseAcquire {
-                key: "session-a".to_owned(),
-                owner: "owner-b".to_owned(),
-                ttl_millis: LONG_LEASE_MILLIS,
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::CompareAndSet {
-                key: "session-a".to_owned(),
-                lease_operation_id: "op-8".to_owned(),
-                expected_generation: Some(1),
-                new_generation: 2,
-                value: "qualification-value-2".to_owned(),
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::CompareAndSet {
-                key: "session-a".to_owned(),
-                lease_operation_id: "op-4".to_owned(),
-                expected_generation: Some(2),
-                new_generation: 3,
-                value: "qualification-stale-value".to_owned(),
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::Read {
-                key: "session-a".to_owned(),
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::CompareAndSet {
-                key: "session-a".to_owned(),
-                lease_operation_id: "op-8".to_owned(),
-                expected_generation: Some(2),
-                new_generation: 3,
-                value: "qualification-value-3".to_owned(),
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::Read {
-                key: "session-a".to_owned(),
-            },
-        ),
-        (
-            1,
-            ScheduledOperation::LeaseRelease {
-                key: "session-a".to_owned(),
-                lease_operation_id: "op-8".to_owned(),
-            },
-        ),
-        (
-            2,
-            ScheduledOperation::Read {
-                key: "session-a".to_owned(),
-            },
-        ),
-    ];
-    let count = operations.len();
-    operations
-        .into_iter()
-        .enumerate()
-        .map(|(offset, (node_index, operation))| ScheduledInvocation {
-            schema_version: "opc-session-ha-schedule/v1",
-            schedule_id: schedule_id.clone(),
-            operation_index: offset + 1,
-            schedule_operation_count: count,
-            operation_id: format!("op-{}", offset + 1),
-            process_id: format!("node-{node_index}"),
-            operation,
-        })
-        .collect()
+    qualification_sequential_workload(member_count).expect("fixed supported topology")
 }
 
 fn write_schedule(path: &Path, schedule: &[ScheduledInvocation]) -> Result<String, HarnessError> {
@@ -2602,35 +2382,19 @@ impl Drop for Fleet {
     }
 }
 
-#[derive(Clone)]
-struct LeaseEvidence {
-    owner: String,
-    fence: u64,
-}
-
 struct HistoryWriter {
     file: File,
-    schedule_sha256: String,
-    history_id: String,
-    operation_count: usize,
     epoch: Instant,
-    leases: HashMap<String, LeaseEvidence>,
+    history: QualificationSequentialHistoryBuilder,
 }
 
 impl HistoryWriter {
-    fn new(
-        path: &Path,
-        schedule_sha256: String,
-        history_id: String,
-        operation_count: usize,
-    ) -> Result<Self, HarnessError> {
+    fn new(path: &Path, schedule: &[ScheduledInvocation]) -> Result<Self, HarnessError> {
         Ok(Self {
             file: open_private_file(path, false)?,
-            schedule_sha256,
-            history_id,
-            operation_count,
             epoch: Instant::now(),
-            leases: HashMap::new(),
+            history: QualificationSequentialHistoryBuilder::new(schedule)
+                .map_err(|_| HarnessError::Evidence)?,
         })
     }
 
@@ -2645,160 +2409,16 @@ impl HistoryWriter {
         completed_ns: u64,
         reply: Option<&QualificationNodeReply>,
     ) -> Result<(), HarnessError> {
-        let operation = self.history_operation(scheduled, reply)?;
-        let history = json!({
-            "schema_version": "opc-session-ha-history/v1",
-            "schedule_sha256": &self.schedule_sha256,
-            "history_id": &self.history_id,
-            "operation_index": scheduled.operation_index,
-            "history_operation_count": self.operation_count,
-            "operation_id": &scheduled.operation_id,
-            "process_id": &scheduled.process_id,
-            "started_ns": started_ns,
-            "completed_ns": completed_ns,
-            "operation": operation,
-        });
-        serde_json::to_writer(&mut self.file, &history).map_err(|_| HarnessError::Evidence)?;
+        let observation = self
+            .history
+            .observe(scheduled, started_ns, completed_ns, reply)
+            .map_err(|_| HarnessError::Evidence)?;
+        serde_json::to_writer(&mut self.file, &observation.history)
+            .map_err(|_| HarnessError::Evidence)?;
         self.file.write_all(b"\n")?;
         self.file.flush()?;
         self.file.sync_data()?;
         Ok(())
-    }
-
-    fn history_operation(
-        &mut self,
-        scheduled: &ScheduledInvocation,
-        reply: Option<&QualificationNodeReply>,
-    ) -> Result<Value, HarnessError> {
-        let key_sha256 = qualification_key_sha256(scheduled.operation.key());
-        match &scheduled.operation {
-            ScheduledOperation::LeaseAcquire { owner, .. } => {
-                let (outcome, fence) = match reply {
-                    Some(QualificationNodeReply::LeaseAcquired { fence }) => {
-                        self.leases.insert(
-                            scheduled.operation_id.clone(),
-                            LeaseEvidence {
-                                owner: owner.clone(),
-                                fence: *fence,
-                            },
-                        );
-                        ("success", Some(*fence))
-                    }
-                    Some(QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::LeaseRejected,
-                    }) => ("rejected", None),
-                    Some(QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::BackendUnavailable,
-                    }) => ("unavailable", None),
-                    _ => ("indeterminate", None),
-                };
-                Ok(json!({
-                    "kind": "lease_acquire",
-                    "key_sha256": key_sha256,
-                    "owner_sha256": qualification_owner_sha256(owner),
-                    "outcome": outcome,
-                    "fence": fence,
-                }))
-            }
-            ScheduledOperation::CompareAndSet {
-                lease_operation_id,
-                expected_generation,
-                new_generation,
-                value,
-                ..
-            } => {
-                let lease = self
-                    .leases
-                    .get(lease_operation_id)
-                    .ok_or(HarnessError::Evidence)?;
-                let outcome = match reply {
-                    Some(QualificationNodeReply::CompareAndSet { applied: true, .. }) => "success",
-                    Some(QualificationNodeReply::CompareAndSet { applied: false, .. }) => {
-                        "conflict"
-                    }
-                    Some(QualificationNodeReply::Error {
-                        code:
-                            QualificationNodeErrorCode::MutationRejected
-                            | QualificationNodeErrorCode::LeaseRejected,
-                    }) => "rejected",
-                    Some(QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::BackendUnavailable,
-                    }) => "unavailable",
-                    _ => "indeterminate",
-                };
-                Ok(json!({
-                    "kind": "compare_and_set",
-                    "key_sha256": key_sha256,
-                    "owner_sha256": qualification_owner_sha256(&lease.owner),
-                    "fence": lease.fence,
-                    "expected_generation": expected_generation,
-                    "new_generation": new_generation,
-                    "value_sha256": qualification_value_sha256(value.as_bytes()),
-                    "outcome": outcome,
-                }))
-            }
-            ScheduledOperation::Read { .. } => {
-                let (outcome, record) = match reply {
-                    Some(QualificationNodeReply::Record {
-                        present: true,
-                        generation: Some(generation),
-                        owner_sha256: Some(owner_sha256),
-                        fence: Some(fence),
-                        value_sha256: Some(value_sha256),
-                    }) => (
-                        "success",
-                        Some(json!({
-                            "generation": generation,
-                            "owner_sha256": owner_sha256,
-                            "fence": fence,
-                            "value_sha256": value_sha256,
-                        })),
-                    ),
-                    Some(QualificationNodeReply::Record {
-                        present: false,
-                        generation: None,
-                        owner_sha256: None,
-                        fence: None,
-                        value_sha256: None,
-                    }) => ("success", None),
-                    Some(QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::BackendUnavailable,
-                    }) => ("unavailable", None),
-                    _ => ("indeterminate", None),
-                };
-                Ok(json!({
-                    "kind": "read",
-                    "key_sha256": key_sha256,
-                    "outcome": outcome,
-                    "record": record,
-                }))
-            }
-            ScheduledOperation::LeaseRelease {
-                lease_operation_id, ..
-            } => {
-                let lease = self
-                    .leases
-                    .get(lease_operation_id)
-                    .ok_or(HarnessError::Evidence)?;
-                let outcome = match reply {
-                    Some(QualificationNodeReply::Released) => "success",
-                    Some(QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::LeaseRejected,
-                    }) => "rejected",
-                    Some(QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::BackendUnavailable,
-                    }) => "unavailable",
-                    _ => "indeterminate",
-                };
-                Ok(json!({
-                    "kind": "lease_release",
-                    "key_sha256": key_sha256,
-                    "owner_sha256": qualification_owner_sha256(&lease.owner),
-                    "fence": lease.fence,
-                    "outcome": outcome,
-                }))
-            }
-        }
     }
 }
 
@@ -2808,7 +2428,10 @@ fn invoke_and_record(
     scheduled: &ScheduledInvocation,
 ) -> Result<QualificationNodeReply, HarnessError> {
     let started_ns = at_stage(history.now_ns(), HarnessStage::HistoryEvidence)?;
-    let node_index = at_stage(scheduled.node_index(), HarnessStage::HistoryEvidence)?;
+    let node_index = at_stage(
+        scheduled.member_index().map_err(|_| HarnessError::Protocol),
+        HarnessStage::HistoryEvidence,
+    )?;
     let reply = fleet.invoke(node_index, &scheduled.command());
     let completed_ns = at_stage(history.now_ns(), HarnessStage::HistoryEvidence)?;
     at_stage(
@@ -2889,12 +2512,7 @@ fn run_foundation(member_count: usize) -> Result<(), HarnessError> {
         HarnessStage::ConfigurationEvidence,
     )?;
     let mut history = at_stage(
-        HistoryWriter::new(
-            &history_path,
-            schedule_sha256.clone(),
-            schedule[0].schedule_id.clone(),
-            schedule.len(),
-        ),
+        HistoryWriter::new(&history_path, &schedule),
         HarnessStage::HistoryEvidence,
     )?;
 
