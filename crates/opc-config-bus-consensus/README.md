@@ -194,14 +194,14 @@ Strict operational requirements:
   and 2 remain replayable only under their original semantics; there is no
   mixed-revision downgrade.
 
-The broader multi-group failure and restart qualification tracked by issue
-`#250` remains required before this crate's source-build-only status can be
-reconsidered. The frozen v2 and v4 session-HA candidate profiles deliberately
+The broader multi-group failure and restart qualification tracked by
+`GAP-001-006` remains required before this crate's source-build-only status can
+be reconsidered. The frozen v2 and v4 session-HA candidate profiles deliberately
 remain byte-identical and therefore retain their historical 26-crate closure;
 they do not claim qualification for this adapter. A locked Cargo-metadata test
 checks the current 27-crate source-build closure independently. An additive
-follow-up qualification change under #250 must introduce candidate evidence
-before this adapter can inherit a session-HA qualification claim.
+follow-up qualification change must introduce candidate evidence before this
+adapter can inherit a session-HA qualification claim.
 
 The remote qualification uses real TCP and mutual TLS to prove fresh recovery,
 lagging catch-up, exact identity and scope rejection, wrong-ALPN rejection,
