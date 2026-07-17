@@ -8,7 +8,8 @@
 //! mechanism that is safe to expose as an SDK primitive today: fixed-header
 //! decode/encode, raw-preserving generic payload-chain walking for unencrypted
 //! payloads, protected-payload boundary metadata, caller-owned crypto provider
-//! traits, narrow IKE_SA_INIT key-agreement/key-derivation material,
+//! traits, typed executable IKE-SA profiles, PRF-HMAC-SHA2-256/384/512, initial
+//! and rekey IKE-SA key-agreement/key-derivation material,
 //! bounded notify-only IKE_SA_INIT error responses,
 //! caller-keyed SA_INIT AES-GCM protected-payload open/seal helpers, typed
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
@@ -198,9 +199,10 @@ pub use sa_init::{
     Ikev2VendorIdPayloadError,
 };
 pub use sa_init_crypto::{
-    derive_child_sa_key_material, derive_ike_sa_init_key_material, Ikev2ChildSaCryptoProfile,
-    Ikev2ChildSaKeyMaterial, Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey,
-    Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
+    derive_child_sa_key_material, derive_ike_sa_init_key_material,
+    derive_ike_sa_rekey_key_material, Ikev2ChildSaCryptoProfile, Ikev2ChildSaKeyMaterial,
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2IntegrityAlgorithm,
+    Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
     Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
 };
 

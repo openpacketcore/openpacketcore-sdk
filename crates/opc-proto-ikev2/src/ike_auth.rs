@@ -12,7 +12,7 @@ use std::{error::Error, fmt};
 
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Sha384};
+use sha2::{Sha256, Sha384, Sha512};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -2043,6 +2043,12 @@ fn ike_auth_prf(
             mac.update(data);
             Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
         }
+        Ikev2PrfAlgorithm::HmacSha2_512 => {
+            let mut mac = Hmac::<Sha512>::new_from_slice(key)
+                .map_err(|_| Ikev2IkeAuthVerificationError::PrfKeyInvalid { len: key.len() })?;
+            mac.update(data);
+            Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
+        }
     }
 }
 
@@ -2455,5 +2461,19 @@ mod tests {
             };
 
         assert_eq!(output.len(), Ikev2PrfAlgorithm::HmacSha2_256.output_len());
+
+        let sha512: Zeroizing<Vec<u8>> =
+            match ike_auth_prf(Ikev2PrfAlgorithm::HmacSha2_512, &[0x0b; 20], b"Hi There") {
+                Ok(output) => output,
+                Err(error) => panic!("unexpected SHA-512 PRF error: {error:?}"),
+            };
+        assert_eq!(sha512.len(), 64);
+        assert_eq!(
+            &sha512[..16],
+            &[
+                0x87, 0xaa, 0x7c, 0xde, 0xa5, 0xef, 0x61, 0x9d, 0x4f, 0xf0, 0xb4, 0x24, 0x1a, 0x1d,
+                0x6c, 0xb0,
+            ]
+        );
     }
 }

@@ -39,19 +39,21 @@ struct ProtectedMessageShape {
 }
 
 fn profile_128() -> Ikev2SaInitCryptoProfile {
-    Ikev2SaInitCryptoProfile::new(
+    Ikev2SaInitCryptoProfile::new_aead(
         Ikev2PrfAlgorithm::HmacSha2_256,
         Ikev2DhGroup::Ecp256,
         Ikev2EncryptionAlgorithm::AesGcm16_128,
     )
+    .expect("valid AES-GCM-128 IKE profile")
 }
 
 fn profile_256() -> Ikev2SaInitCryptoProfile {
-    Ikev2SaInitCryptoProfile::new(
+    Ikev2SaInitCryptoProfile::new_aead(
         Ikev2PrfAlgorithm::HmacSha2_384,
         Ikev2DhGroup::Ecp384,
         Ikev2EncryptionAlgorithm::AesGcm16_256,
     )
+    .expect("valid AES-GCM-256 IKE profile")
 }
 
 fn key_material(profile: Ikev2SaInitCryptoProfile) -> opc_proto_ikev2::Ikev2SaInitKeyMaterial {

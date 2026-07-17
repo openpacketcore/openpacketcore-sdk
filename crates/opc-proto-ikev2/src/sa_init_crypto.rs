@@ -6,7 +6,8 @@
 //! does not own IKE SA state, authentication, EAP, Child SA installation,
 //! responder SPI allocation, retransmission, or ePDG/N3IWF policy.
 //!
-//! @spec IETF RFC7296 2.14, 3.3.2, 3.3.5; IETF RFC8784 2
+//! @spec IETF RFC7296 2.14, 2.17, 2.18, 3.3.2, 3.3.5; IETF RFC4868 2.6-2.7;
+//! IETF RFC8784 2
 //! @req REQ-IETF-RFC7296-SA-INIT-CRYPTO-MATERIAL-001
 
 use std::{error::Error, fmt};
@@ -23,7 +24,7 @@ use p256::{
 };
 use p384::{ecdh::EphemeralSecret as P384EphemeralSecret, PublicKey as P384PublicKey};
 use p521::{ecdh::EphemeralSecret as P521EphemeralSecret, PublicKey as P521PublicKey};
-use sha2::{Sha256, Sha384};
+use sha2::{Sha256, Sha384, Sha512};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -45,6 +46,7 @@ const ENCR_AES_CBC: u16 = 12;
 const ENCR_AES_GCM_16: u16 = 20;
 const PRF_HMAC_SHA2_256: u16 = 5;
 const PRF_HMAC_SHA2_384: u16 = 6;
+const PRF_HMAC_SHA2_512: u16 = 7;
 const INTEG_HMAC_SHA2_256_128: u16 = 12;
 const INTEG_HMAC_SHA2_384_192: u16 = 13;
 const INTEG_HMAC_SHA2_512_256: u16 = 14;
@@ -159,6 +161,8 @@ pub enum Ikev2PrfAlgorithm {
     HmacSha2_256,
     /// PRF_HMAC_SHA2_384, IKEv2 Transform ID 6.
     HmacSha2_384,
+    /// PRF_HMAC_SHA2_512, IKEv2 Transform ID 7.
+    HmacSha2_512,
 }
 
 impl Ikev2PrfAlgorithm {
@@ -172,6 +176,7 @@ impl Ikev2PrfAlgorithm {
         match transform_id {
             PRF_HMAC_SHA2_256 => Ok(Self::HmacSha2_256),
             PRF_HMAC_SHA2_384 => Ok(Self::HmacSha2_384),
+            PRF_HMAC_SHA2_512 => Ok(Self::HmacSha2_512),
             _ => Err(Ikev2SaInitCryptoError::UnsupportedPrf { transform_id }),
         }
     }
@@ -181,6 +186,7 @@ impl Ikev2PrfAlgorithm {
         match self {
             Self::HmacSha2_256 => PRF_HMAC_SHA2_256,
             Self::HmacSha2_384 => PRF_HMAC_SHA2_384,
+            Self::HmacSha2_512 => PRF_HMAC_SHA2_512,
         }
     }
 
@@ -189,6 +195,7 @@ impl Ikev2PrfAlgorithm {
         match self {
             Self::HmacSha2_256 => 32,
             Self::HmacSha2_384 => 48,
+            Self::HmacSha2_512 => 64,
         }
     }
 
@@ -197,6 +204,7 @@ impl Ikev2PrfAlgorithm {
         match self {
             Self::HmacSha2_256 => "HMAC-SHA2-256",
             Self::HmacSha2_384 => "HMAC-SHA2-384",
+            Self::HmacSha2_512 => "HMAC-SHA2-512",
         }
     }
 }
@@ -328,7 +336,7 @@ impl Ikev2EncryptionAlgorithm {
     }
 }
 
-/// IKEv2 ESP integrity algorithms for encrypt-then-MAC Child SAs.
+/// IKEv2 integrity algorithms for encrypt-then-MAC IKE and Child SAs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ikev2IntegrityAlgorithm {
     /// AUTH_HMAC_SHA2_256_128, IKEv2 Transform ID 12.
@@ -364,7 +372,7 @@ impl Ikev2IntegrityAlgorithm {
         }
     }
 
-    /// ESP integrity key length in octets.
+    /// Preferred integrity key length in octets.
     pub const fn key_len(self) -> usize {
         match self {
             Self::HmacSha2_256_128 => 32,
@@ -373,13 +381,18 @@ impl Ikev2IntegrityAlgorithm {
         }
     }
 
+    /// Truncated integrity checksum length in octets.
+    pub const fn icv_len(self) -> usize {
+        match self {
+            Self::HmacSha2_256_128 => 16,
+            Self::HmacSha2_384_192 => 24,
+            Self::HmacSha2_512_256 => 32,
+        }
+    }
+
     /// XFRM authentication truncation length in bits.
     pub const fn icv_len_bits(self) -> u32 {
-        match self {
-            Self::HmacSha2_256_128 => 128,
-            Self::HmacSha2_384_192 => 192,
-            Self::HmacSha2_512_256 => 256,
-        }
+        (self.icv_len() * 8) as u32
     }
 
     /// Exact Linux kernel XFRM algorithm name safe to copy into auth requests.
@@ -610,25 +623,53 @@ pub struct Ikev2SaInitCryptoProfile {
     prf: Ikev2PrfAlgorithm,
     dh_group: Ikev2DhGroup,
     encryption: Ikev2EncryptionAlgorithm,
-    integrity_key_len: usize,
+    integrity: Option<Ikev2IntegrityAlgorithm>,
 }
 
 impl Ikev2SaInitCryptoProfile {
-    /// Build a supported IKE_SA_INIT crypto profile from algorithms.
+    /// Build a supported combined-mode AEAD IKE-SA crypto profile.
     ///
-    /// AES-GCM profiles use zero integrity key length. Encrypt-then-MAC
-    /// profiles must carry the negotiated integrity key length.
-    pub const fn new(
+    /// # Errors
+    ///
+    /// Returns [`Ikev2SaInitCryptoError::MissingIntegrityTransform`] when
+    /// `encryption` is not an AEAD algorithm.
+    pub const fn new_aead(
         prf: Ikev2PrfAlgorithm,
         dh_group: Ikev2DhGroup,
         encryption: Ikev2EncryptionAlgorithm,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Ikev2SaInitCryptoError> {
+        if !encryption.is_aead() {
+            return Err(Ikev2SaInitCryptoError::MissingIntegrityTransform);
+        }
+        Ok(Self {
             prf,
             dh_group,
             encryption,
-            integrity_key_len: 0,
+            integrity: None,
+        })
+    }
+
+    /// Build a supported encrypt-then-MAC IKE-SA crypto profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2SaInitCryptoError::UnexpectedIntegrityTransform`] when
+    /// `encryption` is an AEAD algorithm.
+    pub const fn new_encrypt_then_mac(
+        prf: Ikev2PrfAlgorithm,
+        dh_group: Ikev2DhGroup,
+        encryption: Ikev2EncryptionAlgorithm,
+        integrity: Ikev2IntegrityAlgorithm,
+    ) -> Result<Self, Ikev2SaInitCryptoError> {
+        if encryption.is_aead() {
+            return Err(Ikev2SaInitCryptoError::UnexpectedIntegrityTransform);
         }
+        Ok(Self {
+            prf,
+            dh_group,
+            encryption,
+            integrity: Some(integrity),
+        })
     }
 
     /// Negotiated PRF algorithm.
@@ -646,16 +687,50 @@ impl Ikev2SaInitCryptoProfile {
         self.encryption
     }
 
+    /// Negotiated integrity algorithm, or `None` for combined-mode AEAD.
+    pub const fn integrity(self) -> Option<Ikev2IntegrityAlgorithm> {
+        self.integrity
+    }
+
     /// Integrity key length in octets.
     pub const fn integrity_key_len(self) -> usize {
-        self.integrity_key_len
+        match self.integrity {
+            Some(integrity) => integrity.key_len(),
+            None => 0,
+        }
+    }
+
+    /// Integrity checksum length in octets, or zero for combined-mode AEAD.
+    pub const fn integrity_icv_len(self) -> usize {
+        match self.integrity {
+            Some(integrity) => integrity.icv_len(),
+            None => 0,
+        }
+    }
+
+    /// Validate that every layer needed to protect IKE messages can execute
+    /// this profile.
+    ///
+    /// Profiles can only be obtained through validating constructors, so this
+    /// is primarily a configuration-validation boundary for consumers that
+    /// want an explicit startup capability check.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed crypto error if the profile is not executable.
+    pub const fn validate_executable(self) -> Result<(), Ikev2SaInitCryptoError> {
+        match (self.encryption.is_aead(), self.integrity) {
+            (true, None) | (false, Some(_)) => Ok(()),
+            (true, Some(_)) => Err(Ikev2SaInitCryptoError::UnexpectedIntegrityTransform),
+            (false, None) => Err(Ikev2SaInitCryptoError::MissingIntegrityTransform),
+        }
     }
 
     /// Build a profile from explicit IKEv2 Transform IDs.
     ///
     /// `encryption_key_bits` is the Key Length transform attribute for AES
-    /// transforms. AES-GCM profiles require `integrity_key_len == 0`; AES-CBC
-    /// profiles require a non-zero integrity key length.
+    /// transforms. `integrity_transform_id` must be `None` for AES-GCM and the
+    /// negotiated typed integrity Transform ID for AES-CBC.
     ///
     /// # Errors
     ///
@@ -666,7 +741,7 @@ impl Ikev2SaInitCryptoProfile {
         dh_transform_id: u16,
         encryption_transform_id: u16,
         encryption_key_bits: Option<u16>,
-        integrity_key_len: usize,
+        integrity_transform_id: Option<u16>,
     ) -> Result<Self, Ikev2SaInitCryptoError> {
         let prf = match Ikev2PrfAlgorithm::from_transform_id(prf_transform_id) {
             Ok(prf) => prf,
@@ -683,15 +758,15 @@ impl Ikev2SaInitCryptoProfile {
             Ok(encryption) => encryption,
             Err(error) => return Err(error),
         };
-        let profile = Self {
-            prf,
-            dh_group,
-            encryption,
-            integrity_key_len,
-        };
-        match (profile.encryption.is_aead(), profile.integrity_key_len) {
-            (true, 0) | (false, 1..) => Ok(profile),
-            _ => Err(Ikev2SaInitCryptoError::InconsistentTransformSet),
+        match integrity_transform_id {
+            Some(transform_id) => {
+                let integrity = match Ikev2IntegrityAlgorithm::from_transform_id(transform_id) {
+                    Ok(integrity) => integrity,
+                    Err(error) => return Err(error),
+                };
+                Self::new_encrypt_then_mac(prf, dh_group, encryption, integrity)
+            }
+            None => Self::new_aead(prf, dh_group, encryption),
         }
     }
 
@@ -708,7 +783,7 @@ impl Ikev2SaInitCryptoProfile {
         let mut prf = None;
         let mut dh_group = None;
         let mut encryption = None;
-        let mut integrity_key_len = None;
+        let mut integrity = None;
 
         for transform in transforms {
             match transform.transform_type {
@@ -730,13 +805,12 @@ impl Ikev2SaInitCryptoProfile {
                     )?);
                 }
                 TRANSFORM_TYPE_INTEG => {
-                    if integrity_key_len.is_some() {
+                    if integrity.is_some() {
                         return Err(Ikev2SaInitCryptoError::InconsistentTransformSet);
                     }
-                    integrity_key_len = Some(
-                        Ikev2IntegrityAlgorithm::from_transform_id(transform.transform_id)?
-                            .key_len(),
-                    );
+                    integrity = Some(Ikev2IntegrityAlgorithm::from_transform_id(
+                        transform.transform_id,
+                    )?);
                 }
                 TRANSFORM_TYPE_DH => {
                     if dh_group.is_some() {
@@ -744,18 +818,17 @@ impl Ikev2SaInitCryptoProfile {
                     }
                     dh_group = Some(Ikev2DhGroup::from_transform_id(transform.transform_id)?);
                 }
-                _ => {}
+                _ => return Err(Ikev2SaInitCryptoError::InconsistentTransformSet),
             }
         }
 
-        let profile = Self {
-            prf: prf.ok_or(Ikev2SaInitCryptoError::IncompleteTransformSet)?,
-            dh_group: dh_group.ok_or(Ikev2SaInitCryptoError::IncompleteTransformSet)?,
-            encryption: encryption.ok_or(Ikev2SaInitCryptoError::IncompleteTransformSet)?,
-            integrity_key_len: integrity_key_len.unwrap_or(0),
-        };
-        profile.validate_consistency()?;
-        Ok(profile)
+        let prf = prf.ok_or(Ikev2SaInitCryptoError::IncompleteTransformSet)?;
+        let dh_group = dh_group.ok_or(Ikev2SaInitCryptoError::IncompleteTransformSet)?;
+        let encryption = encryption.ok_or(Ikev2SaInitCryptoError::IncompleteTransformSet)?;
+        match integrity {
+            Some(integrity) => Self::new_encrypt_then_mac(prf, dh_group, encryption, integrity),
+            None => Self::new_aead(prf, dh_group, encryption),
+        }
     }
 
     /// Build a profile from a selected decoded SA Proposal substructure.
@@ -781,11 +854,12 @@ impl Ikev2SaInitCryptoProfile {
     /// Returns [`Ikev2SaInitCryptoError::KeyMaterialLimitOverflow`] if the
     /// profile lengths overflow `usize` or the RFC 7296 PRF+ counter limit.
     pub fn key_material_len(self) -> Result<usize, Ikev2SaInitCryptoError> {
-        self.validate_consistency()?;
+        self.validate_executable()?;
         let prf_len = self.prf.output_len();
+        let integrity_key_len = self.integrity_key_len();
         let total = prf_len
-            .checked_add(self.integrity_key_len)
-            .and_then(|value| value.checked_add(self.integrity_key_len))
+            .checked_add(integrity_key_len)
+            .and_then(|value| value.checked_add(integrity_key_len))
             .and_then(|value| value.checked_add(self.encryption.key_material_len()))
             .and_then(|value| value.checked_add(self.encryption.key_material_len()))
             .and_then(|value| value.checked_add(prf_len))
@@ -796,13 +870,6 @@ impl Ikev2SaInitCryptoProfile {
             })?;
         validate_prf_plus_limit(total, prf_len)?;
         Ok(total)
-    }
-
-    fn validate_consistency(self) -> Result<(), Ikev2SaInitCryptoError> {
-        match (self.encryption.is_aead(), self.integrity_key_len) {
-            (true, 0) | (false, 1..) => Ok(()),
-            _ => Err(Ikev2SaInitCryptoError::InconsistentTransformSet),
-        }
     }
 }
 
@@ -944,10 +1011,10 @@ impl Ikev2SaInitKeyMaterial {
         sk_pi: &[u8],
         sk_pr: &[u8],
     ) -> Result<Self, Ikev2SaInitCryptoError> {
-        profile.validate_consistency()?;
+        profile.validate_executable()?;
 
         let prf_len = profile.prf.output_len();
-        let integrity_key_len = profile.integrity_key_len;
+        let integrity_key_len = profile.integrity_key_len();
         let encryption_key_len = profile.encryption.key_material_len();
 
         validate_exact_key_len("SK_d", sk_d, prf_len)?;
@@ -1046,6 +1113,10 @@ pub enum Ikev2SaInitCryptoErrorCode {
     UnsupportedEncryptionKeyLength,
     /// Unsupported integrity Transform ID.
     UnsupportedIntegrityTransform,
+    /// Encrypt-then-MAC encryption omitted its required integrity transform.
+    MissingIntegrityTransform,
+    /// AEAD encryption supplied a prohibited separate integrity transform.
+    UnexpectedIntegrityTransform,
     /// Peer public value was invalid for the negotiated DH group.
     InvalidPeerPublicKey,
     /// Ephemeral key generation failed.
@@ -1078,6 +1149,10 @@ impl Ikev2SaInitCryptoErrorCode {
             }
             Self::UnsupportedIntegrityTransform => {
                 "ike_sa_init_crypto_unsupported_integrity_transform"
+            }
+            Self::MissingIntegrityTransform => "ike_sa_init_crypto_missing_integrity_transform",
+            Self::UnexpectedIntegrityTransform => {
+                "ike_sa_init_crypto_unexpected_integrity_transform"
             }
             Self::InvalidPeerPublicKey => "ike_sa_init_crypto_invalid_peer_public_key",
             Self::KeyGenerationFailed => "ike_sa_init_crypto_key_generation_failed",
@@ -1121,6 +1196,10 @@ pub enum Ikev2SaInitCryptoError {
         /// Unsupported Transform ID.
         transform_id: u16,
     },
+    /// Encrypt-then-MAC encryption omitted its required integrity transform.
+    MissingIntegrityTransform,
+    /// AEAD encryption supplied a prohibited separate integrity transform.
+    UnexpectedIntegrityTransform,
     /// Peer public value was invalid for the negotiated DH group.
     InvalidPeerPublicKey {
         /// Negotiated DH group.
@@ -1180,6 +1259,12 @@ impl Ikev2SaInitCryptoError {
             Self::UnsupportedIntegrityTransform { .. } => {
                 Ikev2SaInitCryptoErrorCode::UnsupportedIntegrityTransform
             }
+            Self::MissingIntegrityTransform => {
+                Ikev2SaInitCryptoErrorCode::MissingIntegrityTransform
+            }
+            Self::UnexpectedIntegrityTransform => {
+                Ikev2SaInitCryptoErrorCode::UnexpectedIntegrityTransform
+            }
             Self::InvalidPeerPublicKey { .. } => Ikev2SaInitCryptoErrorCode::InvalidPeerPublicKey,
             Self::KeyGenerationFailed { .. } => Ikev2SaInitCryptoErrorCode::KeyGenerationFailed,
             Self::KeyAgreementFailed { .. } => Ikev2SaInitCryptoErrorCode::KeyAgreementFailed,
@@ -1225,6 +1310,12 @@ impl fmt::Display for Ikev2SaInitCryptoError {
             }
             Self::UnsupportedIntegrityTransform { transform_id } => {
                 write!(f, "unsupported IKEv2 integrity transform ID {transform_id}")
+            }
+            Self::MissingIntegrityTransform => {
+                f.write_str("IKEv2 encryption requires a separate integrity transform")
+            }
+            Self::UnexpectedIntegrityTransform => {
+                f.write_str("IKEv2 AEAD encryption prohibits a separate integrity transform")
             }
             Self::InvalidPeerPublicKey { group, actual_len } => {
                 write!(
@@ -1303,6 +1394,76 @@ pub fn derive_ike_sa_init_key_material(
     split_key_stream(profile, skeyseed, key_stream, ppk)
 }
 
+/// Derive key material for an IKE SA created by an IKE-SA rekey exchange.
+///
+/// RFC 7296 section 2.18 deliberately uses two possibly different PRFs. The
+/// old IKE SA's negotiated PRF derives the new `SKEYSEED` from `SK_d (old)`,
+/// while the new IKE SA's negotiated PRF expands that `SKEYSEED` into the new
+/// seven-key stream. `new_dh_shared_secret` is mandatory for an IKE-SA rekey.
+///
+/// RFC 8784 PPK post-processing is not repeated during rekey. Quantum
+/// resistance, when present, is inherited through the old SA's already-mixed
+/// `SK_d` input.
+///
+/// # Errors
+///
+/// Returns [`Ikev2SaInitCryptoError`] when the new profile is not executable,
+/// `old_sk_d` does not match the old PRF's preferred key length, a nonce or
+/// the mandatory new DH secret is invalid, or PRF+ limits are exceeded.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_ike_sa_rekey_key_material(
+    old_prf: Ikev2PrfAlgorithm,
+    old_sk_d: &[u8],
+    new_profile: Ikev2SaInitCryptoProfile,
+    new_initiator_spi: [u8; IKE_SPI_LEN],
+    new_responder_spi: [u8; IKE_SPI_LEN],
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+    new_dh_shared_secret: &[u8],
+) -> Result<Ikev2SaInitKeyMaterial, Ikev2SaInitCryptoError> {
+    new_profile.validate_executable()?;
+    validate_exact_key_len("old SK_d", old_sk_d, old_prf.output_len())?;
+    validate_nonce("initiator", initiator_nonce)?;
+    validate_nonce("responder", responder_nonce)?;
+    validate_secret_input("new DH shared secret", new_dh_shared_secret)?;
+
+    let rekey_seed_len = new_dh_shared_secret
+        .len()
+        .checked_add(initiator_nonce.len())
+        .and_then(|len| len.checked_add(responder_nonce.len()))
+        .ok_or(Ikev2SaInitCryptoError::KeyMaterialLimitOverflow {
+            requested_len: usize::MAX,
+            prf_output_len: old_prf.output_len(),
+        })?;
+    let mut rekey_seed = Zeroizing::new(Vec::with_capacity(rekey_seed_len));
+    rekey_seed.extend_from_slice(new_dh_shared_secret);
+    rekey_seed.extend_from_slice(initiator_nonce);
+    rekey_seed.extend_from_slice(responder_nonce);
+    let skeyseed = prf(old_prf, old_sk_d, &rekey_seed)?;
+
+    let key_seed_len = initiator_nonce
+        .len()
+        .checked_add(responder_nonce.len())
+        .and_then(|len| len.checked_add(IKE_SPI_LEN * 2))
+        .ok_or(Ikev2SaInitCryptoError::KeyMaterialLimitOverflow {
+            requested_len: usize::MAX,
+            prf_output_len: new_profile.prf.output_len(),
+        })?;
+    let mut key_seed = Vec::with_capacity(key_seed_len);
+    key_seed.extend_from_slice(initiator_nonce);
+    key_seed.extend_from_slice(responder_nonce);
+    key_seed.extend_from_slice(&new_initiator_spi);
+    key_seed.extend_from_slice(&new_responder_spi);
+
+    let key_stream = prf_plus(
+        new_profile.prf,
+        &skeyseed,
+        &key_seed,
+        new_profile.key_material_len()?,
+    )?;
+    split_key_stream(new_profile, skeyseed, key_stream, None)
+}
+
 /// Derive Child SA KEYMAT from `SK_d` and Child SA nonces.
 ///
 /// Computes `prf+(SK_d, [g^ir(new) |] Ni | Nr)` and splits the output as
@@ -1355,7 +1516,7 @@ fn split_key_stream(
     ppk: Option<&[u8]>,
 ) -> Result<Ikev2SaInitKeyMaterial, Ikev2SaInitCryptoError> {
     let prf_len = profile.prf.output_len();
-    let integrity_key_len = profile.integrity_key_len;
+    let integrity_key_len = profile.integrity_key_len();
     let encryption_key_len = profile.encryption.key_material_len();
     let mut offset = 0;
     let mut take =
@@ -1512,6 +1673,16 @@ fn prf(
             mac.update(data);
             Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
         }
+        Ikev2PrfAlgorithm::HmacSha2_512 => {
+            let mut mac = Hmac::<Sha512>::new_from_slice(key).map_err(|_| {
+                Ikev2SaInitCryptoError::InvalidKeyLength {
+                    name: "PRF key",
+                    len: key.len(),
+                }
+            })?;
+            mac.update(data);
+            Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
+        }
     }
 }
 
@@ -1528,7 +1699,7 @@ fn prf_plus(
     let mut counter = 1u8;
 
     while out.len() < requested_len {
-        let mut input = Vec::with_capacity(previous.len() + seed.len() + 1);
+        let mut input = Zeroizing::new(Vec::with_capacity(previous.len() + seed.len() + 1));
         input.extend_from_slice(&previous);
         input.extend_from_slice(seed);
         input.push(counter);
@@ -1804,11 +1975,11 @@ mod tests {
     }
 
     fn base_profile(encryption: Ikev2EncryptionAlgorithm) -> Ikev2SaInitCryptoProfile {
-        Ikev2SaInitCryptoProfile::new(
+        must_ok(Ikev2SaInitCryptoProfile::new_aead(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2DhGroup::Ecp256,
             encryption,
-        )
+        ))
     }
 
     fn selected_transform_set() -> Vec<Ikev2SaTransform<'static>> {
@@ -1832,6 +2003,40 @@ mod tests {
                 attributes: Vec::new(),
             },
         ]
+    }
+
+    fn observed_cbc_sha512_transform_set(
+        integrity_before_prf: bool,
+    ) -> Vec<Ikev2SaTransform<'static>> {
+        let encryption = Ikev2SaTransform {
+            transform_type: TRANSFORM_TYPE_ENCR,
+            transform_id: ENCR_AES_CBC,
+            attributes: vec![Ikev2TransformAttribute {
+                attribute_type: TRANSFORM_ATTRIBUTE_KEY_LENGTH,
+                value: Ikev2TransformAttributeValue::Tv(AES_256_KEY_BITS),
+            }],
+        };
+        let integrity = Ikev2SaTransform {
+            transform_type: TRANSFORM_TYPE_INTEG,
+            transform_id: INTEG_HMAC_SHA2_512_256,
+            attributes: Vec::new(),
+        };
+        let prf = Ikev2SaTransform {
+            transform_type: TRANSFORM_TYPE_PRF,
+            transform_id: PRF_HMAC_SHA2_512,
+            attributes: Vec::new(),
+        };
+        let dh = Ikev2SaTransform {
+            transform_type: TRANSFORM_TYPE_DH,
+            transform_id: DH_MODP_2048,
+            attributes: Vec::new(),
+        };
+
+        if integrity_before_prf {
+            vec![encryption, integrity, prf, dh]
+        } else {
+            vec![encryption, prf, integrity, dh]
+        }
     }
 
     fn child_sa_negotiation(transforms: Vec<Ikev2SaTransformBuild>) -> Ikev2ChildSaNegotiation {
@@ -1880,6 +2085,13 @@ mod tests {
             Ikev2PrfAlgorithm::HmacSha2_384
         );
         assert_eq!(
+            must_ok(Ikev2PrfAlgorithm::from_transform_id(7)),
+            Ikev2PrfAlgorithm::HmacSha2_512
+        );
+        assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.transform_id(), 7);
+        assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.output_len(), 64);
+        assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.name(), "HMAC-SHA2-512");
+        assert_eq!(
             must_ok(Ikev2EncryptionAlgorithm::from_transform_id(20, Some(128))),
             Ikev2EncryptionAlgorithm::AesGcm16_128
         );
@@ -1914,6 +2126,97 @@ mod tests {
         assert_eq!(
             Ikev2IntegrityAlgorithm::HmacSha2_512_256.xfrm_name(),
             "hmac(sha512)"
+        );
+        assert_eq!(Ikev2IntegrityAlgorithm::HmacSha2_256_128.icv_len(), 16);
+        assert_eq!(Ikev2IntegrityAlgorithm::HmacSha2_384_192.icv_len(), 24);
+        assert_eq!(Ikev2IntegrityAlgorithm::HmacSha2_512_256.icv_len(), 32);
+    }
+
+    #[test]
+    fn exact_observed_profile_is_typed_and_transform_order_independent() {
+        let by_ids = must_ok(Ikev2SaInitCryptoProfile::from_transform_ids(
+            PRF_HMAC_SHA2_512,
+            DH_MODP_2048,
+            ENCR_AES_CBC,
+            Some(AES_256_KEY_BITS),
+            Some(INTEG_HMAC_SHA2_512_256),
+        ));
+        let integ_then_prf = must_ok(Ikev2SaInitCryptoProfile::from_transforms(
+            &observed_cbc_sha512_transform_set(true),
+        ));
+        let prf_then_integ = must_ok(Ikev2SaInitCryptoProfile::from_transforms(
+            &observed_cbc_sha512_transform_set(false),
+        ));
+
+        assert_eq!(by_ids, integ_then_prf);
+        assert_eq!(integ_then_prf, prf_then_integ);
+        assert_eq!(by_ids.prf(), Ikev2PrfAlgorithm::HmacSha2_512);
+        assert_eq!(by_ids.dh_group(), Ikev2DhGroup::Modp2048);
+        assert_eq!(by_ids.encryption(), Ikev2EncryptionAlgorithm::AesCbc256);
+        assert_eq!(
+            by_ids.integrity(),
+            Some(Ikev2IntegrityAlgorithm::HmacSha2_512_256)
+        );
+        assert_eq!(by_ids.integrity_key_len(), 64);
+        assert_eq!(by_ids.integrity_icv_len(), 32);
+        assert_eq!(must_ok(by_ids.key_material_len()), 384);
+        assert_eq!(by_ids.validate_executable(), Ok(()));
+    }
+
+    #[test]
+    fn direct_profile_constructors_reject_mismatched_integrity_shape() {
+        assert_eq!(
+            must_err(Ikev2SaInitCryptoProfile::new_aead(
+                Ikev2PrfAlgorithm::HmacSha2_512,
+                Ikev2DhGroup::Modp2048,
+                Ikev2EncryptionAlgorithm::AesCbc256,
+            )),
+            Ikev2SaInitCryptoError::MissingIntegrityTransform
+        );
+        assert_eq!(
+            must_err(Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+                Ikev2PrfAlgorithm::HmacSha2_512,
+                Ikev2DhGroup::Modp2048,
+                Ikev2EncryptionAlgorithm::AesGcm16_256,
+                Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+            )),
+            Ikev2SaInitCryptoError::UnexpectedIntegrityTransform
+        );
+        assert_eq!(
+            must_err(Ikev2SaInitCryptoProfile::from_transform_ids(
+                PRF_HMAC_SHA2_512,
+                DH_MODP_2048,
+                ENCR_AES_CBC,
+                Some(AES_256_KEY_BITS),
+                None,
+            ))
+            .as_str(),
+            "ike_sa_init_crypto_missing_integrity_transform"
+        );
+    }
+
+    #[test]
+    fn profile_rejects_each_duplicate_and_unknown_transform_type() {
+        let transforms = observed_cbc_sha512_transform_set(true);
+        for index in 0..transforms.len() {
+            let mut duplicated = transforms.clone();
+            duplicated.insert(index, transforms[index].clone());
+            assert_eq!(
+                must_err(Ikev2SaInitCryptoProfile::from_transforms(&duplicated)),
+                Ikev2SaInitCryptoError::InconsistentTransformSet,
+                "duplicate transform at index {index} must fail closed"
+            );
+        }
+
+        let mut unknown_type = transforms;
+        unknown_type.push(Ikev2SaTransform {
+            transform_type: 5,
+            transform_id: 1,
+            attributes: Vec::new(),
+        });
+        assert_eq!(
+            must_err(Ikev2SaInitCryptoProfile::from_transforms(&unknown_type)),
+            Ikev2SaInitCryptoError::InconsistentTransformSet
         );
     }
 
@@ -2058,7 +2361,7 @@ mod tests {
                 &explicit_integrity
             ))
             .as_str(),
-            "ike_sa_init_crypto_inconsistent_transform_set"
+            "ike_sa_init_crypto_unexpected_integrity_transform"
         );
 
         let duplicate_key_length = vec![
@@ -2110,10 +2413,10 @@ mod tests {
                 DH_ECP_256,
                 ENCR_AES_GCM_16,
                 Some(128),
-                16,
+                Some(INTEG_HMAC_SHA2_256_128),
             ))
             .as_str(),
-            "ike_sa_init_crypto_inconsistent_transform_set"
+            "ike_sa_init_crypto_unexpected_integrity_transform"
         );
     }
 
@@ -2200,6 +2503,250 @@ mod tests {
                 "ike_sa_init_crypto_invalid_peer_public_key"
             );
         }
+    }
+
+    #[test]
+    fn hmac_sha512_matches_rfc4231_test_case_1() {
+        let actual = must_ok(prf(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            &[0x0b; 20],
+            b"Hi There",
+        ));
+        let expected = hex_to_bytes(concat!(
+            "87aa7cdea5ef619d4ff0b4241a1d6cb0",
+            "2379f4e2ce4ec2787ad0b30545e17cde",
+            "daa833b7d6b8a702038b274eaea3f4e4",
+            "be9d914eeb61f1702e696c203a126854"
+        ));
+
+        assert_eq!(&*actual, expected.as_slice());
+    }
+
+    #[test]
+    fn hmac_sha512_matches_rfc4868_auth512_test_case_1() {
+        let actual = must_ok(prf(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            &[0x0b; 64],
+            b"Hi There",
+        ));
+        let expected = hex_to_bytes(concat!(
+            "637edc6e01dce7e6742a99451aae82df",
+            "23da3e92439e590e43e761b33e910fb8",
+            "ac2878ebd5803f6f0b61dbce5e251ff8",
+            "789a4722c1be65aea45fd464e89f8f5b"
+        ));
+        let expected_icv = hex_to_bytes(concat!(
+            "637edc6e01dce7e6742a99451aae82df",
+            "23da3e92439e590e43e761b33e910fb8"
+        ));
+
+        assert_eq!(&*actual, expected.as_slice());
+        assert_eq!(&actual[..32], expected_icv.as_slice());
+    }
+
+    #[test]
+    fn sha512_cbc_ike_sa_kdf_matches_independent_vector() {
+        // Generated independently with OpenSSL 3 HMAC-SHA-512 and the RFC
+        // 7296 section 2.13/2.14 PRF+ equations. This is synthetic test-only
+        // material and contains no captured peer secrets.
+        let profile = must_ok(Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            Ikev2DhGroup::Modp2048,
+            Ikev2EncryptionAlgorithm::AesCbc256,
+            Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+        ));
+        let initiator_nonce: Vec<u8> = (0x00..0x20).collect();
+        let responder_nonce: Vec<u8> = (0xa0..0xc0).collect();
+        let shared_secret: Vec<u8> = (0x00..=0xff).collect();
+
+        let material = must_ok(derive_ike_sa_init_key_material(
+            profile,
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18],
+            &initiator_nonce,
+            &responder_nonce,
+            &shared_secret,
+            None,
+        ));
+
+        assert_eq!(
+            material.skeyseed(),
+            hex_to_bytes(concat!(
+                "be6bee7f3a87542831303538d74f1d0f",
+                "3a0a43476538969db0ec73b87ca2e732",
+                "9246e4c25cfc6d20dff6081d6305e18d",
+                "2b0bf073ecef0b8b97354a865faf0374"
+            ))
+        );
+        assert_eq!(
+            material.sk_d(),
+            hex_to_bytes(concat!(
+                "3a6780f9b7988b52b3640daa79e5b312",
+                "54c8626ef3a8d5a99ea2a9eaa2d16b8b",
+                "729b3469ef799357a90ce554942c209b",
+                "f192c8f39295b727a9eb1681a097f89e"
+            ))
+        );
+        assert_eq!(
+            material.sk_ai(),
+            hex_to_bytes(concat!(
+                "77f1ee6d2350595a0de2a98b516ad4d7",
+                "271c6ead856cdd0b41cff6cbe70378c6",
+                "4dd8d0f6ddc99175e5d24b280ff06533",
+                "aa5b1e2883480a55bdf00c91c5965eed"
+            ))
+        );
+        assert_eq!(
+            material.sk_ar(),
+            hex_to_bytes(concat!(
+                "19973371058ed48a8aca918ea0ca6558",
+                "db708cf43dedc71346087d26571312c2",
+                "3804aa1862746430c0831684b6f2d060",
+                "9835a49860704d9de9603633e3f30652"
+            ))
+        );
+        assert_eq!(
+            material.sk_ei(),
+            hex_to_bytes("e8d7681465f7bb4b2a38526b8d6d9e85b07f4d02038a30cc629af84f1beea3d1")
+        );
+        assert_eq!(
+            material.sk_er(),
+            hex_to_bytes("05bbff5bbdb0e310ca533a87326779a8438d70b699d27514ef0bffe69d286405")
+        );
+        assert_eq!(
+            material.sk_pi(),
+            hex_to_bytes(concat!(
+                "5f5ca92e01d475e94bcf891d030ad537",
+                "5af225315d7a0538416dd5e6fa9b3c92",
+                "a91ac1f1745ad930d43985490e04ce20",
+                "31503ba369809d3ce5fd812fe762c54e"
+            ))
+        );
+        assert_eq!(
+            material.sk_pr(),
+            hex_to_bytes(concat!(
+                "ab498746f6e2f55fd41801101a531174",
+                "d6f0e5bc7a0b50bb5b205cec3717176c",
+                "bd2cdf6ffe4de67d396d83877e958c21",
+                "4fe84e6766788041bc906d90bbeea9eb"
+            ))
+        );
+        assert_eq!(material.sk_ai().len(), 64);
+        assert_eq!(material.sk_ar().len(), 64);
+        assert_eq!(material.sk_ei().len(), 32);
+        assert_eq!(material.sk_er().len(), 32);
+
+        let restored = must_ok(Ikev2SaInitKeyMaterial::from_established_keys(
+            profile,
+            false,
+            material.sk_d(),
+            material.sk_ai(),
+            material.sk_ar(),
+            material.sk_ei(),
+            material.sk_er(),
+            material.sk_pi(),
+            material.sk_pr(),
+        ));
+        assert_eq!(restored.sk_d(), material.sk_d());
+        assert_eq!(restored.sk_ai(), material.sk_ai());
+        assert_eq!(restored.sk_ei(), material.sk_ei());
+    }
+
+    #[test]
+    fn ike_sa_rekey_uses_old_prf_then_new_sha512_prf() {
+        // Generated independently with OpenSSL 3. The old SA uses
+        // PRF-HMAC-SHA2-256; the new suite uses PRF-HMAC-SHA2-512.
+        let new_profile = must_ok(Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            Ikev2DhGroup::Modp2048,
+            Ikev2EncryptionAlgorithm::AesCbc256,
+            Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+        ));
+        let old_sk_d: Vec<u8> = (0x40..0x60).collect();
+        let initiator_nonce: Vec<u8> = (0x00..0x20).collect();
+        let responder_nonce: Vec<u8> = (0xa0..0xc0).collect();
+        let shared_secret: Vec<u8> = (0x00..=0xff).collect();
+
+        let material = must_ok(derive_ike_sa_rekey_key_material(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            &old_sk_d,
+            new_profile,
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18],
+            &initiator_nonce,
+            &responder_nonce,
+            &shared_secret,
+        ));
+
+        assert_eq!(
+            material.skeyseed(),
+            hex_to_bytes("35fbc890deb524b1e80cccbe7020a7918e06a4853de448cfc1f0eb37218318c4")
+        );
+        assert_eq!(
+            material.sk_d(),
+            hex_to_bytes(concat!(
+                "02e1ca700ce78e36823ffcaea5aea667",
+                "294b805f57069130d53ad916ee45b9c4",
+                "000b50655509083aa69e68e4d16f663d",
+                "4bb538e1ad5ee604522e433791922ad3"
+            ))
+        );
+        assert_eq!(
+            material.sk_ei(),
+            hex_to_bytes("2f60d126ebd040ec6c975f71a0bc7dd8ba4b3827af157ed83c320c4edf2b2fc3")
+        );
+        assert_eq!(material.skeyseed().len(), 32, "old PRF owns SKEYSEED");
+        assert_eq!(material.sk_d().len(), 64, "new PRF owns SK_d");
+        assert_eq!(material.sk_ai().len(), 64);
+        assert_eq!(material.sk_ei().len(), 32);
+        assert!(!material.ppk_applied());
+
+        let mut rekey_seed = Zeroizing::new(Vec::new());
+        rekey_seed.extend_from_slice(&shared_secret);
+        rekey_seed.extend_from_slice(&initiator_nonce);
+        rekey_seed.extend_from_slice(&responder_nonce);
+        let wrong_new_prf_skeyseed =
+            must_ok(prf(Ikev2PrfAlgorithm::HmacSha2_512, &old_sk_d, &rekey_seed));
+        assert_ne!(material.skeyseed(), &*wrong_new_prf_skeyseed);
+    }
+
+    #[test]
+    fn ike_sa_rekey_rejects_wrong_old_sk_d_and_missing_new_dh() {
+        let new_profile = must_ok(Ikev2SaInitCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            Ikev2DhGroup::Ecp256,
+            Ikev2EncryptionAlgorithm::AesGcm16_128,
+        ));
+        let nonce = [0x11; 32];
+
+        assert_eq!(
+            must_err(derive_ike_sa_rekey_key_material(
+                Ikev2PrfAlgorithm::HmacSha2_256,
+                &[0x22; 31],
+                new_profile,
+                [0x33; 8],
+                [0x44; 8],
+                &nonce,
+                &nonce,
+                &[0x55; 32],
+            ))
+            .as_str(),
+            "ike_sa_init_crypto_invalid_key_length"
+        );
+        assert_eq!(
+            must_err(derive_ike_sa_rekey_key_material(
+                Ikev2PrfAlgorithm::HmacSha2_256,
+                &[0x22; 32],
+                new_profile,
+                [0x33; 8],
+                [0x44; 8],
+                &nonce,
+                &nonce,
+                &[],
+            ))
+            .as_str(),
+            "ike_sa_init_crypto_invalid_key_length"
+        );
     }
 
     #[test]
@@ -2398,6 +2945,53 @@ mod tests {
         assert_eq!(
             material.responder_to_initiator_integrity(),
             hex_to_bytes("537f5464dcf7a673975dae2711e072fbc781ec3e2edb96e163d216aae050d513")
+        );
+    }
+
+    #[test]
+    fn child_sa_sha512_keymat_matches_independent_vector() {
+        // Generated independently with OpenSSL 3 and RFC 7296 section 2.17.
+        let profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
+            Ikev2PrfAlgorithm::HmacSha2_512,
+            Ikev2EncryptionAlgorithm::AesCbc256,
+            Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+        );
+        let sk_d: Vec<u8> = (0x40..0x80).collect();
+        let initiator_nonce: Vec<u8> = (0x00..0x20).collect();
+        let responder_nonce: Vec<u8> = (0xa0..0xc0).collect();
+        let material = must_ok(derive_child_sa_key_material(
+            profile,
+            &sk_d,
+            &initiator_nonce,
+            &responder_nonce,
+            None,
+        ));
+
+        assert_eq!(
+            material.initiator_to_responder_encryption(),
+            hex_to_bytes("09c697426fc5c806353447f86db77edade7ef3776f9ab86f08a41ed2150fa52e")
+        );
+        assert_eq!(
+            material.initiator_to_responder_integrity(),
+            hex_to_bytes(concat!(
+                "cb113b3457ecb795d45797b870418abe",
+                "7e789b9cfb32bfa92b8ece727484dd5b",
+                "6616ceda28cb525dc2362ac5269a8a47",
+                "51f44f295b55034a5295ea3115c33314"
+            ))
+        );
+        assert_eq!(
+            material.responder_to_initiator_encryption(),
+            hex_to_bytes("8c3fba5a203fef4253d490042638c6a6e5f136de4b4f51e8d48df7a1a5705ad0")
+        );
+        assert_eq!(
+            material.responder_to_initiator_integrity(),
+            hex_to_bytes(concat!(
+                "d12dc46f13f2a3bab87b9f41ddab02ff",
+                "47b9bf9566f3874b98032c93ba958629",
+                "3cabd37aa27114323fd42054244fb24bb",
+                "51949488c5abed1ad2fb08dbf7c0480"
+            ))
         );
     }
 
@@ -2684,25 +3278,14 @@ mod tests {
             "ike_sa_init_crypto_invalid_key_length"
         );
 
-        let cbc_profile = Ikev2SaInitCryptoProfile::new(
-            Ikev2PrfAlgorithm::HmacSha2_256,
-            Ikev2DhGroup::Ecp256,
-            Ikev2EncryptionAlgorithm::AesCbc256,
-        );
         assert_eq!(
-            must_err(Ikev2SaInitKeyMaterial::from_established_keys(
-                cbc_profile,
-                false,
-                &good_sk_d,
-                &[],
-                &[],
-                &[0x20; 32],
-                &[0x20; 32],
-                &good_sk_p,
-                &good_sk_p,
+            must_err(Ikev2SaInitCryptoProfile::new_aead(
+                Ikev2PrfAlgorithm::HmacSha2_256,
+                Ikev2DhGroup::Ecp256,
+                Ikev2EncryptionAlgorithm::AesCbc256,
             ))
             .as_str(),
-            "ike_sa_init_crypto_inconsistent_transform_set"
+            "ike_sa_init_crypto_missing_integrity_transform"
         );
     }
 
@@ -2713,7 +3296,7 @@ mod tests {
             DH_ECP_384,
             ENCR_AES_GCM_16,
             Some(256),
-            0,
+            None,
         ));
         let ni = [0x11u8; IKEV2_NONCE_MAX_LEN];
         let nr = [0x22u8; IKEV2_NONCE_MAX_LEN];

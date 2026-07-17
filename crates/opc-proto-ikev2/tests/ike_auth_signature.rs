@@ -18,11 +18,12 @@ const P384_PKCS8_DER: &[u8] = include_bytes!("data/p384_pkcs8.der");
 const P384_SPKI_DER: &[u8] = include_bytes!("data/p384_spki.der");
 
 fn profile() -> Ikev2SaInitCryptoProfile {
-    Ikev2SaInitCryptoProfile::new(
+    Ikev2SaInitCryptoProfile::new_aead(
         Ikev2PrfAlgorithm::HmacSha2_256,
         Ikev2DhGroup::Ecp256,
         Ikev2EncryptionAlgorithm::AesGcm16_128,
     )
+    .expect("valid AES-GCM IKE profile")
 }
 
 fn key_material() -> Ikev2SaInitKeyMaterial {

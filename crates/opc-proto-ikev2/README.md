@@ -29,7 +29,12 @@ control-plane stack.
   payload open result types.
 - `sa_init` and `sa_init_crypto` provide typed SA/KE/Nonce/Notify helpers,
   SA_INIT response builders, Diffie-Hellman group/profile types, and IKE/Child
-  SA key-material derivation. The notify-only error builder is deliberately
+  SA key-material derivation. IKE-SA profiles preserve the complete negotiated
+  PRF, DH, encryption/key-size, and optional integrity suite; invalid AEAD plus
+  integrity or CBC without integrity combinations cannot be constructed.
+  PRF-HMAC-SHA2-256/384/512 are supported for initial IKE-SA derivation,
+  IKE-SA rekey (including distinct old/new PRFs), Child-SA KEYMAT, restore, and
+  AUTH calculations. The notify-only error builder is deliberately
   bounded to one IKE-SA-shaped `NO_PROPOSAL_CHOSEN` or `INVALID_KE_PAYLOAD`;
   the latter has a convenience builder that writes the accepted non-zero group
   as exactly two big-endian octets. These failures are mutually exclusive, so
@@ -51,6 +56,42 @@ control-plane stack.
   proposal/transforms, optional KE group, and traffic-selector narrowing.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
+
+## IKE-SA profile configuration
+
+Profile construction is the startup capability-validation boundary. The old
+infallible `Ikev2SaInitCryptoProfile::new(prf, dh, encryption)` API was removed
+because it could construct AES-CBC without its negotiated integrity algorithm.
+AEAD and encrypt-then-MAC suites now use separate validating constructors:
+
+```rust
+use opc_proto_ikev2::{
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm,
+    Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile,
+};
+
+fn handset_profile() -> Result<Ikev2SaInitCryptoProfile, Ikev2SaInitCryptoError> {
+    Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+        Ikev2PrfAlgorithm::HmacSha2_512,
+        Ikev2DhGroup::Modp2048,
+        Ikev2EncryptionAlgorithm::AesCbc256,
+        Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+    )
+}
+
+fn existing_gcm_profile() -> Result<Ikev2SaInitCryptoProfile, Ikev2SaInitCryptoError> {
+    Ikev2SaInitCryptoProfile::new_aead(
+        Ikev2PrfAlgorithm::HmacSha2_256,
+        Ikev2DhGroup::Ecp256,
+        Ikev2EncryptionAlgorithm::AesGcm16_128,
+    )
+}
+```
+
+Configuration expressed as wire identifiers should use `from_transform_ids`;
+its final argument is now `Option<u16>` containing the integrity Transform ID,
+not an anonymous key length. `Some(14)` selects
+AUTH-HMAC-SHA2-512-256; AEAD profiles pass `None`.
 
 ## Dedicated-bearer integration
 
