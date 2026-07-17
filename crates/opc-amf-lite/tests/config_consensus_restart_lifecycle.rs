@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -182,6 +183,29 @@ fn assert_exact_history(expected: &[StoredConfig<AmfConfig>], actual: &[StoredCo
     for (expected_record, actual_record) in expected.iter().zip(actual) {
         assert_exact_record(expected_record, actual_record);
     }
+}
+
+fn assert_plaintext_canaries_absent_from_bytes(location: &str, bytes: &[u8], canaries: &[&[u8]]) {
+    for canary in canaries {
+        assert!(
+            !bytes.windows(canary.len()).any(|window| window == *canary),
+            "plaintext canary reached {location}"
+        );
+    }
+}
+
+fn assert_plaintext_canaries_absent_from_tree(path: &Path, canaries: &[&[u8]]) {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).expect("read config artifact directory") {
+            assert_plaintext_canaries_absent_from_tree(
+                &entry.expect("config artifact entry").path(),
+                canaries,
+            );
+        }
+        return;
+    }
+    let bytes = std::fs::read(path).expect("read config artifact");
+    assert_plaintext_canaries_absent_from_bytes(&path.display().to_string(), &bytes, canaries);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -667,59 +691,92 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
     let temp = tempfile::tempdir().expect("config cluster tempdir");
     let mut cluster = ConfigCluster::start(temp.path()).await;
     let provider = provider();
-    let initial_store = encrypted_store(&cluster, 0, &provider);
+    let genesis_tx = tx_id("11111111-2222-4333-8444-555555555555");
     let stable_tx = tx_id("22222222-2222-4222-8222-222222222222");
-    let pending_tx = tx_id("33333333-3333-4333-8333-333333333333");
-    let rollback_tx = tx_id("44444444-4444-4444-8444-444444444444");
+    let confirm_tx = tx_id("33333333-3333-4333-8333-333333333333");
+    let pending_rollback_tx = tx_id("44444444-4444-4444-8444-444444444444");
+    let rollback_tx = tx_id("55555555-4444-4555-8666-777777777777");
+    let plaintext_canaries = [
+        b"PAYLOAD-CANARY-LEADER-GENESIS-0xD1".as_slice(),
+        b"PAYLOAD-CANARY-LEADER-STABLE-0xD2".as_slice(),
+        b"PAYLOAD-CANARY-LEADER-CONFIRM-0xD3".as_slice(),
+        b"PAYLOAD-CANARY-LEADER-PENDING-0xD4".as_slice(),
+    ];
 
-    let mut stable = record(
-        stable_tx,
-        None,
-        1,
-        timestamp("2026-07-16T18:31:00Z"),
-        config("stable-parent", 2_048),
-    );
-    stable.recovery_required = true;
-    stable.confirmed_deadline = Some(timestamp("2036-07-16T18:31:00Z"));
-    initial_store
-        .append_commit_write(CommitWrite::new(stable))
+    encrypted_store(&cluster, 0, &provider)
+        .append_commit_write(CommitWrite::new(record(
+            genesis_tx,
+            None,
+            1,
+            timestamp("2026-07-16T18:30:00Z"),
+            config("PAYLOAD-CANARY-LEADER-GENESIS-0xD1", 1_024),
+        )))
         .await
-        .expect("append initially pending stable record");
-    initial_store
-        .mark_confirmed(stable_tx)
+        .expect("append encrypted genesis record");
+    encrypted_store(&cluster, 0, &provider)
+        .append_commit_write(CommitWrite::new(record(
+            stable_tx,
+            Some(genesis_tx),
+            2,
+            timestamp("2026-07-16T18:31:00Z"),
+            config("PAYLOAD-CANARY-LEADER-STABLE-0xD2", 2_048),
+        )))
         .await
-        .expect("durably confirm stable record");
-    initial_store
-        .clear_recovery_required(stable_tx)
-        .await
-        .expect("durably clear stable recovery marker");
-    let stable_applied = initial_store
-        .load_latest()
-        .await
-        .expect("load stable record")
-        .expect("stable record");
-    assert_eq!(stable_tx, stable_applied.tx_id);
-    assert!(!stable_applied.recovery_required);
-    assert_eq!(None, stable_applied.confirmed_deadline);
-
-    let mut pending = record(
-        pending_tx,
+        .expect("append encrypted stable record");
+    let mut confirm_pending = record(
+        confirm_tx,
         Some(stable_tx),
-        2,
+        3,
         timestamp("2026-07-16T18:32:00Z"),
-        config("pending-must-not-survive", 8_192),
+        config("PAYLOAD-CANARY-LEADER-CONFIRM-0xD3", 4_096),
     );
-    pending.confirmed_deadline = Some(timestamp("2036-07-16T18:32:00Z"));
-    initial_store
-        .append_commit_write(CommitWrite::new(pending))
+    confirm_pending.confirmed_deadline = Some(timestamp("2036-07-16T18:32:00Z"));
+    encrypted_store(&cluster, 0, &provider)
+        .append_commit_write(CommitWrite::new(confirm_pending))
         .await
-        .expect("append pending record");
+        .expect("append encrypted pending-confirm record");
 
     cluster.wait_ready().await;
-    let old_leader = cluster.leader();
-    let old_status = cluster.stores[old_leader].status();
-    cluster.isolate(old_leader);
-    let ready_survivor = cluster.wait_for_survivor_leader(old_leader).await;
+    let stopped_leader = cluster.leader();
+    let stopped_identity = cluster.stores[stopped_leader].status().node_id;
+    let stopped_database = cluster.database_path(stopped_leader);
+    let pre_stop_status = cluster.stores[stopped_leader].status();
+    assert_eq!(Some(pre_stop_status.node_id), pre_stop_status.leader_id);
+    assert!(pre_stop_status.applied_index.is_some_and(|index| index > 0));
+    assert!(pre_stop_status
+        .committed_index
+        .is_some_and(|index| index > 0));
+    let pre_stop_history = encrypted_store(&cluster, stopped_leader, &provider)
+        .load_since(ConfigVersion::INITIAL, 8)
+        .await
+        .expect("load leader-local history before stop");
+    assert_eq!(3, pre_stop_history.len());
+    assert_eq!(genesis_tx, pre_stop_history[0].tx_id);
+    assert_eq!(stable_tx, pre_stop_history[1].tx_id);
+    assert_eq!(confirm_tx, pre_stop_history[2].tx_id);
+    assert!(pre_stop_history[2].confirmed_deadline.is_some());
+    assert!(!pre_stop_history[2].recovery_required);
+
+    cluster
+        .stop_node(stopped_leader)
+        .await
+        .expect("stop actual current leader engine");
+    assert_eq!(
+        ConfigNodeLifecycle::Stopped,
+        cluster
+            .node_lifecycle(stopped_leader)
+            .expect("stopped leader lifecycle")
+    );
+    assert!(cluster
+        .node_transport_is_disconnected(stopped_leader)
+        .await
+        .expect("stopped leader transport state"));
+    assert!(cluster.stores[stopped_leader]
+        .probe_durable_readiness()
+        .await
+        .is_err());
+
+    let ready_survivor = cluster.wait_for_survivor_leader(stopped_leader).await;
     let replacement_id = cluster.stores[ready_survivor]
         .status()
         .leader_id
@@ -734,37 +791,105 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
         Some(replacement_status.node_id),
         replacement_status.leader_id
     );
-    assert_ne!(old_status.node_id, replacement_status.node_id);
-    assert!(replacement_status.term > old_status.term);
+    assert_ne!(pre_stop_status.node_id, replacement_status.node_id);
+    assert!(replacement_status.term > pre_stop_status.term);
     let replacement_store = encrypted_store(&cluster, replacement, &provider);
 
     let pending_on_replacement = replacement_store
         .load_latest()
         .await
-        .expect("load pending record on replacement leader")
-        .expect("pending record on replacement leader");
-    assert_eq!(pending_tx, pending_on_replacement.tx_id);
-    assert!(pending_on_replacement.confirmed_deadline.is_some());
+        .expect("load pending-confirm record on replacement leader")
+        .expect("pending-confirm record on replacement leader");
+    assert_exact_record(&pre_stop_history[2], &pending_on_replacement);
     let pending_target_error = match replacement_store
-        .load_rollback(RollbackTarget::TxId(pending_tx))
+        .load_rollback(RollbackTarget::TxId(confirm_tx))
         .await
     {
-        Ok(_) => panic!("pending record cannot be a rollback target"),
+        Ok(_) => panic!("pending-confirm record cannot be a rollback target"),
         Err(error) => error,
     };
     assert_eq!(StoreErrorCode::NotFound, pending_target_error.code);
 
-    let stable_parent = replacement_store
-        .load_rollback(RollbackTarget::TxId(stable_tx))
+    let stable_parent_before_confirmation = replacement_store
+        .load_rollback(RollbackTarget::Previous)
         .await
-        .expect("load actual stable parent on replacement leader");
-    assert_exact_record(&stable_applied, &stable_parent);
+        .expect("load exact parent of the latest stable record");
+    assert_exact_record(&pre_stop_history[0], &stable_parent_before_confirmation);
+    assert_ne!(confirm_tx, stable_parent_before_confirmation.tx_id);
+
+    replacement_store
+        .mark_confirmed(confirm_tx)
+        .await
+        .expect("durably confirm through replacement authority");
+    let confirmed = replacement_store
+        .load_latest()
+        .await
+        .expect("load confirmed record on replacement leader")
+        .expect("confirmed record on replacement leader");
+    let mut expected_confirmed = pre_stop_history[2].clone();
+    expected_confirmed.confirmed_deadline = None;
+    assert_exact_record(&expected_confirmed, &confirmed);
+    let stable_parent_after_confirmation = replacement_store
+        .load_rollback(RollbackTarget::Previous)
+        .await
+        .expect("load exact parent after replacement confirmation");
+    assert_exact_record(&pre_stop_history[1], &stable_parent_after_confirmation);
+
+    let mut pending_rollback = record(
+        pending_rollback_tx,
+        Some(confirm_tx),
+        4,
+        timestamp("2026-07-16T18:33:00Z"),
+        config("PAYLOAD-CANARY-LEADER-PENDING-0xD4", 8_192),
+    );
+    pending_rollback.recovery_required = true;
+    pending_rollback.confirmed_deadline = Some(timestamp("2036-07-16T18:33:00Z"));
+    replacement_store
+        .append_commit_write(CommitWrite::new(pending_rollback))
+        .await
+        .expect("append rollback candidate through replacement authority");
+    let fenced_pending = replacement_store
+        .load_latest()
+        .await
+        .expect("load fenced rollback candidate")
+        .expect("fenced rollback candidate");
+    assert_eq!(pending_rollback_tx, fenced_pending.tx_id);
+    assert!(fenced_pending.recovery_required);
+    assert!(fenced_pending.confirmed_deadline.is_some());
+    replacement_store
+        .clear_recovery_required(pending_rollback_tx)
+        .await
+        .expect("durably clear pending recovery marker through replacement authority");
+    let published_pending = replacement_store
+        .load_latest()
+        .await
+        .expect("load published rollback candidate")
+        .expect("published rollback candidate");
+    let mut expected_published_pending = fenced_pending.clone();
+    expected_published_pending.recovery_required = false;
+    assert_exact_record(&expected_published_pending, &published_pending);
+
+    let pending_rollback_error = match replacement_store
+        .load_rollback(RollbackTarget::TxId(pending_rollback_tx))
+        .await
+    {
+        Ok(_) => panic!("published pending record still cannot be a rollback target"),
+        Err(error) => error,
+    };
+    assert_eq!(StoreErrorCode::NotFound, pending_rollback_error.code);
+    let previous_while_pending = replacement_store
+        .load_rollback(RollbackTarget::Previous)
+        .await
+        .expect("pending head must not replace the exact stable-parent selector");
+    assert_exact_record(&pre_stop_history[1], &previous_while_pending);
+    assert_ne!(pending_rollback_tx, previous_while_pending.tx_id);
+
     let mut rollback = record(
         rollback_tx,
-        Some(pending_tx),
-        3,
-        timestamp("2026-07-16T18:33:00Z"),
-        stable_parent.config.clone(),
+        Some(pending_rollback_tx),
+        5,
+        timestamp("2026-07-16T18:34:00Z"),
+        confirmed.config.clone(),
     );
     rollback.recovery_required = true;
     replacement_store
@@ -772,13 +897,21 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
             CommitWrite::resolving(
                 rollback,
                 opc_config_bus::ConfirmedCommitResolution::Rollback {
-                    pending_tx_id: pending_tx,
+                    pending_tx_id: pending_rollback_tx,
                 },
             )
             .expect("rollback write shape"),
         )
         .await
         .expect("commit rollback on replacement leader");
+    let fenced_rollback = replacement_store
+        .load_latest()
+        .await
+        .expect("load fenced rollback record")
+        .expect("fenced rollback record");
+    assert_eq!(rollback_tx, fenced_rollback.tx_id);
+    assert!(fenced_rollback.recovery_required);
+    assert_eq!(None, fenced_rollback.confirmed_deadline);
     replacement_store
         .clear_recovery_required(rollback_tx)
         .await
@@ -788,14 +921,14 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
         .await
         .expect("load rollback record")
         .expect("rollback record");
-    assert_eq!(rollback_tx, rollback_applied.tx_id);
-    assert_eq!(stable_parent.config, rollback_applied.config);
-    assert_ne!(pending_on_replacement.config, rollback_applied.config);
-    assert!(!rollback_applied.recovery_required);
-    assert_eq!(None, rollback_applied.confirmed_deadline);
+    let mut expected_rollback = fenced_rollback;
+    expected_rollback.recovery_required = false;
+    assert_exact_record(&expected_rollback, &rollback_applied);
+    assert_eq!(expected_confirmed.config, rollback_applied.config);
+    assert_ne!(published_pending.config, rollback_applied.config);
 
     let stale_confirmation = replacement_store
-        .mark_confirmed(pending_tx)
+        .mark_confirmed(pending_rollback_tx)
         .await
         .expect_err("rolled-back pending transaction cannot be confirmed");
     assert_eq!(StoreErrorCode::Internal, stale_confirmation.code);
@@ -806,37 +939,135 @@ async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_resta
         .expect("head after stale confirmation");
     assert_exact_record(&rollback_applied, &after_stale_confirmation);
 
-    drop(initial_store);
     drop(replacement_store);
+    let survivor_history = encrypted_store(&cluster, replacement, &provider)
+        .load_since(ConfigVersion::INITIAL, 8)
+        .await
+        .expect("load replacement history before stopped leader rejoins");
+    assert_eq!(5, survivor_history.len());
+    assert_eq!(genesis_tx, survivor_history[0].tx_id);
+    assert_eq!(stable_tx, survivor_history[1].tx_id);
+    assert_eq!(confirm_tx, survivor_history[2].tx_id);
+    assert_eq!(pending_rollback_tx, survivor_history[3].tx_id);
+    assert_eq!(rollback_tx, survivor_history[4].tx_id);
+    let expected_history = vec![
+        pre_stop_history[0].clone(),
+        pre_stop_history[1].clone(),
+        expected_confirmed,
+        expected_published_pending,
+        expected_rollback,
+    ];
+    assert_exact_history(&expected_history, &survivor_history);
+
+    cluster
+        .reopen_node_disconnected(stopped_leader)
+        .await
+        .expect("reopen stopped leader from the same disk while disconnected");
+    assert_eq!(
+        ConfigNodeLifecycle::ReopenedDisconnected,
+        cluster
+            .node_lifecycle(stopped_leader)
+            .expect("reopened leader lifecycle")
+    );
+    assert!(cluster
+        .node_transport_is_disconnected(stopped_leader)
+        .await
+        .expect("reopened leader transport state"));
+    let disconnected_status = cluster.stores[stopped_leader].status();
+    assert_eq!(stopped_identity, disconnected_status.node_id);
+    assert!(!disconnected_status.admitted);
+    assert_eq!(stopped_database, cluster.database_path(stopped_leader));
+    let disconnected_history = encrypted_store(&cluster, stopped_leader, &provider)
+        .load_since(ConfigVersion::INITIAL, 8)
+        .await
+        .expect("load disconnected stopped-leader history");
+    verify_nonempty_exact_reopened_history(&pre_stop_history, &disconnected_history)
+        .expect("stopped leader must reopen its exact non-empty pre-stop history");
+    assert!(disconnected_history
+        .iter()
+        .all(|record| record.tx_id != pending_rollback_tx && record.tx_id != rollback_tx));
+    assert!(cluster.stores[stopped_leader]
+        .probe_durable_readiness()
+        .await
+        .is_err());
+
+    cluster
+        .reconnect_node(stopped_leader)
+        .await
+        .expect("reconnect and re-admit stopped leader");
+    assert_eq!(
+        ConfigNodeLifecycle::Running,
+        cluster
+            .node_lifecycle(stopped_leader)
+            .expect("rejoined leader lifecycle")
+    );
+    cluster.wait_ready().await;
+    for node in 0..3 {
+        let converged = encrypted_store(&cluster, node, &provider)
+            .load_since(ConfigVersion::INITIAL, 8)
+            .await
+            .expect("load converged post-rejoin history");
+        assert_exact_history(&survivor_history, &converged);
+    }
+    let first_campaign_frames = cluster.captured_frames();
+    assert!(!first_campaign_frames.is_empty());
+    for (index, frame) in first_campaign_frames.iter().enumerate() {
+        assert_plaintext_canaries_absent_from_bytes(
+            &format!("shared consensus frame {index}"),
+            frame,
+            &plaintext_canaries,
+        );
+    }
+
     cluster.shutdown().await.expect("shutdown config cluster");
     drop(cluster);
 
     let mut restarted = ConfigCluster::start(temp.path()).await;
     for index in 0..3 {
         let restarted_store = encrypted_store(&restarted, index, &provider);
+        let restarted_history = restarted_store
+            .load_since(ConfigVersion::INITIAL, 8)
+            .await
+            .expect("load exact history after full rebuild");
+        assert_exact_history(&survivor_history, &restarted_history);
+        assert_eq!(None, restarted_history[2].confirmed_deadline);
+        assert!(!restarted_history[2].recovery_required);
+        assert!(restarted_history[3].confirmed_deadline.is_some());
+        assert!(!restarted_history[3].recovery_required);
+        assert_eq!(None, restarted_history[4].confirmed_deadline);
+        assert!(!restarted_history[4].recovery_required);
+        assert!(restarted_history
+            .iter()
+            .all(|record| record.plaintext_digest.is_some() && !record.encrypted_blob.is_empty()));
         let restarted_latest = restarted_store
             .load_latest()
             .await
-            .expect("load rollback head after full restart")
-            .expect("rollback head after full restart");
+            .expect("load rollback head after full rebuild")
+            .expect("rollback head after full rebuild");
         assert_exact_record(&rollback_applied, &restarted_latest);
-        let restarted_stable = restarted_store
-            .load_rollback(RollbackTarget::TxId(stable_tx))
-            .await
-            .expect("load confirmed stable metadata after full restart");
-        assert_exact_record(&stable_applied, &restarted_stable);
         let pending_error = match restarted_store
-            .load_rollback(RollbackTarget::TxId(pending_tx))
+            .load_rollback(RollbackTarget::TxId(pending_rollback_tx))
             .await
         {
-            Ok(_) => panic!("rolled-back pending record remains unavailable after restart"),
+            Ok(_) => panic!("rolled-back pending record remains unavailable after rebuild"),
             Err(error) => error,
         };
         assert_eq!(StoreErrorCode::NotFound, pending_error.code);
     }
 
+    let rebuilt_frames = restarted.captured_frames();
+    assert!(!rebuilt_frames.is_empty());
+    for (index, frame) in rebuilt_frames.iter().enumerate() {
+        assert_plaintext_canaries_absent_from_bytes(
+            &format!("rebuilt shared consensus frame {index}"),
+            frame,
+            &plaintext_canaries,
+        );
+    }
     restarted
         .shutdown()
         .await
         .expect("shutdown restarted config cluster");
+    drop(restarted);
+    assert_plaintext_canaries_absent_from_tree(temp.path(), &plaintext_canaries);
 }
