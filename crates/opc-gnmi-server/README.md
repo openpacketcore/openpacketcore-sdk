@@ -84,6 +84,11 @@ admit a Set that creates the genesis commit, but Get remains unavailable until
 that durable head exists; an empty transaction/version cannot prove that
 independently supplied bootstrap payloads are equal across pods.
 
+Source migration: exhaustive matches on the public `GnmiError` enum must
+handle the additive `NotLeader` variant. Code constructing `CommitResult`
+literals must also initialize its new optional `committed_revision` field;
+deserializing older values continues to default that field to `None`.
+
 ## Relationships
 
 - Uses generated protobuf bindings from `crates/opc-gnmi-server/proto`.

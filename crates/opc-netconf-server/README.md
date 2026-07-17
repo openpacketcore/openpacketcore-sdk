@@ -106,6 +106,13 @@ behavior. A shadow bus without a port fails closed. The public synchronous
 therefore reject gated operations whenever one is configured. Production
 leader-aware traffic must use the async session/listener runners.
 
+Source migration: exhaustive matches on `ServerInitError` must handle the
+additive `CommittedRevisionUnsupported` variant. Existing public `RpcError`
+and `RpcErrorInfo` values retain their prior `Copy` behavior and exhaustive
+shape; the runtime leader hint is rendered through a private response path.
+Code constructing `CommitResult` literals must initialize its new optional
+`committed_revision` field.
+
 ## Relationships
 
 - Uses `opc-config-bus` and `opc-config-model` for config commits.
