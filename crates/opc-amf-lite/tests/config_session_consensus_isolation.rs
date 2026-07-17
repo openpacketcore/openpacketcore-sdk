@@ -1,0 +1,332 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use opc_amf_lite::AmfConfig;
+use opc_config_bus::{CommitWrite, EncryptingManagedDatastore, ManagedDatastore, StoredConfig};
+use opc_config_bus_consensus::RaftManagedDatastore;
+use opc_config_model::{RequestSource, TrustedPrincipal, WorkloadIdentity};
+use opc_consensus::{ConsensusPeerError, ConsensusRpcFamily, ConsensusWireRequest};
+use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+use opc_session_store::{
+    CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
+    Generation, OwnerId, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, StableId,
+    StateClass, StateType, StoredSessionRecord,
+};
+use opc_session_testkit::ConsensusTestCluster;
+use opc_types::{ConfigVersion, NetworkFunctionKind, TenantId, TxId};
+
+mod config_consensus_common;
+use config_consensus_common::ConfigCluster;
+
+const INVALID_INNER_PAYLOAD: &[u8] = b"not-a-consensus-command";
+const SESSION_BACKEND_NAMESPACE: &str = "config-session-scope-isolation";
+
+fn tenant() -> TenantId {
+    TenantId::new("scope-isolation-tenant").expect("test tenant")
+}
+
+fn principal() -> TrustedPrincipal {
+    TrustedPrincipal::new(
+        WorkloadIdentity::Internal("scope-isolation-writer".to_owned()),
+        tenant(),
+    )
+}
+
+fn provider() -> Arc<MemoryKeyProvider> {
+    let provider = Arc::new(MemoryKeyProvider::new());
+    provider
+        .insert_active_key(
+            KeyId::new("scope-isolation-config-key").expect("config key ID"),
+            KeyPurpose::Config,
+            tenant(),
+            Zeroizing::new([0x25; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .expect("insert config key");
+    provider
+        .insert_active_key(
+            KeyId::new("scope-isolation-session-key").expect("session key ID"),
+            KeyPurpose::Session,
+            tenant(),
+            Zeroizing::new([0x52; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .expect("insert session key");
+    provider
+}
+
+fn config_record(
+    tx_id: TxId,
+    parent_tx_id: Option<TxId>,
+    version: u64,
+    hostname: &str,
+) -> StoredConfig<AmfConfig> {
+    let mut record = StoredConfig::new(
+        tx_id,
+        ConfigVersion::new(version),
+        principal(),
+        RequestSource::Internal,
+        AmfConfig {
+            hostname: hostname.to_owned(),
+            ..AmfConfig::default()
+        },
+    );
+    record.parent_tx_id = parent_tx_id;
+    record
+}
+
+fn session_key(stable_id: &'static [u8]) -> SessionKey {
+    SessionKey {
+        tenant: tenant(),
+        nf_kind: NetworkFunctionKind::from_static("amf"),
+        key_type: SessionKeyType::PduSession,
+        stable_id: StableId::new(stable_id.to_vec()).expect("test stable ID"),
+    }
+}
+
+async fn append_session_record<B>(
+    store: &B,
+    key: SessionKey,
+    owner: &str,
+    payload: &'static [u8],
+) -> StoredSessionRecord
+where
+    B: SessionBackend + SessionLeaseManager,
+{
+    let owner = OwnerId::new(owner).expect("test owner");
+    let lease = store
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("acquire session lease");
+    let record = StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(1),
+        owner,
+        fence: lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("scope-isolation-record"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(payload),
+    };
+    assert_eq!(
+        CompareAndSetResult::Success,
+        store
+            .compare_and_set(CompareAndSet {
+                key,
+                lease,
+                expected_generation: None,
+                new_record: record.clone(),
+            })
+            .await
+            .expect("append session record")
+    );
+    record
+}
+
+fn assert_config_head_unchanged(before: &StoredConfig<AmfConfig>, after: &StoredConfig<AmfConfig>) {
+    assert_eq!(before.tx_id, after.tx_id);
+    assert_eq!(before.parent_tx_id, after.parent_tx_id);
+    assert_eq!(before.version, after.version);
+    assert_eq!(before.committed_at, after.committed_at);
+    assert_eq!(before.principal, after.principal);
+    assert_eq!(before.source, after.source);
+    assert_eq!(before.schema_digest, after.schema_digest);
+    assert_eq!(before.plaintext_digest, after.plaintext_digest);
+    assert_eq!(before.config, after.config);
+    assert_eq!(before.encrypted_blob, after.encrypted_blob);
+    assert_eq!(before.idempotency_key, after.idempotency_key);
+    assert_eq!(before.apply_plan, after.apply_plan);
+    assert_eq!(before.request_fingerprint, after.request_fingerprint);
+    assert_eq!(before.request_id, after.request_id);
+    assert_eq!(before.recovery_required, after.recovery_required);
+    assert_eq!(before.confirmed_deadline, after.confirmed_deadline);
+    assert_eq!(before.rollback_label, after.rollback_label);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_and_session_groups_reject_cross_scope_without_state_change() {
+    let temp = tempfile::tempdir().expect("config cluster tempdir");
+    let config_cluster = ConfigCluster::start(temp.path()).await;
+    let session_cluster = ConsensusTestCluster::start(3).await;
+    let provider = provider();
+
+    assert_ne!(
+        config_cluster.identity(),
+        session_cluster.consensus_identity(),
+        "config and session groups must use distinct consensus identities"
+    );
+
+    let config_writer = EncryptingManagedDatastore::new(
+        Arc::new(RaftManagedDatastore::<AmfConfig>::new(Arc::new(
+            config_cluster.stores[0].clone(),
+        ))),
+        Arc::clone(&provider),
+    );
+    let config_reader = EncryptingManagedDatastore::new(
+        Arc::new(RaftManagedDatastore::<AmfConfig>::new(Arc::new(
+            config_cluster.stores[1].clone(),
+        ))),
+        Arc::clone(&provider),
+    );
+    let session_writer = EncryptingSessionBackend::new(
+        Arc::new(session_cluster.store(0)),
+        Arc::clone(&provider),
+        SESSION_BACKEND_NAMESPACE,
+    );
+    let session_reader = EncryptingSessionBackend::new(
+        Arc::new(session_cluster.store(1)),
+        Arc::clone(&provider),
+        SESSION_BACKEND_NAMESPACE,
+    );
+
+    let first_config_tx = TxId::new();
+    config_writer
+        .append_commit_write(CommitWrite::new(config_record(
+            first_config_tx,
+            None,
+            1,
+            "config-head-before-cross-route",
+        )))
+        .await
+        .expect("append initial config head");
+    let first_session_key = session_key(b"session-head-before-cross-route");
+    let first_session_record = append_session_record(
+        &session_writer,
+        first_session_key.clone(),
+        "session-writer-one",
+        b"session-payload-before-cross-route",
+    )
+    .await;
+
+    let config_head_before = config_reader
+        .load_latest()
+        .await
+        .expect("read initial config head")
+        .expect("initial config head");
+    let session_head_before = session_reader
+        .get(&first_session_key)
+        .await
+        .expect("read initial session head")
+        .expect("initial session head");
+    assert_eq!(first_session_record, session_head_before);
+
+    // A successful quorum write can return before an uninvolved follower has
+    // applied it. Synchronize the exact target handlers before capturing their
+    // status so later equality cannot mistake legitimate catch-up for a side
+    // effect of the rejected cross-scoped request.
+    tokio::join!(
+        config_cluster.wait_ready(),
+        session_cluster.wait_node_durable_ready(0),
+    );
+
+    let session_stores = (0..3)
+        .map(|index| session_cluster.store(index))
+        .collect::<Vec<_>>();
+    let config_target = &config_cluster.stores[0];
+    let session_target = &session_stores[0];
+    let config_status_before = config_target.status();
+    let session_status_before = session_target.status();
+
+    // A valid target member sends an outer request carrying the other
+    // consumer's scope and deliberately invalid inner bytes. ScopeMismatch,
+    // rather than Protocol, proves rejection occurs before consumer decoding.
+    let session_sender = session_target.status().node_id;
+    let config_scoped_request = ConsensusWireRequest::try_new(
+        config_cluster.identity(),
+        session_sender,
+        ConsensusRpcFamily::ForwardMutation,
+        INVALID_INNER_PAYLOAD.to_vec(),
+    )
+    .expect("bounded config-scoped request");
+    assert_eq!(
+        Err(ConsensusPeerError::ScopeMismatch),
+        session_target
+            .rpc_handler()
+            .handle(session_sender, config_scoped_request)
+            .await
+            .result
+    );
+
+    let config_sender = config_target.status().node_id;
+    let session_scoped_request = ConsensusWireRequest::try_new(
+        session_cluster.consensus_identity(),
+        config_sender,
+        ConsensusRpcFamily::ForwardMutation,
+        INVALID_INNER_PAYLOAD.to_vec(),
+    )
+    .expect("bounded session-scoped request");
+    assert_eq!(
+        Err(ConsensusPeerError::ScopeMismatch),
+        config_target
+            .rpc_handler()
+            .handle(config_sender, session_scoped_request)
+            .await
+            .result
+    );
+
+    assert_eq!(
+        config_status_before,
+        config_target.status(),
+        "cross-scoped request must not change the config target's Raft state"
+    );
+    assert_eq!(
+        session_status_before,
+        session_target.status(),
+        "cross-scoped request must not change the session target's Raft state"
+    );
+
+    let config_head_after = config_reader
+        .load_latest()
+        .await
+        .expect("read config head after cross-route")
+        .expect("config head after cross-route");
+    assert_config_head_unchanged(&config_head_before, &config_head_after);
+    assert_eq!(
+        session_head_before,
+        session_reader
+            .get(&first_session_key)
+            .await
+            .expect("read session head after cross-route")
+            .expect("session head after cross-route")
+    );
+
+    let second_config_tx = TxId::new();
+    config_writer
+        .append_commit_write(CommitWrite::new(config_record(
+            second_config_tx,
+            Some(first_config_tx),
+            2,
+            "config-head-after-cross-route",
+        )))
+        .await
+        .expect("append config after cross-route");
+    let config_after_write = config_reader
+        .load_latest()
+        .await
+        .expect("read config after cross-route write")
+        .expect("config after cross-route write");
+    assert_eq!(second_config_tx, config_after_write.tx_id);
+    assert_eq!(Some(first_config_tx), config_after_write.parent_tx_id);
+    assert_eq!(ConfigVersion::new(2), config_after_write.version);
+    assert_eq!(
+        "config-head-after-cross-route",
+        config_after_write.config.hostname
+    );
+
+    let second_session_key = session_key(b"session-head-after-cross-route");
+    let second_session_record = append_session_record(
+        &session_writer,
+        second_session_key.clone(),
+        "session-writer-two",
+        b"session-payload-after-cross-route",
+    )
+    .await;
+    assert_eq!(
+        second_session_record,
+        session_reader
+            .get(&second_session_key)
+            .await
+            .expect("read session after cross-route write")
+            .expect("session after cross-route write")
+    );
+
+    config_cluster.shutdown().await;
+}

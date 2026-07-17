@@ -20,7 +20,7 @@ use opc_session_store::{
     Clock, ConsensusSessionStore, DurableReadinessState, QuorumReplicaDescriptor,
     QuorumTopologyConfig, QuorumTopologyError, ReplicaBackingIdentity, ReplicaEndpoint,
     ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreBlockReason,
-    RestoreBlockReasonCode, SessionConsensusNodeId, SessionConsensusPeer,
+    RestoreBlockReasonCode, SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
     SessionConsensusPeerError, SessionConsensusRpcHandler, SessionConsensusWireRequest,
     SessionConsensusWireResponse, SqliteSessionBackend, SystemClock, TokioVirtualClock,
     ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
@@ -200,6 +200,7 @@ pub struct ConsensusTestCluster {
     _directory: tempfile::TempDir,
     stores: Vec<ConsensusSessionStore>,
     paths: BTreeMap<(usize, usize), Arc<InProcessConsensusPeer>>,
+    identity: SessionConsensusIdentity,
 }
 
 impl ConsensusTestCluster {
@@ -310,6 +311,7 @@ impl ConsensusTestCluster {
             _directory: directory,
             stores,
             paths,
+            identity,
         };
         cluster.wait_ready().await;
         cluster
@@ -321,6 +323,11 @@ impl ConsensusTestCluster {
             .get(index)
             .unwrap_or_else(|| panic!("consensus test node {index} does not exist"))
             .clone()
+    }
+
+    /// Exact cluster/configuration/epoch scope used by this test fleet.
+    pub const fn consensus_identity(&self) -> SessionConsensusIdentity {
+        self.identity
     }
 
     /// Connect or isolate every consensus path to and from one member.
