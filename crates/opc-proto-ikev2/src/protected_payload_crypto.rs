@@ -1,6 +1,7 @@
 //! IKEv2 protected-payload decryption and sealing helpers for SA_INIT-derived keys.
 //!
-//! @spec IETF RFC5282 3; IETF RFC7296 3.14; IETF RFC7383 2.5
+//! @spec IETF RFC4868 2.1-2.7; IETF RFC5282 3; IETF RFC7296 3.14;
+//! IETF RFC7383 2.5
 //! @req REQ-IETF-RFC5282-AES-GCM-PROTECTED-PAYLOAD-001
 //! @req REQ-IETF-RFC7296-AES-CBC-ETM-PROTECTED-PAYLOAD-001
 
@@ -13,14 +14,14 @@ use aes_gcm::{
 };
 use bytes::Bytes;
 use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
-use hmac::{Hmac, Mac};
 use rand::{rngs::SysRng, TryCryptoRng};
-use sha2::{Sha256, Sha384, Sha512};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
     crypto::{CryptoProvider, ProtectedPayloadContext, ProtectedPayloadKind},
     fragmentation::IKEV2_ENCRYPTED_FRAGMENT_FIXED_BODY_LEN,
+    hmac_sha2::{hmac_sha2_256, hmac_sha2_384, hmac_sha2_512},
     payload::GENERIC_PAYLOAD_HEADER_LEN,
     sa_init_crypto::{
         Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoProfile,
@@ -342,21 +343,24 @@ pub enum Ikev2ProtectedPayloadCryptoError {
     RandomIvGenerationFailed,
 }
 
-/// Exact AAD context for sealing one IKEv2 protected payload body.
+/// Exact authentication context for sealing one IKEv2 protected payload body.
 ///
 /// `message_prefix` must be the final outer IKE message bytes from the IKE
 /// header through the protected payload generic header, excluding only the
 /// protected body that this helper returns. For an `SK` payload with no
 /// cleartext prefix, that is the 28-byte IKE header plus the 4-byte `SK`
 /// generic payload header. If there are unencrypted payloads before `SK`, they
-/// must be included too. This keeps the AEAD AAD binding byte-exact while still
-/// leaving full message construction and retransmission policy to the caller.
+/// must be included too. For `SKF`, it also includes the four-byte unencrypted
+/// fragment prefix after the generic header. AES-GCM authenticates this prefix
+/// as AAD; AES-CBC/HMAC authenticates the exact complete prefix and ciphertext
+/// before appending the ICV. The outer IKE and generic payload Length fields
+/// must already contain their final values. Full message construction and
+/// retransmission caching remain with the caller.
 #[derive(Clone, Copy)]
 pub struct ProtectedPayloadSealContext<'a> {
-    /// Protected payload kind to seal. Only `SK`/Encrypted is currently
-    /// supported.
+    /// Protected payload kind to seal (`SK` or `SKF`).
     pub kind: ProtectedPayloadKind,
-    /// Exact outer message prefix authenticated as AES-GCM AAD.
+    /// Exact outer message prefix authenticated as AEAD AAD or HMAC input.
     pub message_prefix: &'a [u8],
 }
 
@@ -704,9 +708,10 @@ pub fn seal_ikev2_sa_init_aes_cbc_protected_payload(
 
 /// Seal one AES-CBC/HMAC IKEv2 `SK`/`SKF` body with a caller-supplied CSPRNG.
 ///
-/// The [`TryCryptoRng`] bound prevents accidental use of a deterministic or
-/// non-cryptographic random source at this production boundary. The generated
-/// IV is never logged or exposed separately from the protected wire body.
+/// The [`TryCryptoRng`] bound requires a cryptographic RNG implementation. The
+/// caller must still seed it unpredictably and must never use a fixed-seed RNG
+/// in production. The generated IV is never logged or exposed separately from
+/// the protected wire body.
 ///
 /// # Errors
 ///
@@ -1069,7 +1074,7 @@ fn decrypt_aes_gcm(
     }
 
     let (explicit_iv, ciphertext_and_tag) = protected_body.split_at(AES_GCM_EXPLICIT_IV_LEN);
-    let mut nonce = [0_u8; AES_GCM_SALT_LEN + AES_GCM_EXPLICIT_IV_LEN];
+    let mut nonce = Zeroizing::new([0_u8; AES_GCM_SALT_LEN + AES_GCM_EXPLICIT_IV_LEN]);
     nonce[..AES_GCM_SALT_LEN].copy_from_slice(keys.salt);
     nonce[AES_GCM_SALT_LEN..].copy_from_slice(explicit_iv);
 
@@ -1153,7 +1158,7 @@ fn encrypt_aes_gcm(
     plaintext: &[u8],
     explicit_iv: [u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN],
 ) -> Result<Vec<u8>, Ikev2ProtectedPayloadCryptoError> {
-    let mut nonce = [0_u8; AES_GCM_SALT_LEN + AES_GCM_EXPLICIT_IV_LEN];
+    let mut nonce = Zeroizing::new([0_u8; AES_GCM_SALT_LEN + AES_GCM_EXPLICIT_IV_LEN]);
     nonce[..AES_GCM_SALT_LEN].copy_from_slice(keys.salt);
     nonce[AES_GCM_SALT_LEN..].copy_from_slice(&explicit_iv);
 
@@ -1470,42 +1475,9 @@ fn compute_integrity_checksum(
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2ProtectedPayloadCryptoError> {
     validate_key_len("SK_a", integrity.key_len(), integrity_key.len())?;
     let mut checksum = match integrity {
-        Ikev2IntegrityAlgorithm::HmacSha2_256_128 => {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(integrity_key).map_err(|_| {
-                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-                    name: "SK_a",
-                    expected: integrity.key_len(),
-                    actual: integrity_key.len(),
-                }
-            })?;
-            mac.update(first);
-            mac.update(second);
-            Zeroizing::new(mac.finalize().into_bytes().to_vec())
-        }
-        Ikev2IntegrityAlgorithm::HmacSha2_384_192 => {
-            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(integrity_key).map_err(|_| {
-                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-                    name: "SK_a",
-                    expected: integrity.key_len(),
-                    actual: integrity_key.len(),
-                }
-            })?;
-            mac.update(first);
-            mac.update(second);
-            Zeroizing::new(mac.finalize().into_bytes().to_vec())
-        }
-        Ikev2IntegrityAlgorithm::HmacSha2_512_256 => {
-            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(integrity_key).map_err(|_| {
-                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-                    name: "SK_a",
-                    expected: integrity.key_len(),
-                    actual: integrity_key.len(),
-                }
-            })?;
-            mac.update(first);
-            mac.update(second);
-            Zeroizing::new(mac.finalize().into_bytes().to_vec())
-        }
+        Ikev2IntegrityAlgorithm::HmacSha2_256_128 => hmac_sha2_256(integrity_key, &[first, second]),
+        Ikev2IntegrityAlgorithm::HmacSha2_384_192 => hmac_sha2_384(integrity_key, &[first, second]),
+        Ikev2IntegrityAlgorithm::HmacSha2_512_256 => hmac_sha2_512(integrity_key, &[first, second]),
     };
     checksum.truncate(integrity_icv_len(integrity));
     Ok(checksum)
@@ -1521,27 +1493,22 @@ fn verify_integrity_checksum(
     if received_icv.len() != integrity_icv_len(integrity) {
         return Err(Ikev2ProtectedPayloadCryptoError::AuthenticationFailed);
     }
-    let verified = match integrity {
+    let expected = match integrity {
         Ikev2IntegrityAlgorithm::HmacSha2_256_128 => {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(integrity_key)
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?;
-            mac.update(authenticated_message);
-            mac.verify_truncated_left(received_icv)
+            hmac_sha2_256(integrity_key, &[authenticated_message])
         }
         Ikev2IntegrityAlgorithm::HmacSha2_384_192 => {
-            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(integrity_key)
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?;
-            mac.update(authenticated_message);
-            mac.verify_truncated_left(received_icv)
+            hmac_sha2_384(integrity_key, &[authenticated_message])
         }
         Ikev2IntegrityAlgorithm::HmacSha2_512_256 => {
-            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(integrity_key)
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?;
-            mac.update(authenticated_message);
-            mac.verify_truncated_left(received_icv)
+            hmac_sha2_512(integrity_key, &[authenticated_message])
         }
     };
-    verified.map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
+    if bool::from(expected[..received_icv.len()].ct_eq(received_icv)) {
+        Ok(())
+    } else {
+        Err(Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
+    }
 }
 
 const fn integrity_icv_len(integrity: Ikev2IntegrityAlgorithm) -> usize {
@@ -1584,4 +1551,56 @@ fn strip_ike_padding(
     }
     let cleartext_len = body_with_padding.len() - pad_len;
     Ok(Bytes::copy_from_slice(&body_with_padding[..cleartext_len]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_integrity_checksum, verify_integrity_checksum};
+    use crate::Ikev2IntegrityAlgorithm;
+
+    #[test]
+    fn sha256_and_sha384_integrity_match_rfc4868_auth_vectors(
+    ) -> Result<(), super::Ikev2ProtectedPayloadCryptoError> {
+        // RFC 4868 section 2.7.2, AUTH256-1 and AUTH384-1. These fixed-key
+        // authenticator vectors independently cover the left-half truncation
+        // used by IKEv2 AES-CBC/HMAC profiles.
+        let sha256_key = [0x0b; 32];
+        let sha256_expected = [
+            0x19, 0x8a, 0x60, 0x7e, 0xb4, 0x4b, 0xfb, 0xc6, 0x99, 0x03, 0xa0, 0xf1, 0xcf, 0x2b,
+            0xbd, 0xc5,
+        ];
+        let sha256 = compute_integrity_checksum(
+            Ikev2IntegrityAlgorithm::HmacSha2_256_128,
+            &sha256_key,
+            b"Hi There",
+            &[],
+        )?;
+        assert_eq!(sha256.as_slice(), sha256_expected);
+        verify_integrity_checksum(
+            Ikev2IntegrityAlgorithm::HmacSha2_256_128,
+            &sha256_key,
+            b"Hi There",
+            &sha256_expected,
+        )?;
+
+        let sha384_key = [0x0b; 48];
+        let sha384_expected = [
+            0xb6, 0xa8, 0xd5, 0x63, 0x6f, 0x5c, 0x6a, 0x72, 0x24, 0xf9, 0x97, 0x7d, 0xcf, 0x7e,
+            0xe6, 0xc7, 0xfb, 0x6d, 0x0c, 0x48, 0xcb, 0xde, 0xe9, 0x73,
+        ];
+        let sha384 = compute_integrity_checksum(
+            Ikev2IntegrityAlgorithm::HmacSha2_384_192,
+            &sha384_key,
+            b"Hi There",
+            &[],
+        )?;
+        assert_eq!(sha384.as_slice(), sha384_expected);
+        verify_integrity_checksum(
+            Ikev2IntegrityAlgorithm::HmacSha2_384_192,
+            &sha384_key,
+            b"Hi There",
+            &sha384_expected,
+        )?;
+        Ok(())
+    }
 }

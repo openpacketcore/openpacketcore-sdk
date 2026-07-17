@@ -36,10 +36,14 @@ num_cpus = "1.16"
 # to the 0.11 trait line together with aes-gcm-siv, which has no stable
 # release on the new traits yet; partial bumps create duplicate digest versions.
 sha2 = "0.10"
+# IKEv2 PRF and integrity state is key-derived and must be wiped on drop. Keep
+# this explicit alias on the RustCrypto digest 0.11 line with zeroization until
+# the remaining workspace crypto stack can move as one compatibility change.
+sha2-zeroize = { package = "sha2", version = "0.11", features = ["zeroize"] }
 sha1 = "0.11"
 rand = "0.10"
 aes = { version = "0.9.1", features = ["zeroize"] }
-aes-gcm = { version = "0.11.0-rc.4", default-features = false, features = ["aes", "alloc"] }
+aes-gcm = { version = "0.11.0-rc.4", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-gcm-siv = "0.11"
 cbc = { version = "0.2.1", default-features = false, features = ["block-padding", "zeroize"] }
 hkdf = "0.12"

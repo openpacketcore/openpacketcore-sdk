@@ -16,7 +16,6 @@ use crypto_bigint::{
     modular::{FixedMontyForm, FixedMontyParams},
     Odd, Random, U2048,
 };
-use hmac::{Hmac, Mac};
 use p256::{
     ecdh::EphemeralSecret as P256EphemeralSecret,
     elliptic_curve::{common::Generate, point::PointCompression, sec1::ToSec1Point},
@@ -24,10 +23,10 @@ use p256::{
 };
 use p384::{ecdh::EphemeralSecret as P384EphemeralSecret, PublicKey as P384PublicKey};
 use p521::{ecdh::EphemeralSecret as P521EphemeralSecret, PublicKey as P521PublicKey};
-use sha2::{Sha256, Sha384, Sha512};
 use zeroize::Zeroizing;
 
 use crate::{
+    hmac_sha2::{hmac_sha2_256, hmac_sha2_384, hmac_sha2_512},
     ike_auth::Ikev2ChildSaNegotiation,
     sa_init::{
         Ikev2SaProposal, Ikev2SaTransform, Ikev2SaTransformBuild,
@@ -1652,37 +1651,16 @@ fn prf(
     key: &[u8],
     data: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2SaInitCryptoError> {
+    if key.is_empty() {
+        return Err(Ikev2SaInitCryptoError::InvalidKeyLength {
+            name: "PRF key",
+            len: 0,
+        });
+    }
     match algorithm {
-        Ikev2PrfAlgorithm::HmacSha2_256 => {
-            let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| {
-                Ikev2SaInitCryptoError::InvalidKeyLength {
-                    name: "PRF key",
-                    len: key.len(),
-                }
-            })?;
-            mac.update(data);
-            Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
-        }
-        Ikev2PrfAlgorithm::HmacSha2_384 => {
-            let mut mac = Hmac::<Sha384>::new_from_slice(key).map_err(|_| {
-                Ikev2SaInitCryptoError::InvalidKeyLength {
-                    name: "PRF key",
-                    len: key.len(),
-                }
-            })?;
-            mac.update(data);
-            Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
-        }
-        Ikev2PrfAlgorithm::HmacSha2_512 => {
-            let mut mac = Hmac::<Sha512>::new_from_slice(key).map_err(|_| {
-                Ikev2SaInitCryptoError::InvalidKeyLength {
-                    name: "PRF key",
-                    len: key.len(),
-                }
-            })?;
-            mac.update(data);
-            Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
-        }
+        Ikev2PrfAlgorithm::HmacSha2_256 => Ok(hmac_sha2_256(key, &[data])),
+        Ikev2PrfAlgorithm::HmacSha2_384 => Ok(hmac_sha2_384(key, &[data])),
+        Ikev2PrfAlgorithm::HmacSha2_512 => Ok(hmac_sha2_512(key, &[data])),
     }
 }
 

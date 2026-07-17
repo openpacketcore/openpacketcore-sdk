@@ -33,6 +33,7 @@ pub mod device_identity;
 pub mod exchange;
 pub mod fragmentation;
 pub mod header;
+mod hmac_sha2;
 pub mod ike_auth;
 pub mod ike_auth_signature;
 pub mod message;

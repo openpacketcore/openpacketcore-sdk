@@ -976,6 +976,7 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -2959,6 +2960,7 @@ dependencies = [
  "rsa",
  "sha1",
  "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "x509-parser",
  "zeroize",

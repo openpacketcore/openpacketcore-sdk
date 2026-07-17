@@ -6,12 +6,14 @@ use opc_proto_ikev2::{
     ikev2_aes_gcm_protected_body_len, open_protected_payloads,
     seal_ikev2_sa_init_aes_cbc_protected_payload,
     seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector,
-    seal_ikev2_sa_init_protected_payload, Ikev2DhGroup, Ikev2EncryptionAlgorithm,
-    Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadDirection,
-    Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial, Ikev2SaInitProtectedPayloadProvider, Message,
-    ProtectedPayloadKind, ProtectedPayloadOpenError, ProtectedPayloadSealContext,
+    seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng, seal_ikev2_sa_init_protected_payload,
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm,
+    Ikev2ProtectedPayloadCryptoErrorCode, Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile,
+    Ikev2SaInitKeyMaterial, Ikev2SaInitProtectedPayloadProvider, Message, ProtectedPayloadKind,
+    ProtectedPayloadOpenError, ProtectedPayloadSealContext,
 };
 use opc_protocol::{BorrowDecode, DecodeContext};
+use rand::{TryCryptoRng, TryRng};
 use sha2::Sha512;
 
 const INITIATOR_SPI: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -162,6 +164,37 @@ fn hex_nibble(value: u8) -> u8 {
     }
 }
 
+#[derive(Debug)]
+struct InjectedRngFailure;
+
+impl std::fmt::Display for InjectedRngFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("injected random-source failure")
+    }
+}
+
+impl std::error::Error for InjectedRngFailure {}
+
+struct FailingCryptoRng;
+
+impl TryRng for FailingCryptoRng {
+    type Error = InjectedRngFailure;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Err(InjectedRngFailure)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Err(InjectedRngFailure)
+    }
+
+    fn try_fill_bytes(&mut self, _destination: &mut [u8]) -> Result<(), Self::Error> {
+        Err(InjectedRngFailure)
+    }
+}
+
+impl TryCryptoRng for FailingCryptoRng {}
+
 #[test]
 fn cbc_sha512_opens_and_seals_independent_complete_message_vector() {
     // Independently generated with OpenSSL AES-256-CBC and HMAC-SHA512. The
@@ -259,6 +292,87 @@ fn every_declared_cbc_key_size_and_sha2_integrity_roundtrips_both_directions() {
 }
 
 #[test]
+fn cbc_padding_covers_every_block_residue_including_empty_cleartext() {
+    let profile = cbc_profile(
+        Ikev2EncryptionAlgorithm::AesCbc256,
+        Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+    );
+    let material = established_material(profile);
+
+    for cleartext_len in 0..16 {
+        let cleartext = vec![0x5a; cleartext_len];
+        let body_len = ikev2_aes_cbc_protected_body_len(profile, cleartext_len)
+            .expect("CBC body length for every residue");
+        let mut prefix = protected_prefix(
+            ProtectedPayloadKind::Encrypted,
+            Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+            body_len,
+            None,
+            0x100 + u32::try_from(cleartext_len).expect("small test length"),
+        );
+        if cleartext.is_empty() {
+            prefix[28] = 0;
+        }
+        let body = seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector(
+            profile,
+            &material,
+            Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+            ProtectedPayloadSealContext {
+                kind: ProtectedPayloadKind::Encrypted,
+                message_prefix: &prefix,
+            },
+            &cleartext,
+            CBC_IV,
+        )
+        .expect("every CBC padding residue seals");
+        assert_eq!((body.len() - 16 - profile.integrity_icv_len()) % 16, 0);
+        let encoded = message(&prefix, &body);
+        let opened = open(
+            &encoded,
+            profile,
+            &material,
+            Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        )
+        .expect("every CBC padding residue opens");
+        assert_eq!(opened[0].cleartext.as_ref(), cleartext);
+    }
+}
+
+#[test]
+fn cbc_rng_failure_is_typed_and_does_not_fall_back_to_a_fixed_iv() {
+    let profile = cbc_profile(
+        Ikev2EncryptionAlgorithm::AesCbc256,
+        Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+    );
+    let material = established_material(profile);
+    let body_len =
+        ikev2_aes_cbc_protected_body_len(profile, INNER_PAYLOAD.len()).expect("CBC body length");
+    let prefix = protected_prefix(
+        ProtectedPayloadKind::Encrypted,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        body_len,
+        None,
+        0x200,
+    );
+    let error = seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::Encrypted,
+            message_prefix: &prefix,
+        },
+        &INNER_PAYLOAD,
+        &mut FailingCryptoRng,
+    )
+    .expect_err("random-source failure must fail closed");
+    assert_eq!(
+        error.code(),
+        Ikev2ProtectedPayloadCryptoErrorCode::RandomIvGenerationFailed
+    );
+}
+
+#[test]
 fn aes_gcm_192_is_executable_and_skf_uses_fragment_prefix_as_aad() {
     let profile = gcm_192_profile();
     let material = established_material(profile);
@@ -349,6 +463,36 @@ fn cbc_skf_roundtrips_and_authenticates_fragment_metadata() {
     )
     .expect("CBC/HMAC SKF opens");
     assert_eq!(opened[0].kind, ProtectedPayloadKind::EncryptedFragment);
+    assert_eq!(opened[0].cleartext.as_ref(), INNER_PAYLOAD);
+
+    let continued_prefix = protected_prefix(
+        ProtectedPayloadKind::EncryptedFragment,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        body_len,
+        Some([0, 2, 0, 3]),
+        10,
+    );
+    assert_eq!(continued_prefix[28], 0);
+    let continued_body = seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::EncryptedFragment,
+            message_prefix: &continued_prefix,
+        },
+        &INNER_PAYLOAD,
+        CBC_IV,
+    )
+    .expect("non-first CBC/HMAC SKF with Next Payload zero seals");
+    let continued = message(&continued_prefix, &continued_body);
+    let opened = open(
+        &continued,
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+    )
+    .expect("non-first CBC/HMAC SKF with Next Payload zero opens");
     assert_eq!(opened[0].cleartext.as_ref(), INNER_PAYLOAD);
 
     let mut tampered = encoded;

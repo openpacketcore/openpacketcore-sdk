@@ -28,7 +28,6 @@ aes-gcm = { workspace = true }
 bytes = { workspace = true }
 cbc = { workspace = true }
 crypto-bigint = { version = "0.7.5", features = ["getrandom", "zeroize"] }
-hmac = { workspace = true }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-proto-tft = { path = "../opc-proto-tft", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
@@ -39,11 +38,13 @@ rand = { workspace = true }
 rsa = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+sha2-zeroize = { workspace = true }
 subtle = { workspace = true }
 x509-parser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+hmac = { workspace = true }
 opc-proto-ikev2 = { path = ".", version = "0.2.0", features = ["testkit"] }
 opc-proto-gtpv2c = { path = "../opc-proto-gtpv2c", version = "0.2.0" }
 quickcheck = "1"
