@@ -27,6 +27,17 @@ pub enum AuthorityMode {
     Shadow,
 }
 
+impl AuthorityMode {
+    /// Returns whether management reads and writes require an external
+    /// writer-of-record authority proof.
+    ///
+    /// Shadow projections must fail closed when no authority port is installed;
+    /// an authoritative single-writer bus preserves its local behavior.
+    pub const fn requires_external_authority(self) -> bool {
+        matches!(self, Self::Shadow)
+    }
+}
+
 /// Coarse drift state exposed by the config bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriftState {
@@ -321,6 +332,29 @@ impl ConfirmedCommitResolution {
 pub struct CommitWrite<C: OpcConfig> {
     record: StoredConfig<C>,
     confirmed_resolution: Option<ConfirmedCommitResolution>,
+}
+
+/// Metadata attested by a datastore after one commit write succeeds.
+///
+/// The receipt contains no config payload, principal, or key material. The
+/// plaintext digest is optional for source compatibility with custom stores
+/// that predate receipt support; encrypted built-in stores always return it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommitWriteReceipt {
+    plaintext_digest: Option<[u8; 32]>,
+}
+
+impl CommitWriteReceipt {
+    /// Builds a receipt from the digest stored with the committed record.
+    pub const fn new(plaintext_digest: Option<[u8; 32]>) -> Self {
+        Self { plaintext_digest }
+    }
+
+    /// Returns the exact SHA-256 plaintext-envelope digest stored for the
+    /// commit. This is not necessarily a config-only content hash.
+    pub const fn plaintext_digest(self) -> Option<[u8; 32]> {
+        self.plaintext_digest
+    }
 }
 
 impl<C: OpcConfig> CommitWrite<C> {
@@ -778,5 +812,16 @@ impl<C: OpcConfig> ConfigEvent<C> {
             Self::Change(change) => change.version,
             Self::ResyncRequired { latest_version } => *latest_version,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthorityMode;
+
+    #[test]
+    fn shadow_mode_requires_external_authority_while_authoritative_does_not() {
+        assert!(!AuthorityMode::Authoritative.requires_external_authority());
+        assert!(AuthorityMode::Shadow.requires_external_authority());
     }
 }

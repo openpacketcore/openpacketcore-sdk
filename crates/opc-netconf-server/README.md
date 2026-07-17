@@ -26,7 +26,8 @@ Main exports include:
   `SubtreeFilter`, `WithDefaultsMode`, and `XmlError`.
 - Reply helpers:
   `rpc_ok_reply`, `rpc_ok_empty_reply`, `rpc_error_reply`,
-  `rpc_get_schema_reply`, `xml_escape`, and `RpcError`.
+  `rpc_get_schema_reply`, `rpc_ok_committed_revision_reply`, `xml_escape`, and
+  `RpcError`.
 - Server/session/listener types:
   `ReadOnlyNetconfServer`, `SessionConfig`, `SessionRegistry`,
   `run_read_only_session`, `run_read_only_session_with_registry`,
@@ -46,6 +47,64 @@ XML renderer/applicator hooks, operational-state hooks, advertised capabilities,
 schema-source lookup, and edit-config candidate construction. Default render and
 edit hooks fail closed unless a generated or CNF-specific binding implements
 them.
+
+## HA config authority opt-in
+
+Install the same config authority used by the consensus datastore on the
+server core:
+
+```rust,ignore
+use std::sync::Arc;
+
+use opc_config_bus::ConfigAuthorityPort;
+
+let authority: Arc<dyn ConfigAuthorityPort> =
+    Arc::new(raft_managed_datastore.config_authority());
+let server = ReadOnlyNetconfServer::new(binding, policy, audit, transport)?
+    .with_config_authority(authority)?;
+```
+
+The async session dispatcher checks the port before `<edit-config>`,
+`<edit-data>`, `<commit>`, and config read projection. `Retry` and
+`Unavailable` return an `operation-failed` RPC error with
+`<error-app-tag>not-leader</error-app-tag>`. A known bounded hint appears as:
+
+```xml
+<error-info>
+  <leader-hint xmlns="urn:openpacketcore:params:xml:ns:netconf:config-authority:1.0">2</leader-hint>
+</error-info>
+```
+
+The value is XML-escaped and never logged. A numeric consensus-node hint must
+be resolved through the product's fixed authenticated management roster.
+
+Installing the port also opts durable write replies into an `<ok/>`-adjacent
+committed revision:
+
+```xml
+<committed-revision xmlns="urn:openpacketcore:params:xml:ns:netconf:config-authority:1.0">
+  <version>42</version>
+  <content-hash algorithm="sha-256">…64 lowercase hex characters…</content-hash>
+</committed-revision>
+```
+
+The hash exactly matches the persisted plaintext-envelope digest, including
+bound request/replay metadata; it is not a config-only equality hash.
+Construction rejects a datastore that cannot attest new commit digests. A
+replay of a pre-digest legacy record still has no revision and the response
+fails closed until an explicitly reconciled new durable write exists.
+
+For the concrete consensus adapter, the local config bus's `{tx_id, version}`
+must also equal the canonical state-machine head. An empty canonical store may
+admit a write that creates the genesis commit, but linearizable reads remain
+unavailable until that durable head exists; an empty transaction/version cannot
+prove bootstrap-content equality across pods.
+
+Without a port, an authoritative bus preserves the legacy reply bytes and read
+behavior. A shadow bus without a port fails closed. The public synchronous
+`handle_rpc`/`handle_rpc_xml` helpers cannot await an async authority port and
+therefore reject gated operations whenever one is configured. Production
+leader-aware traffic must use the async session/listener runners.
 
 ## Relationships
 
@@ -78,6 +137,8 @@ Limitations:
 - Notification replay, stop-time, and notification filters are rejected.
 - Direct `handle_rpc` helpers are useful for tests, but full session side
   effects require the session/listener runners and `SessionRegistry`.
+- Authority-enabled config reads are the explicit linearizable-read profile;
+  they never fall back to a local projection when leadership is unavailable.
 
 ## Roadmap
 

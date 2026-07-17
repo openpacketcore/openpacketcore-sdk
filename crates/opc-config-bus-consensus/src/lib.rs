@@ -16,15 +16,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use opc_config_bus::{
-    CommitWrite as BusCommitWrite, ConfirmedCommitResolution as BusConfirmedCommitResolution,
-    ManagedDatastore, SealedConfig, StoreError, StoredConfig as BusStoredConfig,
+    CommitWrite as BusCommitWrite, ConfigAuthorityOperation, ConfigAuthorityOutcome,
+    ConfigAuthorityPort, ConfigLeaderHint, ConfigProjectionHead,
+    ConfirmedCommitResolution as BusConfirmedCommitResolution, ManagedDatastore, SealedConfig,
+    StoreError, StoredConfig as BusStoredConfig,
 };
 use opc_config_model::{
     IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget as BusRollbackTarget,
     TrustedPrincipal,
 };
 use opc_persist::{
-    AttestedConfigCommit, AuditOpType, AuditRecord, CommitRecord, CommitSource, ConfigStore,
+    AttestedConfigCommit, AuditOpType, AuditRecord, CommitRecord, CommitSource,
+    ConfigLocalAuthorityOutcome, ConfigStore,
     ConfirmedCommitResolution as PersistConfirmedCommitResolution, ConsensusConfigStore,
     PersistError, PersistErrorKind, RollbackTarget, CONFIG_ROLLBACK_LABEL_MAX_BYTES,
 };
@@ -430,6 +433,79 @@ pub struct RaftManagedDatastore<C> {
     adapter: PersistManagedDatastore<C, ConsensusConfigStore>,
 }
 
+/// Management authority port backed directly by the config Openraft store.
+///
+/// The adapter performs a local-only Openraft linearizability/apply check. It
+/// never forwards the management request and never creates a parallel
+/// leadership signal.
+#[derive(Clone)]
+pub struct ConsensusConfigAuthority {
+    store: Arc<ConsensusConfigStore>,
+}
+
+impl ConsensusConfigAuthority {
+    /// Binds the authority port to the same consensus store used by the config
+    /// bus datastore adapter.
+    pub fn new(store: Arc<ConsensusConfigStore>) -> Self {
+        Self { store }
+    }
+
+    /// Returns the underlying canonical config consensus store.
+    pub fn consensus_store(&self) -> &Arc<ConsensusConfigStore> {
+        &self.store
+    }
+}
+
+impl fmt::Debug for ConsensusConfigAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConsensusConfigAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
+fn map_config_authority_outcome(outcome: ConfigLocalAuthorityOutcome) -> ConfigAuthorityOutcome {
+    match outcome {
+        ConfigLocalAuthorityOutcome::LocalAuthority => ConfigAuthorityOutcome::LocalAuthority,
+        ConfigLocalAuthorityOutcome::Retry { leader_hint } => {
+            let leader_hint = leader_hint
+                .and_then(|node_id| ConfigLeaderHint::new(node_id.get().to_string()).ok());
+            ConfigAuthorityOutcome::Retry { leader_hint }
+        }
+        ConfigLocalAuthorityOutcome::Unavailable => ConfigAuthorityOutcome::Unavailable,
+        _ => ConfigAuthorityOutcome::Unavailable,
+    }
+}
+
+fn projection_can_attempt_authority(
+    operation: ConfigAuthorityOperation,
+    projection: ConfigProjectionHead,
+) -> bool {
+    match operation {
+        ConfigAuthorityOperation::Write => true,
+        ConfigAuthorityOperation::LinearizableRead => projection.tx_id().is_some(),
+        _ => false,
+    }
+}
+
+#[async_trait]
+impl ConfigAuthorityPort for ConsensusConfigAuthority {
+    async fn ensure_local_authority(
+        &self,
+        operation: ConfigAuthorityOperation,
+        projection: ConfigProjectionHead,
+    ) -> ConfigAuthorityOutcome {
+        if !projection_can_attempt_authority(operation, projection) {
+            return ConfigAuthorityOutcome::Unavailable;
+        }
+        map_config_authority_outcome(
+            self.store
+                .ensure_local_authority_at_config_head(projection.tx_id(), projection.version())
+                .await,
+        )
+    }
+}
+
 impl<C> RaftManagedDatastore<C> {
     /// Wrap the already-open config consensus authority.
     pub fn new(store: Arc<ConsensusConfigStore>) -> Self {
@@ -442,6 +518,12 @@ impl<C> RaftManagedDatastore<C> {
     /// RPC-handler, status, readiness, snapshot, and shutdown operations.
     pub fn consensus_store(&self) -> &Arc<ConsensusConfigStore> {
         self.adapter.inner()
+    }
+
+    /// Builds a management authority port over this adapter's exact consensus
+    /// store. The returned port can be shared by gNMI and NETCONF servers.
+    pub fn config_authority(&self) -> ConsensusConfigAuthority {
+        ConsensusConfigAuthority::new(Arc::clone(self.adapter.inner()))
     }
 }
 
@@ -521,6 +603,7 @@ where
 mod tests {
     use super::*;
     use opc_config_model::WorkloadIdentity;
+    use opc_persist::ConfigConsensusNodeId;
     use opc_types::TenantId;
 
     fn encoded_principal() -> String {
@@ -610,5 +693,55 @@ mod tests {
         for encoded in duplicate {
             assert!(decode_persisted_bus_metadata(&encoded).is_err());
         }
+    }
+
+    #[test]
+    fn authority_outcome_uses_only_the_stable_numeric_node_id() {
+        let node_id = ConfigConsensusNodeId::new(42).expect("node ID");
+        let outcome = map_config_authority_outcome(ConfigLocalAuthorityOutcome::Retry {
+            leader_hint: Some(node_id),
+        });
+
+        let ConfigAuthorityOutcome::Retry {
+            leader_hint: Some(hint),
+        } = outcome
+        else {
+            panic!("retry with hint");
+        };
+        assert_eq!(hint.as_str(), "42");
+        assert!(!hint.as_str().contains("ConsensusNodeId"));
+    }
+
+    #[test]
+    fn authority_outcome_fails_closed_without_a_known_leader() {
+        assert_eq!(
+            map_config_authority_outcome(ConfigLocalAuthorityOutcome::Retry { leader_hint: None }),
+            ConfigAuthorityOutcome::Retry { leader_hint: None }
+        );
+        assert_eq!(
+            map_config_authority_outcome(ConfigLocalAuthorityOutcome::Unavailable),
+            ConfigAuthorityOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn empty_projection_allows_only_the_genesis_write() {
+        let empty = ConfigProjectionHead::new(None, opc_types::ConfigVersion::INITIAL);
+        assert!(projection_can_attempt_authority(
+            ConfigAuthorityOperation::Write,
+            empty
+        ));
+        assert!(!projection_can_attempt_authority(
+            ConfigAuthorityOperation::LinearizableRead,
+            empty
+        ));
+        let durable = ConfigProjectionHead::new(
+            Some(opc_types::TxId::new()),
+            opc_types::ConfigVersion::new(1),
+        );
+        assert!(projection_can_attempt_authority(
+            ConfigAuthorityOperation::LinearizableRead,
+            durable
+        ));
     }
 }

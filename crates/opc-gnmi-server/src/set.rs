@@ -5,8 +5,8 @@
 use std::time::{Duration, Instant};
 
 use opc_config_model::{
-    CommitError, CommitMode, CommitRequest, ConfigOperation, OpcConfig, RequestId, RequestSource,
-    TransportType, TrustedPrincipal, YangPath,
+    CommitError, CommitMode, CommitRequest, CommitResult, ConfigOperation, OpcConfig, RequestId,
+    RequestSource, TransportType, TrustedPrincipal, YangPath,
 };
 use opc_mgmt_audit::{AuditOperation, AuditOutcome, AuditReasonCode};
 use opc_mgmt_authz::ConfigWriteAuthorizer;
@@ -15,6 +15,7 @@ use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_schema::SchemaRegistry;
 
 use crate::audit::{outcome_for_error, record_audit, schema_paths_for_yang};
+use crate::committed_revision::response_extension as committed_revision_response_extension;
 use crate::confirmed_commit::{parse_set_commit_extension, SetCommitExtension};
 use crate::get::{now_nanos, yang_path_to_proto};
 use crate::metrics::{
@@ -303,18 +304,8 @@ where
     )?;
 
     let start = Instant::now();
-    match bus.submit(commit).await {
-        Ok(_) => {
-            record_set_commit_latency(commit_metric, start.elapsed());
-            audit_set_result(
-                server,
-                request_id,
-                principal,
-                audit_operation,
-                AuditOutcome::Success,
-                audit_paths,
-            )?;
-        }
+    let result = match bus.submit(commit).await {
+        Ok(result) => result,
         Err(err) => {
             let err = commit_error_to_gnmi(err);
             audit_set_result(
@@ -327,14 +318,37 @@ where
             )?;
             return Err(err);
         }
-    }
+    };
+    record_set_commit_latency(commit_metric, start.elapsed());
+    let extensions = match committed_revision_extensions(server, &result) {
+        Ok(extensions) => extensions,
+        Err(err) => {
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                audit_operation,
+                outcome_for_error(&err),
+                audit_paths,
+            )?;
+            return Err(err);
+        }
+    };
+    audit_set_result(
+        server,
+        request_id,
+        principal,
+        audit_operation,
+        AuditOutcome::Success,
+        audit_paths,
+    )?;
 
     Ok(gnmi::SetResponse {
         prefix: None,
         response: update_results(&normalized)?,
         message: None,
         timestamp: now_nanos(),
-        extension: Vec::new(),
+        extension: extensions,
     })
 }
 
@@ -430,18 +444,8 @@ where
     .with_base_version(snapshot.version);
 
     let start = Instant::now();
-    match bus.submit(commit).await {
-        Ok(_) => {
-            record_set_commit_latency(SetCommitMetric::Patch, start.elapsed());
-            audit_set_result(
-                server,
-                request_id,
-                principal,
-                AuditOperation::Update,
-                AuditOutcome::Success,
-                Vec::new(),
-            )?;
-        }
+    let result = match bus.submit(commit).await {
+        Ok(result) => result,
         Err(err) => {
             let err = commit_error_to_gnmi(err);
             audit_set_result(
@@ -454,15 +458,55 @@ where
             )?;
             return Err(err);
         }
-    }
+    };
+    record_set_commit_latency(SetCommitMetric::Patch, start.elapsed());
+    let extensions = match committed_revision_extensions(server, &result) {
+        Ok(extensions) => extensions,
+        Err(err) => {
+            audit_set_result(
+                server,
+                request_id,
+                principal,
+                AuditOperation::Update,
+                outcome_for_error(&err),
+                Vec::new(),
+            )?;
+            return Err(err);
+        }
+    };
+    audit_set_result(
+        server,
+        request_id,
+        principal,
+        AuditOperation::Update,
+        AuditOutcome::Success,
+        Vec::new(),
+    )?;
 
     Ok(gnmi::SetResponse {
         prefix: None,
         response: Vec::new(),
         message: None,
         timestamp: now_nanos(),
-        extension: Vec::new(),
+        extension: extensions,
     })
+}
+
+fn committed_revision_extensions<C, B>(
+    server: &GnmiServer<C, B>,
+    result: &CommitResult,
+) -> Result<Vec<crate::proto::gnmi_ext::Extension>, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    if !server.committed_revision_responses_enabled() {
+        return Ok(Vec::new());
+    }
+    let revision = result
+        .committed_revision
+        .ok_or_else(|| GnmiError::schema("committed config digest receipt is missing"))?;
+    Ok(vec![committed_revision_response_extension(revision)])
 }
 
 fn set_operation_count(request: &gnmi::SetRequest) -> usize {

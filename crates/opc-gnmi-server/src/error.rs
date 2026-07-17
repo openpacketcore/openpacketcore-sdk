@@ -1,5 +1,6 @@
 //! gNMI foundation errors.
 
+use opc_config_bus::ConfigLeaderHint;
 use opc_mgmt_errors::MgmtStatus;
 use opc_mgmt_limits::LimitsError;
 use thiserror::Error;
@@ -42,6 +43,12 @@ pub enum GnmiError {
     Unavailable {
         /// Server-local, payload-free detail.
         detail: String,
+    },
+    /// The local process is not the current config writer of record.
+    #[error("gNMI service unavailable")]
+    NotLeader {
+        /// Opaque, validated routing hint returned to the client when known.
+        leader_hint: Option<ConfigLeaderHint>,
     },
     /// Deadline expired.
     #[error("gNMI deadline exceeded")]
@@ -89,6 +96,20 @@ impl GnmiError {
         }
     }
 
+    /// Builds a fail-closed writer-of-record rejection.
+    pub fn not_leader(leader_hint: Option<ConfigLeaderHint>) -> Self {
+        Self::NotLeader { leader_hint }
+    }
+
+    /// Returns the validated leader-routing hint, when this is a not-leader
+    /// rejection and the authority supplied one.
+    pub fn leader_hint(&self) -> Option<&ConfigLeaderHint> {
+        match self {
+            Self::NotLeader { leader_hint } => leader_hint.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Builds a failed-precondition error.
     pub fn failed_precondition(detail: impl Into<String>) -> Self {
         Self::FailedPrecondition {
@@ -111,7 +132,7 @@ impl GnmiError {
             Self::PermissionDenied => MgmtStatus::PermissionDenied,
             Self::Unauthenticated => MgmtStatus::Unauthenticated,
             Self::Unimplemented { .. } => MgmtStatus::Unimplemented,
-            Self::Unavailable { .. } => MgmtStatus::Unavailable,
+            Self::Unavailable { .. } | Self::NotLeader { .. } => MgmtStatus::Unavailable,
             Self::DeadlineExceeded => MgmtStatus::DeadlineExceeded,
             Self::FailedPrecondition { .. } => MgmtStatus::FailedPrecondition,
             Self::Internal { .. } => MgmtStatus::Internal,
@@ -127,7 +148,10 @@ impl GnmiError {
             | Self::Unavailable { detail }
             | Self::FailedPrecondition { detail }
             | Self::Internal { detail } => Some(detail.as_str()),
-            Self::PermissionDenied | Self::Unauthenticated | Self::DeadlineExceeded => None,
+            Self::PermissionDenied
+            | Self::Unauthenticated
+            | Self::NotLeader { .. }
+            | Self::DeadlineExceeded => None,
         }
     }
 

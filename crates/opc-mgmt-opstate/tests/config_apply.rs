@@ -488,6 +488,7 @@ fn commit_result_with_new_version_clears_rejected_candidate_metadata() {
             new_version: Some(ConfigVersion::new(4)),
             status: CommitStatus::Committed,
             changed_paths: Vec::new(),
+            committed_revision: None,
             apply_plan: Some(plan(ChangeImpactClass::Hot, "config_changed")),
         });
 
@@ -511,6 +512,7 @@ fn validate_only_result_does_not_mutate_running_status() {
             new_version: None,
             status: CommitStatus::Validated,
             changed_paths: Vec::new(),
+            committed_revision: None,
             apply_plan: Some(plan(ChangeImpactClass::Warm, "validated_only")),
         });
 

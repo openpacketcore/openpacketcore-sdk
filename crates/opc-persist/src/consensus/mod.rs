@@ -13,8 +13,8 @@ mod store;
 mod types;
 
 pub use store::{
-    ConfigConsensusOpenError, ConfigConsensusStatus, ConsensusConfigStore,
-    DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    ConfigConsensusOpenError, ConfigConsensusStatus, ConfigLocalAuthorityOutcome,
+    ConsensusConfigStore, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use types::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusClusterId,

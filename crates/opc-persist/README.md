@@ -39,6 +39,17 @@ accepted single-replica profile.
   pristine node mint competing initial authority.
 - `ConsensusConfigStore::rpc_handler` exposes the shared bounded inbound
   consensus port. `opc-persist` does not contain a second TCP or TLS transport.
+- `ConsensusConfigStore::ensure_local_authority` performs a local-only
+  Openraft read-index barrier, waits for local apply, and verifies exact
+  admitted membership. It returns `LocalAuthority`, `Retry` with an optional
+  canonical node ID, or `Unavailable`; unlike ordinary store operations it
+  never forwards the check to a peer. Management protocols use this result to
+  redirect before touching a local projection or mutation path.
+- `ConsensusConfigStore::ensure_local_authority_at_config_head` additionally
+  drains the fixed proposal-admission cohort under the same operation deadline,
+  compares the payload-free projected transaction/version with the canonical
+  local SQLite state-machine head, and repeats the same-term Openraft barrier.
+  Every return path releases the drained permits.
 - `ApprovedLegacyConfigRecovery` is the explicit offline admission object for
   replacing nonempty legacy authority with one exact applied snapshot.
 - `SecurityPolicyService` and `SqliteSecurityPolicyService` stage, validate,
@@ -198,6 +209,10 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   following unsafe file types; drop guards clean canceled staging work.
 - `probe_durable_readiness` uses Openraft's linearizable path; listener bind or
   a local SQLite read is not readiness evidence.
+- `ensure_local_authority` is deliberately distinct from routed durable reads:
+  only the current local leader can pass it. Unknown leadership, quorum loss,
+  membership drift, or apply timeout is an unavailable result, never
+  permission to serve stale local state.
 - `ConsensusConfigStore::status` snapshots engine progress and live exact
   membership under one Openraft metrics guard, releases that guard, and only
   then updates admission state. Status remains a synchronous observation and

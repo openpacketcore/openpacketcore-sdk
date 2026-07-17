@@ -226,6 +226,24 @@ async fn encrypting_store_binds_parent_tx_id_and_rolls_back_via_decrypted_checkp
     assert_eq!(history[1].parent_tx_id, Some(first.tx_id));
     assert!(!history[0].encrypted_blob.is_empty());
     assert!(!history[1].encrypted_blob.is_empty());
+    assert_eq!(
+        first
+            .committed_revision
+            .expect("first committed revision")
+            .content_hash,
+        history[0]
+            .plaintext_digest
+            .expect("first persisted plaintext digest")
+    );
+    assert_eq!(
+        second
+            .committed_revision
+            .expect("second committed revision")
+            .content_hash,
+        history[1]
+            .plaintext_digest
+            .expect("second persisted plaintext digest")
+    );
     let sealed: &SealedConfig<TestConfig> = &history[0].config;
     assert_eq!(
         sealed.schema_digest(),
@@ -658,6 +676,58 @@ async fn encrypted_legacy_config_only_plaintext_restores_during_rolling_upgrade(
         .expect("restore pre-v2 ciphertext")
         .expect("record");
     assert_eq!(restored.config.name, "pre-v2-envelope");
+}
+
+#[tokio::test]
+async fn encrypted_legacy_replay_never_fabricates_a_committed_revision_digest() {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let provider = test_provider();
+    let key = IdempotencyKey::new("pre-digest-replay").expect("idempotency key");
+    let changed_path = YangPath::new("/system/hostname").expect("path");
+    let mut legacy = StoredConfig::new(
+        TxId::new(),
+        ConfigVersion::new(1),
+        principal(),
+        RequestSource::Northbound,
+        TestConfig::new("legacy-replay"),
+    );
+    legacy.idempotency_key = Some(key.clone());
+    legacy.request_fingerprint = Some(StoredRequestFingerprint {
+        operation: ConfigOperation::Replace,
+        mode: StoredRequestMode::Commit,
+        transport: TransportType::Internal,
+        changed_paths: vec![changed_path.clone()],
+        base_version: Some(ConfigVersion::INITIAL),
+    });
+    let mut legacy_ciphertext = legacy_ciphertext_record(legacy, provider.as_ref()).await;
+    legacy_ciphertext.plaintext_digest = None;
+    inner.seed(legacy_ciphertext).await;
+    let store = EncryptingManagedDatastore::new(Arc::clone(&inner), provider);
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), store)
+        .await
+        .expect("restore legacy record");
+
+    let replay = bus
+        .submit(
+            CommitRequest::commit(
+                RequestId::new(),
+                principal(),
+                TransportType::Internal,
+                RequestSource::Northbound,
+                ConfigOperation::Replace,
+                TestConfig::new("legacy-replay"),
+                vec![changed_path],
+                Instant::now() + Duration::from_secs(1),
+            )
+            .with_base_version(ConfigVersion::INITIAL)
+            .with_idempotency_key(key),
+        )
+        .await
+        .expect("exact legacy replay");
+
+    assert_eq!(replay.new_version, Some(ConfigVersion::new(1)));
+    assert_eq!(replay.committed_revision, None);
+    assert_eq!(inner.history().await.len(), 1);
 }
 
 #[tokio::test]

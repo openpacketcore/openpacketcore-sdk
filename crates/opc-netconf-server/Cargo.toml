@@ -44,6 +44,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 rand = { workspace = true }

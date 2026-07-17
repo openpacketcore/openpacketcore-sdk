@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Leader-aware management commits — gNMI/NETCONF/config bus:** an opt-in
+  `ConfigAuthorityPort` projection fence redirects followers with bounded
+  leader hints and returns the exact persisted `{version, plaintext-envelope
+  SHA-256}` on successful writes. Default authoritative/no-port replies remain
+  byte-identical; stale or absent durable heads and legacy digest-less replays
+  fail closed instead of serving a local projection or fabricating a hash.
 - **Shared Raft-managed config datastore — `opc-config-bus-consensus`:** a
   source-build-only adapter now connects `opc-config-bus` to the existing
   `opc-persist::ConsensusConfigStore` without adding another election,

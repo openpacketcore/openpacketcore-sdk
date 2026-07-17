@@ -17,8 +17,8 @@ use opc_key::{ConfigAad, EnvelopeAad, KeyProvider, Zeroizing};
 use opc_types::TxId;
 
 use crate::types::{
-    CommitWrite, ConfirmedCommitResolution, SealedConfig, StoreError, StoredConfig,
-    StoredRequestFingerprint,
+    CommitWrite, CommitWriteReceipt, ConfirmedCommitResolution, SealedConfig, StoreError,
+    StoredConfig, StoredRequestFingerprint,
 };
 
 const CONFIG_STORE_KIND: &str = "running";
@@ -73,6 +73,17 @@ struct ConfigPlaintextV2<C> {
 /// after a crash, and a definite failed append must leave no partial record.
 #[async_trait]
 pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
+    /// Reports whether new successful commit receipts always contain the exact
+    /// persisted plaintext-envelope digest.
+    ///
+    /// The default is false for source-compatible custom/plaintext stores.
+    /// Wrappers that create and persist the digest must opt in explicitly.
+    /// A replay of a legacy record written before digest support may still
+    /// return no digest; callers must fail closed rather than invent one.
+    fn commit_receipts_include_plaintext_digest(&self) -> bool {
+        false
+    }
+
     /// Loads the highest-version record, or `None` for an empty store (which
     /// makes restore fall back to the caller-supplied bootstrap config).
     async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError>;
@@ -139,6 +150,21 @@ pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
             "atomic config compare-and-append is unsupported",
         ))
     }
+    /// Durably applies one compare-and-append write and returns metadata
+    /// attested by the stored record.
+    ///
+    /// The default preserves existing custom datastore implementations by
+    /// delegating to [`Self::append_commit_write`] and returning the digest
+    /// already present on the input record. Wrappers that create or transform
+    /// the persisted plaintext digest must override this method.
+    async fn append_commit_write_with_receipt(
+        &self,
+        commit: CommitWrite<C>,
+    ) -> Result<CommitWriteReceipt, StoreError> {
+        let receipt = CommitWriteReceipt::new(commit.record().plaintext_digest);
+        self.append_commit_write(commit).await?;
+        Ok(receipt)
+    }
     /// Durably clears the commit-fencing marker on `tx_id` after the snapshot
     /// swap. If this fails the bus fences itself, because a restart would
     /// otherwise refuse to republish the record.
@@ -162,6 +188,10 @@ where
     C: OpcConfig,
     T: ManagedDatastore<C> + ?Sized,
 {
+    fn commit_receipts_include_plaintext_digest(&self) -> bool {
+        (**self).commit_receipts_include_plaintext_digest()
+    }
+
     async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
         (**self).load_latest().await
     }
@@ -199,6 +229,13 @@ where
 
     async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
         (**self).append_commit_write(commit).await
+    }
+
+    async fn append_commit_write_with_receipt(
+        &self,
+        commit: CommitWrite<C>,
+    ) -> Result<CommitWriteReceipt, StoreError> {
+        (**self).append_commit_write_with_receipt(commit).await
     }
 
     async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), StoreError> {
@@ -388,6 +425,10 @@ where
     P: KeyProvider + ?Sized,
     S: ManagedDatastore<SealedConfig<C>> + ?Sized,
 {
+    fn commit_receipts_include_plaintext_digest(&self) -> bool {
+        true
+    }
+
     async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
         match self.inner.load_latest().await? {
             Some(record) => self.decrypt_record(record).await.map(Some),
@@ -452,13 +493,23 @@ where
     }
 
     async fn append_commit_write(&self, commit: CommitWrite<C>) -> Result<(), StoreError> {
+        self.append_commit_write_with_receipt(commit).await?;
+        Ok(())
+    }
+
+    async fn append_commit_write_with_receipt(
+        &self,
+        commit: CommitWrite<C>,
+    ) -> Result<CommitWriteReceipt, StoreError> {
         let (record, resolution) = commit.into_parts();
         let record = self.encrypt_record(record).await?;
+        let receipt = CommitWriteReceipt::new(record.plaintext_digest);
         let write = match resolution {
             Some(resolution) => CommitWrite::resolving(record, resolution)?,
             None => CommitWrite::new(record),
         };
-        self.inner.append_commit_write(write).await
+        self.inner.append_commit_write(write).await?;
+        Ok(receipt)
     }
 
     async fn clear_recovery_required(&self, tx_id: TxId) -> Result<(), StoreError> {

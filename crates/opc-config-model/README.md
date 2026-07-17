@@ -58,6 +58,9 @@ Important behavior:
 - `ForbiddenLive` changes normalize to hard errors.
 - `DrainRequired` and `RestartRequired` changes block traffic until an external
   workflow completes.
+- `CommitResult::committed_revision` defaults to `None` when deserializing
+  older payloads. Downstream Rust struct literals must add
+  `committed_revision: None` (or preserve the returned revision) when upgrading.
 
 ## Roadmap
 

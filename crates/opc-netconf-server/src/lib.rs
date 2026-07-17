@@ -105,6 +105,12 @@
 //!   provider-omitted state paths are pruned before XML projection. Malformed
 //!   provider responses with unrequested paths, duplicate paths, or unrequested
 //!   origin metadata fail closed before XML projection.
+//! - An opt-in writer-of-record port for `<edit-config>`, `<edit-data>`,
+//!   `<commit>`, `<get>`, `<get-config>`, and `<get-data>`. It redirects
+//!   followers with `operation-failed` and a bounded namespaced leader hint,
+//!   and returns exact datastore-attested committed revisions on successful
+//!   durable writes. The default authoritative/no-port profile preserves
+//!   legacy reply bytes.
 //!
 //! Complete base-session semantics are provided by the session runners. The
 //! public [`ReadOnlyNetconfServer::handle_rpc`] and
@@ -123,6 +129,9 @@
 //! [`run_read_only_tls_session_with_registry`] or
 //! [`run_read_only_ssh_session_with_registry`] to get audited cross-session
 //! `<kill-session>`, datastore lock/write semantics, and notification delivery.
+//! When a writer-of-record port is configured, the synchronous direct helpers
+//! cannot await it and reject every gated operation. Leader-aware production
+//! traffic must use the async session/listener runners.
 //!
 //! The raw session-registry controls are intentionally not part of the public
 //! API. Custom transports share a [`SessionRegistry`] by passing it into
@@ -222,7 +231,9 @@ pub use capabilities::{
     WRITABLE_RUNNING_1_0, YANG_LIBRARY_1_1_BASE, YANG_LIBRARY_REVISION,
 };
 pub use error::{
-    rpc_error_reply, rpc_get_schema_reply, rpc_ok_empty_reply, rpc_ok_reply, xml_escape, RpcError,
+    rpc_error_reply, rpc_get_schema_reply, rpc_ok_committed_revision_reply, rpc_ok_empty_reply,
+    rpc_ok_reply, xml_escape, RpcError, NETCONF_NOT_LEADER_APP_TAG,
+    OPC_NETCONF_CONFIG_AUTHORITY_NS,
 };
 pub use filter::{
     get_config_paths, get_paths_with_discovery, get_paths_with_yang_library,
