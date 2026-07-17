@@ -45,10 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hints followed by authoritative repaging. The explicit
   `CommittedRevisionSource` marker gates read-only
   Shadow construction, which rejects writes before I/O. Typed future-cursor,
-  compaction, sequence, and page-bound errors fail closed. The authenticated
-  remote config-watch RPC boundary is not included and remains open under
-  #256, so this change provides the prerequisite local/follower API rather
-  than claiming out-of-process completion.
+  compaction, sequence, and page-bound errors fail closed. The additive
+  `opc-config-bus-consensus` remote adapter carries only this read surface over
+  a dedicated exact-profile mutual-TLS boundary: every bounded long-poll page
+  proves the config consensus identity, product schema digest, and exact
+  client/server SPIFFE IDs; construction rejects an authoritative bus,
+  reconnects from the last caller-visible cursor, and never implements a
+  voter, mutation, rebuild, leader-forward, or second consensus path. Fixed
+  frame/count/deadline/concurrency limits, cancellation isolation, typed
+  redacted errors, snapshot-plus-resume recovery, shared bounded TLS material
+  rotation, clean maximum-version EOF, and real-TCP follower-switch
+  qualification complete the out-of-process #256 surface without changing
+  at-rest encryption or HKMS ownership.
 - **Shared Raft-managed config datastore — `opc-config-bus-consensus`:** a
   source-build-only adapter now connects `opc-config-bus` to the existing
   `opc-persist::ConsensusConfigStore` without adding another election,
