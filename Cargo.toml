@@ -38,8 +38,10 @@ num_cpus = "1.16"
 sha2 = "0.10"
 sha1 = "0.11"
 rand = "0.10"
+aes = { version = "0.9.1", features = ["zeroize"] }
 aes-gcm = { version = "0.11.0-rc.4", default-features = false, features = ["aes", "alloc"] }
 aes-gcm-siv = "0.11"
+cbc = { version = "0.2.1", default-features = false, features = ["block-padding", "zeroize"] }
 hkdf = "0.12"
 subtle = "2.6"
 zeroize = "1.8"

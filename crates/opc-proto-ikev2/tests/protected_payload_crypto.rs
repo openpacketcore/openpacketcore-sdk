@@ -766,7 +766,7 @@ fn seals_and_opens_informational_delete_payload() {
 }
 
 #[test]
-fn sealing_rejects_invalid_aad_prefix_and_unsupported_kind() {
+fn sealing_rejects_invalid_sk_and_skf_prefixes() {
     let profile = profile_128();
     let material = key_material(profile);
     let short_prefix = [0u8; HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN - 1];
@@ -791,7 +791,7 @@ fn sealing_rejects_invalid_aad_prefix_and_unsupported_kind() {
         "ike_protected_payload_crypto_invalid_aad"
     );
 
-    let unsupported_kind = match seal_ikev2_sa_init_protected_payload(
+    let invalid_skf = match seal_ikev2_sa_init_protected_payload(
         profile,
         &material,
         Ikev2ProtectedPayloadDirection::ResponderToInitiator,
@@ -803,12 +803,12 @@ fn sealing_rejects_invalid_aad_prefix_and_unsupported_kind() {
         0,
         EXPLICIT_IV_R2I,
     ) {
-        Ok(_) => panic!("SKF sealing must fail until implemented"),
+        Ok(_) => panic!("SKF sealing with a missing fragment prefix must fail"),
         Err(error) => error,
     };
     assert_eq!(
-        unsupported_kind.as_str(),
-        "ike_protected_payload_crypto_unsupported_kind"
+        invalid_skf.as_str(),
+        "ike_protected_payload_crypto_invalid_aad"
     );
 }
 
@@ -952,7 +952,7 @@ fn rejects_invalid_padding_after_authenticated_decryption() {
 }
 
 #[test]
-fn rejects_short_body_unsupported_kind_and_profile_key_mismatch_with_stable_codes() {
+fn rejects_short_body_malformed_skf_and_profile_key_mismatch_with_stable_codes() {
     let profile = profile_128();
     let material = key_material(profile);
     let short = placeholder_message(4, PayloadType::ExtensibleAuthentication);
@@ -990,19 +990,19 @@ fn rejects_short_body_unsupported_kind_and_profile_key_mismatch_with_stable_code
         payload_offset: 0,
         message_bytes: &[],
     };
-    let unsupported = match decrypt_ikev2_sa_init_protected_payload(
+    let malformed_skf = match decrypt_ikev2_sa_init_protected_payload(
         profile,
         &material,
         Ikev2ProtectedPayloadDirection::InitiatorToResponder,
         context,
         &[],
     ) {
-        Ok(opened) => panic!("SKF unexpectedly opened: {opened:?}"),
+        Ok(opened) => panic!("malformed SKF unexpectedly opened: {opened:?}"),
         Err(error) => error,
     };
     assert_eq!(
-        unsupported.as_str(),
-        "ike_protected_payload_crypto_unsupported_kind"
+        malformed_skf.as_str(),
+        "ike_protected_payload_crypto_invalid_aad"
     );
 
     let mismatch_profile = profile_256();

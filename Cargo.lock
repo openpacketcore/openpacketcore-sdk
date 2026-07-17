@@ -2940,8 +2940,10 @@ dependencies = [
 name = "opc-proto-ikev2"
 version = "0.2.0"
 dependencies = [
+ "aes 0.9.1",
  "aes-gcm",
  "bytes",
+ "cbc",
  "crypto-bigint",
  "hmac 0.12.1",
  "opc-proto-gtpv2c",
@@ -2953,6 +2955,7 @@ dependencies = [
  "p384",
  "p521",
  "quickcheck",
+ "rand 0.10.1",
  "rsa",
  "sha1",
  "sha2 0.10.9",

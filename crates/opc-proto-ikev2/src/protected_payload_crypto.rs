@@ -1,31 +1,52 @@
 //! IKEv2 protected-payload decryption and sealing helpers for SA_INIT-derived keys.
 //!
-//! @spec IETF RFC5282 3; IETF RFC7296 3.14
+//! @spec IETF RFC5282 3; IETF RFC7296 3.14; IETF RFC7383 2.5
 //! @req REQ-IETF-RFC5282-AES-GCM-PROTECTED-PAYLOAD-001
+//! @req REQ-IETF-RFC7296-AES-CBC-ETM-PROTECTED-PAYLOAD-001
 
 use std::{error::Error, fmt};
 
+use aes::{cipher::consts::U12, Aes128, Aes192, Aes256};
 use aes_gcm::{
     aead::{Aead, Key, KeyInit, Nonce, Payload},
-    Aes128Gcm, Aes256Gcm,
+    Aes128Gcm, Aes256Gcm, AesGcm,
 };
 use bytes::Bytes;
+use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use hmac::{Hmac, Mac};
+use rand::{rngs::SysRng, TryCryptoRng};
+use sha2::{Sha256, Sha384, Sha512};
+use zeroize::Zeroizing;
 
 use crate::{
     crypto::{CryptoProvider, ProtectedPayloadContext, ProtectedPayloadKind},
+    fragmentation::IKEV2_ENCRYPTED_FRAGMENT_FIXED_BODY_LEN,
     payload::GENERIC_PAYLOAD_HEADER_LEN,
-    sa_init_crypto::{Ikev2EncryptionAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial},
+    sa_init_crypto::{
+        Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoProfile,
+        Ikev2SaInitKeyMaterial,
+    },
     HEADER_LEN,
 };
 
 const AES_GCM_SALT_LEN: usize = 4;
 const AES_GCM_EXPLICIT_IV_LEN: usize = 8;
 const AES_GCM_ICV_LEN: usize = 16;
+const AES_CBC_IV_LEN: usize = 16;
+const AES_CBC_BLOCK_LEN: usize = 16;
 const AES_128_KEY_LEN: usize = 16;
+const AES_192_KEY_LEN: usize = 24;
 const AES_256_KEY_LEN: usize = 32;
+const IKE_HEADER_LENGTH_OFFSET: usize = 24;
+const GENERIC_PAYLOAD_LENGTH_OFFSET: usize = 2;
+
+type Aes192Gcm = AesGcm<Aes192, U12>;
 
 /// RFC 5282 AES-GCM explicit IV length used in IKEv2 `SK` payload bodies.
 pub const IKEV2_AES_GCM_EXPLICIT_IV_LEN: usize = AES_GCM_EXPLICIT_IV_LEN;
+
+/// RFC 7296 AES-CBC IV and block length used in IKEv2 `SK`/`SKF` payloads.
+pub const IKEV2_AES_CBC_IV_LEN: usize = AES_CBC_IV_LEN;
 
 /// Returns the sealed AES-GCM protected body length for a cleartext chain.
 ///
@@ -64,6 +85,64 @@ pub const fn ikev2_aes_gcm_protected_payload_len(
         None => return None,
     };
     GENERIC_PAYLOAD_HEADER_LEN.checked_add(body_len)
+}
+
+/// Return the minimal RFC 7296 padding length that block-aligns AES-CBC data.
+///
+/// The encrypted plaintext is `cleartext || padding || Pad Length`. IKE padding
+/// octets are deliberately not interpreted; only the final Pad Length octet is
+/// structural. This helper chooses the shortest valid all-zero padding used by
+/// the production sealing helpers.
+pub const fn ikev2_aes_cbc_padding_len(cleartext_payloads_len: usize) -> Option<u8> {
+    let with_pad_length = match cleartext_payloads_len.checked_add(1) {
+        Some(value) => value,
+        None => return None,
+    };
+    let remainder = with_pad_length % AES_CBC_BLOCK_LEN;
+    let padding_len = if remainder == 0 {
+        0
+    } else {
+        AES_CBC_BLOCK_LEN - remainder
+    };
+    Some(padding_len as u8)
+}
+
+/// Return the AES-CBC protected crypto-body length for an executable profile.
+///
+/// The returned length is `IV || ciphertext || ICV`. For `SKF`, the four-octet
+/// Fragment Number/Total Fragments prefix is outside this length and must be
+/// included in [`ProtectedPayloadSealContext::message_prefix`].
+pub fn ikev2_aes_cbc_protected_body_len(
+    profile: Ikev2SaInitCryptoProfile,
+    cleartext_payloads_len: usize,
+) -> Option<usize> {
+    if profile.encryption().is_aead() || profile.integrity().is_none() {
+        return None;
+    }
+    let padding_len = usize::from(ikev2_aes_cbc_padding_len(cleartext_payloads_len)?);
+    let ciphertext_len = cleartext_payloads_len
+        .checked_add(padding_len)?
+        .checked_add(1)?;
+    AES_CBC_IV_LEN
+        .checked_add(ciphertext_len)?
+        .checked_add(profile.integrity_icv_len())
+}
+
+/// Return the generic IKEv2 `SK`/`SKF` payload length field for AES-CBC.
+///
+/// `SKF` callers pass [`IKEV2_ENCRYPTED_FRAGMENT_FIXED_BODY_LEN`] as
+/// `unprotected_body_prefix_len`; ordinary `SK` callers pass zero.
+pub fn ikev2_aes_cbc_protected_payload_len(
+    profile: Ikev2SaInitCryptoProfile,
+    cleartext_payloads_len: usize,
+    unprotected_body_prefix_len: usize,
+) -> Option<usize> {
+    GENERIC_PAYLOAD_HEADER_LEN
+        .checked_add(unprotected_body_prefix_len)?
+        .checked_add(ikev2_aes_cbc_protected_body_len(
+            profile,
+            cleartext_payloads_len,
+        )?)
 }
 
 /// Direction of an IKEv2 protected message on an established IKE SA.
@@ -155,14 +234,20 @@ pub enum Ikev2ProtectedPayloadCryptoErrorCode {
     InvalidKeyMaterialLength,
     /// Protected payload body is too short to contain IV and ICV.
     ProtectedPayloadTooShort,
+    /// An explicit IV has the wrong wire length.
+    InvalidIvLength,
+    /// AES-CBC ciphertext is empty or not block aligned.
+    InvalidCiphertextLength,
     /// The protected payload offset or length is inconsistent with the message.
     InvalidAssociatedData,
-    /// AES-GCM authentication failed.
+    /// Protected-payload authentication failed.
     AuthenticationFailed,
     /// Decrypted IKE padding is structurally invalid.
     InvalidPadding,
     /// AES-GCM explicit IV counter cannot allocate without wrapping.
     ExplicitIvExhausted,
+    /// The operating-system CSPRNG could not produce a fresh AES-CBC IV.
+    RandomIvGenerationFailed,
 }
 
 impl Ikev2ProtectedPayloadCryptoErrorCode {
@@ -177,10 +262,17 @@ impl Ikev2ProtectedPayloadCryptoErrorCode {
             }
             Self::InvalidKeyMaterialLength => "ike_protected_payload_crypto_invalid_key_length",
             Self::ProtectedPayloadTooShort => "ike_protected_payload_crypto_body_too_short",
+            Self::InvalidIvLength => "ike_protected_payload_crypto_invalid_iv_length",
+            Self::InvalidCiphertextLength => {
+                "ike_protected_payload_crypto_invalid_ciphertext_length"
+            }
             Self::InvalidAssociatedData => "ike_protected_payload_crypto_invalid_aad",
             Self::AuthenticationFailed => "ike_protected_payload_crypto_authentication_failed",
             Self::InvalidPadding => "ike_protected_payload_crypto_invalid_padding",
             Self::ExplicitIvExhausted => "ike_protected_payload_crypto_explicit_iv_exhausted",
+            Self::RandomIvGenerationFailed => {
+                "ike_protected_payload_crypto_random_iv_generation_failed"
+            }
         }
     }
 }
@@ -200,8 +292,8 @@ pub enum Ikev2ProtectedPayloadCryptoError {
     UnsupportedEncryptionProfile {
         /// Negotiated encryption algorithm.
         encryption: Ikev2EncryptionAlgorithm,
-        /// Negotiated integrity key length in octets.
-        integrity_key_len: usize,
+        /// Negotiated integrity algorithm, if any.
+        integrity: Option<Ikev2IntegrityAlgorithm>,
     },
     /// A selected key had the wrong length.
     InvalidKeyMaterialLength {
@@ -219,9 +311,23 @@ pub enum Ikev2ProtectedPayloadCryptoError {
         /// Actual protected body length.
         actual: usize,
     },
+    /// An explicit IV was truncated or had the wrong wire length.
+    InvalidIvLength {
+        /// Required IV length in octets.
+        expected: usize,
+        /// Actual available IV length in octets.
+        actual: usize,
+    },
+    /// AES-CBC ciphertext was empty or not block aligned.
+    InvalidCiphertextLength {
+        /// Required AES block length in octets.
+        block_len: usize,
+        /// Actual ciphertext length in octets.
+        actual: usize,
+    },
     /// Protected payload associated-data inputs were inconsistent.
     InvalidAssociatedData,
-    /// AES-GCM authentication failed.
+    /// Protected-payload authentication failed.
     AuthenticationFailed,
     /// IKE padding was structurally invalid after authenticated decryption.
     InvalidPadding {
@@ -232,6 +338,8 @@ pub enum Ikev2ProtectedPayloadCryptoError {
     },
     /// AES-GCM explicit IV counter is exhausted.
     ExplicitIvExhausted,
+    /// The secure random source failed to generate an AES-CBC IV.
+    RandomIvGenerationFailed,
 }
 
 /// Exact AAD context for sealing one IKEv2 protected payload body.
@@ -277,6 +385,10 @@ impl Ikev2ProtectedPayloadCryptoError {
             Self::ProtectedPayloadTooShort { .. } => {
                 Ikev2ProtectedPayloadCryptoErrorCode::ProtectedPayloadTooShort
             }
+            Self::InvalidIvLength { .. } => Ikev2ProtectedPayloadCryptoErrorCode::InvalidIvLength,
+            Self::InvalidCiphertextLength { .. } => {
+                Ikev2ProtectedPayloadCryptoErrorCode::InvalidCiphertextLength
+            }
             Self::InvalidAssociatedData => {
                 Ikev2ProtectedPayloadCryptoErrorCode::InvalidAssociatedData
             }
@@ -285,6 +397,9 @@ impl Ikev2ProtectedPayloadCryptoError {
             }
             Self::InvalidPadding { .. } => Ikev2ProtectedPayloadCryptoErrorCode::InvalidPadding,
             Self::ExplicitIvExhausted => Ikev2ProtectedPayloadCryptoErrorCode::ExplicitIvExhausted,
+            Self::RandomIvGenerationFailed => {
+                Ikev2ProtectedPayloadCryptoErrorCode::RandomIvGenerationFailed
+            }
         }
     }
 
@@ -302,12 +417,13 @@ impl fmt::Display for Ikev2ProtectedPayloadCryptoError {
             }
             Self::UnsupportedEncryptionProfile {
                 encryption,
-                integrity_key_len,
+                integrity,
             } => {
                 write!(
                     f,
-                    "unsupported IKEv2 protected payload profile {} with integrity key length {integrity_key_len}",
-                    encryption.name()
+                    "unsupported IKEv2 protected payload profile {} with integrity {}",
+                    encryption.name(),
+                    integrity.map_or("none", Ikev2IntegrityAlgorithm::name)
                 )
             }
             Self::InvalidKeyMaterialLength {
@@ -326,6 +442,18 @@ impl fmt::Display for Ikev2ProtectedPayloadCryptoError {
                     "IKEv2 protected payload body too short: minimum {min_len}, actual {actual}"
                 )
             }
+            Self::InvalidIvLength { expected, actual } => {
+                write!(
+                    f,
+                    "invalid IKEv2 protected payload IV length: expected {expected}, actual {actual}"
+                )
+            }
+            Self::InvalidCiphertextLength { block_len, actual } => {
+                write!(
+                    f,
+                    "invalid IKEv2 protected payload ciphertext length: block {block_len}, actual {actual}"
+                )
+            }
             Self::InvalidAssociatedData => {
                 f.write_str("IKEv2 protected payload associated data is inconsistent")
             }
@@ -342,13 +470,16 @@ impl fmt::Display for Ikev2ProtectedPayloadCryptoError {
                 )
             }
             Self::ExplicitIvExhausted => f.write_str("IKEv2 AES-GCM explicit IV counter exhausted"),
+            Self::RandomIvGenerationFailed => {
+                f.write_str("IKEv2 AES-CBC secure IV generation failed")
+            }
         }
     }
 }
 
 impl Error for Ikev2ProtectedPayloadCryptoError {}
 
-/// Concrete [`CryptoProvider`] for IKEv2 AES-GCM SK payloads.
+/// Concrete [`CryptoProvider`] for executable IKEv2 `SK` and `SKF` profiles.
 ///
 /// This provider owns no SA state. Callers pass the already-selected SA_INIT
 /// crypto profile, derived key material, and packet direction for one open.
@@ -402,10 +533,10 @@ impl CryptoProvider for Ikev2SaInitProtectedPayloadProvider<'_> {
     }
 }
 
-/// Authenticate and decrypt one IKEv2 `SK` payload body with SA_INIT keys.
+/// Authenticate and decrypt one IKEv2 `SK` or `SKF` payload body with SA_INIT keys.
 ///
-/// The helper supports RFC 5282 `ENCR_AES_GCM_16` profiles with 128-bit or
-/// 256-bit AES keys. It uses `SK_ei`/`SK_ai` for
+/// The helper supports RFC 5282 `ENCR_AES_GCM_16` and RFC 7296 AES-CBC with a
+/// typed SHA-2 integrity transform. It uses `SK_ei`/`SK_ai` for
 /// [`Ikev2ProtectedPayloadDirection::InitiatorToResponder`] and
 /// `SK_er`/`SK_ar` for
 /// [`Ikev2ProtectedPayloadDirection::ResponderToInitiator`].
@@ -413,7 +544,9 @@ impl CryptoProvider for Ikev2SaInitProtectedPayloadProvider<'_> {
 /// # Errors
 ///
 /// Returns [`Ikev2ProtectedPayloadCryptoError`] when the profile, keys, body,
-/// associated data, AEAD authentication, or decrypted IKE padding is invalid.
+/// associated data, authentication, ciphertext shape, or authenticated IKE
+/// padding is invalid. Encrypt-then-MAC profiles verify the ICV in constant
+/// time before decrypting.
 pub fn decrypt_ikev2_sa_init_protected_payload(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &Ikev2SaInitKeyMaterial,
@@ -421,27 +554,44 @@ pub fn decrypt_ikev2_sa_init_protected_payload(
     context: ProtectedPayloadContext<'_>,
     protected_body: &[u8],
 ) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
-    if context.kind != ProtectedPayloadKind::Encrypted {
-        return Err(
-            Ikev2ProtectedPayloadCryptoError::UnsupportedProtectedPayloadKind {
-                kind: context.kind,
-            },
-        );
-    }
     validate_profile(profile)?;
 
     let keys = select_keys(profile, key_material, direction)?;
-    let aad = protected_payload_aad(context, protected_body)?;
-    let plaintext = decrypt_aes_gcm(profile.encryption(), keys, aad, protected_body)?;
+    let view = protected_payload_view(context, protected_body)?;
+    let plaintext = if profile.encryption().is_aead() {
+        Zeroizing::new(decrypt_aes_gcm(
+            profile.encryption(),
+            keys,
+            view.authenticated_prefix,
+            view.crypto_body,
+        )?)
+    } else {
+        let integrity = profile.integrity().ok_or(
+            Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
+                encryption: profile.encryption(),
+                integrity: None,
+            },
+        )?;
+        decrypt_aes_cbc(
+            profile.encryption(),
+            integrity,
+            keys,
+            context.message_bytes,
+            view,
+        )?
+    };
     strip_ike_padding(plaintext)
 }
 
-/// Authenticate and encrypt one IKEv2 `SK` payload body with SA_INIT keys.
+/// Authenticate and encrypt one AES-GCM IKEv2 `SK`/`SKF` crypto body.
 ///
 /// The returned bytes are the protected payload body:
 /// explicit IV || ciphertext || authentication tag. The caller remains
-/// responsible for constructing the outer IKE header and generic payload header
-/// whose exact bytes are supplied in [`ProtectedPayloadSealContext`].
+/// responsible for constructing the final outer IKE header and payload header
+/// whose exact bytes are supplied in [`ProtectedPayloadSealContext`]. For
+/// `SKF`, the context prefix also includes Fragment Number and Total Fragments,
+/// and the returned bytes are the `encrypted_fragment` passed to the structural
+/// SKF builder.
 ///
 /// `cleartext_payloads` is the complete inner cleartext payload chain beginning
 /// with the payload type named by the outer `SK` generic header. This helper
@@ -469,8 +619,8 @@ pub fn seal_ikev2_sa_init_protected_payload(
     padding_len: u8,
     explicit_iv: [u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN],
 ) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
-    let keys = select_seal_keys(profile, key_material, direction, context)?;
-    let plaintext = padded_ike_plaintext(cleartext_payloads, padding_len);
+    let keys = select_seal_keys(profile, key_material, direction)?;
+    let plaintext = padded_ike_plaintext(cleartext_payloads, padding_len)?;
     let sealed = encrypt_aes_gcm(
         profile.encryption(),
         keys,
@@ -478,6 +628,7 @@ pub fn seal_ikev2_sa_init_protected_payload(
         &plaintext,
         explicit_iv,
     )?;
+    validate_seal_context(context, sealed.len())?;
     Ok(Bytes::from(sealed))
 }
 
@@ -501,9 +652,9 @@ pub fn seal_ikev2_sa_init_protected_payload_with_iv_counter(
     padding_len: u8,
     iv_counter: &mut Ikev2AesGcmExplicitIvCounter,
 ) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
-    let keys = select_seal_keys(profile, key_material, direction, context)?;
+    let keys = select_seal_keys(profile, key_material, direction)?;
     let explicit_iv = iv_counter.next_explicit_iv()?;
-    let plaintext = padded_ike_plaintext(cleartext_payloads, padding_len);
+    let plaintext = padded_ike_plaintext(cleartext_payloads, padding_len)?;
     let sealed = encrypt_aes_gcm(
         profile.encryption(),
         keys,
@@ -511,45 +662,177 @@ pub fn seal_ikev2_sa_init_protected_payload_with_iv_counter(
         &plaintext,
         explicit_iv,
     )?;
+    validate_seal_context(context, sealed.len())?;
     Ok(Bytes::from(sealed))
 }
 
+/// Seal one AES-CBC/HMAC IKEv2 `SK`/`SKF` crypto body with a fresh OS-random IV.
+///
+/// This is the production-safe AES-CBC entry point. It always obtains a new
+/// 16-octet IV from [`SysRng`], applies the shortest block-aligning RFC 7296 IKE
+/// padding, encrypts with the directional `SK_e*`, and authenticates the final
+/// message prefix plus IV and ciphertext with directional `SK_a*`.
+///
+/// The caller must construct final IKE and generic payload length fields before
+/// calling. Use [`ikev2_aes_cbc_protected_body_len`] or
+/// [`ikev2_aes_cbc_protected_payload_len`] to calculate them. For `SKF`,
+/// `message_prefix` must end after Fragment Number/Total Fragments and the
+/// returned bytes are the encrypted-fragment portion only.
+///
+/// # Errors
+///
+/// Returns [`Ikev2ProtectedPayloadCryptoError`] when the profile, key material,
+/// final length fields, fragment prefix, padding length, encryption, integrity,
+/// or operating-system random source is invalid.
+pub fn seal_ikev2_sa_init_aes_cbc_protected_payload(
+    profile: Ikev2SaInitCryptoProfile,
+    key_material: &Ikev2SaInitKeyMaterial,
+    direction: Ikev2ProtectedPayloadDirection,
+    context: ProtectedPayloadSealContext<'_>,
+    cleartext_payloads: &[u8],
+) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
+    let mut rng = SysRng;
+    seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng(
+        profile,
+        key_material,
+        direction,
+        context,
+        cleartext_payloads,
+        &mut rng,
+    )
+}
+
+/// Seal one AES-CBC/HMAC IKEv2 `SK`/`SKF` body with a caller-supplied CSPRNG.
+///
+/// The [`TryCryptoRng`] bound prevents accidental use of a deterministic or
+/// non-cryptographic random source at this production boundary. The generated
+/// IV is never logged or exposed separately from the protected wire body.
+///
+/// # Errors
+///
+/// Returns [`Ikev2ProtectedPayloadCryptoError`] under the same conditions as
+/// [`seal_ikev2_sa_init_aes_cbc_protected_payload`].
+pub fn seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng<R>(
+    profile: Ikev2SaInitCryptoProfile,
+    key_material: &Ikev2SaInitKeyMaterial,
+    direction: Ikev2ProtectedPayloadDirection,
+    context: ProtectedPayloadSealContext<'_>,
+    cleartext_payloads: &[u8],
+    rng: &mut R,
+) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError>
+where
+    R: TryCryptoRng + ?Sized,
+{
+    let mut iv = [0_u8; IKEV2_AES_CBC_IV_LEN];
+    rng.try_fill_bytes(&mut iv)
+        .map_err(|_| Ikev2ProtectedPayloadCryptoError::RandomIvGenerationFailed)?;
+    seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector(
+        profile,
+        key_material,
+        direction,
+        context,
+        cleartext_payloads,
+        iv,
+    )
+}
+
+/// Deterministically seal an AES-CBC/HMAC `SK`/`SKF` body for test vectors.
+///
+/// # Security
+///
+/// This is a low-level interoperability/vector boundary. Production code must
+/// use [`seal_ikev2_sa_init_aes_cbc_protected_payload`] or the CSPRNG-bound
+/// variant. Reusing or predicting an IV with the same directional key violates
+/// the IKEv2 AES-CBC security contract.
+///
+/// # Errors
+///
+/// Returns [`Ikev2ProtectedPayloadCryptoError`] when the profile, keys, final
+/// length fields, fragment prefix, encryption, or integrity operation is invalid.
+pub fn seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector(
+    profile: Ikev2SaInitCryptoProfile,
+    key_material: &Ikev2SaInitKeyMaterial,
+    direction: Ikev2ProtectedPayloadDirection,
+    context: ProtectedPayloadSealContext<'_>,
+    cleartext_payloads: &[u8],
+    iv: [u8; IKEV2_AES_CBC_IV_LEN],
+) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
+    validate_profile(profile)?;
+    let integrity = profile.integrity().ok_or(
+        Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
+            encryption: profile.encryption(),
+            integrity: None,
+        },
+    )?;
+    if profile.encryption().is_aead() {
+        return Err(
+            Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
+                encryption: profile.encryption(),
+                integrity: profile.integrity(),
+            },
+        );
+    }
+    let keys = select_seal_keys(profile, key_material, direction)?;
+    let padding_len = ikev2_aes_cbc_padding_len(cleartext_payloads.len()).ok_or(
+        Ikev2ProtectedPayloadCryptoError::InvalidPadding {
+            plaintext_len: cleartext_payloads.len(),
+            pad_len: 0,
+        },
+    )?;
+    let mut plaintext = padded_ike_plaintext(cleartext_payloads, padding_len)?;
+    encrypt_aes_cbc(
+        profile.encryption(),
+        keys.encryption_key,
+        &iv,
+        &mut plaintext,
+    )?;
+
+    let icv_len = profile.integrity_icv_len();
+    let final_body_len = AES_CBC_IV_LEN
+        .checked_add(plaintext.len())
+        .and_then(|value| value.checked_add(icv_len))
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    validate_seal_context(context, final_body_len)?;
+
+    let mut protected_body = Vec::with_capacity(final_body_len);
+    protected_body.extend_from_slice(&iv);
+    protected_body.extend_from_slice(&plaintext);
+    let icv = compute_integrity_checksum(
+        integrity,
+        keys.integrity_key,
+        context.message_prefix,
+        &protected_body,
+    )?;
+    protected_body.extend_from_slice(&icv);
+    Ok(Bytes::from(protected_body))
+}
+
+#[derive(Clone, Copy)]
 struct SelectedProtectedPayloadKeys<'a> {
     encryption_key: &'a [u8],
     salt: &'a [u8],
+    integrity_key: &'a [u8],
 }
 
 fn validate_profile(
     profile: Ikev2SaInitCryptoProfile,
 ) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
-    if profile.integrity_key_len() != 0 {
-        return Err(
+    match (profile.encryption().is_aead(), profile.integrity()) {
+        (true, None) | (false, Some(_)) => Ok(()),
+        _ => Err(
             Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
                 encryption: profile.encryption(),
-                integrity_key_len: profile.integrity_key_len(),
+                integrity: profile.integrity(),
             },
-        );
+        ),
     }
-
-    Ok(())
 }
 
 fn select_seal_keys<'a>(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &'a Ikev2SaInitKeyMaterial,
     direction: Ikev2ProtectedPayloadDirection,
-    context: ProtectedPayloadSealContext<'_>,
 ) -> Result<SelectedProtectedPayloadKeys<'a>, Ikev2ProtectedPayloadCryptoError> {
-    if context.kind != ProtectedPayloadKind::Encrypted {
-        return Err(
-            Ikev2ProtectedPayloadCryptoError::UnsupportedProtectedPayloadKind {
-                kind: context.kind,
-            },
-        );
-    }
-    if context.message_prefix.len() < HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN {
-        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
-    }
     validate_profile(profile)?;
     select_keys(profile, key_material, direction)
 }
@@ -580,18 +863,23 @@ fn select_keys<'a>(
         expected_sk_e_len,
         sk_e.len(),
     )?;
-    let encryption_key_len = expected_sk_e_len.checked_sub(AES_GCM_SALT_LEN).ok_or(
-        Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-            name: direction.encryption_key_name(),
-            expected: expected_sk_e_len,
-            actual: sk_e.len(),
-        },
-    )?;
-    let (encryption_key, salt) = sk_e.split_at(encryption_key_len);
+    let (encryption_key, salt) = if profile.encryption().is_aead() {
+        let encryption_key_len = expected_sk_e_len.checked_sub(AES_GCM_SALT_LEN).ok_or(
+            Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                name: direction.encryption_key_name(),
+                expected: expected_sk_e_len,
+                actual: sk_e.len(),
+            },
+        )?;
+        sk_e.split_at(encryption_key_len)
+    } else {
+        (sk_e, &[][..])
+    };
 
     Ok(SelectedProtectedPayloadKeys {
         encryption_key,
         salt,
+        integrity_key: sk_a,
     })
 }
 
@@ -610,10 +898,17 @@ fn validate_key_len(
     Ok(())
 }
 
-fn protected_payload_aad<'a>(
+#[derive(Clone, Copy)]
+struct ProtectedPayloadView<'a> {
+    authenticated_prefix: &'a [u8],
+    crypto_body: &'a [u8],
+    crypto_body_message_offset: usize,
+}
+
+fn protected_payload_view<'a>(
     context: ProtectedPayloadContext<'a>,
-    protected_body: &[u8],
-) -> Result<&'a [u8], Ikev2ProtectedPayloadCryptoError> {
+    protected_body: &'a [u8],
+) -> Result<ProtectedPayloadView<'a>, Ikev2ProtectedPayloadCryptoError> {
     let payload_header_offset = HEADER_LEN
         .checked_add(context.payload_offset)
         .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
@@ -624,7 +919,10 @@ fn protected_payload_aad<'a>(
         .checked_add(protected_body.len())
         .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
 
-    if protected_body_end > context.message_bytes.len() {
+    // RFC 7296 requires SK (and RFC 7383 SKF) to be the final payload. Enforce
+    // exact coverage so integrity is never verified over a message suffix the
+    // provider silently ignored.
+    if protected_body_end != context.message_bytes.len() {
         return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
     }
     if context
@@ -635,10 +933,125 @@ fn protected_payload_aad<'a>(
         return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
     }
 
-    context
+    let fixed_prefix_len = protected_body_prefix_len(context.kind);
+    if protected_body.len() < fixed_prefix_len {
+        return Err(Ikev2ProtectedPayloadCryptoError::ProtectedPayloadTooShort {
+            min_len: fixed_prefix_len,
+            actual: protected_body.len(),
+        });
+    }
+    if context.kind == ProtectedPayloadKind::EncryptedFragment {
+        validate_fragment_prefix(
+            context.first_inner_payload == crate::payload::PayloadType::NoNext,
+            &protected_body[..fixed_prefix_len],
+        )?;
+    }
+    let crypto_body_message_offset = protected_body_offset
+        .checked_add(fixed_prefix_len)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    let authenticated_prefix = context
         .message_bytes
-        .get(..protected_body_offset)
-        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)
+        .get(..crypto_body_message_offset)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    let crypto_body = protected_body
+        .get(fixed_prefix_len..)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+
+    Ok(ProtectedPayloadView {
+        authenticated_prefix,
+        crypto_body,
+        crypto_body_message_offset,
+    })
+}
+
+const fn protected_body_prefix_len(kind: ProtectedPayloadKind) -> usize {
+    match kind {
+        ProtectedPayloadKind::Encrypted => 0,
+        ProtectedPayloadKind::EncryptedFragment => IKEV2_ENCRYPTED_FRAGMENT_FIXED_BODY_LEN,
+    }
+}
+
+fn validate_fragment_prefix(
+    first_inner_payload_is_none: bool,
+    prefix: &[u8],
+) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
+    let [fragment_number_hi, fragment_number_lo, total_hi, total_lo] = prefix else {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    };
+    let fragment_number = u16::from_be_bytes([*fragment_number_hi, *fragment_number_lo]);
+    let total_fragments = u16::from_be_bytes([*total_hi, *total_lo]);
+    if fragment_number == 0
+        || total_fragments == 0
+        || fragment_number > total_fragments
+        || (fragment_number > 1 && !first_inner_payload_is_none)
+    {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    }
+    Ok(())
+}
+
+fn validate_seal_context(
+    context: ProtectedPayloadSealContext<'_>,
+    crypto_body_len: usize,
+) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
+    let fixed_prefix_len = protected_body_prefix_len(context.kind);
+    let minimum_prefix_len = HEADER_LEN
+        .checked_add(GENERIC_PAYLOAD_HEADER_LEN)
+        .and_then(|value| value.checked_add(fixed_prefix_len))
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    if context.message_prefix.len() < minimum_prefix_len {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    }
+
+    let generic_header_offset = context
+        .message_prefix
+        .len()
+        .checked_sub(fixed_prefix_len + GENERIC_PAYLOAD_HEADER_LEN)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    let generic_header = context
+        .message_prefix
+        .get(generic_header_offset..generic_header_offset + GENERIC_PAYLOAD_HEADER_LEN)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    let payload_length_bytes = generic_header
+        .get(GENERIC_PAYLOAD_LENGTH_OFFSET..GENERIC_PAYLOAD_LENGTH_OFFSET + 2)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    let [payload_length_hi, payload_length_lo] = payload_length_bytes else {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    };
+    let declared_payload_len = u16::from_be_bytes([*payload_length_hi, *payload_length_lo]);
+    let expected_payload_len = GENERIC_PAYLOAD_HEADER_LEN
+        .checked_add(fixed_prefix_len)
+        .and_then(|value| value.checked_add(crypto_body_len))
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    if usize::from(declared_payload_len) != expected_payload_len {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    }
+
+    if context.kind == ProtectedPayloadKind::EncryptedFragment {
+        let fragment_prefix = context
+            .message_prefix
+            .get(context.message_prefix.len() - fixed_prefix_len..)
+            .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+        validate_fragment_prefix(generic_header[0] == 0, fragment_prefix)?;
+    }
+
+    let ike_length_bytes = context
+        .message_prefix
+        .get(IKE_HEADER_LENGTH_OFFSET..IKE_HEADER_LENGTH_OFFSET + 4)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    let [length_0, length_1, length_2, length_3] = ike_length_bytes else {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    };
+    let declared_ike_len = u32::from_be_bytes([*length_0, *length_1, *length_2, *length_3]);
+    let expected_ike_len = context
+        .message_prefix
+        .len()
+        .checked_add(crypto_body_len)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    if usize::try_from(declared_ike_len).ok() != Some(expected_ike_len) {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    }
+    Ok(())
 }
 
 fn decrypt_aes_gcm(
@@ -685,6 +1098,25 @@ fn decrypt_aes_gcm(
                 .decrypt(nonce, payload)
                 .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
         }
+        Ikev2EncryptionAlgorithm::AesGcm16_192 => {
+            validate_key_len(
+                "AES-GCM-192 key",
+                AES_192_KEY_LEN,
+                keys.encryption_key.len(),
+            )?;
+            let key = <&Key<Aes192Gcm>>::try_from(keys.encryption_key).map_err(|_| {
+                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                    name: "AES-GCM-192 key",
+                    expected: AES_192_KEY_LEN,
+                    actual: keys.encryption_key.len(),
+                }
+            })?;
+            let nonce = <&Nonce<Aes192Gcm>>::try_from(nonce.as_slice())
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+            Aes192Gcm::new(key)
+                .decrypt(nonce, payload)
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
+        }
         Ikev2EncryptionAlgorithm::AesGcm16_256 => {
             validate_key_len(
                 "AES-GCM-256 key",
@@ -708,7 +1140,7 @@ fn decrypt_aes_gcm(
         unsupported => Err(
             Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
                 encryption: unsupported,
-                integrity_key_len: 0,
+                integrity: None,
             },
         ),
     }
@@ -749,6 +1181,25 @@ fn encrypt_aes_gcm(
                 .encrypt(nonce, payload)
                 .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?
         }
+        Ikev2EncryptionAlgorithm::AesGcm16_192 => {
+            validate_key_len(
+                "AES-GCM-192 key",
+                AES_192_KEY_LEN,
+                keys.encryption_key.len(),
+            )?;
+            let key = <&Key<Aes192Gcm>>::try_from(keys.encryption_key).map_err(|_| {
+                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                    name: "AES-GCM-192 key",
+                    expected: AES_192_KEY_LEN,
+                    actual: keys.encryption_key.len(),
+                }
+            })?;
+            let nonce = <&Nonce<Aes192Gcm>>::try_from(nonce.as_slice())
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+            Aes192Gcm::new(key)
+                .encrypt(nonce, payload)
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?
+        }
         Ikev2EncryptionAlgorithm::AesGcm16_256 => {
             validate_key_len(
                 "AES-GCM-256 key",
@@ -772,7 +1223,7 @@ fn encrypt_aes_gcm(
             return Err(
                 Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
                     encryption: unsupported,
-                    integrity_key_len: 0,
+                    integrity: None,
                 },
             );
         }
@@ -784,15 +1235,340 @@ fn encrypt_aes_gcm(
     Ok(protected_body)
 }
 
-fn padded_ike_plaintext(cleartext_payloads: &[u8], padding_len: u8) -> Vec<u8> {
-    let mut plaintext = Vec::with_capacity(cleartext_payloads.len() + usize::from(padding_len) + 1);
-    plaintext.extend_from_slice(cleartext_payloads);
-    plaintext.resize(plaintext.len() + usize::from(padding_len), 0);
-    plaintext.push(padding_len);
-    plaintext
+fn decrypt_aes_cbc(
+    encryption: Ikev2EncryptionAlgorithm,
+    integrity: Ikev2IntegrityAlgorithm,
+    keys: SelectedProtectedPayloadKeys<'_>,
+    message_bytes: &[u8],
+    view: ProtectedPayloadView<'_>,
+) -> Result<Zeroizing<Vec<u8>>, Ikev2ProtectedPayloadCryptoError> {
+    let icv_len = integrity_icv_len(integrity);
+    if view.crypto_body.len() < AES_CBC_IV_LEN {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidIvLength {
+            expected: AES_CBC_IV_LEN,
+            actual: view.crypto_body.len(),
+        });
+    }
+    let min_len = AES_CBC_IV_LEN
+        .checked_add(AES_CBC_BLOCK_LEN)
+        .and_then(|value| value.checked_add(icv_len))
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    if view.crypto_body.len() < min_len {
+        return Err(Ikev2ProtectedPayloadCryptoError::ProtectedPayloadTooShort {
+            min_len,
+            actual: view.crypto_body.len(),
+        });
+    }
+
+    let (iv, ciphertext_and_icv) = view.crypto_body.split_at(AES_CBC_IV_LEN);
+    let ciphertext_len = ciphertext_and_icv.len().checked_sub(icv_len).ok_or(
+        Ikev2ProtectedPayloadCryptoError::ProtectedPayloadTooShort {
+            min_len,
+            actual: view.crypto_body.len(),
+        },
+    )?;
+    if ciphertext_len == 0 || !ciphertext_len.is_multiple_of(AES_CBC_BLOCK_LEN) {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+            block_len: AES_CBC_BLOCK_LEN,
+            actual: ciphertext_len,
+        });
+    }
+    let (ciphertext, received_icv) = ciphertext_and_icv.split_at(ciphertext_len);
+
+    let authenticated_end = view
+        .crypto_body_message_offset
+        .checked_add(AES_CBC_IV_LEN)
+        .and_then(|value| value.checked_add(ciphertext_len))
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    let authenticated_message = message_bytes
+        .get(..authenticated_end)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    if authenticated_end
+        .checked_add(icv_len)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?
+        != message_bytes.len()
+    {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData);
+    }
+    verify_integrity_checksum(
+        integrity,
+        keys.integrity_key,
+        authenticated_message,
+        received_icv,
+    )?;
+
+    let mut plaintext = Zeroizing::new(ciphertext.to_vec());
+    decrypt_aes_cbc_in_place(encryption, keys.encryption_key, iv, &mut plaintext)?;
+    Ok(plaintext)
 }
 
-fn strip_ike_padding(plaintext: Vec<u8>) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
+fn encrypt_aes_cbc(
+    encryption: Ikev2EncryptionAlgorithm,
+    encryption_key: &[u8],
+    iv: &[u8],
+    plaintext: &mut [u8],
+) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
+    if plaintext.is_empty() || !plaintext.len().is_multiple_of(AES_CBC_BLOCK_LEN) {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+            block_len: AES_CBC_BLOCK_LEN,
+            actual: plaintext.len(),
+        });
+    }
+    let plaintext_len = plaintext.len();
+    match encryption {
+        Ikev2EncryptionAlgorithm::AesCbc128 => {
+            validate_key_len("AES-CBC-128 key", AES_128_KEY_LEN, encryption_key.len())?;
+            let cipher =
+                cbc::Encryptor::<Aes128>::new_from_slices(encryption_key, iv).map_err(|_| {
+                    Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                        name: "AES-CBC-128 key or IV",
+                        expected: AES_128_KEY_LEN,
+                        actual: encryption_key.len(),
+                    }
+                })?;
+            cipher
+                .encrypt_padded::<NoPadding>(plaintext, plaintext_len)
+                .map(|_| ())
+                .map_err(
+                    |_| Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+                        block_len: AES_CBC_BLOCK_LEN,
+                        actual: plaintext_len,
+                    },
+                )
+        }
+        Ikev2EncryptionAlgorithm::AesCbc192 => {
+            validate_key_len("AES-CBC-192 key", AES_192_KEY_LEN, encryption_key.len())?;
+            let cipher =
+                cbc::Encryptor::<Aes192>::new_from_slices(encryption_key, iv).map_err(|_| {
+                    Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                        name: "AES-CBC-192 key or IV",
+                        expected: AES_192_KEY_LEN,
+                        actual: encryption_key.len(),
+                    }
+                })?;
+            cipher
+                .encrypt_padded::<NoPadding>(plaintext, plaintext_len)
+                .map(|_| ())
+                .map_err(
+                    |_| Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+                        block_len: AES_CBC_BLOCK_LEN,
+                        actual: plaintext_len,
+                    },
+                )
+        }
+        Ikev2EncryptionAlgorithm::AesCbc256 => {
+            validate_key_len("AES-CBC-256 key", AES_256_KEY_LEN, encryption_key.len())?;
+            let cipher =
+                cbc::Encryptor::<Aes256>::new_from_slices(encryption_key, iv).map_err(|_| {
+                    Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                        name: "AES-CBC-256 key or IV",
+                        expected: AES_256_KEY_LEN,
+                        actual: encryption_key.len(),
+                    }
+                })?;
+            cipher
+                .encrypt_padded::<NoPadding>(plaintext, plaintext_len)
+                .map(|_| ())
+                .map_err(
+                    |_| Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+                        block_len: AES_CBC_BLOCK_LEN,
+                        actual: plaintext_len,
+                    },
+                )
+        }
+        unsupported => Err(
+            Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
+                encryption: unsupported,
+                integrity: None,
+            },
+        ),
+    }
+}
+
+fn decrypt_aes_cbc_in_place(
+    encryption: Ikev2EncryptionAlgorithm,
+    encryption_key: &[u8],
+    iv: &[u8],
+    ciphertext: &mut [u8],
+) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
+    let ciphertext_len = ciphertext.len();
+    match encryption {
+        Ikev2EncryptionAlgorithm::AesCbc128 => {
+            validate_key_len("AES-CBC-128 key", AES_128_KEY_LEN, encryption_key.len())?;
+            let cipher =
+                cbc::Decryptor::<Aes128>::new_from_slices(encryption_key, iv).map_err(|_| {
+                    Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                        name: "AES-CBC-128 key or IV",
+                        expected: AES_128_KEY_LEN,
+                        actual: encryption_key.len(),
+                    }
+                })?;
+            cipher
+                .decrypt_padded::<NoPadding>(ciphertext)
+                .map(|_| ())
+                .map_err(
+                    |_| Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+                        block_len: AES_CBC_BLOCK_LEN,
+                        actual: ciphertext_len,
+                    },
+                )
+        }
+        Ikev2EncryptionAlgorithm::AesCbc192 => {
+            validate_key_len("AES-CBC-192 key", AES_192_KEY_LEN, encryption_key.len())?;
+            let cipher =
+                cbc::Decryptor::<Aes192>::new_from_slices(encryption_key, iv).map_err(|_| {
+                    Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                        name: "AES-CBC-192 key or IV",
+                        expected: AES_192_KEY_LEN,
+                        actual: encryption_key.len(),
+                    }
+                })?;
+            cipher
+                .decrypt_padded::<NoPadding>(ciphertext)
+                .map(|_| ())
+                .map_err(
+                    |_| Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+                        block_len: AES_CBC_BLOCK_LEN,
+                        actual: ciphertext_len,
+                    },
+                )
+        }
+        Ikev2EncryptionAlgorithm::AesCbc256 => {
+            validate_key_len("AES-CBC-256 key", AES_256_KEY_LEN, encryption_key.len())?;
+            let cipher =
+                cbc::Decryptor::<Aes256>::new_from_slices(encryption_key, iv).map_err(|_| {
+                    Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                        name: "AES-CBC-256 key or IV",
+                        expected: AES_256_KEY_LEN,
+                        actual: encryption_key.len(),
+                    }
+                })?;
+            cipher
+                .decrypt_padded::<NoPadding>(ciphertext)
+                .map(|_| ())
+                .map_err(
+                    |_| Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+                        block_len: AES_CBC_BLOCK_LEN,
+                        actual: ciphertext_len,
+                    },
+                )
+        }
+        unsupported => Err(
+            Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
+                encryption: unsupported,
+                integrity: None,
+            },
+        ),
+    }
+}
+
+fn compute_integrity_checksum(
+    integrity: Ikev2IntegrityAlgorithm,
+    integrity_key: &[u8],
+    first: &[u8],
+    second: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, Ikev2ProtectedPayloadCryptoError> {
+    validate_key_len("SK_a", integrity.key_len(), integrity_key.len())?;
+    let mut checksum = match integrity {
+        Ikev2IntegrityAlgorithm::HmacSha2_256_128 => {
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(integrity_key).map_err(|_| {
+                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                    name: "SK_a",
+                    expected: integrity.key_len(),
+                    actual: integrity_key.len(),
+                }
+            })?;
+            mac.update(first);
+            mac.update(second);
+            Zeroizing::new(mac.finalize().into_bytes().to_vec())
+        }
+        Ikev2IntegrityAlgorithm::HmacSha2_384_192 => {
+            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(integrity_key).map_err(|_| {
+                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                    name: "SK_a",
+                    expected: integrity.key_len(),
+                    actual: integrity_key.len(),
+                }
+            })?;
+            mac.update(first);
+            mac.update(second);
+            Zeroizing::new(mac.finalize().into_bytes().to_vec())
+        }
+        Ikev2IntegrityAlgorithm::HmacSha2_512_256 => {
+            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(integrity_key).map_err(|_| {
+                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+                    name: "SK_a",
+                    expected: integrity.key_len(),
+                    actual: integrity_key.len(),
+                }
+            })?;
+            mac.update(first);
+            mac.update(second);
+            Zeroizing::new(mac.finalize().into_bytes().to_vec())
+        }
+    };
+    checksum.truncate(integrity_icv_len(integrity));
+    Ok(checksum)
+}
+
+fn verify_integrity_checksum(
+    integrity: Ikev2IntegrityAlgorithm,
+    integrity_key: &[u8],
+    authenticated_message: &[u8],
+    received_icv: &[u8],
+) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
+    validate_key_len("SK_a", integrity.key_len(), integrity_key.len())?;
+    if received_icv.len() != integrity_icv_len(integrity) {
+        return Err(Ikev2ProtectedPayloadCryptoError::AuthenticationFailed);
+    }
+    let verified = match integrity {
+        Ikev2IntegrityAlgorithm::HmacSha2_256_128 => {
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(integrity_key)
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?;
+            mac.update(authenticated_message);
+            mac.verify_truncated_left(received_icv)
+        }
+        Ikev2IntegrityAlgorithm::HmacSha2_384_192 => {
+            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(integrity_key)
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?;
+            mac.update(authenticated_message);
+            mac.verify_truncated_left(received_icv)
+        }
+        Ikev2IntegrityAlgorithm::HmacSha2_512_256 => {
+            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(integrity_key)
+                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?;
+            mac.update(authenticated_message);
+            mac.verify_truncated_left(received_icv)
+        }
+    };
+    verified.map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
+}
+
+const fn integrity_icv_len(integrity: Ikev2IntegrityAlgorithm) -> usize {
+    integrity.icv_len_bits() as usize / 8
+}
+
+fn padded_ike_plaintext(
+    cleartext_payloads: &[u8],
+    padding_len: u8,
+) -> Result<Zeroizing<Vec<u8>>, Ikev2ProtectedPayloadCryptoError> {
+    let body_with_padding_len = cleartext_payloads
+        .len()
+        .checked_add(usize::from(padding_len))
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    let capacity = body_with_padding_len
+        .checked_add(1)
+        .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(capacity));
+    plaintext.extend_from_slice(cleartext_payloads);
+    plaintext.resize(body_with_padding_len, 0);
+    plaintext.push(padding_len);
+    Ok(plaintext)
+}
+
+fn strip_ike_padding(
+    plaintext: Zeroizing<Vec<u8>>,
+) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
     let Some((&pad_len, body_with_padding)) = plaintext.split_last() else {
         return Err(Ikev2ProtectedPayloadCryptoError::InvalidPadding {
             plaintext_len: 0,
