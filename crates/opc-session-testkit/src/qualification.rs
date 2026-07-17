@@ -63,6 +63,20 @@ pub const SESSION_HA_CONCURRENT_HISTORY_SCHEMA_JSON: &str =
 /// false.
 pub const SESSION_HA_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v3/session-ha-candidate-evidence.schema.json");
+/// Closed additive schema for per-slot CAS batch evidence and separated
+/// Openraft/application-journal index domains. This v5 candidate contract does
+/// not alter or graduate the frozen v3/v4 contracts.
+pub const SESSION_HA_CONCURRENT_HISTORY_V5_SCHEMA_JSON: &str =
+    include_str!("../qualification/v5/session-ha-concurrent-history.schema.json");
+/// Closed candidate-evidence schema binding one v5 per-slot history to an
+/// independent checker while fixing all production-credit fields to false.
+pub const SESSION_HA_CANDIDATE_EVIDENCE_V5_SCHEMA_JSON: &str =
+    include_str!("../qualification/v5/session-ha-candidate-evidence.schema.json");
+/// Closed schema for the separately digest-bound fault schedule consumed by
+/// the v5 independent readiness checker. Expected quorum is derived from this
+/// schedule rather than trusted from history rows.
+pub const SESSION_HA_FAULT_SCHEDULE_V5_SCHEMA_JSON: &str =
+    include_str!("../qualification/v5/session-ha-fault-schedule.schema.json");
 /// Exact additive v4 profile that binds both independent history-checker
 /// families without making a production claim.
 pub const SESSION_HA_CANDIDATE_PROFILE_V4_JSON: &str =

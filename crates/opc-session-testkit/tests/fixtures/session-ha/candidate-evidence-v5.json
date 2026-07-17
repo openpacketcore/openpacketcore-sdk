@@ -1,0 +1,83 @@
+{
+  "schema_version": "opc-session-ha-candidate-evidence/v5",
+  "profile_id": "opc-session-openraft-ha/v5-candidate",
+  "experimental": true,
+  "qualification_complete": false,
+  "counts_for_production": false,
+  "source_revision": "0000000000000000000000000000000000000000",
+  "source_tree_status": "dirty_unqualified",
+  "artifact": {
+    "name": "opc-session-quorum-node",
+    "version": "0.2.0-synthetic-fixture",
+    "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "exact_release_artifact": false
+  },
+  "execution": {
+    "history_id": "candidate-history-v5",
+    "campaign_started_ns": 0,
+    "campaign_completed_ns": 1000,
+    "topology_members": 3,
+    "process_ids": ["node-0", "node-1", "node-2"],
+    "max_readiness_gap_ns": 500,
+    "fault_schedule_sha256": "sha256:24f9f3797a3fe5a44d4aa07d1cf5e91e21ef94e2b89dce16a6f1491a4ad07bd9"
+  },
+  "workload": {
+    "schedule_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "isolated_digest_namespace": true,
+    "initial_state_empty": true,
+    "initial_journal_head": 9,
+    "complete_write_history": true,
+    "serialized_batch_invocations": true,
+    "exclusive_application_journal_window": true,
+    "records_non_expiring_through_campaign": true,
+    "state_class": "authoritative-session",
+    "state_type_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "no_lease_mutations_in_history_window": true,
+    "preacquired_leases": [
+      {
+        "key_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "owner_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "fence": 1,
+        "valid_from_ns": 0,
+        "valid_through_ns": 2000
+      },
+      {
+        "key_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "owner_sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "fence": 2,
+        "valid_from_ns": 0,
+        "valid_through_ns": 2000
+      }
+    ]
+  },
+  "history": {
+    "schema_version": "opc-session-ha-concurrent-history/v5",
+    "sha256": "sha256:2e6298e69d4c5d822f382c24b2c1851dfa78a1b57d8ab6ba0018d5b9872f7594",
+    "operation_count": 19,
+    "required_kinds": ["batch", "watch", "restore", "readiness"]
+  },
+  "checker": {
+    "name": "check-session-ha-concurrent-history-v5.py",
+    "version": "5",
+    "sha256": "sha256:e0061e53e9686624cffa1c2c970e6d1c35b69f66f1ab2dc4149968e34428282a"
+  },
+  "coverage": {
+    "cas_batch_per_slot_outcomes": true,
+    "gap_free_application_journal_watch": true,
+    "restore_state_within_call_interval": true,
+    "separate_raft_and_journal_domains": true,
+    "fault_schedule_derived_readiness_gating": true,
+    "fixed_campaign_lease_guards": true,
+    "authoritative_non_expiring_records": true
+  },
+  "remaining_acceptance": [
+    "deployed_kubernetes_3_5",
+    "real_network_and_storage_faults",
+    "crash_point_matrix",
+    "version_migration_and_rollback",
+    "platform_resource_soak",
+    "remote_hkms_rotation",
+    "live_alert_fire_and_clear",
+    "signed_release_bundle"
+  ]
+}

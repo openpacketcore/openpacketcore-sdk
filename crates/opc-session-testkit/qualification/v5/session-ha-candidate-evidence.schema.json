@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-candidate-evidence/v5",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "experimental",
+    "qualification_complete",
+    "counts_for_production",
+    "source_revision",
+    "source_tree_status",
+    "artifact",
+    "execution",
+    "workload",
+    "history",
+    "checker",
+    "coverage",
+    "remaining_acceptance"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-candidate-evidence/v5" },
+    "profile_id": { "const": "opc-session-openraft-ha/v5-candidate" },
+    "experimental": { "const": true },
+    "qualification_complete": { "const": false },
+    "counts_for_production": { "const": false },
+    "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "source_tree_status": { "enum": ["clean", "dirty_unqualified"] },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "sha256", "exact_release_artifact"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "exact_release_artifact": { "type": "boolean" }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "history_id",
+        "campaign_started_ns",
+        "campaign_completed_ns",
+        "topology_members",
+        "process_ids",
+        "max_readiness_gap_ns",
+        "fault_schedule_sha256"
+      ],
+      "properties": {
+        "history_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "campaign_started_ns": { "type": "integer", "minimum": 0 },
+        "campaign_completed_ns": { "type": "integer", "minimum": 1 },
+        "topology_members": { "oneOf": [{ "const": 3 }, { "const": 5 }] },
+        "process_ids": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "max_readiness_gap_ns": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000000000
+        },
+        "fault_schedule_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schedule_sha256",
+        "isolated_digest_namespace",
+        "initial_state_empty",
+        "initial_journal_head",
+        "complete_write_history",
+        "serialized_batch_invocations",
+        "exclusive_application_journal_window",
+        "records_non_expiring_through_campaign",
+        "state_class",
+        "state_type_sha256",
+        "no_lease_mutations_in_history_window",
+        "preacquired_leases"
+      ],
+      "properties": {
+        "schedule_sha256": { "$ref": "#/$defs/digest" },
+        "isolated_digest_namespace": { "const": true },
+        "initial_state_empty": { "const": true },
+        "initial_journal_head": {
+          "$comment": "Linearizably captured application-journal head before the exclusive workload window; never an Openraft index.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "complete_write_history": { "const": true },
+        "serialized_batch_invocations": { "const": true },
+        "exclusive_application_journal_window": { "const": true },
+        "records_non_expiring_through_campaign": { "const": true },
+        "state_class": { "const": "authoritative-session" },
+        "state_type_sha256": { "$ref": "#/$defs/digest" },
+        "no_lease_mutations_in_history_window": { "const": true },
+        "preacquired_leases": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/preacquiredLease" }
+        }
+      }
+    },
+    "history": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "sha256", "operation_count", "required_kinds"],
+      "properties": {
+        "schema_version": { "const": "opc-session-ha-concurrent-history/v5" },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "operation_count": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "required_kinds": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": { "enum": ["batch", "watch", "restore", "readiness"] }
+        }
+      }
+    },
+    "checker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "sha256"],
+      "properties": {
+        "name": { "const": "check-session-ha-concurrent-history-v5.py" },
+        "version": { "const": "5" },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cas_batch_per_slot_outcomes",
+        "gap_free_application_journal_watch",
+        "restore_state_within_call_interval",
+        "separate_raft_and_journal_domains",
+        "fault_schedule_derived_readiness_gating",
+        "fixed_campaign_lease_guards",
+        "authoritative_non_expiring_records"
+      ],
+      "properties": {
+        "cas_batch_per_slot_outcomes": { "const": true },
+        "gap_free_application_journal_watch": { "const": true },
+        "restore_state_within_call_interval": { "const": true },
+        "separate_raft_and_journal_domains": { "const": true },
+        "fault_schedule_derived_readiness_gating": { "const": true },
+        "fixed_campaign_lease_guards": { "const": true },
+        "authoritative_non_expiring_records": { "const": true }
+      }
+    },
+    "remaining_acceptance": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "deployed_kubernetes_3_5",
+          "real_network_and_storage_faults",
+          "crash_point_matrix",
+          "version_migration_and_rollback",
+          "platform_resource_soak",
+          "remote_hkms_rotation",
+          "live_alert_fire_and_clear",
+          "signed_release_bundle"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "preacquiredLease": {
+      "$comment": "Lease times use the same bounded campaign clock as history operation intervals; valid_through_ns is exclusive.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key_sha256",
+        "owner_sha256",
+        "fence",
+        "valid_from_ns",
+        "valid_through_ns"
+      ],
+      "properties": {
+        "key_sha256": { "$ref": "#/$defs/digest" },
+        "owner_sha256": { "$ref": "#/$defs/digest" },
+        "fence": { "type": "integer", "minimum": 1 },
+        "valid_from_ns": { "type": "integer", "minimum": 0 },
+        "valid_through_ns": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

@@ -464,6 +464,14 @@ JSONL history, and independent checker digest. The schema fixes
 `experimental = true`, `qualification_complete = false`, and
 `counts_for_production = false`; a v3 document cannot graduate the HA profile.
 
+This contract is retained byte-for-byte as historical candidate input. Its
+single-index atomic multi-key batch model does not match the current public
+`SessionBackend::batch` contract, which returns one result per slot and permits
+partial success. The Openraft-backed adapter submits admitted slots as
+independent commands. A real campaign must not populate v3 by assigning one
+invented index to those commands or by treating `ReplicationOp::Batch` replay
+shape as production mutation authority.
+
 `scripts/check-session-ha-concurrent-history.py` uses only the Python standard
 library and imports no SDK code. It accepts overlapping operation intervals and
 checks four evidence surfaces together:
@@ -498,6 +506,82 @@ live alert verification, and a signed release bundle remain required by #143.
 Run the focused contract and checker suite with:
 
 `cargo test --locked -p opc-session-testkit --test qualification_history_v3`.
+
+## Per-Slot Concurrent History Candidate
+
+`qualification/v5/session-ha-concurrent-history.schema.json` and
+`qualification/v5/session-ha-candidate-evidence.schema.json` are additive,
+candidate-only contracts aligned with the existing backend behavior. They do
+not modify the frozen v1-v4 files. The v5 workload deliberately serializes
+batch invocations while allowing watch, restore, and readiness intervals to
+overlap; this keeps the first independent state checker bounded without
+claiming a general concurrent-batch linearizability search.
+
+`scripts/check-session-ha-concurrent-history-v5.py` checks:
+
+- each CAS batch slot independently, including partial success and conflict;
+  successful slots carry their committed application-journal sequence, while
+  conflicts and unknown outcomes may not invent one. A contiguous explicit
+  invocation sequence, rather than timestamp or operation-ID sorting, binds
+  the serialized batch order;
+- every mutation uses one digest-bound lease that was acquired before the
+  campaign, remains valid after the campaign, and keeps the same owner and
+  fence for that key. The exclusive history window permits no lease mutation;
+  stale fences and owner changes therefore fail the candidate contract;
+- an exclusive bounded journal window and its exact gap-free watch events. At
+  least one successful watch must cover the complete initial-to-terminal
+  journal window; cursors cannot request or complete beyond a journal head that
+  could have existed during the call;
+- a complete post-batch restore result matching the terminal modeled state,
+  plus validation that every restore state can legally occur within its call
+  interval without claiming a snapshot index the API does not expose. The
+  checker builds each canonical journal-prefix state once and uses a bounded
+  indexed lookup for every restore result;
+- Openraft term/commit/applied monotonicity separately from the application
+  journal head. The checker never compares values across those two domains;
+- fail-closed readiness against the separately digest-bound
+  `opc-session-ha-fault-schedule/v5` document. The checker derives static
+  majority reachability from each interval's running processes and available
+  bidirectional paths; it does not trust `expected_quorum` in a history row.
+  Calls and completed-observation cadence are bounded. Each process's first
+  real probe interval must complete before the first batch starts and report
+  the initial authority head; its final interval must start after the last
+  batch completes, finish inside the final sampling gap, and report the modeled
+  ending head. Every per-process quorum-loss transition must produce a bounded
+  not-ready observation, and every recovery transition must produce a bounded
+  authoritative ready observation. A not-ready result while quorum is
+  scheduled must recover inside the same bounded interval.
+
+The evidence fixes the isolated initial state to empty, binds the exact
+pre-window journal head and every write in the exclusive journal window, and
+requires modeled records to remain non-expiring through the campaign. Ready
+records are structurally fixed to `authoritative-session`, one exact state-type
+digest, and `expires_at_ns = null`; watch and restore rows carry and compare the
+same fields. Ready samples are bounded by the writes that could have linearized
+before their response. The checker accepts nonzero collector probe intervals;
+it never requires a collector to normalize real start/completion timestamps to
+the campaign envelope.
+Unknown batch slots make dependent state, watch, and restore conclusions
+inconclusive rather than successful. Inputs remain digest-bound, closed,
+allocation-bounded, duplicate-field rejecting, and digest-only for keys,
+owners, and values. The fixture proves checker behavior only: no v5 collector,
+Kubernetes evidence, release manifest, or production credit exists yet. The
+frozen v4 manifest continues to bind v3 until a later additive contract
+explicitly replaces that binding.
+
+Run the focused v5 contract and checker suite with:
+
+`cargo test --locked -p opc-session-testkit --test qualification_history_v5`.
+
+The independent checker invocation always supplies all three digest-bound
+artifacts:
+
+```console
+python3 scripts/check-session-ha-concurrent-history-v5.py \
+  --evidence candidate-evidence-v5.json \
+  --fault-schedule fault-schedule-v5.json \
+  --history concurrent-history-v5.jsonl
+```
 
 ## Combined HA Candidate Manifest
 

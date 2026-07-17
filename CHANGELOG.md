@@ -26,6 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabling kernel failover. Strict config negatives, raw ABI fixtures, and
   live single-host multihoming tests cover tuning, selection, Diameter
   delegation, and data delivery.
+- **Per-slot HA qualification contract — `opc-session-testkit`:** an additive
+  candidate-only v5 schema and SDK-independent bounded checker now model the
+  actual per-slot CAS behavior of `SessionBackend::batch`. Successful CAS slots
+  bind exact application-journal sequences, conflicts bind no fabricated
+  event, and an explicit invocation sequence binds ordering. The evidence
+  fixes one campaign-valid owner/fence guard per key and structurally binds
+  non-expiring authoritative record type/class fields plus exact initial and
+  terminal journal heads. At least one watch must cover the exact gap-free
+  initial-to-terminal journal window, and at least one post-batch complete
+  restore must match the terminal state; every restore is checked through a
+  precomputed bounded prefix index. A separately digest-bound fault schedule
+  now derives quorum expectation, bounded completion cadence, initial
+  authority, and explicit loss/recovery-transition observations rather than
+  trusting readiness rows. Openraft term/log indices
+  remain distinct from journal heads. An Openraft production-path regression
+  proves success/conflict/success yields two ordered journal entries. Frozen
+  v1-v4 contracts remain unchanged; v5 adds no collector, deployed evidence,
+  or production qualification claim.
 - **Leader-aware management commits — gNMI/NETCONF/config bus:** an opt-in
   `ConfigAuthorityPort` projection fence redirects followers with bounded
   leader hints and returns the exact persisted `{version, plaintext-envelope
