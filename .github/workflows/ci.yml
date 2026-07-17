@@ -118,7 +118,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@v2.83.0
+        uses: taiki-e/install-action@v2.83.4
         with:
           tool: cargo-hack@0.6.45
           fallback: none
