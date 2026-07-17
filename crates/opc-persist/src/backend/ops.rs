@@ -18,7 +18,7 @@ use super::{
     SqliteBackend, StoredConfigRow,
 };
 
-type LatestConfigHeadRow = (Vec<u8>, i64, Option<String>, Option<String>);
+type LatestConfigHeadRow = (Vec<u8>, i64, Option<String>, Option<String>, String);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ConfigStore implementation
@@ -30,6 +30,88 @@ impl ConfigStore for SqliteBackend {
         let conn = Arc::clone(&self.conn);
         let guard = conn.lock_owned().await;
         let res = Self::load_latest_impl(&guard, self.audit_key.as_ref());
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_read_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let res = Self::load_committed_latest_impl(&guard, self.audit_key.as_ref());
+        if res.is_ok() {
+            opc_redaction::metrics::METRICS
+                .persist_read_success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            opc_redaction::metrics::METRICS
+                .persist_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn load_since(
+        &self,
+        version: ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<StoredConfig>, PersistError> {
+        if limit > crate::CONFIG_HISTORY_PAGE_MAX_ENTRIES {
+            return Err(PersistError::constraint_violation(
+                "config history page exceeds the contract bound",
+            ));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let requested_version = version;
+        let Ok(version) = i64::try_from(version.get()) else {
+            return Ok(Vec::new());
+        };
+        let limit = i64::try_from(limit).map_err(|_| {
+            PersistError::constraint_violation("config history page limit is invalid")
+        })?;
+        let conn = Arc::clone(&self.conn);
+        let guard = conn.lock_owned().await;
+        let res = (|| {
+            let visible_head = Self::load_committed_latest_impl(&guard, self.audit_key.as_ref())?;
+            if visible_head
+                .as_ref()
+                .is_none_or(|head| requested_version >= head.record.version)
+            {
+                return Ok(Vec::new());
+            }
+            let mut statement = guard
+                .prepare(
+                    "SELECT tx_id FROM config_history WHERE version > ?1 ORDER BY version ASC LIMIT ?2",
+                )
+                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            let rows = statement
+                .query_map(params![version, limit], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            let mut records = Vec::new();
+            for row in rows {
+                let tx_id = row.map_err(|error| PersistError::sqlite(error.to_string()))?;
+                let record = Self::load_by_tx_id_bytes(&guard, &tx_id, self.audit_key.as_ref())?
+                    .ok_or_else(|| {
+                        PersistError::inconsistent_state(
+                            "config history row disappeared during a locked page read",
+                        )
+                    })?;
+                if crate::types::config_recovery_required(&record.record.principal)? {
+                    break;
+                }
+                records.push(record);
+            }
+            Ok(records)
+        })();
         if res.is_ok() {
             opc_redaction::metrics::METRICS
                 .persist_read_success
@@ -422,6 +504,51 @@ impl SqliteBackend {
         Self::load_by_tx_id_bytes(conn, &tx_id_bytes, audit_key)
     }
 
+    fn load_committed_latest_impl(
+        conn: &rusqlite::Connection,
+        audit_key: &AuditKey,
+    ) -> Result<Option<StoredConfig>, PersistError> {
+        let first_fenced: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
+            .query_row(
+                r#"SELECT tx_id, parent_tx_id
+                   FROM config_history
+                   WHERE CASE
+                           WHEN json_valid(principal)
+                           THEN json_extract(principal, '$.recovery_required')
+                           ELSE 0
+                         END = 1
+                   ORDER BY version ASC
+                   LIMIT 1"#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| PersistError::sqlite(error.to_string()))?;
+        let Some((fenced_tx_id, parent_tx_id)) = first_fenced else {
+            return Self::load_latest_impl(conn, audit_key);
+        };
+        let fenced =
+            Self::load_by_tx_id_bytes(conn, &fenced_tx_id, audit_key)?.ok_or_else(|| {
+                PersistError::inconsistent_state("fenced config history row disappeared")
+            })?;
+        if !crate::types::config_recovery_required(&fenced.record.principal)? {
+            return Err(PersistError::inconsistent_state(
+                "config publication-fence index is inconsistent",
+            ));
+        }
+        let Some(parent_tx_id) = parent_tx_id else {
+            return Ok(None);
+        };
+        Self::load_by_tx_id_bytes(conn, &parent_tx_id, audit_key)?.map_or_else(
+            || {
+                Err(PersistError::inconsistent_state(
+                    "fenced config head has no durable parent",
+                ))
+            },
+            |parent| Ok(Some(parent)),
+        )
+    }
+
     /// Load a rollback target.
     fn load_rollback_impl(
         conn: &rusqlite::Connection,
@@ -632,15 +759,15 @@ impl SqliteBackend {
 
         let latest: Option<LatestConfigHeadRow> = tx
             .query_row(
-                "SELECT tx_id, version, confirmed_deadline, confirmed_at FROM config_history ORDER BY version DESC LIMIT 1",
+                "SELECT tx_id, version, confirmed_deadline, confirmed_at, principal FROM config_history ORDER BY version DESC LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
             .map_err(|error| PersistError::sqlite(error.to_string()))?;
         match (&latest, record.parent_tx_id) {
             (None, None) => {}
-            (Some((latest_tx_id, latest_version, _, _)), Some(parent_tx_id))
+            (Some((latest_tx_id, latest_version, _, _, _)), Some(parent_tx_id))
                 if latest_tx_id.as_slice() == parent_tx_id.as_uuid().as_bytes()
                     && u64::try_from(*latest_version)
                         .ok()
@@ -653,9 +780,19 @@ impl SqliteBackend {
             }
         }
 
+        if let Some((_, _, _, _, principal)) = &latest {
+            if crate::types::config_recovery_required(principal)? {
+                return Err(PersistError::constraint_violation(
+                    "config publication fence must clear before another append",
+                ));
+            }
+        }
+
         let latest_is_pending = latest
             .as_ref()
-            .is_some_and(|(_, _, deadline, confirmed)| deadline.is_some() && confirmed.is_none());
+            .is_some_and(|(_, _, deadline, confirmed, _)| {
+                deadline.is_some() && confirmed.is_none()
+            });
         match (latest_is_pending, resolution) {
             (false, None) => {}
             (true, Some(ConfirmedCommitResolution::Rollback { pending_tx_id }))

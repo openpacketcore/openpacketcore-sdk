@@ -18,8 +18,9 @@ accepted single-replica profile.
 ## API shape
 
 - `ConfigStore` is the async commit-store trait: `load_latest`,
-  `load_rollback`, `append_commit`, `mark_confirmed`,
-  `create_rollback_point`, and `preflight`.
+  follower-local `load_committed_latest`, bounded ordered `load_since`,
+  `wait_for_committed_change`, `load_rollback`, `append_commit`,
+  `mark_confirmed`, `create_rollback_point`, and `preflight`.
 - `SqliteBackend::open_with_audit_key` opens durable SQLite state. Durable
   opens require an explicit non-zero `AuditKey`.
 - `AuditKey::new([u8; 32])` rejects all-zero keys, and
@@ -239,6 +240,16 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   under their original deadlines. Caller
   cancellation or timeout cannot cancel a dispatched check or start an
   overlapping one, and Openraft remains the sole quorum authority.
+- Committed-watch reads are intentionally different from fresh authoritative
+  reads: `load_committed_latest` and `load_since` return only the calling
+  node's contiguous Openraft-applied, recovery-cleared prefix without a
+  leader/read-index round. An applied `recovery_required` tail remains hidden,
+  blocks successors, and becomes visible only after its clear mutation applies
+  locally. A confirmed-deadline row remains visible once this publication
+  fence is clear. The local head may lag, but its history is committed,
+  ordered, and independently serviceable during loss of the read-barrier path.
+  Apply notifications merely wake consumers; config-bus validates the next
+  durable page before emission.
 - `dangerous-test-hooks` exposes fault injection only for explicitly gated
   test profiles. It is not a production feature.
 

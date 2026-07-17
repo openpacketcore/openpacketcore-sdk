@@ -21,9 +21,10 @@ pub enum AuthorityMode {
     /// persisted, and published locally. All built-in constructors create
     /// authoritative buses.
     Authoritative,
-    /// Reserved for buses that mirror a running config owned by an external
-    /// authority (for example a replication follower); local reads are served
-    /// from the snapshot but the local worker is not the source of truth.
+    /// A read-only bus restored from an explicit committed-revision source
+    /// (for example a local Openraft follower). Mutation is rejected before
+    /// datastore I/O; recovery and watches read only that source's applied
+    /// history.
     Shadow,
 }
 
@@ -89,6 +90,18 @@ pub enum StoreErrorCode {
     /// The blocking startup validation task panicked; treated as a process
     /// bug and the bus fails closed rather than publishing unvalidated config.
     StartupValidationTaskFailed,
+    /// A caller requested more committed-history entries than the bounded
+    /// datastore contract permits in one page.
+    HistoryPageTooLarge,
+    /// A committed-history adapter returned a duplicate, gap, or out-of-order
+    /// revision instead of the exact successor required by the cursor.
+    InvalidHistorySequence,
+    /// The requested committed-history cursor is older than the retained
+    /// history. The caller must install a fresh snapshot before resuming.
+    HistoryCompacted,
+    /// A recovery caller claimed a revision newer than this follower's local
+    /// state-machine-applied head. Recovery refuses to move the caller back.
+    HistoryCursorAhead,
 }
 
 impl StoreErrorCode {
@@ -108,6 +121,10 @@ impl StoreErrorCode {
             Self::StartupSyntaxValidationFailed => "startup_syntax_validation_failed",
             Self::StartupSemanticValidationFailed => "startup_semantic_validation_failed",
             Self::StartupValidationTaskFailed => "startup_validation_task_failed",
+            Self::HistoryPageTooLarge => "history_page_too_large",
+            Self::InvalidHistorySequence => "invalid_history_sequence",
+            Self::HistoryCompacted => "history_compacted",
+            Self::HistoryCursorAhead => "history_cursor_ahead",
         }
     }
 }
@@ -230,6 +247,29 @@ impl StoreError {
     /// an unvalidated config.
     pub fn startup_validation_task_failed(message: impl Into<String>) -> Self {
         Self::new(StoreErrorCode::StartupValidationTaskFailed, message)
+    }
+
+    /// Builds a `HistoryPageTooLarge` error for an over-contract page request.
+    pub fn history_page_too_large(message: impl Into<String>) -> Self {
+        Self::new(StoreErrorCode::HistoryPageTooLarge, message)
+    }
+
+    /// Builds an `InvalidHistorySequence` error for a duplicate, gap, or
+    /// out-of-order committed revision.
+    pub fn invalid_history_sequence(message: impl Into<String>) -> Self {
+        Self::new(StoreErrorCode::InvalidHistorySequence, message)
+    }
+
+    /// Builds a `HistoryCompacted` error. Consumers must recover a complete
+    /// snapshot before using the adapter-provided retained cursor.
+    pub fn history_compacted(message: impl Into<String>) -> Self {
+        Self::new(StoreErrorCode::HistoryCompacted, message)
+    }
+
+    /// Builds a `HistoryCursorAhead` error when a consumer's known revision is
+    /// newer than the local state-machine-applied head.
+    pub fn history_cursor_ahead(message: impl Into<String>) -> Self {
+        Self::new(StoreErrorCode::HistoryCursorAhead, message)
     }
 }
 

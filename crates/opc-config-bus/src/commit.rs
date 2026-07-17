@@ -24,7 +24,7 @@ use crate::alarms::{
     apply_commit_alarm_outcome, raise_commit_error, raise_config_error_alarm,
     CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
 };
-use crate::authorizer::ConfigAuthorizer;
+use crate::authorizer::{ConfigAuthorizer, DenyAllAuthorizer};
 use crate::datastore::ManagedDatastore;
 use crate::restore::{
     restore_validation_context, startup_bootstrap_principal, validate_publishable_stored_config,
@@ -68,6 +68,8 @@ const CANDIDATE_PAYLOAD_SIZE_UNAVAILABLE_MESSAGE: &str =
     "config candidate serialized payload size is unavailable";
 const CANDIDATE_PAYLOAD_SIZE_FAILED_MESSAGE: &str =
     "config candidate serialized payload size could not be measured";
+const SHADOW_MUTATION_REJECTED_MESSAGE: &str =
+    "config mutations are disabled on a shadow committed-revision bus";
 
 pub(crate) struct Submission<C: OpcConfig> {
     pub(crate) request: CommitRequest<C>,
@@ -227,6 +229,33 @@ impl<C: OpcConfig> ConfigBus<C> {
         }
     }
 
+    pub(crate) fn spawn_shadow(
+        initial: C,
+        version: ConfigVersion,
+        tx_id: Option<TxId>,
+        store: Arc<dyn ManagedDatastore<C>>,
+        alarm_manager: SharedAlarmManager,
+    ) -> Self {
+        let snapshot = Arc::new(AtomicConfigSnapshot::with_state(initial, version, tx_id));
+        let subscribers = Arc::new(Mutex::new(Vec::new()));
+        let recovery = Arc::new(RecoveryState::default());
+        let admission_limits = Arc::new(CommitAdmissionLimits::default());
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        Self {
+            tx,
+            snapshot,
+            subscribers,
+            authority_mode: AuthorityMode::Shadow,
+            recovery,
+            alarm_manager,
+            authorizer: Arc::new(DenyAllAuthorizer),
+            admission_limits,
+            store,
+        }
+    }
+
     /// Enables a serialized candidate payload cap and returns this bus handle.
     ///
     /// The cap is checked before diffing, validation, persistence, or
@@ -259,6 +288,12 @@ impl<C: OpcConfig> ConfigBus<C> {
     /// durable append, and snapshot publication have all succeeded; failures
     /// before the durable append leave the running config untouched.
     pub async fn submit(&self, request: CommitRequest<C>) -> Result<CommitResult, CommitError> {
+        if self.authority_mode == AuthorityMode::Shadow {
+            return Err(CommitError::new(
+                CommitErrorCode::AdmissionRejected,
+                SHADOW_MUTATION_REJECTED_MESSAGE,
+            ));
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         let sent = self.tx.try_send(Submission {
             request,

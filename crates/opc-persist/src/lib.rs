@@ -134,5 +134,5 @@ pub use security_policy::{
 pub use types::{
     extract_tenant, redact_entry, AttestedConfigCommit, AuditKey, AuditOpType, AuditRecord,
     CommitRecord, CommitSource, ConfirmedCommitResolution, RollbackTarget, StoredConfig,
-    CONFIG_ROLLBACK_LABEL_MAX_BYTES,
+    CONFIG_HISTORY_PAGE_MAX_ENTRIES, CONFIG_ROLLBACK_LABEL_MAX_BYTES,
 };

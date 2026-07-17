@@ -246,6 +246,9 @@ impl fmt::Debug for AttestedConfigCommit {
 // ConfigStore trait
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Maximum number of config-history records returned by one persistence page.
+pub const CONFIG_HISTORY_PAGE_MAX_ENTRIES: usize = 64;
+
 /// Core persistence trait for the management substrate.
 ///
 /// Implementors must guarantee that [`append_commit`](ConfigStore::append_commit)
@@ -259,6 +262,53 @@ pub trait ConfigStore: Send + Sync {
     /// Load the most recent configuration, including a pending commit-confirmed
     /// row when it is the newest durable record.
     async fn load_latest(&self) -> Result<Option<StoredConfig>, PersistError>;
+
+    /// Load the most recent publication-safe record visible in this node's
+    /// local committed state-machine view.
+    ///
+    /// Standalone stores use the same durable head as `load_latest`.
+    /// Consensus stores override this method to avoid a leader/read-index
+    /// round while still returning only locally applied state through the
+    /// first uncleared `recovery_required` publication fence.
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
+        self.load_latest()
+            .await?
+            .map(|record| {
+                config_recovery_required(&record.record.principal)
+                    .map(|fenced| (!fenced).then_some(record))
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Load at most `limit` durable publication-safe config records strictly
+    /// after `version`, ordered by ascending `ConfigVersion`.
+    ///
+    /// Implementations supporting follower-served config watches must return
+    /// only the contiguous locally committed/applied, recovery-cleared prefix
+    /// and must never start after the exact successor or skip a fenced row.
+    /// The default fails closed for legacy adapters.
+    async fn load_since(
+        &self,
+        _version: ConfigVersion,
+        _limit: usize,
+    ) -> Result<Vec<StoredConfig>, PersistError> {
+        Err(PersistError::constraint_violation(
+            "ordered committed config history is unsupported",
+        ))
+    }
+
+    /// Wait until this local store may have applied a revision newer than
+    /// `version`.
+    ///
+    /// The notification is a wake hint only; consumers must repage and enforce
+    /// the durable cursor. Consensus stores override this with a
+    /// register-before-head apply notification. Legacy stores use a bounded
+    /// fallback interval.
+    async fn wait_for_committed_change(&self, _version: ConfigVersion) -> Result<(), PersistError> {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        Ok(())
+    }
 
     /// Load a specific rollback target.
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError>;
@@ -660,6 +710,14 @@ pub(crate) fn config_rollback_label(stored: &str) -> Result<Option<String>, Pers
     match parse_config_principal(stored) {
         ParsedConfigPrincipal::Legacy => Ok(None),
         ParsedConfigPrincipal::Wrapped(metadata) => Ok(metadata.rollback_label),
+        ParsedConfigPrincipal::Invalid => Err(PersistError::corrupt_blob()),
+    }
+}
+
+pub(crate) fn config_recovery_required(stored: &str) -> Result<bool, PersistError> {
+    match parse_config_principal(stored) {
+        ParsedConfigPrincipal::Legacy => Ok(false),
+        ParsedConfigPrincipal::Wrapped(metadata) => Ok(metadata.recovery_required),
         ParsedConfigPrincipal::Invalid => Err(PersistError::corrupt_blob()),
     }
 }

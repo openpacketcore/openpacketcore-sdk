@@ -2215,7 +2215,7 @@ fn deterministic_row_id(domain: &[u8], identity: &[u8]) -> i64 {
     i64::try_from(id.max(1)).expect("masked deterministic row ID fits i64")
 }
 
-type LatestConfigHeadRow = (Vec<u8>, i64, Option<String>, Option<String>);
+type LatestConfigHeadRow = (Vec<u8>, i64, Option<String>, Option<String>, String);
 
 fn append_prepared_commit_sync(
     conn: &Connection,
@@ -2286,24 +2286,30 @@ fn append_prepared_commit_sync(
     }
     let latest: Option<LatestConfigHeadRow> = conn
         .query_row(
-            "SELECT tx_id, version, confirmed_deadline, confirmed_at FROM config_history ORDER BY version DESC LIMIT 1",
+            "SELECT tx_id, version, confirmed_deadline, confirmed_at, principal FROM config_history ORDER BY version DESC LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()
         .map_err(db_error)?;
     match (&latest, record.parent_tx_id) {
         (None, None) => {}
-        (Some((latest_tx, latest_version, _, _)), Some(parent))
+        (Some((latest_tx, latest_version, _, _, _)), Some(parent))
             if latest_tx.as_slice() == parent.as_uuid().as_bytes()
                 && checked_u64(*latest_version)?
                     .checked_add(1)
                     .is_some_and(|next| next == record.version.get()) => {}
         _ => return Ok(Err(ConfigMutationFailure::Conflict)),
     }
+    if let Some((_, _, _, _, principal)) = &latest {
+        match crate::types::config_recovery_required(principal) {
+            Ok(true) | Err(_) => return Ok(Err(ConfigMutationFailure::Conflict)),
+            Ok(false) => {}
+        }
+    }
     let latest_is_pending = latest
         .as_ref()
-        .is_some_and(|(_, _, deadline, confirmed)| deadline.is_some() && confirmed.is_none());
+        .is_some_and(|(_, _, deadline, confirmed, _)| deadline.is_some() && confirmed.is_none());
     match (latest_is_pending, resolution) {
         (false, None) => {}
         (true, None) if schema_version == LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION => {

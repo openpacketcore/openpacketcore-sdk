@@ -9,12 +9,12 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{watch, Mutex as AsyncMutex};
 
 use opc_config_model::{IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget};
 use opc_crypto::{decrypt_envelope, encrypt_attested_envelope};
 use opc_key::{ConfigAad, EnvelopeAad, KeyProvider, Zeroizing};
-use opc_types::TxId;
+use opc_types::{ConfigVersion, TxId};
 
 use crate::types::{
     CommitWrite, CommitWriteReceipt, ConfirmedCommitResolution, SealedConfig, StoreError,
@@ -33,6 +33,8 @@ const IDEMPOTENCY_LOOKUP_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/config-bus/idempotency-lookup/v1\0";
 const REQUEST_LOOKUP_DIGEST_DOMAIN: &[u8] = b"openpacketcore/config-bus/request-lookup/v1\0";
 const REPLAY_LOOKUP_BINDING_FAILED_MESSAGE: &str = "config envelope replay lookup binding mismatch";
+const DEFAULT_COMMITTED_CHANGE_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 #[derive(Serialize)]
 struct ConfigPlaintextV2Ref<'a, C> {
@@ -87,6 +89,50 @@ pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
     /// Loads the highest-version record, or `None` for an empty store (which
     /// makes restore fall back to the caller-supplied bootstrap config).
     async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError>;
+    /// Loads this node's latest locally committed/applied, publication-safe
+    /// record without requiring a leader-local fanout or writer read path.
+    ///
+    /// Standalone stores default to [`ManagedDatastore::load_latest`]. A
+    /// replicated adapter overrides this only when it can prove the returned
+    /// row came from its local consensus state machine after commitment and
+    /// its `recovery_required` publication fence was durably cleared. An
+    /// applied fenced tail is excluded, leaving the last cleared prefix head.
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
+        Ok(self
+            .load_latest()
+            .await?
+            .filter(|record| !record.recovery_required))
+    }
+    /// Loads at most `limit` committed, publication-safe records whose
+    /// versions are strictly greater than `after`, ordered by ascending
+    /// `ConfigVersion`.
+    ///
+    /// Non-empty results must begin at `after.next()` and be gap-free. Requests
+    /// above [`crate::MAX_CONFIG_HISTORY_PAGE_ENTRIES`] fail with
+    /// `HistoryPageTooLarge`; an adapter that retained only a newer suffix must
+    /// return `HistoryCompacted` rather than silently starting late. The
+    /// default fails closed so external stores cannot claim watch support
+    /// without implementing the ordered-history contract.
+    async fn load_since(
+        &self,
+        _after: ConfigVersion,
+        _limit: usize,
+    ) -> Result<Vec<StoredConfig<C>>, StoreError> {
+        Err(StoreError::unavailable(
+            "ordered committed config history is unsupported",
+        ))
+    }
+    /// Waits until this node may have applied a config revision newer than
+    /// `after`.
+    ///
+    /// This is only a wake hint: callers must repage durable history and
+    /// validate its cursor after every wake. Replicated and in-memory adapters
+    /// override it with register-before-head notifications. Legacy adapters
+    /// use a bounded four-probes-per-second fallback instead of a hot poll.
+    async fn wait_for_committed_change(&self, _after: ConfigVersion) -> Result<(), StoreError> {
+        tokio::time::sleep(DEFAULT_COMMITTED_CHANGE_POLL_INTERVAL).await;
+        Ok(())
+    }
     /// Resolves a rollback selector (previous/version/tx-id/label) to its
     /// stored record. Must return a `NotFound` error for unknown targets and
     /// must refuse records still pending commit-confirmed resolution.
@@ -182,6 +228,19 @@ pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
     }
 }
 
+/// Explicit trust marker for datastores suitable as a Shadow bus's committed
+/// revision source.
+///
+/// Implementing this trait asserts that `load_committed_latest` and
+/// `load_since` expose only durable records accepted by the store's commit
+/// authority. In particular, a consensus adapter must expose only locally
+/// state-machine-applied entries. There is deliberately no blanket
+/// implementation: an arbitrary or unauthenticated store cannot be passed to
+/// the Shadow constructor by accident. Implementors must stop at the first
+/// locally applied row whose `recovery_required` publication fence remains set;
+/// they must never skip it and expose a later row.
+pub trait CommittedRevisionSource<C: OpcConfig>: ManagedDatastore<C> {}
+
 #[async_trait]
 impl<C, T> ManagedDatastore<C> for Arc<T>
 where
@@ -194,6 +253,22 @@ where
 
     async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
         (**self).load_latest().await
+    }
+
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
+        (**self).load_committed_latest().await
+    }
+
+    async fn load_since(
+        &self,
+        after: ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<StoredConfig<C>>, StoreError> {
+        (**self).load_since(after, limit).await
+    }
+
+    async fn wait_for_committed_change(&self, after: ConfigVersion) -> Result<(), StoreError> {
+        (**self).wait_for_committed_change(after).await
     }
 
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig<C>, StoreError> {
@@ -245,6 +320,13 @@ where
     async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), StoreError> {
         (**self).mark_confirmed(tx_id).await
     }
+}
+
+impl<C, T> CommittedRevisionSource<C> for Arc<T>
+where
+    C: OpcConfig,
+    T: CommittedRevisionSource<C> + ?Sized,
+{
 }
 
 /// Managed-datastore wrapper that binds persisted config records to RFC 001
@@ -436,6 +518,30 @@ where
         }
     }
 
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
+        match self.inner.load_committed_latest().await? {
+            Some(record) => self.decrypt_record(record).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn load_since(
+        &self,
+        after: ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<StoredConfig<C>>, StoreError> {
+        let encrypted = self.inner.load_since(after, limit).await?;
+        let mut plaintext = Vec::with_capacity(encrypted.len());
+        for record in encrypted {
+            plaintext.push(self.decrypt_record(record).await?);
+        }
+        Ok(plaintext)
+    }
+
+    async fn wait_for_committed_change(&self, after: ConfigVersion) -> Result<(), StoreError> {
+        self.inner.wait_for_committed_change(after).await
+    }
+
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig<C>, StoreError> {
         let record = self.inner.load_rollback(target).await?;
         self.decrypt_record(record).await
@@ -519,6 +625,14 @@ where
     async fn mark_confirmed(&self, tx_id: TxId) -> Result<(), StoreError> {
         self.inner.mark_confirmed(tx_id).await
     }
+}
+
+impl<C, P, S> CommittedRevisionSource<C> for EncryptingManagedDatastore<C, P, S>
+where
+    C: OpcConfig + Serialize + DeserializeOwned,
+    P: KeyProvider + ?Sized,
+    S: CommittedRevisionSource<SealedConfig<C>> + ?Sized,
+{
 }
 
 fn build_config_envelope_aad<C: OpcConfig>(
@@ -654,6 +768,7 @@ where
 /// process restart, and must not be used as production configuration storage.
 pub struct InMemoryManagedDatastore<C: OpcConfig> {
     state: AsyncMutex<InMemoryStoreState<C>>,
+    committed_version: watch::Sender<Option<ConfigVersion>>,
 }
 
 struct InMemoryStoreState<C: OpcConfig> {
@@ -668,12 +783,14 @@ impl<C: OpcConfig> InMemoryManagedDatastore<C> {
     /// commit-confirmed records) but keeps everything in process memory, so
     /// nothing survives a restart.
     pub fn new() -> Self {
+        let (committed_version, _) = watch::channel(None);
         Self {
             state: AsyncMutex::new(InMemoryStoreState {
                 latest: None,
                 history: Vec::new(),
                 rollback_labels: HashMap::new(),
             }),
+            committed_version,
         }
     }
 
@@ -697,8 +814,14 @@ impl<C: OpcConfig> InMemoryManagedDatastore<C> {
         if let Some(label) = record.rollback_label.clone() {
             state.rollback_labels.insert(label, index);
         }
+        let version = record.version;
+        let visible = !record.recovery_required;
         state.latest = Some(record.clone());
         state.history.push(record);
+        drop(state);
+        if visible {
+            self.committed_version.send_replace(Some(version));
+        }
     }
 }
 
@@ -712,6 +835,57 @@ impl<C: OpcConfig> Default for InMemoryManagedDatastore<C> {
 impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
     async fn load_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
         Ok(self.state.lock().await.latest.clone())
+    }
+
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig<C>>, StoreError> {
+        let state = self.state.lock().await;
+        let mut visible = None;
+        for record in &state.history {
+            if record.recovery_required {
+                break;
+            }
+            visible = Some(record.clone());
+        }
+        Ok(visible)
+    }
+
+    async fn load_since(
+        &self,
+        after: ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<StoredConfig<C>>, StoreError> {
+        if limit > crate::MAX_CONFIG_HISTORY_PAGE_ENTRIES {
+            return Err(StoreError::history_page_too_large(format!(
+                "requested {limit} committed config revisions; maximum is {}",
+                crate::MAX_CONFIG_HISTORY_PAGE_ENTRIES
+            )));
+        }
+        if limit == 0 || after.next().is_none() {
+            return Ok(Vec::new());
+        }
+        let state = self.state.lock().await;
+        let mut records = Vec::with_capacity(limit);
+        for record in &state.history {
+            if record.recovery_required {
+                break;
+            }
+            if record.version > after && records.len() < limit {
+                records.push(record.clone());
+            }
+        }
+        Ok(records)
+    }
+
+    async fn wait_for_committed_change(&self, after: ConfigVersion) -> Result<(), StoreError> {
+        let mut revisions = self.committed_version.subscribe();
+        loop {
+            if revisions.borrow().is_some_and(|version| version > after) {
+                return Ok(());
+            }
+            revisions.changed().await.map_err(|_| {
+                StoreError::unavailable("committed config change notification closed")
+            })?;
+        }
     }
 
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig<C>, StoreError> {
@@ -842,6 +1016,11 @@ impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
         }
 
         if let Some(current) = state.latest.as_ref() {
+            if current.recovery_required {
+                return Err(StoreError::unavailable(
+                    "config publication fence must clear before another append",
+                ));
+            }
             let expected_version = current
                 .version
                 .next()
@@ -903,8 +1082,14 @@ impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
         if let Some(label) = commit.rollback_label.clone() {
             state.rollback_labels.insert(label, index);
         }
+        let version = commit.version;
+        let visible = !commit.recovery_required;
         state.latest = Some(commit.clone());
         state.history.push(commit);
+        drop(state);
+        if visible {
+            self.committed_version.send_replace(Some(version));
+        }
         Ok(())
     }
 
@@ -928,6 +1113,9 @@ impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
         {
             state.latest = Some(state.history[index].clone());
         }
+        let version = state.history[index].version;
+        drop(state);
+        self.committed_version.send_replace(Some(version));
         Ok(())
     }
 

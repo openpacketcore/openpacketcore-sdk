@@ -139,6 +139,13 @@ impl MockConfigStore {
                 ));
             }
         }
+        if let Some(current) = current {
+            if super::types::config_recovery_required(&current.record.principal)? {
+                return Err(PersistError::constraint_violation(
+                    "config publication fence must clear before another append",
+                ));
+            }
+        }
         let current_key = latest.clone();
         let current_is_pending = current_key.as_ref().is_some_and(|key| {
             commits
@@ -184,6 +191,51 @@ impl ConfigStore for MockConfigStore {
         };
         let commits = self.commits.read().unwrap();
         Ok(commits.get(tx_id_bytes).cloned())
+    }
+
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
+        let commits = self
+            .commits
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut records = commits.values().collect::<Vec<_>>();
+        records.sort_by_key(|stored| stored.record.version);
+        let mut visible = None;
+        for stored in records {
+            if super::types::config_recovery_required(&stored.record.principal)? {
+                break;
+            }
+            visible = Some(stored.clone());
+        }
+        Ok(visible)
+    }
+
+    async fn load_since(
+        &self,
+        version: opc_types::ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<StoredConfig>, PersistError> {
+        if limit > crate::CONFIG_HISTORY_PAGE_MAX_ENTRIES {
+            return Err(PersistError::constraint_violation(
+                "config history page exceeds the contract bound",
+            ));
+        }
+        let commits = self
+            .commits
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut records = commits.values().collect::<Vec<_>>();
+        records.sort_by_key(|stored| stored.record.version);
+        let mut visible = Vec::with_capacity(limit);
+        for stored in records {
+            if super::types::config_recovery_required(&stored.record.principal)? {
+                break;
+            }
+            if stored.record.version > version && visible.len() < limit {
+                visible.push(stored.clone());
+            }
+        }
+        Ok(visible)
     }
 
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError> {
@@ -386,6 +438,14 @@ impl ConfigStore for UnsafePathMock {
         Err(PersistError::preflight_failed(&self.reason))
     }
 
+    async fn load_since(
+        &self,
+        _version: opc_types::ConfigVersion,
+        _limit: usize,
+    ) -> Result<Vec<StoredConfig>, PersistError> {
+        Err(PersistError::preflight_failed(&self.reason))
+    }
+
     async fn load_rollback(&self, _target: RollbackTarget) -> Result<StoredConfig, PersistError> {
         Err(PersistError::preflight_failed(&self.reason))
     }
@@ -526,6 +586,25 @@ impl<S: ConfigStore> ConfigStore for FaultInjectingStore<S> {
         } else {
             Ok(None)
         }
+    }
+
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig>, PersistError> {
+        self.inner.load_committed_latest().await
+    }
+
+    async fn load_since(
+        &self,
+        version: opc_types::ConfigVersion,
+        limit: usize,
+    ) -> Result<Vec<StoredConfig>, PersistError> {
+        self.inner.load_since(version, limit).await
+    }
+
+    async fn wait_for_committed_change(
+        &self,
+        version: opc_types::ConfigVersion,
+    ) -> Result<(), PersistError> {
+        self.inner.wait_for_committed_change(version).await
     }
 
     async fn load_rollback(&self, target: RollbackTarget) -> Result<StoredConfig, PersistError> {

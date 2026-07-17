@@ -110,14 +110,16 @@ pub(crate) fn startup_error_alarm_spec(code: StoreErrorCode) -> (Severity, Proba
         | StoreErrorCode::RestoreSchemaMismatch
         | StoreErrorCode::RestoreRecoveryRequired
         | StoreErrorCode::RestoreConfirmedDeadline
-        | StoreErrorCode::StartupValidationTaskFailed => {
+        | StoreErrorCode::StartupValidationTaskFailed
+        | StoreErrorCode::InvalidHistorySequence => {
             (Severity::Critical, ProbableCause::StorageCorruption)
         }
         StoreErrorCode::NotFound => (Severity::Major, ProbableCause::StorageCorruption),
         StoreErrorCode::StartupSyntaxValidationFailed
-        | StoreErrorCode::StartupSemanticValidationFailed => {
-            (Severity::Major, ProbableCause::ConfigApplyFailed)
-        }
+        | StoreErrorCode::StartupSemanticValidationFailed
+        | StoreErrorCode::HistoryPageTooLarge
+        | StoreErrorCode::HistoryCompacted
+        | StoreErrorCode::HistoryCursorAhead => (Severity::Major, ProbableCause::ConfigApplyFailed),
     }
 }
 
