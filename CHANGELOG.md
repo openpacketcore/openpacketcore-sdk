@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle expiry, and pool shutdown invalidate it before dispatch.
 
 ### Added
+- **SCTP multihoming path control — `opc-sctp` / `opc-libsctp-sys`:** the
+  existing RTO and heartbeat configuration now applies validated non-default
+  values through exact, layout-asserted Linux `SCTP_RTOINFO` and
+  `SCTP_PEER_ADDR_PARAMS` bindings while omitted values preserve kernel
+  defaults. Generic and Diameter associations can select a current peer path
+  through `SCTP_PRIMARY_ADDR`; unknown paths fail before mutation and the
+  bounded health snapshot updates without claiming a reachability change or
+  disabling kernel failover. Strict config negatives, raw ABI fixtures, and
+  live single-host multihoming tests cover tuning, selection, Diameter
+  delegation, and data delivery.
 - **Leader-aware management commits — gNMI/NETCONF/config bus:** an opt-in
   `ConfigAuthorityPort` projection fence redirects followers with bounded
   leader hints and returns the exact persisted `{version, plaintext-envelope

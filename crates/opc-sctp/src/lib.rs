@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(any(target_os = "linux", test))]
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use bytes::Bytes;
 #[cfg(target_os = "linux")]
@@ -124,7 +124,11 @@ impl Default for InitConfig {
     }
 }
 
-/// Optional RTO policy. Non-default values are intentionally rejected today.
+/// Optional SCTP retransmission-timeout policy.
+///
+/// Omitted values retain the kernel setting. Explicit values must be nonzero
+/// and internally ordered as `min_ms <= initial_ms <= max_ms` for every pair
+/// that is present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RtoConfig {
     /// Initial RTO in milliseconds.
@@ -135,7 +139,11 @@ pub struct RtoConfig {
     pub max_ms: Option<u32>,
 }
 
-/// Optional heartbeat policy. Non-default values are intentionally rejected today.
+/// Optional SCTP peer-path heartbeat policy.
+///
+/// Omitted values retain the kernel setting. An explicit zero heartbeat
+/// interval requests RFC 6458 zero-delay mode; the path RTO and jitter still
+/// apply. `path_max_retrans` must be nonzero when supplied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HeartbeatConfig {
     /// Heartbeat interval in milliseconds.
@@ -709,11 +717,28 @@ impl DiameterSctpAssociation {
     /// Return bounded per-path health for this Diameter SCTP association.
     ///
     /// The snapshot is initialized from the distinct configured set, or the
-    /// bounded kernel-reported set for an accepted association, and updated
-    /// before [`Self::recv`] returns each peer-address-change notification.
+    /// bounded kernel-reported set for an accepted association. Path state is
+    /// updated before [`Self::recv`] returns each peer-address-change
+    /// notification. A made-primary event is reconciled best-effort with the
+    /// kernel's current primary; if that health-only query fails, the event is
+    /// still returned and the last known designation is preserved.
     #[must_use]
     pub fn peer_path_health(&self) -> Vec<SctpPathHealth> {
         self.association.peer_path_health()
+    }
+
+    /// Select the peer address used as this Diameter association's primary path.
+    ///
+    /// The supplied address must match a current peer path. On success the
+    /// local SCTP stack sends future traffic on that path when it is usable;
+    /// SCTP remains responsible for failover.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SctpError`] when the address is not a current peer path or
+    /// the kernel rejects primary-path selection.
+    pub fn set_primary_peer_path(&self, peer_addr: SocketAddr) -> Result<(), SctpError> {
+        self.association.set_primary_peer_path(peer_addr)
     }
 
     /// Return SDK SCTP association metrics.
@@ -1330,8 +1355,60 @@ impl SctpPathTracker {
         self.record_path_change(peer_addr, state);
     }
 
-    fn mark_primary_reachable(&self, peer_addr: SocketAddr) {
-        self.record_path_change(peer_addr, SctpPeerAddrState::MadePrimary);
+    fn initialize_primary_reachable(&self, peer_addr: SocketAddr) {
+        self.mark_primary_with_status(peer_addr, Some(SctpPathStatus::Reachable));
+    }
+
+    fn mark_primary(&self, peer_addr: SocketAddr) {
+        self.mark_primary_with_status(peer_addr, None);
+    }
+
+    fn mark_primary_with_status(&self, peer_addr: SocketAddr, status: Option<SctpPathStatus>) {
+        let mut paths = match self.paths.write() {
+            Ok(paths) => paths,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let primary_index = if let Some(primary_index) = paths
+            .iter()
+            .position(|path| same_sctp_path(path.peer_addr, peer_addr))
+        {
+            primary_index
+        } else if paths.len() < MAX_STATIC_MULTIHOMING_ADDRESSES {
+            let primary_index = paths.len();
+            paths.push(SctpPathHealth {
+                peer_addr,
+                status: SctpPathStatus::Unknown,
+                primary: false,
+            });
+            primary_index
+        } else if let Some(primary_index) = paths
+            .iter()
+            .position(|path| path.status == SctpPathStatus::Removed)
+        {
+            paths[primary_index] = SctpPathHealth {
+                peer_addr,
+                status: SctpPathStatus::Unknown,
+                primary: false,
+            };
+            primary_index
+        } else {
+            let Some(primary_index) = paths.iter().rposition(|path| !path.primary) else {
+                return;
+            };
+            paths[primary_index] = SctpPathHealth {
+                peer_addr,
+                status: SctpPathStatus::Unknown,
+                primary: false,
+            };
+            primary_index
+        };
+        for path in paths.iter_mut() {
+            path.primary = false;
+        }
+        paths[primary_index].primary = true;
+        if let Some(status) = status {
+            paths[primary_index].status = status;
+        }
     }
 
     fn record_path_change(&self, peer_addr: SocketAddr, state: SctpPeerAddrState) {
@@ -1382,9 +1459,9 @@ impl SctpPathTracker {
         }
         let path = &mut paths[path_index];
         match state {
-            SctpPeerAddrState::Available
-            | SctpPeerAddrState::MadePrimary
-            | SctpPeerAddrState::Confirmed => path.status = SctpPathStatus::Reachable,
+            SctpPeerAddrState::Available | SctpPeerAddrState::Confirmed => {
+                path.status = SctpPathStatus::Reachable;
+            }
             SctpPeerAddrState::Unreachable => {
                 path.status = SctpPathStatus::Unreachable;
             }
@@ -1398,6 +1475,7 @@ impl SctpPathTracker {
             SctpPeerAddrState::Added | SctpPeerAddrState::Unknown(_) => {
                 path.status = SctpPathStatus::Unknown;
             }
+            SctpPeerAddrState::MadePrimary => {}
         }
         if state == SctpPeerAddrState::MadePrimary {
             path.primary = true;
@@ -1415,6 +1493,67 @@ fn same_sctp_path(left: SocketAddr, right: SocketAddr) -> bool {
                 && left.scope_id() == right.scope_id()
         }
         (SocketAddr::V4(_), SocketAddr::V6(_)) | (SocketAddr::V6(_), SocketAddr::V4(_)) => false,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn lock_path_control(gate: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    match gate.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn set_primary_path_serialized<CurrentPeers, SelectPrimary>(
+    gate: &Mutex<()>,
+    tracker: &SctpPathTracker,
+    requested_peer: SocketAddr,
+    current_peers: CurrentPeers,
+    select_primary: SelectPrimary,
+) -> Result<(), SctpError>
+where
+    CurrentPeers: FnOnce() -> Result<Vec<SocketAddr>, SctpError>,
+    SelectPrimary: FnOnce(SocketAddr) -> Result<(), SctpError>,
+{
+    let _control_guard = lock_path_control(gate);
+    let canonical_peer = current_peers()?
+        .into_iter()
+        .find(|candidate| same_sctp_path(*candidate, requested_peer))
+        .ok_or(SctpError::InvalidConfig {
+            field: "peer_addr",
+            reason: "must be a current peer address",
+        })?;
+    select_primary(canonical_peer)?;
+    tracker.mark_primary(canonical_peer);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn record_path_event_serialized<CurrentPrimary>(
+    gate: &Mutex<()>,
+    tracker: &SctpPathTracker,
+    event: SctpEvent,
+    current_primary: CurrentPrimary,
+) where
+    CurrentPrimary: FnOnce() -> Option<SocketAddr>,
+{
+    let _control_guard = lock_path_control(gate);
+    if matches!(
+        event,
+        SctpEvent::PeerAddrChange {
+            state: SctpPeerAddrState::MadePrimary,
+            ..
+        }
+    ) {
+        // A notification may have been dequeued before a concurrent explicit
+        // selection acquired the gate. Reconcile with the kernel rather than
+        // allowing that stale event to roll the tracker back.
+        if let Some(primary_peer) = current_primary() {
+            tracker.mark_primary(primary_peer);
+        }
+    } else {
+        tracker.record(event);
     }
 }
 
@@ -1507,10 +1646,12 @@ impl SctpAssociation {
 
     /// Receive one message.
     ///
-    /// Concurrent active calls are serialized so path events are applied to
-    /// [`Self::peer_path_health`] in kernel receive order before this returns.
-    /// A receive future is not cancellation-safe after it starts consuming a
-    /// multi-chunk SCTP record.
+    /// Concurrent active calls are serialized so path events are processed in
+    /// kernel receive order before this returns. A made-primary event is
+    /// reconciled best-effort with the kernel's current primary; if that
+    /// health-only query fails, the event is returned while the last known
+    /// designation is preserved. A receive future is not cancellation-safe
+    /// after it starts consuming a multi-chunk SCTP record.
     pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
         self.imp.recv().await
     }
@@ -1525,12 +1666,31 @@ impl SctpAssociation {
     /// Non-primary paths begin as [`SctpPathStatus::Unknown`]; the connected
     /// or accepted primary begins reachable when the kernel reports it.
     /// Peer-address-change notifications update the snapshot before
-    /// [`Self::recv`] returns them. IPv6 flow information is deliberately not
-    /// part of path identity, following RFC 3493 guidance for system-produced
-    /// socket addresses.
+    /// [`Self::recv`] returns them, except that a made-primary reconciliation
+    /// query failure preserves the last known designation while still
+    /// returning the event. IPv6 flow information is deliberately not part of
+    /// path identity, following RFC 3493 guidance for system-produced socket
+    /// addresses.
     #[must_use]
     pub fn peer_path_health(&self) -> Vec<SctpPathHealth> {
         self.imp.peer_path_health()
+    }
+
+    /// Select the peer address used as this association's primary path.
+    ///
+    /// The supplied address must match a current peer path. A successful
+    /// selection updates [`Self::peer_path_health`] immediately; SCTP can
+    /// still fail over when the selected path is unavailable. Concurrent
+    /// selections and received path notifications are serialized with the
+    /// kernel mutation and health update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SctpError::InvalidConfig`] when `peer_addr` is not a current
+    /// path, [`SctpError::CapabilityUnavailable`] when the kernel lacks the
+    /// option, or [`SctpError::Io`] for another socket failure.
+    pub fn set_primary_peer_path(&self, peer_addr: SocketAddr) -> Result<(), SctpError> {
+        self.imp.set_primary_peer_path(peer_addr)
     }
 
     /// Return association metrics.
@@ -1576,14 +1736,48 @@ fn validate_common(
             reason: "must be greater than zero",
         });
     }
-    if rto != RtoConfig::default() {
-        return Err(SctpError::UnsupportedFeature {
-            feature: "custom RTO parameters",
+    validate_rto_config(rto)?;
+    validate_heartbeat_config(heartbeat)?;
+    Ok(())
+}
+
+fn validate_rto_config(rto: RtoConfig) -> Result<(), SctpError> {
+    if [rto.initial_ms, rto.min_ms, rto.max_ms]
+        .into_iter()
+        .flatten()
+        .any(|value| value == 0)
+    {
+        return Err(SctpError::InvalidConfig {
+            field: "rto",
+            reason: "explicit timeout values must be greater than zero",
         });
     }
-    if heartbeat != HeartbeatConfig::default() {
-        return Err(SctpError::UnsupportedFeature {
-            feature: "custom heartbeat parameters",
+    if matches!((rto.min_ms, rto.max_ms), (Some(min), Some(max)) if min > max) {
+        return Err(SctpError::InvalidConfig {
+            field: "rto",
+            reason: "min_ms must not exceed max_ms",
+        });
+    }
+    if matches!((rto.initial_ms, rto.min_ms), (Some(initial), Some(min)) if initial < min) {
+        return Err(SctpError::InvalidConfig {
+            field: "rto",
+            reason: "initial_ms must not be below min_ms",
+        });
+    }
+    if matches!((rto.initial_ms, rto.max_ms), (Some(initial), Some(max)) if initial > max) {
+        return Err(SctpError::InvalidConfig {
+            field: "rto",
+            reason: "initial_ms must not exceed max_ms",
+        });
+    }
+    Ok(())
+}
+
+fn validate_heartbeat_config(heartbeat: HeartbeatConfig) -> Result<(), SctpError> {
+    if heartbeat.path_max_retrans == Some(0) {
+        return Err(SctpError::InvalidConfig {
+            field: "heartbeat.path_max_retrans",
+            reason: "must be greater than zero when supplied",
         });
     }
     Ok(())
@@ -1839,11 +2033,24 @@ fn io_err(operation: &'static str, source: io::Error) -> SctpError {
 
 #[cfg(target_os = "linux")]
 fn multihoming_io_err(operation: &'static str, source: io::Error) -> SctpError {
-    if opc_libsctp_sys::is_multihoming_unavailable(&source) {
+    if opc_libsctp_sys::is_sctp_capability_unavailable(&source) {
         SctpError::CapabilityUnavailable {
             capability: "static_multihoming",
             source,
         }
+    } else {
+        io_err(operation, source)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn path_control_io_err(
+    operation: &'static str,
+    capability: &'static str,
+    source: io::Error,
+) -> SctpError {
+    if opc_libsctp_sys::is_sctp_capability_unavailable(&source) {
+        SctpError::CapabilityUnavailable { capability, source }
     } else {
         io_err(operation, source)
     }
@@ -1865,6 +2072,7 @@ mod platform {
         mode: SctpMode,
         peer_paths: SctpPathTracker,
         recv_gate: tokio::sync::Mutex<()>,
+        path_control_gate: Mutex<()>,
     }
 
     #[derive(Debug)]
@@ -1879,7 +2087,13 @@ mod platform {
         let local = config.local_addrs[0];
         let fd = opc_libsctp_sys::open_socket(sys_family(&local), sys_style(config.mode))
             .map_err(|source| io_err("socket", source))?;
-        configure_fd(fd.as_fd(), config.init, config.nodelay)?;
+        configure_fd(
+            fd.as_fd(),
+            config.init,
+            config.nodelay,
+            config.rto,
+            config.heartbeat,
+        )?;
         if config.local_addrs.len() == 1 {
             opc_libsctp_sys::bind(fd.as_fd(), &local).map_err(|source| io_err("bind", source))?;
         } else {
@@ -1904,7 +2118,13 @@ mod platform {
         let peer_paths = SctpPathTracker::new(&config.remote_addrs);
         let fd = opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne))
             .map_err(|source| io_err("socket", source))?;
-        configure_fd(fd.as_fd(), config.init, config.nodelay)?;
+        configure_fd(
+            fd.as_fd(),
+            config.init,
+            config.nodelay,
+            config.rto,
+            config.heartbeat,
+        )?;
         if config.local_addrs.len() == 1 {
             opc_libsctp_sys::bind(fd.as_fd(), &config.local_addrs[0])
                 .map_err(|source| io_err("bind", source))?;
@@ -1931,13 +2151,14 @@ mod platform {
         }
         if let Ok(primary_peer) = opc_libsctp_sys::peer_primary_address(socket.fd.get_ref().as_fd())
         {
-            peer_paths.mark_primary_reachable(primary_peer);
+            peer_paths.initialize_primary_reachable(primary_peer);
         }
         Ok(Association {
             socket,
             mode: SctpMode::OneToOne,
             peer_paths,
             recv_gate: tokio::sync::Mutex::new(()),
+            path_control_gate: Mutex::new(()),
         })
     }
 
@@ -1972,7 +2193,7 @@ mod platform {
                             peer_addrs.truncate(MAX_STATIC_MULTIHOMING_ADDRESSES);
                         }
                         let peer_paths = SctpPathTracker::new(&peer_addrs);
-                        peer_paths.mark_primary_reachable(peer);
+                        peer_paths.initialize_primary_reachable(peer);
                         let async_fd =
                             AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
                         self.socket.metrics.record_accept();
@@ -1986,6 +2207,7 @@ mod platform {
                             mode: SctpMode::OneToOne,
                             peer_paths,
                             recv_gate: tokio::sync::Mutex::new(()),
+                            path_control_gate: Mutex::new(()),
                         });
                     }
                     Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
@@ -2046,7 +2268,12 @@ mod platform {
             let _recv_guard = self.recv_gate.lock().await;
             let message = self.socket.recv().await?;
             if let Some(event) = message.event {
-                self.peer_paths.record(event);
+                record_path_event_serialized(
+                    &self.path_control_gate,
+                    &self.peer_paths,
+                    event,
+                    || opc_libsctp_sys::peer_primary_address(self.socket.fd.get_ref().as_fd()).ok(),
+                );
             }
             Ok(message)
         }
@@ -2061,6 +2288,32 @@ mod platform {
 
         pub fn peer_path_health(&self) -> Vec<SctpPathHealth> {
             self.peer_paths.snapshot()
+        }
+
+        pub fn set_primary_peer_path(&self, peer_addr: SocketAddr) -> Result<(), SctpError> {
+            set_primary_path_serialized(
+                &self.path_control_gate,
+                &self.peer_paths,
+                peer_addr,
+                || {
+                    opc_libsctp_sys::peer_addresses(self.socket.fd.get_ref().as_fd(), 0)
+                        .map_err(|source| io_err("peer_addresses", source))
+                },
+                |canonical_peer_addr| {
+                    opc_libsctp_sys::set_primary_peer_address(
+                        self.socket.fd.get_ref().as_fd(),
+                        0,
+                        &canonical_peer_addr,
+                    )
+                    .map_err(|source| {
+                        path_control_io_err(
+                            "set_primary_peer_address",
+                            "primary_path_selection",
+                            source,
+                        )
+                    })
+                },
+            )
         }
 
         pub fn metrics(&self) -> SctpMetricsSnapshot {
@@ -2221,6 +2474,8 @@ mod platform {
         fd: std::os::fd::BorrowedFd<'_>,
         init: InitConfig,
         nodelay: bool,
+        rto: RtoConfig,
+        heartbeat: HeartbeatConfig,
     ) -> Result<(), SctpError> {
         opc_libsctp_sys::set_initmsg(fd, sys_init(init))
             .map_err(|source| io_err("set_initmsg", source))?;
@@ -2230,6 +2485,34 @@ mod platform {
             .map_err(|source| io_err("set_recv_rcvinfo", source))?;
         opc_libsctp_sys::set_events(fd, opc_libsctp_sys::EventSubscriptions::default())
             .map_err(|source| io_err("set_events", source))?;
+        if rto != RtoConfig::default() {
+            opc_libsctp_sys::set_rto_parameters(
+                fd,
+                opc_libsctp_sys::RtoParameters {
+                    assoc_id: 0,
+                    initial_ms: rto.initial_ms.and_then(std::num::NonZeroU32::new),
+                    max_ms: rto.max_ms.and_then(std::num::NonZeroU32::new),
+                    min_ms: rto.min_ms.and_then(std::num::NonZeroU32::new),
+                },
+            )
+            .map_err(|source| path_control_io_err("set_rto_parameters", "path_tuning", source))?;
+        }
+        if heartbeat != HeartbeatConfig::default() {
+            opc_libsctp_sys::set_peer_address_parameters(
+                fd,
+                opc_libsctp_sys::PeerAddressParameters {
+                    assoc_id: 0,
+                    peer_addr: None,
+                    heartbeat_interval_ms: heartbeat.interval_ms,
+                    path_max_retransmissions: heartbeat
+                        .path_max_retrans
+                        .and_then(std::num::NonZeroU16::new),
+                },
+            )
+            .map_err(|source| {
+                path_control_io_err("set_peer_address_parameters", "path_tuning", source)
+            })?;
+        }
         Ok(())
     }
 
@@ -2336,6 +2619,11 @@ mod platform {
         pub fn peer_path_health(&self) -> Vec<SctpPathHealth> {
             let _ = self;
             Vec::new()
+        }
+
+        pub fn set_primary_peer_path(&self, peer_addr: SocketAddr) -> Result<(), SctpError> {
+            let _ = (self, peer_addr);
+            Err(SctpError::UnsupportedPlatform)
         }
 
         pub fn metrics(&self) -> SctpMetricsSnapshot {
@@ -2686,7 +2974,7 @@ mod tests {
         let notification = SocketAddr::V6(SocketAddrV6::new(address, 3868, 0x0102_0304, 3));
         let tracker = SctpPathTracker::new(&[configured]);
 
-        tracker.mark_primary_reachable(raw_current);
+        tracker.initialize_primary_reachable(raw_current);
         tracker.record(SctpEvent::PeerAddrChange {
             peer_addr: notification,
             state: SctpPeerAddrState::Confirmed,
@@ -2741,7 +3029,7 @@ mod tests {
         let paths = tracker.snapshot();
         assert_eq!(paths[0].status, SctpPathStatus::PotentiallyFailed);
         assert!(!paths[0].primary);
-        assert_eq!(paths[1].status, SctpPathStatus::Reachable);
+        assert_eq!(paths[1].status, SctpPathStatus::Unknown);
         assert!(paths[1].primary);
     }
 
@@ -2790,7 +3078,177 @@ mod tests {
         let paths = tracker.snapshot();
         assert!(!paths[0].primary);
         assert!(paths[1].primary);
-        assert_eq!(paths[1].status, SctpPathStatus::Reachable);
+        assert_eq!(paths[1].status, SctpPathStatus::Unknown);
+    }
+
+    #[test]
+    fn explicit_primary_selection_does_not_manufacture_reachability() {
+        let first: SocketAddr = "192.0.2.10:3868".parse().unwrap();
+        let second: SocketAddr = "192.0.2.11:3868".parse().unwrap();
+        let tracker = SctpPathTracker::new(&[first, second]);
+        tracker.record(SctpEvent::PeerAddrChange {
+            peer_addr: second,
+            state: SctpPeerAddrState::PotentiallyFailed,
+            error: 0,
+            assoc_id: 7,
+        });
+
+        tracker.mark_primary(second);
+
+        let paths = tracker.snapshot();
+        assert!(!paths[0].primary);
+        assert!(paths[1].primary);
+        assert_eq!(paths[1].status, SctpPathStatus::PotentiallyFailed);
+    }
+
+    #[test]
+    fn made_primary_event_preserves_unhealthy_path_status() {
+        let first: SocketAddr = "192.0.2.10:3868".parse().unwrap();
+        let second: SocketAddr = "192.0.2.11:3868".parse().unwrap();
+        for state in [
+            SctpPeerAddrState::PotentiallyFailed,
+            SctpPeerAddrState::Unreachable,
+        ] {
+            let expected_status = match state {
+                SctpPeerAddrState::PotentiallyFailed => SctpPathStatus::PotentiallyFailed,
+                SctpPeerAddrState::Unreachable => SctpPathStatus::Unreachable,
+                _ => unreachable!("test enumerates only unhealthy states"),
+            };
+            let tracker = SctpPathTracker::new(&[first, second]);
+            tracker.record(SctpEvent::PeerAddrChange {
+                peer_addr: second,
+                state,
+                error: 0,
+                assoc_id: 7,
+            });
+            tracker.record(SctpEvent::PeerAddrChange {
+                peer_addr: second,
+                state: SctpPeerAddrState::MadePrimary,
+                error: 0,
+                assoc_id: 7,
+            });
+
+            let paths = tracker.snapshot();
+            assert!(!paths[0].primary);
+            assert!(paths[1].primary);
+            assert_eq!(paths[1].status, expected_status);
+        }
+    }
+
+    #[test]
+    fn primary_selection_serializes_kernel_and_tracker_updates() {
+        let first: SocketAddr = "192.0.2.10:3868".parse().unwrap();
+        let second: SocketAddr = "192.0.2.11:3868".parse().unwrap();
+        let peers = vec![first, second];
+        let gate = Arc::new(Mutex::new(()));
+        let tracker = Arc::new(SctpPathTracker::new(&peers));
+        let kernel_primary = Arc::new(Mutex::new(first));
+        let (first_selected_tx, first_selected_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+
+        let first_gate = Arc::clone(&gate);
+        let first_tracker = Arc::clone(&tracker);
+        let first_kernel_primary = Arc::clone(&kernel_primary);
+        let first_peers = peers.clone();
+        let first_worker = std::thread::spawn(move || {
+            set_primary_path_serialized(
+                &first_gate,
+                &first_tracker,
+                first,
+                || Ok(first_peers),
+                |canonical_peer| {
+                    *first_kernel_primary.lock().unwrap() = canonical_peer;
+                    first_selected_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        first_selected_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let second_gate = Arc::clone(&gate);
+        let second_tracker = Arc::clone(&tracker);
+        let second_kernel_primary = Arc::clone(&kernel_primary);
+        let second_worker = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            set_primary_path_serialized(
+                &second_gate,
+                &second_tracker,
+                second,
+                || {
+                    second_entered_tx.send(()).unwrap();
+                    Ok(peers)
+                },
+                |canonical_peer| {
+                    *second_kernel_primary.lock().unwrap() = canonical_peer;
+                    Ok(())
+                },
+            )
+        });
+        second_started_rx.recv().unwrap();
+        assert!(matches!(
+            second_entered_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_first_tx.send(()).unwrap();
+        first_worker.join().unwrap().unwrap();
+        second_worker.join().unwrap().unwrap();
+        assert_eq!(*kernel_primary.lock().unwrap(), second);
+        let paths = tracker.snapshot();
+        assert_eq!(paths.iter().filter(|path| path.primary).count(), 1);
+        assert!(paths
+            .iter()
+            .any(|path| path.peer_addr == second && path.primary));
+    }
+
+    #[test]
+    fn delayed_made_primary_event_reconciles_with_kernel_after_setter() {
+        let first: SocketAddr = "192.0.2.10:3868".parse().unwrap();
+        let second: SocketAddr = "192.0.2.11:3868".parse().unwrap();
+        let peers = vec![first, second];
+        let gate = Mutex::new(());
+        let tracker = SctpPathTracker::new(&peers);
+        let kernel_primary = Mutex::new(first);
+        let stale_event = SctpEvent::PeerAddrChange {
+            peer_addr: first,
+            state: SctpPeerAddrState::MadePrimary,
+            error: 0,
+            assoc_id: 7,
+        };
+
+        // Model a notification that has already left the socket receive queue,
+        // followed by a complete explicit selection before event application.
+        set_primary_path_serialized(
+            &gate,
+            &tracker,
+            second,
+            || Ok(peers),
+            |canonical_peer| {
+                *kernel_primary.lock().unwrap() = canonical_peer;
+                Ok(())
+            },
+        )
+        .unwrap();
+        record_path_event_serialized(&gate, &tracker, stale_event, || {
+            Some(*kernel_primary.lock().unwrap())
+        });
+
+        let paths = tracker.snapshot();
+        assert_eq!(paths.iter().filter(|path| path.primary).count(), 1);
+        assert!(paths
+            .iter()
+            .any(|path| path.peer_addr == second && path.primary));
+
+        // A failed health-only reconciliation must not regress to the stale
+        // event address or turn notification delivery into a receive failure.
+        record_path_event_serialized(&gate, &tracker, stale_event, || None);
+        assert!(tracker
+            .snapshot()
+            .iter()
+            .any(|path| path.peer_addr == second && path.primary));
     }
 
     #[test]
@@ -2882,7 +3340,7 @@ mod tests {
         let primary_paths: Vec<_> = paths.iter().filter(|path| path.primary).collect();
         assert_eq!(primary_paths.len(), 1);
         assert_eq!(primary_paths[0].peer_addr, replacement);
-        assert_eq!(primary_paths[0].status, SctpPathStatus::Reachable);
+        assert_eq!(primary_paths[0].status, SctpPathStatus::Unknown);
     }
 
     #[test]
@@ -3274,22 +3732,66 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_custom_rto_and_heartbeat_until_layouts_are_bound() {
+    fn config_accepts_valid_custom_rto_and_heartbeat() {
         let mut config = SctpEndpointConfig::one_to_one("127.0.0.1:38412".parse().unwrap());
-        config.rto.initial_ms = Some(100);
-        assert!(matches!(
-            config.validate(),
-            Err(SctpError::UnsupportedFeature {
-                feature: "custom RTO parameters"
-            })
-        ));
+        config.rto = RtoConfig {
+            initial_ms: Some(500),
+            min_ms: Some(100),
+            max_ms: Some(2_000),
+        };
+        config.heartbeat = HeartbeatConfig {
+            interval_ms: Some(0),
+            path_max_retrans: Some(3),
+        };
+        assert!(config.validate().is_ok());
+    }
 
-        let mut config = SctpEndpointConfig::one_to_one("127.0.0.1:38412".parse().unwrap());
-        config.heartbeat.interval_ms = Some(1000);
+    #[test]
+    fn config_rejects_ambiguous_or_internally_unordered_path_tuning() {
+        for rto in [
+            RtoConfig {
+                initial_ms: Some(0),
+                ..RtoConfig::default()
+            },
+            RtoConfig {
+                min_ms: Some(0),
+                ..RtoConfig::default()
+            },
+            RtoConfig {
+                max_ms: Some(0),
+                ..RtoConfig::default()
+            },
+            RtoConfig {
+                min_ms: Some(500),
+                max_ms: Some(400),
+                ..RtoConfig::default()
+            },
+            RtoConfig {
+                initial_ms: Some(99),
+                min_ms: Some(100),
+                ..RtoConfig::default()
+            },
+            RtoConfig {
+                initial_ms: Some(501),
+                max_ms: Some(500),
+                ..RtoConfig::default()
+            },
+        ] {
+            let mut config = SctpConnectConfig::new("127.0.0.1:38412".parse().unwrap());
+            config.rto = rto;
+            assert!(matches!(
+                config.validate(),
+                Err(SctpError::InvalidConfig { field: "rto", .. })
+            ));
+        }
+
+        let mut config = SctpConnectConfig::new("127.0.0.1:38412".parse().unwrap());
+        config.heartbeat.path_max_retrans = Some(0);
         assert!(matches!(
             config.validate(),
-            Err(SctpError::UnsupportedFeature {
-                feature: "custom heartbeat parameters"
+            Err(SctpError::InvalidConfig {
+                field: "heartbeat.path_max_retrans",
+                ..
             })
         ));
     }
@@ -3668,6 +4170,15 @@ mod tests {
         server_config
             .local_addrs
             .push("127.0.0.2:0".parse().unwrap());
+        server_config.rto = RtoConfig {
+            initial_ms: Some(500),
+            min_ms: Some(100),
+            max_ms: Some(2_000),
+        };
+        server_config.heartbeat = HeartbeatConfig {
+            interval_ms: Some(250),
+            path_max_retrans: Some(2),
+        };
         let server = SctpEndpoint::bind(server_config).unwrap();
         let mut server_addresses = server.local_addresses().unwrap();
         server_addresses.sort_unstable();
@@ -3683,6 +4194,15 @@ mod tests {
             "127.0.0.3:0".parse().unwrap(),
             "127.0.0.4:0".parse().unwrap(),
         ];
+        client_config.rto = RtoConfig {
+            initial_ms: Some(500),
+            min_ms: Some(100),
+            max_ms: Some(2_000),
+        };
+        client_config.heartbeat = HeartbeatConfig {
+            interval_ms: Some(250),
+            path_max_retrans: Some(2),
+        };
         let client = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             SctpAssociation::connect(client_config),
@@ -3723,6 +4243,26 @@ mod tests {
         client_peer.sort_unstable();
         assert_eq!(client_peer, server_addresses);
 
+        let unknown_peer = SocketAddr::new(
+            "127.0.0.9".parse::<std::net::IpAddr>().unwrap(),
+            server_addresses[0].port(),
+        );
+        assert!(matches!(
+            client.set_primary_peer_path(unknown_peer),
+            Err(SctpError::InvalidConfig {
+                field: "peer_addr",
+                ..
+            })
+        ));
+        client.set_primary_peer_path(server_addresses[1]).unwrap();
+        let selected_primary: Vec<_> = client
+            .peer_path_health()
+            .into_iter()
+            .filter(|path| path.primary)
+            .collect();
+        assert_eq!(selected_primary.len(), 1);
+        assert_eq!(selected_primary[0].peer_addr, server_addresses[1]);
+
         client
             .send(OutboundMessage::ordered(
                 Bytes::from_static(b"multihomed-sctp"),
@@ -3756,6 +4296,15 @@ mod tests {
             "127.0.0.3:0".parse().unwrap(),
             "127.0.0.4:0".parse().unwrap(),
         ];
+        client_config.rto = RtoConfig {
+            initial_ms: Some(500),
+            min_ms: Some(100),
+            max_ms: Some(2_000),
+        };
+        client_config.heartbeat = HeartbeatConfig {
+            interval_ms: Some(250),
+            path_max_retrans: Some(2),
+        };
         let client = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             DiameterSctpAssociation::connect_with_config_and_inbound_ppid_policy(
@@ -3803,6 +4352,15 @@ mod tests {
         assert_eq!(received, inbound);
         assert_eq!(client.peer().remote_addr, server_addresses[0]);
         assert_eq!(client.peer_path_health().len(), 2);
+        client.set_primary_peer_path(server_addresses[1]).unwrap();
+        assert_eq!(
+            client
+                .peer_path_health()
+                .into_iter()
+                .find(|path| path.primary)
+                .map(|path| path.peer_addr),
+            Some(server_addresses[1])
+        );
         assert_eq!(client.peer().security, DiameterSctpSecurity::ClearText);
         assert_eq!(
             client.peer().inbound_ppid_policy,

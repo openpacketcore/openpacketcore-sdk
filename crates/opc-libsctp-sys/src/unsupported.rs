@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use std::os::fd::{BorrowedFd, OwnedFd};
 
 use crate::{
-    AddressFamily, ConnectStatus, EventSubscriptions, InitMsg, Received, SendInfo, SocketStyle,
+    AddressFamily, ConnectStatus, EventSubscriptions, InitMsg, PeerAddressParameters, Received,
+    RtoParameters, SendInfo, SocketStyle,
 };
 
 pub const SCTP_UNORDERED_FLAG: u16 = 1;
@@ -64,11 +65,34 @@ pub fn is_multihoming_unavailable(_error: &io::Error) -> bool {
     true
 }
 
+pub fn is_sctp_capability_unavailable(_error: &io::Error) -> bool {
+    true
+}
+
 pub fn socket_error(_fd: BorrowedFd<'_>) -> io::Result<Option<io::Error>> {
     Err(unsupported())
 }
 
 pub fn set_initmsg(_fd: BorrowedFd<'_>, _init: InitMsg) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn set_rto_parameters(_fd: BorrowedFd<'_>, _parameters: RtoParameters) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn set_peer_address_parameters(
+    _fd: BorrowedFd<'_>,
+    _parameters: PeerAddressParameters,
+) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn set_primary_peer_address(
+    _fd: BorrowedFd<'_>,
+    _assoc_id: i32,
+    _peer_addr: &SocketAddr,
+) -> io::Result<()> {
     Err(unsupported())
 }
 
