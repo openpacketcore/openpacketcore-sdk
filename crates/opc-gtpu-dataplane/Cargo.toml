@@ -30,6 +30,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # setns() for the privileged multi-netns integration test.
 nix = { workspace = true, features = ["net", "sched", "socket", "uio"] }
+opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0" }
 
 [lints]
 workspace = true

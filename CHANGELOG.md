@@ -1371,6 +1371,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's tick (authenticated-client CPU DoS).
 
 ### Fixed
+- **Identity-bound GTP-U/XFRM steering evidence — `opc-gtpu-dataplane`:** the
+  privileged Linux qualification now exercises the deployed per-bearer profile
+  end to end: ESP-in-UDP/4500 decrypt on one of multiple shared-reqid inbound
+  SAs must carry its full-width output mark through forwarding and select the
+  dedicated uplink TEID, while a dedicated G-PDU must stamp its mark before
+  XFRM OUT and select the dedicated SPI instead of the otherwise-identical
+  default SA. A new redaction-safe `datapath_snapshot` API succeeds only after
+  proving both exact live tc program IDs and every exact named bpffs map pin,
+  reads the held counter map directly, aggregates all per-CPU values, and
+  repeats the identity proof. This removes ambiguous same-name `bpftool` map
+  evidence without changing forwarding behavior, packet bytes, counter slots,
+  or the pinned-map schema.
 - **GTP-U removal recovery — `opc-gtpu-dataplane`:** default and marked bearer
   forwarding-resource removal now treats Aya's Linux `ENOENT` delete result as
   idempotent absence, matching its lookup semantics. This prevents an optional

@@ -2509,6 +2509,7 @@ dependencies = [
  "aya",
  "nix",
  "opc-gtpu-ebpf-common",
+ "opc-ipsec-xfrm",
  "opc-linux-gtpu-sys",
  "opc-types",
  "thiserror 2.0.18",

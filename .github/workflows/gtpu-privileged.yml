@@ -80,8 +80,11 @@ jobs:
           cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run
 
       # Proves the committed CO-RE artifact end-to-end on a real kernel:
-      # uplink tc-egress selection of distinct TEIDs by the exact skb mark,
-      # downlink tc-ingress mark stamping before post-decap routing/XFRM,
+      # real ESP-in-UDP/4500 decrypt output-mark -> forwarding -> tc egress
+      # selection of a dedicated TEID, and marked GTP-U decap -> forwarding ->
+      # selection of the dedicated XFRM OUT policy/SA rather than the default,
+      # using the shared wildcard-SPI/reqid profile deployed by an ePDG;
+      # exact attached-program/pinned-map identity and per-CPU counter sums,
       # byte-compatible unmarked traffic, v1 live-filter/schema adoption,
       # unknown-mark/TEID drops, echo passthrough, restore/adoption, and
       # ownership-safe teardown (no opc_gtpu filters or pins left behind;
