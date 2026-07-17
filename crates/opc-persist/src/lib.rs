@@ -48,6 +48,14 @@
 //! truncated tails fail closed when stored configuration is loaded. Durable
 //! backends require caller-supplied audit key material.
 //!
+//! Management-operation audit uses the same opaque [`AuditKey`] boundary with
+//! a separate purpose/version domain. [`SqliteBackend`] atomically appends one
+//! bounded structured event, prunes count-based retention, and advances an
+//! authenticated low-water/terminal anchor. Full verification streams retained
+//! records without collecting them; retrieval uses fixed-bounded absolute
+//! sequence pages. A coherent rollback of the entire database remains an
+//! external-checkpoint concern rather than evidence a local file can provide.
+//!
 //! ## Usage
 //!
 //! ```ignore
@@ -94,6 +102,7 @@ mod backend;
 pub mod break_glass;
 mod consensus;
 mod error;
+mod management_audit;
 mod mock;
 mod preflight;
 mod schema;
@@ -119,6 +128,19 @@ pub use consensus::{
     CONFIG_CONSENSUS_WIRE_VERSION, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use error::{PersistError, PersistErrorKind};
+pub use management_audit::{
+    ManagementAuditCursorError, ManagementAuditEventRecord, ManagementAuditOperationCode,
+    ManagementAuditOutcomeCode, ManagementAuditPage, ManagementAuditPageRequest,
+    ManagementAuditPageRequestError, ManagementAuditRecordError, ManagementAuditRetention,
+    ManagementAuditRetentionError, ManagementAuditStoreError, ManagementAuditTransportCode,
+    ManagementAuditVerification, ManagementAuditVerificationError,
+    ManagementAuditVerificationFailure, StoredManagementAuditRecord,
+    MANAGEMENT_AUDIT_FORMAT_VERSION, MANAGEMENT_AUDIT_MAX_EVENT_BYTES,
+    MANAGEMENT_AUDIT_MAX_PAGE_RECORDS, MANAGEMENT_AUDIT_MAX_PRINCIPAL_BYTES,
+    MANAGEMENT_AUDIT_MAX_REASON_BYTES, MANAGEMENT_AUDIT_MAX_RETAINED_RECORDS,
+    MANAGEMENT_AUDIT_MAX_SCHEMA_PATHS, MANAGEMENT_AUDIT_MAX_SCHEMA_PATH_BYTES,
+    MANAGEMENT_AUDIT_MAX_TENANT_BYTES, MANAGEMENT_AUDIT_MAX_TX_ID_BYTES,
+};
 #[cfg(feature = "dangerous-test-hooks")]
 pub use mock::{FaultInjectingStore, FaultType};
 pub use mock::{MockConfigStore, UnsafePathMock};

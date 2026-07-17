@@ -27,6 +27,10 @@ Production security uses explicit shared adapters:
 - Memory key providers remain deterministic test/conformance adapters.
 - Persistence audit records redact sensitive values before storage and before
   hash-chain/HMAC material is calculated.
+- `opc-mgmt-audit-store` is the production adapter for management-operation
+  audit: it stores only the existing bounded structured fields, maintains an
+  authenticated retention anchor, verifies retained history on restart, and
+  fails closed under bounded queue/acknowledgement deadlines.
 - Alarm administration uses NACM-backed authorization and durable audit sinks.
 
 ## Consequences
@@ -38,12 +42,24 @@ Security failures should fail closed and surface sanitized errors rather than
 leaking paths, SQL details, PEM material, keys, subscriber identifiers, or
 network addresses.
 
+The local authenticated anchor detects retained-row alteration, deletion,
+reordering, and anchor/row disagreement. A coherent whole-database rollback is
+outside the evidence a local file can provide and requires a deployment-owned
+external monotonic checkpoint when storage anti-rollback is required.
+
+Fixed-retention appends prune at most one previously authenticated low-water
+row. The new low-water must authenticate before another append can prune it;
+retention reconfiguration performs full verification before multi-row pruning.
+Normal appends therefore remain constant-work boundary checks. A SQLite data
+version change from an external connection activates the exceptional orphan
+path-row scan before append.
+
 ## Evidence
 
 - `crates/opc-identity/`
 - `crates/opc-tls/`
 - `crates/opc-key/`
-- `crates/opc-persist/src/backend.rs`
+- `crates/opc-persist/src/backend/`
+- `crates/opc-mgmt-audit-store/`
 - `crates/opc-alarm/src/nacm_adapter.rs`
 - `crates/opc-alarm/src/persist_adapter.rs`
-

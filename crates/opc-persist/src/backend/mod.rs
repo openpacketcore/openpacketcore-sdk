@@ -21,6 +21,7 @@ use rand::{rngs::SysRng, TryRng};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "dangerous-test-hooks")]
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
@@ -143,6 +144,9 @@ pub struct SqliteBackend {
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     /// Audit HMAC key used to seal and verify local audit-trail rows.
     audit_key: Arc<AuditKey>,
+    /// Last SQLite data-version observed after authenticating management-audit
+    /// state. SQLite advances this value only for commits by other connections.
+    management_audit_data_version: Arc<AtomicU64>,
     /// Cached preflight result (populated after first successful preflight).
     cached_caps: std::sync::OnceLock<PersistCapabilities>,
     /// Narrow fault injection for the alarm-audit adapter. This deliberately
@@ -214,6 +218,15 @@ impl SqliteBackend {
         &self.audit_key
     }
 
+    pub(crate) fn management_audit_data_version(&self) -> u64 {
+        self.management_audit_data_version.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_management_audit_data_version(&self, version: u64) {
+        self.management_audit_data_version
+            .store(version, Ordering::Release);
+    }
+
     pub(crate) fn conn(&self) -> Arc<AsyncMutex<rusqlite::Connection>> {
         self.conn.clone()
     }
@@ -283,6 +296,7 @@ impl SqliteBackend {
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
+            management_audit_data_version: Arc::new(AtomicU64::new(0)),
             cached_caps: std::sync::OnceLock::new(),
             #[cfg(feature = "dangerous-test-hooks")]
             alarm_audit_write_fault: Arc::new(AtomicBool::new(false)),
@@ -359,6 +373,7 @@ impl SqliteBackend {
             | (Some("1.7.0"), _)
             | (Some("1.8.0"), _)
             | (Some("1.8.1"), _)
+            | (Some("1.9.0"), _)
             | (None, _) => {
                 if let Some(from_version) = current_version.as_deref() {
                     schema::run_migrations(&conn, from_version)

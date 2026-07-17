@@ -11,7 +11,7 @@ failed, and non-config management operations.
 Public API:
 
 - `AuditEvent`, the structured event record.
-- `AuditSink`, the async sink trait.
+- `AuditSink`, the synchronous fail-closed sink trait.
 - `TracingAuditSink`, a best-effort sink that emits events through `tracing`.
 - `AuditOperation`, `AuditOutcome`, `AuditReasonCode`, `AuditTxId`, and
   `SchemaNodePath`.
@@ -49,12 +49,15 @@ Current scope:
 Production note:
 
 - `TracingAuditSink` is not durable or tamper-evident. Production deployments
-  should provide an `AuditSink` backed by a durable audit store or pipeline.
+  should use `opc-mgmt-audit-store::DurableAuditSink`, which durably
+  acknowledges the event through the reference SQLite profile.
 
-## Roadmap
+## Durable Adapter
 
-- Keep event fields redaction-safe by construction.
-- Add durable sink adapters outside this core contract crate.
+`opc-mgmt-audit-store` persists only this crate's existing structured fields.
+It adds authenticated chaining, bounded retention/query pages, restart
+verification, production storage preflight, and bounded worker acknowledgement
+without moving storage dependencies into this core contract crate.
 
 ## Verification
 

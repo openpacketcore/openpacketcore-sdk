@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current schema version. Bump this and add a migration step to evolve the schema.
-pub const SCHEMA_VERSION: &str = "1.9.0";
+pub const SCHEMA_VERSION: &str = "1.10.0";
 /// Cap SQLite lock waits on async runtime workers.
 pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 100;
 
@@ -91,6 +91,51 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             scope TEXT NOT NULL,
             correlation_id TEXT NULL,
             occurred_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS management_audit_event (
+            sequence INTEGER PRIMARY KEY CHECK(sequence >= 0),
+            request_id BLOB NOT NULL CHECK(length(request_id) = 16),
+            tenant TEXT NOT NULL CHECK(length(CAST(tenant AS BLOB)) BETWEEN 1 AND 256),
+            principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 1024),
+            transport TEXT NOT NULL CHECK(transport IN ('gnmi', 'netconf-ssh', 'netconf-tls', 'restconf-https', 'internal')),
+            operation TEXT NOT NULL CHECK(operation IN ('capabilities', 'read', 'subscribe', 'create', 'update', 'replace', 'delete', 'commit', 'rollback', 'validate', 'exec')),
+            outcome TEXT NOT NULL CHECK(outcome IN ('intent', 'success', 'denied', 'failed')),
+            reason TEXT NULL CHECK(reason IS NULL OR length(CAST(reason AS BLOB)) BETWEEN 1 AND 64),
+            schema_path_count INTEGER NOT NULL CHECK(schema_path_count BETWEEN 0 AND 256),
+            tx_id TEXT NULL CHECK(tx_id IS NULL OR length(CAST(tx_id AS BLOB)) BETWEEN 1 AND 128),
+            previous_hash BLOB NOT NULL CHECK(length(previous_hash) = 32),
+            entry_hmac BLOB NOT NULL CHECK(length(entry_hmac) = 32),
+            CHECK(
+                (outcome IN ('intent', 'success') AND reason IS NULL)
+                OR (outcome IN ('denied', 'failed') AND reason IS NOT NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS management_audit_schema_path (
+            event_sequence INTEGER NOT NULL REFERENCES management_audit_event(sequence) ON DELETE CASCADE,
+            path_index INTEGER NOT NULL CHECK(path_index BETWEEN 0 AND 255),
+            schema_path TEXT NOT NULL CHECK(length(CAST(schema_path AS BLOB)) BETWEEN 1 AND 4096),
+            PRIMARY KEY(event_sequence, path_index)
+        );
+
+        CREATE TABLE IF NOT EXISTS management_audit_anchor (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            format_version INTEGER NOT NULL CHECK(format_version = 1),
+            retention_max_records INTEGER NOT NULL CHECK(retention_max_records BETWEEN 1 AND 1000000),
+            key_epoch INTEGER NOT NULL CHECK(key_epoch > 0),
+            total_count INTEGER NOT NULL CHECK(total_count >= 0),
+            retained_count INTEGER NOT NULL CHECK(retained_count >= 0 AND retained_count <= retention_max_records),
+            low_water_sequence INTEGER NOT NULL CHECK(low_water_sequence >= 0),
+            low_water_hash BLOB NOT NULL CHECK(length(low_water_hash) = 32),
+            terminal_sequence INTEGER NULL CHECK(terminal_sequence IS NULL OR terminal_sequence >= 0),
+            terminal_hash BLOB NOT NULL CHECK(length(terminal_hash) = 32),
+            anchor_hmac BLOB NOT NULL CHECK(length(anchor_hmac) = 32),
+            CHECK(total_count = low_water_sequence + retained_count),
+            CHECK(
+                (total_count = 0 AND retained_count = 0 AND low_water_sequence = 0 AND terminal_sequence IS NULL)
+                OR (total_count > 0 AND retained_count > 0 AND terminal_sequence = total_count - 1)
+            )
         );
 
         CREATE INDEX IF NOT EXISTS audit_trail_tx_id_idx ON audit_trail(tx_id);
@@ -489,6 +534,57 @@ pub fn run_migrations(conn: &Connection, from_version: &str) -> Result<(), rusql
         // Openraft adapter inspects them under an immediate transaction,
         // rejects nonempty authority, and drops only proven-empty tables.
         current = "1.9.0".to_string();
+    }
+    if current == "1.9.0" {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS management_audit_event (
+                sequence INTEGER PRIMARY KEY CHECK(sequence >= 0),
+                request_id BLOB NOT NULL CHECK(length(request_id) = 16),
+                tenant TEXT NOT NULL CHECK(length(CAST(tenant AS BLOB)) BETWEEN 1 AND 256),
+                principal TEXT NOT NULL CHECK(length(CAST(principal AS BLOB)) BETWEEN 1 AND 1024),
+                transport TEXT NOT NULL CHECK(transport IN ('gnmi', 'netconf-ssh', 'netconf-tls', 'restconf-https', 'internal')),
+                operation TEXT NOT NULL CHECK(operation IN ('capabilities', 'read', 'subscribe', 'create', 'update', 'replace', 'delete', 'commit', 'rollback', 'validate', 'exec')),
+                outcome TEXT NOT NULL CHECK(outcome IN ('intent', 'success', 'denied', 'failed')),
+                reason TEXT NULL CHECK(reason IS NULL OR length(CAST(reason AS BLOB)) BETWEEN 1 AND 64),
+                schema_path_count INTEGER NOT NULL CHECK(schema_path_count BETWEEN 0 AND 256),
+                tx_id TEXT NULL CHECK(tx_id IS NULL OR length(CAST(tx_id AS BLOB)) BETWEEN 1 AND 128),
+                previous_hash BLOB NOT NULL CHECK(length(previous_hash) = 32),
+                entry_hmac BLOB NOT NULL CHECK(length(entry_hmac) = 32),
+                CHECK(
+                    (outcome IN ('intent', 'success') AND reason IS NULL)
+                    OR (outcome IN ('denied', 'failed') AND reason IS NOT NULL)
+                )
+            );
+
+            CREATE TABLE IF NOT EXISTS management_audit_schema_path (
+                event_sequence INTEGER NOT NULL REFERENCES management_audit_event(sequence) ON DELETE CASCADE,
+                path_index INTEGER NOT NULL CHECK(path_index BETWEEN 0 AND 255),
+                schema_path TEXT NOT NULL CHECK(length(CAST(schema_path AS BLOB)) BETWEEN 1 AND 4096),
+                PRIMARY KEY(event_sequence, path_index)
+            );
+
+            CREATE TABLE IF NOT EXISTS management_audit_anchor (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                format_version INTEGER NOT NULL CHECK(format_version = 1),
+                retention_max_records INTEGER NOT NULL CHECK(retention_max_records BETWEEN 1 AND 1000000),
+                key_epoch INTEGER NOT NULL CHECK(key_epoch > 0),
+                total_count INTEGER NOT NULL CHECK(total_count >= 0),
+                retained_count INTEGER NOT NULL CHECK(retained_count >= 0 AND retained_count <= retention_max_records),
+                low_water_sequence INTEGER NOT NULL CHECK(low_water_sequence >= 0),
+                low_water_hash BLOB NOT NULL CHECK(length(low_water_hash) = 32),
+                terminal_sequence INTEGER NULL CHECK(terminal_sequence IS NULL OR terminal_sequence >= 0),
+                terminal_hash BLOB NOT NULL CHECK(length(terminal_hash) = 32),
+                anchor_hmac BLOB NOT NULL CHECK(length(anchor_hmac) = 32),
+                CHECK(total_count = low_water_sequence + retained_count),
+                CHECK(
+                    (total_count = 0 AND retained_count = 0 AND low_water_sequence = 0 AND terminal_sequence IS NULL)
+                    OR (total_count > 0 AND retained_count > 0 AND terminal_sequence = total_count - 1)
+                )
+            );
+            "#,
+        )?;
+        current = "1.10.0".to_string();
     }
 
     let _ = current;

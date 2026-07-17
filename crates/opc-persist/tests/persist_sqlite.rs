@@ -1,6 +1,10 @@
 mod persist_common;
 
-use opc_persist::{AuditKey, ConfigStore, MockConfigStore, PersistErrorKind, SqliteBackend};
+use opc_persist::{
+    AuditKey, ConfigStore, ManagementAuditEventRecord, ManagementAuditOperationCode,
+    ManagementAuditOutcomeCode, ManagementAuditRetention, ManagementAuditTransportCode,
+    MockConfigStore, PersistErrorKind, SqliteBackend,
+};
 use opc_types::{Timestamp, TxId};
 
 use persist_common::{make_audit_record, make_commit_record, test_audit_key};
@@ -66,7 +70,7 @@ async fn open_migrates_schema_version_1_0_0_to_alarm_audit_schema() {
         .query_row("SELECT COUNT(*) FROM alarm_audit", [], |row| row.get(0))
         .expect("query migrated alarm audit table");
 
-    assert_eq!(sdk_version, "1.9.0");
+    assert_eq!(sdk_version, "1.10.0");
     assert_ne!(schema_digest, "legacy-digest");
     assert_eq!(alarm_audit_count, 1);
 }
@@ -113,8 +117,90 @@ async fn open_migrates_schema_version_1_4_0_to_current_schema() {
         )
         .expect("read migrated schema digest");
 
-    assert_eq!(sdk_version, "1.9.0");
+    assert_eq!(sdk_version, "1.10.0");
     assert_ne!(schema_digest, "legacy-digest-1-4");
+}
+
+#[tokio::test]
+async fn open_migrates_schema_version_1_9_0_to_management_audit_schema() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db_path = temp_dir.path().join("test_schema_migration_1_9_0.db");
+    let audit_key = test_audit_key();
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open legacy database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_digest TEXT NOT NULL,
+                sdk_version TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (id, schema_digest, sdk_version, created_at)
+            VALUES (1, 'legacy-digest-1-9', '1.9.0', datetime('now'));
+            "#,
+        )
+        .expect("seed legacy 1.9.0 schema version");
+    }
+
+    let backend = SqliteBackend::open_with_audit_key(&db_path, true, 0, audit_key.clone())
+        .await
+        .expect("open and migrate 1.9.0 backend");
+    let retention = ManagementAuditRetention::try_new(8).expect("retention");
+    let initial = backend
+        .configure_management_audit(retention)
+        .await
+        .expect("configure migrated management audit store");
+    assert_eq!(initial.total_count, 0);
+
+    let event = ManagementAuditEventRecord::try_new(
+        [0x29; 16],
+        "tenant-a",
+        "user:operator-a",
+        ManagementAuditTransportCode::Gnmi,
+        ManagementAuditOperationCode::Read,
+        ManagementAuditOutcomeCode::Success,
+        None::<String>,
+        ["/ietf-system:system"],
+        None::<String>,
+    )
+    .expect("management audit event");
+    backend
+        .append_management_audit(&event, retention)
+        .await
+        .expect("append after migration");
+    drop(backend);
+
+    let reopened = SqliteBackend::open_with_audit_key(&db_path, true, 0, audit_key)
+        .await
+        .expect("reopen migrated backend");
+    assert_eq!(
+        reopened
+            .verify_management_audit()
+            .await
+            .expect("verify migrated management audit trail")
+            .total_count,
+        1
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open migrated database");
+    let sdk_version: String = conn
+        .query_row(
+            "SELECT sdk_version FROM schema_version WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated schema version");
+    let management_table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name LIKE 'management_audit_%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query management audit tables");
+    assert_eq!(sdk_version, "1.10.0");
+    assert_eq!(management_table_count, 3);
 }
 
 #[tokio::test]

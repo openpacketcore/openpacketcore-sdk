@@ -14,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SHA-256}` on successful writes. Default authoritative/no-port replies remain
   byte-identical; stale or absent durable heads and legacy digest-less replays
   fail closed instead of serving a local projection or fabricating a hash.
+- **Durable management audit store — `opc-mgmt-audit-store`:** a production
+  `AuditSink` adapter now commits the existing value-free management event
+  fields to the reference SQLite profile with a purpose-separated HMAC chain,
+  authenticated retention low-water/terminal anchor, full restart verification,
+  typed first-break failures, and fixed-bounded cursor pages. Appends atomically
+  advance and prune the trail. Construction rejects unsafe or ephemeral storage
+  and wrong keys; the worker admits at most 64 queued requests and fails closed
+  after a five-second durable acknowledgement deadline without manufacturing
+  success. Shutdown is likewise bounded and reports detached stalled workers.
+  Local verification detects retained alteration, deletion, reordering, and
+  anchor/row disagreement; a coherent whole-database rollback still requires an
+  external monotonic checkpoint supplied by the deployment platform.
 - **Follower-local committed config recovery — `opc-config-bus`:** bounded,
   transport-neutral committed-revision pages and exclusive `ConfigVersion`
   cursors now provide gap-free `watch_committed` streams and atomic
