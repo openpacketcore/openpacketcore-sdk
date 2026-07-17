@@ -1,6 +1,10 @@
+use std::ffi::OsStr;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use opc_amf_lite::AmfConfig;
 use opc_config_bus::{
@@ -13,13 +17,24 @@ use opc_config_model::{
     RollbackTarget, TransportType, TrustedPrincipal, WorkloadIdentity, YangPath,
 };
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
-use opc_types::{ConfigVersion, TenantId, Timestamp, TxId};
+use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp, TxId};
+use sha2::{Digest, Sha256};
 
 mod config_consensus_common;
-use config_consensus_common::{ConfigCluster, ConfigClusterLifecycleError, ConfigNodeLifecycle};
+use config_consensus_common::{
+    cluster_transition_timeout, ConfigCluster, ConfigClusterLifecycleError, ConfigNodeLifecycle,
+};
 
 type EncryptedConfigStore =
     EncryptingManagedDatastore<AmfConfig, MemoryKeyProvider, RaftManagedDatastore<AmfConfig>>;
+
+const PROCESS_CRASH_CHILD_MODE_ENV: &str = "OPC_CONFIG_PROCESS_CRASH_CHILD_MODE";
+const PROCESS_CRASH_CHILD_ROOT_ENV: &str = "OPC_CONFIG_PROCESS_CRASH_CHILD_ROOT";
+const PROCESS_CRASH_CHILD_MODE: &str = "config-consensus-process-crash-v1";
+const PROCESS_CRASH_EVIDENCE_FILE: &str = "process-crash-ready.sha256";
+const PROCESS_CRASH_EVIDENCE_STAGING_FILE: &str = "process-crash-ready.sha256.part";
+const PROCESS_CRASH_GENESIS_CANARY: &str = "PROCESS-CRASH-GENESIS-MUST-NOT-PERSIST-0xE1";
+const PROCESS_CRASH_PAYLOAD_CANARY: &str = "PROCESS-CRASH-PAYLOAD-MUST-NOT-PERSIST-0xE2";
 
 fn tx_id(value: &str) -> TxId {
     TxId::from_str(value).expect("fixed transaction ID")
@@ -208,6 +223,273 @@ fn assert_plaintext_canaries_absent_from_tree(path: &Path, canaries: &[&[u8]]) {
     assert_plaintext_canaries_absent_from_bytes(&path.display().to_string(), &bytes, canaries);
 }
 
+#[derive(serde::Serialize)]
+struct ExactStoredConfigEvidence<'a> {
+    tx_id: &'a TxId,
+    parent_tx_id: &'a Option<TxId>,
+    version: &'a ConfigVersion,
+    committed_at: &'a Timestamp,
+    principal: &'a TrustedPrincipal,
+    source: &'a RequestSource,
+    schema_digest: &'a SchemaDigest,
+    plaintext_digest: &'a Option<[u8; 32]>,
+    config: &'a AmfConfig,
+    encrypted_blob: &'a [u8],
+    idempotency_key: &'a Option<IdempotencyKey>,
+    apply_plan: &'a Option<ApplyPlan>,
+    request_fingerprint: &'a Option<StoredRequestFingerprint>,
+    request_id: &'a Option<RequestId>,
+    recovery_required: bool,
+    confirmed_deadline: &'a Option<Timestamp>,
+    rollback_label: &'a Option<String>,
+}
+
+fn exact_record_evidence_digest(record: &StoredConfig<AmfConfig>) -> [u8; 32] {
+    let StoredConfig {
+        tx_id,
+        parent_tx_id,
+        version,
+        committed_at,
+        principal,
+        source,
+        schema_digest,
+        plaintext_digest,
+        config,
+        encrypted_blob,
+        idempotency_key,
+        apply_plan,
+        request_fingerprint,
+        request_id,
+        recovery_required,
+        confirmed_deadline,
+        rollback_label,
+    } = record;
+    let evidence = ExactStoredConfigEvidence {
+        tx_id,
+        parent_tx_id,
+        version,
+        committed_at,
+        principal,
+        source,
+        schema_digest,
+        plaintext_digest,
+        config,
+        encrypted_blob,
+        idempotency_key,
+        apply_plan,
+        request_fingerprint,
+        request_id,
+        recovery_required: *recovery_required,
+        confirmed_deadline,
+        rollback_label,
+    };
+    let encoded = serde_json::to_vec(&evidence).expect("serialize exact process-crash record");
+    Sha256::digest(encoded).into()
+}
+
+fn process_crash_genesis_record() -> StoredConfig<AmfConfig> {
+    record(
+        tx_id("c2500001-2500-4250-8250-000000000001"),
+        None,
+        1,
+        timestamp("2026-07-17T05:00:00Z"),
+        config(PROCESS_CRASH_GENESIS_CANARY, 8_192),
+    )
+}
+
+fn process_crash_rich_record() -> StoredConfig<AmfConfig> {
+    let parent_tx_id = tx_id("c2500001-2500-4250-8250-000000000001");
+    let rich_tx_id = tx_id("c2500002-2500-4250-8250-000000000002");
+    let changed_path = YangPath::new("/amf/hostname").expect("changed path");
+    let mut rich = record(
+        rich_tx_id,
+        Some(parent_tx_id),
+        2,
+        timestamp("2026-07-17T05:01:00Z"),
+        config(PROCESS_CRASH_PAYLOAD_CANARY, 16_384),
+    );
+    rich.idempotency_key = Some(
+        IdempotencyKey::new("process-crash-rich-record").expect("process-crash idempotency key"),
+    );
+    rich.apply_plan = Some(ApplyPlan::default_hot(
+        vec![changed_path.clone()],
+        Some(RollbackTarget::TxId(parent_tx_id)),
+    ));
+    rich.request_fingerprint = Some(StoredRequestFingerprint {
+        operation: ConfigOperation::Replace,
+        mode: StoredRequestMode::CommitConfirmed {
+            timeout: Duration::from_secs(600),
+        },
+        transport: TransportType::NetconfTls,
+        changed_paths: vec![changed_path],
+        base_version: Some(ConfigVersion::new(1)),
+    });
+    rich.request_id = Some(
+        RequestId::from_str("c2500003-2500-4250-8250-000000000003")
+            .expect("process-crash request ID"),
+    );
+    rich.recovery_required = true;
+    rich.confirmed_deadline = Some(timestamp("2036-07-17T05:01:00Z"));
+    rich.rollback_label = Some("process-crash-rich-record".to_owned());
+    rich
+}
+
+fn assert_process_crash_rich_record(actual: &StoredConfig<AmfConfig>) {
+    let expected = process_crash_rich_record();
+    assert_eq!(expected.tx_id, actual.tx_id, "process-crash tx_id");
+    assert_eq!(
+        expected.parent_tx_id, actual.parent_tx_id,
+        "process-crash parent_tx_id"
+    );
+    assert_eq!(expected.version, actual.version, "process-crash version");
+    assert_eq!(
+        expected.committed_at, actual.committed_at,
+        "process-crash committed_at"
+    );
+    assert_eq!(
+        expected.principal, actual.principal,
+        "process-crash principal"
+    );
+    assert_eq!(expected.source, actual.source, "process-crash source");
+    assert_eq!(
+        expected.schema_digest, actual.schema_digest,
+        "process-crash schema_digest"
+    );
+    assert_eq!(expected.config, actual.config, "process-crash config");
+    assert_eq!(
+        expected.idempotency_key, actual.idempotency_key,
+        "process-crash idempotency_key"
+    );
+    assert_eq!(
+        expected.apply_plan, actual.apply_plan,
+        "process-crash apply_plan"
+    );
+    assert_eq!(
+        expected.request_fingerprint, actual.request_fingerprint,
+        "process-crash request_fingerprint"
+    );
+    assert_eq!(
+        expected.request_id, actual.request_id,
+        "process-crash request_id"
+    );
+    assert_eq!(
+        expected.recovery_required, actual.recovery_required,
+        "process-crash recovery_required"
+    );
+    assert_eq!(
+        expected.confirmed_deadline, actual.confirmed_deadline,
+        "process-crash confirmed_deadline"
+    );
+    assert_eq!(
+        expected.rollback_label, actual.rollback_label,
+        "process-crash rollback_label"
+    );
+    assert!(
+        actual.plaintext_digest.is_some(),
+        "process-crash plaintext digest must survive"
+    );
+    assert!(
+        !actual.encrypted_blob.is_empty(),
+        "process-crash ciphertext must survive"
+    );
+}
+
+fn process_crash_child_deadline() -> Duration {
+    let transition = cluster_transition_timeout();
+    transition.saturating_add(transition)
+}
+
+fn publish_process_crash_evidence(root: &Path, digest: [u8; 32]) {
+    let staging = root.join(PROCESS_CRASH_EVIDENCE_STAGING_FILE);
+    let published = root.join(PROCESS_CRASH_EVIDENCE_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staging)
+        .expect("create process-crash evidence staging file");
+    file.write_all(&digest)
+        .expect("write process-crash evidence digest");
+    file.sync_all().expect("sync process-crash evidence digest");
+    drop(file);
+    std::fs::rename(staging, published).expect("publish process-crash evidence digest");
+}
+
+struct KillOnDropChild {
+    child: Child,
+}
+
+impl KillOnDropChild {
+    fn spawn(root: &Path) -> Self {
+        let executable = std::env::current_exe().expect("config lifecycle test executable");
+        let child = Command::new(executable)
+            .args([
+                "--exact",
+                "unclean_process_restart_child",
+                "--test-threads=1",
+            ])
+            .env(PROCESS_CRASH_CHILD_MODE_ENV, PROCESS_CRASH_CHILD_MODE)
+            .env(PROCESS_CRASH_CHILD_ROOT_ENV, root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn process-crash child");
+        Self { child }
+    }
+
+    fn try_wait(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().expect("poll process-crash child")
+    }
+
+    fn kill(&mut self) {
+        self.child.kill().expect("kill process-crash child");
+    }
+}
+
+impl Drop for KillOnDropChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+async fn wait_for_process_crash_evidence(child: &mut KillOnDropChild, path: &Path) -> [u8; 32] {
+    tokio::time::timeout(process_crash_child_deadline(), async {
+        loop {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    return bytes
+                        .try_into()
+                        .expect("process-crash evidence must contain exactly one SHA-256 digest")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => panic!("process-crash evidence could not be read"),
+            }
+            if let Some(status) = child.try_wait() {
+                panic!("process-crash child exited before readiness: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("process-crash child readiness deadline")
+}
+
+async fn wait_for_process_crash_exit(child: &mut KillOnDropChild) -> ExitStatus {
+    tokio::time::timeout(cluster_transition_timeout(), async {
+        loop {
+            if let Some(status) = child.try_wait() {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("process-crash child exit deadline")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DurableReopenEvidenceError {
     EmptyExpectedHistory,
@@ -350,6 +632,94 @@ async fn encrypted_record_metadata_and_payload_survive_full_consensus_restart_ex
         .shutdown()
         .await
         .expect("shutdown restarted config cluster");
+}
+
+#[test]
+fn unclean_process_restart_child() {
+    if std::env::var_os(PROCESS_CRASH_CHILD_MODE_ENV).as_deref()
+        != Some(OsStr::new(PROCESS_CRASH_CHILD_MODE))
+    {
+        return;
+    }
+    let root = std::env::var_os(PROCESS_CRASH_CHILD_ROOT_ENV)
+        .map(std::path::PathBuf::from)
+        .expect("process-crash child root environment");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("process-crash child Tokio runtime");
+    runtime.block_on(async move {
+        let cluster = ConfigCluster::start(&root).await;
+        let provider = provider();
+        let encrypted = encrypted_store(&cluster, 0, &provider);
+        encrypted
+            .append_commit_write(CommitWrite::new(process_crash_genesis_record()))
+            .await
+            .expect("append process-crash genesis");
+        encrypted
+            .append_commit_write(CommitWrite::new(process_crash_rich_record()))
+            .await
+            .expect("append process-crash rich record");
+        let committed = encrypted
+            .load_latest()
+            .await
+            .expect("read process-crash rich record")
+            .expect("process-crash rich record");
+        assert_process_crash_rich_record(&committed);
+        publish_process_crash_evidence(&root, exact_record_evidence_digest(&committed));
+        std::future::pending::<()>().await;
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encrypted_record_survives_unclean_process_restart_exactly() {
+    let temp = tempfile::tempdir().expect("process-crash config cluster tempdir");
+    let evidence_path = temp.path().join(PROCESS_CRASH_EVIDENCE_FILE);
+    let mut child = KillOnDropChild::spawn(temp.path());
+    let pre_crash_digest = wait_for_process_crash_evidence(&mut child, &evidence_path).await;
+
+    child.kill();
+    let status = wait_for_process_crash_exit(&mut child).await;
+    assert!(
+        !status.success(),
+        "process-crash child must terminate uncleanly"
+    );
+
+    let mut restarted = ConfigCluster::start(temp.path()).await;
+    let provider = provider();
+    let mut exact_reference = None;
+    for index in 0..3 {
+        let restored = encrypted_store(&restarted, index, &provider)
+            .load_latest()
+            .await
+            .expect("read process-crash record after restart")
+            .expect("process-crash record after restart");
+        assert_process_crash_rich_record(&restored);
+        assert_eq!(
+            pre_crash_digest,
+            exact_record_evidence_digest(&restored),
+            "restarted replica must recover the exact pre-crash record"
+        );
+        if let Some(reference) = exact_reference.as_ref() {
+            assert_exact_record(reference, &restored);
+        } else {
+            exact_reference = Some(restored);
+        }
+    }
+
+    restarted
+        .shutdown()
+        .await
+        .expect("shutdown process-crash recovery cluster");
+    drop(restarted);
+    assert_plaintext_canaries_absent_from_tree(
+        temp.path(),
+        &[
+            PROCESS_CRASH_GENESIS_CANARY.as_bytes(),
+            PROCESS_CRASH_PAYLOAD_CANARY.as_bytes(),
+        ],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
