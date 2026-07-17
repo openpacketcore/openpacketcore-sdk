@@ -38,7 +38,7 @@ num_cpus = "1.16"
 sha2 = "0.10"
 sha1 = "0.11"
 rand = "0.10"
-aes-gcm = { version = "0.11.0-rc.4", default-features = false, features = ["aes", "alloc"] }
+aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc"] }
 aes-gcm-siv = "0.11"
 hkdf = "0.12"
 subtle = "2.6"
