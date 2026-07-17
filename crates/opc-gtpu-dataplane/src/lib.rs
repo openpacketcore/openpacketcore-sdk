@@ -24,8 +24,8 @@ pub mod unsupported;
 
 pub use backend::GtpuDataplaneBackend;
 pub use ebpf::{
-    EbpfGtpuDataplaneBackend, EbpfGtpuDataplaneBackendConfig, DEFAULT_BPFFS_PIN_ROOT,
-    DEFAULT_TC_PRIORITY,
+    EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuDataplaneBackend,
+    EbpfGtpuDataplaneBackendConfig, DEFAULT_BPFFS_PIN_ROOT, DEFAULT_TC_PRIORITY,
 };
 pub use error::GtpuError;
 pub use linux::{LinuxGtpuDataplaneBackend, LinuxGtpuDataplaneBackendConfig};

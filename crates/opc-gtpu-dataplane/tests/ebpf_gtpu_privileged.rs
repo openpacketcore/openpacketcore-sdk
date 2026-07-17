@@ -15,12 +15,21 @@
 //!   GTP-U flags/type/length, the PGW-assigned O-TEID, and the intact inner
 //!   packet. This is precisely the direction the mainline `gtp` netdevice
 //!   cannot serve.
+//!   The production-boundary case sends ESP-in-UDP/4500 through one of two
+//!   shared-request-ID inbound SAs; the dedicated SA's output mark must survive
+//!   decrypt and forwarding and select the dedicated uplink TEID.
 //! - **Downlink**: a G-PDU sent from the PGW on the ePDG's I-TEID must be
 //!   decapsulated by the tc ingress program and *forwarded through the ePDG
 //!   stack* (the position where XFRM policy applies) to the UE netns, which
 //!   receives the inner UDP payload on an ordinary socket. Sequence-numbered
 //!   G-PDUs (S flag) must decapsulate too; unknown TEIDs must be dropped;
 //!   GTP-U echo requests must pass through to the local control plane.
+//!   The production-boundary case installs disjoint default and dedicated
+//!   XFRM OUT policies/SAs; a marked dedicated G-PDU must leave under the
+//!   dedicated SPI, never the default SPI.
+//! - **Identity/counters**: the attached tc program map-ID sets must equal the
+//!   exact bpffs pins. The public diagnostic snapshot must report those live
+//!   program/map IDs and correctly aggregate the exact per-CPU counter map.
 //! - **Restore**: a second backend instance adopts the provisioned interface
 //!   via `resolve_device`, re-installs the session idempotently, and the
 //!   datapath keeps forwarding.
@@ -31,15 +40,17 @@ use std::env;
 use std::fs;
 use std::io::IoSliceMut;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapInfo};
+use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapInfo, PerCpuArray};
 use aya::programs::tc::{NlOptions, TcAttachOptions, TcHandle};
-use aya::programs::{SchedClassifier, TcAttachType};
+use aya::programs::{loaded_programs, SchedClassifier, TcAttachType};
 use aya::{Ebpf, EbpfLoader};
+use nix::libc;
+use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpPdpContext, GtpVersion, GtpuCapability,
@@ -47,15 +58,33 @@ use opc_gtpu_dataplane::{
 };
 use opc_gtpu_ebpf_common::{
     ipv4_header_checksum, DownlinkPdr, MarkedBearerOwner, MarkedBearerOwnerPhase, UplinkFar,
-    UplinkFarKey, DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS, MAP_DOWNLINK_PDR,
-    MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_FAR,
+    UplinkFarKey, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED,
+    COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_PDR_VALUE_LEN,
+    MAP_CONFIG, MAP_COUNTERS, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER,
+    MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR,
     MARKED_BEARER_OWNER_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
     UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN,
     UPLINK_MARK_KEY_LEN,
 };
+use opc_ipsec_xfrm::{
+    Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
+    LifetimeConfig, LinuxXfrmBackend, PolicyParameters, SaParameters, UdpEncap, XfrmAction,
+    XfrmBackend, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmRequestId, XfrmSelector,
+    XfrmTemplate,
+};
+
+sockopt_impl!(
+    UdpEspInUdp,
+    SetOnly,
+    nix::libc::SOL_UDP,
+    nix::libc::UDP_ENCAP,
+    i32
+);
 
 const EPDG_S2BU_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const PGW_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+const EPDG_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
+const UE_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 const UE_PAA: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 2);
 const REMOTE_HOST: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 const LOCAL_TEID: u32 = 0x1000_0001;
@@ -68,7 +97,19 @@ const LOCAL_TEID_A: u32 = 0x1000_0002;
 const LOCAL_TEID_B: u32 = 0x1000_0003;
 const PEER_TEID_A: u32 = 0x2000_0002;
 const PEER_TEID_B: u32 = 0x2000_0003;
+const INBOUND_SPI_DEFAULT: u32 = 0x3000_0000;
+const INBOUND_SPI_A: u32 = 0x3000_0001;
+const OUTBOUND_SPI_DEFAULT: u32 = 0x4000_0001;
+const OUTBOUND_SPI_A: u32 = 0x4000_0002;
+const XFRM_SESSION_REQUEST_ID: u32 = 0x0a00_0001;
 const GTPU_PORT: u16 = 2152;
+const NAT_T_PORT: u16 = 4500;
+const XFRM_INNER_SOURCE_PORT: u16 = 5004;
+const XFRM_INNER_DESTINATION_PORT: u16 = 53;
+const XFRM_DOWNLINK_SOURCE_PORT: u16 = 53;
+const XFRM_DOWNLINK_DESTINATION_PORT: u16 = 5005;
+const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ESP: u8 = 50;
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const SDK_TC_HANDLE: TcHandle = TcHandle::new(0, 1);
 
@@ -154,6 +195,7 @@ impl TestNet {
         run("ip", &["addr", "add", "192.0.2.1/24", "dev", "s2bu"]);
         run("ip", &["link", "set", "s2bu", "up"]);
         run("ip", &["addr", "add", "10.45.0.1/24", "dev", "ue0"]);
+        run("ip", &["addr", "add", "198.18.0.1/24", "dev", "ue0"]);
         run("ip", &["link", "set", "ue0", "up"]);
         run("tc", &["qdisc", "add", "dev", "ue0", "clsact"]);
         for (priority, source_port, mark) in [
@@ -213,6 +255,10 @@ impl TestNet {
         run(
             "ip",
             &["-n", &ue_ns, "addr", "add", "10.45.0.2/24", "dev", "ue1"],
+        );
+        run(
+            "ip",
+            &["-n", &ue_ns, "addr", "add", "198.18.0.2/24", "dev", "ue1"],
         );
         run("ip", &["-n", &ue_ns, "link", "set", "ue1", "up"]);
         run("ip", &["-n", &ue_ns, "link", "set", "lo", "up"]);
@@ -376,6 +422,295 @@ fn dedicated_session_context(
     context.peer_teid = Teid::new(peer_teid).expect("nonzero peer TEID");
     context.bearer_mark = Some(GtpBearerMark::new(mark).expect("nonzero bearer mark"));
     context
+}
+
+fn xfrm_ip(address: Ipv4Addr) -> IpAddress {
+    IpAddress::Ipv4(address.octets())
+}
+
+fn xfrm_session_request_id() -> XfrmRequestId {
+    XfrmRequestId::new(XFRM_SESSION_REQUEST_ID).expect("nonzero session request ID")
+}
+
+fn marked_inner_selector() -> XfrmSelector {
+    let mut selector = XfrmSelector::new(xfrm_ip(UE_PAA), xfrm_ip(REMOTE_HOST), IPPROTO_UDP);
+    selector.source_port = XFRM_INNER_SOURCE_PORT;
+    selector.destination_port = XFRM_INNER_DESTINATION_PORT;
+    selector
+}
+
+fn downlink_selector() -> XfrmSelector {
+    let mut selector = XfrmSelector::new(xfrm_ip(REMOTE_HOST), xfrm_ip(UE_PAA), IPPROTO_UDP);
+    selector.source_port = XFRM_DOWNLINK_SOURCE_PORT;
+    selector.destination_port = XFRM_DOWNLINK_DESTINATION_PORT;
+    selector
+}
+
+fn inbound_sa_parameters(spi: u32, output_mark: XfrmMark) -> SaParameters {
+    SaParameters {
+        selector: marked_inner_selector(),
+        id: XfrmId {
+            destination: xfrm_ip(EPDG_SWU_IP),
+            spi,
+            protocol: IPPROTO_ESP,
+        },
+        source_address: xfrm_ip(UE_SWU_IP),
+        request_id: Some(xfrm_session_request_id()),
+        auth: Some((
+            AuthAlgorithm::hmac_sha256(96),
+            KeyMaterial::new(vec![0xab; 32]),
+        )),
+        crypt: Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0xcd; 16]))),
+        aead: None,
+        mode: XfrmMode::Tunnel,
+        lifetime: LifetimeConfig::default(),
+        replay_window: 32,
+        replay_state: None,
+        encap: Some(UdpEncap::esp_in_udp(NAT_T_PORT, NAT_T_PORT)),
+        mark: None,
+        output_mark: Some(output_mark),
+        if_id: None,
+        egress_dscp: None,
+    }
+}
+
+fn outbound_sa_parameters() -> SaParameters {
+    let mut parameters = inbound_sa_parameters(
+        INBOUND_SPI_A,
+        XfrmMark {
+            value: MARK_A,
+            mask: u32::MAX,
+        },
+    );
+    parameters.id.destination = xfrm_ip(EPDG_SWU_IP);
+    parameters.source_address = xfrm_ip(UE_SWU_IP);
+    parameters.output_mark = None;
+    parameters
+}
+
+fn downlink_sa_parameters(spi: u32, mark: Option<XfrmMark>) -> SaParameters {
+    SaParameters {
+        selector: downlink_selector(),
+        id: XfrmId {
+            destination: xfrm_ip(UE_SWU_IP),
+            spi,
+            protocol: IPPROTO_ESP,
+        },
+        source_address: xfrm_ip(EPDG_SWU_IP),
+        request_id: Some(xfrm_session_request_id()),
+        auth: Some((
+            AuthAlgorithm::hmac_sha256(96),
+            KeyMaterial::new(vec![0xab; 32]),
+        )),
+        crypt: Some((Algorithm::cbc_aes(), KeyMaterial::new(vec![0xcd; 16]))),
+        aead: None,
+        mode: XfrmMode::Tunnel,
+        lifetime: LifetimeConfig::default(),
+        replay_window: 32,
+        replay_state: None,
+        encap: Some(UdpEncap::esp_in_udp(NAT_T_PORT, NAT_T_PORT)),
+        mark,
+        output_mark: None,
+        if_id: None,
+        egress_dscp: None,
+    }
+}
+
+fn downlink_policy_parameters(spi: u32, mark: XfrmMark) -> PolicyParameters {
+    PolicyParameters {
+        selector: downlink_selector(),
+        direction: XfrmDirection::Out,
+        action: XfrmAction::Allow,
+        priority: 100,
+        templates: vec![XfrmTemplate {
+            id: XfrmId {
+                destination: xfrm_ip(UE_SWU_IP),
+                spi,
+                protocol: IPPROTO_ESP,
+            },
+            source_address: xfrm_ip(EPDG_SWU_IP),
+            request_id: Some(xfrm_session_request_id()),
+            mode: XfrmMode::Tunnel,
+        }],
+        mark: Some(mark),
+        if_id: None,
+    }
+}
+
+fn inbound_policy_parameters(direction: XfrmDirection) -> PolicyParameters {
+    PolicyParameters {
+        selector: marked_inner_selector(),
+        direction,
+        action: XfrmAction::Allow,
+        priority: 100,
+        templates: vec![XfrmTemplate {
+            id: XfrmId {
+                destination: xfrm_ip(EPDG_SWU_IP),
+                spi: 0,
+                protocol: IPPROTO_ESP,
+            },
+            source_address: xfrm_ip(UE_SWU_IP),
+            request_id: Some(xfrm_session_request_id()),
+            mode: XfrmMode::Tunnel,
+        }],
+        mark: None,
+        if_id: None,
+    }
+}
+
+async fn install_real_marked_inbound_xfrm(
+    ue_namespace: &str,
+) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    let backend = LinuxXfrmBackend::new();
+    for (spi, output_mark) in [
+        (
+            INBOUND_SPI_DEFAULT,
+            XfrmMark {
+                value: 0,
+                mask: u32::MAX,
+            },
+        ),
+        (
+            INBOUND_SPI_A,
+            XfrmMark {
+                value: MARK_A,
+                mask: u32::MAX,
+            },
+        ),
+    ] {
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: inbound_sa_parameters(spi, output_mark),
+            })
+            .await?;
+    }
+    for direction in [XfrmDirection::In, XfrmDirection::Forward] {
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: inbound_policy_parameters(direction),
+            })
+            .await?;
+    }
+
+    let ue_namespace = ue_namespace.to_owned();
+    in_netns(&ue_namespace, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build UE XFRM runtime");
+        runtime.block_on(async {
+            let peer_backend = LinuxXfrmBackend::new();
+            peer_backend
+                .install_sa(InstallSaRequest {
+                    parameters: outbound_sa_parameters(),
+                })
+                .await
+                .expect("install UE outbound SA");
+            peer_backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: PolicyParameters {
+                        direction: XfrmDirection::Out,
+                        ..inbound_policy_parameters(XfrmDirection::Out)
+                    },
+                })
+                .await
+                .expect("install UE outbound policy");
+        });
+    });
+    Ok(())
+}
+
+async fn install_real_marked_outbound_xfrm() -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    let backend = LinuxXfrmBackend::new();
+    let default_mark = XfrmMark {
+        value: 0,
+        mask: u32::MAX,
+    };
+    let dedicated_mark = XfrmMark {
+        value: MARK_A,
+        mask: u32::MAX,
+    };
+    for (spi, sa_mark, policy_mark) in [
+        (OUTBOUND_SPI_DEFAULT, None, default_mark),
+        (OUTBOUND_SPI_A, Some(dedicated_mark), dedicated_mark),
+    ] {
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: downlink_sa_parameters(spi, sa_mark),
+            })
+            .await?;
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: downlink_policy_parameters(spi, policy_mark),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+fn nat_t_socket(address: Ipv4Addr) -> UdpSocket {
+    use nix::sys::socket::setsockopt;
+
+    let socket = UdpSocket::bind((address, NAT_T_PORT)).expect("bind NAT-T socket");
+    setsockopt(
+        &socket,
+        UdpEspInUdp,
+        &i32::from(opc_ipsec_xfrm::UDP_ENCAP_ESPINUDP),
+    )
+    .expect("enable ESP-in-UDP decapsulation");
+    socket
+}
+
+fn packet_capture_socket(namespace: &str) -> OwnedFd {
+    use nix::sys::socket::{
+        setsockopt, socket, sockopt, AddressFamily, SockFlag, SockProtocol, SockType,
+    };
+    use nix::sys::time::TimeVal;
+
+    let namespace = namespace.to_owned();
+    in_netns(&namespace, || {
+        let socket = socket(
+            AddressFamily::Packet,
+            SockType::Raw,
+            SockFlag::SOCK_CLOEXEC,
+            SockProtocol::EthAll,
+        )
+        .expect("open UE AF_PACKET capture socket");
+        setsockopt(&socket, sockopt::ReceiveTimeout, &TimeVal::new(3, 0))
+            .expect("set packet-capture timeout");
+        socket
+    })
+}
+
+fn capture_nat_t_esp_spi(capture: &OwnedFd) -> u32 {
+    use nix::sys::socket::{recv, MsgFlags};
+
+    let mut frame = vec![0_u8; 65_536];
+    loop {
+        let length = recv(capture.as_raw_fd(), &mut frame, MsgFlags::empty())
+            .expect("receive outbound ESP-in-UDP frame before timeout");
+        if length < 14 + 20 + 8 + 4 || frame[12..14] != [0x08, 0x00] {
+            continue;
+        }
+        let ip = &frame[14..length];
+        let ihl = usize::from(ip[0] & 0x0f) * 4;
+        if ip[0] >> 4 != 4
+            || ihl < 20
+            || ip.len() < ihl + 12
+            || ip[9] != IPPROTO_UDP
+            || ip[12..16] != EPDG_SWU_IP.octets()
+            || ip[16..20] != UE_SWU_IP.octets()
+        {
+            continue;
+        }
+        let udp = &ip[ihl..];
+        if u16::from_be_bytes([udp[0], udp[1]]) != NAT_T_PORT
+            || u16::from_be_bytes([udp[2], udp[3]]) != NAT_T_PORT
+        {
+            continue;
+        }
+        return u32::from_be_bytes(udp[8..12].try_into().expect("ESP SPI bytes"));
+    }
 }
 
 /// Build an inner IPv4/UDP packet as it would leave the PGW toward the UE.
@@ -632,6 +967,20 @@ fn pinned_schema_marker(pin_dir: &std::path::Path) -> [u8; UPLINK_FAR_VALUE_LEN]
         .expect("read pinned schema marker")
 }
 
+fn pinned_counter(pin_dir: &std::path::Path, index: u32) -> u64 {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_COUNTERS)).expect("open pinned counters"),
+    )
+    .expect("identify pinned counters map");
+    let counters = PerCpuArray::<_, u64>::try_from(map).expect("typed pinned counters");
+    counters
+        .get(&index, 0)
+        .expect("read per-CPU counter")
+        .iter()
+        .copied()
+        .sum()
+}
+
 fn set_marked_owner_phase(pin_dir: &std::path::Path, mark: u32, phase: MarkedBearerOwnerPhase) {
     let selector = UplinkFarKey {
         ue_ip: UE_PAA.octets(),
@@ -699,6 +1048,35 @@ fn tc_program_id(direction: &str) -> u32 {
         .unwrap_or_else(|| panic!("tc {direction} filter has no BPF program ID: {filters}"))
 }
 
+fn attached_program_map_ids(direction: &str) -> Vec<u32> {
+    let program_id = tc_program_id(direction);
+    let program = loaded_programs()
+        .find_map(|result| match result {
+            Ok(info) if info.id() == program_id => Some(info),
+            Ok(_) | Err(_) => None,
+        })
+        .unwrap_or_else(|| panic!("tc {direction} program ID {program_id} is not loaded"));
+    let mut map_ids = program
+        .map_ids()
+        .unwrap_or_else(|error| panic!("read tc {direction} program map IDs: {error}"))
+        .unwrap_or_else(|| panic!("kernel did not report tc {direction} program map IDs"));
+    map_ids.sort_unstable();
+    map_ids
+}
+
+fn exact_pinned_map_ids(pin_dir: &std::path::Path, names: &[&str]) -> Vec<u32> {
+    let mut map_ids = names
+        .iter()
+        .map(|name| {
+            MapInfo::from_pin(pin_dir.join(name))
+                .unwrap_or_else(|error| panic!("open pinned {name}: {error}"))
+                .id()
+        })
+        .collect::<Vec<_>>();
+    map_ids.sort_unstable();
+    map_ids
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
 async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::error::Error>> {
@@ -722,6 +1100,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     let mut request = CreateGtpDeviceRequest::new("s2bu");
     request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
     let device = backend.create_device(request).await?;
+    let marked_pin_dir = net.pin_root.join("s2bu");
     // veth namespace crossing scrubs socket marks. Inject the distinct outer
     // sentinel in the ePDG namespace at an earlier, non-SDK tc priority.
     net.install_outer_mark_injector();
@@ -743,6 +1122,77 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         tc_filters("ingress").contains("opc_gtpu_downlink"),
         "downlink program must be attached at tc ingress"
     );
+    assert_eq!(
+        attached_program_map_ids("egress"),
+        exact_pinned_map_ids(
+            &marked_pin_dir,
+            &[
+                MAP_UPLINK_FAR,
+                MAP_UPLINK_MARK_FAR,
+                MAP_UPLINK_DSCP,
+                MAP_UPLINK_MARK_DSCP,
+                MAP_MARKED_BEARER_OWNER,
+                MAP_COUNTERS,
+                MAP_CONFIG,
+            ],
+        ),
+        "the live uplink program must reference the exact pinned maps read by diagnostics",
+    );
+    assert_eq!(
+        attached_program_map_ids("ingress"),
+        exact_pinned_map_ids(
+            &marked_pin_dir,
+            &[
+                MAP_DOWNLINK_PDR,
+                MAP_DOWNLINK_MARK_PDR,
+                MAP_MARKED_BEARER_OWNER,
+                MAP_COUNTERS,
+            ],
+        ),
+        "the live downlink program must reference the exact pinned maps read by diagnostics",
+    );
+    let initial_snapshot = backend.datapath_snapshot(&device).await?;
+    assert_eq!(initial_snapshot.uplink_program_id, tc_program_id("egress"));
+    assert_eq!(
+        initial_snapshot.downlink_program_id,
+        tc_program_id("ingress")
+    );
+    assert_eq!(
+        initial_snapshot.counters_map_id,
+        MapInfo::from_pin(marked_pin_dir.join(MAP_COUNTERS))?.id()
+    );
+    for (reported, index) in [
+        (
+            initial_snapshot.counters.uplink_encapsulated,
+            COUNTER_UL_ENCAP,
+        ),
+        (
+            initial_snapshot.counters.uplink_far_misses,
+            COUNTER_UL_FAR_MISS,
+        ),
+        (
+            initial_snapshot.counters.downlink_decapsulated,
+            COUNTER_DL_DECAP,
+        ),
+        (
+            initial_snapshot.counters.downlink_unknown_teid,
+            COUNTER_DL_UNKNOWN_TEID,
+        ),
+        (
+            initial_snapshot.counters.downlink_malformed,
+            COUNTER_DL_MALFORMED,
+        ),
+        (
+            initial_snapshot.counters.downlink_destination_mismatches,
+            COUNTER_DL_DST_MISMATCH,
+        ),
+    ] {
+        assert_eq!(
+            reported,
+            pinned_counter(&marked_pin_dir, index),
+            "the public snapshot must aggregate every per-CPU value from the exact pinned map",
+        );
+    }
 
     // A second live reconciler must not interleave map operations with the
     // current owner. Kernel-owned abstract socket lifetime makes this work
@@ -813,6 +1263,9 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     });
     let ue_unknown_mark_socket = in_netns(&net.ue_ns, || {
         UdpSocket::bind((UE_PAA, 5003)).expect("bind unknown-mark UE socket")
+    });
+    let ue_xfrm_mark_a_socket = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, XFRM_INNER_SOURCE_PORT)).expect("bind XFRM mark-A UE socket")
     });
     // Local control-plane socket that must still see non-G-PDU GTP-U.
     let epdg_cp_socket = UdpSocket::bind((EPDG_S2BU_IP, GTPU_PORT))?;
@@ -895,7 +1348,6 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     // must finish the old removal without claiming the bearer is present or
     // resurrecting it in the same call; the next attempt publishes a fresh
     // Active owner/FAR pair.
-    let marked_pin_dir = net.pin_root.join("s2bu");
     set_marked_owner_phase(&marked_pin_dir, MARK_B, MarkedBearerOwnerPhase::Removing);
     let removed_far = UplinkFar::decode(&take_marked_far(&marked_pin_dir, MARK_B));
     assert_eq!(removed_far.o_teid, PEER_TEID_B.to_be_bytes());
@@ -913,6 +1365,88 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         "unexpected recovery result: {recovery:?}"
     );
     backend.install_pdp_context(bearer_b.clone()).await?;
+
+    // Exercise the production boundary omitted by the tc-injected cases
+    // below: the peer emits a real tunnel-mode ESP packet, the SDK-installed
+    // inbound SA decrypts it and applies its full-width output mark, Linux
+    // forwards the inner packet, and tc egress must select the dedicated FAR.
+    let _epdg_nat_t_socket = nat_t_socket(EPDG_SWU_IP);
+    let _ue_nat_t_socket = in_netns(&net.ue_ns, || nat_t_socket(UE_SWU_IP));
+    install_real_marked_inbound_xfrm(&net.ue_ns).await?;
+    drain_datagrams(&pgw_socket);
+    let xfrm_uplink_encap_before = backend
+        .datapath_snapshot(&device)
+        .await?
+        .counters
+        .uplink_encapsulated;
+    let (len, from) = send_until_received(
+        || {
+            let _ = ue_xfrm_mark_a_socket.send_to(
+                b"opc-xfrm-mark-a",
+                (REMOTE_HOST, XFRM_INNER_DESTINATION_PORT),
+            );
+        },
+        &pgw_socket,
+        &mut buffer,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "decrypted ESP uplink must select the dedicated FAR\nxfrm-state={}\nxfrm-policy={}\ntc={}",
+            command_stdout("ip", &["-s", "xfrm", "state"]),
+            command_stdout("ip", &["-s", "xfrm", "policy"]),
+            command_stdout("tc", &["-s", "filter", "show", "dev", "s2bu", "egress"]),
+        )
+    });
+    assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(
+        u32::from_be_bytes(buffer[4..8].try_into().expect("GTP-U TEID bytes")),
+        PEER_TEID_A,
+        "the post-decrypt mark must select the dedicated uplink TEID",
+    );
+    assert!(buffer[..len].ends_with(b"opc-xfrm-mark-a"));
+    assert!(
+        backend
+            .datapath_snapshot(&device)
+            .await?
+            .counters
+            .uplink_encapsulated
+            > xfrm_uplink_encap_before,
+        "the committed per-CPU counter must observe the ESP-decrypted marked encapsulation",
+    );
+
+    // Prove the reverse production boundary with two otherwise-identical OUT
+    // policies and SAs. A dedicated G-PDU must be decapsulated, stamped with
+    // MARK_A, and encrypted under the marked SA rather than the default SA.
+    install_real_marked_outbound_xfrm().await?;
+    let outbound_capture = packet_capture_socket(&net.ue_ns);
+    let xfrm_downlink_decap_before = backend
+        .datapath_snapshot(&device)
+        .await?
+        .counters
+        .downlink_decapsulated;
+    let xfrm_downlink_inner = build_inner_udp(
+        REMOTE_HOST,
+        UE_PAA,
+        XFRM_DOWNLINK_SOURCE_PORT,
+        XFRM_DOWNLINK_DESTINATION_PORT,
+        b"opc-xfrm-downlink-mark-a",
+    );
+    let xfrm_downlink_gpdu = build_gpdu(LOCAL_TEID_A, None, &xfrm_downlink_inner);
+    pgw_socket.send_to(&xfrm_downlink_gpdu, (EPDG_S2BU_IP, GTPU_PORT))?;
+    assert_eq!(
+        capture_nat_t_esp_spi(&outbound_capture),
+        OUTBOUND_SPI_A,
+        "the marked downlink must select the dedicated outbound Child SA",
+    );
+    assert!(
+        backend
+            .datapath_snapshot(&device)
+            .await?
+            .counters
+            .downlink_decapsulated
+            > xfrm_downlink_decap_before,
+        "the committed per-CPU counter must observe the marked GTP-U decapsulation",
+    );
 
     for (socket, payload, expected_teid) in [
         (&ue_mark_a_socket, b"opc-mark-a".as_slice(), PEER_TEID_A),

@@ -18,14 +18,17 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   GTP generic-netlink family.
 - `EbpfGtpuDataplaneBackend`: tc `clsact` eBPF datapath adapter for
   uplink-capable access-gateway roles where the mainline `gtp` netdevice cannot
-  select PDP context by inner source address.
+  select PDP context by inner source address. Its `datapath_snapshot` method
+  returns identity-bound aggregate counters from the exact live programs and
+  pinned map.
 - `MockGtpuDataplaneBackend`: deterministic in-memory backend with operation
   capture and failure injection.
 - `UnsupportedGtpuDataplaneBackend`: reports unsupported-platform results while
   preserving trait-object usage on non-Linux or disabled builds.
 - Model exports include `CreateGtpDeviceRequest`, `GtpDevice`,
   `GtpPdpContext`, `GtpBearerMark`, `RemovePdpContextRequest`, `Teid`,
-  `GtpuProbe`, `GtpuBackendKind`, `GtpuCapability`, `DscpCodepoint`,
+  `GtpuProbe`, `GtpuBackendKind`, `GtpuCapability`,
+  `EbpfGtpuDatapathSnapshot`, `EbpfGtpuDatapathCounters`, `DscpCodepoint`,
   `GtpRole`, `GtpVersion`, `GtpAddressFamily`, and `GTPU_PORT`.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
   emitted by `Debug`/`Display`.
@@ -118,6 +121,29 @@ compatible configuration: preserved bits change the exact GTP-U lookup key
 and can select no bearer. TFT classification, mark allocation, XFRM policy/SA
 installation, and collision avoidance with other Linux mark users remain
 product responsibilities.
+
+For redaction-safe live diagnostics, call
+`EbpfGtpuDataplaneBackend::datapath_snapshot(&device)`. Under the backend's
+required exclusive-writer contract, a successful call re-opens every named
+bpffs pin, verifies the full map-ID sets referenced by the held uplink and
+downlink programs, verifies both exact program IDs are still in their tc slots,
+reads the held `GTPU_COUNTERS` map directly, aggregates every per-CPU value,
+then repeats the identity proof. The returned
+`EbpfGtpuDatapathSnapshot` contains only kernel-local program/map IDs and
+aggregate counters; it contains no addresses, TEIDs, packet marks, or payloads.
+This avoids `bpftool map dump name GTPU_COUNTERS`, which can select an unrelated
+same-name map when stale or concurrently loaded objects exist. The method
+returns `StateIndeterminate` rather than presenting counters as authoritative
+if a hook or pin mismatch is visible at either identity check. An external-root
+replace-and-restore between checks is outside the exclusive-writer contract and
+cannot be distinguished by this diagnostic.
+
+The existing counter schema remains unchanged and aggregates default and
+dedicated bearers. Use counter deltas to prove that the attached uplink/downlink
+programs ran; use the peer's observed GTP-U TEID for per-bearer correlation.
+An all-zero identity-bound snapshot during a claimed GTP-U round trip means the
+traffic did not traverse these exact programs, not that a marked lookup chose
+the default entry.
 
 Existing `GtpPdpContext` literals must add `bearer_mark: None` to retain the
 default path, or construct a non-zero `GtpBearerMark` for a dedicated bearer.

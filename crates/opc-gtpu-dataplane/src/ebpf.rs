@@ -48,6 +48,48 @@ pub const DEFAULT_BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/opc-gtpu";
 /// Default tc filter priority for the datapath programs.
 pub const DEFAULT_TC_PRIORITY: u16 = 50;
 
+/// Redaction-safe aggregate of one eBPF GTP-U datapath counter map.
+///
+/// Each value is the saturating sum of every per-CPU slot in the exact map
+/// held by the backend. The counters contain no addresses, TEIDs, marks, or
+/// packet contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EbpfGtpuDatapathCounters {
+    /// Uplink packets successfully GTP-U encapsulated.
+    pub uplink_encapsulated: u64,
+    /// Uplink packets for which no usable FAR was found.
+    pub uplink_far_misses: u64,
+    /// Downlink G-PDUs successfully decapsulated.
+    pub downlink_decapsulated: u64,
+    /// Downlink G-PDUs dropped because their TEID was unknown.
+    pub downlink_unknown_teid: u64,
+    /// Downlink GTP-U packets dropped as malformed.
+    pub downlink_malformed: u64,
+    /// Downlink G-PDUs dropped because the inner destination did not match
+    /// the PDR's UE address.
+    pub downlink_destination_mismatches: u64,
+}
+
+/// Identity-bound diagnostic snapshot for one live eBPF GTP-U datapath.
+///
+/// Under the backend's exclusive-writer contract, a successful snapshot proves
+/// that both tc hooks contain the exact program IDs loaded by this backend,
+/// every named bpffs pin identifies the exact held map, and both programs
+/// reference `counters_map_id` at both identity checks. The program and map IDs
+/// are kernel-local diagnostic handles and the counters are aggregate-only, so
+/// `Debug` is safe for redacted operational evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EbpfGtpuDatapathSnapshot {
+    /// Kernel program ID attached at tc egress for uplink encapsulation.
+    pub uplink_program_id: u32,
+    /// Kernel program ID attached at tc ingress for downlink decapsulation.
+    pub downlink_program_id: u32,
+    /// Kernel map ID of the exact pinned per-CPU counter map.
+    pub counters_map_id: u32,
+    /// Per-path counters aggregated across all possible CPUs.
+    pub counters: EbpfGtpuDatapathCounters,
+}
+
 /// Runtime behavior for the eBPF GTP-U backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfGtpuDataplaneBackendConfig {
@@ -252,6 +294,9 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         local_teid: [u8; 4],
     ) -> Result<Option<[u8; UPLINK_MARK_KEY_LEN]>, GtpuError>;
 
+    /// Read counters only after proving the live hooks and exact named pins.
+    fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError>;
+
     /// Probe the environment for eBPF datapath readiness.
     fn probe_environment(&self) -> EbpfEnvironment;
 
@@ -326,6 +371,30 @@ impl EbpfGtpuDataplaneBackend {
     #[must_use]
     pub fn with_config(config: EbpfGtpuDataplaneBackendConfig) -> Self {
         Self::with_runtime_and_config(Arc::new(aya_runtime::AyaGtpuRuntime::new()), config)
+    }
+
+    /// Read an identity-bound, redaction-safe snapshot for a managed device.
+    ///
+    /// Under the backend's exclusive-writer contract, success proves at both
+    /// identity checks that the live tc filters and every named bpffs pin match
+    /// the exact programs and maps held by this backend. Counter values are read
+    /// from that held per-CPU map and aggregated across all possible CPUs,
+    /// avoiding ambiguous same-name map selection by external tooling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GtpuError::NotFound`] when `device` is not managed by this
+    /// backend. Identity loss, a replaced hook or pin, and an identity change
+    /// while the snapshot is read return [`GtpuError::StateIndeterminate`].
+    pub async fn datapath_snapshot(
+        &self,
+        device: &GtpDevice,
+    ) -> Result<EbpfGtpuDatapathSnapshot, GtpuError> {
+        let device = device.clone();
+        self.run_blocking("ebpf_datapath_snapshot", move |backend| {
+            backend.datapath_snapshot_sync(device)
+        })
+        .await
     }
 
     pub(crate) fn with_runtime_and_config(
@@ -742,6 +811,22 @@ impl EbpfGtpuDataplaneBackend {
         )?;
         devices.remove(&device.ifindex);
         Ok(())
+    }
+
+    fn datapath_snapshot_sync(
+        &self,
+        device: GtpDevice,
+    ) -> Result<EbpfGtpuDatapathSnapshot, GtpuError> {
+        let _operation = self.operation_guard()?;
+        validate_interface_name(&device.name)?;
+        let devices = self.devices()?;
+        if devices
+            .get(&device.ifindex)
+            .is_none_or(|managed| managed.name != device.name)
+        {
+            return Err(GtpuError::NotFound);
+        }
+        self.inner.runtime.datapath_snapshot(device.ifindex)
     }
 
     fn install_pdp_context_sync(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
@@ -1231,15 +1316,19 @@ mod aya_runtime {
 
     use opc_gtpu_ebpf_common::{
         MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr, UplinkFarKey,
-        DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR,
-        MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
-        MAP_UPLINK_MARK_FAR, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
-        PROG_DOWNLINK, PROG_UPLINK, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
-        UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
-        UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
+        COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
+        COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS,
+        MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP,
+        MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MARKED_BEARER_OWNER_VALUE_LEN,
+        MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
+        UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+        UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
+        UPLINK_MARK_KEY_LEN,
     };
 
-    use super::{EbpfEnvironment, EbpfGtpuRuntime};
+    use super::{
+        EbpfEnvironment, EbpfGtpuDatapathCounters, EbpfGtpuDatapathSnapshot, EbpfGtpuRuntime,
+    };
     use crate::GtpuError;
 
     /// The committed CO-RE datapath object built by
@@ -3500,6 +3589,55 @@ mod aya_runtime {
             })
         }
 
+        fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError> {
+            let devices = self
+                .devices
+                .lock()
+                .map_err(|_| GtpuError::io("ebpf_datapath_snapshot", super::poisoned_lock()))?;
+            let device = devices.get(&ifindex).ok_or(GtpuError::NotFound)?;
+            let indeterminate = || GtpuError::StateIndeterminate {
+                operation: "ebpf_datapath_snapshot",
+            };
+            if !Self::loaded_datapath_is_current(ifindex, device) {
+                return Err(indeterminate());
+            }
+
+            let map = device.ebpf.map(MAP_COUNTERS).ok_or_else(indeterminate)?;
+            let counters = PerCpuArray::<_, u64>::try_from(map).map_err(|_| {
+                GtpuError::io(
+                    "ebpf_datapath_counters",
+                    invalid_data("counter map has an unexpected shape"),
+                )
+            })?;
+            let aggregate = |index: u32| -> Result<u64, GtpuError> {
+                let values = counters
+                    .get(&index, 0)
+                    .map_err(|error| map_error("ebpf_datapath_counters", error))?;
+                Ok(values.iter().copied().fold(0_u64, u64::saturating_add))
+            };
+            let snapshot = EbpfGtpuDatapathSnapshot {
+                uplink_program_id: device.datapath_identity.uplink.program_id,
+                downlink_program_id: device.datapath_identity.downlink.program_id,
+                counters_map_id: device.datapath_identity.pins.counters,
+                counters: EbpfGtpuDatapathCounters {
+                    uplink_encapsulated: aggregate(COUNTER_UL_ENCAP)?,
+                    uplink_far_misses: aggregate(COUNTER_UL_FAR_MISS)?,
+                    downlink_decapsulated: aggregate(COUNTER_DL_DECAP)?,
+                    downlink_unknown_teid: aggregate(COUNTER_DL_UNKNOWN_TEID)?,
+                    downlink_malformed: aggregate(COUNTER_DL_MALFORMED)?,
+                    downlink_destination_mismatches: aggregate(COUNTER_DL_DST_MISMATCH)?,
+                },
+            };
+            // Repeat the complete proof after the reads so any hook or pin
+            // replacement still visible at the second check fails closed. An
+            // external-root replace-and-restore between checks is outside the
+            // required exclusive-writer contract and is not distinguishable.
+            if !Self::loaded_datapath_is_current(ifindex, device) {
+                return Err(indeterminate());
+            }
+            Ok(snapshot)
+        }
+
         fn probe_environment(&self) -> EbpfEnvironment {
             EbpfEnvironment {
                 platform_supported: true,
@@ -3916,6 +4054,7 @@ mod tests {
         marked_owner:
             HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; MARKED_BEARER_OWNER_VALUE_LEN]>,
         marked_owner_by_teid: HashMap<(u32, [u8; 4]), [u8; UPLINK_MARK_KEY_LEN]>,
+        datapath_snapshot: EbpfGtpuDatapathSnapshot,
         dscp_map_ready: HashSet<u32>,
         marked_far_map_ready: HashSet<u32>,
         marked_dscp_map_ready: HashSet<u32>,
@@ -4605,6 +4744,28 @@ mod tests {
                 .copied())
         }
 
+        fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError> {
+            let mut state = self.state();
+            let exact = state.attached.contains_key(&ifindex)
+                && state.dscp_map_ready.contains(&ifindex)
+                && state.marked_far_map_ready.contains(&ifindex)
+                && state.marked_dscp_map_ready.contains(&ifindex)
+                && state.marked_pdr_map_ready.contains(&ifindex)
+                && state.marked_owner_map_ready.contains(&ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && !state.pin_identity_invalid.contains(&ifindex)
+                && !state.uplink_filter_foreign.contains(&ifindex)
+                && !state.downlink_filter_foreign.contains(&ifindex);
+            if !exact {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_datapath_snapshot",
+                });
+            }
+            state.operations.push("datapath_snapshot");
+            Ok(state.datapath_snapshot)
+        }
+
         fn probe_environment(&self) -> EbpfEnvironment {
             self.environment
         }
@@ -4706,6 +4867,54 @@ mod tests {
             state.pinned_config.get(&attachment.pin_dir),
             Some(&[192, 0, 2, 1])
         );
+    }
+
+    #[tokio::test]
+    async fn datapath_snapshot_returns_exact_identity_bound_counters() {
+        let (backend, runtime) = backend_with_fake();
+        let expected = EbpfGtpuDatapathSnapshot {
+            uplink_program_id: 101,
+            downlink_program_id: 102,
+            counters_map_id: 201,
+            counters: EbpfGtpuDatapathCounters {
+                uplink_encapsulated: 11,
+                uplink_far_misses: 12,
+                downlink_decapsulated: 13,
+                downlink_unknown_teid: 14,
+                downlink_malformed: 15,
+                downlink_destination_mismatches: 16,
+            },
+        };
+        runtime.state().datapath_snapshot = expected;
+        let device = backend.create_device(create_request()).await.unwrap();
+
+        assert_eq!(backend.datapath_snapshot(&device).await.unwrap(), expected);
+        assert_eq!(
+            runtime.state().operations.last(),
+            Some(&"datapath_snapshot")
+        );
+    }
+
+    #[tokio::test]
+    async fn datapath_snapshot_rejects_unmanaged_or_identity_lost_devices() {
+        let (backend, runtime) = backend_with_fake();
+        let device = backend.create_device(create_request()).await.unwrap();
+        let unknown = GtpDevice {
+            name: device.name.clone(),
+            ifindex: device.ifindex + 1,
+        };
+        assert!(matches!(
+            backend.datapath_snapshot(&unknown).await.unwrap_err(),
+            GtpuError::NotFound
+        ));
+
+        runtime.state().pin_identity_invalid.insert(device.ifindex);
+        assert!(matches!(
+            backend.datapath_snapshot(&device).await.unwrap_err(),
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_datapath_snapshot"
+            }
+        ));
     }
 
     #[tokio::test]
