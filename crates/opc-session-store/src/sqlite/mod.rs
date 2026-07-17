@@ -1757,6 +1757,125 @@ mod operation_lifetime_tests {
 }
 
 #[cfg(test)]
+mod consensus_readiness_deadline_tests {
+    use std::collections::BTreeMap;
+
+    use opc_consensus::{
+        derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+    };
+
+    use super::*;
+    use crate::{
+        consensus::ConsensusSessionStore,
+        readiness::DurableReadinessState,
+        topology::{
+            QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
+            ReplicaId, ReplicaTlsIdentity, ValidatedQuorumTopology,
+        },
+    };
+
+    const OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
+    const RECOVERY_PREFLIGHT_HOLD: Duration = Duration::from_millis(600);
+    const PROBE_ASSERTION_SLACK: Duration = Duration::from_millis(250);
+
+    fn singleton_topology() -> ValidatedQuorumTopology {
+        let replica_id = ReplicaId::new("readiness-deadline-singleton").expect("replica ID");
+        let descriptor = QuorumReplicaDescriptor::new(
+            replica_id.clone(),
+            ReplicaEndpoint::new("readiness-deadline.invalid", 7443).expect("endpoint"),
+            ReplicaTlsIdentity::new("spiffe://test/session/readiness-deadline")
+                .expect("TLS identity"),
+            ReplicaFailureDomain::new("readiness-deadline-zone").expect("failure domain"),
+            ReplicaBackingIdentity::new("readiness-deadline-disk").expect("backing identity"),
+        );
+        let cluster_id =
+            ConsensusClusterId::new("session-readiness-deadline-tests").expect("cluster ID");
+        let epoch = ConsensusConfigurationEpoch::new(1).expect("configuration epoch");
+        let configuration_id =
+            derive_configuration_id(cluster_id, epoch, &[descriptor.configuration_fingerprint()]);
+        ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+            replica_id,
+            vec![descriptor],
+            ConsensusIdentity::new(cluster_id, configuration_id, epoch),
+        )
+        .expect("singleton topology")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readiness_recovery_and_barrier_share_one_complete_operation_deadline() {
+        let snapshots = tempfile::tempdir().expect("snapshot directory");
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
+        let apply_gate = Arc::clone(&backend.consensus_apply_gate);
+        let store = ConsensusSessionStore::open_with_operation_timeout(
+            singleton_topology(),
+            backend.clone(),
+            snapshots.path(),
+            BTreeMap::new(),
+            OPERATION_TIMEOUT,
+        )
+        .await
+        .expect("open consensus singleton");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize consensus singleton");
+        assert!(store.probe_durable_readiness().await.is_ready());
+
+        let held_apply = apply_gate
+            .acquire_owned()
+            .await
+            .expect("hold state-machine apply");
+        let status_before = store.status();
+        let mutation_store = store.clone();
+        let mutation = tokio::spawn(async move { mutation_store.max_replication_sequence().await });
+        tokio::time::timeout(OPERATION_TIMEOUT, async {
+            loop {
+                let status = store.status();
+                if status.last_log_index.is_some_and(|last| {
+                    last > status_before.last_log_index.unwrap_or_default()
+                        && status.applied_index.is_none_or(|applied| applied < last)
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mutation reaches the log while apply is held");
+
+        let held_connection = backend.conn.lock().await;
+        let probe_store = store.clone();
+        let probe_started = tokio::time::Instant::now();
+        let probe = tokio::spawn(async move { probe_store.probe_durable_readiness().await });
+        tokio::time::timeout(OPERATION_TIMEOUT, async {
+            while backend.operation_workers.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("readiness recovery preflight waits on the held SQLite connection");
+        tokio::time::sleep(RECOVERY_PREFLIGHT_HOLD).await;
+        drop(held_connection);
+
+        let report = tokio::time::timeout_at(
+            probe_started + OPERATION_TIMEOUT + PROBE_ASSERTION_SLACK,
+            probe,
+        )
+        .await
+        .expect("readiness probe must not receive a second operation budget")
+        .expect("readiness probe task");
+        assert_eq!(report.state(), DurableReadinessState::NoQuorum);
+        assert!(probe_started.elapsed() >= RECOVERY_PREFLIGHT_HOLD);
+
+        drop(held_apply);
+        let _ = tokio::time::timeout(Duration::from_secs(2), mutation)
+            .await
+            .expect("mutation task settles after apply resumes")
+            .expect("mutation task");
+    }
+}
+
+#[cfg(test)]
 mod restore_cancellation_tests {
     use super::*;
 

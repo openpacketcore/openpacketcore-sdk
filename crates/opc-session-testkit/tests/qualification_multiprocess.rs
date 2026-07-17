@@ -17,8 +17,9 @@ use opc_session_testkit::qualification::{
     read_bounded_json_line, write_json_line, QualificationMember, QualificationNodeCommand,
     QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
     QualificationReadinessCode, QualificationTransportConfig, SessionHaQualificationProfile,
-    QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
-    SESSION_HA_EVIDENCE_SCHEMA_JSON, SESSION_HA_PROFILE_JSON,
+    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_NODE_SCHEMA_VERSION,
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS, SESSION_HA_EVIDENCE_SCHEMA_JSON,
+    SESSION_HA_PROFILE_JSON,
 };
 use opc_session_testkit::qualification_sequential::{
     qualification_sequential_workload, QualificationSequentialHistoryBuilder,
@@ -36,6 +37,8 @@ use time::OffsetDateTime;
 
 const CHILD_START_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+const READINESS_REPLY_TIMEOUT: Duration =
+    Duration::from_millis(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
 const FLEET_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DATABASE_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -1894,7 +1897,7 @@ impl Fleet {
                 if now >= deadline {
                     return Err(readiness_deadline(stage, &last_readiness));
                 }
-                let receive_timeout = CHILD_REPLY_TIMEOUT.min(deadline.duration_since(now));
+                let receive_timeout = READINESS_REPLY_TIMEOUT.min(deadline.duration_since(now));
                 let reply = self.nodes[*node_index].as_ref().ok_or_else(|| {
                     stage_error(stage, Some(*node_index), HarnessFailureKind::Disconnected)
                 });
@@ -2017,7 +2020,7 @@ impl Fleet {
             if now >= deadline {
                 return Err(readiness_deadline(stage, &readiness));
             }
-            let timeout = CHILD_REPLY_TIMEOUT.min(deadline.duration_since(now));
+            let timeout = READINESS_REPLY_TIMEOUT.min(deadline.duration_since(now));
             let node = self.nodes[node_index].as_mut().ok_or_else(|| {
                 stage_error(stage, Some(node_index), HarnessFailureKind::Disconnected)
             })?;
