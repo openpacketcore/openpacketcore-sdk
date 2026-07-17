@@ -1459,6 +1459,8 @@ fn is_bounded_identifier(value: &str) -> bool {
 #[derive(Clone)]
 pub struct KubectlQualificationKubernetesCampaignPort {
     executable: OsString,
+    #[cfg(test)]
+    argument_prefix: Vec<OsString>,
     command_timeout: Duration,
 }
 
@@ -1478,15 +1480,32 @@ impl KubectlQualificationKubernetesCampaignPort {
     pub fn new() -> Self {
         Self {
             executable: OsString::from("kubectl"),
+            #[cfg(test)]
+            argument_prefix: Vec::new(),
             command_timeout: QUALIFICATION_KUBERNETES_COMMAND_TIMEOUT,
         }
     }
 
-    #[cfg(test)]
-    fn with_executable(executable: OsString, command_timeout: Duration) -> Self {
+    #[cfg(all(test, unix))]
+    fn with_test_script(script: OsString, command_timeout: Duration) -> Self {
         Self {
-            executable,
+            executable: OsString::from("/bin/sh"),
+            argument_prefix: vec![script],
             command_timeout,
+        }
+    }
+
+    fn command_arguments(&self, arguments: Vec<OsString>) -> Vec<OsString> {
+        #[cfg(test)]
+        {
+            let mut prefixed = Vec::with_capacity(self.argument_prefix.len() + arguments.len());
+            prefixed.extend(self.argument_prefix.iter().cloned());
+            prefixed.extend(arguments);
+            prefixed
+        }
+        #[cfg(not(test))]
+        {
+            arguments
         }
     }
 }
@@ -1509,9 +1528,10 @@ impl QualificationKubernetesCampaignPort for KubectlQualificationKubernetesCampa
         let mut input = Vec::new();
         write_json_line(&mut input, command)
             .map_err(|_| QualificationKubernetesPortError::Unavailable)?;
+        let arguments = self.command_arguments(control_client_arguments(namespace, pod_name));
         let output = run_kubectl(
             &self.executable,
-            &control_client_arguments(namespace, pod_name),
+            &arguments,
             &input,
             self.command_timeout,
             KUBECTL_STDOUT_MAX_BYTES,
@@ -1546,9 +1566,10 @@ impl QualificationKubernetesCampaignPort for KubectlQualificationKubernetesCampa
             "status": { "conditions": [condition] },
         }))
         .map_err(|_| QualificationKubernetesPortError::Unavailable)?;
+        let arguments = self.command_arguments(status_patch_arguments(namespace, pod_name, &patch));
         let output = run_kubectl(
             &self.executable,
-            &status_patch_arguments(namespace, pod_name, &patch),
+            &arguments,
             &[],
             self.command_timeout,
             4 * 1024,
@@ -3073,12 +3094,36 @@ mod tests {
     #[cfg(unix)]
     fn write_fake_kubectl(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().expect("fake kubectl directory");
-        let executable = directory.path().join("kubectl");
-        fs::write(&executable, format!("#!/bin/sh\nset -eu\n{body}\n"))
-            .expect("write fake kubectl");
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
-            .expect("make fake kubectl executable");
-        (directory, executable)
+        let script = directory.path().join("kubectl");
+        fs::write(&script, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake kubectl");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o600))
+            .expect("make fake kubectl script private");
+        (directory, script)
+    }
+
+    #[cfg(unix)]
+    async fn run_fake_kubectl(
+        script: &Path,
+        arguments: &[OsString],
+        stdin_bytes: &[u8],
+        timeout: Duration,
+        stdout_max_bytes: usize,
+        stderr_max_bytes: usize,
+        cancellation: &QualificationKubernetesCampaignCancellation,
+    ) -> Result<KubectlOutput, QualificationKubernetesPortError> {
+        let mut shell_arguments = Vec::with_capacity(arguments.len() + 1);
+        shell_arguments.push(script.as_os_str().to_os_string());
+        shell_arguments.extend(arguments.iter().cloned());
+        run_kubectl(
+            std::ffi::OsStr::new("/bin/sh"),
+            &shell_arguments,
+            stdin_bytes,
+            timeout,
+            stdout_max_bytes,
+            stderr_max_bytes,
+            cancellation,
+        )
+        .await
     }
 
     #[cfg(unix)]
@@ -3142,8 +3187,8 @@ mod tests {
 exec sleep 30"#,
         );
         let cancellation = QualificationKubernetesCampaignCancellation::new();
-        let result = run_kubectl(
-            executable.as_os_str(),
+        let result = run_fake_kubectl(
+            &executable,
             &[],
             &[],
             Duration::from_millis(250),
@@ -3179,8 +3224,8 @@ exec sleep 30"#,
         let task_cancellation = Arc::clone(&cancellation);
         let task_executable = executable.clone();
         let task = tokio::spawn(async move {
-            run_kubectl(
-                task_executable.as_os_str(),
+            run_fake_kubectl(
+                &task_executable,
                 &[],
                 &[],
                 Duration::from_secs(30),
@@ -3227,7 +3272,7 @@ exec sleep 30"#,
 exec sleep 30"#,
         );
         let pid_path = appended_path(&executable, ".pid");
-        let port = KubectlQualificationKubernetesCampaignPort::with_executable(
+        let port = KubectlQualificationKubernetesCampaignPort::with_test_script(
             executable.into_os_string(),
             Duration::from_secs(30),
         );
@@ -3265,8 +3310,8 @@ exec sleep 30"#,
         let oversized = "x".repeat(2_049);
         let (_overflow_directory, overflow_executable) =
             write_fake_kubectl(&format!("printf '%s' '{oversized}'"));
-        let overflow = run_kubectl(
-            overflow_executable.as_os_str(),
+        let overflow = run_fake_kubectl(
+            &overflow_executable,
             &[],
             &[],
             Duration::from_secs(2),
@@ -3281,8 +3326,8 @@ exec sleep 30"#,
         ));
 
         let (_failure_directory, failure_executable) = write_fake_kubectl("exit 9");
-        let failure = run_kubectl(
-            failure_executable.as_os_str(),
+        let failure = run_fake_kubectl(
+            &failure_executable,
             &[],
             &[],
             Duration::from_secs(2),
@@ -3303,7 +3348,7 @@ exec sleep 30"#,
         let cancellation = QualificationKubernetesCampaignCancellation::new();
         let (_malformed_directory, malformed_executable) =
             write_fake_kubectl("IFS= read -r _\nprintf '%s\\n' 'not-json'");
-        let malformed = KubectlQualificationKubernetesCampaignPort::with_executable(
+        let malformed = KubectlQualificationKubernetesCampaignPort::with_test_script(
             malformed_executable.into_os_string(),
             Duration::from_secs(2),
         )
@@ -3322,7 +3367,7 @@ exec sleep 30"#,
         let (_duplicate_directory, duplicate_executable) = write_fake_kubectl(
             "IFS= read -r _\nprintf '%s\\n%s\\n' '{\"reply\":\"initialized\"}' '{\"reply\":\"initialized\"}'",
         );
-        let duplicate = KubectlQualificationKubernetesCampaignPort::with_executable(
+        let duplicate = KubectlQualificationKubernetesCampaignPort::with_test_script(
             duplicate_executable.into_os_string(),
             Duration::from_secs(2),
         )
@@ -3347,7 +3392,7 @@ exec sleep 30"#,
 printf '%s\n' "$input" > "${0}.stdin"
 printf '%s\n' '{"reply":"lease_acquired","fence":7}'"#,
         );
-        let port = KubectlQualificationKubernetesCampaignPort::with_executable(
+        let port = KubectlQualificationKubernetesCampaignPort::with_test_script(
             executable.clone().into_os_string(),
             Duration::from_secs(2),
         );
@@ -3380,7 +3425,7 @@ printf '%s\n' '{"reply":"lease_acquired","fence":7}'"#,
     #[tokio::test]
     async fn kubectl_status_adapter_uses_only_the_status_subresource_command() {
         let (_directory, executable) = write_fake_kubectl(r#"printf '%s\n' "$@" > "${0}.args""#);
-        let port = KubectlQualificationKubernetesCampaignPort::with_executable(
+        let port = KubectlQualificationKubernetesCampaignPort::with_test_script(
             executable.clone().into_os_string(),
             Duration::from_secs(2),
         );
