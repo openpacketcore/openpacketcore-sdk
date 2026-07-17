@@ -477,6 +477,17 @@ impl AuditKey {
         mac.update(&self.epoch.to_be_bytes());
         mac.finalize().into_bytes().into()
     }
+
+    pub(crate) fn authenticate_canonical(
+        &self,
+        canonical_input: &[u8],
+    ) -> Result<[u8; 32], PersistError> {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(self.as_bytes())
+            .map_err(|_| PersistError::constraint_violation("audit HMAC key length is invalid"))?;
+        mac.update(canonical_input);
+        Ok(mac.finalize().into_bytes().into())
+    }
 }
 
 impl fmt::Debug for AuditKey {
@@ -489,6 +500,201 @@ impl fmt::Debug for AuditKey {
             )
             .field("material", &"<redacted>")
             .finish()
+    }
+}
+
+/// Fixed purpose/version domains admitted by the shared audit-chain encoder.
+///
+/// The domain is prepended to the canonical field stream before HMAC. This
+/// prevents an authenticated management event from being replayed as an
+/// authenticated retention anchor, or vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum AuditChainDomain {
+    /// One management-plane audit event under the v1 durable schema.
+    ManagementEventV1,
+    /// The v1 management-plane retention/high-water anchor.
+    ManagementAnchorV1,
+}
+
+impl AuditChainDomain {
+    const fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::ManagementEventV1 => b"openpacketcore/management-audit/event/v1\0",
+            Self::ManagementAnchorV1 => b"openpacketcore/management-audit/anchor/v1\0",
+        }
+    }
+}
+
+/// One typed field in the canonical audit-chain HMAC input.
+///
+/// Fields are encoded in caller-provided order with an explicit type tag.
+/// Variable-width values are length-prefixed, option presence is explicit, and
+/// hashes remain fixed-width. This removes concatenation ambiguity without
+/// exposing raw [`AuditKey`] material.
+#[derive(Clone, Copy)]
+#[non_exhaustive]
+pub(crate) enum AuditChainField<'a> {
+    /// Unsigned 64-bit integer in network byte order.
+    U64(u64),
+    /// Length-prefixed arbitrary bytes.
+    Bytes(&'a [u8]),
+    /// Length-prefixed UTF-8 text.
+    Text(&'a str),
+    /// Explicitly present or absent length-prefixed UTF-8 text.
+    OptionalText(Option<&'a str>),
+    /// One fixed-width SHA-256/HMAC link value.
+    Hash(&'a [u8; 32]),
+}
+
+impl fmt::Debug for AuditChainField<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::U64(value) => formatter.debug_tuple("U64").field(value).finish(),
+            Self::Bytes(value) => formatter
+                .debug_struct("Bytes")
+                .field("byte_len", &value.len())
+                .finish(),
+            Self::Text(value) => formatter
+                .debug_struct("Text")
+                .field("byte_len", &value.len())
+                .finish(),
+            Self::OptionalText(value) => formatter
+                .debug_struct("OptionalText")
+                .field("present", &value.is_some())
+                .field("byte_len", &value.map_or(0, str::len))
+                .finish(),
+            Self::Hash(_) => formatter.write_str("Hash(<redacted>)"),
+        }
+    }
+}
+
+/// Maximum canonical input accepted by [`calculate_audit_chain_hmac`].
+pub(crate) const MAX_CANONICAL_AUDIT_CHAIN_BYTES: usize = 1024 * 1024;
+
+/// Authenticate a typed, domain-separated canonical audit-chain field stream.
+///
+/// This is the shared HMAC boundary for durable audit adapters. It deliberately
+/// returns only the MAC and never exposes key bytes. Callers must include the
+/// predecessor hash as a [`AuditChainField::Hash`] when authenticating a linked
+/// record.
+pub(crate) fn calculate_audit_chain_hmac(
+    audit_key: &AuditKey,
+    domain: AuditChainDomain,
+    fields: &[AuditChainField<'_>],
+) -> Result<[u8; 32], PersistError> {
+    let field_count = u32::try_from(fields.len()).map_err(|_| {
+        PersistError::constraint_violation("audit chain field count exceeds its durable bound")
+    })?;
+    let domain_bytes = domain.as_bytes();
+    let mut encoded_len = domain_bytes
+        .len()
+        .checked_add(std::mem::size_of::<u32>())
+        .ok_or_else(|| PersistError::constraint_violation("audit chain input is too large"))?;
+    for field in fields {
+        let field_len = match field {
+            AuditChainField::U64(_) => 1 + std::mem::size_of::<u64>(),
+            AuditChainField::Bytes(bytes) => checked_variable_audit_field_len(bytes.len(), false)?,
+            AuditChainField::Text(text) => checked_variable_audit_field_len(text.len(), false)?,
+            AuditChainField::OptionalText(Some(text)) => {
+                checked_variable_audit_field_len(text.len(), true)?
+            }
+            AuditChainField::OptionalText(None) => 2,
+            AuditChainField::Hash(_) => 1 + 32,
+        };
+        encoded_len = encoded_len
+            .checked_add(field_len)
+            .ok_or_else(|| PersistError::constraint_violation("audit chain input is too large"))?;
+    }
+    if encoded_len > MAX_CANONICAL_AUDIT_CHAIN_BYTES {
+        return Err(PersistError::constraint_violation(
+            "audit chain input exceeds its canonical byte bound",
+        ));
+    }
+
+    let mut input = Vec::with_capacity(encoded_len);
+    input.extend_from_slice(domain_bytes);
+    input.extend_from_slice(&field_count.to_be_bytes());
+    for field in fields {
+        match field {
+            AuditChainField::U64(value) => {
+                input.push(1);
+                input.extend_from_slice(&value.to_be_bytes());
+            }
+            AuditChainField::Bytes(bytes) => {
+                input.push(2);
+                encode_audit_chain_bytes(&mut input, bytes)?;
+            }
+            AuditChainField::Text(text) => {
+                input.push(3);
+                encode_audit_chain_bytes(&mut input, text.as_bytes())?;
+            }
+            AuditChainField::OptionalText(None) => {
+                input.push(4);
+                input.push(0);
+            }
+            AuditChainField::OptionalText(Some(text)) => {
+                input.push(4);
+                input.push(1);
+                encode_audit_chain_bytes(&mut input, text.as_bytes())?;
+            }
+            AuditChainField::Hash(hash) => {
+                input.push(5);
+                input.extend_from_slice(*hash);
+            }
+        }
+    }
+    if input.len() != encoded_len {
+        return Err(PersistError::constraint_violation(
+            "audit chain canonical length is inconsistent",
+        ));
+    }
+    audit_key.authenticate_canonical(&input)
+}
+
+fn checked_variable_audit_field_len(
+    value_len: usize,
+    optional: bool,
+) -> Result<usize, PersistError> {
+    let _ = u32::try_from(value_len).map_err(|_| {
+        PersistError::constraint_violation("audit chain field exceeds its durable byte bound")
+    })?;
+    1_usize
+        .checked_add(usize::from(optional))
+        .and_then(|len| len.checked_add(std::mem::size_of::<u32>()))
+        .and_then(|len| len.checked_add(value_len))
+        .ok_or_else(|| PersistError::constraint_violation("audit chain input is too large"))
+}
+
+fn encode_audit_chain_bytes(input: &mut Vec<u8>, value: &[u8]) -> Result<(), PersistError> {
+    let len = u32::try_from(value.len()).map_err(|_| {
+        PersistError::constraint_violation("audit chain field exceeds its durable byte bound")
+    })?;
+    input.extend_from_slice(&len.to_be_bytes());
+    input.extend_from_slice(value);
+    Ok(())
+}
+
+#[cfg(test)]
+mod audit_chain_encoding_tests {
+    use super::AuditChainField;
+
+    #[test]
+    fn canonical_field_debug_redacts_all_value_bearing_variants() {
+        const CANARY: &str = "tenant-principal-canary";
+        let hash = [0x41; 32];
+        let fields = [
+            AuditChainField::Bytes(CANARY.as_bytes()),
+            AuditChainField::Text(CANARY),
+            AuditChainField::OptionalText(Some(CANARY)),
+            AuditChainField::Hash(&hash),
+        ];
+
+        let rendered = format!("{fields:?}");
+        assert!(!rendered.contains(CANARY));
+        assert!(!rendered.contains("65, 65"));
+        assert!(rendered.contains("byte_len"));
+        assert!(rendered.contains("Hash(<redacted>)"));
     }
 }
 

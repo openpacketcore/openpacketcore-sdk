@@ -928,6 +928,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         "opc-consensus",
         "opc-gnmi-server",
         "opc-ipsec-lb",
+        "opc-mgmt-audit-store",
         "opc-mgmt-authz",
         "opc-mgmt-transport",
         "opc-netconf-server",
@@ -945,7 +946,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         "operator-lifecycle",
         "operator-lifecycle-cli",
     ]);
-    assert_eq!(source_build_only.len(), 27);
+    assert_eq!(source_build_only.len(), 28);
     let mut computed_source_closure =
         BTreeSet::from(["opc-consensus", "opc-persist", "opc-session-store"]);
     loop {

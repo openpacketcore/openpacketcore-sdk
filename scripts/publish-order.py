@@ -55,7 +55,10 @@ FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY = {
     "operator-lifecycle",
     "operator-lifecycle-cli",
 }
-POST_V2_SOURCE_BUILD_ONLY_ADDITIONS = {"opc-config-bus-consensus"}
+POST_V2_SOURCE_BUILD_ONLY_ADDITIONS = {
+    "opc-config-bus-consensus",
+    "opc-mgmt-audit-store",
+}
 SOURCE_BUILD_ONLY = (
     FROZEN_SESSION_HA_V2_SOURCE_BUILD_ONLY | POST_V2_SOURCE_BUILD_ONLY_ADDITIONS
 )

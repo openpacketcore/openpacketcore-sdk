@@ -2670,6 +2670,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-mgmt-audit-store"
+version = "0.2.0"
+dependencies = [
+ "opc-config-model",
+ "opc-mgmt-audit",
+ "opc-persist",
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "opc-mgmt-authz"
 version = "0.2.0"
 dependencies = [
