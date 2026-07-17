@@ -29,7 +29,8 @@ use opc_session_net::{
 };
 use opc_session_store::{
     validate_session_ttl, OwnerId, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, MAX_REPLICATION_LOG_PAGE_ENTRIES, STABLE_ID_MAX_BYTES,
+    ReplicaId, ReplicaTlsIdentity, StateType, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, STABLE_ID_MAX_BYTES,
 };
 use opc_tls::{TlsMaterialAvailability, TlsMaterialReloadReason, TlsMaterialStatus};
 use opc_types::{SpiffeId, Timestamp};
@@ -120,13 +121,64 @@ pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON: &str =
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES: usize = 64 * 1024;
 
 /// Version of the private node configuration and control protocol.
-pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 3;
+pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 4;
 /// Maximum accepted node configuration document.
 pub const QUALIFICATION_MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Maximum accepted control request or response line.
 pub const QUALIFICATION_MAX_CONTROL_LINE_BYTES: usize = 16 * 1024;
 /// Maximum number of synthetic payload bytes admitted by the node harness.
 pub const QUALIFICATION_MAX_VALUE_BYTES: usize = 512;
+/// Maximum number of compare-and-set slots admitted by one v5 collector batch.
+///
+/// The production consensus adapter executes batch slots sequentially. Two
+/// slots therefore consume at most two fixed operation-timeout envelopes and
+/// still leave room for a separately scheduled readiness observation inside
+/// the v5 checker's 60-second sampling cadence.
+pub const QUALIFICATION_CONCURRENT_BATCH_MAX_SLOTS: usize = 2;
+/// Maximum number of real CAS observations returned by one bounded v5
+/// watch or restore collector operation.
+pub const QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS: usize = 24;
+/// Maximum committed application-journal entries one finish operation may
+/// consume, including entries that contain no matching v5 CAS record.
+///
+/// This is capped by the 24-record control-frame bound and remains below the
+/// production watch stream's 64-entry live channel. The collector fails
+/// closed instead of trying to drain an already overrun live stream.
+pub const QUALIFICATION_CONCURRENT_COLLECTOR_MAX_JOURNAL_ENTRIES: u64 = 24;
+/// Maximum restore pages inspected by one v5 collector command.
+///
+/// The second page exists only to prove completeness or report the fixed
+/// record overflow; no unbounded cursor walk is admitted.
+pub const QUALIFICATION_CONCURRENT_RESTORE_MAX_PAGES: usize = 2;
+/// Maximum simultaneously retained v5 collector watch subscriptions in one
+/// qualification child.
+pub const QUALIFICATION_CONCURRENT_WATCH_MAX_SUBSCRIPTIONS: usize = 8;
+/// Maximum collector commands in flight against one qualification child.
+///
+/// Future collectors must await the terminal reply before sending another
+/// command to that node. In particular, readiness is scheduled only after a
+/// long control returns; this does not claim arbitrary same-node overlap.
+pub const QUALIFICATION_CONCURRENT_MAX_IN_FLIGHT_COMMANDS_PER_NODE: usize = 1;
+/// Versioned v5 collector command scheduling discipline.
+pub const QUALIFICATION_CONCURRENT_COMMAND_SCHEDULING_PROFILE: &str =
+    "one-in-flight-terminal-then-readiness/v1";
+/// Bounded local IPC delivery allowance for collector timing arithmetic.
+pub const QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS: u64 = 1_000;
+/// Maximum two-stage batch/restore response envelope.
+pub const QUALIFICATION_CONCURRENT_LONG_CONTROL_RESPONSE_MILLIS: u64 =
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS * 2 + QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS;
+/// Maximum three-stage readiness response envelope: recovery-pending read,
+/// Openraft barrier, then the separately linearized application-journal head.
+pub const QUALIFICATION_CONCURRENT_READINESS_RESPONSE_MILLIS: u64 =
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS * 3 + QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS;
+/// Maximum v5 independent-checker readiness sampling cadence.
+pub const QUALIFICATION_CONCURRENT_READINESS_CADENCE_MILLIS: u64 = 60_000;
+/// Maximum UTF-8 length of one private collector subscription identifier.
+pub const QUALIFICATION_CONCURRENT_SUBSCRIPTION_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 length of one history identifier before digest derivation.
+pub const QUALIFICATION_CONCURRENT_HISTORY_ID_MAX_BYTES: usize = 128;
+/// Prefix of the history-derived state type reserved for v5 collector data.
+pub const QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX: &str = "opc-session-ha-concurrent/";
 /// Maximum retained lease handles in one qualification child.
 pub const QUALIFICATION_MAX_LEASE_HANDLES: usize = 1024;
 /// Explicit inbound consensus connection-slot limit used by fleet resource
@@ -351,10 +403,30 @@ pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET
 pub const QUALIFICATION_OPERATION_TIMEOUT_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
 /// Parent-side bound for one child command response. Mutation shutdown retains
-/// a stricter 30-second campaign SLO; this additional 15 seconds lets the
-/// parent receive a typed terminal failure after one already-accepted backend
-/// operation reaches its fixed 10-second terminal bound.
+/// a stricter 30-second campaign SLO. The v5 collector arithmetic additionally
+/// keeps both its bounded two-stage long control and its conservative
+/// three-stage readiness command below this isolated-response ceiling.
 pub const QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS: u64 = 45_000;
+const _: () = {
+    assert!(QUALIFICATION_CONCURRENT_MAX_IN_FLIGHT_COMMANDS_PER_NODE == 1);
+    assert!(
+        QUALIFICATION_CONCURRENT_COLLECTOR_MAX_JOURNAL_ENTRIES as usize
+            <= MAX_REPLICATION_WATCH_BACKLOG_ENTRIES
+    );
+    assert!(
+        QUALIFICATION_CONCURRENT_LONG_CONTROL_RESPONSE_MILLIS
+            < QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS
+    );
+    assert!(
+        QUALIFICATION_CONCURRENT_READINESS_RESPONSE_MILLIS
+            < QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS
+    );
+    assert!(
+        QUALIFICATION_CONCURRENT_LONG_CONTROL_RESPONSE_MILLIS
+            + QUALIFICATION_CONCURRENT_READINESS_RESPONSE_MILLIS
+            <= QUALIFICATION_CONCURRENT_READINESS_CADENCE_MILLIS
+    );
+};
 /// Remaining-validity budget of the same-issuer SVID used by the bounded
 /// fault/expiry campaign.
 pub const QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS: u64 = 75_000;
@@ -2299,7 +2371,13 @@ fn is_bounded_label(value: &str, maximum: usize) -> bool {
 
 /// Return the exact evidence digest for one synthetic qualification key.
 pub fn qualification_key_sha256(value: &str) -> String {
-    qualification_digest("key", value.as_bytes())
+    qualification_key_bytes_sha256(value.as_bytes())
+}
+
+/// Return the exact evidence digest for one synthetic qualification key's
+/// stable byte representation.
+pub fn qualification_key_bytes_sha256(value: &[u8]) -> String {
+    qualification_digest("key", value)
 }
 
 /// Return the exact evidence digest for one synthetic qualification owner.
@@ -2310,6 +2388,31 @@ pub fn qualification_owner_sha256(value: &str) -> String {
 /// Return the exact evidence digest for a synthetic qualification value.
 pub fn qualification_value_sha256(value: &[u8]) -> String {
     qualification_digest("value", value)
+}
+
+/// Return the exact evidence digest for one validated session state type.
+pub fn qualification_state_type_sha256(value: &str) -> String {
+    qualification_digest("state-type", value.as_bytes())
+}
+
+/// Derive the unique bounded state type used by one v5 concurrent history.
+///
+/// The history identifier itself never needs to cross the child control
+/// boundary. Its domain-separated digest is the only identity retained in
+/// the encrypted record's state discriminator.
+pub fn qualification_concurrent_state_type(
+    history_id: &str,
+) -> Result<QualificationConcurrentStateType, QualificationCommandError> {
+    if !is_bounded_label(history_id, QUALIFICATION_CONCURRENT_HISTORY_ID_MAX_BYTES) {
+        return Err(QualificationCommandError::StateType);
+    }
+    let digest = qualification_digest("concurrent-history", history_id.as_bytes());
+    let digest = digest
+        .strip_prefix("sha256:")
+        .ok_or(QualificationCommandError::StateType)?;
+    QualificationConcurrentStateType::new(format!(
+        "{QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX}{digest}"
+    ))
 }
 
 /// Exact deterministic seed for the 3/5-voter traffic/resource workload.
@@ -2569,6 +2672,255 @@ fn is_admissible_deployed_bind_ip(ip: IpAddr) -> bool {
     !matches!(ip, IpAddr::V4(address) if address == Ipv4Addr::BROADCAST)
 }
 
+/// Opaque private-control identifier for one retained concurrent watch.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct QualificationConcurrentSubscriptionId(String);
+
+impl QualificationConcurrentSubscriptionId {
+    /// Validate and construct one bounded subscription identifier.
+    pub fn new(value: impl Into<String>) -> Result<Self, QualificationCommandError> {
+        let value = value.into();
+        if !is_bounded_label(&value, QUALIFICATION_CONCURRENT_SUBSCRIPTION_ID_MAX_BYTES) {
+            return Err(QualificationCommandError::SubscriptionId);
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the validated identifier for exact in-process correlation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn validate(&self) -> Result<(), QualificationCommandError> {
+        Self::new(self.0.clone()).map(|_| ())
+    }
+}
+
+impl fmt::Debug for QualificationConcurrentSubscriptionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("QualificationConcurrentSubscriptionId(<redacted>)")
+    }
+}
+
+impl<'de> Deserialize<'de> for QualificationConcurrentSubscriptionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(|_| {
+            <D::Error as serde::de::Error>::custom(
+                "qualification concurrent subscription ID is malformed",
+            )
+        })
+    }
+}
+
+/// History-derived state discriminator for v5 concurrent collector records.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct QualificationConcurrentStateType(String);
+
+impl QualificationConcurrentStateType {
+    /// Validate one exact history-derived state discriminator.
+    pub fn new(value: impl Into<String>) -> Result<Self, QualificationCommandError> {
+        let value = value.into();
+        StateType::new(value.clone()).map_err(|_| QualificationCommandError::StateType)?;
+        let Some(digest) = value.strip_prefix(QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX) else {
+            return Err(QualificationCommandError::StateType);
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(QualificationCommandError::StateType);
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the validated state discriminator for encrypted store access.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn validate(&self) -> Result<(), QualificationCommandError> {
+        Self::new(self.0.clone()).map(|_| ())
+    }
+}
+
+impl fmt::Debug for QualificationConcurrentStateType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("QualificationConcurrentStateType(<redacted>)")
+    }
+}
+
+impl<'de> Deserialize<'de> for QualificationConcurrentStateType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(|_| {
+            <D::Error as serde::de::Error>::custom(
+                "qualification concurrent state type is malformed",
+            )
+        })
+    }
+}
+
+/// One bounded compare-and-set slot submitted through the v5 collector.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationConcurrentBatchSlot {
+    /// Existing process-local lease handle authorizing this slot.
+    pub lease_handle: String,
+    /// Stable ID in the qualification-only tenant/NF/key scope.
+    pub stable_id: String,
+    /// Required current generation, or absence for a create.
+    pub expected_generation: Option<u64>,
+    /// Generation installed when the expectation holds.
+    pub new_generation: u64,
+    /// Unique history-derived state type for this campaign.
+    pub state_type: QualificationConcurrentStateType,
+    /// Bounded synthetic plaintext encrypted by the existing protected store.
+    pub value: String,
+}
+
+impl QualificationConcurrentBatchSlot {
+    fn validate(&self) -> Result<(), QualificationCommandError> {
+        validate_handle(&self.lease_handle)?;
+        validate_stable_id(&self.stable_id)?;
+        self.state_type.validate()?;
+        if self.new_generation == 0
+            || self
+                .expected_generation
+                .is_some_and(|current| current >= self.new_generation)
+        {
+            return Err(QualificationCommandError::Generation);
+        }
+        if self.value.len() > QUALIFICATION_MAX_VALUE_BYTES {
+            return Err(QualificationCommandError::Value);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for QualificationConcurrentBatchSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QualificationConcurrentBatchSlot")
+            .field("expected_generation", &self.expected_generation)
+            .field("new_generation", &self.new_generation)
+            .field("value_bytes", &self.value.len())
+            .field("identifiers", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Exhaustive fixed command-kind inventory for bounded collector diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationNodeCommandKind {
+    /// Validate and open the configured node runtime.
+    Configure,
+    /// Initialize the configured consensus cluster.
+    Initialize,
+    /// Probe the legacy durable-readiness view.
+    Probe,
+    /// Probe strict consensus readiness plus the application-journal head.
+    ProbeConcurrentReadiness,
+    /// Inspect the projected SVID source.
+    ProjectedSourceStatus,
+    /// Inspect the admitted TLS material.
+    MaterialStatus,
+    /// Read the current connection reauthentication generation.
+    ReauthenticationGeneration,
+    /// Advance the connection reauthentication generation.
+    RequestReauthentication,
+    /// Exercise one directed authenticated peer connection.
+    DirectedHandshake,
+    /// Read bounded connection-lifecycle metrics.
+    LifecycleMetrics,
+    /// Change the qualification-only consensus RPC fault gate.
+    SetConsensusRpcAvailability,
+    /// Read bounded security metrics.
+    SecurityMetrics,
+    /// Start the deterministic traffic watch.
+    StartTrafficWatch,
+    /// Reconcile the deterministic traffic watch after restart.
+    ReconcileTrafficWatch,
+    /// Start the deterministic traffic mutation task.
+    StartTrafficMutation,
+    /// Stop the deterministic traffic mutation task.
+    StopTrafficMutation,
+    /// Stop the deterministic traffic watch.
+    StopTrafficWatch,
+    /// Read traffic state with a linearized journal head.
+    TrafficStatus,
+    /// Read the existing traffic observation without another backend call.
+    TrafficStatusSnapshot,
+    /// Register a bounded v5 collector watch.
+    StartConcurrentWatch,
+    /// Consume a v5 collector watch through an exact terminal sequence.
+    FinishConcurrentWatch,
+    /// Drop a retained v5 collector watch.
+    AbortConcurrentWatch,
+    /// Submit a bounded v5 compare-and-set batch.
+    ConcurrentBatch,
+    /// Scan one bounded v5 restore scope.
+    ConcurrentRestore,
+    /// Acquire a qualification lease.
+    Acquire,
+    /// Apply one legacy qualification compare-and-set operation.
+    CompareAndSet,
+    /// Read one legacy qualification record.
+    Get,
+    /// Release a qualification lease.
+    Release,
+    /// Forget one process-local qualification lease handle.
+    ForgetLease,
+    /// Shut down the qualification child.
+    Shutdown,
+}
+
+impl QualificationNodeCommandKind {
+    /// Complete command inventory in stable protocol order.
+    pub const ALL: &'static [Self] = &[
+        Self::Configure,
+        Self::Initialize,
+        Self::Probe,
+        Self::ProbeConcurrentReadiness,
+        Self::ProjectedSourceStatus,
+        Self::MaterialStatus,
+        Self::ReauthenticationGeneration,
+        Self::RequestReauthentication,
+        Self::DirectedHandshake,
+        Self::LifecycleMetrics,
+        Self::SetConsensusRpcAvailability,
+        Self::SecurityMetrics,
+        Self::StartTrafficWatch,
+        Self::ReconcileTrafficWatch,
+        Self::StartTrafficMutation,
+        Self::StopTrafficMutation,
+        Self::StopTrafficWatch,
+        Self::TrafficStatus,
+        Self::TrafficStatusSnapshot,
+        Self::StartConcurrentWatch,
+        Self::FinishConcurrentWatch,
+        Self::AbortConcurrentWatch,
+        Self::ConcurrentBatch,
+        Self::ConcurrentRestore,
+        Self::Acquire,
+        Self::CompareAndSet,
+        Self::Get,
+        Self::Release,
+        Self::ForgetLease,
+        Self::Shutdown,
+    ];
+}
+
 /// Bounded commands accepted by one qualification child process.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -2576,6 +2928,9 @@ pub enum QualificationNodeCommand {
     Configure,
     Initialize,
     Probe,
+    /// Probe strict Openraft readiness, then independently linearize the
+    /// application-journal head used by v5 history collection.
+    ProbeConcurrentReadiness,
     ProjectedSourceStatus,
     MaterialStatus,
     /// Return the process-local connection reauthentication generation.
@@ -2621,6 +2976,31 @@ pub enum QualificationNodeCommand {
     /// uses this non-intrusive view; authoritative watch-head settlement keeps
     /// using `TrafficStatus`.
     TrafficStatusSnapshot,
+    /// Register one real applied-state watch after the supplied committed
+    /// application-journal sequence.
+    StartConcurrentWatch {
+        subscription_id: QualificationConcurrentSubscriptionId,
+        requested_after_journal_sequence: u64,
+    },
+    /// Consume the retained real watch through one exact terminal
+    /// application-journal sequence.
+    FinishConcurrentWatch {
+        subscription_id: QualificationConcurrentSubscriptionId,
+        complete_through_journal_sequence: u64,
+    },
+    /// Idempotently drop one retained real watch without consuming it.
+    AbortConcurrentWatch {
+        subscription_id: QualificationConcurrentSubscriptionId,
+    },
+    /// Submit one bounded batch through the protected production store path.
+    ConcurrentBatch {
+        slots: Vec<QualificationConcurrentBatchSlot>,
+    },
+    /// Return a complete bounded restore view for one history-derived state
+    /// type in the fixed qualification tenant/NF/key scope.
+    ConcurrentRestore {
+        state_type: QualificationConcurrentStateType,
+    },
     Acquire {
         lease_handle: String,
         stable_id: String,
@@ -2659,6 +3039,9 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::Configure => formatter.write_str("QualificationNodeCommand::Configure"),
             Self::Initialize => formatter.write_str("QualificationNodeCommand::Initialize"),
             Self::Probe => formatter.write_str("QualificationNodeCommand::Probe"),
+            Self::ProbeConcurrentReadiness => {
+                formatter.write_str("QualificationNodeCommand::ProbeConcurrentReadiness")
+            }
             Self::ProjectedSourceStatus => {
                 formatter.write_str("QualificationNodeCommand::ProjectedSourceStatus")
             }
@@ -2702,6 +3085,38 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::TrafficStatusSnapshot => {
                 formatter.write_str("QualificationNodeCommand::TrafficStatusSnapshot")
             }
+            Self::StartConcurrentWatch {
+                requested_after_journal_sequence,
+                ..
+            } => formatter
+                .debug_struct("QualificationNodeCommand::StartConcurrentWatch")
+                .field(
+                    "requested_after_journal_sequence",
+                    requested_after_journal_sequence,
+                )
+                .field("subscription_id", &"<redacted>")
+                .finish(),
+            Self::FinishConcurrentWatch {
+                complete_through_journal_sequence,
+                ..
+            } => formatter
+                .debug_struct("QualificationNodeCommand::FinishConcurrentWatch")
+                .field(
+                    "complete_through_journal_sequence",
+                    complete_through_journal_sequence,
+                )
+                .field("subscription_id", &"<redacted>")
+                .finish(),
+            Self::AbortConcurrentWatch { .. } => {
+                formatter.write_str("QualificationNodeCommand::AbortConcurrentWatch")
+            }
+            Self::ConcurrentBatch { slots } => formatter
+                .debug_struct("QualificationNodeCommand::ConcurrentBatch")
+                .field("slot_count", &slots.len())
+                .finish(),
+            Self::ConcurrentRestore { .. } => {
+                formatter.write_str("QualificationNodeCommand::ConcurrentRestore")
+            }
             Self::Acquire { .. } => formatter.write_str("QualificationNodeCommand::Acquire"),
             Self::CompareAndSet { value, .. } => formatter
                 .debug_struct("QualificationNodeCommand::CompareAndSet")
@@ -2718,6 +3133,50 @@ impl fmt::Debug for QualificationNodeCommand {
 }
 
 impl QualificationNodeCommand {
+    /// Return the exhaustive fixed kind used by timeout/error diagnostics.
+    pub const fn kind(&self) -> QualificationNodeCommandKind {
+        match self {
+            Self::Configure => QualificationNodeCommandKind::Configure,
+            Self::Initialize => QualificationNodeCommandKind::Initialize,
+            Self::Probe => QualificationNodeCommandKind::Probe,
+            Self::ProbeConcurrentReadiness => {
+                QualificationNodeCommandKind::ProbeConcurrentReadiness
+            }
+            Self::ProjectedSourceStatus => QualificationNodeCommandKind::ProjectedSourceStatus,
+            Self::MaterialStatus => QualificationNodeCommandKind::MaterialStatus,
+            Self::ReauthenticationGeneration => {
+                QualificationNodeCommandKind::ReauthenticationGeneration
+            }
+            Self::RequestReauthentication => QualificationNodeCommandKind::RequestReauthentication,
+            Self::DirectedHandshake { .. } => QualificationNodeCommandKind::DirectedHandshake,
+            Self::LifecycleMetrics => QualificationNodeCommandKind::LifecycleMetrics,
+            Self::SetConsensusRpcAvailability { .. } => {
+                QualificationNodeCommandKind::SetConsensusRpcAvailability
+            }
+            Self::SecurityMetrics => QualificationNodeCommandKind::SecurityMetrics,
+            Self::StartTrafficWatch => QualificationNodeCommandKind::StartTrafficWatch,
+            Self::ReconcileTrafficWatch => QualificationNodeCommandKind::ReconcileTrafficWatch,
+            Self::StartTrafficMutation => QualificationNodeCommandKind::StartTrafficMutation,
+            Self::StopTrafficMutation => QualificationNodeCommandKind::StopTrafficMutation,
+            Self::StopTrafficWatch => QualificationNodeCommandKind::StopTrafficWatch,
+            Self::TrafficStatus => QualificationNodeCommandKind::TrafficStatus,
+            Self::TrafficStatusSnapshot => QualificationNodeCommandKind::TrafficStatusSnapshot,
+            Self::StartConcurrentWatch { .. } => QualificationNodeCommandKind::StartConcurrentWatch,
+            Self::FinishConcurrentWatch { .. } => {
+                QualificationNodeCommandKind::FinishConcurrentWatch
+            }
+            Self::AbortConcurrentWatch { .. } => QualificationNodeCommandKind::AbortConcurrentWatch,
+            Self::ConcurrentBatch { .. } => QualificationNodeCommandKind::ConcurrentBatch,
+            Self::ConcurrentRestore { .. } => QualificationNodeCommandKind::ConcurrentRestore,
+            Self::Acquire { .. } => QualificationNodeCommandKind::Acquire,
+            Self::CompareAndSet { .. } => QualificationNodeCommandKind::CompareAndSet,
+            Self::Get { .. } => QualificationNodeCommandKind::Get,
+            Self::Release { .. } => QualificationNodeCommandKind::Release,
+            Self::ForgetLease { .. } => QualificationNodeCommandKind::ForgetLease,
+            Self::Shutdown => QualificationNodeCommandKind::Shutdown,
+        }
+    }
+
     /// Validate all attacker-controlled fields before a backend or provider is
     /// consulted by the child process.
     pub fn validate(&self) -> Result<(), QualificationCommandError> {
@@ -2725,6 +3184,7 @@ impl QualificationNodeCommand {
             Self::Configure
             | Self::Initialize
             | Self::Probe
+            | Self::ProbeConcurrentReadiness
             | Self::ProjectedSourceStatus
             | Self::MaterialStatus
             | Self::ReauthenticationGeneration
@@ -2782,6 +3242,29 @@ impl QualificationNodeCommand {
             Self::Release { lease_handle } | Self::ForgetLease { lease_handle } => {
                 validate_handle(lease_handle)
             }
+            Self::StartConcurrentWatch {
+                subscription_id,
+                requested_after_journal_sequence,
+            } => {
+                subscription_id.validate()?;
+                if *requested_after_journal_sequence == u64::MAX {
+                    return Err(QualificationCommandError::JournalSequence);
+                }
+                Ok(())
+            }
+            Self::FinishConcurrentWatch {
+                subscription_id, ..
+            }
+            | Self::AbortConcurrentWatch { subscription_id } => subscription_id.validate(),
+            Self::ConcurrentBatch { slots } => {
+                if slots.is_empty() || slots.len() > QUALIFICATION_CONCURRENT_BATCH_MAX_SLOTS {
+                    return Err(QualificationCommandError::BatchSlots);
+                }
+                slots
+                    .iter()
+                    .try_for_each(QualificationConcurrentBatchSlot::validate)
+            }
+            Self::ConcurrentRestore { state_type } => state_type.validate(),
         }
     }
 }
@@ -2807,20 +3290,207 @@ fn validate_stable_id(value: &str) -> Result<(), QualificationCommandError> {
 /// Fixed validation failures for the child control boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QualificationCommandError {
+    /// A referenced qualification node index is outside the supported fleet.
     #[error("qualification node index is invalid")]
     NodeIndex,
+    /// A process-local lease handle is empty, oversized, or noncanonical.
     #[error("qualification lease handle is invalid")]
     LeaseHandle,
+    /// A stable session identifier violates the store bound.
     #[error("qualification stable ID is invalid")]
     StableId,
+    /// A lease owner violates the session-store model.
     #[error("qualification owner is invalid")]
     Owner,
+    /// A requested lease lifetime violates the store policy.
     #[error("qualification TTL is invalid")]
     Ttl,
+    /// A compare-and-set generation does not advance its expectation.
     #[error("qualification generation is invalid")]
     Generation,
+    /// A synthetic value exceeds the control boundary.
     #[error("qualification value is invalid")]
     Value,
+    /// A v5 batch is empty or exceeds its fixed slot bound.
+    #[error("qualification concurrent batch slot count is invalid")]
+    BatchSlots,
+    /// A v5 watch subscription identifier is noncanonical.
+    #[error("qualification concurrent subscription ID is invalid")]
+    SubscriptionId,
+    /// A v5 application-journal cursor cannot advance safely.
+    #[error("qualification application-journal sequence is invalid")]
+    JournalSequence,
+    /// A v5 state type is not the exact history-derived form.
+    #[error("qualification concurrent state type is invalid")]
+    StateType,
+}
+
+/// Fixed v5 readiness view with Openraft and application-journal index
+/// domains represented separately.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationConcurrentReadiness {
+    /// Whether every strict readiness and journal-head condition succeeded.
+    pub ready: bool,
+    /// Stable reason for the readiness decision.
+    pub reason_code: QualificationReadinessCode,
+    /// Stable local consensus node identifier.
+    pub node_id: u64,
+    /// Number of voters reported by the fresh readiness operation.
+    pub configured_voters: usize,
+    /// Exact manifest-bound voter identifiers expected by this child.
+    pub configured_voter_ids: Vec<u64>,
+    /// Minimum distinct voters proven freshly reachable.
+    pub fresh_reachable_voters: usize,
+    /// Minimum distinct voters whose agreement was committed.
+    pub agreeing_voters: usize,
+    /// Majority size required by the configured topology.
+    pub required_quorum: usize,
+    /// Openraft authority fields are absent unless both the readiness barrier
+    /// and the independent journal-head read completed successfully.
+    pub raft_term: Option<u64>,
+    pub raft_leader_id: Option<u64>,
+    pub raft_commit_index: Option<u64>,
+    pub raft_applied_index: Option<u64>,
+    /// Linearizably observed committed application-journal head. This value is
+    /// never compared numerically with an Openraft index.
+    pub journal_head: Option<u64>,
+}
+
+impl fmt::Debug for QualificationConcurrentReadiness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QualificationConcurrentReadiness")
+            .field("ready", &self.ready)
+            .field("reason_code", &self.reason_code)
+            .field("configured_voters", &self.configured_voters)
+            .field("fresh_reachable_voters", &self.fresh_reachable_voters)
+            .field("agreeing_voters", &self.agreeing_voters)
+            .field("required_quorum", &self.required_quorum)
+            .field("authority", &self.journal_head.is_some())
+            .field("identities", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Fixed state class emitted by v5 attempted/committed record evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QualificationConcurrentStateClass {
+    /// Authoritative session state protected by lease fencing.
+    AuthoritativeSession,
+}
+
+/// Digest-only attempted mutation returned for one batch slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationConcurrentMutationSnapshot {
+    /// Domain-separated digest of the attempted session key.
+    pub key_sha256: String,
+    /// Generation expected by the compare-and-set attempt.
+    pub expected_generation: Option<u64>,
+    /// Generation proposed by the compare-and-set attempt.
+    pub new_generation: u64,
+    /// Domain-separated digest of the lease owner.
+    pub owner_sha256: String,
+    /// Fencing token authorizing the attempt.
+    pub fence: u64,
+    /// State-class contract for the attempted record.
+    pub state_class: QualificationConcurrentStateClass,
+    /// Domain-separated digest of the history-derived state type.
+    pub state_type_sha256: String,
+    /// Optional expiry instant; v5 collector records require absence.
+    pub expires_at_ns: Option<i64>,
+    /// Domain-separated digest of the attempted plaintext value.
+    pub value_sha256: String,
+}
+
+/// Digest-only committed record returned by watch and restore collectors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationConcurrentRecordSnapshot {
+    /// Domain-separated digest of the committed session key.
+    pub key_sha256: String,
+    /// Committed record generation.
+    pub generation: u64,
+    /// Domain-separated digest of the committed lease owner.
+    pub owner_sha256: String,
+    /// Committed fencing token.
+    pub fence: u64,
+    /// State-class contract for the committed record.
+    pub state_class: QualificationConcurrentStateClass,
+    /// Domain-separated digest of the committed state type.
+    pub state_type_sha256: String,
+    /// Optional expiry instant; v5 collector records require absence.
+    pub expires_at_ns: Option<i64>,
+    /// Domain-separated digest of the committed plaintext value.
+    pub value_sha256: String,
+}
+
+/// Typed outcome for one real protected-store batch slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationConcurrentBatchSlotOutcome {
+    /// The compare-and-set mutation committed.
+    Success,
+    /// The compare-and-set expectation did not match.
+    Conflict,
+    /// Cancellation or acknowledgement loss made the outcome unknowable.
+    Indeterminate,
+    /// The store rejected the attempt before a committed outcome was known.
+    Unavailable,
+}
+
+/// Aggregate outcome for one bounded protected-store batch call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationConcurrentBatchOutcome {
+    /// Every slot returned one typed result.
+    Completed,
+    /// The batch call may have committed work but returned no complete result.
+    Indeterminate,
+    /// The batch call failed before any committed result was established.
+    Unavailable,
+}
+
+/// One batch result slot. No application-journal sequence is present: the
+/// collector must correlate successful attempts with actual watch events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationConcurrentBatchSlotResult {
+    /// One-based position of this slot in the submitted batch.
+    pub slot_index: usize,
+    /// Typed outcome returned by the protected store.
+    pub outcome: QualificationConcurrentBatchSlotOutcome,
+    /// Digest-only description of the attempted mutation.
+    pub mutation: QualificationConcurrentMutationSnapshot,
+}
+
+impl QualificationConcurrentBatchSlotResult {
+    /// Whether this successful attempted slot exactly matches one real
+    /// committed watch event. The event's application-journal sequence remains
+    /// owned by the collector and is never copied into the child batch reply.
+    pub fn matches_committed_watch_event(&self, event: &QualificationConcurrentWatchEvent) -> bool {
+        self.outcome == QualificationConcurrentBatchSlotOutcome::Success
+            && self.mutation.key_sha256 == event.record.key_sha256
+            && self.mutation.new_generation == event.record.generation
+            && self.mutation.owner_sha256 == event.record.owner_sha256
+            && self.mutation.fence == event.record.fence
+            && self.mutation.state_class == event.record.state_class
+            && self.mutation.state_type_sha256 == event.record.state_type_sha256
+            && self.mutation.expires_at_ns == event.record.expires_at_ns
+            && self.mutation.value_sha256 == event.record.value_sha256
+    }
+}
+
+/// One real committed CAS event consumed from the protected watch stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationConcurrentWatchEvent {
+    /// Committed application-journal position carrying this record.
+    pub journal_sequence: u64,
+    /// Digest-only committed record observed at that position.
+    pub record: QualificationConcurrentRecordSnapshot,
 }
 
 /// Fixed response categories emitted by a qualification child process.
@@ -2859,6 +3529,10 @@ pub enum QualificationNodeReply {
         committed_index: Option<u64>,
         applied_index: Option<u64>,
     },
+    /// Strict v5 readiness plus a separately linearized journal head.
+    ConcurrentReadiness {
+        status: QualificationConcurrentReadiness,
+    },
     ProjectedSourceStatus {
         status: QualificationProjectedSvidStatus,
     },
@@ -2888,6 +3562,36 @@ pub enum QualificationNodeReply {
     },
     TrafficStatus {
         status: QualificationTrafficStatus,
+    },
+    ConcurrentWatchStarted {
+        /// Exact identifier of the retained watch.
+        subscription_id: QualificationConcurrentSubscriptionId,
+        /// Journal position after which delivery begins.
+        requested_after_journal_sequence: u64,
+    },
+    ConcurrentWatchFinished {
+        /// Exact identifier of the consumed watch.
+        subscription_id: QualificationConcurrentSubscriptionId,
+        /// Last journal position proven consumed.
+        complete_through_journal_sequence: u64,
+        /// Matching digest-only CAS records in journal order.
+        events: Vec<QualificationConcurrentWatchEvent>,
+    },
+    ConcurrentWatchAborted {
+        /// Exact identifier removed by the idempotent abort.
+        subscription_id: QualificationConcurrentSubscriptionId,
+    },
+    ConcurrentBatch {
+        /// Aggregate result of the protected-store batch call.
+        outcome: QualificationConcurrentBatchOutcome,
+        /// One typed result for every submitted slot.
+        slots: Vec<QualificationConcurrentBatchSlotResult>,
+    },
+    ConcurrentRestore {
+        /// Whether the returned bounded restore view is complete.
+        complete: bool,
+        /// Complete digest-only records in deterministic key-digest order.
+        records: Vec<QualificationConcurrentRecordSnapshot>,
     },
     LeaseAcquired {
         fence: u64,
@@ -3340,17 +4044,40 @@ pub struct QualificationTrafficStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualificationNodeErrorCode {
+    /// The command or one of its bounded fields was invalid.
     InvalidRequest,
+    /// Consensus cluster initialization did not complete.
     InitializationUnavailable,
+    /// A protected store operation was unavailable.
     BackendUnavailable,
+    /// Lease acquisition or release was rejected.
     LeaseRejected,
+    /// The requested process-local lease handle already exists.
     LeaseHandleDuplicate,
+    /// The requested process-local lease handle does not exist.
     LeaseHandleMissing,
+    /// A compare-and-set mutation was rejected.
     MutationRejected,
+    /// The configured transport could not complete the operation.
     TransportUnavailable,
+    /// Required TLS material was unavailable.
     MaterialUnavailable,
+    /// The directed authenticated handshake could not be proven.
     DirectedHandshakeUnavailable,
+    /// The deterministic traffic task could not complete the operation.
     TrafficUnavailable,
+    /// The requested v5 watch identifier is already retained.
+    ConcurrentWatchDuplicate,
+    /// The requested v5 watch identifier is not retained.
+    ConcurrentWatchMissing,
+    /// The v5 watch could not be registered or consumed safely.
+    ConcurrentWatchUnavailable,
+    /// The requested v5 watch window exceeds its fixed bound.
+    ConcurrentWatchOverflow,
+    /// The v5 restore view could not prove a complete bounded result.
+    ConcurrentRestoreUnavailable,
+    /// The v5 restore scope contains more records than the collector bound.
+    ConcurrentRestoreOverflow,
 }
 
 /// Bounded JSON-line decoding failure.
@@ -3460,6 +4187,365 @@ mod tests {
             .expect("read bounded frame")
             .expect("frame present");
         assert!(matches!(second, QualificationNodeCommand::Probe));
+    }
+
+    fn concurrent_test_state_type() -> QualificationConcurrentStateType {
+        qualification_concurrent_state_type("history-fixture").expect("history-derived state type")
+    }
+
+    fn concurrent_test_record() -> QualificationConcurrentRecordSnapshot {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        QualificationConcurrentRecordSnapshot {
+            key_sha256: digest.clone(),
+            generation: u64::MAX,
+            owner_sha256: digest.clone(),
+            fence: u64::MAX,
+            state_class: QualificationConcurrentStateClass::AuthoritativeSession,
+            state_type_sha256: digest.clone(),
+            expires_at_ns: None,
+            value_sha256: digest,
+        }
+    }
+
+    #[test]
+    fn concurrent_control_contract_is_bounded_strict_and_redacted() {
+        let state_type = concurrent_test_state_type();
+        assert_eq!(
+            state_type,
+            qualification_concurrent_state_type("history-fixture")
+                .expect("deterministic state type")
+        );
+        assert_ne!(
+            state_type,
+            qualification_concurrent_state_type("other-history").expect("unique state type")
+        );
+        assert!(QualificationConcurrentStateType::new("unscoped").is_err());
+        assert!(qualification_concurrent_state_type(" bad-history").is_err());
+        assert!(serde_json::from_str::<QualificationConcurrentStateType>("\"unscoped\"").is_err());
+
+        let subscription_id = QualificationConcurrentSubscriptionId::new("private-subscription")
+            .expect("bounded subscription ID");
+        assert!(serde_json::from_str::<QualificationConcurrentSubscriptionId>("\" bad\"").is_err());
+        let subscription_wire =
+            serde_json::to_string(&subscription_id).expect("encode valid subscription ID");
+        assert_eq!(
+            serde_json::from_str::<QualificationConcurrentSubscriptionId>(&subscription_wire)
+                .expect("decode valid subscription ID"),
+            subscription_id
+        );
+        let state_type_wire =
+            serde_json::to_string(&state_type).expect("encode valid concurrent state type");
+        assert_eq!(
+            serde_json::from_str::<QualificationConcurrentStateType>(&state_type_wire)
+                .expect("decode valid concurrent state type"),
+            state_type
+        );
+        let slot = QualificationConcurrentBatchSlot {
+            lease_handle: "private-lease".to_owned(),
+            stable_id: "private-stable-id".to_owned(),
+            expected_generation: Some(1),
+            new_generation: 2,
+            state_type: state_type.clone(),
+            value: "private-value".to_owned(),
+        };
+        let command = QualificationNodeCommand::ConcurrentBatch {
+            slots: vec![slot.clone()],
+        };
+        command.validate().expect("valid concurrent batch");
+        let debug = format!("{command:?}");
+        for secret in [
+            "private-lease",
+            "private-stable-id",
+            "private-value",
+            state_type.as_str(),
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        let watch = QualificationNodeCommand::StartConcurrentWatch {
+            subscription_id: subscription_id.clone(),
+            requested_after_journal_sequence: 7,
+        };
+        watch.validate().expect("valid watch");
+        assert!(!format!("{watch:?}").contains(subscription_id.as_str()));
+
+        assert!(
+            QualificationNodeCommand::ConcurrentBatch { slots: Vec::new() }
+                .validate()
+                .is_err()
+        );
+        assert!(QualificationNodeCommand::ConcurrentBatch {
+            slots: vec![slot; QUALIFICATION_CONCURRENT_BATCH_MAX_SLOTS + 1]
+        }
+        .validate()
+        .is_err());
+        assert!(QualificationNodeCommand::StartConcurrentWatch {
+            subscription_id,
+            requested_after_journal_sequence: u64::MAX,
+        }
+        .validate()
+        .is_err());
+
+        let unknown = serde_json::json!({
+            "command": "concurrent_batch",
+            "slots": [{
+                "lease_handle": "lease",
+                "stable_id": "stable",
+                "expected_generation": null,
+                "new_generation": 1,
+                "state_type": state_type.as_str(),
+                "value": "value",
+                "unknown": true
+            }]
+        });
+        assert!(serde_json::from_value::<QualificationNodeCommand>(unknown).is_err());
+
+        assert_eq!(QUALIFICATION_CONCURRENT_BATCH_MAX_SLOTS, 2);
+        assert_eq!(QUALIFICATION_CONCURRENT_RESTORE_MAX_PAGES, 2);
+        assert_eq!(QUALIFICATION_CONCURRENT_COLLECTOR_MAX_JOURNAL_ENTRIES, 24);
+        assert_eq!(QUALIFICATION_CONCURRENT_MAX_IN_FLIGHT_COMMANDS_PER_NODE, 1);
+        assert_eq!(
+            QUALIFICATION_CONCURRENT_COMMAND_SCHEDULING_PROFILE,
+            "one-in-flight-terminal-then-readiness/v1"
+        );
+        assert_eq!(
+            QUALIFICATION_CONCURRENT_LONG_CONTROL_RESPONSE_MILLIS,
+            21_000
+        );
+        assert_eq!(QUALIFICATION_CONCURRENT_READINESS_RESPONSE_MILLIS, 31_000);
+        assert!(
+            usize::try_from(QUALIFICATION_CONCURRENT_COLLECTOR_MAX_JOURNAL_ENTRIES)
+                .expect("small collector window")
+                <= MAX_REPLICATION_WATCH_BACKLOG_ENTRIES
+        );
+    }
+
+    #[test]
+    fn concurrent_command_inventory_is_complete_and_unique() {
+        let commands = vec![
+            QualificationNodeCommand::Configure,
+            QualificationNodeCommand::Initialize,
+            QualificationNodeCommand::Probe,
+            QualificationNodeCommand::ProbeConcurrentReadiness,
+            QualificationNodeCommand::ProjectedSourceStatus,
+            QualificationNodeCommand::MaterialStatus,
+            QualificationNodeCommand::ReauthenticationGeneration,
+            QualificationNodeCommand::RequestReauthentication,
+            QualificationNodeCommand::DirectedHandshake {
+                remote_node_index: 1,
+            },
+            QualificationNodeCommand::LifecycleMetrics,
+            QualificationNodeCommand::SetConsensusRpcAvailability {
+                availability: QualificationConsensusRpcAvailability::Available,
+            },
+            QualificationNodeCommand::SecurityMetrics,
+            QualificationNodeCommand::StartTrafficWatch,
+            QualificationNodeCommand::ReconcileTrafficWatch,
+            QualificationNodeCommand::StartTrafficMutation,
+            QualificationNodeCommand::StopTrafficMutation,
+            QualificationNodeCommand::StopTrafficWatch,
+            QualificationNodeCommand::TrafficStatus,
+            QualificationNodeCommand::TrafficStatusSnapshot,
+            QualificationNodeCommand::StartConcurrentWatch {
+                subscription_id: QualificationConcurrentSubscriptionId::new("watch-a")
+                    .expect("subscription"),
+                requested_after_journal_sequence: 0,
+            },
+            QualificationNodeCommand::FinishConcurrentWatch {
+                subscription_id: QualificationConcurrentSubscriptionId::new("watch-b")
+                    .expect("subscription"),
+                complete_through_journal_sequence: 0,
+            },
+            QualificationNodeCommand::AbortConcurrentWatch {
+                subscription_id: QualificationConcurrentSubscriptionId::new("watch-c")
+                    .expect("subscription"),
+            },
+            QualificationNodeCommand::ConcurrentBatch {
+                slots: vec![QualificationConcurrentBatchSlot {
+                    lease_handle: "lease".to_owned(),
+                    stable_id: "stable".to_owned(),
+                    expected_generation: None,
+                    new_generation: 1,
+                    state_type: concurrent_test_state_type(),
+                    value: "value".to_owned(),
+                }],
+            },
+            QualificationNodeCommand::ConcurrentRestore {
+                state_type: concurrent_test_state_type(),
+            },
+            QualificationNodeCommand::Acquire {
+                lease_handle: "lease".to_owned(),
+                stable_id: "stable".to_owned(),
+                owner: "owner".to_owned(),
+                ttl_millis: 1_000,
+            },
+            QualificationNodeCommand::CompareAndSet {
+                lease_handle: "lease".to_owned(),
+                stable_id: "stable".to_owned(),
+                expected_generation: None,
+                new_generation: 1,
+                value: "value".to_owned(),
+            },
+            QualificationNodeCommand::Get {
+                stable_id: "stable".to_owned(),
+            },
+            QualificationNodeCommand::Release {
+                lease_handle: "lease".to_owned(),
+            },
+            QualificationNodeCommand::ForgetLease {
+                lease_handle: "lease".to_owned(),
+            },
+            QualificationNodeCommand::Shutdown,
+        ];
+        let kinds = commands
+            .iter()
+            .map(QualificationNodeCommand::kind)
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, QualificationNodeCommandKind::ALL);
+        let unique = kinds.into_iter().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), QualificationNodeCommandKind::ALL.len());
+    }
+
+    #[test]
+    fn concurrent_frames_fit_the_existing_sixteen_kibibyte_boundary() {
+        let state_type = concurrent_test_state_type();
+        let slots = (0..QUALIFICATION_CONCURRENT_BATCH_MAX_SLOTS)
+            .map(|index| QualificationConcurrentBatchSlot {
+                lease_handle: format!("lease-{index}-{}", "l".repeat(48)),
+                stable_id: format!("stable-{index}-{}", "s".repeat(47)),
+                expected_generation: Some(u64::MAX - 1),
+                new_generation: u64::MAX,
+                state_type: state_type.clone(),
+                value: "v".repeat(QUALIFICATION_MAX_VALUE_BYTES),
+            })
+            .collect();
+        let mut encoded = Vec::new();
+        write_json_line(
+            &mut encoded,
+            &QualificationNodeCommand::ConcurrentBatch { slots },
+        )
+        .expect("maximum concurrent command frame");
+        assert!(encoded.len() <= QUALIFICATION_MAX_CONTROL_LINE_BYTES + 1);
+
+        let record = concurrent_test_record();
+        let events = (0..QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS)
+            .map(|index| QualificationConcurrentWatchEvent {
+                journal_sequence: u64::MAX - u64::try_from(index).expect("bounded index"),
+                record: record.clone(),
+            })
+            .collect();
+        let mut encoded = Vec::new();
+        write_json_line(
+            &mut encoded,
+            &QualificationNodeReply::ConcurrentWatchFinished {
+                subscription_id: QualificationConcurrentSubscriptionId::new(
+                    "s".repeat(QUALIFICATION_CONCURRENT_SUBSCRIPTION_ID_MAX_BYTES),
+                )
+                .expect("maximum subscription ID"),
+                complete_through_journal_sequence: u64::MAX,
+                events,
+            },
+        )
+        .expect("maximum concurrent watch reply frame");
+        assert!(encoded.len() <= QUALIFICATION_MAX_CONTROL_LINE_BYTES + 1);
+
+        let mut encoded = Vec::new();
+        write_json_line(
+            &mut encoded,
+            &QualificationNodeReply::ConcurrentRestore {
+                complete: true,
+                records: vec![record; QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS],
+            },
+        )
+        .expect("maximum concurrent restore reply frame");
+        assert!(encoded.len() <= QUALIFICATION_MAX_CONTROL_LINE_BYTES + 1);
+    }
+
+    #[test]
+    fn every_maximum_concurrent_command_survives_worst_case_json_escaping() {
+        let subscription_id = QualificationConcurrentSubscriptionId::new(
+            "\"".repeat(QUALIFICATION_CONCURRENT_SUBSCRIPTION_ID_MAX_BYTES),
+        )
+        .expect("maximum escapable subscription ID");
+        let state_type = concurrent_test_state_type();
+        let slot = QualificationConcurrentBatchSlot {
+            lease_handle: "\"".repeat(64),
+            stable_id: "\0".repeat(STABLE_ID_MAX_BYTES),
+            expected_generation: Some(u64::MAX - 1),
+            new_generation: u64::MAX,
+            state_type: state_type.clone(),
+            value: "\0".repeat(QUALIFICATION_MAX_VALUE_BYTES),
+        };
+        let commands = [
+            QualificationNodeCommand::StartConcurrentWatch {
+                subscription_id: subscription_id.clone(),
+                requested_after_journal_sequence: u64::MAX - 1,
+            },
+            QualificationNodeCommand::FinishConcurrentWatch {
+                subscription_id: subscription_id.clone(),
+                complete_through_journal_sequence: u64::MAX,
+            },
+            QualificationNodeCommand::AbortConcurrentWatch { subscription_id },
+            QualificationNodeCommand::ConcurrentBatch {
+                slots: vec![slot; QUALIFICATION_CONCURRENT_BATCH_MAX_SLOTS],
+            },
+            QualificationNodeCommand::ConcurrentRestore { state_type },
+        ];
+
+        for command in commands {
+            command.validate().expect("maximum command is valid");
+            let mut encoded = Vec::new();
+            write_json_line(&mut encoded, &command).expect("maximum escaped command frame");
+            assert_eq!(encoded.last(), Some(&b'\n'));
+            assert!(encoded.len() - 1 <= QUALIFICATION_MAX_CONTROL_LINE_BYTES);
+            let decoded = read_bounded_json_line::<_, QualificationNodeCommand>(
+                &mut io::BufReader::new(encoded.as_slice()),
+            )
+            .expect("decode maximum escaped command")
+            .expect("maximum command frame");
+            assert_eq!(decoded.kind(), command.kind());
+        }
+
+        let encoded_batch = serde_json::to_string(&QualificationNodeCommand::ConcurrentBatch {
+            slots: vec![
+                QualificationConcurrentBatchSlot {
+                    lease_handle: "\"".repeat(64),
+                    stable_id: "\0".repeat(STABLE_ID_MAX_BYTES),
+                    expected_generation: Some(u64::MAX - 1),
+                    new_generation: u64::MAX,
+                    state_type: concurrent_test_state_type(),
+                    value: "\0".repeat(QUALIFICATION_MAX_VALUE_BYTES),
+                };
+                QUALIFICATION_CONCURRENT_BATCH_MAX_SLOTS
+            ],
+        })
+        .expect("encode escaped batch");
+        assert!(encoded_batch.contains("\\u0000"));
+        assert!(encoded_batch.contains("\\\""));
+    }
+
+    #[test]
+    fn concurrent_batch_reply_never_invents_a_journal_sequence() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let reply = QualificationNodeReply::ConcurrentBatch {
+            outcome: QualificationConcurrentBatchOutcome::Completed,
+            slots: vec![QualificationConcurrentBatchSlotResult {
+                slot_index: 1,
+                outcome: QualificationConcurrentBatchSlotOutcome::Success,
+                mutation: QualificationConcurrentMutationSnapshot {
+                    key_sha256: digest.clone(),
+                    expected_generation: None,
+                    new_generation: 1,
+                    owner_sha256: digest.clone(),
+                    fence: 1,
+                    state_class: QualificationConcurrentStateClass::AuthoritativeSession,
+                    state_type_sha256: digest.clone(),
+                    expires_at_ns: None,
+                    value_sha256: digest,
+                },
+            }],
+        };
+        let encoded = serde_json::to_string(&reply).expect("encode batch reply");
+        assert!(!encoded.contains("journal_sequence"));
     }
 
     #[test]
@@ -3901,8 +4987,8 @@ mod tests {
 
     #[test]
     fn node_control_schema_rejects_incompatible_versions() {
-        assert_eq!(QUALIFICATION_NODE_SCHEMA_VERSION, 3);
-        for incompatible_version in [1, 2] {
+        assert_eq!(QUALIFICATION_NODE_SCHEMA_VERSION, 4);
+        for incompatible_version in [1, 2, 3] {
             let mut config = valid_config();
             config.schema_version = incompatible_version;
             assert_eq!(config.validate(), Err(QualificationConfigError::Schema));
