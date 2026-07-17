@@ -1,0 +1,38 @@
+{
+  "schema_version": "opc-session-ha-fault-schedule/v5",
+  "history_id": "candidate-history-v5",
+  "campaign_started_ns": 0,
+  "campaign_completed_ns": 1000,
+  "process_ids": ["node-0", "node-1", "node-2"],
+  "intervals": [
+    {
+      "interval_sequence": 1,
+      "started_ns": 0,
+      "completed_ns": 599,
+      "running_process_ids": ["node-0", "node-1", "node-2"],
+      "available_bidirectional_pairs": [
+        { "left_process_id": "node-0", "right_process_id": "node-1" },
+        { "left_process_id": "node-0", "right_process_id": "node-2" },
+        { "left_process_id": "node-1", "right_process_id": "node-2" }
+      ]
+    },
+    {
+      "interval_sequence": 2,
+      "started_ns": 600,
+      "completed_ns": 799,
+      "running_process_ids": ["node-0", "node-1", "node-2"],
+      "available_bidirectional_pairs": []
+    },
+    {
+      "interval_sequence": 3,
+      "started_ns": 800,
+      "completed_ns": 1000,
+      "running_process_ids": ["node-0", "node-1", "node-2"],
+      "available_bidirectional_pairs": [
+        { "left_process_id": "node-0", "right_process_id": "node-1" },
+        { "left_process_id": "node-0", "right_process_id": "node-2" },
+        { "left_process_id": "node-1", "right_process_id": "node-2" }
+      ]
+    }
+  ]
+}

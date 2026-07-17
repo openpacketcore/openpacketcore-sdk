@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-fault-schedule/v5",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "history_id",
+    "campaign_started_ns",
+    "campaign_completed_ns",
+    "process_ids",
+    "intervals"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-fault-schedule/v5" },
+    "history_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "campaign_started_ns": { "type": "integer", "minimum": 0 },
+    "campaign_completed_ns": { "type": "integer", "minimum": 1 },
+    "process_ids": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+    },
+    "intervals": {
+      "$comment": "Intervals are inclusive and must form one contiguous campaign partition. The independent checker enforces canonical process/pair order and derives each process's direct static-majority reachability.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/interval" }
+    }
+  },
+  "$defs": {
+    "pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["left_process_id", "right_process_id"],
+      "properties": {
+        "left_process_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "right_process_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "interval_sequence",
+        "started_ns",
+        "completed_ns",
+        "running_process_ids",
+        "available_bidirectional_pairs"
+      ],
+      "properties": {
+        "interval_sequence": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "started_ns": { "type": "integer", "minimum": 0 },
+        "completed_ns": { "type": "integer", "minimum": 0 },
+        "running_process_ids": {
+          "type": "array",
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "available_bidirectional_pairs": {
+          "type": "array",
+          "maxItems": 10,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/pair" }
+        }
+      }
+    }
+  }
+}

@@ -1007,6 +1007,121 @@ async fn batch_preflight_rejects_unsealed_payload_before_any_slot_commits() {
 }
 
 #[tokio::test]
+async fn batch_commits_independent_slots_and_preserves_partial_results() {
+    let cluster = TestCluster::start().await;
+    let store = &cluster.stores[0];
+    let first_key = session_key(b"batch-partial-first");
+    let second_key = session_key(b"batch-partial-second");
+    let first_lease = store
+        .acquire(
+            &first_key,
+            owner("batch-partial-owner-first"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("first lease");
+    let second_lease = store
+        .acquire(
+            &second_key,
+            owner("batch-partial-owner-second"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("second lease");
+    let first_record = sealed_record(
+        first_key.clone(),
+        1,
+        &first_lease,
+        b"sealed-batch-partial-first",
+    );
+    let second_record = sealed_record(
+        second_key.clone(),
+        1,
+        &second_lease,
+        b"sealed-batch-partial-second",
+    );
+    let conflict_record = sealed_record(
+        first_key.clone(),
+        2,
+        &first_lease,
+        b"sealed-batch-partial-conflict",
+    );
+    let before = store
+        .max_replication_sequence()
+        .await
+        .expect("journal head before partial batch");
+
+    let results = store
+        .batch(vec![
+            SessionOp::CompareAndSet(CompareAndSet {
+                key: first_key.clone(),
+                lease: first_lease.clone(),
+                expected_generation: None,
+                new_record: first_record.clone(),
+            }),
+            SessionOp::CompareAndSet(CompareAndSet {
+                key: first_key.clone(),
+                lease: first_lease,
+                expected_generation: None,
+                new_record: conflict_record,
+            }),
+            SessionOp::CompareAndSet(CompareAndSet {
+                key: second_key.clone(),
+                lease: second_lease,
+                expected_generation: None,
+                new_record: second_record.clone(),
+            }),
+        ])
+        .await
+        .expect("partial batch invocation");
+
+    assert_eq!(results.len(), 3);
+    assert!(matches!(
+        &results[0],
+        opc_session_store::SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success))
+    ));
+    assert!(matches!(
+        &results[1],
+        opc_session_store::SessionOpResult::CompareAndSet(Ok(
+            CompareAndSetResult::Conflict { current: Some(record) }
+        )) if record == &first_record
+    ));
+    assert!(matches!(
+        &results[2],
+        opc_session_store::SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success))
+    ));
+
+    let after = store
+        .max_replication_sequence()
+        .await
+        .expect("journal head after partial batch");
+    assert_eq!(after, before.checked_add(2).expect("small journal advance"));
+    let entries = store
+        .get_replication_log(before + 1, 2)
+        .await
+        .expect("partial batch journal entries");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].sequence, before + 1);
+    assert_eq!(entries[1].sequence, before + 2);
+    assert!(matches!(
+        &entries[0].op,
+        ReplicationOp::CompareAndSet { key, .. } if key == &first_key
+    ));
+    assert!(matches!(
+        &entries[1].op,
+        ReplicationOp::CompareAndSet { key, .. } if key == &second_key
+    ));
+    assert_eq!(
+        store.get(&first_key).await.expect("first record read"),
+        Some(first_record)
+    );
+    assert_eq!(
+        store.get(&second_key).await.expect("second record read"),
+        Some(second_record)
+    );
+}
+
+#[tokio::test]
 async fn encryption_wrapper_keeps_plaintext_above_consensus_and_durable_authority() {
     let cluster = TestCluster::start().await;
     let provider = encryption_provider();
