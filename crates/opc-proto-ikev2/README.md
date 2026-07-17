@@ -27,15 +27,24 @@ control-plane stack.
   `PayloadType`, and `validate_payload_chain`.
 - `crypto` defines the caller-supplied `CryptoProvider` boundary and protected
   payload open result types.
-- `sa_init` and `sa_init_crypto` provide typed SA/KE/Nonce/Notify helpers,
-  SA_INIT response builders, Diffie-Hellman group/profile types, and IKE/Child
-  SA key-material derivation. The notify-only error builder is deliberately
+- `sa_init`, `sa_init_crypto`, and `sa_init_negotiation` provide typed
+  SA/KE/Nonce/Notify helpers, SA_INIT response builders, product-neutral
+  responder proposal selection, Diffie-Hellman group/profile types, and
+  IKE/Child SA key-material derivation. IKE-SA profiles preserve the complete negotiated
+  PRF, DH, encryption/key-size, and optional integrity suite; invalid AEAD plus
+  integrity or CBC without integrity combinations cannot be constructed.
+  PRF-HMAC-SHA2-256/384/512 are supported for initial IKE-SA derivation,
+  IKE-SA rekey (including distinct old/new PRFs), Child-SA KEYMAT, restore, and
+  AUTH calculations. The notify-only error builder is deliberately
   bounded to one IKE-SA-shaped `NO_PROPOSAL_CHOSEN` or `INVALID_KE_PAYLOAD`;
   the latter has a convenience builder that writes the accepted non-zero group
   as exactly two big-endian octets. These failures are mutually exclusive, so
   the builder rejects a multi-Notify response rather than emitting ambiguity.
-- `protected_payload_crypto` provides caller-keyed AES-GCM-16 `SK` open/seal
-  helpers for already-derived SA_INIT key material.
+- `protected_payload_crypto` provides caller-keyed AES-GCM-16 and
+  AES-CBC/SHA-2 encrypt-then-MAC `SK`/`SKF` open/seal helpers for
+  already-derived SA_INIT key material. Production CBC sealing obtains a fresh
+  16-octet IV from a cryptographically secure random source; callers cache the
+  complete already-sealed response for retransmission.
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
   helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
   selector/proposal helpers.
@@ -51,6 +60,204 @@ control-plane stack.
   proposal/transforms, optional KE group, and traffic-selector narrowing.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
+
+## IKE-SA profile configuration
+
+Profile construction is the startup capability-validation boundary. The old
+infallible `Ikev2SaInitCryptoProfile::new(prf, dh, encryption)` API was removed
+because it could construct AES-CBC without its negotiated integrity algorithm.
+AEAD and encrypt-then-MAC suites now use separate validating constructors:
+
+```rust
+use opc_proto_ikev2::{
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm,
+    Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile,
+};
+
+fn handset_profile() -> Result<Ikev2SaInitCryptoProfile, Ikev2SaInitCryptoError> {
+    Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+        Ikev2PrfAlgorithm::HmacSha2_512,
+        Ikev2DhGroup::Modp2048,
+        Ikev2EncryptionAlgorithm::AesCbc256,
+        Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+    )
+}
+
+fn existing_gcm_profile() -> Result<Ikev2SaInitCryptoProfile, Ikev2SaInitCryptoError> {
+    Ikev2SaInitCryptoProfile::new_aead(
+        Ikev2PrfAlgorithm::HmacSha2_256,
+        Ikev2DhGroup::Ecp256,
+        Ikev2EncryptionAlgorithm::AesGcm16_128,
+    )
+}
+```
+
+Configuration expressed as wire identifiers should use `from_transform_ids`;
+its final argument is now `Option<u16>` containing the integrity Transform ID,
+not an anonymous key length. `Some(14)` selects
+AUTH-HMAC-SHA2-512-256; AEAD profiles pass `None`.
+
+The executable IKE-SA matrix is:
+
+| Mechanism | Transform IDs and sizes | Key/material contract |
+| --- | --- | --- |
+| PRF | HMAC-SHA2-256 (5), HMAC-SHA2-384 (6), HMAC-SHA2-512 (7) | 32, 48, or 64 octets for each of `SK_d`, `SK_pi`, and `SK_pr` |
+| DH | MODP-2048 (14), ECP-256 (19), ECP-384 (20), ECP-521 (21) | Exact public-value lengths 256, 64, 96, and 132 octets |
+| AES-GCM-16 | ENCR 20 with 128, 192, or 256-bit key; no INTEG | AES key plus four-octet salt; eight-octet explicit IV and 16-octet tag on the wire |
+| AES-CBC | ENCR 12 with 128, 192, or 256-bit key | Raw 16, 24, or 32-octet `SK_e*`; fresh 16-octet IV per newly sealed message |
+| SHA-2 integrity | AUTH-HMAC-SHA2-256-128 (12), 384-192 (13), or 512-256 (14) | 32/48/64-octet `SK_a*`; 16/24/32-octet ICV |
+
+Every CBC key size may be paired with each supported SHA-2 integrity
+algorithm. `validate_executable()` is the explicit startup check, although all
+public profile constructors already enforce the same contract.
+
+### Migration from the anonymous integrity length
+
+The old constructor could represent AES-CBC without its algorithm, and the old
+wire-ID constructor accepted an arbitrary `usize` integrity-key length:
+
+```text
+Ikev2SaInitCryptoProfile::new(prf, dh, encryption)
+Ikev2SaInitCryptoProfile::from_transform_ids(7, 14, 12, Some(256), 64)
+```
+
+Replace those calls with a fallible typed constructor or a typed integrity
+Transform ID, and reject errors during configuration loading:
+
+```rust
+use opc_proto_ikev2::{Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile};
+
+fn configured_handset_profile() -> Result<Ikev2SaInitCryptoProfile, Ikev2SaInitCryptoError> {
+    let profile = Ikev2SaInitCryptoProfile::from_transform_ids(
+        7,         // PRF_HMAC_SHA2_512
+        14,        // 2048-bit MODP
+        12,        // ENCR_AES_CBC
+        Some(256),
+        Some(14),  // AUTH_HMAC_SHA2_512_256
+    )?;
+    profile.validate_executable()?;
+    Ok(profile)
+}
+```
+
+Downstream exhaustive matches must add these exact arms:
+
+- `Ikev2PrfAlgorithm::HmacSha2_512`;
+- `Ikev2SaInitCryptoError::{MissingIntegrityTransform,
+  UnexpectedIntegrityTransform}` and the corresponding
+  `Ikev2SaInitCryptoErrorCode` variants;
+- `Ikev2ProtectedPayloadCryptoError::{InvalidIvLength,
+  InvalidCiphertextLength, RandomIvGenerationFailed}` and the corresponding
+  `Ikev2ProtectedPayloadCryptoErrorCode` variants.
+
+The existing `UnsupportedEncryptionProfile` error also changes field shape
+from `integrity_key_len: usize` to
+`integrity: Option<Ikev2IntegrityAlgorithm>`. Existing authentication,
+authenticated-padding, unsupported-integrity, and key-material errors retain
+their variants and stable codes.
+
+Consumers must remove any blanket `integrity.is_some()` rejection. Preserve
+the selected typed INTEG transform in the profile, pass that profile through
+derivation/restore and protected-payload construction, and select the CBC
+open/seal path when `encryption().is_aead()` is false. Restored CBC SAs pass the
+same typed profile to `Ikev2SaInitKeyMaterial::from_established_keys`; integrity
+ID 14 requires 64-octet `SK_ai`/`SK_ar`, while AES-CBC-256 requires 32-octet
+`SK_ei`/`SK_er`. Existing AES-GCM callers use `new_aead`, retain empty `SK_a*`,
+and keep their monotonic explicit-IV state.
+
+## IKE_SA_INIT proposal selection
+
+`Ikev2SaInitNegotiationPolicy` is the startup capability and responder
+preference boundary. It accepts only complete executable profiles. The selector
+combines transforms by type, so wire order never affects selection and
+same-type alternatives remain valid. It returns one exact response proposal,
+including the initiator's selected Key Length attribute unchanged:
+
+```rust
+use opc_proto_ikev2::{
+    negotiate_ike_sa_init, Ikev2SaInitNegotiationError,
+    Ikev2SaInitNegotiationPolicy, Ikev2SaInitPayloads,
+};
+
+fn select_handset_suite(
+    payloads: &Ikev2SaInitPayloads<'_>,
+) -> Result<opc_proto_ikev2::Ikev2SaInitNegotiation, Ikev2SaInitNegotiationError> {
+    let profile = handset_profile()
+        .map_err(Ikev2SaInitNegotiationError::UnsupportedConfiguredProfile)?;
+    let policy = Ikev2SaInitNegotiationPolicy::new(vec![profile])?;
+    negotiate_ike_sa_init(payloads, &policy)
+}
+# fn handset_profile() -> Result<opc_proto_ikev2::Ikev2SaInitCryptoProfile,
+#     opc_proto_ikev2::Ikev2SaInitCryptoError> {
+#     opc_proto_ikev2::Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+#         opc_proto_ikev2::Ikev2PrfAlgorithm::HmacSha2_512,
+#         opc_proto_ikev2::Ikev2DhGroup::Modp2048,
+#         opc_proto_ikev2::Ikev2EncryptionAlgorithm::AesCbc256,
+#         opc_proto_ikev2::Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+#     )
+# }
+```
+
+`NoAcceptableProposal` is a stable typed outcome suitable for
+`NO_PROPOSAL_CHOSEN`. A supported offered suite whose DH transform does not
+match the KE payload returns `KeyExchangeDhGroupMismatch`, allowing the product
+to decide whether to send the bounded `INVALID_KE_PAYLOAD` response. Duplicate
+transforms or attributes fail closed. NAT detection, fragmentation,
+signature-hash, redirect, and unknown non-critical/private-use notifications do not
+participate in algorithm selection. The product still owns responder SPI and
+nonce allocation, anti-amplification policy, transaction caching, and the IKE
+SA state machine.
+
+## Protected IKE_AUTH integration
+
+For AES-CBC, use `ikev2_aes_cbc_protected_body_len` or
+`ikev2_aes_cbc_protected_payload_len` to calculate the final outer IKE Length
+and `SK`/`SKF` payload Length before sealing. Then pass the exact bytes through
+the protected generic header as `message_prefix`. This is the production
+sealing call for a responder IKE_AUTH:
+
+```rust
+use bytes::Bytes;
+use opc_proto_ikev2::{
+    seal_ikev2_sa_init_aes_cbc_protected_payload,
+    Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadDirection,
+    Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial, ProtectedPayloadKind,
+    ProtectedPayloadSealContext,
+};
+
+fn seal_responder_ike_auth(
+    profile: Ikev2SaInitCryptoProfile,
+    keys: &Ikev2SaInitKeyMaterial,
+    final_message_prefix: &[u8],
+    cleartext_payload_chain: &[u8],
+) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
+    seal_ikev2_sa_init_aes_cbc_protected_payload(
+        profile,
+        keys,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::Encrypted,
+            message_prefix: final_message_prefix,
+        },
+        cleartext_payload_chain,
+    )
+}
+```
+
+The returned body is `IV || ciphertext || ICV`; for the observed profile the
+lengths are 16, a non-empty multiple of 16, and 32 octets respectively. Use
+`Ikev2SaInitProtectedPayloadProvider` with `InitiatorToResponder` to open the
+handset's request. The provider authenticates the complete message before
+decrypting. Well-formed, same-length corruption of authenticated header bytes,
+IV, ciphertext, or ICV that reaches cryptographic verification returns the
+same `AuthenticationFailed` outcome before decryption. Malformed framing and
+lengths return their stable structural errors without decryption;
+`InvalidPadding` is reachable only after successful authentication. Use the
+same APIs for `SKF`; its four-octet Fragment Number/Total Fragments prefix is
+included in the final authenticated prefix. Cache and replay the complete
+already-built wire message for retransmissions—calling the production CBC
+sealer again deliberately generates a different IV. The explicit-IV sealer is
+a low-level test/vector boundary and must not be used by production callers.
 
 ## Dedicated-bearer integration
 

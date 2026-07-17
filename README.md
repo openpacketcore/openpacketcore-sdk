@@ -16,8 +16,10 @@ now includes three experimental, transport-neutral protocol crates: the
 `opc-proto-gtpv2c` crate, limited to an S2b typed GTPv2-C subset; the
 `opc-proto-diameter` crate for RFC 6733 framing, base peer procedures, and
 initial 3GPP application dictionary work; and the `opc-proto-ikev2` crate for
-IKEv2 header and generic payload-chain scaffolding. They are consumed as direct
-protocol dependencies, not through the `opc-sdk` default feature set or prelude.
+IKEv2 framing, typed executable SA_INIT crypto profiles and key derivation,
+proposal selection, and AES-GCM/AES-CBC protected payload mechanisms. They are
+consumed as direct protocol dependencies, not through the `opc-sdk` default
+feature set or prelude.
 They do **not** provide a product-ready EPC or ePDG control-plane stack: full
 GTP-C and S1AP stacks are not provided; Diameter realm routing, AAA/HSS/CDF
 behavior, IKE SA state machines, EAP-AKA, Child SA lifecycle policy, transport
@@ -60,7 +62,7 @@ The SDK is organized into a clean multi-crate Rust workspace and a Go reference 
 | [`opc-proto-nas`](crates/opc-proto-nas/) | NAS-5GS (TS 24.501) codec: headers, body dispatch, mobile identity, BCD unpacking, Registration/Security Mode IEs, and NAS security hooks *(experimental)*. | [RFC 005](docs/rfc/005-protocol-framework.md) |
 | [`opc-proto-ngap`](crates/opc-proto-ngap/) | NGAP (TS 38.413) v0 decoder via `rasn` APER: PDU framing, fixture-proven NGSetupRequest, raw-preserving re-encode *(experimental v0)*. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0013](docs/adr/0013-ngap-asn1-strategy.md) |
 | [`opc-proto-gtpv2c`](crates/opc-proto-gtpv2c/) | GTPv2-C (TS 29.274) experimental S2b subset: raw-preserving header/IE shell plus typed Echo/Create/Modify/Delete/Update views. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |
-| [`opc-proto-ikev2`](crates/opc-proto-ikev2/) | IKEv2 (RFC 7296/RFC 7383) experimental scaffold: fixed header, raw generic payload-chain walking for unencrypted payloads, unknown payload preservation, SKF fragmentation structure/reassembly helpers, and crypto-provider boundary traits *(no IKE SA state machine, EAP-AKA, or Child SA lifecycle)*. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [Conformance](crates/opc-proto-ikev2/CONFORMANCE.md) |
+| [`opc-proto-ikev2`](crates/opc-proto-ikev2/) | Experimental IKEv2 (RFC 7296/RFC 7383) mechanisms: framing and typed payloads, executable SA_INIT profiles and proposal selection, PRF-HMAC-SHA2 key derivation, AES-GCM/AES-CBC `SK`/`SKF` protection, and fragmentation structure/reassembly helpers *(no IKE SA state machine, EAP-AKA, retransmission cache, or Child SA lifecycle policy)*. | [RFC 005](docs/rfc/005-protocol-framework.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md), [Conformance](crates/opc-proto-ikev2/CONFORMANCE.md) |
 | [`opc-sctp`](crates/opc-sctp/) | Safe Linux SCTP transport wrapper for CNFs that terminate N2/NGAP or other SCTP interfaces. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
 | [`opc-libsctp-sys`](crates/opc-libsctp-sys/) | Narrow unsafe Linux SCTP UAPI boundary used only by `opc-sctp`; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md) |
 | [`opc-linux-xfrm-sys`](crates/opc-linux-xfrm-sys/) | Narrow unsafe Linux XFRM netlink UAPI boundary; unsupported platforms fail explicitly. | [ADR 0017](docs/adr/0017-sctp-transport-ffi-boundary.md), [ADR 0018](docs/adr/0018-epc-untrusted-access-sdk-boundary.md) |

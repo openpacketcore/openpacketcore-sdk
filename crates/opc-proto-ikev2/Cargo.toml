@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Experimental IKEv2 header and payload-chain codec scaffold for OpenPacketCore"
+description = "Experimental typed IKEv2 codec, crypto profiles, key derivation, and protected payloads"
 readme = "README.md"
 documentation = "https://docs.rs/opc-proto-ikev2"
 keywords = ["ikev2", "ipsec", "telecom", "packet-core", "codec"]
@@ -23,24 +23,28 @@ rsa-signing = []
 testkit = []
 
 [dependencies]
+aes = { workspace = true }
 aes-gcm = { workspace = true }
 bytes = { workspace = true }
+cbc = { workspace = true }
 crypto-bigint = { version = "0.7.5", features = ["getrandom", "zeroize"] }
-hmac = { workspace = true }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-proto-tft = { path = "../opc-proto-tft", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 p256 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
 p384 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
 p521 = { version = "0.14.0-rc.10", default-features = false, features = ["ecdh", "std"] }
+rand = { workspace = true }
 rsa = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+sha2-zeroize = { workspace = true }
 subtle = { workspace = true }
 x509-parser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+hmac = { workspace = true }
 opc-proto-ikev2 = { path = ".", version = "0.2.0", features = ["testkit"] }
 opc-proto-gtpv2c = { path = "../opc-proto-gtpv2c", version = "0.2.0" }
 quickcheck = "1"

@@ -11,12 +11,11 @@
 use std::{error::Error, fmt};
 
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
-use sha2::{Sha256, Sha384};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
+    hmac_sha2::{hmac_sha2_256, hmac_sha2_384, hmac_sha2_512},
     notify::{Ikev2NotifyPayload, Ikev2NotifyPayloadError, IKEV2_NOTIFY_REKEY_SA},
     payload::{PayloadChain, PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     sa_init::{
@@ -2031,18 +2030,9 @@ fn ike_auth_prf(
         return Err(Ikev2IkeAuthVerificationError::PrfKeyEmpty);
     }
     match algorithm {
-        Ikev2PrfAlgorithm::HmacSha2_256 => {
-            let mut mac = Hmac::<Sha256>::new_from_slice(key)
-                .map_err(|_| Ikev2IkeAuthVerificationError::PrfKeyInvalid { len: key.len() })?;
-            mac.update(data);
-            Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
-        }
-        Ikev2PrfAlgorithm::HmacSha2_384 => {
-            let mut mac = Hmac::<Sha384>::new_from_slice(key)
-                .map_err(|_| Ikev2IkeAuthVerificationError::PrfKeyInvalid { len: key.len() })?;
-            mac.update(data);
-            Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
-        }
+        Ikev2PrfAlgorithm::HmacSha2_256 => Ok(hmac_sha2_256(key, &[data])),
+        Ikev2PrfAlgorithm::HmacSha2_384 => Ok(hmac_sha2_384(key, &[data])),
+        Ikev2PrfAlgorithm::HmacSha2_512 => Ok(hmac_sha2_512(key, &[data])),
     }
 }
 
@@ -2455,5 +2445,19 @@ mod tests {
             };
 
         assert_eq!(output.len(), Ikev2PrfAlgorithm::HmacSha2_256.output_len());
+
+        let sha512: Zeroizing<Vec<u8>> =
+            match ike_auth_prf(Ikev2PrfAlgorithm::HmacSha2_512, &[0x0b; 20], b"Hi There") {
+                Ok(output) => output,
+                Err(error) => panic!("unexpected SHA-512 PRF error: {error:?}"),
+            };
+        assert_eq!(sha512.len(), 64);
+        assert_eq!(
+            &sha512[..16],
+            &[
+                0x87, 0xaa, 0x7c, 0xde, 0xa5, 0xef, 0x61, 0x9d, 0x4f, 0xf0, 0xb4, 0x24, 0x1a, 0x1d,
+                0x6c, 0xb0,
+            ]
+        );
     }
 }

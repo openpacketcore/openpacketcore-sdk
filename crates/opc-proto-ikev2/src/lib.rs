@@ -8,9 +8,11 @@
 //! mechanism that is safe to expose as an SDK primitive today: fixed-header
 //! decode/encode, raw-preserving generic payload-chain walking for unencrypted
 //! payloads, protected-payload boundary metadata, caller-owned crypto provider
-//! traits, narrow IKE_SA_INIT key-agreement/key-derivation material,
+//! traits, typed executable IKE-SA profiles, PRF-HMAC-SHA2-256/384/512, initial
+//! and rekey IKE-SA key-agreement/key-derivation material,
 //! bounded notify-only IKE_SA_INIT error responses,
-//! caller-keyed SA_INIT AES-GCM protected-payload open/seal helpers, typed
+//! product-neutral executable IKE_SA_INIT proposal selection, caller-keyed
+//! SA_INIT AES-GCM and AES-CBC/SHA-2 protected-payload open/seal helpers, typed
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
 //! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY
@@ -22,7 +24,7 @@
 //!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
-//! @conformance experimental-scaffold — see CONFORMANCE.md
+//! @conformance experimental-mechanism boundary — see CONFORMANCE.md
 
 use opc_protocol::ValidationLevel;
 
@@ -32,6 +34,7 @@ pub mod device_identity;
 pub mod exchange;
 pub mod fragmentation;
 pub mod header;
+mod hmac_sha2;
 pub mod ike_auth;
 pub mod ike_auth_signature;
 pub mod message;
@@ -42,6 +45,7 @@ pub mod payload;
 pub mod protected_payload_crypto;
 pub mod sa_init;
 pub mod sa_init_crypto;
+pub mod sa_init_negotiation;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
@@ -178,12 +182,16 @@ pub use payload::{
     GENERIC_PAYLOAD_HEADER_LEN,
 };
 pub use protected_payload_crypto::{
-    decrypt_ikev2_sa_init_protected_payload, ikev2_aes_gcm_protected_body_len,
-    ikev2_aes_gcm_protected_payload_len, seal_ikev2_sa_init_protected_payload,
+    decrypt_ikev2_sa_init_protected_payload, ikev2_aes_cbc_padding_len,
+    ikev2_aes_cbc_protected_body_len, ikev2_aes_cbc_protected_payload_len,
+    ikev2_aes_gcm_protected_body_len, ikev2_aes_gcm_protected_payload_len,
+    seal_ikev2_sa_init_aes_cbc_protected_payload,
+    seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector,
+    seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng, seal_ikev2_sa_init_protected_payload,
     seal_ikev2_sa_init_protected_payload_with_iv_counter, Ikev2AesGcmExplicitIvCounter,
     Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadCryptoErrorCode,
     Ikev2ProtectedPayloadDirection, Ikev2SaInitProtectedPayloadProvider,
-    ProtectedPayloadSealContext, IKEV2_AES_GCM_EXPLICIT_IV_LEN,
+    ProtectedPayloadSealContext, IKEV2_AES_CBC_IV_LEN, IKEV2_AES_GCM_EXPLICIT_IV_LEN,
 };
 pub use sa_init::{
     build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response,
@@ -198,10 +206,15 @@ pub use sa_init::{
     Ikev2VendorIdPayloadError,
 };
 pub use sa_init_crypto::{
-    derive_child_sa_key_material, derive_ike_sa_init_key_material, Ikev2ChildSaCryptoProfile,
-    Ikev2ChildSaKeyMaterial, Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey,
-    Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
+    derive_child_sa_key_material, derive_ike_sa_init_key_material,
+    derive_ike_sa_rekey_key_material, Ikev2ChildSaCryptoProfile, Ikev2ChildSaKeyMaterial,
+    Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2IntegrityAlgorithm,
+    Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
     Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
+};
+pub use sa_init_negotiation::{
+    negotiate_ike_sa_init, Ikev2SaInitNegotiation, Ikev2SaInitNegotiationError,
+    Ikev2SaInitNegotiationPolicy,
 };
 
 pub(crate) const fn is_strict(level: ValidationLevel) -> bool {

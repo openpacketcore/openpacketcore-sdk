@@ -482,11 +482,11 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         SwmEmergencyAuthorizationPath::RecoveredDeviceIdentity
     );
 
-    let profile = Ikev2SaInitCryptoProfile::new(
+    let profile = Ikev2SaInitCryptoProfile::new_aead(
         Ikev2PrfAlgorithm::HmacSha2_256,
         Ikev2DhGroup::Ecp256,
         Ikev2EncryptionAlgorithm::AesGcm16_128,
-    );
+    )?;
     let key_material = derive_ike_sa_init_key_material(
         profile,
         [0x11; 8],
