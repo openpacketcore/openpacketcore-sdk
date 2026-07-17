@@ -70,6 +70,107 @@ marker and decrypts the locally applied head and history pages. The marker is
 not available for arbitrary `ManagedDatastore` implementations, so a Shadow
 `ConfigBus` cannot accidentally be restored from an unproven feed.
 
+## Authenticated remote recovery and watch
+
+`ConfigWatchServer` exposes the same follower-local, publication-safe view to
+remote config consumers. It is deliberately a read adapter, not an Openraft
+transport: its closed wire grammar contains only `Recover` and `Page`, and it
+cannot vote, replicate, rebuild state, submit config, or enter a read-index
+barrier. A consumer may connect to any configured follower without funneling
+catch-up traffic through the writer. Construction fails unless the supplied
+bus has `AuthorityMode::Shadow`; an authoritative writer bus cannot be exposed
+accidentally.
+
+Every bounded page uses a fresh mutual-TLS connection and proves all of the
+following before dispatch:
+
+- the dedicated `opc-config-watch/1` ALPN and exact contract profile;
+- the existing `ConfigConsensusIdentity` (cluster, configuration, and epoch);
+- the product's exact `SchemaDigest`, checked again on every decoded snapshot
+  and page entry before caller visibility;
+- the server's exact configured SPIFFE ID; and
+- the client's exact configured SPIFFE ID and membership in the server's
+  bounded reader allowlist.
+
+Requests are limited to 16 KiB before allocation, responses to 8 MiB, pages to
+64 complete revisions, long polls to 30 seconds, and one listener to 32 active
+connections. Reads, writes, TLS/application handshakes, backend work, reconnect
+backoff, and shutdown are time-bounded. A peer that disconnects while a page is
+waiting cancels that read-only operation. A peer that stops reading cannot hold
+a server slot past the write deadline. Oversized snapshots or one-entry pages
+fail with `ConfigWatchError::FrameTooLarge`; configure the config bus's
+serialized-candidate admission limit at or below the wire response budget,
+including the small JSON envelope overhead.
+
+The wire byte cap prevents untrusted peer-controlled allocation. The trusted
+local `OpcConfig` source is materialized before JSON encoding, so a full
+64-entry page can transiently retain up to 64 cloned configs even when adaptive
+encoding later reduces the transmitted page. Products with large configs must
+include that trusted heap bound in capacity planning and set candidate
+admission limits accordingly; this adapter does not introduce a second payload
+storage or streaming framework.
+
+The remote payload is plaintext configuration protected by mutually
+authenticated TLS and exact application authorization. At-rest ciphertext and
+HKMS key handles remain unchanged: Openraft, its log, snapshots, and SQLite
+still receive only the sealed representation. Decryption occurs in the local
+`EncryptingManagedDatastore` before the trusted Shadow bus serves an authorized
+consumer, just as it does for local config readers.
+
+Minimal composition:
+
+```rust,ignore
+use std::sync::Arc;
+
+use opc_config_bus::ConfigBus;
+use opc_config_bus_consensus::{
+    fixed_config_watch_endpoint, ConfigWatchClientBinding, ConfigWatchServer,
+    ConfigWatchServerBinding, RemoteConfigWatch,
+};
+
+// `managed` is an EncryptingManagedDatastore over this node's local
+// RaftManagedDatastore. It carries the CommittedRevisionSource trust marker.
+let shadow = Arc::new(ConfigBus::restore_shadow(managed).await?);
+let server_binding = ConfigWatchServerBinding::try_new(
+    consensus_identity,
+    local_server_spiffe_id,
+    vec![authorized_consumer_spiffe_id.clone()],
+)?;
+let server = ConfigWatchServer::new(
+    shadow,
+    authenticated_server_tls,
+    server_binding,
+)?;
+let (server_handle, bound_address) = server
+    .listen(listen_address)
+    .await?;
+
+let remote = RemoteConfigWatch::<MyConfig>::new(
+    ConfigWatchClientBinding::new(
+        consensus_identity,
+        authorized_consumer_spiffe_id,
+        expected_server_spiffe_id,
+        expected_schema_digest,
+    ),
+    fixed_config_watch_endpoint(bound_address),
+    authenticated_client_tls,
+);
+let recovery = remote.recover_from(last_applied_version).await?;
+let (snapshot, mut committed_tail) = recovery.into_parts();
+install_complete_snapshot(snapshot)?;
+while let Some(revision) = committed_tail.next().await {
+    apply_committed_revision(revision?)?;
+}
+
+server_handle.shutdown().await;
+```
+
+`fixed_config_watch_endpoint` is convenient for an already-resolved address.
+Production discovery can supply `ConfigWatchAddrResolver`; it runs before every
+reconnect. Resolution never changes the exact expected server SPIFFE ID or
+consensus scope. To move to a differently identified follower, construct a new
+client binding and resume from the last caller-applied `ConfigVersion`.
+
 Strict operational requirements:
 
 - use a config-specific `ConfigConsensusIdentity`, roster, listener port,
@@ -84,6 +185,10 @@ Strict operational requirements:
 - serve committed watches from the local follower adapter and treat
   `HistoryCursorAhead` as local lag, never as authority to move a consumer
   backward;
+- keep the remote server on a dedicated listener/ALPN, supply exact reader
+  SPIFFE identities and the product schema digest, and set the config candidate
+  byte admission limit so one complete revision fits the response-frame
+  contract;
 - for command/RPC revision 3, drain config writers, stop the complete config
   voter set, upgrade every member, and restart the set together. Revisions 1
   and 2 remain replayable only under their original semantics; there is no
@@ -98,9 +203,11 @@ checks the current 27-crate source-build closure independently. An additive
 follow-up qualification change under #250 must introduce candidate evidence
 before this adapter can inherit a session-HA qualification claim.
 
-The adapter does not expose a config-watch network protocol. It makes the
-ordered stream serviceable inside each authority process and exposes
-transport-neutral page/cursor types through `opc-config-bus`; a separate
-authenticated, bounded RPC adapter is still required for a remote dataplane
-process. Issue #256 remains open until that boundary and its process-level
-qualification exist.
+The remote qualification uses real TCP and mutual TLS to prove fresh recovery,
+lagging catch-up, exact identity and scope rejection, wrong-ALPN rejection,
+schema/profile rejection, oversized and partial-frame failure, all-slot
+cancellation isolation, material rotation, maximum-version EOF, adaptive page
+continuation, and cursor-preserving follower replacement. The underlying
+config-consensus tests separately prove that the served rows are identical local
+state-machine-applied history across a real three-node Openraft leader change;
+the transport deliberately reuses that authority instead of reproducing it.

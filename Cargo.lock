@@ -2352,14 +2352,24 @@ name = "opc-config-bus-consensus"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "opc-config-bus",
  "opc-config-model",
+ "opc-identity",
  "opc-key",
  "opc-persist",
+ "opc-tls",
  "opc-types",
+ "rcgen",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
  "tokio",
+ "tokio-rustls",
+ "uuid",
 ]
 
 [[package]]

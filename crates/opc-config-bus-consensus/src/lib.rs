@@ -1,7 +1,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
-//! Ciphertext-only durable adapters for [`opc_config_bus`].
+//! Durable config-consensus and authenticated follower-read adapters.
 //!
 //! [`RaftManagedDatastore`] is a narrow adapter over the existing
 //! [`opc_persist::ConsensusConfigStore`]. It never implements or wraps a
@@ -10,7 +10,23 @@
 //! crate and outside the Openraft command, log, snapshot, and transport
 //! boundary. Its committed-history read port is follower-local: it exposes
 //! only Openraft state-machine-applied rows and does not enter a leader read
-//! barrier.
+//! barrier. [`ConfigWatchServer`] and [`RemoteConfigWatch`] carry only that
+//! read surface across a dedicated, exactly profiled mutual-TLS boundary. They
+//! bind the product schema and reject authoritative buses; they never implement
+//! a consensus peer, accept a mutation, or forward reads to the leader.
+
+pub mod remote_watch;
+
+pub use remote_watch::{
+    fixed_config_watch_endpoint, ConfigWatchAddrResolver, ConfigWatchBindingError,
+    ConfigWatchClientBinding, ConfigWatchContractProfile, ConfigWatchError, ConfigWatchServer,
+    ConfigWatchServerBinding, ConfigWatchServerError, ConfigWatchServerHandle,
+    RemoteConfigRecovery, RemoteConfigRevisionStream, RemoteConfigWatch, CONFIG_WATCH_ALPN,
+    CONFIG_WATCH_MAX_CLIENT_IDENTITIES, CONFIG_WATCH_MAX_CONCURRENT_CONNECTIONS,
+    CONFIG_WATCH_MAX_LONG_POLL, CONFIG_WATCH_MAX_REQUEST_FRAME_BYTES,
+    CONFIG_WATCH_MAX_RESPONSE_FRAME_BYTES, CONFIG_WATCH_WIRE_REVISION,
+    CURRENT_CONFIG_WATCH_CONTRACT_PROFILE,
+};
 
 use std::fmt;
 use std::marker::PhantomData;

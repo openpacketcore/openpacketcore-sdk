@@ -7,7 +7,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Ciphertext-only persistence adapters from opc-config-bus to opc-persist config consensus"
+description = "Config-bus persistence and authenticated follower-read adapters over config consensus"
 readme = "README.md"
 documentation = "https://docs.rs/opc-config-bus-consensus"
 keywords = ["5g", "cnf", "config", "consensus", "openraft"]
@@ -15,16 +15,27 @@ categories = ["network-programming", "data-structures"]
 
 [dependencies]
 async-trait = { workspace = true }
+futures-util = "0.3"
 opc-config-bus = { path = "../opc-config-bus", version = "0.2.0" }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 opc-persist = { path = "../opc-persist", version = "0.2.0" }
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
+rustls-pki-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio-rustls = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+rcgen = { workspace = true }
+tempfile = "3"
+time = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 
 [lints]
 workspace = true
