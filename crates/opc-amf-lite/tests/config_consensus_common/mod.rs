@@ -93,6 +93,7 @@ impl ConsensusPeer for LoopbackPeer {
 
 pub struct ConfigCluster {
     pub stores: Vec<ConsensusConfigStore>,
+    identity: ConfigConsensusIdentity,
     paths: BTreeMap<(usize, usize), Arc<LoopbackPeer>>,
     captured_frames: Arc<StdMutex<Vec<Vec<u8>>>>,
 }
@@ -165,11 +166,16 @@ impl ConfigCluster {
         three.expect("initialize node three");
         let cluster = Self {
             stores,
+            identity,
             paths,
             captured_frames,
         };
         cluster.wait_ready().await;
         cluster
+    }
+
+    pub const fn identity(&self) -> ConfigConsensusIdentity {
+        self.identity
     }
 
     pub async fn wait_ready(&self) {
