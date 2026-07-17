@@ -1460,12 +1460,13 @@ mod tests {
     use std::time::Duration;
 
     use opc_consensus::engine::{CommittedLeaderId, EntryPayload, Membership, RaftSnapshotBuilder};
-    use opc_crypto::CryptoEnvelopeV1;
+    use opc_crypto::{encrypt_envelope_with_handle_and_nonce, CryptoEnvelopeV1};
     use opc_key::{
-        serialize_bound_aad, AeadAlgorithm, ConfigAad, EnvelopeAad, KeyId, AEAD_TAG_LEN,
-        AES_256_GCM_SIV_NONCE_LEN,
+        serialize_bound_aad, AeadAlgorithm, ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose,
+        Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN,
     };
-    use opc_types::{ConfigVersion, SchemaDigest, TenantId};
+    use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp, TxId};
+    use sha2::Digest as _;
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     use super::*;
@@ -1533,6 +1534,60 @@ mod tests {
         assert!(collect_bounded_entries(oversized).is_err());
     }
 
+    fn snapshot_commit_record(
+        tx_id: TxId,
+        parent_tx_id: Option<TxId>,
+        version: u64,
+        committed_at: Timestamp,
+        confirmed_deadline: Option<Timestamp>,
+        marker: u8,
+    ) -> CommitRecord {
+        let principal = "spiffe://test.example/tenant/tenant-a/ns/core/sa/config".to_owned();
+        let schema_digest = SchemaDigest::from_bytes([marker; 32]);
+        let tenant = TenantId::from_static("tenant-a");
+        let key_id = KeyId::new("config-snapshot-install-key").expect("key ID");
+        let handle = KeyHandle::new(
+            key_id,
+            KeyPurpose::Config,
+            tenant.clone(),
+            Zeroizing::new([0x73; AES_256_GCM_SIV_KEY_LEN]),
+        );
+        let aad = EnvelopeAad::config(
+            tenant,
+            version,
+            ConfigAad::new(
+                tx_id,
+                parent_tx_id,
+                committed_at,
+                &principal,
+                schema_digest,
+                "running",
+            )
+            .expect("config AAD"),
+        );
+        let plaintext = [marker; 32];
+        let encrypted_blob = encrypt_envelope_with_handle_and_nonce(
+            &handle,
+            &aad,
+            &plaintext,
+            [marker; AES_256_GCM_SIV_NONCE_LEN],
+        )
+        .expect("encrypted config envelope");
+        CommitRecord {
+            tx_id,
+            parent_tx_id,
+            version: ConfigVersion::new(version),
+            committed_at,
+            principal,
+            source: CommitSource::Gnmi,
+            schema_digest,
+            plaintext_digest: Sha256::digest(plaintext).to_vec(),
+            encrypted_blob,
+            rollback_point: false,
+            confirmed_deadline,
+        }
+    }
+
     fn mutation_entry() -> Entry<ConfigRaftTypeConfig> {
         Entry {
             log_id: log_id(1),
@@ -1544,6 +1599,26 @@ mod tests {
                 intent: ConfigMutationIntent::MarkConfirmed {
                     tx_id: opc_types::TxId::new(),
                 },
+            }),
+        }
+    }
+
+    fn snapshot_commit_entry(
+        index: u64,
+        request_byte: u8,
+        record: CommitRecord,
+    ) -> Entry<ConfigRaftTypeConfig> {
+        let logical_time = record.committed_at;
+        let prepared = PreparedConfigCommit::prepare(record, Vec::new(), &shared_audit_key())
+            .expect("prepared config commit");
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(ConfigConsensusCommand {
+                schema_version: CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity: identity(),
+                request_id: ConfigConsensusRequestId::from_bytes([request_byte; 16]),
+                logical_time,
+                intent: ConfigMutationIntent::AppendCommit(Box::new(prepared)),
             }),
         }
     }
@@ -2122,6 +2197,30 @@ mod tests {
     #[tokio::test]
     async fn file_snapshot_install_is_checksummed_atomic_and_replaces_applied_state() {
         let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let genesis_tx = TxId::from_uuid(uuid::Uuid::from_bytes([0x31; 16]));
+        let child_tx = TxId::from_uuid(uuid::Uuid::from_bytes([0x32; 16]));
+        let genesis_at = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(1_767_225_600)
+                .expect("fixed genesis timestamp"),
+        );
+        let child_at = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(1_767_225_660)
+                .expect("fixed child timestamp"),
+        );
+        let child_deadline = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(1_767_225_960)
+                .expect("fixed confirmation deadline"),
+        );
+        let genesis = snapshot_commit_record(genesis_tx, None, 1, genesis_at, None, 0x41);
+        let child = snapshot_commit_record(
+            child_tx,
+            Some(genesis_tx),
+            2,
+            child_at,
+            Some(child_deadline),
+            0x42,
+        );
+        let expected_ciphertext = child.encrypted_blob.clone();
         let source_backend =
             SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
                 .await
@@ -2134,17 +2233,25 @@ mod tests {
         )
         .await
         .expect("source storage");
-        source_machine
-            .apply([membership_entry(), mutation_entry()])
+        let responses = source_machine
+            .apply([
+                membership_entry(),
+                snapshot_commit_entry(1, 0x91, genesis),
+                snapshot_commit_entry(2, 0x92, child),
+            ])
             .await
             .expect("source apply");
+        assert!(
+            responses.iter().all(|response| response.result.is_ok()),
+            "snapshot source entries must all apply"
+        );
         let mut snapshot = source_machine
             .get_snapshot_builder()
             .await
             .build_snapshot()
             .await
             .expect("source snapshot");
-        assert_eq!(Some(log_id(1)), snapshot.meta.last_log_id);
+        assert_eq!(Some(log_id(2)), snapshot.meta.last_log_id);
 
         let rejected_backend =
             SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
@@ -2232,6 +2339,31 @@ mod tests {
         assert_eq!(snapshot.meta.last_log_id, applied);
         assert_eq!(snapshot.meta.last_membership, membership);
 
+        let restored = crate::ConfigStore::load_latest(&destination_backend)
+            .await
+            .expect("load installed config history")
+            .expect("installed config history");
+        assert!(
+            restored.record.tx_id == child_tx,
+            "snapshot must restore the exact child transaction"
+        );
+        assert!(
+            restored.record.version == ConfigVersion::new(2),
+            "snapshot must restore the exact child version"
+        );
+        assert!(
+            restored.record.parent_tx_id == Some(genesis_tx),
+            "snapshot must restore the exact parent transaction"
+        );
+        assert!(
+            restored.record.confirmed_deadline == Some(child_deadline),
+            "snapshot must restore the exact confirmation deadline"
+        );
+        assert!(
+            restored.record.encrypted_blob == expected_ciphertext,
+            "snapshot must restore the exact sealed ciphertext"
+        );
+
         let conn = destination_backend.conn();
         let conn = conn.lock().await;
         let sequence: i64 = conn
@@ -2248,6 +2380,9 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("installed outcomes");
+        let history: i64 = conn
+            .query_row("SELECT COUNT(*) FROM config_history", [], |row| row.get(0))
+            .expect("installed history count");
         let logs: i64 = conn
             .query_row("SELECT COUNT(*) FROM config_raft_log", [], |row| row.get(0))
             .expect("installed log count");
@@ -2258,8 +2393,9 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("stale attachment count");
-        assert_eq!(1, sequence);
-        assert_eq!(1, outcomes);
+        assert_eq!(2, sequence);
+        assert_eq!(2, outcomes);
+        assert_eq!(2, history);
         assert_eq!(0, logs, "snapshot must not import log-store authority");
         assert_eq!(0, stale_attachments, "install must detach stale aliases");
     }

@@ -157,6 +157,41 @@ fn assert_consensus_rows_forbidden_absent(database: &Path) {
     }
 }
 
+fn assert_live_config_logs_are_non_vacuous_and_forbidden_absent(root: &Path) {
+    for index in 0..3 {
+        let database = root.join(format!("config-{index}.sqlite"));
+        let conn = rusqlite::Connection::open(database).expect("open live config database");
+        let has_append_commit: bool = conn
+            .query_row(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM config_raft_log
+                       WHERE json_type(
+                           CAST(entry_json AS TEXT),
+                           '$.payload.Normal.intent.AppendCommit'
+                       ) IS NOT NULL
+                   )"#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect config append log rows");
+        assert!(
+            has_append_commit,
+            "raw config log scan must cover a sealed append entry"
+        );
+
+        let mut statement = conn
+            .prepare("SELECT entry_json FROM config_raft_log")
+            .expect("prepare config log scan");
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .expect("query config log rows");
+        for row in rows {
+            assert_forbidden_bytes_absent("config raft log row", &row.expect("config log row"));
+        }
+    }
+}
+
 fn assert_live_artifacts_forbidden_absent(root: &Path, cluster: &ConfigCluster) {
     let frames = cluster.captured_frames();
     assert!(
@@ -273,6 +308,7 @@ async fn hkms_boundary_survives_rotation_followers_snapshots_and_restart() {
         assert_eq!(second_tx, latest.record.tx_id);
         assert!(!latest.record.encrypted_blob.is_empty());
     }
+    assert_live_config_logs_are_non_vacuous_and_forbidden_absent(temp.path());
     assert_eq!(
         2,
         provider.call_count(),
