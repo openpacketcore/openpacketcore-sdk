@@ -38,8 +38,8 @@ use opc_session_testkit::qualification::{
     session_mtls_candidate_schedule_sha256, write_json_line,
     QualificationConnectionLifecycleConfig, QualificationConnectionLifecycleMetrics,
     QualificationConsensusRpcAvailability, QualificationMember, QualificationNodeCommand,
-    QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
-    QualificationPeerRouting, QualificationProjectedMtlsConfig,
+    QualificationNodeCommandKind, QualificationNodeConfig, QualificationNodeErrorCode,
+    QualificationNodeReply, QualificationPeerRouting, QualificationProjectedMtlsConfig,
     QualificationProjectedSvidAvailability, QualificationProjectedSvidReason,
     QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
@@ -1876,63 +1876,12 @@ enum ReaderMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingCommandKind {
     AwaitBound,
-    Configure,
-    Initialize,
-    Probe,
-    ProjectedSourceStatus,
-    MaterialStatus,
-    ReauthenticationGeneration,
-    RequestReauthentication,
-    DirectedHandshake,
-    LifecycleMetrics,
-    SetConsensusRpcAvailability,
-    SecurityMetrics,
-    StartTrafficWatch,
-    ReconcileTrafficWatch,
-    StartTrafficMutation,
-    StopTrafficMutation,
-    StopTrafficWatch,
-    TrafficStatus,
-    Acquire,
-    CompareAndSet,
-    Get,
-    Release,
-    ForgetLease,
-    Shutdown,
+    Command(QualificationNodeCommandKind),
 }
 
 impl PendingCommandKind {
     fn from_command(command: &QualificationNodeCommand) -> Self {
-        match command {
-            QualificationNodeCommand::Configure => Self::Configure,
-            QualificationNodeCommand::Initialize => Self::Initialize,
-            QualificationNodeCommand::Probe => Self::Probe,
-            QualificationNodeCommand::ProjectedSourceStatus => Self::ProjectedSourceStatus,
-            QualificationNodeCommand::MaterialStatus => Self::MaterialStatus,
-            QualificationNodeCommand::ReauthenticationGeneration => {
-                Self::ReauthenticationGeneration
-            }
-            QualificationNodeCommand::RequestReauthentication => Self::RequestReauthentication,
-            QualificationNodeCommand::DirectedHandshake { .. } => Self::DirectedHandshake,
-            QualificationNodeCommand::LifecycleMetrics => Self::LifecycleMetrics,
-            QualificationNodeCommand::SetConsensusRpcAvailability { .. } => {
-                Self::SetConsensusRpcAvailability
-            }
-            QualificationNodeCommand::SecurityMetrics => Self::SecurityMetrics,
-            QualificationNodeCommand::StartTrafficWatch => Self::StartTrafficWatch,
-            QualificationNodeCommand::ReconcileTrafficWatch => Self::ReconcileTrafficWatch,
-            QualificationNodeCommand::StartTrafficMutation => Self::StartTrafficMutation,
-            QualificationNodeCommand::StopTrafficMutation => Self::StopTrafficMutation,
-            QualificationNodeCommand::StopTrafficWatch => Self::StopTrafficWatch,
-            QualificationNodeCommand::TrafficStatus
-            | QualificationNodeCommand::TrafficStatusSnapshot => Self::TrafficStatus,
-            QualificationNodeCommand::Acquire { .. } => Self::Acquire,
-            QualificationNodeCommand::CompareAndSet { .. } => Self::CompareAndSet,
-            QualificationNodeCommand::Get { .. } => Self::Get,
-            QualificationNodeCommand::Release { .. } => Self::Release,
-            QualificationNodeCommand::ForgetLease { .. } => Self::ForgetLease,
-            QualificationNodeCommand::Shutdown => Self::Shutdown,
-        }
+        Self::Command(command.kind())
     }
 }
 
@@ -9362,14 +9311,14 @@ fn pending_command_diagnostic_is_deterministic_and_payload_free() {
     assert_eq!(
         diagnostic,
         PendingCommandDiagnostic {
-            kind: PendingCommandKind::CompareAndSet,
+            kind: PendingCommandKind::Command(QualificationNodeCommandKind::CompareAndSet),
             sequence: 7,
             send_elapsed_millis: 42,
         }
     );
     assert_eq!(
         format!("{diagnostic:?}"),
-        "PendingCommandDiagnostic { kind: CompareAndSet, sequence: 7, send_elapsed_millis: 42 }"
+        "PendingCommandDiagnostic { kind: Command(CompareAndSet), sequence: 7, send_elapsed_millis: 42 }"
     );
 }
 

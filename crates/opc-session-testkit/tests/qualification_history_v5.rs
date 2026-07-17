@@ -3,8 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use opc_session_testkit::qualification::{
-    SESSION_HA_CANDIDATE_EVIDENCE_V5_SCHEMA_JSON, SESSION_HA_CONCURRENT_HISTORY_V5_SCHEMA_JSON,
-    SESSION_HA_FAULT_SCHEDULE_V5_SCHEMA_JSON,
+    QualificationConcurrentBatchOutcome, QualificationConcurrentBatchSlotOutcome,
+    QualificationConcurrentBatchSlotResult, QualificationConcurrentMutationSnapshot,
+    QualificationConcurrentRecordSnapshot, QualificationConcurrentWatchEvent,
+    QualificationNodeReply, SESSION_HA_CANDIDATE_EVIDENCE_V5_SCHEMA_JSON,
+    SESSION_HA_CONCURRENT_HISTORY_V5_SCHEMA_JSON, SESSION_HA_FAULT_SCHEDULE_V5_SCHEMA_JSON,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -161,6 +164,69 @@ fn output_json(output: &Output) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("canonical checker output")
+}
+
+fn typed_watch_event(value: &Value) -> QualificationConcurrentWatchEvent {
+    QualificationConcurrentWatchEvent {
+        journal_sequence: value["journal_sequence"]
+            .as_u64()
+            .expect("fixture journal sequence"),
+        record: serde_json::from_value::<QualificationConcurrentRecordSnapshot>(
+            serde_json::json!({
+                "key_sha256": value["key_sha256"],
+                "generation": value["generation"],
+                "owner_sha256": value["owner_sha256"],
+                "fence": value["fence"],
+                "state_class": value["state_class"],
+                "state_type_sha256": value["state_type_sha256"],
+                "expires_at_ns": value["expires_at_ns"],
+                "value_sha256": value["value_sha256"],
+            }),
+        )
+        .expect("typed fixture watch record"),
+    }
+}
+
+fn project_child_batch_reply(
+    reply: &QualificationNodeReply,
+    committed: &[QualificationConcurrentWatchEvent],
+    invocation_sequence: u64,
+) -> Value {
+    let QualificationNodeReply::ConcurrentBatch { outcome, slots } = reply else {
+        panic!("expected typed child batch reply")
+    };
+    let slots = slots
+        .iter()
+        .map(|slot| {
+            let journal_sequence =
+                if slot.outcome == QualificationConcurrentBatchSlotOutcome::Success {
+                    let matches = committed
+                        .iter()
+                        .filter(|event| slot.matches_committed_watch_event(event))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        matches.len(),
+                        1,
+                        "successful child slot must correlate once"
+                    );
+                    Value::from(matches[0].journal_sequence)
+                } else {
+                    Value::Null
+                };
+            serde_json::json!({
+                "slot_index": slot.slot_index,
+                "outcome": slot.outcome,
+                "journal_sequence": journal_sequence,
+                "mutation": slot.mutation,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "batch",
+        "invocation_sequence": invocation_sequence,
+        "outcome": outcome,
+        "slots": slots,
+    })
 }
 
 fn structural_schema_for_lightweight_validator(mut schema: Value) -> Value {
@@ -338,6 +404,74 @@ fn independent_checker_accepts_partial_batch_and_separate_index_domains() {
     );
     assert_eq!(result["violation_codes"], serde_json::json!([]));
     assert_eq!(result["inconclusive_codes"], serde_json::json!([]));
+}
+
+#[test]
+fn typed_child_mixed_batch_replies_project_into_the_frozen_v5_checker() {
+    let fixture = fixture_rows();
+    let first_mutation = serde_json::from_value::<QualificationConcurrentMutationSnapshot>(
+        fixture[1]["operation"]["slots"][0]["mutation"].clone(),
+    )
+    .expect("typed first mutation");
+    let mut second_mutation = serde_json::from_value::<QualificationConcurrentMutationSnapshot>(
+        fixture[0]["operation"]["slots"][2]["mutation"].clone(),
+    )
+    .expect("typed second mutation");
+    second_mutation.expected_generation = None;
+    second_mutation.new_generation = 2;
+    let committed = fixture[2]["operation"]["events"]
+        .as_array()
+        .expect("watch events")
+        .iter()
+        .filter(|event| event["batch_operation_id"] == "batch-2")
+        .map(typed_watch_event)
+        .collect::<Vec<_>>();
+    assert_eq!(committed.len(), 1);
+
+    for (second_outcome, expected_status, expected_inconclusive) in [
+        (
+            QualificationConcurrentBatchSlotOutcome::Conflict,
+            "pass",
+            serde_json::json!([]),
+        ),
+        (
+            QualificationConcurrentBatchSlotOutcome::Unavailable,
+            "inconclusive",
+            serde_json::json!(["unknown_batch_slot_outcome"]),
+        ),
+        (
+            QualificationConcurrentBatchSlotOutcome::Indeterminate,
+            "inconclusive",
+            serde_json::json!(["unknown_batch_slot_outcome"]),
+        ),
+    ] {
+        let reply = QualificationNodeReply::ConcurrentBatch {
+            outcome: QualificationConcurrentBatchOutcome::Completed,
+            slots: vec![
+                QualificationConcurrentBatchSlotResult {
+                    slot_index: 1,
+                    outcome: QualificationConcurrentBatchSlotOutcome::Success,
+                    mutation: first_mutation.clone(),
+                },
+                QualificationConcurrentBatchSlotResult {
+                    slot_index: 2,
+                    outcome: second_outcome,
+                    mutation: second_mutation.clone(),
+                },
+            ],
+        };
+        let wire = serde_json::to_vec(&reply).expect("encode actual child reply");
+        let decoded = serde_json::from_slice::<QualificationNodeReply>(&wire)
+            .expect("decode actual child reply");
+        let mut rows = fixture_rows();
+        rows[1]["operation"] = project_child_batch_reply(&decoded, &committed, 2);
+
+        let output = run_mutated(&rows);
+        let result = output_json(&output);
+        assert_eq!(result["status"], expected_status);
+        assert_eq!(result["inconclusive_codes"], expected_inconclusive);
+        assert_eq!(result["violation_codes"], serde_json::json!([]));
+    }
 }
 
 #[test]

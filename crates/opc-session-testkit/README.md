@@ -138,11 +138,12 @@ local socket access, including Kubernetes `pods/exec` access used to launch
 the client, is node-administrator-equivalent qualification authority and must
 be restricted and audited accordingly.
 
-Its strict private node configuration/control schema is version 3. Version 2
-is explicitly rejected because it predates the routing-aware optional
-`dial_addr` representation; version 1 is also rejected because lifecycle
-replies did not carry the fixed `superseded` and `abandoned` terminal
-outcomes. Node config accepts `projected_mtls` with an absolute
+Its strict private node configuration/control schema is version 4. Version 3
+is explicitly rejected because it predates the bounded v5 collector command
+inventory. Version 2 is rejected because it predates the routing-aware
+optional `dial_addr` representation; version 1 is also rejected because
+lifecycle replies did not carry the fixed `superseded` and `abandoned`
+terminal outcomes. Node config accepts `projected_mtls` with an absolute
 projected volume root inside the node workspace, normalized relative
 certificate/key/bundle names, a bounded polling interval, and a finite
 validated connection lifecycle policy. The control protocol exposes only
@@ -516,6 +517,35 @@ not modify the frozen v1-v4 files. The v5 workload deliberately serializes
 batch invocations while allowing watch, restore, and readiness intervals to
 overlap; this keeps the first independent state checker bounded without
 claiming a general concurrent-batch linearizability search.
+
+The private node protocol exposes additive v5 collector controls over the
+existing protected `ConsensusSessionStore`: strict readiness followed by a
+separately linearized application-journal head, real watch registration and
+bounded completion, at most two sequential per-slot CAS attempts, and a
+complete restore scan scoped to one history-derived state type in the fixed
+qualification tenant/NF/key namespace. Restore inspects at most two pages; the
+second proves completion, reports the fixed record overflow, or fails closed
+as unavailable when it cannot establish either outcome. Batch
+replies contain only digest-bound attempts and typed outcomes; they
+deliberately contain no journal sequence. A collector assigns a successful
+slot's sequence only after correlating that attempt with an actual committed
+watch record. Watch/restore replies and requested completion windows are capped
+at 24 digest-only records/journal entries so the unchanged 16 KiB control frame
+is a hard boundary. A compliant collector promptly finishes or aborts each of
+the at most eight retained watches; an abandoned stream may fill its existing
+64-entry channel and then fails closed rather than weakening that backend
+bound. Abort is idempotent and process shutdown drops every retained stream.
+
+The v5 collector scheduling profile is
+`one-in-flight-terminal-then-readiness/v1`: at most one command is in flight
+per node, and a readiness sample starts only after the preceding long control
+has returned a terminal reply. It does not claim arbitrary same-node overlap.
+Two 10-second backend stages plus delivery (21 seconds) and the readiness
+command's conservative three-stage envelope plus delivery (31 seconds) each
+remain below the 45-second child-reply bound and total 52 seconds inside the
+60-second checker cadence. No outer timeout cancels an accepted backend
+operation. These controls do not create another commit/sequencing path and do
+not make the v5 candidate a production qualification result.
 
 `scripts/check-session-ha-concurrent-history-v5.py` checks:
 

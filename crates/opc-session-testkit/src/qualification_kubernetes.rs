@@ -847,7 +847,7 @@ mod tests {
                     .expect("encoded node config");
                 let node: QualificationNodeConfig =
                     serde_json::from_str(encoded).expect("strict node config");
-                assert_eq!(node.schema_version, 3);
+                assert_eq!(node.schema_version, QUALIFICATION_NODE_SCHEMA_VERSION);
                 assert_eq!(node.node_index, node_index);
                 assert_eq!(
                     node.configuration_generation,

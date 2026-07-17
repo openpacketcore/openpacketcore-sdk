@@ -40,26 +40,35 @@ use opc_session_store::{
     EncryptingSessionBackend, FenceToken, Generation, LeaseError, LeaseGuard, OwnerId,
     QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
     ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationEntry, ReplicationOp,
-    RestoreScanCursorProfile, RestoreScanRequest, SessionBackend, SessionConsensusIdentity,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager,
-    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
-    ValidatedQuorumTopology,
+    RestoreScanCursorProfile, RestoreScanRequest, RestoreScanScope, SessionBackend,
+    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionOp, SessionOpResult, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
-    qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
-    qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
-    write_json_line, QualificationConnectionLifecycleMetrics,
+    qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
+    qualification_traffic_schedule_sha256, qualification_traffic_seed, qualification_traffic_value,
+    qualification_value_sha256, read_bounded_json_line, write_json_line,
+    QualificationConcurrentBatchOutcome, QualificationConcurrentBatchSlot,
+    QualificationConcurrentBatchSlotOutcome, QualificationConcurrentBatchSlotResult,
+    QualificationConcurrentMutationSnapshot, QualificationConcurrentReadiness,
+    QualificationConcurrentRecordSnapshot, QualificationConcurrentStateClass,
+    QualificationConcurrentStateType, QualificationConcurrentSubscriptionId,
+    QualificationConcurrentWatchEvent, QualificationConnectionLifecycleMetrics,
     QualificationConsensusRpcAvailability, QualificationNodeCommand, QualificationNodeConfig,
     QualificationNodeErrorCode, QualificationNodeReply, QualificationPeerRouting,
     QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialStatus,
     QualificationTrafficErrorClass, QualificationTrafficFailureCode,
     QualificationTrafficFailureStage, QualificationTrafficState, QualificationTrafficStatus,
-    QualificationTransportConfig, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
-    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_MAX_CONFIG_BYTES,
-    QUALIFICATION_MAX_LEASE_HANDLES,
+    QualificationTransportConfig, QUALIFICATION_CONCURRENT_COLLECTOR_MAX_JOURNAL_ENTRIES,
+    QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS, QUALIFICATION_CONCURRENT_RESTORE_MAX_PAGES,
+    QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX, QUALIFICATION_CONCURRENT_WATCH_MAX_SUBSCRIPTIONS,
+    QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
+    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
@@ -320,8 +329,15 @@ struct QualificationNode {
     configured_voter_ids: Vec<u64>,
     traffic_schedule_bound: bool,
     traffic: Option<QualificationTrafficRuntime>,
+    concurrent_watches:
+        HashMap<QualificationConcurrentSubscriptionId, QualificationConcurrentWatchRuntime>,
     empty_vote_dispatches: Arc<AtomicU64>,
     rpc_gate: QualificationConsensusRpcGate,
+}
+
+struct QualificationConcurrentWatchRuntime {
+    requested_after_journal_sequence: u64,
+    stream: BoxStream<'static, Result<ReplicationEntry, StoreError>>,
 }
 
 struct QualificationTrafficRuntime {
@@ -816,6 +832,7 @@ impl QualificationNode {
             traffic_schedule_bound: qualification_traffic_schedule_sha256(config.members.len())
                 .is_some_and(|digest| digest == config.workload_schedule_sha256),
             traffic: None,
+            concurrent_watches: HashMap::new(),
             empty_vote_dispatches,
             rpc_gate,
         })
@@ -833,6 +850,9 @@ impl QualificationNode {
                 },
             },
             QualificationNodeCommand::Probe => self.probe().await,
+            QualificationNodeCommand::ProbeConcurrentReadiness => {
+                self.probe_concurrent_readiness().await
+            }
             QualificationNodeCommand::ProjectedSourceStatus => self.projected_source_status(),
             QualificationNodeCommand::MaterialStatus => self.material_status(),
             QualificationNodeCommand::ReauthenticationGeneration => {
@@ -865,6 +885,29 @@ impl QualificationNode {
             QualificationNodeCommand::StopTrafficWatch => self.stop_traffic_watch().await,
             QualificationNodeCommand::TrafficStatus => self.traffic_status().await,
             QualificationNodeCommand::TrafficStatusSnapshot => self.traffic_status_snapshot(),
+            QualificationNodeCommand::StartConcurrentWatch {
+                subscription_id,
+                requested_after_journal_sequence,
+            } => {
+                self.start_concurrent_watch(subscription_id, requested_after_journal_sequence)
+                    .await
+            }
+            QualificationNodeCommand::FinishConcurrentWatch {
+                subscription_id,
+                complete_through_journal_sequence,
+            } => {
+                self.finish_concurrent_watch(subscription_id, complete_through_journal_sequence)
+                    .await
+            }
+            QualificationNodeCommand::AbortConcurrentWatch { subscription_id } => {
+                self.abort_concurrent_watch(subscription_id)
+            }
+            QualificationNodeCommand::ConcurrentBatch { slots } => {
+                self.concurrent_batch(slots).await
+            }
+            QualificationNodeCommand::ConcurrentRestore { state_type } => {
+                self.concurrent_restore(state_type).await
+            }
             QualificationNodeCommand::Acquire {
                 lease_handle,
                 stable_id,
@@ -1756,21 +1799,378 @@ impl QualificationNode {
         }
     }
 
+    async fn probe_concurrent_readiness(&self) -> QualificationNodeReply {
+        let report = self.store.probe_durable_readiness().await;
+        let reported_reason = qualification_readiness_code(report.state());
+        let status = self.store.status();
+        let progress = report.recovery_progress();
+        let required_quorum = (self.configured_voter_ids.len() / 2) + 1;
+        let strict_report = report.is_ready()
+            && report.configured_voters() == self.configured_voter_ids.len()
+            && report.fresh_reachable_voters() == required_quorum
+            && report.agreeing_voters() == required_quorum
+            && report.required_quorum() == required_quorum
+            && self.configured_voter_ids.contains(&status.node_id.get())
+            && status.term > 0
+            && status
+                .leader_id
+                .is_some_and(|leader| self.configured_voter_ids.contains(&leader.get()))
+            && report.committed_barrier_index().is_some()
+            && progress.local_applied_index().is_some_and(|applied| {
+                report
+                    .committed_barrier_index()
+                    .is_some_and(|committed| applied >= committed)
+            });
+
+        let journal_head = if strict_report {
+            self.protected.max_replication_sequence().await.ok()
+        } else {
+            None
+        };
+        let ready = strict_report && journal_head.is_some();
+        QualificationNodeReply::ConcurrentReadiness {
+            status: QualificationConcurrentReadiness {
+                ready,
+                reason_code: if ready {
+                    QualificationReadinessCode::Ready
+                } else if report.is_ready() {
+                    QualificationReadinessCode::NoQuorum
+                } else {
+                    reported_reason
+                },
+                node_id: status.node_id.get(),
+                configured_voters: report.configured_voters(),
+                configured_voter_ids: self.configured_voter_ids.clone(),
+                fresh_reachable_voters: report.fresh_reachable_voters(),
+                agreeing_voters: report.agreeing_voters(),
+                required_quorum: report.required_quorum(),
+                raft_term: ready.then_some(status.term),
+                raft_leader_id: ready
+                    .then(|| status.leader_id.map(|leader| leader.get()))
+                    .flatten(),
+                raft_commit_index: ready.then(|| report.committed_barrier_index()).flatten(),
+                raft_applied_index: ready.then(|| progress.local_applied_index()).flatten(),
+                journal_head: ready.then_some(journal_head).flatten(),
+            },
+        }
+    }
+
+    async fn start_concurrent_watch(
+        &mut self,
+        subscription_id: QualificationConcurrentSubscriptionId,
+        requested_after_journal_sequence: u64,
+    ) -> QualificationNodeReply {
+        if self.concurrent_watches.contains_key(&subscription_id) {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::ConcurrentWatchDuplicate,
+            };
+        }
+        if self.concurrent_watches.len() >= QUALIFICATION_CONCURRENT_WATCH_MAX_SUBSCRIPTIONS {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
+            };
+        }
+        let Some(start_sequence) = requested_after_journal_sequence.checked_add(1) else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::InvalidRequest,
+            };
+        };
+        let stream = match self.protected.watch(start_sequence).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
+                }
+            }
+        };
+        self.concurrent_watches.insert(
+            subscription_id.clone(),
+            QualificationConcurrentWatchRuntime {
+                requested_after_journal_sequence,
+                stream,
+            },
+        );
+        QualificationNodeReply::ConcurrentWatchStarted {
+            subscription_id,
+            requested_after_journal_sequence,
+        }
+    }
+
+    async fn finish_concurrent_watch(
+        &mut self,
+        subscription_id: QualificationConcurrentSubscriptionId,
+        complete_through_journal_sequence: u64,
+    ) -> QualificationNodeReply {
+        let Some(requested_after_journal_sequence) = self
+            .concurrent_watches
+            .get(&subscription_id)
+            .map(|watch| watch.requested_after_journal_sequence)
+        else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::ConcurrentWatchMissing,
+            };
+        };
+        if complete_through_journal_sequence < requested_after_journal_sequence {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::InvalidRequest,
+            };
+        }
+        if complete_through_journal_sequence - requested_after_journal_sequence
+            > QUALIFICATION_CONCURRENT_COLLECTOR_MAX_JOURNAL_ENTRIES
+        {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::ConcurrentWatchOverflow,
+            };
+        }
+        if complete_through_journal_sequence == requested_after_journal_sequence {
+            match self.protected.max_replication_sequence().await {
+                Ok(head) if head >= requested_after_journal_sequence => {}
+                Ok(_) => {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                }
+                Err(_) => {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
+                    }
+                }
+            }
+        }
+        let Some(mut watch) = self.concurrent_watches.remove(&subscription_id) else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::ConcurrentWatchMissing,
+            };
+        };
+        let mut events = Vec::new();
+        if complete_through_journal_sequence != requested_after_journal_sequence {
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_millis(QUALIFICATION_OPERATION_TIMEOUT_MILLIS);
+            let mut expected_sequence = requested_after_journal_sequence.saturating_add(1);
+            loop {
+                let entry = match tokio::time::timeout_at(deadline, watch.stream.next()).await {
+                    Ok(Some(Ok(entry))) if entry.sequence == expected_sequence => entry,
+                    Ok(Some(Ok(_))) | Ok(Some(Err(_))) | Ok(None) | Err(_) => {
+                        return QualificationNodeReply::Error {
+                            code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
+                        }
+                    }
+                };
+                if append_concurrent_watch_events(entry, &mut events).is_err() {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::ConcurrentWatchOverflow,
+                    };
+                }
+                if expected_sequence == complete_through_journal_sequence {
+                    break;
+                }
+                let Some(next_sequence) = expected_sequence.checked_add(1) else {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
+                    };
+                };
+                if next_sequence > complete_through_journal_sequence {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
+                    };
+                }
+                expected_sequence = next_sequence;
+            }
+        }
+        QualificationNodeReply::ConcurrentWatchFinished {
+            subscription_id,
+            complete_through_journal_sequence,
+            events,
+        }
+    }
+
+    fn abort_concurrent_watch(
+        &mut self,
+        subscription_id: QualificationConcurrentSubscriptionId,
+    ) -> QualificationNodeReply {
+        self.concurrent_watches.remove(&subscription_id);
+        QualificationNodeReply::ConcurrentWatchAborted { subscription_id }
+    }
+
+    async fn concurrent_batch(
+        &self,
+        slots: Vec<QualificationConcurrentBatchSlot>,
+    ) -> QualificationNodeReply {
+        let mut attempts = Vec::with_capacity(slots.len());
+        let mut operations = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let Some(lease) = self
+                .leases
+                .get(&slot.lease_handle)
+                .filter(|lease| !lease.released)
+                .map(|lease| lease.guard.clone())
+            else {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::LeaseHandleMissing,
+                };
+            };
+            let key = match qualification_key(&slot.stable_id) {
+                Ok(key) if lease.key() == &key => key,
+                Ok(_) => {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                }
+                Err(()) => {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                }
+            };
+            let state_type = match StateType::new(slot.state_type.as_str().to_owned()) {
+                Ok(state_type) => state_type,
+                Err(_) => {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                }
+            };
+            let attempted = QualificationConcurrentMutationSnapshot {
+                key_sha256: qualification_key_bytes_sha256(slot.stable_id.as_bytes()),
+                expected_generation: slot.expected_generation,
+                new_generation: slot.new_generation,
+                owner_sha256: qualification_owner_sha256(lease.owner().as_str()),
+                fence: lease.fence().get(),
+                state_class: QualificationConcurrentStateClass::AuthoritativeSession,
+                state_type_sha256: qualification_state_type_sha256(slot.state_type.as_str()),
+                expires_at_ns: None,
+                value_sha256: qualification_value_sha256(slot.value.as_bytes()),
+            };
+            let record = StoredSessionRecord {
+                key: key.clone(),
+                generation: Generation::new(slot.new_generation),
+                owner: lease.owner().clone(),
+                fence: lease.fence(),
+                state_class: StateClass::AuthoritativeSession,
+                state_type,
+                expires_at: None,
+                payload: EncryptedSessionPayload::new(slot.value.as_bytes()),
+            };
+            attempts.push(attempted);
+            operations.push(SessionOp::CompareAndSet(CompareAndSet {
+                key,
+                lease,
+                expected_generation: slot.expected_generation.map(Generation::new),
+                new_record: record,
+            }));
+        }
+
+        let (outcome, outcomes) =
+            concurrent_batch_outcomes(attempts.len(), self.protected.batch(operations).await);
+        let slots = attempts
+            .into_iter()
+            .zip(outcomes)
+            .enumerate()
+            .map(
+                |(index, (mutation, outcome))| QualificationConcurrentBatchSlotResult {
+                    slot_index: index + 1,
+                    outcome,
+                    mutation,
+                },
+            )
+            .collect();
+        QualificationNodeReply::ConcurrentBatch { outcome, slots }
+    }
+
+    async fn concurrent_restore(
+        &self,
+        state_type: QualificationConcurrentStateType,
+    ) -> QualificationNodeReply {
+        let state_type_model = match StateType::new(state_type.as_str().to_owned()) {
+            Ok(state_type) => state_type,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::InvalidRequest,
+                }
+            }
+        };
+        let scope = match concurrent_restore_scope(state_type_model) {
+            Ok(scope) => scope,
+            Err(()) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
+                }
+            }
+        };
+        let mut cursor = None;
+        let mut records = Vec::new();
+        let mut page_count = 0_usize;
+        loop {
+            page_count = page_count.saturating_add(1);
+            if page_count > QUALIFICATION_CONCURRENT_RESTORE_MAX_PAGES {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
+                };
+            }
+            let page = match self
+                .protected
+                .scan_restore_records(RestoreScanRequest {
+                    scope: scope.clone(),
+                    cursor,
+                    limit: QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS,
+                })
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
+                    }
+                }
+            };
+            if page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
+                || page.loaded_count != page.records.len()
+                || page.records.len() > QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS
+                || page.complete != page.next_cursor.is_none()
+            {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
+                };
+            }
+            for record in page.records {
+                let snapshot = match concurrent_record_snapshot(&record) {
+                    Ok(Some(snapshot)) if scope.matches_record(&record) => snapshot,
+                    Ok(Some(_)) | Ok(None) | Err(()) => {
+                        return QualificationNodeReply::Error {
+                            code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
+                        }
+                    }
+                };
+                if records.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::ConcurrentRestoreOverflow,
+                    };
+                }
+                records.push(snapshot);
+            }
+            if page.complete {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        records.sort_unstable_by(|left, right| left.key_sha256.cmp(&right.key_sha256));
+        if records
+            .windows(2)
+            .any(|pair| pair[0].key_sha256 == pair[1].key_sha256)
+        {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
+            };
+        }
+        QualificationNodeReply::ConcurrentRestore {
+            complete: true,
+            records,
+        }
+    }
+
     async fn probe(&self) -> QualificationNodeReply {
         let report = self.store.probe_durable_readiness().await;
-        let reason_code = match report.state() {
-            opc_session_store::DurableReadinessState::Ready => QualificationReadinessCode::Ready,
-            opc_session_store::DurableReadinessState::NoQuorum => {
-                QualificationReadinessCode::NoQuorum
-            }
-            opc_session_store::DurableReadinessState::TopologyInvalid => {
-                QualificationReadinessCode::TopologyInvalid
-            }
-            opc_session_store::DurableReadinessState::RecoveryRequired => {
-                QualificationReadinessCode::RecoveryRequired
-            }
-            _ => QualificationReadinessCode::RecoveryRequired,
-        };
+        let reason_code = qualification_readiness_code(report.state());
         let progress = report.recovery_progress();
         let status = self.store.status();
         QualificationNodeReply::Readiness {
@@ -1790,6 +2190,7 @@ impl QualificationNode {
     }
 
     async fn stop_server(&mut self) {
+        self.concurrent_watches.clear();
         if self
             .traffic
             .as_ref()
@@ -1810,6 +2211,162 @@ impl QualificationNode {
             server.abort_and_wait().await;
         }
     }
+}
+
+fn qualification_readiness_code(
+    state: opc_session_store::DurableReadinessState,
+) -> QualificationReadinessCode {
+    match state {
+        opc_session_store::DurableReadinessState::Ready => QualificationReadinessCode::Ready,
+        opc_session_store::DurableReadinessState::NoQuorum => QualificationReadinessCode::NoQuorum,
+        opc_session_store::DurableReadinessState::TopologyInvalid => {
+            QualificationReadinessCode::TopologyInvalid
+        }
+        opc_session_store::DurableReadinessState::RecoveryRequired => {
+            QualificationReadinessCode::RecoveryRequired
+        }
+        _ => QualificationReadinessCode::RecoveryRequired,
+    }
+}
+
+fn concurrent_store_error_outcome(error: &StoreError) -> QualificationConcurrentBatchSlotOutcome {
+    match error {
+        StoreError::CasIdempotencyOutcomeUnavailable
+        | StoreError::BackendOperationOutcomeUnavailable => {
+            QualificationConcurrentBatchSlotOutcome::Indeterminate
+        }
+        _ => QualificationConcurrentBatchSlotOutcome::Unavailable,
+    }
+}
+
+fn concurrent_batch_result_outcome(
+    result: SessionOpResult,
+) -> QualificationConcurrentBatchSlotOutcome {
+    match result {
+        SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success)) => {
+            QualificationConcurrentBatchSlotOutcome::Success
+        }
+        SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Conflict { .. })) => {
+            QualificationConcurrentBatchSlotOutcome::Conflict
+        }
+        SessionOpResult::CompareAndSet(Err(error)) => concurrent_store_error_outcome(&error),
+        SessionOpResult::Get(_)
+        | SessionOpResult::DeleteFenced(_)
+        | SessionOpResult::RefreshTtl(_) => QualificationConcurrentBatchSlotOutcome::Indeterminate,
+    }
+}
+
+fn concurrent_batch_outcomes(
+    expected_slots: usize,
+    result: Result<Vec<SessionOpResult>, StoreError>,
+) -> (
+    QualificationConcurrentBatchOutcome,
+    Vec<QualificationConcurrentBatchSlotOutcome>,
+) {
+    match result {
+        Ok(results) if results.len() == expected_slots => (
+            QualificationConcurrentBatchOutcome::Completed,
+            results
+                .into_iter()
+                .map(concurrent_batch_result_outcome)
+                .collect(),
+        ),
+        Ok(_) => (
+            QualificationConcurrentBatchOutcome::Indeterminate,
+            vec![QualificationConcurrentBatchSlotOutcome::Indeterminate; expected_slots],
+        ),
+        Err(error) => {
+            let slot_outcome = concurrent_store_error_outcome(&error);
+            let batch_outcome = match slot_outcome {
+                QualificationConcurrentBatchSlotOutcome::Indeterminate => {
+                    QualificationConcurrentBatchOutcome::Indeterminate
+                }
+                QualificationConcurrentBatchSlotOutcome::Unavailable => {
+                    QualificationConcurrentBatchOutcome::Unavailable
+                }
+                QualificationConcurrentBatchSlotOutcome::Success
+                | QualificationConcurrentBatchSlotOutcome::Conflict => {
+                    QualificationConcurrentBatchOutcome::Indeterminate
+                }
+            };
+            (batch_outcome, vec![slot_outcome; expected_slots])
+        }
+    }
+}
+
+fn concurrent_restore_scope(state_type: StateType) -> Result<RestoreScanScope, ()> {
+    Ok(RestoreScanScope {
+        tenant: Some(TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?),
+        nf_kind: Some(NetworkFunctionKind::new("smf").map_err(|_| ())?),
+        key_type: Some(SessionKeyType::PduSession),
+        state_class: Some(StateClass::AuthoritativeSession),
+        state_type: Some(state_type),
+        owner: None,
+    })
+}
+
+fn concurrent_record_snapshot(
+    record: &StoredSessionRecord,
+) -> Result<Option<QualificationConcurrentRecordSnapshot>, ()> {
+    if !record
+        .state_type
+        .as_str()
+        .starts_with(QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX)
+    {
+        return Ok(None);
+    }
+    QualificationConcurrentStateType::new(record.state_type.as_str().to_owned()).map_err(|_| ())?;
+    if record.key.tenant.as_str() != QUALIFICATION_TENANT
+        || record.key.nf_kind.as_str() != "smf"
+        || record.key.key_type != SessionKeyType::PduSession
+        || record.state_class != StateClass::AuthoritativeSession
+        || record.expires_at.is_some()
+        || record.generation.get() == 0
+        || record.fence.get() == 0
+    {
+        return Err(());
+    }
+    Ok(Some(QualificationConcurrentRecordSnapshot {
+        key_sha256: qualification_key_bytes_sha256(record.key.stable_id.as_bytes()),
+        generation: record.generation.get(),
+        owner_sha256: qualification_owner_sha256(record.owner.as_str()),
+        fence: record.fence.get(),
+        state_class: QualificationConcurrentStateClass::AuthoritativeSession,
+        state_type_sha256: qualification_state_type_sha256(record.state_type.as_str()),
+        expires_at_ns: None,
+        value_sha256: qualification_value_sha256(record.payload.as_bytes()),
+    }))
+}
+
+fn append_concurrent_watch_events(
+    entry: ReplicationEntry,
+    events: &mut Vec<QualificationConcurrentWatchEvent>,
+) -> Result<(), ()> {
+    let sequence = entry.sequence;
+    let mut pending = vec![entry.op];
+    while let Some(operation) = pending.pop() {
+        match operation {
+            ReplicationOp::CompareAndSet { new_record, .. } => {
+                let Some(record) = concurrent_record_snapshot(&new_record)? else {
+                    continue;
+                };
+                if events.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
+                    return Err(());
+                }
+                events.push(QualificationConcurrentWatchEvent {
+                    journal_sequence: sequence,
+                    record,
+                });
+            }
+            ReplicationOp::Batch { ops } => pending.extend(ops.into_iter().rev()),
+            ReplicationOp::DeleteFenced { .. }
+            | ReplicationOp::RefreshTtl { .. }
+            | ReplicationOp::AcquireLease { .. }
+            | ReplicationOp::RenewLease { .. }
+            | ReplicationOp::ReleaseLease { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4149,6 +4706,60 @@ mod tests {
             b"{\"reply\":\"started\",\"node_index\":0}\n{\"reply\":\"shutting_down\"}\n",
         ));
         assert!(read_single_control_reply(&mut duplicate_reply).is_err());
+    }
+
+    #[test]
+    fn shape_correct_batch_results_are_completed_with_exact_mixed_slots() {
+        let success = || SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success));
+        let cases = [
+            (
+                SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Conflict { current: None })),
+                QualificationConcurrentBatchSlotOutcome::Conflict,
+            ),
+            (
+                SessionOpResult::CompareAndSet(Err(StoreError::BackendUnavailable(
+                    "fixed test failure".to_owned(),
+                ))),
+                QualificationConcurrentBatchSlotOutcome::Unavailable,
+            ),
+            (
+                SessionOpResult::CompareAndSet(Err(StoreError::CasIdempotencyOutcomeUnavailable)),
+                QualificationConcurrentBatchSlotOutcome::Indeterminate,
+            ),
+        ];
+
+        for (second, expected_second) in cases {
+            let (aggregate, slots) = concurrent_batch_outcomes(2, Ok(vec![success(), second]));
+            assert_eq!(aggregate, QualificationConcurrentBatchOutcome::Completed);
+            assert_eq!(
+                slots,
+                vec![
+                    QualificationConcurrentBatchSlotOutcome::Success,
+                    expected_second,
+                ]
+            );
+        }
+
+        let (aggregate, slots) = concurrent_batch_outcomes(2, Ok(vec![success()]));
+        assert_eq!(
+            aggregate,
+            QualificationConcurrentBatchOutcome::Indeterminate
+        );
+        assert_eq!(
+            slots,
+            vec![QualificationConcurrentBatchSlotOutcome::Indeterminate; 2]
+        );
+        let (aggregate, slots) = concurrent_batch_outcomes(
+            2,
+            Err(StoreError::BackendUnavailable(
+                "fixed outer failure".to_owned(),
+            )),
+        );
+        assert_eq!(aggregate, QualificationConcurrentBatchOutcome::Unavailable);
+        assert_eq!(
+            slots,
+            vec![QualificationConcurrentBatchSlotOutcome::Unavailable; 2]
+        );
     }
 
     #[cfg(unix)]
