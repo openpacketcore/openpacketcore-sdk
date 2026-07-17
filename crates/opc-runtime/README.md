@@ -29,7 +29,8 @@ resource budgets, source admission, and deterministic test clocks.
 - UDP helpers receive the concrete local destination and can send a reply from
   that exact endpoint. Linux and Android use per-datagram packet-info ancillary
   data; platforms without it only allow the send when a concrete socket bind
-  already guarantees the requested source.
+  already guarantees the requested source. Typed socket options can opt a
+  listener into Linux/Android `SO_BINDTODEVICE` scoping before address bind.
 - Feature `observability` adds `init_observability_logging`.
 
 ```rust,no_run
@@ -75,6 +76,30 @@ addresses, and oversized datagrams before sending. It never silently falls
 back to kernel source selection. Product code remains responsible for carrying
 the observed destination through every normal, replay, retransmit, and error
 reply path.
+
+Linux and Android applications that place a UDP listener in a VRF or another
+device-scoped L3 domain can opt in explicitly:
+
+```rust,no_run
+use std::{io, net::SocketAddr};
+
+use opc_runtime::{
+    bind_udp_socket_with_destination_metadata_and_options, UdpSocketOptions,
+};
+
+fn bind_in_vrf(bind: SocketAddr) -> io::Result<opc_runtime::UdpDestinationMetadataSocket> {
+    let options = UdpSocketOptions::default().with_bind_device("vrf-public");
+    bind_udp_socket_with_destination_metadata_and_options(bind, &options)
+}
+```
+
+The device option is default-off. When configured, the runtime validates the
+interface name, applies `SO_BINDTODEVICE` before `bind(2)`, and keeps the same
+scope for source-locality probes used by `send_to_from`. Linux requires
+`CAP_NET_RAW`; unsupported platforms return `io::ErrorKind::Unsupported`
+instead of silently binding in the default routing domain. The original
+`bind_udp_socket_with_destination_metadata` constructor remains unchanged in
+behavior and does not select a device.
 
 ## Relationships
 
