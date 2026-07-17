@@ -27,9 +27,10 @@ control-plane stack.
   `PayloadType`, and `validate_payload_chain`.
 - `crypto` defines the caller-supplied `CryptoProvider` boundary and protected
   payload open result types.
-- `sa_init` and `sa_init_crypto` provide typed SA/KE/Nonce/Notify helpers,
-  SA_INIT response builders, Diffie-Hellman group/profile types, and IKE/Child
-  SA key-material derivation. IKE-SA profiles preserve the complete negotiated
+- `sa_init`, `sa_init_crypto`, and `sa_init_negotiation` provide typed
+  SA/KE/Nonce/Notify helpers, SA_INIT response builders, product-neutral
+  responder proposal selection, Diffie-Hellman group/profile types, and
+  IKE/Child SA key-material derivation. IKE-SA profiles preserve the complete negotiated
   PRF, DH, encryption/key-size, and optional integrity suite; invalid AEAD plus
   integrity or CBC without integrity combinations cannot be constructed.
   PRF-HMAC-SHA2-256/384/512 are supported for initial IKE-SA derivation,
@@ -39,8 +40,11 @@ control-plane stack.
   the latter has a convenience builder that writes the accepted non-zero group
   as exactly two big-endian octets. These failures are mutually exclusive, so
   the builder rejects a multi-Notify response rather than emitting ambiguity.
-- `protected_payload_crypto` provides caller-keyed AES-GCM-16 `SK` open/seal
-  helpers for already-derived SA_INIT key material.
+- `protected_payload_crypto` provides caller-keyed AES-GCM-16 and
+  AES-CBC/SHA-2 encrypt-then-MAC `SK`/`SKF` open/seal helpers for
+  already-derived SA_INIT key material. Production CBC sealing obtains a fresh
+  16-octet IV from a cryptographically secure random source; callers cache the
+  complete already-sealed response for retransmission.
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
   helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
   selector/proposal helpers.
@@ -92,6 +96,49 @@ Configuration expressed as wire identifiers should use `from_transform_ids`;
 its final argument is now `Option<u16>` containing the integrity Transform ID,
 not an anonymous key length. `Some(14)` selects
 AUTH-HMAC-SHA2-512-256; AEAD profiles pass `None`.
+
+## IKE_SA_INIT proposal selection
+
+`Ikev2SaInitNegotiationPolicy` is the startup capability and responder
+preference boundary. It accepts only complete executable profiles. The selector
+combines transforms by type, so wire order never affects selection and
+same-type alternatives remain valid. It returns one exact response proposal,
+including the initiator's selected Key Length attribute unchanged:
+
+```rust
+use opc_proto_ikev2::{
+    negotiate_ike_sa_init, Ikev2SaInitNegotiationError,
+    Ikev2SaInitNegotiationPolicy, Ikev2SaInitPayloads,
+};
+
+fn select_handset_suite(
+    payloads: &Ikev2SaInitPayloads<'_>,
+) -> Result<opc_proto_ikev2::Ikev2SaInitNegotiation, Ikev2SaInitNegotiationError> {
+    let profile = handset_profile()
+        .map_err(Ikev2SaInitNegotiationError::UnsupportedConfiguredProfile)?;
+    let policy = Ikev2SaInitNegotiationPolicy::new(vec![profile])?;
+    negotiate_ike_sa_init(payloads, &policy)
+}
+# fn handset_profile() -> Result<opc_proto_ikev2::Ikev2SaInitCryptoProfile,
+#     opc_proto_ikev2::Ikev2SaInitCryptoError> {
+#     opc_proto_ikev2::Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+#         opc_proto_ikev2::Ikev2PrfAlgorithm::HmacSha2_512,
+#         opc_proto_ikev2::Ikev2DhGroup::Modp2048,
+#         opc_proto_ikev2::Ikev2EncryptionAlgorithm::AesCbc256,
+#         opc_proto_ikev2::Ikev2IntegrityAlgorithm::HmacSha2_512_256,
+#     )
+# }
+```
+
+`NoAcceptableProposal` is a stable typed outcome suitable for
+`NO_PROPOSAL_CHOSEN`. A supported offered suite whose DH transform does not
+match the KE payload returns `KeyExchangeDhGroupMismatch`, allowing the product
+to decide whether to send the bounded `INVALID_KE_PAYLOAD` response. Duplicate
+transforms or attributes fail closed. NAT detection, fragmentation,
+signature-hash, redirect, and unknown non-critical/private-use notifications do not
+participate in algorithm selection. The product still owns responder SPI and
+nonce allocation, anti-amplification policy, transaction caching, and the IKE
+SA state machine.
 
 ## Dedicated-bearer integration
 

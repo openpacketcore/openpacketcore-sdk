@@ -11,7 +11,8 @@
 //! traits, typed executable IKE-SA profiles, PRF-HMAC-SHA2-256/384/512, initial
 //! and rekey IKE-SA key-agreement/key-derivation material,
 //! bounded notify-only IKE_SA_INIT error responses,
-//! caller-keyed SA_INIT AES-GCM protected-payload open/seal helpers, typed
+//! product-neutral executable IKE_SA_INIT proposal selection, caller-keyed
+//! SA_INIT AES-GCM and AES-CBC/SHA-2 protected-payload open/seal helpers, typed
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
 //! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY
@@ -44,6 +45,7 @@ pub mod payload;
 pub mod protected_payload_crypto;
 pub mod sa_init;
 pub mod sa_init_crypto;
+pub mod sa_init_negotiation;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
@@ -209,6 +211,10 @@ pub use sa_init_crypto::{
     Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2IntegrityAlgorithm,
     Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
     Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
+};
+pub use sa_init_negotiation::{
+    negotiate_ike_sa_init, Ikev2SaInitNegotiation, Ikev2SaInitNegotiationError,
+    Ikev2SaInitNegotiationPolicy,
 };
 
 pub(crate) const fn is_strict(level: ValidationLevel) -> bool {
