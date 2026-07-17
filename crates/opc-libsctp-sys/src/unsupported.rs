@@ -8,8 +8,10 @@ use crate::{
 
 pub const SCTP_UNORDERED_FLAG: u16 = 1;
 pub const SCTP_NOTIFICATION_FLAG: i32 = 0x8000;
-pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = 1;
-pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = 5;
+const SCTP_NOTIFICATION_TYPE_BASE: u16 = 1 << 15;
+pub const SCTP_ASSOC_CHANGE_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 1;
+pub const SCTP_PEER_ADDR_CHANGE_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 2;
+pub const SCTP_SHUTDOWN_EVENT_NOTIFICATION: u16 = SCTP_NOTIFICATION_TYPE_BASE + 5;
 
 fn unsupported() -> io::Error {
     io::Error::new(
@@ -51,6 +53,10 @@ pub fn local_addresses(_fd: BorrowedFd<'_>, _assoc_id: i32) -> io::Result<Vec<So
 }
 
 pub fn peer_addresses(_fd: BorrowedFd<'_>, _assoc_id: i32) -> io::Result<Vec<SocketAddr>> {
+    Err(unsupported())
+}
+
+pub fn peer_primary_address(_fd: BorrowedFd<'_>) -> io::Result<SocketAddr> {
     Err(unsupported())
 }
 

@@ -222,6 +222,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strict. The policy survives single-address and static-multihoming Diameter
   construction, while association metrics count accepted legacy messages and
   a redaction-safe warning is emitted at most once per association.
+- `opc-sctp`: Linux `SCTP_PEER_ADDR_CHANGE` notifications now decode into
+  typed, address-redacted events and update a bounded per-association path
+  health snapshot with reachability and primary-path state. An event-capable
+  Diameter receive boundary exposes transport notifications without changing
+  the existing payload-only helper's notification, truncation, or PPID
+  behavior. Notification constants now use the Linux UAPI
+  `SCTP_SN_TYPE_BASE` values so association and shutdown events decode on real
+  kernels as well as fixtures.
 - **SWm emergency identity construction — `opc-proto-diameter`:** consumers
   can now obtain the canonical TS 23.003 IMEI Emergency NAI with
   `emergency_nai` and build the byte-identical RFC 3748

@@ -17,7 +17,7 @@ publish = false
 bytes = { workspace = true }
 opc-libsctp-sys = { path = "../opc-libsctp-sys", version = "0.2.0" }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "time", "io-util"] }
+tokio = { workspace = true, features = ["net", "time", "io-util", "sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
