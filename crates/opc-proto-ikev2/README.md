@@ -97,6 +97,74 @@ its final argument is now `Option<u16>` containing the integrity Transform ID,
 not an anonymous key length. `Some(14)` selects
 AUTH-HMAC-SHA2-512-256; AEAD profiles pass `None`.
 
+The executable IKE-SA matrix is:
+
+| Mechanism | Transform IDs and sizes | Key/material contract |
+| --- | --- | --- |
+| PRF | HMAC-SHA2-256 (5), HMAC-SHA2-384 (6), HMAC-SHA2-512 (7) | 32, 48, or 64 octets for each of `SK_d`, `SK_pi`, and `SK_pr` |
+| DH | MODP-2048 (14), ECP-256 (19), ECP-384 (20), ECP-521 (21) | Exact public-value lengths 256, 64, 96, and 132 octets |
+| AES-GCM-16 | ENCR 20 with 128, 192, or 256-bit key; no INTEG | AES key plus four-octet salt; eight-octet explicit IV and 16-octet tag on the wire |
+| AES-CBC | ENCR 12 with 128, 192, or 256-bit key | Raw 16, 24, or 32-octet `SK_e*`; fresh 16-octet IV per newly sealed message |
+| SHA-2 integrity | AUTH-HMAC-SHA2-256-128 (12), 384-192 (13), or 512-256 (14) | 32/48/64-octet `SK_a*`; 16/24/32-octet ICV |
+
+Every CBC key size may be paired with each supported SHA-2 integrity
+algorithm. `validate_executable()` is the explicit startup check, although all
+public profile constructors already enforce the same contract.
+
+### Migration from the anonymous integrity length
+
+The old constructor could represent AES-CBC without its algorithm, and the old
+wire-ID constructor accepted an arbitrary `usize` integrity-key length:
+
+```text
+Ikev2SaInitCryptoProfile::new(prf, dh, encryption)
+Ikev2SaInitCryptoProfile::from_transform_ids(7, 14, 12, Some(256), 64)
+```
+
+Replace those calls with a fallible typed constructor or a typed integrity
+Transform ID, and reject errors during configuration loading:
+
+```rust
+use opc_proto_ikev2::{Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile};
+
+fn configured_handset_profile() -> Result<Ikev2SaInitCryptoProfile, Ikev2SaInitCryptoError> {
+    let profile = Ikev2SaInitCryptoProfile::from_transform_ids(
+        7,         // PRF_HMAC_SHA2_512
+        14,        // 2048-bit MODP
+        12,        // ENCR_AES_CBC
+        Some(256),
+        Some(14),  // AUTH_HMAC_SHA2_512_256
+    )?;
+    profile.validate_executable()?;
+    Ok(profile)
+}
+```
+
+Downstream exhaustive matches must add these exact arms:
+
+- `Ikev2PrfAlgorithm::HmacSha2_512`;
+- `Ikev2SaInitCryptoError::{MissingIntegrityTransform,
+  UnexpectedIntegrityTransform}` and the corresponding
+  `Ikev2SaInitCryptoErrorCode` variants;
+- `Ikev2ProtectedPayloadCryptoError::{InvalidIvLength,
+  InvalidCiphertextLength, RandomIvGenerationFailed}` and the corresponding
+  `Ikev2ProtectedPayloadCryptoErrorCode` variants.
+
+The existing `UnsupportedEncryptionProfile` error also changes field shape
+from `integrity_key_len: usize` to
+`integrity: Option<Ikev2IntegrityAlgorithm>`. Existing authentication,
+authenticated-padding, unsupported-integrity, and key-material errors retain
+their variants and stable codes.
+
+Consumers must remove any blanket `integrity.is_some()` rejection. Preserve
+the selected typed INTEG transform in the profile, pass that profile through
+derivation/restore and protected-payload construction, and select the CBC
+open/seal path when `encryption().is_aead()` is false. Restored CBC SAs pass the
+same typed profile to `Ikev2SaInitKeyMaterial::from_established_keys`; integrity
+ID 14 requires 64-octet `SK_ai`/`SK_ar`, while AES-CBC-256 requires 32-octet
+`SK_ei`/`SK_er`. Existing AES-GCM callers use `new_aead`, retain empty `SK_a*`,
+and keep their monotonic explicit-IV state.
+
 ## IKE_SA_INIT proposal selection
 
 `Ikev2SaInitNegotiationPolicy` is the startup capability and responder
@@ -139,6 +207,57 @@ signature-hash, redirect, and unknown non-critical/private-use notifications do 
 participate in algorithm selection. The product still owns responder SPI and
 nonce allocation, anti-amplification policy, transaction caching, and the IKE
 SA state machine.
+
+## Protected IKE_AUTH integration
+
+For AES-CBC, use `ikev2_aes_cbc_protected_body_len` or
+`ikev2_aes_cbc_protected_payload_len` to calculate the final outer IKE Length
+and `SK`/`SKF` payload Length before sealing. Then pass the exact bytes through
+the protected generic header as `message_prefix`. This is the production
+sealing call for a responder IKE_AUTH:
+
+```rust
+use bytes::Bytes;
+use opc_proto_ikev2::{
+    seal_ikev2_sa_init_aes_cbc_protected_payload,
+    Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadDirection,
+    Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial, ProtectedPayloadKind,
+    ProtectedPayloadSealContext,
+};
+
+fn seal_responder_ike_auth(
+    profile: Ikev2SaInitCryptoProfile,
+    keys: &Ikev2SaInitKeyMaterial,
+    final_message_prefix: &[u8],
+    cleartext_payload_chain: &[u8],
+) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
+    seal_ikev2_sa_init_aes_cbc_protected_payload(
+        profile,
+        keys,
+        Ikev2ProtectedPayloadDirection::ResponderToInitiator,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::Encrypted,
+            message_prefix: final_message_prefix,
+        },
+        cleartext_payload_chain,
+    )
+}
+```
+
+The returned body is `IV || ciphertext || ICV`; for the observed profile the
+lengths are 16, a non-empty multiple of 16, and 32 octets respectively. Use
+`Ikev2SaInitProtectedPayloadProvider` with `InitiatorToResponder` to open the
+handset's request. The provider authenticates the complete message before
+decrypting. Well-formed, same-length corruption of authenticated header bytes,
+IV, ciphertext, or ICV that reaches cryptographic verification returns the
+same `AuthenticationFailed` outcome before decryption. Malformed framing and
+lengths return their stable structural errors without decryption;
+`InvalidPadding` is reachable only after successful authentication. Use the
+same APIs for `SKF`; its four-octet Fragment Number/Total Fragments prefix is
+included in the final authenticated prefix. Cache and replay the complete
+already-built wire message for retransmissions—calling the production CBC
+sealer again deliberately generates a different IV. The explicit-IV sealer is
+a low-level test/vector boundary and must not be used by production callers.
 
 ## Dedicated-bearer integration
 

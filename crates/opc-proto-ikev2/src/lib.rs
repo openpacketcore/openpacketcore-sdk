@@ -24,7 +24,7 @@
 //!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
-//! @conformance experimental-scaffold — see CONFORMANCE.md
+//! @conformance experimental-mechanism boundary — see CONFORMANCE.md
 
 use opc_protocol::ValidationLevel;
 

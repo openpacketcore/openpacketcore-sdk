@@ -1,9 +1,10 @@
-# opc-proto-ikev2 conformance scaffold
+# opc-proto-ikev2 conformance boundary
 
 This document defines the current conformance boundary for the experimental
-`opc-proto-ikev2` crate. It is a scaffold for RFC 7296 IKEv2 header and generic
-payload-chain work, not a complete IKEv2 implementation and not an ePDG product
-claim.
+`opc-proto-ikev2` crate. Its typed IKE-SA profile, KDF, proposal-selection, and
+protected-payload rows are executable mechanisms rather than structural codec
+claims. The crate is not a complete IKEv2 state machine and does not make an
+ePDG product-readiness claim.
 
 ## Claimed coverage
 
@@ -16,7 +17,7 @@ claim.
 | IKE_SA_INIT proposal selection (`RFC 7296` §2.7, §3.3.2, §3.3.5, §3.3.6; `RFC 5282` §8) | Product-neutral executable-suite selection | `src/sa_init_negotiation.rs` selects against an ordered set of already-executable typed profiles. Same-type transforms are OR alternatives, different types are AND requirements, and wire order is irrelevant. The selected transform and every attribute are copied exactly into a single response-ready proposal. Unknown transform types make only their proposal unacceptable; unknown attributes make only their transform unusable. Exact duplicate transforms, duplicate attributes, invalid IKE proposal SPIs/numbers, missing types, KE/DH mismatch, and invalid KE public-value length fail closed with stable typed codes. `NoAcceptableProposal` maps cleanly to `NO_PROPOSAL_CHOSEN`; a supported offered group with a different KE has a distinct mismatch result for `INVALID_KE_PAYLOAD`. `tests/sa_init_negotiation.rs` independently audits a literal synthetic ENCR→INTEG→PRF→DH fixture and proves alternate order/alternatives, unsupported DH1, and duplicate rejection. |
 | Unknown payload preservation | Experimental structural coverage | Unknown non-critical payloads remain raw-preserved; unknown critical payloads fail closed by default as required by RFC 7296 §2.2. |
 | Protected payload boundary (`SK`, `SKF`) | Boundary plus AES-GCM and AES-CBC/SHA-2 open/seal | `src/crypto.rs` and `tests/payload_chain.rs` expose `ProtectedPayloadContext` and `CryptoProvider`; the codec classifies both `SK` and `SKF`, treats protected bodies as opaque, and never parses ciphertext as cleartext. `src/protected_payload_crypto.rs` and `tests/protected_payload_crypto.rs`/`tests/protected_payload_encrypt_then_mac.rs` provide caller-keyed RFC 5282 AES-GCM-16 and RFC 7296 AES-CBC with AUTH-HMAC-SHA2-256-128/384-192/512-256. CBC verifies the truncated ICV in constant time before decrypting, validates authenticated padding, and uses a fresh CSPRNG IV at the production sealing boundary. `tests/sa_init_negotiation.rs` decodes a literal capture-shaped SA_INIT, selects AES-CBC-256/PRF-SHA2-512/INTEG-SHA2-512-256/DH14, generates responder DH material, derives all seven keys, builds and independently decodes the SA_INIT response, then opens/seals bidirectional protected IKE_AUTH. Header/IV/ciphertext/ICV corruption, wrong-direction keys, malformed ciphertext, and authenticated invalid padding are rejected; cached response bytes replay unchanged. |
-| IKEv2 encrypted fragmentation (`RFC 7383` `SKF`) | Experimental structural coverage | `src/fragmentation.rs` decodes/builds SKF fixed fields, enforces nonzero Fragment Number/Total Fragments, rejects number > total, enforces `Next Payload = 0` for non-first fragments, exposes the `IKEV2_FRAGMENTATION_SUPPORTED` notify type, and reassembles already-decrypted fragment cleartext with duplicate/missing/total/size checks. It does not decrypt SKF ciphertext or own retransmission/reassembly queues. |
+| IKEv2 encrypted fragmentation (`RFC 7383` `SKF`) | Experimental structural coverage | `src/fragmentation.rs` decodes/builds SKF fixed fields, enforces nonzero Fragment Number/Total Fragments, rejects number > total, enforces `Next Payload = 0` for non-first fragments, exposes the `IKEV2_FRAGMENTATION_SUPPORTED` notify type, and reassembles already-decrypted fragment cleartext with duplicate/missing/total/size checks. That module owns framing/reassembly only; `protected_payload_crypto` authenticates, opens, and seals the supported `SKF` profiles. The crate does not own retransmission or reassembly queues. |
 | IKE_AUTH cleartext payload helpers | Experimental typed coverage for opened payload chains | `src/ike_auth.rs` and `tests/ike_auth_payloads.rs` decode/build IDi/IDr, AUTH, EAP, CP, SA, TSi/TSr, Notify, and Delete payloads from cleartext chains with redaction-safe debug output and malformed-input checks. |
 | IKE_AUTH shared-key AUTH MIC | Experimental transcript-bound helper coverage | `src/ike_auth.rs` and `tests/ike_auth_payloads.rs` compute and verify RFC 7296 shared-key AUTH MICs from explicit SA_INIT transcript bytes, peer nonce, ID payload body, negotiated PRF, `SK_pi`/`SK_pr`, and caller-supplied EAP/AAA keying material. The helper does not run EAP-AKA or choose AAA policy. |
 | 3GPP DEVICE_IDENTITY Notify (`TS 24.302` §8.2.9.2) | Experimental typed mechanism coverage | `src/device_identity.rs` and `tests/device_identity.rs` distinguish empty-value IMEI/IMEISV requests from responses; require Notify type 41101, Protocol ID 0, empty SPI, and an exact two-octet combined length; validate fixed-size TBCD digits and the IMEI terminal `0xF` end mark; preserve every received digit in redaction-safe `Imei15`/`Imeisv` values; and accept the TS 23.003 spare-zero form without treating Luhn as a wire rule. It does not select when to request identity, correlate an exchange, authorize emergency service, or replace RFC 7296 method-2 AUTH. |
@@ -102,6 +103,24 @@ and §3.10.1 for error type 14 with no notification data; the latter uses
 §1.2, §1.3, and §3.10.1 for error type 17 and the accepted Diffie-Hellman
 group as exactly two big-endian octets. These are specification-derived wire
 vectors, not independent-peer captures.
+
+The SHA-2 primitive tests copy the published PRF and authenticator values from
+[RFC 4868 §2.7](https://www.rfc-editor.org/rfc/rfc4868.html#section-2.7), which
+in turn identifies the PRF cases sourced from RFC 4231. They cover SHA-256,
+SHA-384, and SHA-512, including a SHA-512 key longer than its compression-block
+size and the 256-bit integrity truncation. Fixed synthetic initial-IKE-SA,
+mixed-PRF rekey, and Child-SA KEYMAT values were generated independently with
+OpenSSL 3 HMAC operations and the RFC 7296 PRF+ equations. The complete
+AES-CBC-256/HMAC-SHA2-512-256 message in
+`tests/protected_payload_encrypt_then_mac.rs` was independently generated with
+OpenSSL 3 AES-256-CBC and HMAC-SHA512; its literal final IKE and `SK` lengths
+make incorrect MAC coverage fail. None of these values came from the handset
+capture or from a second call into the SDK implementation.
+
+`tests/sa_init_negotiation.rs` contains a literal, synthetic, redaction-safe
+SA_INIT message with the observed protocol shape. Its addresses, SPIs, nonce,
+DH public value, and notifications are authored test values. The test never
+embeds or derives live subscriber or peer material.
 
 Future fixtures must follow ADR 0015: spec-authored or independently captured
 bytes, octet-level comments, raw preservation for unknown payloads, negative

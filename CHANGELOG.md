@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle expiry, and pool shutdown invalidate it before dispatch.
 
 ### Added
+- **IKEv2 encrypt-then-MAC suites — `opc-proto-ikev2`:** typed executable
+  IKE-SA profiles now preserve the negotiated PRF, DH group, encryption/key
+  size, and optional integrity algorithm. PRF-HMAC-SHA2-512 (Transform ID 7),
+  AES-CBC-128/192/256 with AUTH-HMAC-SHA2-256-128/384-192/512-256, and
+  AES-GCM-192 are executable across initial/rekey/Child KDFs, restore, AUTH,
+  and `SK`/`SKF` protection. CBC verifies a constant-time truncated ICV before
+  decryption and uses a fresh 16-byte CSPRNG IV for every new message; callers
+  must replay cached sealed bytes for retransmissions. The ambiguous profile
+  constructor and anonymous integrity-key length are replaced by fallible typed
+  constructors and `Option<integrity Transform ID>`. RustCrypto AES/CBC, a
+  zeroizing SHA-2 primitive, and an explicitly wiped HMAC composition back the
+  implementation; stable errors expose unsupported suites, key/IV/body
+  lengths, authentication, and authenticated padding failures without secret
+  material.
 - **Device-scoped destination-metadata UDP sockets — `opc-runtime`:** an
   explicit, default-off typed option can apply Linux/Android
   `SO_BINDTODEVICE` before address bind, allowing listeners such as IKE and
