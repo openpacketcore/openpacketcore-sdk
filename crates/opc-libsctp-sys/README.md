@@ -12,11 +12,14 @@ other protocol codecs.
 ## API Shape
 
 - Types: `AssocId`, `AddressFamily`, `SocketStyle`, `ConnectStatus`, `InitMsg`,
-  `EventSubscriptions`, `SendInfo`, `RecvInfo`, `RecvFlags`, and `Received`.
+  `RtoParameters`, `PeerAddressParameters`, `EventSubscriptions`, `SendInfo`,
+  `RecvInfo`, `RecvFlags`, and `Received`.
 - Functions: `open_socket`, single-address `bind`/`connect`, bounded atomic
   `bind_addresses`/`connect_addresses`, `local_addresses`, `peer_addresses`,
-  `listen`, `accept`, `socket_error`, `set_initmsg`, `set_nodelay`,
-  `set_recv_rcvinfo`, `set_events`, `send_msg`, and `recv_msg`.
+  `peer_primary_address`, `listen`, `accept`, `socket_error`, `set_initmsg`,
+  `set_rto_parameters`, `set_peer_address_parameters`,
+  `set_primary_peer_address`, `set_nodelay`, `set_recv_rcvinfo`, `set_events`,
+  `send_msg`, and `recv_msg`.
 - Constants: `SCTP_UNORDERED_FLAG`, `SCTP_NOTIFICATION_FLAG`,
   `SCTP_ASSOC_CHANGE_NOTIFICATION`, and `SCTP_SHUTDOWN_EVENT_NOTIFICATION`.
 
@@ -45,6 +48,10 @@ let fd = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne)?;
   runtime `libsctp` dependency, and accept at most `MAX_SCTP_ADDRESSES` entries.
 - Address-list inspection is bounded to the same maximum and rejects malformed
   kernel responses before exposing them to the safe crate.
+- RTO, peer-path heartbeat/retransmission, and primary-address helpers bind the
+  exact Linux packed/aligned UAPI layouts. Unit tests assert every field offset,
+  total size, alignment, option-update encoding, wildcard behavior, and
+  redaction-safe peer-parameter `Debug` output.
 
 ## Roadmap
 
@@ -57,4 +64,5 @@ let fd = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne)?;
 ```sh
 cargo test -p opc-libsctp-sys
 cargo test -p opc-libsctp-sys linux::tests::loopback_bindx_connectx_reports_all_addresses -- --ignored --exact
+cargo test -p opc-libsctp-sys linux::tests::loopback_path_tuning_and_primary_selection -- --ignored --exact
 ```

@@ -5,8 +5,8 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr;
 
 use crate::{
-    AddressFamily, ConnectStatus, EventSubscriptions, InitMsg, Received, RecvFlags, RecvInfo,
-    SendInfo, SocketStyle, MAX_SCTP_ADDRESSES,
+    AddressFamily, ConnectStatus, EventSubscriptions, InitMsg, PeerAddressParameters, Received,
+    RecvFlags, RecvInfo, RtoParameters, SendInfo, SocketStyle, MAX_SCTP_ADDRESSES,
 };
 
 // Linux UAPI values from include/uapi/linux/sctp.h. libc intentionally does
@@ -17,6 +17,8 @@ const SCTP_GET_PEER_ADDRS: libc::c_int = 108;
 const SCTP_GET_LOCAL_ADDRS: libc::c_int = 109;
 const SCTP_SOCKOPT_CONNECTX: libc::c_int = 110;
 const SCTP_GETADDRS_HEADER_BYTES: usize = mem::size_of::<i32>() + mem::size_of::<u32>();
+const SPP_HB_ENABLE: u32 = 1;
+const SPP_HB_TIME_IS_ZERO: u32 = 1 << 7;
 
 pub const SCTP_UNORDERED_FLAG: u16 = libc::SCTP_UNORDERED as u16;
 pub const SCTP_NOTIFICATION_FLAG: i32 = libc::SCTP_NOTIFICATION;
@@ -39,6 +41,48 @@ struct SctpEventSubscribe {
     authentication_event: u8,
     sender_dry_event: u8,
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct SctpRtoInfo {
+    assoc_id: i32,
+    initial_ms: u32,
+    max_ms: u32,
+    min_ms: u32,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct PackedSctpPrimaryAddress {
+    assoc_id: i32,
+    peer_addr: libc::sockaddr_storage,
+}
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct SctpPrimaryAddress(PackedSctpPrimaryAddress);
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct PackedSctpPeerAddressParameters {
+    assoc_id: i32,
+    peer_addr: libc::sockaddr_storage,
+    heartbeat_interval_ms: u32,
+    path_max_retransmissions: u16,
+    path_mtu: u32,
+    sack_delay_ms: u32,
+    flags: u32,
+    ipv6_flow_label: u32,
+    dscp: u8,
+    // Linux rounds the packed UAPI structure to its declared four-byte
+    // alignment. Make the byte explicit so no uninitialized padding crosses
+    // the syscall boundary.
+    padding: u8,
+}
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct SctpPeerAddressParameters(PackedSctpPeerAddressParameters);
 
 pub fn open_socket(family: AddressFamily, style: SocketStyle) -> io::Result<OwnedFd> {
     let domain = match family {
@@ -163,6 +207,10 @@ pub fn peer_primary_address(fd: BorrowedFd<'_>) -> io::Result<SocketAddr> {
 }
 
 pub fn is_multihoming_unavailable(error: &io::Error) -> bool {
+    is_sctp_capability_unavailable(error)
+}
+
+pub fn is_sctp_capability_unavailable(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
         Some(errno)
@@ -235,6 +283,82 @@ pub fn set_initmsg(fd: BorrowedFd<'_>, init: InitMsg) -> io::Result<()> {
         sinit_max_init_timeo: init.max_init_timeout_ms,
     };
     set_sockopt(fd, libc::IPPROTO_SCTP, libc::SCTP_INITMSG, &raw)
+}
+
+pub fn set_rto_parameters(fd: BorrowedFd<'_>, parameters: RtoParameters) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::IPPROTO_SCTP,
+        libc::SCTP_RTOINFO,
+        &raw_rto_parameters(parameters),
+    )
+}
+
+fn raw_rto_parameters(parameters: RtoParameters) -> SctpRtoInfo {
+    SctpRtoInfo {
+        assoc_id: parameters.assoc_id,
+        initial_ms: parameters.initial_ms.map_or(0, std::num::NonZeroU32::get),
+        max_ms: parameters.max_ms.map_or(0, std::num::NonZeroU32::get),
+        min_ms: parameters.min_ms.map_or(0, std::num::NonZeroU32::get),
+    }
+}
+
+pub fn set_peer_address_parameters(
+    fd: BorrowedFd<'_>,
+    parameters: PeerAddressParameters,
+) -> io::Result<()> {
+    let raw = raw_peer_address_parameters(parameters);
+    set_sockopt(fd, libc::IPPROTO_SCTP, libc::SCTP_PEER_ADDR_PARAMS, &raw)
+}
+
+fn raw_peer_address_parameters(parameters: PeerAddressParameters) -> SctpPeerAddressParameters {
+    let peer_addr = if let Some(peer_addr) = parameters.peer_addr {
+        socket_addr_to_raw(&peer_addr).0
+    } else {
+        // SAFETY: An all-zero sockaddr_storage is the RFC 6458 wildcard value.
+        unsafe { mem::zeroed() }
+    };
+    let mut flags = 0;
+    if let Some(interval_ms) = parameters.heartbeat_interval_ms {
+        flags |= SPP_HB_ENABLE;
+        if interval_ms == 0 {
+            flags |= SPP_HB_TIME_IS_ZERO;
+        }
+    }
+    SctpPeerAddressParameters(PackedSctpPeerAddressParameters {
+        assoc_id: parameters.assoc_id,
+        peer_addr,
+        heartbeat_interval_ms: parameters.heartbeat_interval_ms.unwrap_or(0),
+        path_max_retransmissions: parameters
+            .path_max_retransmissions
+            .map_or(0, std::num::NonZeroU16::get),
+        path_mtu: 0,
+        sack_delay_ms: 0,
+        flags,
+        ipv6_flow_label: 0,
+        dscp: 0,
+        padding: 0,
+    })
+}
+
+pub fn set_primary_peer_address(
+    fd: BorrowedFd<'_>,
+    assoc_id: i32,
+    peer_addr: &SocketAddr,
+) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::IPPROTO_SCTP,
+        libc::SCTP_PRIMARY_ADDR,
+        &raw_primary_peer_address(assoc_id, peer_addr),
+    )
+}
+
+fn raw_primary_peer_address(assoc_id: i32, peer_addr: &SocketAddr) -> SctpPrimaryAddress {
+    SctpPrimaryAddress(PackedSctpPrimaryAddress {
+        assoc_id,
+        peer_addr: socket_addr_to_raw(peer_addr).0,
+    })
 }
 
 pub fn set_nodelay(fd: BorrowedFd<'_>, enabled: bool) -> io::Result<()> {
@@ -738,6 +862,7 @@ fn raw_to_socket_addr(
 mod tests {
     use super::*;
     use std::mem::{align_of, offset_of, size_of};
+    use std::num::{NonZeroU16, NonZeroU32};
     use std::os::fd::AsFd;
 
     const TEST_INIT: InitMsg = InitMsg {
@@ -774,6 +899,46 @@ mod tests {
         raw_to_socket_addr(&storage, len).unwrap()
     }
 
+    fn get_sctp_option<T>(fd: BorrowedFd<'_>, option: libc::c_int, value: &mut T) {
+        let mut len = size_of::<T>() as libc::socklen_t;
+        // SAFETY: `value` is a writable option buffer of exactly `len` bytes,
+        // and `fd` stays borrowed for the duration of `getsockopt`.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::IPPROTO_SCTP,
+                option,
+                (value as *mut T).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt failed: {}", io::Error::last_os_error());
+        assert_eq!(len as usize, size_of::<T>());
+    }
+
+    fn assert_path_tuning(
+        fd: BorrowedFd<'_>,
+        initial_ms: u32,
+        max_ms: u32,
+        min_ms: u32,
+        heartbeat_interval_ms: u32,
+        path_max_retransmissions: u16,
+    ) {
+        let mut rto = SctpRtoInfo::default();
+        get_sctp_option(fd, libc::SCTP_RTOINFO, &mut rto);
+        assert_eq!(rto.initial_ms, initial_ms);
+        assert_eq!(rto.max_ms, max_ms);
+        assert_eq!(rto.min_ms, min_ms);
+
+        let mut peer_parameters = raw_peer_address_parameters(PeerAddressParameters::default());
+        get_sctp_option(fd, libc::SCTP_PEER_ADDR_PARAMS, &mut peer_parameters);
+        let peer_parameters = peer_parameters.0;
+        let actual_heartbeat_interval_ms = peer_parameters.heartbeat_interval_ms;
+        let actual_path_max_retransmissions = peer_parameters.path_max_retransmissions;
+        assert_eq!(actual_heartbeat_interval_ms, heartbeat_interval_ms);
+        assert_eq!(actual_path_max_retransmissions, path_max_retransmissions);
+    }
+
     fn recv_data_message(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> Received {
         for _ in 0..100 {
             wait_fd(fd, libc::POLLIN);
@@ -803,6 +968,115 @@ mod tests {
         assert_eq!(size_of::<libc::sctp_rcvinfo>(), 28);
         assert_eq!(size_of::<SctpEventSubscribe>(), 10);
         assert_eq!(align_of::<SctpEventSubscribe>(), 1);
+        assert_eq!(size_of::<SctpRtoInfo>(), 16);
+        assert_eq!(align_of::<SctpRtoInfo>(), 4);
+        assert_eq!(offset_of!(SctpRtoInfo, assoc_id), 0);
+        assert_eq!(offset_of!(SctpRtoInfo, initial_ms), 4);
+        assert_eq!(offset_of!(SctpRtoInfo, max_ms), 8);
+        assert_eq!(offset_of!(SctpRtoInfo, min_ms), 12);
+        assert_eq!(size_of::<SctpPrimaryAddress>(), 132);
+        assert_eq!(align_of::<SctpPrimaryAddress>(), 4);
+        assert_eq!(offset_of!(SctpPrimaryAddress, 0), 0);
+        assert_eq!(size_of::<PackedSctpPrimaryAddress>(), 132);
+        assert_eq!(align_of::<PackedSctpPrimaryAddress>(), 1);
+        assert_eq!(offset_of!(PackedSctpPrimaryAddress, assoc_id), 0);
+        assert_eq!(offset_of!(PackedSctpPrimaryAddress, peer_addr), 4);
+        assert_eq!(size_of::<SctpPeerAddressParameters>(), 156);
+        assert_eq!(align_of::<SctpPeerAddressParameters>(), 4);
+        assert_eq!(offset_of!(SctpPeerAddressParameters, 0), 0);
+        assert_eq!(size_of::<PackedSctpPeerAddressParameters>(), 156);
+        assert_eq!(align_of::<PackedSctpPeerAddressParameters>(), 1);
+        assert_eq!(offset_of!(PackedSctpPeerAddressParameters, assoc_id), 0);
+        assert_eq!(offset_of!(PackedSctpPeerAddressParameters, peer_addr), 4);
+        assert_eq!(
+            offset_of!(PackedSctpPeerAddressParameters, heartbeat_interval_ms),
+            132
+        );
+        assert_eq!(
+            offset_of!(PackedSctpPeerAddressParameters, path_max_retransmissions),
+            136
+        );
+        assert_eq!(offset_of!(PackedSctpPeerAddressParameters, path_mtu), 138);
+        assert_eq!(
+            offset_of!(PackedSctpPeerAddressParameters, sack_delay_ms),
+            142
+        );
+        assert_eq!(offset_of!(PackedSctpPeerAddressParameters, flags), 146);
+        assert_eq!(
+            offset_of!(PackedSctpPeerAddressParameters, ipv6_flow_label),
+            150
+        );
+        assert_eq!(offset_of!(PackedSctpPeerAddressParameters, dscp), 154);
+        assert_eq!(offset_of!(PackedSctpPeerAddressParameters, padding), 155);
+    }
+
+    #[test]
+    fn raw_path_control_parameters_match_rfc6458_update_semantics() {
+        let rto = raw_rto_parameters(RtoParameters {
+            assoc_id: 7,
+            initial_ms: NonZeroU32::new(800),
+            max_ms: NonZeroU32::new(2_000),
+            min_ms: None,
+        });
+        assert_eq!(rto.assoc_id, 7);
+        assert_eq!(rto.initial_ms, 800);
+        assert_eq!(rto.max_ms, 2_000);
+        assert_eq!(rto.min_ms, 0);
+
+        let peer_addr: SocketAddr = "127.0.0.2:3868".parse().unwrap();
+        let positive_heartbeat = raw_peer_address_parameters(PeerAddressParameters {
+            assoc_id: 9,
+            peer_addr: Some(peer_addr),
+            heartbeat_interval_ms: Some(1_500),
+            path_max_retransmissions: NonZeroU16::new(3),
+        })
+        .0;
+        let assoc_id = positive_heartbeat.assoc_id;
+        let heartbeat_interval_ms = positive_heartbeat.heartbeat_interval_ms;
+        let path_max_retransmissions = positive_heartbeat.path_max_retransmissions;
+        let flags = positive_heartbeat.flags;
+        let raw_addr = positive_heartbeat.peer_addr;
+        assert_eq!(assoc_id, 9);
+        assert_eq!(heartbeat_interval_ms, 1_500);
+        assert_eq!(path_max_retransmissions, 3);
+        assert_eq!(flags, SPP_HB_ENABLE);
+        assert_eq!(
+            raw_to_socket_addr(&raw_addr, size_of::<libc::sockaddr_in>() as libc::socklen_t)
+                .unwrap(),
+            peer_addr
+        );
+
+        let zero_heartbeat = raw_peer_address_parameters(PeerAddressParameters {
+            heartbeat_interval_ms: Some(0),
+            ..PeerAddressParameters::default()
+        })
+        .0;
+        let heartbeat_interval_ms = zero_heartbeat.heartbeat_interval_ms;
+        let flags = zero_heartbeat.flags;
+        assert_eq!(heartbeat_interval_ms, 0);
+        assert_eq!(flags, SPP_HB_ENABLE | SPP_HB_TIME_IS_ZERO);
+
+        let wildcard = raw_peer_address_parameters(PeerAddressParameters {
+            path_max_retransmissions: NonZeroU16::new(2),
+            ..PeerAddressParameters::default()
+        })
+        .0;
+        let path_max_retransmissions = wildcard.path_max_retransmissions;
+        let flags = wildcard.flags;
+        let raw_addr = wildcard.peer_addr;
+        assert_eq!(path_max_retransmissions, 2);
+        assert_eq!(flags, 0);
+        assert_eq!(raw_addr.ss_family, 0);
+
+        let primary = raw_primary_peer_address(11, &peer_addr).0;
+        let assoc_id = primary.assoc_id;
+        let raw_addr = primary.peer_addr;
+        assert_eq!(assoc_id, 11);
+        assert_eq!(
+            raw_to_socket_addr(&raw_addr, size_of::<libc::sockaddr_in>() as libc::socklen_t)
+                .unwrap(),
+            peer_addr
+        );
     }
 
     #[test]
@@ -899,10 +1173,16 @@ mod tests {
             assert!(is_multihoming_unavailable(&io::Error::from_raw_os_error(
                 errno
             )));
+            assert!(is_sctp_capability_unavailable(
+                &io::Error::from_raw_os_error(errno)
+            ));
         }
         assert!(!is_multihoming_unavailable(&io::Error::from_raw_os_error(
             libc::EINVAL
         )));
+        assert!(!is_sctp_capability_unavailable(
+            &io::Error::from_raw_os_error(libc::EINVAL)
+        ));
     }
 
     #[test]
@@ -1051,6 +1331,90 @@ mod tests {
         let mut client_peer = peer_addresses(client.as_fd(), 0).unwrap();
         client_peer.sort_unstable();
         assert_eq!(client_peer, listener_addresses);
+    }
+
+    #[test]
+    #[ignore = "requires Linux kernel SCTP multihoming support"]
+    fn loopback_path_tuning_and_primary_selection() {
+        let listener = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne).unwrap();
+        set_initmsg(listener.as_fd(), TEST_INIT).unwrap();
+        set_rto_parameters(
+            listener.as_fd(),
+            RtoParameters {
+                assoc_id: 0,
+                initial_ms: NonZeroU32::new(500),
+                max_ms: NonZeroU32::new(2_000),
+                min_ms: NonZeroU32::new(100),
+            },
+        )
+        .unwrap();
+        set_peer_address_parameters(
+            listener.as_fd(),
+            PeerAddressParameters {
+                assoc_id: 0,
+                peer_addr: None,
+                heartbeat_interval_ms: Some(250),
+                path_max_retransmissions: NonZeroU16::new(2),
+            },
+        )
+        .unwrap();
+        bind_addresses(
+            listener.as_fd(),
+            &[
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.2:0".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        listen(listener.as_fd(), 8).unwrap();
+        let mut listener_addresses = local_addresses(listener.as_fd(), 0).unwrap();
+        listener_addresses.sort_unstable();
+
+        let client = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne).unwrap();
+        set_initmsg(client.as_fd(), TEST_INIT).unwrap();
+        set_rto_parameters(
+            client.as_fd(),
+            RtoParameters {
+                assoc_id: 0,
+                initial_ms: NonZeroU32::new(500),
+                max_ms: NonZeroU32::new(2_000),
+                min_ms: NonZeroU32::new(100),
+            },
+        )
+        .unwrap();
+        set_peer_address_parameters(
+            client.as_fd(),
+            PeerAddressParameters {
+                assoc_id: 0,
+                peer_addr: None,
+                heartbeat_interval_ms: Some(250),
+                path_max_retransmissions: NonZeroU16::new(2),
+            },
+        )
+        .unwrap();
+
+        assert_path_tuning(client.as_fd(), 500, 2_000, 100, 250, 2);
+
+        if connect_addresses(client.as_fd(), &listener_addresses).unwrap()
+            == ConnectStatus::InProgress
+        {
+            wait_fd(client.as_fd(), libc::POLLOUT);
+            assert!(socket_error(client.as_fd()).unwrap().is_none());
+        }
+        wait_fd(listener.as_fd(), libc::POLLIN);
+        let (accepted, _peer) = accept(listener.as_fd()).unwrap();
+
+        // The connected client retains its endpoint defaults, and an accepted
+        // association inherits the listener's future-association defaults.
+        assert_path_tuning(client.as_fd(), 500, 2_000, 100, 250, 2);
+        assert_path_tuning(accepted.as_fd(), 500, 2_000, 100, 250, 2);
+
+        let requested_primary = listener_addresses[1];
+        set_primary_peer_address(client.as_fd(), 0, &requested_primary).unwrap();
+        assert_eq!(
+            peer_primary_address(client.as_fd()).unwrap(),
+            requested_primary
+        );
     }
 
     #[test]

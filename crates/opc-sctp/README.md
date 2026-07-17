@@ -58,9 +58,16 @@ Each connected association exposes a bounded
 `DiameterSctpAssociation`).
 The distinct configured (or bounded kernel-reported accepted) path set
 initializes with unknown reachability, while the current
-`getpeername`/accepted primary is marked reachable. Calling `recv` applies
+`getpeername`/accepted primary is marked reachable. Calling `recv` processes
 available, unreachable, removed, made-primary, confirmed, and
 potentially-failed events before returning them.
+Made-primary changes only the primary designation and preserves the path's
+current reachability classification. The designation is reconciled with the
+kernel's current primary under the association control gate, so a notification
+dequeued before a concurrent explicit selection cannot roll the snapshot back.
+If that health-only current-primary query fails, `recv` still returns the event
+and preserves the last known designation rather than applying a possibly stale
+address.
 Health therefore reflects notifications consumed by the application; it is not
 a separate background socket reader. Concurrent active association receives
 are serialized so path events are applied in kernel receive order. Receive
@@ -99,6 +106,57 @@ async fn receive_one(
 convenience API: it consumes and applies transport notifications, skips them,
 and returns the next validated Diameter payload with its existing truncation
 and PPID behavior unchanged.
+
+### Path tuning and primary selection
+
+The default `RtoConfig` and `HeartbeatConfig` leave Linux SCTP defaults
+unchanged. A deployment with a measured failover target can opt in through the
+existing endpoint or connect configuration:
+
+```rust,no_run
+use opc_sctp::{
+    HeartbeatConfig, RtoConfig, SctpAssociation, SctpConnectConfig, SctpError,
+};
+
+async fn connect_tuned(
+    primary: std::net::SocketAddr,
+    secondary: std::net::SocketAddr,
+) -> Result<SctpAssociation, SctpError> {
+    let mut config = SctpConnectConfig::new(primary);
+    config.remote_addrs.push(secondary);
+    config.rto = RtoConfig {
+        initial_ms: Some(500),
+        min_ms: Some(100),
+        max_ms: Some(2_000),
+    };
+    config.heartbeat = HeartbeatConfig {
+        interval_ms: Some(250),
+        path_max_retrans: Some(2),
+    };
+
+    let association = SctpAssociation::connect(config).await?;
+    association.set_primary_peer_path(secondary)?;
+    Ok(association)
+}
+```
+
+Explicit RTO values are nonzero milliseconds and must satisfy every supplied
+`min <= initial <= max` relationship. A heartbeat interval of zero requests
+RFC 6458 zero-delay mode; the path RTO and jitter still apply. An explicit
+path retransmission threshold must be nonzero. Endpoint values are installed
+before listen and therefore apply to future accepted one-to-one associations;
+connect values are installed before association setup. A kernel that lacks an
+option returns a typed `CapabilityUnavailable` error instead of silently using
+defaults.
+
+`SctpAssociation::set_primary_peer_path` and the equivalent Diameter method
+accept only a current kernel-reported peer path. A successful selection updates
+the health snapshot immediately, but it does not disable SCTP failover or
+change reachability state. Selection calls and received path notifications are
+serialized per association so the kernel selection and health snapshot cannot
+be reordered by concurrent callers. All raw `SCTP_RTOINFO`,
+`SCTP_PEER_ADDR_PARAMS`, and `SCTP_PRIMARY_ADDR` layouts remain confined to
+`opc-libsctp-sys`.
 
 ### Legacy Diameter PPID 0 interoperability
 
@@ -192,8 +250,9 @@ async fn send_diameter(
   and retains unknown future state values as typed `Unknown` transitions.
 - Per-path health is bounded to `MAX_STATIC_MULTIHOMING_ADDRESSES` and advances
   only while the consumer receives association messages or notifications.
-- Custom RTO and heartbeat configs are modeled, but non-default values fail
-  closed until the corresponding Linux option layouts are safely bound.
+- Custom RTO and heartbeat configs use exact asserted Linux UAPI layouts and
+  preserve kernel defaults when omitted. Primary-path selection validates the
+  current kernel peer set before applying `SCTP_PRIMARY_ADDR`.
 - Live loopback tests require kernel SCTP support and are ignored where the host
   cannot provide it. The path-failover qualification additionally uses
   passwordless `sudo` to install port-scoped SCTP firewall rules and always
@@ -210,6 +269,7 @@ async fn send_diameter(
 
 ```sh
 cargo test -p opc-sctp
+cargo test -p opc-libsctp-sys linux::tests::loopback_path_tuning_and_primary_selection -- --ignored --exact
 cargo test -p opc-sctp tests::loopback_static_multihoming_binds_and_connects_full_sets -- --ignored --exact
 cargo test -p opc-sctp tests::loopback_diameter_recv_surfaces_transport_notification -- --ignored --exact
 cargo test -p opc-sctp tests::static_multihoming_survives_primary_path_drop -- --ignored --exact
