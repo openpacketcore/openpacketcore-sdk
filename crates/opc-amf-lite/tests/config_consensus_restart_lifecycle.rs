@@ -251,6 +251,83 @@ async fn encrypted_record_metadata_and_payload_survive_full_consensus_restart_ex
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_parent_appends_have_one_state_machine_winner() {
+    let temp = tempfile::tempdir().expect("config cluster tempdir");
+    let cluster = ConfigCluster::start(temp.path()).await;
+    let provider = provider();
+    let genesis_tx = tx_id("55555555-5555-4555-8555-555555555555");
+    let contender_a_tx = tx_id("66666666-6666-4666-8666-666666666666");
+    let contender_b_tx = tx_id("77777777-7777-4777-8777-777777777777");
+    let writer_a = encrypted_store(&cluster, 0, &provider);
+    let writer_b = encrypted_store(&cluster, 1, &provider);
+
+    writer_a
+        .append_commit_write(CommitWrite::new(record(
+            genesis_tx,
+            None,
+            1,
+            timestamp("2026-07-16T18:34:00Z"),
+            config("lineage-genesis", 1_024),
+        )))
+        .await
+        .expect("append lineage genesis");
+    cluster.wait_ready().await;
+
+    let contender_a = record(
+        contender_a_tx,
+        Some(genesis_tx),
+        2,
+        timestamp("2026-07-16T18:35:00Z"),
+        config("lineage-contender-a", 2_048),
+    );
+    let contender_b = record(
+        contender_b_tx,
+        Some(genesis_tx),
+        2,
+        timestamp("2026-07-16T18:36:00Z"),
+        config("lineage-contender-b", 4_096),
+    );
+
+    let (result_a, result_b) = tokio::join!(
+        writer_a.append_commit_write(CommitWrite::new(contender_a)),
+        writer_b.append_commit_write(CommitWrite::new(contender_b)),
+    );
+    let (winner_tx, loser_tx) = match (result_a, result_b) {
+        (Ok(()), Err(error)) => {
+            assert_eq!(StoreErrorCode::Internal, error.code);
+            (contender_a_tx, contender_b_tx)
+        }
+        (Err(error), Ok(())) => {
+            assert_eq!(StoreErrorCode::Internal, error.code);
+            (contender_b_tx, contender_a_tx)
+        }
+        (Ok(()), Ok(())) => panic!("same-parent contenders must not both apply"),
+        (Err(error_a), Err(error_b)) => {
+            panic!("one same-parent contender must apply: {error_a}; {error_b}")
+        }
+    };
+
+    cluster.wait_ready().await;
+    for index in 0..3 {
+        let reader = encrypted_store(&cluster, index, &provider);
+        let history = reader
+            .load_since(ConfigVersion::INITIAL, 4)
+            .await
+            .expect("load converged config history");
+        assert_eq!(2, history.len());
+        assert_eq!(genesis_tx, history[0].tx_id);
+        assert_eq!(None, history[0].parent_tx_id);
+        assert_eq!(ConfigVersion::new(1), history[0].version);
+        assert_eq!(winner_tx, history[1].tx_id);
+        assert_eq!(Some(genesis_tx), history[1].parent_tx_id);
+        assert_eq!(ConfigVersion::new(2), history[1].version);
+        assert!(history.iter().all(|record| record.tx_id != loser_tx));
+    }
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn confirmed_lifecycle_rolls_back_on_replacement_leader_and_survives_restart() {
     let temp = tempfile::tempdir().expect("config cluster tempdir");
     let cluster = ConfigCluster::start(temp.path()).await;
