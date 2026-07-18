@@ -13,6 +13,14 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod envelope;
+
+pub use envelope::{
+    classify_udp_checksum, internet_checksum, internet_checksum_sum_is_valid, udp_ipv4_checksum,
+    udp_ipv4_checksum_is_valid, GtpuEnvelopeBounds, GtpuEnvelopeError, Ipv4EnvelopeBounds,
+    UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, IPV4_MAX_HDR_LEN,
+};
+
 /// GTP-U UDP port (TS 29.281 §4.4.2).
 pub const GTPU_UDP_PORT: u16 = 2152;
 

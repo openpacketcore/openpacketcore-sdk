@@ -83,6 +83,61 @@ interface and `bind_address` is the local outer IPv4 address. It pins maps under
 downlink PDR state from one `GtpPdpContext`, and supports restore through
 `resolve_device`. It only supports IPv4 session state today.
 
+### Downlink outer-envelope validation
+
+The tc ingress program validates the complete unfragmented outer envelope
+before reading PDR state. IPv4 version, variable IHL, Total Length, accessible
+bytes, and the checksum over the complete option-bearing header must agree.
+UDP Length must contain its header plus the mandatory GTP-U header and end
+exactly at IPv4 Total Length. The GTP-U Length field must then end exactly at
+the UDP payload boundary. Optional fields, extension headers, and the minimum
+inner IPv4 header are loaded only within that proven GTP-U end.
+
+Ethernet bytes beyond IPv4 Total Length are legal layer-2 padding, not UDP or
+GTP-U payload. The program trims such padding before front decapsulation, so it
+cannot survive as unauthenticated inner bytes. Bytes inside the declared UDP
+payload but beyond the GTP-U Length are malformed rather than padding.
+
+An IPv4 UDP checksum field of zero is legal omission only after the program
+rules out a pending zero-seed `CHECKSUM_PARTIAL` operation. The checksum-level
+query cannot make that distinction. Instead, a non-pseudoheader 16-bit
+`bpf_l4_csum_replace` probe changes an ordinary checksum field but is a stable
+no-op for `CHECKSUM_PARTIAL`. The program snapshots the checksum bytes, probes
+and reverses a fixed delta, restores the exact snapshot with zero store flags,
+and reloads it before accepting omission or software verification. Any probe,
+reverse, store, or reload failure drops before PDR lookup; the packet retains
+the exact original checksum bytes.
+
+For a non-zero checksum, only a positive `BPF_CSUM_LEVEL_QUERY` result is
+trusted. At this hook the GTP-U UDP checksum is the current outermost checksum,
+so `CHECKSUM_UNNECESSARY` with checksum level zero is sufficient. A negative
+query includes `CHECKSUM_NONE`, `CHECKSUM_COMPLETE`, `CHECKSUM_PARTIAL`, and
+helper failure. The reversible probe must first prove the state is not
+`CHECKSUM_PARTIAL`; only then can exact software verification over the IPv4
+pseudo-header and declared UDP bytes authorize a completed wire checksum. A
+pending checksum is rejected even if its current bytes happen to satisfy the
+final checksum equation. The program never repairs or trusts an unfinished
+checksum.
+
+After UDP/2152 identifies a candidate, every malformed declaration or
+unverified checksum increments the existing bounded `downlink_malformed`
+counter and drops before TEID/PDR lookup, decapsulation, or inner-destination
+validation. Addresses, TEIDs, lengths, checksum values, and payload bytes are
+not emitted. Non-UDP traffic, other UDP ports, fragments awaiting host-stack
+policy, and structurally valid non-G-PDU GTP-U control traffic retain their
+pass-through behavior.
+
+The privileged proof covers a legal zero `CHECKSUM_NONE` omission, non-zero
+software-verified bytes, authenticated zero and non-zero
+`CHECKSUM_UNNECESSARY`, and genuine zero-seed, non-zero-seed, and already
+checksum-valid-byte `CHECKSUM_PARTIAL` frames. The positive fixture uses
+WireGuard AEAD authentication of the complete inner IPv4 packet before Linux
+publishes checksum metadata and forwards the current UDP packet into the real
+tc hook. Every partial form fails before PDR/decap counters, while both legal
+zero cases decapsulate only after the exact checksum bytes are restored. A
+boundary mismatch with trusted metadata proves metadata never bypasses
+structural validation.
+
 ### Per-bearer packet marks
 
 The eBPF backend can install a default bearer and multiple dedicated bearers
@@ -305,7 +360,15 @@ retained only for the exact migration proof described above.
   ePDG uplink datapath.
 - The eBPF backend requires bpffs, kernel BTF, tc/eBPF privileges
   (`CAP_NET_ADMIN` and `CAP_BPF` or `CAP_SYS_ADMIN`), and enough MTU headroom
-  for 36 bytes of outer IPv4/UDP/GTP-U headers.
+  for 36 bytes of outer IPv4/UDP/GTP-U headers. The current object also uses
+  the bounded `bpf_loop` helper (available in mainline Linux 5.17 and newer)
+  to checksum the complete declared UDP range without verifier unrolling; the
+  repository's documented production node profile remains Linux 6.8 or newer.
+- The ignored privileged eBPF proof additionally requires the `gtp` and
+  `wireguard` kernel modules plus `ip`, `tc`, `ethtool`, `nft`, `wg`, and
+  Python 3. CI preflights and installs these prerequisites. A platform without
+  them is explicitly unavailable for this proof; an ignored or skipped run is
+  not positive datapath evidence.
 - eBPF cleanup checks exact BPF program IDs and named pin map IDs, but classic
   tc/bpffs cleanup requires the documented exclusive-writer boundary; it does
   not claim atomic conditional deletion against uncoordinated external writers.
@@ -324,6 +387,7 @@ retained only for the exact migration proof described above.
 ```sh
 cargo test -p opc-gtpu-dataplane
 sudo modprobe gtp
+sudo modprobe wireguard
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture'
 ```

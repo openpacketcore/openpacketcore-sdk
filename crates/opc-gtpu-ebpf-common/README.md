@@ -16,6 +16,14 @@ GTP-U encapsulation/classification helpers.
 - `classify_gtpu` classifies a mandatory GTP-U header as `NotGtpV1`,
   `NotGpdu`, or `Gpdu { teid, length, has_opt, has_ext }`.
 - `ipv4_header_checksum` computes an option-free IPv4 header checksum.
+- `Ipv4EnvelopeBounds`, `UdpEnvelopeBounds`, and `GtpuEnvelopeBounds` validate
+  the exact nested downlink boundary with checked arithmetic while retaining
+  legal layer-2 padding outside the IPv4 packet.
+- `classify_udp_checksum` uses typed `UdpChecksumEvidence` to distinguish legal
+  IPv4 checksum omission, positive kernel verification, and exact software
+  verification. `NoPendingOffload` is an explicit caller proof, not something
+  inferred from a failed metadata query. Internet and IPv4 UDP checksum helpers
+  cover variable and odd-length fixtures without kernel access.
 
 All multi-byte wire and map fields are network byte order unless noted in the
 Rust docs.
@@ -53,8 +61,10 @@ assert_eq!(encap.len(), GTPU_ENCAP_LEN);
 - `#![no_std]`, `#![forbid(unsafe_code)]`, and dependency-free.
 - Contains no map access, loader code, tc hooks, kernel syscalls, or product
   policy.
-- Downlink classification only inspects the mandatory GTP-U header; extension
-  walking happens in the eBPF program.
+- The shared envelope model validates declarations and checksum bytes but does
+  not inspect kernel checksum metadata or access packet memory. A live skb
+  caller must exclude pending offload before supplying `NoPendingOffload`; the
+  eBPF program owns that evidence boundary and GTP-U extension walking.
 
 ## Roadmap
 
