@@ -248,30 +248,32 @@ mod tests {
 
     fn generate_test_certs(
         spiffe_id: &str,
-    ) -> (rcgen::Certificate, KeyPair, rcgen::Certificate, KeyPair) {
+    ) -> (
+        rcgen::CertifiedIssuer<'static, KeyPair>,
+        rcgen::Certificate,
+        KeyPair,
+    ) {
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params
             .distinguished_name
             .push(DnType::CommonName, "Test CA");
         let ca_key = KeyPair::generate().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
-        let (wl_cert, wl_key) = generate_workload_cert(spiffe_id, &ca_cert, &ca_key);
+        let (wl_cert, wl_key) = generate_workload_cert(spiffe_id, &ca);
 
-        (ca_cert, ca_key, wl_cert, wl_key)
+        (ca, wl_cert, wl_key)
     }
 
     fn generate_workload_cert(
         spiffe_id: &str,
-        ca_cert: &rcgen::Certificate,
-        ca_key: &KeyPair,
+        issuer: &rcgen::Issuer<'_, impl rcgen::SigningKey>,
     ) -> (rcgen::Certificate, KeyPair) {
         let now = ::time::OffsetDateTime::now_utc();
         generate_workload_cert_with_validity(
             spiffe_id,
-            ca_cert,
-            ca_key,
+            issuer,
             now - ::time::Duration::days(1),
             now + ::time::Duration::days(1),
         )
@@ -279,8 +281,7 @@ mod tests {
 
     fn generate_workload_cert_with_validity(
         spiffe_id: &str,
-        ca_cert: &rcgen::Certificate,
-        ca_key: &KeyPair,
+        issuer: &rcgen::Issuer<'_, impl rcgen::SigningKey>,
         not_before: ::time::OffsetDateTime,
         not_after: ::time::OffsetDateTime,
     ) -> (rcgen::Certificate, KeyPair) {
@@ -288,15 +289,15 @@ mod tests {
         wl_params
             .distinguished_name
             .push(DnType::CommonName, "Workload");
-        wl_params
-            .subject_alt_names
-            .push(SanType::URI(rcgen::Ia5String::try_from(spiffe_id).unwrap()));
+        wl_params.subject_alt_names.push(SanType::URI(
+            rcgen::string::Ia5String::try_from(spiffe_id).unwrap(),
+        ));
 
         wl_params.not_before = not_before;
         wl_params.not_after = not_after;
 
         let wl_key = KeyPair::generate().unwrap();
-        let wl_cert = wl_params.signed_by(&wl_key, ca_cert, ca_key).unwrap();
+        let wl_cert = wl_params.signed_by(&wl_key, issuer).unwrap();
 
         (wl_cert, wl_key)
     }
@@ -345,13 +346,13 @@ mod tests {
             std::process::id()
         ));
         let spiffe = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
-        let (ca_cert, _ca_key, wl_cert, wl_key) = generate_test_certs(spiffe);
+        let (ca, wl_cert, wl_key) = generate_test_certs(spiffe);
 
         let (cert_path, key_path, bundle_path) = write_pem_files(
             &dir,
-            &(wl_cert.pem() + &ca_cert.pem()),
+            &(wl_cert.pem() + &ca.pem()),
             &wl_key.serialize_pem(),
-            &ca_cert.pem(),
+            &ca.pem(),
         );
 
         let source = FileSvidSource::new(
@@ -385,13 +386,13 @@ mod tests {
             std::process::id()
         ));
         let spiffe1 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
-        let (ca_cert1, _ca_key1, wl_cert1, wl_key1) = generate_test_certs(spiffe1);
+        let (ca1, wl_cert1, wl_key1) = generate_test_certs(spiffe1);
 
         let (cert_path, key_path, bundle_path) = write_pem_files(
             &dir,
-            &(wl_cert1.pem() + &ca_cert1.pem()),
+            &(wl_cert1.pem() + &ca1.pem()),
             &wl_key1.serialize_pem(),
-            &ca_cert1.pem(),
+            &ca1.pem(),
         );
 
         let source = FileSvidSource::new(
@@ -409,15 +410,15 @@ mod tests {
 
         // Generate a new cert with a different SPIFFE ID to prove rotation.
         let spiffe2 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/1";
-        let (ca_cert2, _ca_key2, wl_cert2, wl_key2) = generate_test_certs(spiffe2);
+        let (ca2, wl_cert2, wl_key2) = generate_test_certs(spiffe2);
 
         let mut f = fs::File::create(&cert_path).unwrap();
-        f.write_all((wl_cert2.pem() + &ca_cert2.pem()).as_bytes())
+        f.write_all((wl_cert2.pem() + &ca2.pem()).as_bytes())
             .unwrap();
         let mut f = fs::File::create(&key_path).unwrap();
         f.write_all(wl_key2.serialize_pem().as_bytes()).unwrap();
         let mut f = fs::File::create(&bundle_path).unwrap();
-        f.write_all(ca_cert2.pem().as_bytes()).unwrap();
+        f.write_all(ca2.pem().as_bytes()).unwrap();
 
         // Wait for the state to update.
         let rx = source.subscribe();
@@ -447,21 +448,20 @@ mod tests {
             std::process::id()
         ));
         let spiffe = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
-        let (ca_cert, ca_key, _wl_cert, _wl_key) = generate_test_certs(spiffe);
+        let (ca, _wl_cert, _wl_key) = generate_test_certs(spiffe);
         let now = ::time::OffsetDateTime::now_utc();
         let (wl_cert, wl_key) = generate_workload_cert_with_validity(
             spiffe,
-            &ca_cert,
-            &ca_key,
+            &ca,
             now - ::time::Duration::days(2),
             now - ::time::Duration::days(1),
         );
 
         let (cert_path, key_path, bundle_path) = write_pem_files(
             &dir,
-            &(wl_cert.pem() + &ca_cert.pem()),
+            &(wl_cert.pem() + &ca.pem()),
             &wl_key.serialize_pem(),
-            &ca_cert.pem(),
+            &ca.pem(),
         );
 
         let source = FileSvidSource::new(
@@ -492,21 +492,20 @@ mod tests {
             std::process::id()
         ));
         let spiffe = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
-        let (ca_cert, ca_key, _wl_cert, _wl_key) = generate_test_certs(spiffe);
+        let (ca, _wl_cert, _wl_key) = generate_test_certs(spiffe);
         let now = ::time::OffsetDateTime::now_utc();
         let (wl_cert, wl_key) = generate_workload_cert_with_validity(
             spiffe,
-            &ca_cert,
-            &ca_key,
+            &ca,
             now + ::time::Duration::days(1),
             now + ::time::Duration::days(2),
         );
 
         let (cert_path, key_path, bundle_path) = write_pem_files(
             &dir,
-            &(wl_cert.pem() + &ca_cert.pem()),
+            &(wl_cert.pem() + &ca.pem()),
             &wl_key.serialize_pem(),
-            &ca_cert.pem(),
+            &ca.pem(),
         );
 
         let source = FileSvidSource::new(
@@ -537,13 +536,13 @@ mod tests {
             std::process::id()
         ));
         let spiffe1 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
-        let (ca_cert1, _ca_key1, wl_cert1, wl_key1) = generate_test_certs(spiffe1);
+        let (ca1, wl_cert1, wl_key1) = generate_test_certs(spiffe1);
 
         let (cert_path, key_path, bundle_path) = write_pem_files(
             &dir,
-            &(wl_cert1.pem() + &ca_cert1.pem()),
+            &(wl_cert1.pem() + &ca1.pem()),
             &wl_key1.serialize_pem(),
-            &ca_cert1.pem(),
+            &ca1.pem(),
         );
 
         let source = FileSvidSource::new(
@@ -561,10 +560,10 @@ mod tests {
         let mut event_rx = source.subscribe_events();
 
         let spiffe2 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/1";
-        let (ca_cert2, _ca_key2, wl_cert2, wl_key2) = generate_test_certs(spiffe2);
+        let (ca2, wl_cert2, wl_key2) = generate_test_certs(spiffe2);
 
         let mut f = fs::File::create(&cert_path).unwrap();
-        f.write_all((wl_cert2.pem() + &ca_cert2.pem()).as_bytes())
+        f.write_all((wl_cert2.pem() + &ca2.pem()).as_bytes())
             .unwrap();
         let mut f = fs::File::create(&key_path).unwrap();
         f.write_all(wl_key2.serialize_pem().as_bytes()).unwrap();
@@ -592,13 +591,13 @@ mod tests {
             std::process::id()
         ));
         let spiffe1 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
-        let (ca_cert, ca_key, wl_cert1, wl_key1) = generate_test_certs(spiffe1);
+        let (ca, wl_cert1, wl_key1) = generate_test_certs(spiffe1);
 
         let (cert_path, key_path, bundle_path) = write_pem_files(
             &dir,
-            &(wl_cert1.pem() + &ca_cert.pem()),
+            &(wl_cert1.pem() + &ca.pem()),
             &wl_key1.serialize_pem(),
-            &ca_cert.pem(),
+            &ca.pem(),
         );
 
         let source = FileSvidSource::new(
@@ -616,10 +615,10 @@ mod tests {
         let mut event_rx = source.subscribe_events();
 
         let spiffe2 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/1";
-        let (wl_cert2, _wl_key2) = generate_workload_cert(spiffe2, &ca_cert, &ca_key);
+        let (wl_cert2, _wl_key2) = generate_workload_cert(spiffe2, &ca);
 
         let mut f = fs::File::create(&cert_path).unwrap();
-        f.write_all((wl_cert2.pem() + &ca_cert.pem()).as_bytes())
+        f.write_all((wl_cert2.pem() + &ca.pem()).as_bytes())
             .unwrap();
         let mut f = fs::File::create(&key_path).unwrap();
         f.write_all(wl_key1.serialize_pem().as_bytes()).unwrap();
@@ -647,13 +646,13 @@ mod tests {
             std::process::id()
         ));
         let spiffe = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
-        let (ca_cert, _ca_key, wl_cert, wl_key) = generate_test_certs(spiffe);
+        let (ca, wl_cert, wl_key) = generate_test_certs(spiffe);
 
         let (cert_path, key_path, bundle_path) = write_pem_files(
             &dir,
-            &(wl_cert.pem() + &ca_cert.pem()),
+            &(wl_cert.pem() + &ca.pem()),
             &wl_key.serialize_pem(),
-            &ca_cert.pem(),
+            &ca.pem(),
         );
 
         let source = FileSvidSource::new(

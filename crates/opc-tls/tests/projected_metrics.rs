@@ -72,19 +72,17 @@ fn material_for_id_expiring_after(spiffe_id: &str, valid_for: time::Duration) ->
         .distinguished_name
         .push(DnType::CommonName, "projected metrics CA");
     let ca_key = KeyPair::generate().expect("generate CA key");
-    let ca = ca_params.self_signed(&ca_key).expect("sign CA");
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("sign CA");
 
     let now = time::OffsetDateTime::now_utc();
     let mut leaf_params = CertificateParams::default();
     leaf_params.subject_alt_names.push(SanType::URI(
-        rcgen::Ia5String::try_from(spiffe_id).expect("test SPIFFE ID"),
+        rcgen::string::Ia5String::try_from(spiffe_id).expect("test SPIFFE ID"),
     ));
     leaf_params.not_before = now - time::Duration::minutes(1);
     leaf_params.not_after = now + valid_for;
     let leaf_key = KeyPair::generate().expect("generate leaf key");
-    let leaf = leaf_params
-        .signed_by(&leaf_key, &ca, &ca_key)
-        .expect("sign leaf");
+    let leaf = leaf_params.signed_by(&leaf_key, &ca).expect("sign leaf");
 
     TestMaterial {
         certificate_chain: leaf.pem() + &ca.pem(),
@@ -101,7 +99,7 @@ fn material_with_short_intermediate() -> TestMaterial {
         .distinguished_name
         .push(DnType::CommonName, "projected metrics root");
     let root_key = KeyPair::generate().expect("generate root key");
-    let root = root_params.self_signed(&root_key).expect("sign root");
+    let root = rcgen::CertifiedIssuer::self_signed(root_params, root_key).expect("sign root");
 
     let mut intermediate_params = CertificateParams::default();
     intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -111,19 +109,19 @@ fn material_with_short_intermediate() -> TestMaterial {
         .distinguished_name
         .push(DnType::CommonName, "projected metrics intermediate");
     let intermediate_key = KeyPair::generate().expect("generate intermediate key");
-    let intermediate = intermediate_params
-        .signed_by(&intermediate_key, &root, &root_key)
-        .expect("sign intermediate");
+    let intermediate =
+        rcgen::CertifiedIssuer::signed_by(intermediate_params, intermediate_key, &root)
+            .expect("sign intermediate");
 
     let mut leaf_params = CertificateParams::default();
     leaf_params.subject_alt_names.push(SanType::URI(
-        rcgen::Ia5String::try_from(SPIFFE_ID).expect("test SPIFFE ID"),
+        rcgen::string::Ia5String::try_from(SPIFFE_ID).expect("test SPIFFE ID"),
     ));
     leaf_params.not_before = now - time::Duration::minutes(1);
     leaf_params.not_after = now + time::Duration::seconds(5);
     let leaf_key = KeyPair::generate().expect("generate leaf key");
     let leaf = leaf_params
-        .signed_by(&leaf_key, &intermediate, &intermediate_key)
+        .signed_by(&leaf_key, &intermediate)
         .expect("sign leaf");
 
     TestMaterial {

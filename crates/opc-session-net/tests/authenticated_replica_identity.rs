@@ -36,8 +36,7 @@ use opc_types::{NetworkFunctionKind, TenantId};
 const SERVER_REPLICA: u16 = 2;
 
 struct TestPki {
-    ca_cert: rcgen::Certificate,
-    ca_key: rcgen::KeyPair,
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 }
 
 impl TestPki {
@@ -48,8 +47,8 @@ impl TestPki {
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "Session identity test CA");
-        let ca_cert = params.self_signed(&ca_key).expect("CA certificate");
-        Self { ca_cert, ca_key }
+        let ca = rcgen::CertifiedIssuer::self_signed(params, ca_key).expect("CA certificate");
+        Self { ca }
     }
 
     fn client_config(&self, replica: u16) -> AuthenticatedClientConfig {
@@ -73,7 +72,7 @@ impl TestPki {
     fn identity_state(&self, replica: u16) -> opc_identity::IdentityState {
         self.identity_state_with_trust_and_validity(
             replica,
-            &[&self.ca_cert],
+            &[self.ca.as_ref()],
             time::Duration::days(1),
         )
     }
@@ -89,17 +88,15 @@ impl TestPki {
             .distinguished_name
             .push(rcgen::DnType::CommonName, format!("replica-{replica}"));
         params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::Ia5String::try_from(replica_spiffe(replica)).expect("SPIFFE URI"),
+            rcgen::string::Ia5String::try_from(replica_spiffe(replica)).expect("SPIFFE URI"),
         ));
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::days(1);
         params.not_after = now + validity;
         let key = rcgen::KeyPair::generate().expect("leaf key");
-        let cert = params
-            .signed_by(&key, &self.ca_cert, &self.ca_key)
-            .expect("leaf certificate");
+        let cert = params.signed_by(&key, &self.ca).expect("leaf certificate");
 
-        let certs = parse_certs_pem(&(cert.pem() + &self.ca_cert.pem())).expect("certificate PEM");
+        let certs = parse_certs_pem(&(cert.pem() + &self.ca.pem())).expect("certificate PEM");
         let private_key = parse_key_pem(&key.serialize_pem()).expect("private key PEM");
         let trust_domain = opc_identity::TrustDomain::new("test-domain").expect("trust domain");
         let mut trust_bundles = opc_identity::TrustBundleSet::new();
@@ -399,7 +396,7 @@ fn retirement_reason_count(limit: LifecycleLimit) -> u64 {
 
 async fn assert_paused_direct_lifecycle_wiring(endpoint: LifecycleEndpoint, limit: LifecycleLimit) {
     let pki = TestPki::new();
-    let trust = [&pki.ca_cert];
+    let trust = [pki.ca.as_ref()];
     let long_validity = time::Duration::days(1);
     let short_validity = time::Duration::seconds(45);
     let (client_validity, server_validity) = match (endpoint, limit) {
@@ -864,7 +861,7 @@ fn assert_exact_replacement_hello(first: &Request, replacement: &Request) {
 
 async fn assert_real_mtls_leaf_expiry_reconnects(short_local_leaf: bool) {
     let pki = TestPki::new();
-    let trust = [&pki.ca_cert];
+    let trust = [pki.ca.as_ref()];
     let short = time::Duration::seconds(7);
     let long = time::Duration::days(1);
     let client_validity = if short_local_leaf { short } else { long };
@@ -1080,9 +1077,9 @@ impl RotationMaterialHarness<'_> {
 async fn continuous_real_mtls_traffic_survives_trust_rotation_and_rejects_removed_old_trust() {
     let old_pki = TestPki::new();
     let new_pki = TestPki::new();
-    let old_trust = [&old_pki.ca_cert];
-    let overlap = [&old_pki.ca_cert, &new_pki.ca_cert];
-    let new_trust = [&new_pki.ca_cert];
+    let old_trust = [old_pki.ca.as_ref()];
+    let overlap = [old_pki.ca.as_ref(), new_pki.ca.as_ref()];
+    let new_trust = [new_pki.ca.as_ref()];
     let validity = time::Duration::days(1);
     let (client_tx, client_rx) = tokio::sync::watch::channel(Some(
         old_pki.identity_state_with_trust_and_validity(1, &old_trust, validity),

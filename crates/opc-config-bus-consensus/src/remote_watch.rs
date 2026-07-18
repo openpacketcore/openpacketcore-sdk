@@ -1952,8 +1952,7 @@ mod tests {
     }
 
     struct TestCa {
-        certificate: rcgen::Certificate,
-        key: rcgen::KeyPair,
+        issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
         pem: String,
     }
 
@@ -1965,13 +1964,10 @@ mod tests {
                 .distinguished_name
                 .push(DnType::CommonName, "config watch test CA");
             let key = rcgen::KeyPair::generate().expect("CA key");
-            let certificate = params.self_signed(&key).expect("CA certificate");
-            let pem = certificate.pem();
-            Self {
-                certificate,
-                key,
-                pem,
-            }
+            let issuer = rcgen::CertifiedIssuer::self_signed(params, key)
+                .expect("CA certificate and issuer");
+            let pem = issuer.pem();
+            Self { issuer, pem }
         }
 
         fn issue_material(&self, spiffe_id: &SpiffeId) -> (String, String) {
@@ -1980,14 +1976,14 @@ mod tests {
                 .distinguished_name
                 .push(DnType::CommonName, "config watch workload");
             params.subject_alt_names.push(SanType::URI(
-                rcgen::Ia5String::try_from(spiffe_id.as_str()).expect("SPIFFE URI"),
+                rcgen::string::Ia5String::try_from(spiffe_id.as_str()).expect("SPIFFE URI"),
             ));
             let now = time::OffsetDateTime::now_utc();
             params.not_before = now - time::Duration::days(1);
             params.not_after = now + time::Duration::days(1);
             let key = rcgen::KeyPair::generate().expect("leaf key");
             let certificate = params
-                .signed_by(&key, &self.certificate, &self.key)
+                .signed_by(&key, &self.issuer)
                 .expect("leaf certificate");
 
             (certificate.pem(), key.serialize_pem())

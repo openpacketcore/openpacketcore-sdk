@@ -1438,31 +1438,30 @@ mod tests {
             .distinguished_name
             .push(DnType::CommonName, "Smoke Test CA");
         let ca_key = KeyPair::generate().expect("ca key");
-        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+        let ca =
+            rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca cert and issuer");
         let server = signed_leaf(
-            &ca_cert,
-            &ca_key,
+            &ca,
             "NETCONF Server",
             "spiffe://test-domain/tenant/test/ns/default/sa/netconf-server/nf/amf/instance/0",
             true,
         );
         let client = signed_leaf(
-            &ca_cert,
-            &ca_key,
+            &ca,
             "NETCONF Client",
             "spiffe://test-domain/tenant/test/ns/default/sa/netconf-client/nf/amf/instance/0",
             false,
         );
         let server_state = identity_state_from_pem(
-            &(server.0.pem() + &ca_cert.pem()),
+            &(server.0.pem() + &ca.pem()),
             &server.1.serialize_pem(),
-            &ca_cert.pem(),
+            &ca.pem(),
         );
         MtlsMaterial {
             server_state,
-            client_cert_pem: (client.0.pem() + &ca_cert.pem()).into_bytes(),
+            client_cert_pem: (client.0.pem() + &ca.pem()).into_bytes(),
             client_key_pem: client.1.serialize_pem().into_bytes(),
-            trust_roots_pem: ca_cert.pem().into_bytes(),
+            trust_roots_pem: ca.pem().into_bytes(),
         }
     }
 
@@ -1474,12 +1473,10 @@ mod tests {
             .distinguished_name
             .push(DnType::CommonName, "Other CA");
         let other_ca_key = KeyPair::generate().expect("other ca key");
-        let other_ca = other_ca_params
-            .self_signed(&other_ca_key)
-            .expect("other ca cert");
+        let other_ca = rcgen::CertifiedIssuer::self_signed(other_ca_params, other_ca_key)
+            .expect("other ca cert and issuer");
         let other_client = signed_leaf(
             &other_ca,
-            &other_ca_key,
             "Untrusted Client",
             "spiffe://test-domain/tenant/test/ns/default/sa/netconf-client/nf/amf/instance/1",
             false,
@@ -1492,8 +1489,7 @@ mod tests {
     }
 
     fn signed_leaf(
-        ca_cert: &rcgen::Certificate,
-        ca_key: &KeyPair,
+        issuer: &rcgen::Issuer<'_, impl rcgen::SigningKey>,
         common_name: &str,
         spiffe_id: &str,
         include_localhost_dns: bool,
@@ -1503,18 +1499,18 @@ mod tests {
             .distinguished_name
             .push(DnType::CommonName, common_name);
         params.subject_alt_names.push(SanType::URI(
-            rcgen::Ia5String::try_from(spiffe_id).expect("spiffe san"),
+            rcgen::string::Ia5String::try_from(spiffe_id).expect("spiffe san"),
         ));
         if include_localhost_dns {
             params.subject_alt_names.push(SanType::DnsName(
-                rcgen::Ia5String::try_from("localhost").expect("dns san"),
+                rcgen::string::Ia5String::try_from("localhost").expect("dns san"),
             ));
         }
         let now = ::time::OffsetDateTime::now_utc();
         params.not_before = now - ::time::Duration::days(1);
         params.not_after = now + ::time::Duration::days(1);
         let key = KeyPair::generate().expect("leaf key");
-        let cert = params.signed_by(&key, ca_cert, ca_key).expect("leaf cert");
+        let cert = params.signed_by(&key, issuer).expect("leaf cert");
         (cert, key)
     }
 

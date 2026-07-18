@@ -5,16 +5,14 @@ pub(crate) static SESSION_CONNECTION_METRICS_TEST_LOCK: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 pub(crate) struct RotatableServerMaterial {
-    ca_certificate: rcgen::Certificate,
-    ca_key: rcgen::KeyPair,
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
     spiffe_id: String,
     source: tokio::sync::watch::Sender<Option<opc_identity::IdentityState>>,
     config: opc_tls::AuthenticatedServerConfig,
 }
 
 pub(crate) struct RotatableClientMaterial {
-    ca_certificate: rcgen::Certificate,
-    ca_key: rcgen::KeyPair,
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
     spiffe_id: String,
     source: tokio::sync::watch::Sender<Option<opc_identity::IdentityState>>,
     config: opc_tls::AuthenticatedClientConfig,
@@ -29,16 +27,15 @@ impl RotatableClientMaterial {
         parameters
             .distinguished_name
             .push(rcgen::DnType::CommonName, "session client material test CA");
-        let ca_certificate = parameters.self_signed(&ca_key).expect("sign test CA");
-        let initial = identity_state(&ca_certificate, &ca_key, &spiffe_id);
+        let ca = rcgen::CertifiedIssuer::self_signed(parameters, ca_key).expect("sign test CA");
+        let initial = identity_state(&ca, &spiffe_id);
         let (source, receiver) = tokio::sync::watch::channel(Some(initial));
         let config = opc_tls::TlsConfigBuilder::new(receiver)
             .allow_any_trusted_peer()
             .build_authenticated_client_config()
             .expect("build authenticated client config");
         Self {
-            ca_certificate,
-            ca_key,
+            ca,
             spiffe_id,
             source,
             config,
@@ -51,11 +48,8 @@ impl RotatableClientMaterial {
 
     pub(crate) fn rotate(&self) {
         let previous = self.config.material_status().epoch();
-        self.source.send_replace(Some(identity_state(
-            &self.ca_certificate,
-            &self.ca_key,
-            &self.spiffe_id,
-        )));
+        self.source
+            .send_replace(Some(identity_state(&self.ca, &self.spiffe_id)));
         let current = self.config.material_status();
         assert_ne!(
             current.epoch(),
@@ -78,16 +72,15 @@ impl RotatableServerMaterial {
         parameters
             .distinguished_name
             .push(rcgen::DnType::CommonName, "session bootstrap race test CA");
-        let ca_certificate = parameters.self_signed(&ca_key).expect("sign test CA");
-        let initial = identity_state(&ca_certificate, &ca_key, &spiffe_id);
+        let ca = rcgen::CertifiedIssuer::self_signed(parameters, ca_key).expect("sign test CA");
+        let initial = identity_state(&ca, &spiffe_id);
         let (source, receiver) = tokio::sync::watch::channel(Some(initial));
         let config = opc_tls::TlsConfigBuilder::new(receiver)
             .allow_any_trusted_peer()
             .build_authenticated_server_config()
             .expect("build authenticated server config");
         Self {
-            ca_certificate,
-            ca_key,
+            ca,
             spiffe_id,
             source,
             config,
@@ -100,11 +93,8 @@ impl RotatableServerMaterial {
 
     pub(crate) fn rotate(&self) {
         let previous = self.config.material_status().epoch();
-        self.source.send_replace(Some(identity_state(
-            &self.ca_certificate,
-            &self.ca_key,
-            &self.spiffe_id,
-        )));
+        self.source
+            .send_replace(Some(identity_state(&self.ca, &self.spiffe_id)));
         let current = self.config.material_status();
         assert_ne!(
             current.epoch(),
@@ -119,8 +109,7 @@ impl RotatableServerMaterial {
 }
 
 fn identity_state(
-    ca_certificate: &rcgen::Certificate,
-    ca_key: &rcgen::KeyPair,
+    ca: &rcgen::CertifiedIssuer<'_, impl rcgen::SigningKey>,
     spiffe_id: &str,
 ) -> opc_identity::IdentityState {
     let mut parameters = rcgen::CertificateParams::default();
@@ -128,22 +117,20 @@ fn identity_state(
         .distinguished_name
         .push(rcgen::DnType::CommonName, "session bootstrap race leaf");
     parameters.subject_alt_names.push(rcgen::SanType::URI(
-        rcgen::Ia5String::try_from(spiffe_id).expect("test SPIFFE URI"),
+        rcgen::string::Ia5String::try_from(spiffe_id).expect("test SPIFFE URI"),
     ));
     let now = time::OffsetDateTime::now_utc();
     parameters.not_before = now - time::Duration::days(1);
     parameters.not_after = now + time::Duration::days(1);
     let key = rcgen::KeyPair::generate().expect("generate test leaf key");
-    let certificate = parameters
-        .signed_by(&key, ca_certificate, ca_key)
-        .expect("sign test leaf");
-    let certificates = parse_certs_pem(&(certificate.pem() + &ca_certificate.pem()))
-        .expect("parse test certificate chain");
+    let certificate = parameters.signed_by(&key, ca).expect("sign test leaf");
+    let certificates =
+        parse_certs_pem(&(certificate.pem() + &ca.pem())).expect("parse test certificate chain");
     let private_key = parse_key_pem(&key.serialize_pem()).expect("parse test private key");
     let mut bundles = opc_identity::TrustBundleSet::new();
     bundles.insert(TrustBundle {
         trust_domain: opc_identity::TrustDomain::new("test-domain").expect("test trust domain"),
-        certificates: parse_certs_pem(&ca_certificate.pem()).expect("parse test CA"),
+        certificates: parse_certs_pem(&ca.pem()).expect("parse test CA"),
     });
     build_identity_state(certificates, private_key, bundles).expect("build test identity state")
 }

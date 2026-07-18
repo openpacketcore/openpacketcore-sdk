@@ -33,8 +33,7 @@ const CLIENT_REPLICA: u16 = 1;
 const SERVER_REPLICA: u16 = 2;
 
 struct TestPki {
-    ca_certificate: rcgen::Certificate,
-    ca_key: rcgen::KeyPair,
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 }
 
 impl TestPki {
@@ -45,11 +44,8 @@ impl TestPki {
         parameters
             .distinguished_name
             .push(rcgen::DnType::CommonName, "bootstrap retirement test CA");
-        let ca_certificate = parameters.self_signed(&ca_key).expect("sign test CA");
-        Self {
-            ca_certificate,
-            ca_key,
-        }
+        let ca = rcgen::CertifiedIssuer::self_signed(parameters, ca_key).expect("sign test CA");
+        Self { ca }
     }
 
     fn identity_state(&self, replica: u16) -> opc_identity::IdentityState {
@@ -58,22 +54,22 @@ impl TestPki {
             .distinguished_name
             .push(rcgen::DnType::CommonName, format!("replica-{replica}"));
         parameters.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::Ia5String::try_from(replica_spiffe(replica)).expect("SPIFFE URI"),
+            rcgen::string::Ia5String::try_from(replica_spiffe(replica)).expect("SPIFFE URI"),
         ));
         let now = time::OffsetDateTime::now_utc();
         parameters.not_before = now - time::Duration::days(1);
         parameters.not_after = now + time::Duration::days(1);
         let key = rcgen::KeyPair::generate().expect("generate leaf key");
         let certificate = parameters
-            .signed_by(&key, &self.ca_certificate, &self.ca_key)
+            .signed_by(&key, &self.ca)
             .expect("sign leaf certificate");
-        let certificates = parse_certs_pem(&(certificate.pem() + &self.ca_certificate.pem()))
+        let certificates = parse_certs_pem(&(certificate.pem() + &self.ca.pem()))
             .expect("parse certificate chain");
         let private_key = parse_key_pem(&key.serialize_pem()).expect("parse private key");
         let mut trust_bundles = opc_identity::TrustBundleSet::new();
         trust_bundles.insert(TrustBundle {
             trust_domain: opc_identity::TrustDomain::new("test-domain").expect("trust domain"),
-            certificates: parse_certs_pem(&self.ca_certificate.pem()).expect("parse CA"),
+            certificates: parse_certs_pem(&self.ca.pem()).expect("parse CA"),
         });
         build_identity_state(certificates, private_key, trust_bundles)
             .expect("build identity state")

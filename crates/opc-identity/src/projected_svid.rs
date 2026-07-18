@@ -1331,21 +1331,19 @@ mod tests {
         bundle_pem: String,
     }
 
-    fn test_ca(common_name: &str) -> (rcgen::Certificate, KeyPair) {
+    fn test_ca(common_name: &str) -> rcgen::CertifiedIssuer<'static, KeyPair> {
         let mut parameters = CertificateParams::default();
         parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         parameters
             .distinguished_name
             .push(DnType::CommonName, common_name);
         let key = KeyPair::generate().expect("generate test CA key");
-        let certificate = parameters.self_signed(&key).expect("sign test CA");
-        (certificate, key)
+        rcgen::CertifiedIssuer::self_signed(parameters, key).expect("sign test CA")
     }
 
     fn workload_certificate(
         spiffe_id: &str,
-        ca: &rcgen::Certificate,
-        ca_key: &KeyPair,
+        issuer: &rcgen::Issuer<'_, impl rcgen::SigningKey>,
         not_before: time::OffsetDateTime,
         not_after: time::OffsetDateTime,
     ) -> (rcgen::Certificate, KeyPair) {
@@ -1354,26 +1352,25 @@ mod tests {
             .distinguished_name
             .push(DnType::CommonName, "projected workload");
         parameters.subject_alt_names.push(SanType::URI(
-            rcgen::Ia5String::try_from(spiffe_id).expect("test SPIFFE ID"),
+            rcgen::string::Ia5String::try_from(spiffe_id).expect("test SPIFFE ID"),
         ));
         parameters.not_before = not_before;
         parameters.not_after = not_after;
         let key = KeyPair::generate().expect("generate workload key");
         let certificate = parameters
-            .signed_by(&key, ca, ca_key)
+            .signed_by(&key, issuer)
             .expect("sign workload certificate");
         (certificate, key)
     }
 
     fn valid_material(spiffe_id: &str) -> TestMaterial {
-        let (ca, ca_key) = test_ca("projected test CA");
-        material_signed_by(spiffe_id, &ca, &ca_key, None)
+        let ca = test_ca("projected test CA");
+        material_signed_by(spiffe_id, &ca, None)
     }
 
     fn material_signed_by(
         spiffe_id: &str,
-        ca: &rcgen::Certificate,
-        ca_key: &KeyPair,
+        ca: &rcgen::CertifiedIssuer<'_, impl rcgen::SigningKey>,
         validity: Option<(time::OffsetDateTime, time::OffsetDateTime)>,
     ) -> TestMaterial {
         let now = time::OffsetDateTime::now_utc();
@@ -1381,8 +1378,7 @@ mod tests {
             now - time::Duration::hours(1),
             now + time::Duration::hours(1),
         ));
-        let (workload, workload_key) =
-            workload_certificate(spiffe_id, ca, ca_key, not_before, not_after);
+        let (workload, workload_key) = workload_certificate(spiffe_id, ca, not_before, not_after);
         TestMaterial {
             cert_chain_pem: workload.pem() + &ca.pem(),
             private_key_pem: workload_key.serialize_pem(),
@@ -1964,8 +1960,8 @@ mod tests {
     #[tokio::test]
     async fn rejected_candidates_retain_the_exact_last_good_state() {
         let directory = TestDirectory::new("rejections");
-        let (ca, ca_key) = test_ca("stable CA");
-        let initial_material = material_signed_by(SPIFFE_A, &ca, &ca_key, None);
+        let ca = test_ca("stable CA");
+        let initial_material = material_signed_by(SPIFFE_A, &ca, None);
         write_generation(directory.path(), "..good", &initial_material);
         switch_generation(directory.path(), "..good");
         let source = source(directory.path());
@@ -2094,7 +2090,7 @@ mod tests {
                 .expect("retained identity"),
         );
 
-        let valid_second = material_signed_by(SPIFFE_B, &ca, &ca_key, None);
+        let valid_second = material_signed_by(SPIFFE_B, &ca, None);
         let wrong_key = TestMaterial {
             cert_chain_pem: valid_second.cert_chain_pem.clone(),
             private_key_pem: initial_material.private_key_pem.clone(),
@@ -2140,7 +2136,6 @@ mod tests {
         let expired = material_signed_by(
             SPIFFE_B,
             &ca,
-            &ca_key,
             Some((
                 now - time::Duration::hours(2),
                 now - time::Duration::hours(1),
@@ -2164,7 +2159,6 @@ mod tests {
         let not_yet_valid = material_signed_by(
             SPIFFE_B,
             &ca,
-            &ca_key,
             Some((
                 now + time::Duration::hours(1),
                 now + time::Duration::hours(2),

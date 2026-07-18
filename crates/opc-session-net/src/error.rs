@@ -131,14 +131,14 @@ mod tests {
         ca_parameters
             .distinguished_name
             .push(DnType::CommonName, "TLS accept classifier CA");
-        let ca = ca_parameters.self_signed(&ca_key).expect("sign CA");
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_parameters, ca_key).expect("sign CA");
         let server_key = KeyPair::generate().expect("generate server key");
         let mut server_parameters = CertificateParams::default();
         server_parameters.subject_alt_names.push(SanType::DnsName(
-            rcgen::Ia5String::try_from("localhost").expect("localhost DNS name"),
+            rcgen::string::Ia5String::try_from("localhost").expect("localhost DNS name"),
         ));
         let server_certificate = server_parameters
-            .signed_by(&server_key, &ca, &ca_key)
+            .signed_by(&server_key, &ca)
             .expect("sign server certificate");
 
         let mut roots = RootCertStore::empty();

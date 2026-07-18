@@ -696,7 +696,7 @@ mod spiffe_san_tests {
         let mut params = CertificateParams::default();
         params.subject_alt_names = uris
             .iter()
-            .map(|uri| SanType::URI(rcgen::Ia5String::try_from(*uri).unwrap()))
+            .map(|uri| SanType::URI(rcgen::string::Ia5String::try_from(*uri).unwrap()))
             .collect();
         let key = KeyPair::generate().unwrap();
         params.self_signed(&key).unwrap().der().to_vec()
