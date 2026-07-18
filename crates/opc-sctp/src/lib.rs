@@ -2,6 +2,11 @@
 //!
 //! The crate keeps all unsafe Linux SCTP UAPI work in `opc-libsctp-sys` and
 //! exposes a safe async API for one-to-one and one-to-many SCTP sockets.
+//! Diameter helpers in this crate are explicitly unprotected SCTP framing:
+//! PPID metadata does not establish DTLS, authenticate a peer, or prove that
+//! an association is protected. Deployments must provide and attest a separate
+//! protection mechanism such as IPsec, or use a real protected Diameter
+//! transport outside this crate.
 
 #![forbid(unsafe_code)]
 
@@ -41,11 +46,6 @@ pub const NGAP_PPID: PayloadProtocolIdentifier = PayloadProtocolIdentifier::new(
 ///
 /// RFC 6733 assigns PPID 46 to Diameter over SCTP without DTLS.
 pub const DIAMETER_SCTP_PPID: PayloadProtocolIdentifier = PayloadProtocolIdentifier::new(46);
-
-/// Diameter SCTP payload protocol identifier for DTLS/SCTP DATA chunks.
-///
-/// RFC 6733 assigns PPID 47 to Diameter over protected DTLS/SCTP.
-pub const DIAMETER_DTLS_SCTP_PPID: PayloadProtocolIdentifier = PayloadProtocolIdentifier::new(47);
 
 /// Default SCTP stream used by the Diameter SCTP helper.
 pub const DIAMETER_DEFAULT_STREAM_ID: u16 = 0;
@@ -287,22 +287,44 @@ impl OutboundMessage {
     }
 }
 
-/// Security profile for Diameter over SCTP metadata.
+/// Protection provided by an ordinary [`DiameterSctpPeer`] association.
+///
+/// The only supported value is [`Self::Unprotected`]. It does not attest an
+/// external IPsec deployment. A future in-SDK protected Diameter transport
+/// must use an association type that can prove its authenticated handshake,
+/// rather than adding a PPID-only value here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiameterSctpProtection {
+    /// Ordinary SCTP with no SDK-provided encryption or peer authentication.
+    Unprotected,
+}
+
+/// Legacy Diameter SCTP selector retained for a fail-closed migration.
+///
+/// This selector never establishes transport security. New code must use the
+/// explicitly unprotected `DiameterSctpPeer::new_unprotected` and
+/// `DiameterSctpAssociation::connect_unprotected_with_config` entry points.
+/// A legacy request for `Dtls` returns
+/// [`DiameterSctpError::ProtectedTransportUnavailable`] before socket setup or
+/// payload framing.
+#[deprecated(
+    since = "0.2.0",
+    note = "PPID metadata is not transport security; use explicitly unprotected Diameter SCTP APIs or a real protected transport"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiameterSctpSecurity {
-    /// Diameter carried directly in SCTP DATA chunks.
+    /// Legacy name for the explicitly unprotected PPID-46 path.
     ClearText,
-    /// Diameter carried in protected DTLS/SCTP DATA chunks.
+    /// Unsupported legacy request; every SDK compatibility entry point rejects it.
     Dtls,
 }
 
+#[allow(deprecated)]
 impl DiameterSctpSecurity {
-    /// Return the PPID required for this Diameter SCTP security profile.
-    #[must_use]
-    pub const fn ppid(self) -> PayloadProtocolIdentifier {
+    const fn require_unprotected(self) -> Result<(), DiameterSctpError> {
         match self {
-            Self::ClearText => DIAMETER_SCTP_PPID,
-            Self::Dtls => DIAMETER_DTLS_SCTP_PPID,
+            Self::ClearText => Ok(()),
+            Self::Dtls => Err(DiameterSctpError::ProtectedTransportUnavailable),
         }
     }
 }
@@ -310,12 +332,12 @@ impl DiameterSctpSecurity {
 /// Inbound PPID compatibility policy for Diameter over SCTP.
 ///
 /// Strict validation is the production default. The legacy-zero mode is an
-/// explicit interoperability escape hatch for non-conforming clear-text
-/// Diameter peers; it never changes outbound PPIDs or protected DTLS/SCTP
-/// validation.
+/// explicit interoperability escape hatch for non-conforming peers on the
+/// unprotected PPID-46 path; it never changes outbound PPIDs and cannot enable
+/// PPID-47 framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DiameterInboundPpidPolicy {
-    /// Require the PPID selected by [`DiameterSctpSecurity`].
+    /// Require the unprotected Diameter-over-SCTP PPID 46.
     #[default]
     Strict,
     /// Also accept inbound PPID 0 for clear-text Diameter.
@@ -329,17 +351,10 @@ enum DiameterInboundPpidKind {
 }
 
 impl DiameterInboundPpidPolicy {
-    const fn classify(
-        self,
-        security: DiameterSctpSecurity,
-        actual: PayloadProtocolIdentifier,
-    ) -> Option<DiameterInboundPpidKind> {
-        if actual.get() == security.ppid().get() {
+    const fn classify(self, actual: PayloadProtocolIdentifier) -> Option<DiameterInboundPpidKind> {
+        if actual.get() == DIAMETER_SCTP_PPID.get() {
             Some(DiameterInboundPpidKind::Standard)
-        } else if matches!(self, Self::AcceptLegacyZero)
-            && matches!(security, DiameterSctpSecurity::ClearText)
-            && actual.get() == 0
-        {
+        } else if matches!(self, Self::AcceptLegacyZero) && actual.get() == 0 {
             Some(DiameterInboundPpidKind::LegacyZero)
         } else {
             None
@@ -371,8 +386,8 @@ pub struct DiameterSctpPeer {
     pub remote_addr: SocketAddr,
     /// Optional local bind address.
     pub local_addr: Option<SocketAddr>,
-    /// Diameter SCTP security profile.
-    pub security: DiameterSctpSecurity,
+    /// Transport protection supplied by this SDK association.
+    pub protection: DiameterSctpProtection,
     /// Inbound Diameter PPID compatibility policy.
     pub inbound_ppid_policy: DiameterInboundPpidPolicy,
     /// Maximum SCTP user payload accepted for one Diameter message.
@@ -384,7 +399,7 @@ impl fmt::Debug for DiameterSctpPeer {
         f.debug_struct("DiameterSctpPeer")
             .field("remote_addr", &"<redacted>")
             .field("local_addr", &self.local_addr.map(|_| "<redacted>"))
-            .field("security", &self.security)
+            .field("protection", &self.protection)
             .field("inbound_ppid_policy", &self.inbound_ppid_policy)
             .field("max_message_bytes", &self.max_message_bytes)
             .finish()
@@ -392,17 +407,33 @@ impl fmt::Debug for DiameterSctpPeer {
 }
 
 impl DiameterSctpPeer {
-    /// Create a clear-text Diameter SCTP peer intent for one remote address.
+    /// Create an explicitly unprotected Diameter SCTP peer intent.
+    ///
+    /// Outbound payloads use PPID 46. This constructor does not establish or
+    /// attest DTLS, TLS, IPsec, peer authentication, or confidentiality.
     #[must_use]
-    pub fn new(remote_addr: SocketAddr) -> Self {
+    pub fn new_unprotected(remote_addr: SocketAddr) -> Self {
         let default_config = SctpConnectConfig::new(remote_addr);
         Self {
             remote_addr,
             local_addr: None,
-            security: DiameterSctpSecurity::ClearText,
+            protection: DiameterSctpProtection::Unprotected,
             inbound_ppid_policy: DiameterInboundPpidPolicy::Strict,
             max_message_bytes: default_config.max_message_bytes,
         }
+    }
+
+    /// Create a legacy clear-text peer intent.
+    ///
+    /// This compatibility constructor is unprotected and is retained only to
+    /// provide a compiler-visible migration to [`Self::new_unprotected`].
+    #[deprecated(
+        since = "0.2.0",
+        note = "use DiameterSctpPeer::new_unprotected to acknowledge that ordinary SCTP is not a protected transport"
+    )]
+    #[must_use]
+    pub fn new(remote_addr: SocketAddr) -> Self {
+        Self::new_unprotected(remote_addr)
     }
 
     /// Return a copy that binds the SCTP association from one local address.
@@ -414,20 +445,34 @@ impl DiameterSctpPeer {
 
     /// Return a copy that uses the requested inbound Diameter PPID policy.
     ///
-    /// [`DiameterInboundPpidPolicy::AcceptLegacyZero`] affects clear-text
-    /// inbound messages only. DTLS remains strict and outbound clear-text
-    /// messages continue to use [`DIAMETER_SCTP_PPID`].
+    /// [`DiameterInboundPpidPolicy::AcceptLegacyZero`] affects unprotected
+    /// inbound messages only. Outbound messages continue to use
+    /// [`DIAMETER_SCTP_PPID`], and PPID 47 is never enabled.
     #[must_use]
     pub fn with_inbound_ppid_policy(mut self, policy: DiameterInboundPpidPolicy) -> Self {
         self.inbound_ppid_policy = policy;
         self
     }
 
-    /// Return a copy that uses the requested Diameter SCTP security profile.
-    #[must_use]
-    pub fn with_security(mut self, security: DiameterSctpSecurity) -> Self {
-        self.security = security;
-        self
+    /// Apply a legacy Diameter SCTP selector during migration.
+    ///
+    /// `ClearText` retains this explicitly unprotected peer. `Dtls` fails
+    /// closed because this crate has no DTLS record layer or authenticated
+    /// protected-association type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError::ProtectedTransportUnavailable`] for
+    /// `DiameterSctpSecurity::Dtls`. No peer capable of framing or connecting
+    /// is returned in that case.
+    #[allow(deprecated)]
+    #[deprecated(
+        since = "0.2.0",
+        note = "use DiameterSctpPeer::new_unprotected or a real protected Diameter transport"
+    )]
+    pub fn with_security(self, security: DiameterSctpSecurity) -> Result<Self, DiameterSctpError> {
+        security.require_unprotected()?;
+        Ok(self)
     }
 
     /// Return a copy that uses the requested maximum message size.
@@ -454,10 +499,13 @@ impl DiameterSctpPeer {
         Ok(config)
     }
 
-    /// Wrap an encoded Diameter message with outbound SCTP metadata.
+    /// Wrap an encoded Diameter message with unprotected PPID-46 metadata.
+    ///
+    /// A [`DiameterSctpPeer`] cannot represent DTLS, so this method can only
+    /// emit [`DIAMETER_SCTP_PPID`].
     #[must_use]
     pub fn outbound_message(&self, payload: Bytes) -> OutboundMessage {
-        OutboundMessage::ordered(payload, DIAMETER_DEFAULT_STREAM_ID, self.security.ppid())
+        OutboundMessage::ordered(payload, DIAMETER_DEFAULT_STREAM_ID, DIAMETER_SCTP_PPID)
     }
 
     /// Validate inbound SCTP metadata before Diameter payload decode.
@@ -483,11 +531,10 @@ impl DiameterSctpPeer {
         if message.truncated {
             return Err(DiameterSctpError::Truncated);
         }
-        let expected = self.security.ppid();
         self.inbound_ppid_policy
-            .classify(self.security, message.ppid)
+            .classify(message.ppid)
             .ok_or(DiameterSctpError::WrongPpid {
-                expected: expected.get(),
+                expected: DIAMETER_SCTP_PPID.get(),
                 actual: message.ppid.get(),
             })
     }
@@ -514,9 +561,8 @@ impl DiameterSctpPeer {
     /// association cannot be opened on the current platform/runtime.
     pub async fn connect_association(&self) -> Result<DiameterSctpAssociation, DiameterSctpError> {
         let config = self.sctp_connect_config()?;
-        DiameterSctpAssociation::connect_with_config_and_inbound_ppid_policy(
+        DiameterSctpAssociation::connect_unprotected_with_config_and_inbound_ppid_policy(
             config,
-            self.security,
             self.inbound_ppid_policy,
         )
         .await
@@ -553,7 +599,7 @@ pub struct DiameterSctpAssociation {
 }
 
 impl DiameterSctpAssociation {
-    /// Open a Diameter-framed association from an explicit SCTP client config.
+    /// Open an explicitly unprotected Diameter-framed SCTP association.
     ///
     /// This is the Diameter counterpart to [`SctpAssociation::connect`] and
     /// preserves the complete local and remote address sets in `config`.
@@ -564,8 +610,8 @@ impl DiameterSctpAssociation {
     /// selection across the full validated sets.
     ///
     /// This entry point always uses [`DiameterInboundPpidPolicy::Strict`]. Use
-    /// [`Self::connect_with_config_and_inbound_ppid_policy`] for an explicit
-    /// per-association compatibility policy.
+    /// [`Self::connect_unprotected_with_config_and_inbound_ppid_policy`] for an
+    /// explicit per-association compatibility policy.
     ///
     /// # Errors
     ///
@@ -574,35 +620,32 @@ impl DiameterSctpAssociation {
     /// or peer cannot open the requested association. A host that lacks static
     /// multihoming reports [`SctpError::CapabilityUnavailable`]; this function
     /// never silently reduces the configured address sets.
-    pub async fn connect_with_config(
+    pub async fn connect_unprotected_with_config(
         config: SctpConnectConfig,
-        security: DiameterSctpSecurity,
     ) -> Result<Self, DiameterSctpError> {
-        Self::connect_with_config_and_inbound_ppid_policy(
+        Self::connect_unprotected_with_config_and_inbound_ppid_policy(
             config,
-            security,
             DiameterInboundPpidPolicy::Strict,
         )
         .await
     }
 
-    /// Open a Diameter-framed association with an explicit inbound PPID policy.
+    /// Open an explicitly unprotected association with an inbound PPID policy.
     ///
-    /// This is the opt-in counterpart to [`Self::connect_with_config`]. It
+    /// This is the opt-in counterpart to
+    /// [`Self::connect_unprotected_with_config`]. It
     /// preserves complete static-multihoming address sets and applies `policy`
-    /// only to inbound Diameter metadata. Outbound messages always use the PPID
-    /// selected by `security`.
+    /// only to inbound Diameter metadata. Outbound messages always use PPID 46.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Self::connect_with_config`].
-    pub async fn connect_with_config_and_inbound_ppid_policy(
+    /// Returns the same errors as [`Self::connect_unprotected_with_config`].
+    pub async fn connect_unprotected_with_config_and_inbound_ppid_policy(
         config: SctpConnectConfig,
-        security: DiameterSctpSecurity,
         policy: DiameterInboundPpidPolicy,
     ) -> Result<Self, DiameterSctpError> {
         config.validate().map_err(DiameterSctpError::from)?;
-        let peer = Self::peer_from_connect_config(&config, security, policy)?;
+        let peer = Self::peer_from_connect_config(&config, policy)?;
         let association = SctpAssociation::connect(config)
             .await
             .map_err(DiameterSctpError::connect)?;
@@ -613,9 +656,56 @@ impl DiameterSctpAssociation {
         })
     }
 
+    /// Open a legacy Diameter-framed SCTP association.
+    ///
+    /// `ClearText` delegates to the explicitly unprotected PPID-46 path.
+    /// `Dtls` fails before SCTP configuration validation or socket setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError::ProtectedTransportUnavailable`] when
+    /// `security` requests DTLS, or the errors documented by
+    /// [`Self::connect_unprotected_with_config`] for the legacy clear-text path.
+    #[allow(deprecated)]
+    #[deprecated(
+        since = "0.2.0",
+        note = "use connect_unprotected_with_config or a real protected Diameter transport"
+    )]
+    pub async fn connect_with_config(
+        config: SctpConnectConfig,
+        security: DiameterSctpSecurity,
+    ) -> Result<Self, DiameterSctpError> {
+        security.require_unprotected()?;
+        Self::connect_unprotected_with_config(config).await
+    }
+
+    /// Open a legacy association with an explicit inbound PPID policy.
+    ///
+    /// `Dtls` always fails before SCTP configuration validation or socket
+    /// setup. The inbound compatibility policy cannot weaken that result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiameterSctpError::ProtectedTransportUnavailable`] when
+    /// `security` requests DTLS, or the errors documented by
+    /// [`Self::connect_unprotected_with_config_and_inbound_ppid_policy`] for
+    /// the legacy clear-text path.
+    #[allow(deprecated)]
+    #[deprecated(
+        since = "0.2.0",
+        note = "use connect_unprotected_with_config_and_inbound_ppid_policy or a real protected Diameter transport"
+    )]
+    pub async fn connect_with_config_and_inbound_ppid_policy(
+        config: SctpConnectConfig,
+        security: DiameterSctpSecurity,
+        policy: DiameterInboundPpidPolicy,
+    ) -> Result<Self, DiameterSctpError> {
+        security.require_unprotected()?;
+        Self::connect_unprotected_with_config_and_inbound_ppid_policy(config, policy).await
+    }
+
     fn peer_from_connect_config(
         config: &SctpConnectConfig,
-        security: DiameterSctpSecurity,
         policy: DiameterInboundPpidPolicy,
     ) -> Result<DiameterSctpPeer, DiameterSctpError> {
         let Some(&remote_addr) = config.remote_addrs.first() else {
@@ -627,7 +717,7 @@ impl DiameterSctpAssociation {
         Ok(DiameterSctpPeer {
             remote_addr,
             local_addr: config.local_addrs.first().copied(),
-            security,
+            protection: DiameterSctpProtection::Unprotected,
             inbound_ppid_policy: policy,
             max_message_bytes: config.max_message_bytes,
         })
@@ -639,7 +729,7 @@ impl DiameterSctpAssociation {
         &self.peer
     }
 
-    /// Send one encoded Diameter payload with the peer's required PPID.
+    /// Send one encoded Diameter payload with unprotected PPID 46.
     ///
     /// # Errors
     ///
@@ -662,7 +752,7 @@ impl DiameterSctpAssociation {
     /// # Errors
     ///
     /// Returns [`DiameterSctpError`] when receive fails or non-notification
-    /// SCTP metadata is invalid for this peer's Diameter security profile.
+    /// SCTP metadata is invalid for this unprotected Diameter framing profile.
     pub async fn recv(&self) -> Result<DiameterSctpInbound, DiameterSctpError> {
         let message = self
             .association
@@ -694,7 +784,7 @@ impl DiameterSctpAssociation {
     /// # Errors
     ///
     /// Returns [`DiameterSctpError`] when receive fails or the SCTP metadata is
-    /// not valid for this peer's Diameter security profile.
+    /// not valid for this unprotected Diameter framing profile.
     pub async fn recv_diameter_payload(&self) -> Result<Bytes, DiameterSctpError> {
         loop {
             match self.recv().await? {
@@ -830,6 +920,8 @@ impl DiameterSctpConnectProjection {
 /// Error type for Diameter SCTP transport intent and metadata validation.
 #[derive(Debug)]
 pub enum DiameterSctpError {
+    /// A legacy caller requested a protected transport that this crate cannot establish.
+    ProtectedTransportUnavailable,
     /// SDK SCTP config validation failed.
     SctpConfig(SctpError),
     /// SDK SCTP connect failed.
@@ -842,7 +934,7 @@ pub enum DiameterSctpError {
     Notification,
     /// SCTP reported payload truncation.
     Truncated,
-    /// SCTP PPID did not match the selected Diameter security profile.
+    /// SCTP PPID did not match the unprotected Diameter framing profile.
     WrongPpid {
         /// Expected PPID.
         expected: u32,
@@ -868,6 +960,7 @@ impl DiameterSctpError {
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
+            Self::ProtectedTransportUnavailable => "diameter_sctp_protected_transport_unavailable",
             Self::SctpConfig(_) => "diameter_sctp_config_error",
             Self::SctpConnect(SctpError::UnsupportedPlatform) => {
                 "diameter_sctp_unsupported_platform"
@@ -900,6 +993,9 @@ impl From<SctpError> for DiameterSctpError {
 impl fmt::Display for DiameterSctpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProtectedTransportUnavailable => {
+                f.write_str("diameter_sctp_protected_transport_unavailable")
+            }
             Self::SctpConfig(error) => write!(f, "diameter_sctp_config_error: {error}"),
             Self::SctpConnect(SctpError::UnsupportedPlatform) => {
                 f.write_str("diameter_sctp_unsupported_platform")
@@ -926,7 +1022,10 @@ impl std::error::Error for DiameterSctpError {
             | Self::SctpConnect(error)
             | Self::SctpSend(error)
             | Self::SctpRecv(error) => Some(error),
-            Self::Notification | Self::Truncated | Self::WrongPpid { .. } => None,
+            Self::ProtectedTransportUnavailable
+            | Self::Notification
+            | Self::Truncated
+            | Self::WrongPpid { .. } => None,
         }
     }
 }
@@ -2648,7 +2747,7 @@ mod tests {
     use super::*;
 
     fn diameter_peer() -> DiameterSctpPeer {
-        DiameterSctpPeer::new("127.0.0.1:3868".parse().unwrap())
+        DiameterSctpPeer::new_unprotected("127.0.0.1:3868".parse().unwrap())
     }
 
     fn diameter_inbound(ppid: PayloadProtocolIdentifier) -> InboundMessage {
@@ -2663,6 +2762,10 @@ mod tests {
             truncated: false,
             control_truncated: false,
         }
+    }
+
+    fn reserved_diameter_dtls_ppid() -> PayloadProtocolIdentifier {
+        PayloadProtocolIdentifier::new(47)
     }
 
     fn push_u16_ne(out: &mut Vec<u8>, value: u16) {
@@ -2723,11 +2826,8 @@ mod tests {
     }
 
     #[test]
-    fn diameter_ppids_match_rfc_6733_values() {
+    fn unprotected_diameter_ppid_matches_rfc_6733_value() {
         assert_eq!(DIAMETER_SCTP_PPID.get(), 46);
-        assert_eq!(DIAMETER_DTLS_SCTP_PPID.get(), 47);
-        assert_eq!(DiameterSctpSecurity::ClearText.ppid(), DIAMETER_SCTP_PPID);
-        assert_eq!(DiameterSctpSecurity::Dtls.ppid(), DIAMETER_DTLS_SCTP_PPID);
 
         let network = DIAMETER_SCTP_PPID.to_network_order();
         assert_eq!(
@@ -2745,6 +2845,10 @@ mod tests {
         assert_eq!(
             diameter_peer().inbound_ppid_policy,
             DiameterInboundPpidPolicy::Strict
+        );
+        assert_eq!(
+            diameter_peer().protection,
+            DiameterSctpProtection::Unprotected
         );
         assert_eq!(
             diameter_peer()
@@ -3369,13 +3473,13 @@ mod tests {
 
         let peer = DiameterSctpAssociation::peer_from_connect_config(
             &config,
-            DiameterSctpSecurity::ClearText,
             DiameterInboundPpidPolicy::AcceptLegacyZero,
         )
         .unwrap();
 
         assert_eq!(peer.remote_addr, config.remote_addrs[0]);
         assert_eq!(peer.local_addr, Some(config.local_addrs[0]));
+        assert_eq!(peer.protection, DiameterSctpProtection::Unprotected);
         assert_eq!(
             peer.inbound_ppid_policy,
             DiameterInboundPpidPolicy::AcceptLegacyZero
@@ -3426,10 +3530,9 @@ mod tests {
         let mut config = SctpConnectConfig::new("127.0.0.1:3868".parse().unwrap());
         config.remote_addrs.clear();
 
-        let error =
-            DiameterSctpAssociation::connect_with_config(config, DiameterSctpSecurity::ClearText)
-                .await
-                .unwrap_err();
+        let error = DiameterSctpAssociation::connect_unprotected_with_config(config)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, DiameterSctpError::SctpConfig(_)));
         assert_eq!(error.as_str(), "diameter_sctp_config_error");
@@ -3471,16 +3574,12 @@ mod tests {
     }
 
     #[test]
-    fn diameter_outbound_message_uses_selected_ppid() {
-        let clear = diameter_peer().outbound_message(Bytes::from_static(b"diameter"));
-        assert_eq!(clear.stream_id, DIAMETER_DEFAULT_STREAM_ID);
-        assert_eq!(clear.ppid, DIAMETER_SCTP_PPID);
-        assert_eq!(clear.order, DeliveryOrder::Ordered);
-
-        let protected = diameter_peer()
-            .with_security(DiameterSctpSecurity::Dtls)
-            .outbound_message(Bytes::from_static(b"diameter"));
-        assert_eq!(protected.ppid, DIAMETER_DTLS_SCTP_PPID);
+    fn diameter_unprotected_outbound_message_always_uses_ppid_46() {
+        let unprotected = diameter_peer().outbound_message(Bytes::from_static(b"diameter"));
+        assert_eq!(unprotected.stream_id, DIAMETER_DEFAULT_STREAM_ID);
+        assert_eq!(unprotected.ppid, DIAMETER_SCTP_PPID);
+        assert_ne!(unprotected.ppid, reserved_diameter_dtls_ppid());
+        assert_eq!(unprotected.order, DeliveryOrder::Ordered);
 
         let compatibility = diameter_peer()
             .with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero)
@@ -3515,7 +3614,7 @@ mod tests {
         assert_eq!(payload, &Bytes::from_static(b"diameter"));
 
         let error = peer
-            .validate_inbound_message(&diameter_inbound(DIAMETER_DTLS_SCTP_PPID))
+            .validate_inbound_message(&diameter_inbound(reserved_diameter_dtls_ppid()))
             .unwrap_err();
         assert!(matches!(
             error,
@@ -3578,24 +3677,72 @@ mod tests {
     }
 
     #[test]
-    fn diameter_legacy_zero_policy_keeps_dtls_strict() {
-        let peer = diameter_peer()
+    #[allow(deprecated)]
+    fn diameter_legacy_dtls_peer_selector_fails_before_payload_framing() {
+        let error = diameter_peer()
             .with_security(DiameterSctpSecurity::Dtls)
-            .with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero);
-
-        peer.validate_inbound_message(&diameter_inbound(DIAMETER_DTLS_SCTP_PPID))
-            .unwrap();
-        let error = peer
-            .validate_inbound_message(&diameter_inbound(PayloadProtocolIdentifier::new(0)))
             .unwrap_err();
 
         assert!(matches!(
             error,
-            DiameterSctpError::WrongPpid {
-                expected: 47,
-                actual: 0
-            }
+            DiameterSctpError::ProtectedTransportUnavailable
         ));
+        assert_eq!(
+            error.as_str(),
+            "diameter_sctp_protected_transport_unavailable"
+        );
+        assert_eq!(error.to_string(), error.as_str());
+    }
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn diameter_legacy_dtls_connect_fails_before_config_or_socket_setup() {
+        let mut invalid_config = SctpConnectConfig::new("127.0.0.1:3868".parse().unwrap());
+        invalid_config.remote_addrs.clear();
+
+        let strict_error = DiameterSctpAssociation::connect_with_config(
+            invalid_config.clone(),
+            DiameterSctpSecurity::Dtls,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            strict_error,
+            DiameterSctpError::ProtectedTransportUnavailable
+        ));
+
+        let compatibility_error =
+            DiameterSctpAssociation::connect_with_config_and_inbound_ppid_policy(
+                invalid_config,
+                DiameterSctpSecurity::Dtls,
+                DiameterInboundPpidPolicy::AcceptLegacyZero,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            compatibility_error,
+            DiameterSctpError::ProtectedTransportUnavailable
+        ));
+
+        let projection = DiameterSctpConnectProjection::from_error(&compatibility_error);
+        assert_eq!(projection.outcome, DiameterSctpConnectOutcome::Failed);
+        assert!(!projection.connected);
+        assert_eq!(
+            projection.error_code,
+            Some("diameter_sctp_protected_transport_unavailable")
+        );
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn diameter_legacy_cleartext_selector_migrates_only_to_unprotected() {
+        let peer = diameter_peer()
+            .with_security(DiameterSctpSecurity::ClearText)
+            .unwrap();
+        let outbound = peer.outbound_message(Bytes::from_static(b"diameter"));
+
+        assert_eq!(outbound.ppid, DIAMETER_SCTP_PPID);
+        assert_ne!(outbound.ppid, reserved_diameter_dtls_ppid());
     }
 
     #[test]
@@ -4307,9 +4454,8 @@ mod tests {
         };
         let client = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            DiameterSctpAssociation::connect_with_config_and_inbound_ppid_policy(
+            DiameterSctpAssociation::connect_unprotected_with_config_and_inbound_ppid_policy(
                 client_config,
-                DiameterSctpSecurity::ClearText,
                 DiameterInboundPpidPolicy::AcceptLegacyZero,
             ),
         )
@@ -4361,7 +4507,6 @@ mod tests {
                 .map(|path| path.peer_addr),
             Some(server_addresses[1])
         );
-        assert_eq!(client.peer().security, DiameterSctpSecurity::ClearText);
         assert_eq!(
             client.peer().inbound_ppid_policy,
             DiameterInboundPpidPolicy::AcceptLegacyZero
@@ -4446,7 +4591,7 @@ mod tests {
         server_addr: SocketAddr,
     ) -> (SctpEndpoint, DiameterSctpAssociation, SctpAssociation) {
         let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
-        let client = DiameterSctpPeer::new(server_addr)
+        let client = DiameterSctpPeer::new_unprotected(server_addr)
             .connect_association()
             .await
             .unwrap();
@@ -4460,7 +4605,7 @@ mod tests {
     async fn loopback_diameter_legacy_zero_policy_is_inbound_only_and_counted() {
         let server_addr: SocketAddr = "127.0.0.1:38419".parse().unwrap();
         let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
-        let client = DiameterSctpPeer::new(server_addr)
+        let client = DiameterSctpPeer::new_unprotected(server_addr)
             .with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero)
             .connect_association()
             .await
@@ -4567,7 +4712,7 @@ mod tests {
             .send(OutboundMessage::ordered(
                 Bytes::from_static(b"diameter"),
                 DIAMETER_DEFAULT_STREAM_ID,
-                DIAMETER_DTLS_SCTP_PPID,
+                reserved_diameter_dtls_ppid(),
             ))
             .await
             .unwrap();
