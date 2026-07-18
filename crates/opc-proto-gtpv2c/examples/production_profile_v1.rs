@@ -2,15 +2,16 @@ use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     s2b_create_session_accepted_response, s2b_create_session_rejected_response,
     s2b_create_session_request, s2b_delete_session_request, s2b_delete_session_response,
-    s2b_echo_request, s2b_echo_response, s2b_modify_bearer_request, s2b_modify_bearer_response,
-    s2b_update_bearer_request, s2b_update_bearer_response, AccessPointName,
-    AggregateMaximumBitRate, BearerContext, CauseValue, EpsBearerId, FullyQualifiedTeid,
-    MessageDirection, MessageType, OwnedMessage, PdnAddressAllocation, PlmnId, RatType,
-    RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse, S2bCreateSessionRejectedResponse,
-    S2bCreateSessionRequest, S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage,
-    S2bModifyBearerRequest, S2bModifyBearerResponse, S2bUpdateBearerRequest,
-    S2bUpdateBearerRequestContext, S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode,
-    SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue,
+    s2b_echo_request, s2b_echo_response, s2b_modify_bearer_response,
+    s2b_ue_ipsec_tunnel_update_request, s2b_update_bearer_request, s2b_update_bearer_response,
+    AccessPointName, AggregateMaximumBitRate, BearerContext, CauseValue, EpsBearerId,
+    FullyQualifiedTeid, MessageDirection, MessageType, OwnedMessage, PdnAddressAllocation, PlmnId,
+    RatType, RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse,
+    S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bDeleteSessionRequest,
+    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerResponse, S2bUeIpsecTunnelUpdateEndpoint,
+    S2bUeIpsecTunnelUpdateRequest, S2bUpdateBearerRequest, S2bUpdateBearerRequestContext,
+    S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode, SelectionModeValue,
+    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue,
 };
 use opc_protocol::{DecodeContext, DuplicateIePolicy, Encode, EncodeContext, ValidationLevel};
 use std::io::{Error as IoError, ErrorKind};
@@ -74,10 +75,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     round_trip_profile_message(
-        s2b_modify_bearer_request(S2bModifyBearerRequest {
+        s2b_ue_ipsec_tunnel_update_request(S2bUeIpsecTunnelUpdateRequest {
             sequence_number: 0x010205,
             teid: 0x0102_0304,
-            bearer_context: bearer_context(6),
+            wlan_location: None,
+            wlan_location_timestamp: None,
+            endpoint: S2bUeIpsecTunnelUpdateEndpoint::General,
             additional_ies: Vec::new(),
         })?,
         MessageType::ModifyBearerRequest,

@@ -191,6 +191,8 @@ pub const IE_TYPE_APN: u8 = 71;
 pub const IE_TYPE_AMBR: u8 = 72;
 /// GTPv2-C EPS Bearer ID IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_EBI: u8 = 73;
+/// GTPv2-C IP Address IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_IP_ADDRESS: u8 = 74;
 /// GTPv2-C MEI IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_MEI: u8 = 75;
 /// GTPv2-C MSISDN IE type (TS 29.274 Table 8.1-1).
@@ -217,12 +219,18 @@ pub const IE_TYPE_BEARER_CONTEXT: u8 = 93;
 pub const IE_TYPE_CHARGING_ID: u8 = 94;
 /// GTPv2-C PDN Type IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_PDN_TYPE: u8 = 99;
+/// GTPv2-C Port Number IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_PORT_NUMBER: u8 = 126;
 /// GTPv2-C APN Restriction IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_APN_RESTRICTION: u8 = 127;
 /// GTPv2-C Selection Mode IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_SELECTION_MODE: u8 = 128;
 /// GTPv2-C Additional Protocol Configuration Options IE type.
 pub const IE_TYPE_APCO: u8 = 163;
+/// GTPv2-C TWAN Identifier IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_TWAN_IDENTIFIER: u8 = 169;
+/// GTPv2-C TWAN Identifier Timestamp IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP: u8 = 179;
 /// GTPv2-C Overload Control Information IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_OVERLOAD_CONTROL_INFORMATION: u8 = 180;
 /// GTPv2-C Load Control Information IE type (TS 29.274 Table 8.1-1).
@@ -891,6 +899,68 @@ impl EpsBearerId {
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         dst.put_u8(self.value & 0x0f);
         Ok(())
+    }
+}
+
+/// IPv4 or IPv6 endpoint carried by the GTPv2-C IP Address IE (type 74).
+///
+/// The address bytes are intentionally omitted from [`fmt::Debug`] because
+/// this IE can identify a subscriber endpoint.
+///
+/// @spec 3GPP TS29274 R18 8.9
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-IP-ADDRESS-001
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IpAddress {
+    /// Four-octet IPv4 address.
+    Ipv4([u8; 4]),
+    /// Sixteen-octet IPv6 address.
+    Ipv6([u8; 16]),
+}
+
+impl IpAddress {
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        match value {
+            [a, b, c, d] => Ok(Self::Ipv4([*a, *b, *c, *d])),
+            [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] => Ok(Self::Ipv6([
+                *a, *b, *c, *d, *e, *f, *g, *h, *i, *j, *k, *l, *m, *n, *o, *p,
+            ])),
+            _ => Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "IP Address IE must contain exactly 4 or 16 octets",
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref())),
+        }
+    }
+
+    fn encode_value(self, dst: &mut BytesMut) {
+        match self {
+            Self::Ipv4(address) => dst.put_slice(&address),
+            Self::Ipv6(address) => dst.put_slice(&address),
+        }
+    }
+
+    /// Return `true` when this value is an IPv4 address.
+    #[must_use]
+    pub const fn is_ipv4(self) -> bool {
+        matches!(self, Self::Ipv4(_))
+    }
+
+    /// Return `true` when this value is an IPv6 address.
+    #[must_use]
+    pub const fn is_ipv6(self) -> bool {
+        matches!(self, Self::Ipv6(_))
+    }
+}
+
+impl fmt::Debug for IpAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IpAddress")
+            .field("family", &if self.is_ipv4() { "ipv4" } else { "ipv6" })
+            .field("address", &"<redacted>")
+            .finish()
     }
 }
 
@@ -1732,6 +1802,53 @@ impl PdnType {
     }
 }
 
+/// Transport port carried by the GTPv2-C Port Number IE (type 126).
+///
+/// The numeric value is intentionally omitted from [`fmt::Debug`] because it
+/// is endpoint metadata. The accessor remains available to protocol users.
+///
+/// @spec 3GPP TS29274 R18 8.56
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-PORT-NUMBER-001
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortNumber(u16);
+
+impl PortNumber {
+    /// Construct a port-number value.
+    #[must_use]
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Return the decoded numeric port.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_min_len(
+            value,
+            2,
+            offset,
+            "Port Number IE must contain its two fixed octets",
+        )?;
+        Ok(Self(u16::from_be_bytes([value[0], value[1]])))
+    }
+
+    fn encode_value(self, dst: &mut BytesMut) {
+        dst.put_u16(self.0);
+    }
+}
+
+impl fmt::Debug for PortNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PortNumber")
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
 /// PDN Address Allocation IE (type 79).
 ///
 /// @spec 3GPP TS29274 R18 8.14
@@ -2359,6 +2476,524 @@ impl ChargingId {
     }
 }
 
+/// Maximum SSID length carried by a TWAN Identifier.
+pub const MAX_TWAN_SSID_LEN: usize = 32;
+/// Maximum length of any one-octet-length TWAN Identifier subfield.
+pub const MAX_TWAN_SUBFIELD_LEN: usize = u8::MAX as usize;
+// RFC 1035's 255-octet domain-name bound includes the terminating root-label
+// octet that TS 29.274 excludes from the TWAN Relay Identity representation.
+const MAX_TWAN_RELAY_FQDN_LEN: usize = MAX_TWAN_SUBFIELD_LEN - 1;
+
+/// Relay identity from the logical-access portion of a TWAN Identifier.
+///
+/// @spec 3GPP TS29274 R18 8.100 Table 8.100-1
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-TWAN-RELAY-001
+#[derive(Clone, PartialEq, Eq)]
+pub enum TwanRelayIdentity {
+    /// IPv4 or IPv6 relay address (relay identity type 0).
+    IpAddress(IpAddress),
+    /// RFC 1035 label-encoded FQDN without its trailing zero octet (type 1).
+    Fqdn(Vec<u8>),
+}
+
+impl fmt::Debug for TwanRelayIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IpAddress(address) => formatter
+                .debug_struct("TwanRelayIdentity")
+                .field("kind", &"ip_address")
+                .field(
+                    "address_family",
+                    &if address.is_ipv4() { "ipv4" } else { "ipv6" },
+                )
+                .field("value", &"<redacted>")
+                .finish(),
+            Self::Fqdn(value) => formatter
+                .debug_struct("TwanRelayIdentity")
+                .field("kind", &"fqdn")
+                .field("encoded_len", &value.len())
+                .field("value", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+/// Logical Access Identifier carried by a TWAN Identifier.
+///
+/// @spec 3GPP TS29274 R18 8.100
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-TWAN-LAII-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct TwanLogicalAccessId {
+    /// Typed relay identity.
+    pub relay_identity: TwanRelayIdentity,
+    /// RFC 3046 Circuit-ID octets.
+    pub circuit_id: Vec<u8>,
+}
+
+impl fmt::Debug for TwanLogicalAccessId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TwanLogicalAccessId")
+            .field("relay_identity", &self.relay_identity)
+            .field("circuit_id_len", &self.circuit_id.len())
+            .field("circuit_id", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Stable validation failure for a typed [`TwanIdentifier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwanIdentifierError {
+    /// SSID exceeded the IEEE 802.11 maximum of 32 octets.
+    SsidTooLong,
+    /// Civic Address exceeded its one-octet length field.
+    CivicAddressTooLong,
+    /// TWAN Operator Name exceeded its one-octet length field.
+    OperatorNameTooLong,
+    /// Both mutually exclusive TWAN operator identifier forms were present.
+    ConflictingOperatorIdentifiers,
+    /// Relay identity was empty or exceeded its one-octet length field.
+    InvalidRelayIdentityLength,
+    /// FQDN relay identity was not a complete RFC 1035 label sequence.
+    InvalidRelayFqdn,
+    /// Circuit-ID exceeded its one-octet length field.
+    CircuitIdTooLong,
+}
+
+impl TwanIdentifierError {
+    /// Return a stable machine-readable validation code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SsidTooLong => "gtpv2c_twan_ssid_too_long",
+            Self::CivicAddressTooLong => "gtpv2c_twan_civic_address_too_long",
+            Self::OperatorNameTooLong => "gtpv2c_twan_operator_name_too_long",
+            Self::ConflictingOperatorIdentifiers => "gtpv2c_twan_operator_identifiers_conflict",
+            Self::InvalidRelayIdentityLength => "gtpv2c_twan_relay_identity_length_invalid",
+            Self::InvalidRelayFqdn => "gtpv2c_twan_relay_fqdn_invalid",
+            Self::CircuitIdTooLong => "gtpv2c_twan_circuit_id_too_long",
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::SsidTooLong => "TWAN Identifier SSID must not exceed 32 octets",
+            Self::CivicAddressTooLong => {
+                "TWAN Identifier Civic Address must fit its one-octet length"
+            }
+            Self::OperatorNameTooLong => {
+                "TWAN Identifier Operator Name must fit its one-octet length"
+            }
+            Self::ConflictingOperatorIdentifiers => {
+                "TWAN Identifier must not contain both PLMN and Operator Name"
+            }
+            Self::InvalidRelayIdentityLength => "TWAN Identifier relay identity length is invalid",
+            Self::InvalidRelayFqdn => {
+                "TWAN Identifier relay FQDN must use complete RFC 1035 labels"
+            }
+            Self::CircuitIdTooLong => "TWAN Identifier Circuit-ID must fit its one-octet length",
+        }
+    }
+}
+
+impl fmt::Display for TwanIdentifierError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for TwanIdentifierError {}
+
+/// Complete Release 18 TWAN Identifier IE (type 169).
+///
+/// Every optional field has an inspectable typed representation. Variable
+/// fields are bounded by their normative one-octet length fields and SSID is
+/// additionally bounded to 32 octets. Debug output exposes only field presence,
+/// family, and lengths because the contents describe subscriber location.
+///
+/// @spec 3GPP TS29274 R18 8.100
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-TWAN-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct TwanIdentifier {
+    /// IEEE 802.11 SSID octets (zero through 32 octets).
+    pub ssid: Vec<u8>,
+    /// IEEE 802.11 BSSID, when reported.
+    pub bssid: Option<[u8; 6]>,
+    /// RFC 4776 Civic Address contents, excluding its first three octets.
+    pub civic_address: Option<Vec<u8>>,
+    /// PLMN identity of a mobile-network TWAN operator.
+    pub plmn: Option<PlmnId>,
+    /// TS 23.003 TWAN Operator Name encoding.
+    pub operator_name: Option<Vec<u8>>,
+    /// Relay identity and Circuit-ID comprising Logical Access ID.
+    pub logical_access_id: Option<TwanLogicalAccessId>,
+}
+
+impl TwanIdentifier {
+    /// Construct an SSID-only TWAN Identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TwanIdentifierError::SsidTooLong`] when `ssid` exceeds 32
+    /// octets.
+    pub fn new(ssid: impl Into<Vec<u8>>) -> Result<Self, TwanIdentifierError> {
+        let value = Self {
+            ssid: ssid.into(),
+            bssid: None,
+            civic_address: None,
+            plmn: None,
+            operator_name: None,
+            logical_access_id: None,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validate every bounded subfield and relay FQDN.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable [`TwanIdentifierError`] for the first invalid field.
+    pub fn validate(&self) -> Result<(), TwanIdentifierError> {
+        if self.ssid.len() > MAX_TWAN_SSID_LEN {
+            return Err(TwanIdentifierError::SsidTooLong);
+        }
+        if self
+            .civic_address
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_TWAN_SUBFIELD_LEN)
+        {
+            return Err(TwanIdentifierError::CivicAddressTooLong);
+        }
+        if self
+            .operator_name
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_TWAN_SUBFIELD_LEN)
+        {
+            return Err(TwanIdentifierError::OperatorNameTooLong);
+        }
+        if self.plmn.is_some() && self.operator_name.is_some() {
+            return Err(TwanIdentifierError::ConflictingOperatorIdentifiers);
+        }
+        if let Some(logical_access_id) = &self.logical_access_id {
+            let relay_len = match &logical_access_id.relay_identity {
+                TwanRelayIdentity::IpAddress(IpAddress::Ipv4(_)) => 4,
+                TwanRelayIdentity::IpAddress(IpAddress::Ipv6(_)) => 16,
+                TwanRelayIdentity::Fqdn(value) => {
+                    if !is_valid_dns_name_without_root(value) {
+                        return Err(TwanIdentifierError::InvalidRelayFqdn);
+                    }
+                    value.len()
+                }
+            };
+            if relay_len == 0 || relay_len > MAX_TWAN_SUBFIELD_LEN {
+                return Err(TwanIdentifierError::InvalidRelayIdentityLength);
+            }
+            if logical_access_id.circuit_id.len() > MAX_TWAN_SUBFIELD_LEN {
+                return Err(TwanIdentifierError::CircuitIdTooLong);
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_min_len(
+            value,
+            2,
+            offset,
+            "TWAN Identifier IE must contain flags and SSID length",
+        )?;
+        // TS 29.274 clause 7.7.8 requires receivers to ignore fields that are
+        // currently defined as spare. Canonical encoding below still emits
+        // those bits as zero.
+        let flags = value[0] & 0x1f;
+
+        let mut cursor = 2usize;
+        let ssid_len = value[1] as usize;
+        if ssid_len > MAX_TWAN_SSID_LEN {
+            return Err(twan_decode_error(
+                TwanIdentifierError::SsidTooLong.reason(),
+                checked_add_offset(offset, 1)?,
+            ));
+        }
+        let ssid = take_twan_field(value, &mut cursor, ssid_len, offset)?.to_vec();
+
+        let bssid = if flags & 0x01 != 0 {
+            let bytes = take_twan_field(value, &mut cursor, 6, offset)?;
+            Some(<[u8; 6]>::try_from(bytes).map_err(|_| {
+                twan_decode_error("TWAN Identifier BSSID must be six octets", offset)
+            })?)
+        } else {
+            None
+        };
+
+        let civic_address = if flags & 0x02 != 0 {
+            let length = take_twan_length(value, &mut cursor, offset)?;
+            Some(take_twan_field(value, &mut cursor, length, offset)?.to_vec())
+        } else {
+            None
+        };
+
+        let plmn = if flags & 0x04 != 0 {
+            let field_offset = checked_add_offset(offset, cursor)?;
+            let bytes = take_twan_field(value, &mut cursor, 3, offset)?;
+            Some(PlmnId::decode_value(bytes, field_offset)?)
+        } else {
+            None
+        };
+
+        let operator_name = if flags & 0x08 != 0 {
+            let length = take_twan_length(value, &mut cursor, offset)?;
+            Some(take_twan_field(value, &mut cursor, length, offset)?.to_vec())
+        } else {
+            None
+        };
+
+        let logical_access_id = if flags & 0x10 != 0 {
+            let relay_type_offset = checked_add_offset(offset, cursor)?;
+            let relay_type = take_twan_octet(value, &mut cursor, offset)?;
+            let relay_len = take_twan_length(value, &mut cursor, offset)?;
+            let relay_offset = checked_add_offset(offset, cursor)?;
+            let relay = take_twan_field(value, &mut cursor, relay_len, offset)?;
+            let relay_identity = match relay_type {
+                0 => TwanRelayIdentity::IpAddress(IpAddress::decode_value(relay, relay_offset)?),
+                1 if is_valid_dns_name_without_root(relay) => {
+                    TwanRelayIdentity::Fqdn(relay.to_vec())
+                }
+                1 => {
+                    return Err(twan_decode_error(
+                        TwanIdentifierError::InvalidRelayFqdn.reason(),
+                        relay_offset,
+                    ));
+                }
+                other => {
+                    return Err(DecodeError::new(
+                        DecodeErrorCode::InvalidEnumValue {
+                            field: "twan_relay_identity_type",
+                            value: u64::from(other),
+                        },
+                        relay_type_offset,
+                    )
+                    .with_spec_ref(spec_ref()));
+                }
+            };
+            let circuit_len = take_twan_length(value, &mut cursor, offset)?;
+            let circuit_id = take_twan_field(value, &mut cursor, circuit_len, offset)?.to_vec();
+            Some(TwanLogicalAccessId {
+                relay_identity,
+                circuit_id,
+            })
+        } else {
+            None
+        };
+
+        // TWAN Identifier is an Extendable IE. Unknown trailing fields from a
+        // later release are intentionally ignored by this Release 18 view as
+        // required by TS 29.274 clause 8.1. The enclosing S2b raw-preserving
+        // message view retains the original octets byte-exact.
+
+        let decoded = Self {
+            ssid,
+            bssid,
+            civic_address,
+            plmn,
+            operator_name,
+            logical_access_id,
+        };
+        decoded
+            .validate()
+            .map_err(|error| twan_decode_error(error.reason(), offset))?;
+        Ok(decoded)
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        self.validate()
+            .map_err(|error| encode_structural_error(error.reason()))?;
+        let mut flags = 0u8;
+        flags |= u8::from(self.bssid.is_some());
+        flags |= u8::from(self.civic_address.is_some()) << 1;
+        flags |= u8::from(self.plmn.is_some()) << 2;
+        flags |= u8::from(self.operator_name.is_some()) << 3;
+        flags |= u8::from(self.logical_access_id.is_some()) << 4;
+        dst.put_u8(flags);
+        put_twan_len(self.ssid.len(), dst)?;
+        dst.put_slice(&self.ssid);
+        if let Some(bssid) = self.bssid {
+            dst.put_slice(&bssid);
+        }
+        if let Some(civic_address) = &self.civic_address {
+            put_twan_len(civic_address.len(), dst)?;
+            dst.put_slice(civic_address);
+        }
+        if let Some(plmn) = &self.plmn {
+            plmn.encode_value(dst)?;
+        }
+        if let Some(operator_name) = &self.operator_name {
+            put_twan_len(operator_name.len(), dst)?;
+            dst.put_slice(operator_name);
+        }
+        if let Some(logical_access_id) = &self.logical_access_id {
+            match &logical_access_id.relay_identity {
+                TwanRelayIdentity::IpAddress(address) => {
+                    dst.put_u8(0);
+                    let len = if address.is_ipv4() { 4 } else { 16 };
+                    put_twan_len(len, dst)?;
+                    address.encode_value(dst);
+                }
+                TwanRelayIdentity::Fqdn(fqdn) => {
+                    dst.put_u8(1);
+                    put_twan_len(fqdn.len(), dst)?;
+                    dst.put_slice(fqdn);
+                }
+            }
+            put_twan_len(logical_access_id.circuit_id.len(), dst)?;
+            dst.put_slice(&logical_access_id.circuit_id);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for TwanIdentifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TwanIdentifier")
+            .field("ssid_len", &self.ssid.len())
+            .field("ssid", &"<redacted>")
+            .field("bssid_present", &self.bssid.is_some())
+            .field(
+                "civic_address_len",
+                &self.civic_address.as_ref().map(Vec::len),
+            )
+            .field("plmn_present", &self.plmn.is_some())
+            .field(
+                "operator_name_len",
+                &self.operator_name.as_ref().map(Vec::len),
+            )
+            .field("logical_access_id", &self.logical_access_id)
+            .finish()
+    }
+}
+
+/// NTP-era seconds at which a TWAN Identifier was acquired (IE type 179).
+///
+/// The timestamp value is omitted from Debug because it is subscriber
+/// location metadata.
+///
+/// @spec 3GPP TS29274 R18 8.110
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-TWAN-TIMESTAMP-001
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TwanIdentifierTimestamp(u32);
+
+impl TwanIdentifierTimestamp {
+    /// Construct a timestamp from the first four octets of an RFC 5905 NTP timestamp.
+    #[must_use]
+    pub const fn from_ntp_seconds(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Return the NTP-era seconds value.
+    #[must_use]
+    pub const fn ntp_seconds(self) -> u32 {
+        self.0
+    }
+
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_min_len(
+            value,
+            4,
+            offset,
+            "TWAN Identifier Timestamp IE must contain its four fixed octets",
+        )?;
+        Ok(Self(u32::from_be_bytes([
+            value[0], value[1], value[2], value[3],
+        ])))
+    }
+
+    fn encode_value(self, dst: &mut BytesMut) {
+        dst.put_u32(self.0);
+    }
+}
+
+impl fmt::Debug for TwanIdentifierTimestamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TwanIdentifierTimestamp")
+            .field("ntp_seconds", &"<redacted>")
+            .finish()
+    }
+}
+
+fn is_valid_dns_name_without_root(value: &[u8]) -> bool {
+    if value.is_empty() || value.len() > MAX_TWAN_RELAY_FQDN_LEN {
+        return false;
+    }
+    let mut cursor = 0usize;
+    while cursor < value.len() {
+        let label_len = value[cursor] as usize;
+        if label_len == 0 || label_len > 63 {
+            return false;
+        }
+        let Some(label_start) = cursor.checked_add(1) else {
+            return false;
+        };
+        let Some(label_end) = label_start.checked_add(label_len) else {
+            return false;
+        };
+        if label_end > value.len() {
+            return false;
+        }
+        cursor = label_end;
+    }
+    cursor == value.len()
+}
+
+fn twan_decode_error(reason: &'static str, offset: usize) -> DecodeError {
+    DecodeError::new(DecodeErrorCode::InvalidLength { reason }, offset).with_spec_ref(spec_ref())
+}
+
+fn take_twan_octet(value: &[u8], cursor: &mut usize, offset: usize) -> Result<u8, DecodeError> {
+    let bytes = take_twan_field(value, cursor, 1, offset)?;
+    match bytes {
+        [octet] => Ok(*octet),
+        _ => Err(twan_decode_error(
+            "TWAN Identifier one-octet field has invalid length",
+            checked_add_offset(offset, *cursor)?,
+        )),
+    }
+}
+
+fn take_twan_length(value: &[u8], cursor: &mut usize, offset: usize) -> Result<usize, DecodeError> {
+    Ok(take_twan_octet(value, cursor, offset)? as usize)
+}
+
+fn take_twan_field<'a>(
+    value: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+    offset: usize,
+) -> Result<&'a [u8], DecodeError> {
+    let start = *cursor;
+    let end = start.checked_add(length).ok_or_else(|| {
+        DecodeError::new(DecodeErrorCode::LengthOverflow, offset).with_spec_ref(spec_ref())
+    })?;
+    if end > value.len() {
+        return Err(DecodeError::new(
+            DecodeErrorCode::Truncated,
+            checked_add_offset(offset, start)?,
+        )
+        .with_spec_ref(spec_ref()));
+    }
+    *cursor = end;
+    Ok(&value[start..end])
+}
+
+fn put_twan_len(length: usize, dst: &mut BytesMut) -> Result<(), EncodeError> {
+    let length = u8::try_from(length)
+        .map_err(|_| EncodeError::length_overflow().with_spec_ref(spec_ref()))?;
+    dst.put_u8(length);
+    Ok(())
+}
+
 /// Additional Protocol Configuration Options IE (type 163).
 ///
 /// APCO carries an additional TS 24.008 protocol-configuration container. Like
@@ -2423,6 +3058,8 @@ pub enum TypedIeValue<'a> {
     AggregateMaximumBitRate(AggregateMaximumBitRate),
     /// EPS Bearer ID IE (type 73).
     EpsBearerId(EpsBearerId),
+    /// IP Address IE (type 74).
+    IpAddress(IpAddress),
     /// MEI IE (type 75).
     Mei(TbcdDigits),
     /// MSISDN IE (type 76).
@@ -2449,12 +3086,18 @@ pub enum TypedIeValue<'a> {
     ChargingId(ChargingId),
     /// PDN Type IE (type 99).
     PdnType(PdnType),
+    /// Port Number IE (type 126).
+    PortNumber(PortNumber),
     /// APN Restriction IE (type 127).
     ApnRestriction(ApnRestriction),
     /// Selection Mode IE (type 128).
     SelectionMode(SelectionMode),
     /// Additional Protocol Configuration Options IE (type 163).
     AdditionalProtocolConfigurationOptions(AdditionalProtocolConfigurationOptions),
+    /// TWAN Identifier IE (type 169).
+    TwanIdentifier(TwanIdentifier),
+    /// TWAN Identifier Timestamp IE (type 179).
+    TwanIdentifierTimestamp(TwanIdentifierTimestamp),
     /// Unsupported, unknown, private, or future IE preserved byte-exact.
     Raw(RawIe<'a>),
 }
@@ -2524,6 +3167,9 @@ impl<'a> TypedIe<'a> {
             IE_TYPE_EBI => {
                 TypedIeValue::EpsBearerId(EpsBearerId::decode_value(raw.value, value_offset, ctx)?)
             }
+            IE_TYPE_IP_ADDRESS => {
+                TypedIeValue::IpAddress(IpAddress::decode_value(raw.value, value_offset)?)
+            }
             IE_TYPE_MEI => TypedIeValue::Mei(TbcdDigits::decode_value(raw.value, value_offset)?),
             IE_TYPE_MSISDN => {
                 TypedIeValue::Msisdn(TbcdDigits::decode_value(raw.value, value_offset)?)
@@ -2571,6 +3217,9 @@ impl<'a> TypedIe<'a> {
             IE_TYPE_PDN_TYPE => {
                 TypedIeValue::PdnType(PdnType::decode_value(raw.value, value_offset, ctx)?)
             }
+            IE_TYPE_PORT_NUMBER => {
+                TypedIeValue::PortNumber(PortNumber::decode_value(raw.value, value_offset)?)
+            }
             IE_TYPE_APN_RESTRICTION => {
                 TypedIeValue::ApnRestriction(ApnRestriction::decode_value(raw.value, value_offset)?)
             }
@@ -2581,6 +3230,12 @@ impl<'a> TypedIe<'a> {
             )?),
             IE_TYPE_APCO => TypedIeValue::AdditionalProtocolConfigurationOptions(
                 AdditionalProtocolConfigurationOptions::decode_value(raw.value, value_offset)?,
+            ),
+            IE_TYPE_TWAN_IDENTIFIER => {
+                TypedIeValue::TwanIdentifier(TwanIdentifier::decode_value(raw.value, value_offset)?)
+            }
+            IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP => TypedIeValue::TwanIdentifierTimestamp(
+                TwanIdentifierTimestamp::decode_value(raw.value, value_offset)?,
             ),
             _ if matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject) => {
                 return Err(
@@ -2605,6 +3260,7 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::AccessPointName(_) => IE_TYPE_APN,
             TypedIeValue::AggregateMaximumBitRate(_) => IE_TYPE_AMBR,
             TypedIeValue::EpsBearerId(_) => IE_TYPE_EBI,
+            TypedIeValue::IpAddress(_) => IE_TYPE_IP_ADDRESS,
             TypedIeValue::Mei(_) => IE_TYPE_MEI,
             TypedIeValue::Msisdn(_) => IE_TYPE_MSISDN,
             TypedIeValue::Indication(_) => IE_TYPE_INDICATION,
@@ -2618,9 +3274,12 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::BearerContext(_) => IE_TYPE_BEARER_CONTEXT,
             TypedIeValue::ChargingId(_) => IE_TYPE_CHARGING_ID,
             TypedIeValue::PdnType(_) => IE_TYPE_PDN_TYPE,
+            TypedIeValue::PortNumber(_) => IE_TYPE_PORT_NUMBER,
             TypedIeValue::ApnRestriction(_) => IE_TYPE_APN_RESTRICTION,
             TypedIeValue::SelectionMode(_) => IE_TYPE_SELECTION_MODE,
             TypedIeValue::AdditionalProtocolConfigurationOptions(_) => IE_TYPE_APCO,
+            TypedIeValue::TwanIdentifier(_) => IE_TYPE_TWAN_IDENTIFIER,
+            TypedIeValue::TwanIdentifierTimestamp(_) => IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
             TypedIeValue::Raw(raw) => raw.ie_type,
         }
     }
@@ -2664,6 +3323,10 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::AccessPointName(value) => value.encode_value(dst),
             TypedIeValue::AggregateMaximumBitRate(value) => value.encode_value(dst),
             TypedIeValue::EpsBearerId(value) => value.encode_value(dst),
+            TypedIeValue::IpAddress(value) => {
+                value.encode_value(dst);
+                Ok(())
+            }
             TypedIeValue::Indication(value) => value.encode_value(dst),
             TypedIeValue::ProtocolConfigurationOptions(value) => value.encode_value(dst),
             TypedIeValue::PdnAddressAllocation(value) => value.encode_value(dst),
@@ -2677,9 +3340,18 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::BearerContext(value) => value.encode_value(dst, ctx),
             TypedIeValue::ChargingId(value) => value.encode_value(dst),
             TypedIeValue::PdnType(value) => value.encode_value(dst),
+            TypedIeValue::PortNumber(value) => {
+                value.encode_value(dst);
+                Ok(())
+            }
             TypedIeValue::ApnRestriction(value) => value.encode_value(dst),
             TypedIeValue::SelectionMode(value) => value.encode_value(dst),
             TypedIeValue::AdditionalProtocolConfigurationOptions(value) => value.encode_value(dst),
+            TypedIeValue::TwanIdentifier(value) => value.encode_value(dst),
+            TypedIeValue::TwanIdentifierTimestamp(value) => {
+                value.encode_value(dst);
+                Ok(())
+            }
             TypedIeValue::Raw(_) => Err(encode_structural_error(
                 "raw IE value must use the raw-preserving encoder",
             )),
@@ -2699,6 +3371,7 @@ impl fmt::Debug for TypedIeValue<'_> {
                 .field(value)
                 .finish(),
             Self::EpsBearerId(value) => f.debug_tuple("EpsBearerId").field(value).finish(),
+            Self::IpAddress(value) => f.debug_tuple("IpAddress").field(value).finish(),
             Self::Mei(value) => f.debug_tuple("Mei").field(value).finish(),
             Self::Msisdn(value) => f.debug_tuple("Msisdn").field(value).finish(),
             Self::Indication(value) => f.debug_tuple("Indication").field(value).finish(),
@@ -2719,10 +3392,16 @@ impl fmt::Debug for TypedIeValue<'_> {
             Self::BearerContext(value) => f.debug_tuple("BearerContext").field(value).finish(),
             Self::ChargingId(value) => f.debug_tuple("ChargingId").field(value).finish(),
             Self::PdnType(value) => f.debug_tuple("PdnType").field(value).finish(),
+            Self::PortNumber(value) => f.debug_tuple("PortNumber").field(value).finish(),
             Self::ApnRestriction(value) => f.debug_tuple("ApnRestriction").field(value).finish(),
             Self::SelectionMode(value) => f.debug_tuple("SelectionMode").field(value).finish(),
             Self::AdditionalProtocolConfigurationOptions(value) => f
                 .debug_tuple("AdditionalProtocolConfigurationOptions")
+                .field(value)
+                .finish(),
+            Self::TwanIdentifier(value) => f.debug_tuple("TwanIdentifier").field(value).finish(),
+            Self::TwanIdentifierTimestamp(value) => f
+                .debug_tuple("TwanIdentifierTimestamp")
                 .field(value)
                 .finish(),
             Self::Raw(raw) => f
