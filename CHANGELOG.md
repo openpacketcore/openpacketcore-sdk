@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **BREAKING — typed conditional S2b session context — `opc-proto-gtpv2c`:**
+  Create Session now uses `S2bCreateSessionIdentity` for subscriber versus
+  UICC-less emergency identity and a new `S2bCreateSessionContext` for
+  AAA/HSS-provenanced MSISDN, PCO/APCO, Recovery, Charging Characteristics,
+  Trace Information, WLAN location/timestamp, UE local/NAT endpoint data, and
+  the separately typed optional Fixed Broadband ePDG IKEv2 endpoint. Delete
+  Session now requires `S2bDeleteSessionContext` with its mandatory S2b UE
+  Local IP, optional procedure-specific UDP/TCP ports, WLAN context, and an
+  explicitly Diameter- or IKEv2-discriminated release cause. Canonical builders
+  enforce the different Create/Delete instances and block profile-owned fields
+  from `additional_ies`; ProcedureAware receive discards wrong known instances,
+  preserves unknown optionals, validates endpoint/emergency dependencies, and
+  exposes redaction-safe context projections. New typed
+  `ChargingCharacteristics`, exact-length `TraceInformation` with typed
+  `SessionTraceDepth`, and `RanNasCause` IE codecs are public. IKEv2 release
+  causes use the validated `Ikev2ErrorNotifyType`; `RanNasCause::ikev2` is
+  fallible and rejects higher-range Notify types above 16383. Existing
+  Create callers must replace `imsi` with `identity` and add `context`; Delete
+  callers must add the required endpoint context. No feature flag is required.
 - **BREAKING — RFC 7296 receiver-ignored fields — `opc-proto-ikev2`:** network
   decode now accepts higher IKEv2 minor versions, ignored Version/Critical bits,
   and receiver-ignored reserved fields in fixed/generic headers, SA

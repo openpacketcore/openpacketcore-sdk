@@ -17,6 +17,14 @@
 //! S2b Create Session Requests carry the requested family only in
 //! [`PdnAddressAllocation`]; explicit dynamic/static constructors prevent a
 //! top-level PDN Type IE or family/address-shape mismatch from being emitted.
+//! Their conditional context is also typed: AAA/HSS-provenanced MSISDN,
+//! UICC-less emergency identity, charging/trace data, WLAN location, and UE
+//! NAT metadata use exact S2b instances. The optional Fixed Broadband ePDG
+//! IKEv2 endpoint is a separate role from the UE endpoint. Delete Session
+//! requires the S2b UE Local IP and supports typed Diameter/IKEv2 release
+//! cause, procedure-specific NAT ports, and location/timestamp projection.
+//! Product code remains responsible for deciding when optional policy-owned
+//! values apply and for obtaining them from AAA/HSS or local configuration.
 //! S2b Modify Bearer uses the UE-initiated IPsec tunnel-update profile:
 //! independently optional typed WLAN location/timestamp values and a distinct
 //! Fixed Broadband endpoint form whose UDP port cannot exist without its UE
@@ -86,20 +94,23 @@ pub use ie::{
     decode_typed_ie_sequence, encode_typed_ie_sequence, validate_ie_region, AccessPointName,
     AdditionalProtocolConfigurationOptions, AggregateMaximumBitRate, AllocationRetentionPriority,
     ApnRestriction, BearerContext, BearerQos, BearerQosResourceType, BearerQosValidationError,
-    Cause, CauseValue, ChargingId, DuplicateIeEvidence, EpsBearerId, FullyQualifiedTeid,
-    Indication, IpAddress, OwnedRawIe, PdnAddressAllocation, PdnAddressAllocationError, PdnType,
-    PdnTypeValue, PlmnId, PortNumber, ProtocolConfigurationOptions, RatType, RatTypeValue, RawIe,
-    RawIeIterator, Recovery, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits,
-    TwanIdentifier, TwanIdentifierError, TwanIdentifierTimestamp, TwanLogicalAccessId,
-    TwanRelayIdentity, TypedIe, TypedIeValue, IE_HEADER_LEN, IE_TYPE_AMBR, IE_TYPE_APCO,
-    IE_TYPE_APN, IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS,
-    IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
-    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_IP_ADDRESS, IE_TYPE_LOAD_CONTROL_INFORMATION,
-    IE_TYPE_MEI, IE_TYPE_MSISDN, IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO,
-    IE_TYPE_PDN_TYPE, IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_PORT_NUMBER, IE_TYPE_RAT_TYPE,
-    IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK, IE_TYPE_TWAN_IDENTIFIER,
-    IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP, MAX_BEARER_QOS_BITRATE_KBPS, MAX_DUPLICATE_IE_EVIDENCE,
-    MAX_TWAN_SSID_LEN, MAX_TWAN_SUBFIELD_LEN, PAA_ASSIGNED_IPV6_PREFIX_LENGTH,
+    Cause, CauseValue, ChargingCharacteristics, ChargingId, DuplicateIeEvidence, EpsBearerId,
+    FullyQualifiedTeid, Ikev2ErrorNotifyType, Ikev2ErrorNotifyTypeError, Indication, IpAddress,
+    OwnedRawIe, PdnAddressAllocation, PdnAddressAllocationError, PdnType, PdnTypeValue, PlmnId,
+    PortNumber, ProtocolConfigurationOptions, RanNasCause, RatType, RatTypeValue, RawIe,
+    RawIeIterator, Recovery, SelectionMode, SelectionModeValue, ServingNetwork, SessionTraceDepth,
+    TbcdDigits, TraceInformation, TwanIdentifier, TwanIdentifierError, TwanIdentifierTimestamp,
+    TwanLogicalAccessId, TwanRelayIdentity, TypedIe, TypedIeValue, IE_HEADER_LEN, IE_TYPE_AMBR,
+    IE_TYPE_APCO, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS,
+    IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE, IE_TYPE_CHARGING_CHARACTERISTICS, IE_TYPE_CHARGING_ID,
+    IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_IP_ADDRESS,
+    IE_TYPE_LOAD_CONTROL_INFORMATION, IE_TYPE_MEI, IE_TYPE_MSISDN,
+    IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE,
+    IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_PORT_NUMBER, IE_TYPE_RAN_NAS_CAUSE, IE_TYPE_RAT_TYPE,
+    IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK, IE_TYPE_TRACE_INFORMATION,
+    IE_TYPE_TWAN_IDENTIFIER, IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP, MAX_BEARER_QOS_BITRATE_KBPS,
+    MAX_DUPLICATE_IE_EVIDENCE, MAX_IKEV2_ERROR_NOTIFY_TYPE, MAX_TWAN_SSID_LEN,
+    MAX_TWAN_SUBFIELD_LEN, PAA_ASSIGNED_IPV6_PREFIX_LENGTH,
 };
 pub use message::{Message, OwnedMessage};
 pub use pco::{
@@ -123,18 +134,20 @@ pub use s2b::{
     Gtpv2cClientTransactionState, Gtpv2cEchoPeer, Gtpv2cEchoPeerBlocker, Gtpv2cEchoPeerError,
     Gtpv2cEchoPeerEvent, Gtpv2cEchoPeerPolicy, Gtpv2cEchoPeerProjection, Gtpv2cEchoPeerReadiness,
     Gtpv2cEchoPeerSnapshot, Gtpv2cEchoPeerState, Gtpv2cEchoPeerTransition, Gtpv2cPeerToken,
-    MessageDirection, Procedure, S2bCreateSessionAcceptedResponse,
+    MessageDirection, Procedure, S2bAaaProvidedMsisdn, S2bCreateSessionAcceptedResponse,
+    S2bCreateSessionContext, S2bCreateSessionContextSummary, S2bCreateSessionIdentity,
     S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bDecodedMessage,
-    S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerRequest,
-    S2bModifyBearerResponse, S2bProcedureMessage, S2bProfileBuildError, S2bProfileBuildResult,
-    S2bReceiveDiagnostics, S2bUeIpsecTunnelUpdateEndpoint, S2bUeIpsecTunnelUpdateProjectionError,
-    S2bUeIpsecTunnelUpdateRequest, S2bUeIpsecTunnelUpdateRequestSummary,
-    S2bUeIpsecTunnelUpdateResponseSummary, CREATE_BEARER_REQUEST, CREATE_BEARER_RESPONSE,
-    CREATE_SESSION_REQUEST, CREATE_SESSION_RESPONSE, DELETE_BEARER_REQUEST, DELETE_BEARER_RESPONSE,
-    DELETE_SESSION_REQUEST, DELETE_SESSION_RESPONSE, ECHO_REQUEST, ECHO_RESPONSE,
-    INTERFACE_TYPE_S2B_EPDG_GTP_C, INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
-    INTERFACE_TYPE_S2B_U_PGW_GTP_U, MODIFY_BEARER_REQUEST, MODIFY_BEARER_RESPONSE,
-    UPDATE_BEARER_REQUEST, UPDATE_BEARER_RESPONSE,
+    S2bDeleteSessionContext, S2bDeleteSessionContextSummary, S2bDeleteSessionRequest,
+    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerRequest, S2bModifyBearerResponse,
+    S2bProcedureMessage, S2bProfileBuildError, S2bProfileBuildResult, S2bReceiveDiagnostics,
+    S2bSessionContextProjectionError, S2bUeEndpoint, S2bUeIpsecTunnelUpdateEndpoint,
+    S2bUeIpsecTunnelUpdateProjectionError, S2bUeIpsecTunnelUpdateRequest,
+    S2bUeIpsecTunnelUpdateRequestSummary, S2bUeIpsecTunnelUpdateResponseSummary, S2bUeNatTraversal,
+    CREATE_BEARER_REQUEST, CREATE_BEARER_RESPONSE, CREATE_SESSION_REQUEST, CREATE_SESSION_RESPONSE,
+    DELETE_BEARER_REQUEST, DELETE_BEARER_RESPONSE, DELETE_SESSION_REQUEST, DELETE_SESSION_RESPONSE,
+    ECHO_REQUEST, ECHO_RESPONSE, INTERFACE_TYPE_S2B_EPDG_GTP_C, INTERFACE_TYPE_S2B_PGW_GTP_C,
+    INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U, MODIFY_BEARER_REQUEST,
+    MODIFY_BEARER_RESPONSE, UPDATE_BEARER_REQUEST, UPDATE_BEARER_RESPONSE,
 };
 pub use triggered::{
     Gtpv2cMonotonicMillis, Gtpv2cTriggeredCommit, Gtpv2cTriggeredCompletion,

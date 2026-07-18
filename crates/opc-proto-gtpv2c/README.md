@@ -21,9 +21,13 @@ control-plane stack.
 - `ie` exposes `RawIe`, `OwnedRawIe`, `RawIeIterator`, `validate_ie_region`,
   `TypedIe`, `TypedIeValue`, and typed S2b IE structs such as `Cause`,
   `Recovery`, `AccessPointName`, `BearerContext`, `FullyQualifiedTeid`, and
-  `PdnAddressAllocation`. S2b tunnel updates additionally use redaction-safe
-  typed `IpAddress`, `PortNumber`, complete bounded `TwanIdentifier`, and
-  `TwanIdentifierTimestamp` values. Their Extendable IE decoders retain the
+  `PdnAddressAllocation`, `ChargingCharacteristics`, `TraceInformation`, and
+  Diameter/IKEv2-discriminated `RanNasCause`. IKEv2 release causes carry a
+  validated `Ikev2ErrorNotifyType` in RFC 7296's `0..=16383` error range;
+  `RanNasCause::ikev2` is fallible. S2b session context and tunnel updates
+  additionally use redaction-safe typed `IpAddress`, `PortNumber`, complete
+  bounded `TwanIdentifier`, and `TwanIdentifierTimestamp` values.
+  Their Extendable IE decoders retain the
   known Release 18 prefix while raw-preserving message encode retains accepted
   later-release suffixes; canonical encode emits only understood fields and
   zero TWAN spare flags. PAA has explicit dynamic IPv4/IPv6/IPv4v6,
@@ -43,6 +47,14 @@ control-plane stack.
   raw fallback for unsupported message types. `decode_with_diagnostics`
   additionally returns bounded, value-free `S2bReceiveDiagnostics` evidence
   for ignored duplicate singleton keys.
+- `S2bCreateSessionIdentity`, `S2bCreateSessionContext`, and
+  `S2bDeleteSessionContext` own the conditional S2b attach/detach fields.
+  Product policy explicitly chooses optional presence and supplies subscriber,
+  trace, charging, and location data. The builder validates the declared
+  decision, exact instances, and cross-fields without fetching AAA/HSS data or
+  inventing policy. `S2bUeEndpoint` separates UE local IP/NAT state from the
+  Create-only Fixed Broadband ePDG IKEv2 endpoint. Matching receive projection
+  methods expose the accepted context without logging values.
 - `S2bUeIpsecTunnelUpdateRequest` is the S2b-specific Modify Bearer intent.
   WLAN location and timestamp are independently optional. Its endpoint enum
   makes the general and Fixed Broadband/local-policy forms distinct; UE UDP
@@ -227,7 +239,8 @@ unexpected known keys, preserves genuinely unknown optional keys, retains the
 first non-repeatable type/instance key in each exact scope, ignores later
 occurrences, and truncates declared lists at their procedure-table bounds.
 Typed procedure projections enforce required presence, F-TEID interface/value
-semantics, and correlation. Length, mandatory-field, and semantic validation
+semantics, conditional S2b endpoint/context relationships, and correlation.
+Length, mandatory-field, and semantic validation
 of the first retained value still fail closed. Canonical builders deliberately
 use a separate sender-validation path: duplicate profile-owned or additional
 singleton keys remain construction errors and are never emitted.
@@ -237,6 +250,18 @@ separate top-level PDN Type IE, as required by TS 29.274 Table 7.2.1-1 Note 1.
 PAA carries the requested family. On receive, a conforming request without IE
 99 is accepted; an unexpected known PDN Type IE is discarded under clause
 7.7.9 while the rest of the request continues to be processed.
+
+Create Session additionally owns MSISDN instance 0, Charging Characteristics
+instance 0, Trace Information instance 0, UE Local IP/UDP instance 0, UE TCP
+Port instance 2, optional Fixed Broadband ePDG IP instance 3, WLAN Location
+instance 1, and WLAN Location Timestamp instance 0. NAT ports require UE Local
+IP, and the UICC-less emergency identity requires that local IP. Delete Session
+uses UE Local IP/UDP instance 0, UE TCP Port instance 1, WLAN Location and
+Timestamp instance 1, and optional Diameter/IKEv2 RAN/NAS Cause instance 0;
+it has no ePDG-IP instance-3 role. Procedure-aware receive discards wrong known
+instances and retains genuinely unknown optionals. Canonical sender
+`additional_ies` apply that same per-procedure type/instance grammar, while
+still preserving genuinely unknown and private extensions.
 
 The runnable [`dedicated_bearer` example](examples/dedicated_bearer.rs) shows
 the GTP transaction boundary for receiving a triggered request, projecting its
@@ -283,7 +308,10 @@ through `additional_ies` because the S2b builder rejects it. Other interface
 profiles may continue to use the separately exported `PdnType` IE.
 
 ```rust
-use opc_proto_gtpv2c::{PdnAddressAllocation, S2bCreateSessionRequest};
+use opc_proto_gtpv2c::{
+    PdnAddressAllocation, S2bCreateSessionContext, S2bCreateSessionIdentity,
+    S2bCreateSessionRequest,
+};
 
 # let sequence_number = 1;
 # let imsi = opc_proto_gtpv2c::TbcdDigits::new("001010123456789");
@@ -295,7 +323,7 @@ use opc_proto_gtpv2c::{PdnAddressAllocation, S2bCreateSessionRequest};
 # let bearer_context = opc_proto_gtpv2c::BearerContext { members: Vec::new() };
 let request = S2bCreateSessionRequest {
     sequence_number,
-    imsi,
+    identity: S2bCreateSessionIdentity::subscriber(imsi),
     rat_type,
     serving_network,
     sender_f_teid,
@@ -303,6 +331,7 @@ let request = S2bCreateSessionRequest {
     selection_mode,
     paa: PdnAddressAllocation::dynamic_ipv4v6(),
     bearer_context,
+    context: S2bCreateSessionContext::default(),
     additional_ies: Vec::new(),
 };
 
@@ -315,6 +344,20 @@ Static IPv6 constructors require the TS 29.274 assigned prefix length /64 and
 reject all-zero values that would be ambiguous with dynamic allocation. A
 dual-stack static allocation accepts either family or both and encodes an
 unprovided family as the required all-zero value.
+
+`S2bCreateSessionRequest::imsi` has been replaced by the explicit `identity`
+field, and `context` is new. Existing IMSI callers should use
+`S2bCreateSessionIdentity::subscriber(imsi)` plus
+`S2bCreateSessionContext::default()`, then opt into typed conditional fields.
+UICC-less emergency callers select `UiccLessEmergency` with MEI and a UIMSI
+Indication, and must supply `context.ue_endpoint`. `S2bDeleteSessionRequest`
+now requires `S2bDeleteSessionContext` with a `S2bUeEndpoint`, because Table
+7.2.9.1-1 makes UE Local IP mandatory on S2b. Exhaustive matches must handle
+the new `TypedIeValue::{ChargingCharacteristics,TraceInformation,RanNasCause}`
+variants and `S2bSessionContextProjectionError` variants. No Cargo feature is
+required. IKEv2 release-cause callers must handle the `Result` returned by
+`RanNasCause::ikev2`; higher-range Notify types cannot be represented as
+release causes.
 
 Accepted Create Session Response callers must replace
 `S2bCreateSessionAcceptedResponse::sender_f_teid` with

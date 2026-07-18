@@ -271,10 +271,11 @@ spec-authored conformance fixtures, not captures from an independent peer.
 | --- | --- | --- |
 | 0 | `48` | Common header flags: version 2, TEID present (§5.1). |
 | 1 | `24` | Message Type: Delete Session Request in the common-header message-type field (§5.1). |
-| 2..3 | `00 0d` | Length: TEID/sequence/spare (8) + EBI IE (5), excluding first four octets (§5.1). |
+| 2..3 | `00 15` | Length: TEID/sequence/spare (8) + EBI IE (5) + S2b UE Local IP Address IE (8), excluding first four octets (§5.1). |
 | 4..7 | `01 02 03 04` | Header TEID (§5.1). |
 | 8..11 | `00 10 05 00` | Sequence number `0x001005`, spare 0 (§5.1). |
 | 12..16 | `49 00 01 00 05` | Linked EPS Bearer ID IE TLIV/value: EBI 5 (§8.2, §8.8). |
+| 17..24 | `4a 00 04 00 c0 00 02 2c` | Mandatory S2b UE Local IPv4 Address `192.0.2.44`, IP Address instance 0 (Table 7.2.9.1-1, §8.9). |
 
 ### `delete_session_response_cause.bin`
 
