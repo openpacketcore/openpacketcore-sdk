@@ -48,6 +48,28 @@ evidence.
   admission check.
 - `StoredSessionRecord` carries key, generation, owner, fence, state class/type,
   expiry, and encrypted payload bytes.
+- `FencedOwnershipStore` composes the existing backend lease, CAS, TTL, and
+  committed-watch surfaces into key-agnostic logical ownership leases. Opaque
+  keys contain 1 through 64 bytes, opaque metadata is capped at 64 KiB, every
+  claim/renew/transfer commits a strictly higher fence-derived generation,
+  and a key-scoped retained `FencedOwnershipMutationId` replays an exact
+  committed result or rejects conflicting reuse while that result remains the
+  current record. IDs are not a second global request registry.
+  `FencedOwnershipToken` is the effect-point proof; a stale, equal, expired,
+  wrong-owner, or wrong-namespace token fails closed. Logical expiry is derived
+  from the backend-minted lease guard's authority timestamp, not a facade-local
+  wall clock.
+- `FencedOwnershipCache` is a bounded synchronous hot-path view whose hits
+  clone only an `Arc`, not owner/metadata storage. An empty cache must replay
+  from committed sequence 1 through a proven `FencedOwnershipCacheReplayHead`;
+  resuming later requires an explicit `FencedOwnershipCacheSeed` asserting an
+  externally coherent namespace, snapshot, head, and proof-completion
+  timestamp. Entry count and total retained record bytes are independently
+  bounded, and passive expiry is reclaimed through an ordered expiry index.
+  A gap, malformed ownership record, capacity breach, stopped feed, clock
+  regression, or lag beyond the explicit staleness bound returns
+  `FencedOwnershipCacheLookup::Stale` without an owner. Its snapshot reports
+  lag, retained bytes, and hit/miss/stale/feed-failure counters.
 - `SqliteSessionBackend::open(path)` and `in_memory()` provide the reference
   backend.
 - `EncryptingSessionBackend::new(inner, provider, backend_namespace)` wraps a
@@ -882,6 +904,83 @@ rollback; callers must follow the existing request-id/idempotency, fencing, and
 authoritative re-read rules before retrying. Diagnostics use fixed
 operation-family/reason categories and never record keys, owners, payloads,
 transaction IDs, peer identities, or backend/peer-controlled error text.
+
+## Fenced ownership
+
+The ownership facade does not add a database, sequencer, election, encryption,
+or product placement policy. In production, wrap the existing
+`ConsensusSessionStore` in `EncryptingSessionBackend` with the deployment's
+session `KeyProvider`/HKMS integration, then pass that wrapper to
+`FencedOwnershipStore`. The facade itself does not call a key provider: passing
+a plain backend stores a plaintext ownership payload. Correct composition seals
+the opaque metadata in the existing authenticated session envelope while
+retaining Openraft as the only commit authority. Standard session-record
+headers (including lookup key and owner) keep their existing storage contract;
+use a keyed digest rather than a sensitive raw identifier as the opaque key.
+A short bounded backend lease only serializes one mutation; the expiring
+authoritative record is the logical ownership lease. Passive expiry removes the
+live record while the backend fence floor remains, so an ABA return to a former
+owner still receives a higher generation.
+
+```rust,no_run
+use std::time::Duration;
+use opc_session_store::{
+    FencedOwnershipKey, FencedOwnershipMetadata, FencedOwnershipMutationId,
+    FencedOwnershipNamespace, FencedOwnershipStore, OwnerId, SystemClock,
+};
+use opc_types::{NetworkFunctionKind, TenantId};
+
+async fn claim<B>(backend: B) -> Result<(), opc_session_store::FencedOwnershipError>
+where
+    B: opc_session_store::SessionBackend
+        + opc_session_store::SessionLeaseManager
+        + 'static,
+{
+    let namespace = FencedOwnershipNamespace::new(
+        TenantId::new("tenant-a")
+            .map_err(|_| opc_session_store::FencedOwnershipError::InvalidKey)?,
+        NetworkFunctionKind::new("epdg")
+            .map_err(|_| opc_session_store::FencedOwnershipError::InvalidKey)?,
+    );
+    let ownership = FencedOwnershipStore::new(backend, namespace, SystemClock);
+    ownership.validate_authority().await?;
+    let record = ownership
+        .claim(
+            FencedOwnershipMutationId::new(),
+            FencedOwnershipKey::new(b"caller-canonical-key")?,
+            OwnerId::new("epdg-0")
+                .map_err(|_| opc_session_store::FencedOwnershipError::InvalidKey)?,
+            Duration::from_secs(30),
+            FencedOwnershipMetadata::empty(),
+        )
+        .await?
+        .into_inner();
+    ownership.validate_fence(&record.fence_token()).await
+}
+```
+
+Dropping an in-flight mutation makes its outcome unknown. The bounded mutation
+lease and logical expiry preserve safety; retry only the exact retained
+mutation ID and inputs, which recovers the committed result without applying a
+second ownership change. Cache watch consumption owns no detached task and
+marks and clears the view on explicit shutdown. Cache bootstrap has exactly two
+safe forms: replay every committed entry from sequence 1, or install a
+`FencedOwnershipCacheSeed::from_caller_proven_snapshot` whose records and head
+were bound by an external coherent authority. Both proof types carry the time
+that proof completed; installing them never resets an old view's freshness to
+the local installation time. Manual full replay must call `begin_full_replay`
+with a caller-proven head before applying sequence 1;
+`run_watch_until` obtains a linearizable head from the backend and does this
+automatically. A partial backlog remains stale. A healthy but quiet watch is
+not a heartbeat and ages stale at the configured bound until another committed
+entry or externally coherent proof arrives. The public restore-scan cursor
+does not expose an atomic replication watermark, and bounded watch catch-up
+does not manufacture one, so the SDK does not claim a turnkey arbitrary-cursor
+snapshot/watch handoff. Selecting eligible owners, deciding when failover is
+safe, interpreting metadata, and programming packet routing remain consumer
+responsibilities. This primitive does not by itself graduate the networked
+session-store profile; deployed failure/resource/soak evidence remains tracked
+by issue #143.
 
 ## Relationships
 
