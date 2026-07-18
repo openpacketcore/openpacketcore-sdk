@@ -30,6 +30,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Added
+- **Exact authenticated-control-plane SA relocation — `opc-ipsec-xfrm`:** a
+  typed `RelocateSaRequest` carries a query-proven old SA identity plus new
+  outer addresses and ESP-in-UDP ports. Linux uses the exact single-state
+  `XFRM_MSG_MIGRATE_STATE` UAPI, validates current state before mutation, and
+  requires exact target GETSA readback plus old-tuple absence after an identity
+  move; it never falls back to ambiguous legacy migration or packet-source
+  inference. The upstream missing-SA feature
+  probe maps `ESRCH` to `Available` and the documented `EINVAL`/`ENOPROTOOPT`
+  cases to `Missing`; a real-operation `EINVAL` is never reclassified as
+  old-kernel evidence. Relocation is explicitly documented as not
+  cancellation-safe once polled, requiring exact recovery reconciliation before
+  safety fences are released or a retry begins. Policies, authenticated IKE
+  signalling, writer serialization, and seamless-mobility qualification remain
+  consumer-owned. Typed preserve/set/remove encapsulation actions cover native
+  ESP and exact NAT-T add, port replacement, and removal semantics. Default
+  trait methods plus separate identity/capability queries preserve the existing
+  `SaState` and `XfrmProbe` public shapes and third-party backend source
+  compatibility; the mock records relocations in a separate typed log without
+  extending its established exhaustive operation enum. Relocation snapshots
+  preserve every raw selector field and reject unmodelled nonzero NAT-T
+  original addresses. A required direction contract distinguishes incoming
+  migration from outgoing migration after the upstream-mandated temporary
+  block policy, preventing cleartext fallback and AES-GCM IV reuse.
 - **Aggregate admission budget — `opc-runtime`:** a product-neutral global
   token bucket and in-flight ceiling now compose after the existing per-source
   limiter. The aggregate state has no source-key table or eviction path, so

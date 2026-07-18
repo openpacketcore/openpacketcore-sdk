@@ -57,6 +57,12 @@ pub enum XfrmError {
         /// Stable operation label.
         operation: &'static str,
     },
+    /// Query-proven state did not match the caller's current-state snapshot.
+    #[error("XFRM {operation} current state does not match the request")]
+    StateMismatch {
+        /// Stable operation label.
+        operation: &'static str,
+    },
     /// The requested SA or policy was not found.
     #[error("XFRM state not found")]
     NotFound,
@@ -173,6 +179,18 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "XFRM install_sa final state is indeterminate"
+        );
+    }
+
+    #[test]
+    fn state_mismatch_display_is_safe() {
+        let err = XfrmError::StateMismatch {
+            operation: "relocate_sa_preflight",
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "XFRM relocate_sa_preflight current state does not match the request"
         );
     }
 

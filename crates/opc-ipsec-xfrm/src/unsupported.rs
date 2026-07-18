@@ -6,7 +6,8 @@ use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
     AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, QuerySaRequest, RekeyPolicyRequest,
-    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaState, SpiAllocation, XfrmProbe,
+    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaRelocationIdentity,
+    SaState, SpiAllocation, XfrmProbe,
 };
 
 /// XFRM backend that reports [`XfrmError::UnsupportedPlatform`] for every
@@ -38,7 +39,18 @@ impl XfrmBackend for UnsupportedXfrmBackend {
         Err(XfrmError::UnsupportedPlatform)
     }
 
+    async fn query_sa_relocation_identity(
+        &self,
+        _request: QuerySaRequest,
+    ) -> Result<SaRelocationIdentity, XfrmError> {
+        Err(XfrmError::UnsupportedPlatform)
+    }
+
     async fn rekey_sa(&self, _request: RekeySaRequest) -> Result<(), XfrmError> {
+        Err(XfrmError::UnsupportedPlatform)
+    }
+
+    async fn relocate_sa(&self, _request: RelocateSaRequest) -> Result<(), XfrmError> {
         Err(XfrmError::UnsupportedPlatform)
     }
 
@@ -66,7 +78,7 @@ impl XfrmBackend for UnsupportedXfrmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{IpAddress, XfrmBackendKind};
+    use crate::model::{IpAddress, XfrmBackendKind, XfrmCapability};
 
     #[tokio::test]
     async fn unsupported_backend_returns_unsupported_platform_for_all_ops() {
@@ -89,5 +101,9 @@ mod tests {
         assert!(!probe.platform_supported);
         assert!(!probe.kernel_reachable);
         assert!(!probe.net_admin_capable);
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Missing
+        );
     }
 }

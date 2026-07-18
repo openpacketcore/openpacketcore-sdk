@@ -4,8 +4,19 @@
 //! a deterministic mock backend for tests, an unsupported-platform backend, and
 //! redaction-safe error types. SA parameters can carry an independent Linux
 //! lookup mark and a masked post-transform output mark; the latter is applied
-//! to inbound/decrypt SAs as well as outbound SAs. This crate deliberately does
-//! not implement IKE, ESP processing, namespace management, or deployment
+//! to inbound/decrypt SAs as well as outbound SAs. An exact single-SA
+//! relocation primitive uses the current-upstream Linux
+//! `XFRM_MSG_MIGRATE_STATE` UAPI after validating a query-proven current-state
+//! snapshot. It relocates SA state only: callers own authenticated endpoint
+//! signalling, policy-template coordination, and namespace-wide writer
+//! serialization. Outgoing relocation requires the upstream temporary-block
+//! policy sequence, made explicit by [`SaRelocationDirection`], to prevent
+//! cleartext fallback and AES-GCM IV reuse; incoming relocation does not. The
+//! relocation future is not cancellation-safe once polled: callers must keep
+//! safety fences in place and perform exact old/new tuple reconciliation before
+//! retrying or releasing writer exclusion after cancellation or process loss.
+//! The crate never infers relocation from packet source addresses and deliberately
+//! does not implement IKE, ESP processing, namespace management, or deployment
 //! policy.
 //!
 //! Raw Linux netlink work stays in [`opc_linux_xfrm_sys`]; this crate is safe
@@ -45,15 +56,17 @@ pub use ikev2::{
     IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
 };
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
-pub use mock::{MockOperation, MockXfrmBackend};
+pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};
 pub use model::{
     AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, InstallPolicyRequest,
     InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig, LifetimeCurrent, PolicyParameters,
-    QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RemovePolicyRequest, RemoveSaRequest,
-    SaParameters, SaReplayState, SaState, SaStatistics, SpiAllocation, UdpEncap, XfrmAction,
-    XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmProbe,
-    XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP, XFRM_AEAD_RFC4106_GCM_AES,
-    XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES,
+    QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest,
+    RemoveSaRequest, SaParameters, SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity,
+    SaRelocationSelector, SaReplayState, SaState, SaStatistics, SpiAllocation, UdpEncap,
+    XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode,
+    XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
+    XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512,
+    XFRM_ENCR_CBC_AES,
 };
 pub use opc_types::DscpCodepoint;
 pub use unsupported::UnsupportedXfrmBackend;

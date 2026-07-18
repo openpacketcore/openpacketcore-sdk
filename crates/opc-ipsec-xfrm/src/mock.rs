@@ -8,10 +8,13 @@ use async_trait::async_trait;
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
-    validate_sa_output_mark, AllocateSpiRequest, InstallPolicyRequest, InstallSaRequest, IpAddress,
-    LifetimeConfig, LifetimeCurrent, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
-    RemovePolicyRequest, RemoveSaRequest, SaReplayState, SaState, SaStatistics, SpiAllocation,
-    XfrmAction, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query, AllocateSpiRequest,
+    InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig, LifetimeCurrent,
+    QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest,
+    RemoveSaRequest, SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity,
+    SaRelocationSelector, SaReplayState, SaState, SaStatistics, SpiAllocation, XfrmAction,
+    XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmSelector,
+    XfrmTemplate,
 };
 
 /// One recorded call against the mock backend.
@@ -163,6 +166,25 @@ pub enum MockOperation {
     Probe,
 }
 
+/// One exact SA relocation recorded by [`MockXfrmBackend`].
+///
+/// Relocations use a separate log so adding the optional backend capability
+/// does not add a variant to the established, exhaustive [`MockOperation`]
+/// enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockSaRelocation {
+    /// Query-proven current SA snapshot.
+    pub current: SaRelocationIdentity,
+    /// New outer source address.
+    pub new_source_address: IpAddress,
+    /// New outer destination address.
+    pub new_destination: IpAddress,
+    /// UDP encapsulation action.
+    pub encap: SaRelocationEncap,
+    /// Traffic direction and outbound safety assertion.
+    pub direction: SaRelocationDirection,
+}
+
 /// Deterministic in-memory XFRM backend.
 ///
 /// Records every operation so tests can assert on the requests that reached the
@@ -179,11 +201,18 @@ pub struct MockXfrmBackend {
 type AllocatedSpiKey = (IpAddress, u8, u32);
 type SaKey = (IpAddress, u8, u32, Option<XfrmMark>);
 
+#[derive(Debug, Clone)]
+struct MockSaRecord {
+    state: SaState,
+    identity: SaRelocationIdentity,
+}
+
 #[derive(Debug)]
 struct MockState {
     operations: Vec<MockOperation>,
+    relocations: Vec<MockSaRelocation>,
     allocated_spis: BTreeSet<AllocatedSpiKey>,
-    sas: BTreeMap<SaKey, SaState>,
+    sas: BTreeMap<SaKey, MockSaRecord>,
     probe_result: XfrmProbe,
     failure: Option<XfrmError>,
 }
@@ -199,6 +228,7 @@ impl MockXfrmBackend {
         Self {
             state: Arc::new(Mutex::new(MockState {
                 operations: Vec::new(),
+                relocations: Vec::new(),
                 allocated_spis: BTreeSet::new(),
                 sas: BTreeMap::new(),
                 probe_result,
@@ -243,6 +273,15 @@ impl MockXfrmBackend {
         state.operations.clone()
     }
 
+    /// Return all exact SA relocations, in order.
+    pub fn relocations(&self) -> Vec<MockSaRelocation> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.relocations.clone()
+    }
+
     /// Clear the recorded operation log.
     pub fn clear_operations(&self) {
         let mut state = self
@@ -250,6 +289,7 @@ impl MockXfrmBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.operations.clear();
+        state.relocations.clear();
     }
 
     fn check_failure(state: &MockState) -> Result<(), XfrmError> {
@@ -264,12 +304,12 @@ fn sa_key(id: XfrmId, mark: Option<XfrmMark>) -> SaKey {
     (id.destination, id.protocol, id.spi, mark)
 }
 
-fn sa_state_from_parameters(parameters: &crate::model::SaParameters) -> SaState {
+fn sa_record_from_parameters(parameters: &crate::model::SaParameters) -> MockSaRecord {
     let replay_state = parameters
         .replay_state
         .clone()
         .unwrap_or_else(|| SaReplayState::fresh(parameters.replay_window));
-    SaState {
+    let state = SaState {
         selector: parameters.selector.clone(),
         id: parameters.id,
         source_address: parameters.source_address,
@@ -285,7 +325,19 @@ fn sa_state_from_parameters(parameters: &crate::model::SaParameters) -> SaState 
         },
         output_mark: parameters.output_mark,
         egress_dscp: None,
-    }
+    };
+    let identity = SaRelocationIdentity {
+        selector: SaRelocationSelector::from_selector(&state.selector),
+        id: state.id,
+        source_address: state.source_address,
+        request_id: state.request_id,
+        mode: state.mode,
+        encap: parameters.encap,
+        mark: parameters.mark,
+        if_id: parameters.if_id,
+        output_mark: state.output_mark,
+    };
+    MockSaRecord { state, identity }
 }
 
 impl Default for MockXfrmBackend {
@@ -404,12 +456,13 @@ impl XfrmBackend for MockXfrmBackend {
         });
         state.sas.insert(
             sa_key(request.parameters.id, request.parameters.mark),
-            sa_state_from_parameters(&request.parameters),
+            sa_record_from_parameters(&request.parameters),
         );
         Ok(())
     }
 
     async fn query_sa(&self, request: QuerySaRequest) -> Result<SaState, XfrmError> {
+        validate_sa_query(request)?;
         let mut state = self
             .state
             .lock()
@@ -428,7 +481,34 @@ impl XfrmBackend for MockXfrmBackend {
                 request.spi,
                 request.mark,
             ))
-            .cloned()
+            .map(|record| record.state.clone())
+            .ok_or(XfrmError::NotFound)
+    }
+
+    async fn query_sa_relocation_identity(
+        &self,
+        request: QuerySaRequest,
+    ) -> Result<SaRelocationIdentity, XfrmError> {
+        validate_sa_query(request)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        state.operations.push(MockOperation::QuerySa {
+            destination: request.destination,
+            spi: request.spi,
+            protocol: request.protocol,
+        });
+        state
+            .sas
+            .get(&(
+                request.destination,
+                request.protocol,
+                request.spi,
+                request.mark,
+            ))
+            .map(|record| record.identity.clone())
             .ok_or(XfrmError::NotFound)
     }
 
@@ -500,8 +580,54 @@ impl XfrmBackend for MockXfrmBackend {
         });
         state.sas.insert(
             sa_key(request.parameters.id, request.parameters.mark),
-            sa_state_from_parameters(&request.parameters),
+            sa_record_from_parameters(&request.parameters),
         );
+        Ok(())
+    }
+
+    async fn relocate_sa(&self, request: RelocateSaRequest) -> Result<(), XfrmError> {
+        validate_relocate_sa_request(&request)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        state.relocations.push(MockSaRelocation {
+            current: request.current.clone(),
+            new_source_address: request.new_source_address,
+            new_destination: request.new_destination,
+            encap: request.encap,
+            direction: request.direction,
+        });
+
+        let old_key = sa_key(request.current.id, request.current.mark);
+        let new_id = XfrmId {
+            destination: request.new_destination,
+            ..request.current.id
+        };
+        let new_key = sa_key(new_id, request.current.mark);
+        let observed = state.sas.get(&old_key).ok_or(XfrmError::NotFound)?;
+        if request.current != observed.identity {
+            return Err(XfrmError::StateMismatch {
+                operation: "relocate_sa_preflight",
+            });
+        }
+        if new_key != old_key && state.sas.contains_key(&new_key) {
+            return Err(XfrmError::AlreadyExists);
+        }
+
+        let mut current = state
+            .sas
+            .remove(&old_key)
+            .ok_or(XfrmError::StateIndeterminate {
+                operation: "relocate_sa_mock_mutation",
+            })?;
+        current.state.id = new_id;
+        current.state.source_address = request.new_source_address;
+        current.identity.id = new_id;
+        current.identity.source_address = request.new_source_address;
+        current.identity.encap = request.encap.resulting(current.identity.encap);
+        state.sas.insert(new_key, current);
         Ok(())
     }
 
@@ -582,6 +708,15 @@ impl XfrmBackend for MockXfrmBackend {
         Self::check_failure(&state)?;
         state.operations.push(MockOperation::Probe);
         Ok(state.probe_result)
+    }
+
+    async fn sa_relocation_capability(&self) -> Result<XfrmCapability, XfrmError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        Ok(XfrmCapability::Available)
     }
 }
 
@@ -894,6 +1029,307 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_relocates_exact_sa_and_preserves_stable_state() {
+        let backend = MockXfrmBackend::new();
+        let mut params = sample_sa_parameters();
+        params.source_address = ipv4(192, 0, 2, 10);
+        params.id.destination = ipv4(192, 0, 2, 20);
+        params.request_id = crate::XfrmRequestId::new(7);
+        params.encap = Some(crate::UdpEncap::esp_in_udp(4500, 4500));
+        params.mark = Some(XfrmMark {
+            value: 0x1200,
+            mask: 0xff00,
+        });
+        params.if_id = Some(9);
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+        let old_query = QuerySaRequest {
+            destination: params.id.destination,
+            protocol: params.id.protocol,
+            spi: params.id.spi,
+            mark: params.mark,
+        };
+        let before = backend.query_sa(old_query).await.unwrap();
+        let current = backend
+            .query_sa_relocation_identity(old_query)
+            .await
+            .unwrap();
+        backend.clear_operations();
+        let request = RelocateSaRequest {
+            current,
+            new_source_address: ipv4(198, 51, 100, 10),
+            new_destination: ipv4(198, 51, 100, 20),
+            encap: SaRelocationEncap::Set(crate::UdpEncap::esp_in_udp(4500, 62_000)),
+            direction: SaRelocationDirection::OutboundBlockPolicyInstalled,
+        };
+
+        backend.relocate_sa(request.clone()).await.unwrap();
+
+        assert!(matches!(
+            backend.query_sa(old_query).await,
+            Err(XfrmError::NotFound)
+        ));
+        let relocated = backend
+            .query_sa(QuerySaRequest {
+                destination: request.new_destination,
+                ..old_query
+            })
+            .await
+            .unwrap();
+        assert_eq!(relocated.id.destination, request.new_destination);
+        assert_eq!(relocated.source_address, request.new_source_address);
+        assert_eq!(relocated.request_id, before.request_id);
+        let relocated_identity = backend
+            .query_sa_relocation_identity(QuerySaRequest {
+                destination: request.new_destination,
+                ..old_query
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            relocated_identity.encap,
+            Some(crate::UdpEncap::esp_in_udp(4500, 62_000))
+        );
+        assert_eq!(relocated_identity.mark, params.mark);
+        assert_eq!(relocated_identity.if_id, params.if_id);
+        assert!(matches!(
+            backend.relocations().first(),
+            Some(MockSaRelocation {
+                current,
+                direction: SaRelocationDirection::OutboundBlockPolicyInstalled,
+                ..
+            }) if current == &request.current
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_relocation_preserves_native_esp_and_models_natt_add_remove() {
+        let backend = MockXfrmBackend::new();
+        let mut params = sample_sa_parameters();
+        params.source_address = ipv4(192, 0, 2, 30);
+        params.id.destination = ipv4(192, 0, 2, 40);
+        params.encap = None;
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+        let old_query =
+            QuerySaRequest::new(params.id.destination, params.id.protocol, params.id.spi);
+        let current = backend
+            .query_sa_relocation_identity(old_query)
+            .await
+            .unwrap();
+        let new_query =
+            QuerySaRequest::new(ipv4(198, 51, 100, 40), params.id.protocol, params.id.spi);
+        backend
+            .relocate_sa(RelocateSaRequest {
+                current,
+                new_source_address: ipv4(198, 51, 100, 30),
+                new_destination: new_query.destination,
+                encap: SaRelocationEncap::Preserve,
+                direction: SaRelocationDirection::Inbound,
+            })
+            .await
+            .unwrap();
+        let native = backend
+            .query_sa_relocation_identity(new_query)
+            .await
+            .unwrap();
+        assert_eq!(native.encap, None);
+
+        backend
+            .relocate_sa(RelocateSaRequest {
+                current: native,
+                new_source_address: ipv4(198, 51, 100, 30),
+                new_destination: new_query.destination,
+                encap: SaRelocationEncap::Set(crate::UdpEncap::esp_in_udp(4500, 4500)),
+                direction: SaRelocationDirection::Inbound,
+            })
+            .await
+            .unwrap();
+        let natt = backend
+            .query_sa_relocation_identity(new_query)
+            .await
+            .unwrap();
+        assert_eq!(natt.encap, Some(crate::UdpEncap::esp_in_udp(4500, 4500)));
+
+        backend
+            .relocate_sa(RelocateSaRequest {
+                current: natt,
+                new_source_address: ipv4(198, 51, 100, 30),
+                new_destination: new_query.destination,
+                encap: SaRelocationEncap::Remove,
+                direction: SaRelocationDirection::Inbound,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .query_sa_relocation_identity(new_query)
+                .await
+                .unwrap()
+                .encap,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_relocation_checks_missing_and_stale_source_before_target_collision() {
+        let backend = MockXfrmBackend::new();
+        let old = sample_sa_parameters();
+        let mut target = old.clone();
+        target.id.destination = ipv4(198, 51, 100, 20);
+        target.source_address = ipv4(198, 51, 100, 10);
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: old.clone(),
+            })
+            .await
+            .unwrap();
+        backend
+            .install_sa(InstallSaRequest { parameters: target })
+            .await
+            .unwrap();
+        let old_query = QuerySaRequest::new(old.id.destination, old.id.protocol, old.id.spi);
+        let current = backend
+            .query_sa_relocation_identity(old_query)
+            .await
+            .unwrap();
+        let mut stale = current.clone();
+        stale.selector.source_port_mask = 1;
+
+        let error = backend
+            .relocate_sa(RelocateSaRequest {
+                current: stale,
+                new_source_address: ipv4(198, 51, 100, 10),
+                new_destination: ipv4(198, 51, 100, 20),
+                encap: SaRelocationEncap::Preserve,
+                direction: SaRelocationDirection::Inbound,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            XfrmError::StateMismatch {
+                operation: "relocate_sa_preflight"
+            }
+        ));
+
+        backend
+            .remove_sa(RemoveSaRequest::new(
+                old.id.destination,
+                old.id.protocol,
+                old.id.spi,
+            ))
+            .await
+            .unwrap();
+        let error = backend
+            .relocate_sa(RelocateSaRequest {
+                current,
+                new_source_address: ipv4(198, 51, 100, 10),
+                new_destination: ipv4(198, 51, 100, 20),
+                encap: SaRelocationEncap::Preserve,
+                direction: SaRelocationDirection::Inbound,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, XfrmError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn mock_relocation_reports_collision_after_exact_source_preflight() {
+        let backend = MockXfrmBackend::new();
+        let old = sample_sa_parameters();
+        let mut target = old.clone();
+        target.id.destination = ipv4(198, 51, 100, 20);
+        target.source_address = ipv4(198, 51, 100, 10);
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: old.clone(),
+            })
+            .await
+            .unwrap();
+        backend
+            .install_sa(InstallSaRequest { parameters: target })
+            .await
+            .unwrap();
+        let current = backend
+            .query_sa_relocation_identity(QuerySaRequest::new(
+                old.id.destination,
+                old.id.protocol,
+                old.id.spi,
+            ))
+            .await
+            .unwrap();
+
+        let error = backend
+            .relocate_sa(RelocateSaRequest {
+                current,
+                new_source_address: ipv4(198, 51, 100, 10),
+                new_destination: ipv4(198, 51, 100, 20),
+                encap: SaRelocationEncap::Preserve,
+                direction: SaRelocationDirection::Inbound,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, XfrmError::AlreadyExists));
+    }
+
+    #[tokio::test]
+    async fn mock_relocation_uses_shared_mark_and_if_id_validation() {
+        let backend = MockXfrmBackend::new();
+        let parameters = sample_sa_parameters();
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: parameters.clone(),
+            })
+            .await
+            .unwrap();
+        let current = backend
+            .query_sa_relocation_identity(QuerySaRequest::new(
+                parameters.id.destination,
+                parameters.id.protocol,
+                parameters.id.spi,
+            ))
+            .await
+            .unwrap();
+        let base = RelocateSaRequest {
+            current,
+            new_source_address: ipv4(198, 51, 100, 10),
+            new_destination: ipv4(198, 51, 100, 20),
+            encap: SaRelocationEncap::Preserve,
+            direction: SaRelocationDirection::OutboundBlockPolicyInstalled,
+        };
+
+        let mut zero_mark_mask = base.clone();
+        zero_mark_mask.current.mark = Some(XfrmMark { value: 1, mask: 0 });
+        assert!(matches!(
+            backend.relocate_sa(zero_mark_mask).await,
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.current.mark",
+                ..
+            })
+        ));
+
+        let mut zero_if_id = base;
+        zero_if_id.current.if_id = Some(0);
+        assert!(matches!(
+            backend.relocate_sa(zero_if_id).await,
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.current.if_id",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn mock_remove_sa_records_operation() {
         let backend = MockXfrmBackend::new();
         let params = sample_sa_parameters();
@@ -1159,6 +1595,51 @@ mod tests {
         backend.clear_operations();
         backend.remove_sa(request).await.unwrap();
         assert_eq!(backend.operations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mock_relocation_query_validates_before_injected_failure_or_recording() {
+        let backend = MockXfrmBackend::new();
+        backend.set_failure(XfrmError::Unavailable);
+
+        let zero_spi = backend
+            .query_sa_relocation_identity(QuerySaRequest::new(ipv4(10, 0, 0, 2), 50, 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            zero_spi,
+            XfrmError::InvalidConfig { field: "spi", .. }
+        ));
+
+        let zero_protocol = backend
+            .query_sa_relocation_identity(QuerySaRequest::new(ipv4(10, 0, 0, 2), 0, 0x1234_5678))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            zero_protocol,
+            XfrmError::InvalidConfig {
+                field: "protocol",
+                ..
+            }
+        ));
+
+        let injected = backend
+            .query_sa_relocation_identity(QuerySaRequest::new(ipv4(10, 0, 0, 2), 50, 0x1234_5678))
+            .await
+            .unwrap_err();
+        assert!(matches!(injected, XfrmError::Unavailable));
+        assert!(backend.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_relocation_capability_honors_injected_failure() {
+        let backend = MockXfrmBackend::new();
+        backend.set_failure(XfrmError::Unavailable);
+
+        let error = backend.sa_relocation_capability().await.unwrap_err();
+
+        assert!(matches!(error, XfrmError::Unavailable));
+        assert!(backend.operations().is_empty());
     }
 
     #[tokio::test]
