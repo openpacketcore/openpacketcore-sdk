@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "crates/opc-ipsec-xfrm/**"
+      - "crates/opc-proto-ikev2/**"
       - "crates/opc-ipsec-xfrm-ebpf/**"
       - "crates/opc-ipsec-xfrm-ebpf-common/**"
       - "crates/opc-linux-xfrm-sys/**"
@@ -17,6 +18,7 @@ on:
       - main
     paths:
       - "crates/opc-ipsec-xfrm/**"
+      - "crates/opc-proto-ikev2/**"
       - "crates/opc-ipsec-xfrm-ebpf/**"
       - "crates/opc-ipsec-xfrm-ebpf-common/**"
       - "crates/opc-linux-xfrm-sys/**"
@@ -95,6 +97,8 @@ jobs:
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
           cargo test --locked -p opc-ipsec-xfrm \
+            --features ikev2 \
+            --test xfrm_auth_only_privileged \
             --test xfrm_dscp_privileged \
             --test xfrm_relocation_privileged \
             --no-run
@@ -131,6 +135,23 @@ jobs:
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
               cargo test --locked -p opc-ipsec-xfrm --test xfrm_relocation_privileged -- --ignored --nocapture
+            '
+
+      - name: Run authenticated-only ESP pass and tamper-rejection proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_XFRM_RUN_AUTH_ONLY_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture
             '
 
   ebpf-object:

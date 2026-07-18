@@ -39,7 +39,7 @@ management, product SA/SPD policy, or deployment defaults.
 
 ```rust,no_run
 use opc_ipsec_xfrm::{
-    AuthAlgorithm, InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig,
+    Algorithm, AuthAlgorithm, InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig,
     SaParameters, XfrmBackend, XfrmId, XfrmMode, XfrmSelector,
     MockXfrmBackend,
 };
@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         source_address: IpAddress::Ipv4([10, 0, 0, 1]),
         request_id: None,
         auth: Some((AuthAlgorithm::hmac_sha256(96), KeyMaterial::new(vec![0xab; 32]))),
-        crypt: None,
+        crypt: Some((Algorithm::null(), KeyMaterial::new(Vec::new()))),
         aead: None,
         mode: XfrmMode::Tunnel,
         lifetime: LifetimeConfig::default(),
@@ -79,6 +79,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Authenticated-only ESP and ENCR_NULL
+
+With the `ikev2` feature,
+`Ikev2ChildSaCryptoProfile::new_authenticated_only` derives no encryption or
+salt octets and the mapper emits separate Linux auth and NULL-crypt slots. The
+Linux adapter uses the kernel's canonical `ecb(cipher_null)` transform with a
+zero-bit key, exposed as `XFRM_ENCR_NULL` and `Algorithm::null()`. This is an
+adapter representation required by the XFRM UAPI; it does not fabricate an
+IKEv2 encryption key or alter the negotiated ENCR_NULL transform.
+
+The encoder accepts an empty key only for this exact NULL algorithm. It rejects
+a non-empty NULL key, NULL without separate authentication, empty key material
+for every other cipher, AEAD in the crypt slot, and ESP auth without an
+explicit NULL cipher before sending a netlink mutation. Linux itself rejects
+the latter raw shape with `EINVAL`.
+Generic models and mocks may still describe other protocol shapes, but Linux
+authenticated-only ESP callers must use `Algorithm::null()` or the IKEv2
+mapper.
+
+`tests/xfrm_auth_only_privileged.rs` creates a fresh local/peer namespace pair,
+installs bidirectional authenticated-only tunnel SAs through the SDK, captures
+a real ESP packet, and proves both valid delivery and integrity-failure
+rejection of a tampered packet. It contains synthetic documentation-address
+and private-address fixtures only; keys are test-only and never logged.
 
 ## Exact SA relocation
 
@@ -371,7 +396,8 @@ excludes the old key material needed for rollback.
 - `query_sa` returns replay/lifetime/statistics and the exact generic/combined
   output mark, but never key material.
 - The `ikev2` feature maps validated Child SA intent to XFRM requests; it does
-  not run IKE, allocate SPIs, or choose product policy.
+  not run IKE, allocate SPIs, enable ENCR_NULL in an allowlist, or choose
+  product policy.
 - The IKEv2 mapper keeps SPI-pinned policies as its compatibility default and
   also supports a shared non-zero request ID with wildcard policy-template SPI
   for simultaneous old/new Child-SA rekey overlap.
@@ -393,4 +419,5 @@ cargo test -p opc-ipsec-xfrm --features ikev2
 ./scripts/build-ipsec-xfrm-ebpf.sh
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_dscp_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_RELOCATION_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_relocation_privileged -- --ignored --nocapture'
+sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_AUTH_ONLY_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture'
 ```

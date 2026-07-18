@@ -16,7 +16,8 @@
 //! IKE_AUTH cleartext payload helpers, transcript-bound shared-key AUTH MIC
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
 //! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY
-//! notifications, product-neutral Child SA negotiation intent, and strict
+//! notifications, product-neutral Child SA negotiation intent including
+//! authenticated-only ESP ENCR_NULL profiles and KEYMAT, and strict
 //! opened-payload helpers for 3GPP TS 24.302 dedicated-bearer establishment,
 //! modification, and deletion. It does not implement an IKE SA state machine,
 //! EAP-AKA, retransmission policy, cookie policy, Child SA installation, XFRM
