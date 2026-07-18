@@ -25,6 +25,8 @@ control-plane stack.
   `encode_header`.
 - `payload` exposes `PayloadChain`, `RawPayload`, `RawPayloadIterator`,
   `PayloadType`, and `validate_payload_chain`.
+- `validation` exposes `Ikev2ValidationProfile`, separating conformant network
+  receive behavior from opt-in sender-canonical fixture validation.
 - `crypto` defines the caller-supplied `CryptoProvider` boundary and protected
   payload open result types.
 - `sa_init`, `sa_init_crypto`, and `sa_init_negotiation` provide typed
@@ -61,6 +63,46 @@ control-plane stack.
   proposal/transforms, optional KE group, and traffic-selector narrowing.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
+
+## Network receive and sender-canonical validation
+
+RFC 7296 requires senders to clear several reserved fields but explicitly
+requires receivers to ignore them. `Message::decode`, `decode_header`, payload
+iteration, and the typed ID/AUTH/KE/TS/CP decoders therefore use
+`Ikev2ValidationProfile::NetworkReceive` by default. This remains the correct
+profile even with `DecodeContext::conservative()` or `ValidationLevel::Strict`:
+those context settings continue to enforce hostile lengths, bounded payload
+counts, payload chaining, valid major version, typed cardinality, unknown
+critical payloads, integrity, and authentication.
+
+Generated outbound fixtures can opt into the separate canonical checks:
+
+```rust
+use opc_proto_ikev2::{Ikev2ValidationProfile, Message};
+use opc_protocol::DecodeContext;
+
+# let generated_message = [0u8; 0];
+let result = Message::decode_with_profile(
+    &generated_message,
+    DecodeContext::conservative(),
+    Ikev2ValidationProfile::SenderCanonical,
+);
+# let _ = result;
+```
+
+The corresponding `*_with_profile` typed body decoders and
+`decode_ike_auth_cleartext_payloads_with_profile` diagnose a non-zero Version
+bit, Critical bit on understood payloads, and non-zero SA Proposal/Transform,
+ID, AUTH, KE, TS, CP, and CP-attribute reserved fields. Production typed
+builders continue to emit zero. The raw `Message` shell deliberately preserves
+supplied payload-chain bytes; callers generating outbound raw fixtures should
+run sender-canonical validation before sending them.
+
+`Ikev2IdentificationPayload::reserved` retains the exact three received ID
+octets. `to_payload_body()` reconstructs the exact received ID body, including
+those ignored octets, because RFC 7296 AUTH authenticates that body byte for
+byte. It must not be replaced with a zero-canonicalized ID body during AUTH
+verification.
 
 ## IKE-SA profile configuration
 

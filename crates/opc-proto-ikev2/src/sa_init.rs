@@ -17,6 +17,7 @@ use crate::{
         IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
     },
     payload::{PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
+    validation::Ikev2ValidationProfile,
     HEADER_LEN,
 };
 
@@ -50,10 +51,18 @@ impl<'a> Ikev2SaPayload<'a> {
     /// Returns [`Ikev2SaPayloadError`] when the raw payload is not an SA
     /// payload or any Proposal/Transform substructure is malformed.
     pub fn decode(raw: RawPayload<'a>) -> Result<Self, Ikev2SaPayloadError> {
+        Self::decode_with_profile(raw, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode a typed SA payload with an explicit IKEv2 validation profile.
+    pub fn decode_with_profile(
+        raw: RawPayload<'a>,
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2SaPayloadError> {
         if raw.payload_type != PayloadType::SecurityAssociation {
             return Err(Ikev2SaPayloadError::NotSaPayload);
         }
-        Self::decode_body(raw.body)
+        Self::decode_body_with_profile(raw.body, profile)
     }
 
     /// Decode a typed SA payload from an SA body.
@@ -63,6 +72,14 @@ impl<'a> Ikev2SaPayload<'a> {
     /// Returns [`Ikev2SaPayloadError`] when Proposal/Transform substructures
     /// are malformed.
     pub fn decode_body(body: &'a [u8]) -> Result<Self, Ikev2SaPayloadError> {
+        Self::decode_body_with_profile(body, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode an SA body with an explicit IKEv2 validation profile.
+    pub fn decode_body_with_profile(
+        body: &'a [u8],
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2SaPayloadError> {
         if body.is_empty() {
             return Err(Ikev2SaPayloadError::MissingProposal);
         }
@@ -76,6 +93,9 @@ impl<'a> Ikev2SaPayload<'a> {
             let last = remaining[0];
             if last != 0 && last != PROPOSAL_MORE {
                 return Err(Ikev2SaPayloadError::InvalidProposalLastMarker);
+            }
+            if profile.requires_sender_canonical_fields() && remaining[1] != 0 {
+                return Err(Ikev2SaPayloadError::ReservedNonZero);
             }
             let proposal_len = usize::from(u16::from_be_bytes([remaining[2], remaining[3]]));
             if proposal_len < PROPOSAL_HEADER_LEN {
@@ -98,7 +118,8 @@ impl<'a> Ikev2SaPayload<'a> {
             if transform_start > proposal_body.len() {
                 return Err(Ikev2SaPayloadError::ProposalSpiLengthExceedsBody);
             }
-            let transforms = decode_transforms(&proposal_body[transform_start..], transform_count)?;
+            let transforms =
+                decode_transforms(&proposal_body[transform_start..], transform_count, profile)?;
             proposals.push(Ikev2SaProposal {
                 proposal_number: proposal_body[4],
                 protocol_id: proposal_body[5],
@@ -238,6 +259,9 @@ pub enum Ikev2SaPayloadError {
     MissingProposal,
     /// Proposal substructure ended before the fixed header.
     ProposalTooShort,
+    /// A Proposal or Transform reserved field was non-zero under
+    /// sender-canonical validation.
+    ReservedNonZero,
     /// Proposal Last Substructure marker was not valid for IKEv2.
     InvalidProposalLastMarker,
     /// Proposal length was shorter than the fixed Proposal header.
@@ -279,6 +303,7 @@ impl Ikev2SaPayloadError {
             Self::NotSaPayload => "ike_sa_init_sa_not_sa_payload",
             Self::MissingProposal => "ike_sa_init_sa_missing_proposal",
             Self::ProposalTooShort => "ike_sa_init_sa_proposal_too_short",
+            Self::ReservedNonZero => "ike_sa_init_sa_reserved_non_zero",
             Self::InvalidProposalLastMarker => "ike_sa_init_sa_invalid_proposal_last_marker",
             Self::ProposalLengthTooShort => "ike_sa_init_sa_proposal_length_too_short",
             Self::ProposalLengthExceedsBody => "ike_sa_init_sa_proposal_length_exceeds_body",
@@ -332,10 +357,18 @@ impl<'a> Ikev2KeyExchangePayload<'a> {
     /// Returns [`Ikev2KeyExchangePayloadError`] when the raw payload is not KE
     /// or the KE body is malformed.
     pub fn decode(raw: RawPayload<'a>) -> Result<Self, Ikev2KeyExchangePayloadError> {
+        Self::decode_with_profile(raw, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode a typed KE payload with an explicit IKEv2 validation profile.
+    pub fn decode_with_profile(
+        raw: RawPayload<'a>,
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2KeyExchangePayloadError> {
         if raw.payload_type != PayloadType::KeyExchange {
             return Err(Ikev2KeyExchangePayloadError::NotKeyExchangePayload);
         }
-        Self::decode_body(raw.body)
+        Self::decode_body_with_profile(raw.body, profile)
     }
 
     /// Decode a typed KE payload from a KE body.
@@ -344,6 +377,14 @@ impl<'a> Ikev2KeyExchangePayload<'a> {
     ///
     /// Returns [`Ikev2KeyExchangePayloadError`] when the KE body is malformed.
     pub fn decode_body(body: &'a [u8]) -> Result<Self, Ikev2KeyExchangePayloadError> {
+        Self::decode_body_with_profile(body, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode a KE body with an explicit IKEv2 validation profile.
+    pub fn decode_body_with_profile(
+        body: &'a [u8],
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2KeyExchangePayloadError> {
         if body.len() < KE_FIXED_BODY_LEN {
             return Err(Ikev2KeyExchangePayloadError::BodyTooShort);
         }
@@ -351,7 +392,7 @@ impl<'a> Ikev2KeyExchangePayload<'a> {
         if dh_group == 0 {
             return Err(Ikev2KeyExchangePayloadError::InvalidDhGroup);
         }
-        if body[2] != 0 || body[3] != 0 {
+        if profile.requires_sender_canonical_fields() && (body[2] != 0 || body[3] != 0) {
             return Err(Ikev2KeyExchangePayloadError::ReservedNonZero);
         }
         let key_exchange_data = &body[KE_FIXED_BODY_LEN..];
@@ -383,7 +424,7 @@ pub enum Ikev2KeyExchangePayloadError {
     BodyTooShort,
     /// DH Group was zero.
     InvalidDhGroup,
-    /// Reserved field was not zero.
+    /// Reserved field was not zero under sender-canonical validation.
     ReservedNonZero,
     /// KE data was empty.
     EmptyKeyExchangeData,
@@ -656,6 +697,23 @@ pub fn decode_ike_sa_init_request_payloads<'a>(
     message: &Message<'a>,
     ctx: DecodeContext,
 ) -> Result<Ikev2SaInitPayloads<'a>, Ikev2SaInitPayloadError> {
+    decode_ike_sa_init_request_payloads_with_profile(
+        message,
+        ctx,
+        Ikev2ValidationProfile::NetworkReceive,
+    )
+}
+
+/// Decode an IKE_SA_INIT request using an explicit IKEv2 validation profile.
+///
+/// Network receive mode accepts RFC-defined ignored KE and generic-payload
+/// reserved fields. Sender-canonical mode is available for outbound fixture
+/// validation; both modes retain all structural and request-shape checks.
+pub fn decode_ike_sa_init_request_payloads_with_profile<'a>(
+    message: &Message<'a>,
+    ctx: DecodeContext,
+    profile: Ikev2ValidationProfile,
+) -> Result<Ikev2SaInitPayloads<'a>, Ikev2SaInitPayloadError> {
     validate_sa_init_request_header(&message.header)?;
 
     let mut security_association = None;
@@ -665,7 +723,7 @@ pub fn decode_ike_sa_init_request_payloads<'a>(
     let mut vendor_ids = Vec::new();
     let mut other_payload_count = 0;
 
-    for raw in message.payloads_with_context(ctx) {
+    for raw in message.payloads_with_profile(ctx, profile) {
         let raw = raw.map_err(Ikev2SaInitPayloadError::PayloadDecode)?;
         match raw.payload_type {
             PayloadType::SecurityAssociation => {
@@ -673,7 +731,7 @@ pub fn decode_ike_sa_init_request_payloads<'a>(
                     return Err(Ikev2SaInitPayloadError::DuplicateSecurityAssociation);
                 }
                 security_association = Some(
-                    Ikev2SaPayload::decode(raw)
+                    Ikev2SaPayload::decode_with_profile(raw, profile)
                         .map_err(Ikev2SaInitPayloadError::SecurityAssociation)?,
                 );
             }
@@ -682,7 +740,7 @@ pub fn decode_ike_sa_init_request_payloads<'a>(
                     return Err(Ikev2SaInitPayloadError::DuplicateKeyExchange);
                 }
                 key_exchange = Some(
-                    Ikev2KeyExchangePayload::decode(raw)
+                    Ikev2KeyExchangePayload::decode_with_profile(raw, profile)
                         .map_err(Ikev2SaInitPayloadError::KeyExchange)?,
                 );
             }
@@ -1208,6 +1266,7 @@ pub fn build_ike_sa_init_invalid_ke_response(
 fn decode_transforms<'a>(
     mut remaining: &'a [u8],
     expected_count: usize,
+    profile: Ikev2ValidationProfile,
 ) -> Result<Vec<Ikev2SaTransform<'a>>, Ikev2SaPayloadError> {
     let mut transforms = Vec::with_capacity(expected_count);
     for index in 0..expected_count {
@@ -1217,6 +1276,9 @@ fn decode_transforms<'a>(
         let last = remaining[0];
         if last != 0 && last != TRANSFORM_MORE {
             return Err(Ikev2SaPayloadError::InvalidTransformLastMarker);
+        }
+        if profile.requires_sender_canonical_fields() && (remaining[1] != 0 || remaining[5] != 0) {
+            return Err(Ikev2SaPayloadError::ReservedNonZero);
         }
         let transform_len = usize::from(u16::from_be_bytes([remaining[2], remaining[3]]));
         if transform_len < TRANSFORM_HEADER_LEN {

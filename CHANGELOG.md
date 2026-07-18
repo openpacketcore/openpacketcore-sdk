@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **BREAKING — RFC 7296 receiver-ignored fields — `opc-proto-ikev2`:** network
+  decode now accepts higher IKEv2 minor versions, ignored Version/Critical bits,
+  and receiver-ignored reserved fields in fixed/generic headers, SA
+  Proposal/Transform structures, ID, AUTH, KE, TS, CP, and CP attributes while
+  retaining every structural, major-version, unknown-critical, integrity, and
+  authentication check. `Ikev2ValidationProfile::SenderCanonical` preserves
+  opt-in outbound-fixture diagnostics, and typed builders continue to emit
+  zero. Decoded `Ikev2IdentificationPayload` gains the exact three-octet
+  `reserved` field, and `to_payload_body()` now preserves it so AUTH verifies
+  the received ID body byte-for-byte instead of silently canonicalizing it.
+  Downstream struct literals must initialize `reserved`; decoded values should
+  pass `to_payload_body()` directly into AUTH transcript construction.
+  Exhaustive downstream error matches must also handle
+  `Ikev2SaPayloadError::ReservedNonZero` and
+  `Ikev2IkeAuthBuildError::ConfigurationAttributeTypeTooLarge`.
 - **BREAKING — S2b Create Session PAA profile — `opc-proto-gtpv2c`:**
   `S2bCreateSessionRequest` no longer accepts or emits the top-level PDN Type
   IE prohibited by TS 29.274 Table 7.2.1-1 Note 1. The required PAA now owns

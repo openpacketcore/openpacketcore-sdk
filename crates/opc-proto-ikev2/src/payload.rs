@@ -5,7 +5,7 @@
 
 use opc_protocol::{DecodeContext, DecodeError, DecodeErrorCode, SpecRef};
 
-use crate::crypto::ProtectedPayloadKind;
+use crate::{crypto::ProtectedPayloadKind, validation::Ikev2ValidationProfile};
 
 /// IKEv2 generic payload header length in octets.
 pub const GENERIC_PAYLOAD_HEADER_LEN: usize = 4;
@@ -230,9 +230,28 @@ impl<'a> PayloadChain<'a> {
         RawPayloadIterator::new(self.first_payload, self.bytes, ctx)
     }
 
+    /// Iterate over payloads with explicit parser limits and IKEv2 validation
+    /// profile.
+    pub fn iter_with_profile(
+        &self,
+        ctx: DecodeContext,
+        profile: Ikev2ValidationProfile,
+    ) -> RawPayloadIterator<'a> {
+        RawPayloadIterator::new_with_profile(self.first_payload, self.bytes, ctx, profile)
+    }
+
     /// Validate the payload chain under the supplied context.
     pub fn validate(&self, ctx: DecodeContext) -> Result<(), DecodeError> {
         validate_payload_chain(self.first_payload, self.bytes, ctx)
+    }
+
+    /// Validate the payload chain with an explicit IKEv2 validation profile.
+    pub fn validate_with_profile(
+        &self,
+        ctx: DecodeContext,
+        profile: Ikev2ValidationProfile,
+    ) -> Result<(), DecodeError> {
+        validate_payload_chain_with_profile(self.first_payload, self.bytes, ctx, profile)
     }
 }
 
@@ -245,6 +264,7 @@ pub struct RawPayloadIterator<'a> {
     current_payload: PayloadType,
     remaining: &'a [u8],
     ctx: DecodeContext,
+    profile: Ikev2ValidationProfile,
     offset: usize,
     seen: usize,
 }
@@ -252,10 +272,26 @@ pub struct RawPayloadIterator<'a> {
 impl<'a> RawPayloadIterator<'a> {
     /// Create a new iterator over raw payload bytes.
     pub const fn new(first_payload: PayloadType, bytes: &'a [u8], ctx: DecodeContext) -> Self {
+        Self::new_with_profile(
+            first_payload,
+            bytes,
+            ctx,
+            Ikev2ValidationProfile::NetworkReceive,
+        )
+    }
+
+    /// Create a new iterator with an explicit IKEv2 validation profile.
+    pub const fn new_with_profile(
+        first_payload: PayloadType,
+        bytes: &'a [u8],
+        ctx: DecodeContext,
+        profile: Ikev2ValidationProfile,
+    ) -> Self {
         Self {
             current_payload: first_payload,
             remaining: bytes,
             ctx,
+            profile,
             offset: 0,
             seen: 0,
         }
@@ -309,11 +345,25 @@ impl<'a> Iterator for RawPayloadIterator<'a> {
         let length = u16::from_be_bytes([self.remaining[2], self.remaining[3]]);
         let payload_len = length as usize;
 
-        if crate::is_strict(self.ctx.validation_level) && reserved != 0 {
+        if self.profile.requires_sender_canonical_fields() && reserved != 0 {
             let offset = self.offset + 1;
             return Some(Err(self.fail(
                 DecodeErrorCode::Structural {
-                    reason: "generic payload reserved bits must be zero",
+                    reason: "IKEv2 generic payload reserved bits must be zero on send",
+                },
+                offset,
+                spec,
+            )));
+        }
+
+        if self.profile.requires_sender_canonical_fields()
+            && critical
+            && !matches!(payload_type, PayloadType::Unknown(_))
+        {
+            let offset = self.offset + 1;
+            return Some(Err(self.fail(
+                DecodeErrorCode::Structural {
+                    reason: "known IKEv2 payload Critical bit must be zero on send",
                 },
                 offset,
                 spec,
@@ -387,6 +437,30 @@ pub fn validate_payload_chain(
     bytes: &[u8],
     ctx: DecodeContext,
 ) -> Result<(), DecodeError> {
+    validate_payload_chain_with_profile(
+        first_payload,
+        bytes,
+        ctx,
+        Ikev2ValidationProfile::NetworkReceive,
+    )
+}
+
+/// Validate an IKEv2 generic payload chain with an explicit profile.
+///
+/// Network receive validation ignores the generic-header reserved bits as RFC
+/// 7296 requires, while still rejecting malformed lengths, excessive payload
+/// counts, impossible chaining, and unknown critical payloads. Sender-canonical
+/// validation additionally requires those reserved bits to be zero.
+///
+/// @spec IETF RFC7296 2.5, 3.2
+/// @req REQ-IETF-RFC7296-3.2-VALIDATE-002
+/// @conformance experimental-scaffold
+pub fn validate_payload_chain_with_profile(
+    first_payload: PayloadType,
+    bytes: &[u8],
+    ctx: DecodeContext,
+    profile: Ikev2ValidationProfile,
+) -> Result<(), DecodeError> {
     if first_payload.is_no_next() && bytes.is_empty() {
         return Ok(());
     }
@@ -400,7 +474,7 @@ pub fn validate_payload_chain(
         .with_spec_ref(spec_ref()));
     }
 
-    let mut iterator = RawPayloadIterator::new(first_payload, bytes, ctx);
+    let mut iterator = RawPayloadIterator::new_with_profile(first_payload, bytes, ctx, profile);
     for item in &mut iterator {
         let _payload = item?;
     }
