@@ -25,7 +25,9 @@ control-plane stack.
 - `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
   shells and implement the shared `opc-protocol` codec traits.
 - `S2bMessage<'a>` and `S2bProcedureMessage<'a>` provide typed S2b views and
-  raw fallback for unsupported message types.
+  raw fallback for unsupported message types. `decode_with_diagnostics`
+  additionally returns bounded, value-free `S2bReceiveDiagnostics` evidence
+  for ignored duplicate singleton keys.
 - `S2bCreateBearerRequest`/`Response`, `S2bUpdateBearerRequest`/`Response`,
   and `S2bDeleteBearerRequest`/`Response` project the complete S2b
   dedicated-bearer shapes claimed by this crate. Their builders enforce
@@ -88,11 +90,31 @@ let ctx = DecodeContext {
     validation_level: ValidationLevel::ProcedureAware,
     ..DecodeContext::default()
 };
-let (tail, decoded) = S2bMessage::decode(&encoded, ctx)?;
+let (tail, decoded) = S2bMessage::decode_with_diagnostics(&encoded, ctx)?;
 assert!(tail.is_empty());
-assert!(decoded.as_view().is_some());
+assert!(decoded.message().as_view().is_some());
+assert!(decoded.diagnostics().is_empty());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+`ProcedureAware` is a receiver profile. In accordance with TS 29.274 clauses
+7.7.9 and 7.7.10, it classifies each crate-known IE type/instance against one
+full-message grammar keyed by procedure, direction, and exact enclosing Bearer
+Context instance before decoding its value. It discards unexpected known keys,
+preserves genuinely unknown optional keys, retains the first non-repeatable
+type/instance key in each exact scope, ignores later occurrences, and truncates
+declared lists at their procedure-table bounds. Interface-specific S2b
+presence, F-TEID role/type, and correlation checks remain in the typed
+procedure projections. Length, mandatory-field, and semantic validation of the
+first retained value still fail closed. Canonical builders deliberately use a
+separate sender-validation path: duplicate profile-owned or additional
+singleton keys remain construction errors and are never emitted.
+
+The current Create Session profile still treats top-level PDN Type as an
+allowed and required compatibility field. Issue #335 owns the separate
+send-profile/PAA-constructor migration that will remove that field for S2b; the
+receive-policy change here deliberately does not partially implement that API
+migration.
 
 The runnable [`dedicated_bearer` example](examples/dedicated_bearer.rs) shows
 the GTP transaction boundary for receiving a triggered request, projecting its

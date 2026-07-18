@@ -18,6 +18,167 @@ use opc_protocol::{
 
 use crate::ie::{RawIe, RawIeIterator, IE_HEADER_LEN};
 
+/// Maximum number of distinct duplicate-IE keys retained in receive diagnostics.
+///
+/// Further duplicate keys are counted by the enclosing S2b diagnostic summary
+/// without retaining peer-controlled values or allocating an unbounded list.
+pub const MAX_DUPLICATE_IE_EVIDENCE: usize = 64;
+
+/// Redaction-safe evidence that a singleton IE key was repeated in one scope.
+///
+/// Offsets are relative to the start of the decoded top-level IE region. A
+/// grouped IE has its own scope, identified by both `depth` and `scope_offset`.
+/// No IE value bytes are retained.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateIeEvidence {
+    ie_type: u8,
+    instance: u8,
+    depth: usize,
+    scope_offset: usize,
+    first_offset: usize,
+    duplicate_count: u16,
+}
+
+impl DuplicateIeEvidence {
+    /// Return the repeated IE type.
+    pub const fn ie_type(self) -> u8 {
+        self.ie_type
+    }
+
+    /// Return the repeated IE instance.
+    pub const fn instance(self) -> u8 {
+        self.instance
+    }
+
+    /// Return the grouped-IE nesting depth of this key.
+    pub const fn depth(self) -> usize {
+        self.depth
+    }
+
+    /// Return the offset at which this IE scope begins.
+    pub const fn scope_offset(self) -> usize {
+        self.scope_offset
+    }
+
+    /// Return the offset of the first retained occurrence.
+    pub const fn first_offset(self) -> usize {
+        self.first_offset
+    }
+
+    /// Return the saturated number of ignored later occurrences.
+    pub const fn duplicate_count(self) -> u16 {
+        self.duplicate_count
+    }
+}
+
+impl fmt::Debug for DuplicateIeEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DuplicateIeEvidence")
+            .field("ie_type", &self.ie_type)
+            .field("instance", &self.instance)
+            .field("depth", &self.depth)
+            .field("scope_offset", &self.scope_offset)
+            .field("first_offset", &self.first_offset)
+            .field("duplicate_count", &self.duplicate_count)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct DuplicateIeCollector {
+    entries: Vec<DuplicateIeEvidence>,
+    omitted_count: u32,
+}
+
+impl DuplicateIeCollector {
+    fn record(
+        &mut self,
+        ie_type: u8,
+        instance: u8,
+        depth: usize,
+        scope_offset: usize,
+        first_offset: usize,
+    ) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.ie_type == ie_type
+                && entry.instance == instance
+                && entry.depth == depth
+                && entry.scope_offset == scope_offset
+        }) {
+            entry.duplicate_count = entry.duplicate_count.saturating_add(1);
+            return;
+        }
+        if self.entries.len() < MAX_DUPLICATE_IE_EVIDENCE {
+            self.entries.push(DuplicateIeEvidence {
+                ie_type,
+                instance,
+                depth,
+                scope_offset,
+                first_offset,
+                duplicate_count: 1,
+            });
+        } else {
+            self.omitted_count = self.omitted_count.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<DuplicateIeEvidence>, u32) {
+        (self.entries, self.omitted_count)
+    }
+}
+
+pub(crate) struct DecodedIeSequence<'a> {
+    pub(crate) ies: Vec<TypedIe<'a>>,
+    pub(crate) duplicate_evidence: Vec<DuplicateIeEvidence>,
+    pub(crate) omitted_duplicate_count: u32,
+}
+
+type IeDecodeFilter<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> bool;
+type IeRepeatableLimit<'f> = &'f dyn Fn(u8, u8, usize, Option<(u8, u8)>) -> Option<usize>;
+
+#[derive(Clone, Copy)]
+struct IeDecodePolicy<'p> {
+    legacy_pgw_triggered_request: bool,
+    filter: Option<IeDecodeFilter<'p>>,
+    scoped_repeatable_limit: Option<IeRepeatableLimit<'p>>,
+}
+
+impl<'p> IeDecodePolicy<'p> {
+    const fn legacy(pgw_triggered_request: bool) -> Self {
+        Self {
+            legacy_pgw_triggered_request: pgw_triggered_request,
+            filter: None,
+            scoped_repeatable_limit: None,
+        }
+    }
+
+    const fn scoped(filter: IeDecodeFilter<'p>, repeatable_limit: IeRepeatableLimit<'p>) -> Self {
+        Self {
+            legacy_pgw_triggered_request: false,
+            filter: Some(filter),
+            scoped_repeatable_limit: Some(repeatable_limit),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IeSequencePosition {
+    depth: usize,
+    base_offset: usize,
+    parent_ie: Option<(u8, u8)>,
+}
+
+impl IeSequencePosition {
+    const fn root(depth: usize) -> Self {
+        Self {
+            depth,
+            base_offset: 0,
+            parent_ie: None,
+        }
+    }
+}
+
 /// GTPv2-C IMSI IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_IMSI: u8 = 1;
 /// GTPv2-C Cause IE type (TS 29.274 Table 8.1-1).
@@ -1823,6 +1984,9 @@ impl<'a> BearerContext<'a> {
         ctx: DecodeContext,
         depth: usize,
         base_offset: usize,
+        instance: u8,
+        policy: IeDecodePolicy<'_>,
+        duplicate_evidence: &mut DuplicateIeCollector,
     ) -> Result<Self, DecodeError> {
         if depth.saturating_add(1) > ctx.max_depth {
             return Err(
@@ -1834,9 +1998,13 @@ impl<'a> BearerContext<'a> {
             members: decode_typed_ie_sequence_at(
                 value,
                 ctx,
-                depth.saturating_add(1),
-                base_offset,
-                false,
+                IeSequencePosition {
+                    depth: depth.saturating_add(1),
+                    base_offset,
+                    parent_ie: Some((IE_TYPE_BEARER_CONTEXT, instance)),
+                },
+                policy,
+                duplicate_evidence,
             )?,
         })
     }
@@ -2011,6 +2179,25 @@ impl<'a> TypedIe<'a> {
         depth: usize,
         base_offset: usize,
     ) -> Result<Self, DecodeError> {
+        let mut duplicate_evidence = DuplicateIeCollector::default();
+        Self::decode_from_raw_with_evidence(
+            raw,
+            ctx,
+            depth,
+            base_offset,
+            IeDecodePolicy::legacy(false),
+            &mut duplicate_evidence,
+        )
+    }
+
+    fn decode_from_raw_with_evidence(
+        raw: RawIe<'a>,
+        ctx: DecodeContext,
+        depth: usize,
+        base_offset: usize,
+        policy: IeDecodePolicy<'_>,
+        duplicate_evidence: &mut DuplicateIeCollector,
+    ) -> Result<Self, DecodeError> {
         let value_offset = checked_add_offset(base_offset, IE_HEADER_LEN)?;
         let value = match raw.ie_type {
             IE_TYPE_IMSI => TypedIeValue::Imsi(TbcdDigits::decode_value(raw.value, value_offset)?),
@@ -2065,6 +2252,9 @@ impl<'a> TypedIe<'a> {
                 ctx,
                 depth,
                 value_offset,
+                raw.instance,
+                policy,
+                duplicate_evidence,
             )?),
             IE_TYPE_CHARGING_ID => {
                 TypedIeValue::ChargingId(ChargingId::decode_value(raw.value, value_offset)?)
@@ -2275,7 +2465,35 @@ pub fn decode_typed_ie_sequence<'a>(
     ctx: DecodeContext,
     depth: usize,
 ) -> Result<Vec<TypedIe<'a>>, DecodeError> {
-    decode_typed_ie_sequence_at(input, ctx, depth, 0, false)
+    let mut duplicate_evidence = DuplicateIeCollector::default();
+    decode_typed_ie_sequence_at(
+        input,
+        ctx,
+        IeSequencePosition::root(depth),
+        IeDecodePolicy::legacy(false),
+        &mut duplicate_evidence,
+    )
+}
+
+pub(crate) fn decode_typed_ie_sequence_with_evidence<'a>(
+    input: &'a [u8],
+    ctx: DecodeContext,
+    depth: usize,
+) -> Result<DecodedIeSequence<'a>, DecodeError> {
+    let mut collector = DuplicateIeCollector::default();
+    let ies = decode_typed_ie_sequence_at(
+        input,
+        ctx,
+        IeSequencePosition::root(depth),
+        IeDecodePolicy::legacy(false),
+        &mut collector,
+    )?;
+    let (duplicate_evidence, omitted_duplicate_count) = collector.into_parts();
+    Ok(DecodedIeSequence {
+        ies,
+        duplicate_evidence,
+        omitted_duplicate_count,
+    })
 }
 
 /// Decode the top-level IE sequence of a PGW-triggered bearer request.
@@ -2284,11 +2502,48 @@ pub fn decode_typed_ie_sequence<'a>(
 /// additional repeated type/instance pairs for requests 95, 97, and 99.
 /// Keeping this profile request-specific prevents the same duplicates from
 /// being silently accepted in responses 96, 98, and 100.
-pub(crate) fn decode_pgw_triggered_request_ie_sequence<'a>(
+pub(crate) fn decode_pgw_triggered_request_ie_sequence_with_evidence<'a>(
     input: &'a [u8],
     ctx: DecodeContext,
-) -> Result<Vec<TypedIe<'a>>, DecodeError> {
-    decode_typed_ie_sequence_at(input, ctx, 0, 0, true)
+) -> Result<DecodedIeSequence<'a>, DecodeError> {
+    let mut collector = DuplicateIeCollector::default();
+    let ies = decode_typed_ie_sequence_at(
+        input,
+        ctx,
+        IeSequencePosition::root(0),
+        IeDecodePolicy::legacy(true),
+        &mut collector,
+    )?;
+    let (duplicate_evidence, omitted_duplicate_count) = collector.into_parts();
+    Ok(DecodedIeSequence {
+        ies,
+        duplicate_evidence,
+        omitted_duplicate_count,
+    })
+}
+
+/// Decode an S2b receive sequence while discarding table-known unexpected keys
+/// before their values are interpreted.
+pub(crate) fn decode_s2b_receive_ie_sequence_with_evidence<'a>(
+    input: &'a [u8],
+    ctx: DecodeContext,
+    filter: IeDecodeFilter<'_>,
+    scoped_repeatable_limit: IeRepeatableLimit<'_>,
+) -> Result<DecodedIeSequence<'a>, DecodeError> {
+    let mut collector = DuplicateIeCollector::default();
+    let ies = decode_typed_ie_sequence_at(
+        input,
+        ctx,
+        IeSequencePosition::root(0),
+        IeDecodePolicy::scoped(filter, scoped_repeatable_limit),
+        &mut collector,
+    )?;
+    let (duplicate_evidence, omitted_duplicate_count) = collector.into_parts();
+    Ok(DecodedIeSequence {
+        ies,
+        duplicate_evidence,
+        omitted_duplicate_count,
+    })
 }
 
 /// Decode a sequence of GTPv2-C IEs into typed values with raw fallback,
@@ -2303,30 +2558,107 @@ pub(crate) fn decode_pgw_triggered_request_ie_sequence<'a>(
 fn decode_typed_ie_sequence_at<'a>(
     input: &'a [u8],
     ctx: DecodeContext,
-    depth: usize,
-    base_offset: usize,
-    pgw_triggered_request: bool,
+    position: IeSequencePosition,
+    policy: IeDecodePolicy<'_>,
+    duplicate_evidence: &mut DuplicateIeCollector,
 ) -> Result<Vec<TypedIe<'a>>, DecodeError> {
-    if depth > ctx.max_depth {
+    if position.depth > ctx.max_depth {
         return Err(
-            DecodeError::new(DecodeErrorCode::DepthExceeded, base_offset).with_spec_ref(spec_ref()),
+            DecodeError::new(DecodeErrorCode::DepthExceeded, position.base_offset)
+                .with_spec_ref(spec_ref()),
         );
     }
-    let mut ies = Vec::new();
-    let mut iter = RawIeIterator::new_at_offset(input, ctx, base_offset);
+    let mut ies: Vec<TypedIe<'a>> = Vec::new();
+    let mut seen = Vec::new();
+    let mut iter = RawIeIterator::new_at_offset(input, ctx, position.base_offset);
     loop {
         let offset = iter.offset();
         match iter.next() {
             Some(Ok(raw)) => {
-                let typed = TypedIe::decode_from_raw(raw, ctx, depth, offset)?;
+                if policy.filter.is_some_and(|filter| {
+                    !filter(
+                        raw.ie_type,
+                        raw.instance,
+                        position.depth,
+                        position.parent_ie,
+                    )
+                }) {
+                    continue;
+                }
+                let key = (raw.ie_type, raw.instance);
+                let first_offset = seen.iter().find_map(|(seen_key, first_offset)| {
+                    (*seen_key == key).then_some(*first_offset)
+                });
+                let repeatable_limit = match policy.scoped_repeatable_limit {
+                    Some(resolve) => resolve(
+                        raw.ie_type,
+                        raw.instance,
+                        position.depth,
+                        position.parent_ie,
+                    ),
+                    None => legacy_repeatable_limit(
+                        position.depth,
+                        raw.ie_type,
+                        raw.instance,
+                        policy.legacy_pgw_triggered_request,
+                    ),
+                };
+                if let Some(first_offset) = first_offset {
+                    if repeatable_limit.is_none() {
+                        match ctx.duplicate_ie_policy {
+                            DuplicateIePolicy::Reject => {
+                                return Err(DecodeError::new(DecodeErrorCode::DuplicateIe, offset)
+                                    .with_spec_ref(spec_ref()));
+                            }
+                            DuplicateIePolicy::First => {
+                                duplicate_evidence.record(
+                                    raw.ie_type,
+                                    raw.instance,
+                                    position.depth,
+                                    position.base_offset,
+                                    first_offset,
+                                );
+                                continue;
+                            }
+                            DuplicateIePolicy::Last => {}
+                        }
+                    } else if matches!(ctx.duplicate_ie_policy, DuplicateIePolicy::First)
+                        && repeatable_limit.is_some_and(|limit| {
+                            ies.iter()
+                                .filter(|ie| {
+                                    ie.ie_type() == raw.ie_type && ie.instance == raw.instance
+                                })
+                                .count()
+                                >= limit
+                        })
+                    {
+                        duplicate_evidence.record(
+                            raw.ie_type,
+                            raw.instance,
+                            position.depth,
+                            position.base_offset,
+                            first_offset,
+                        );
+                        continue;
+                    }
+                } else {
+                    seen.push((key, offset));
+                }
+
+                let typed = TypedIe::decode_from_raw_with_evidence(
+                    raw,
+                    ctx,
+                    position.depth,
+                    offset,
+                    policy,
+                    duplicate_evidence,
+                )?;
                 apply_duplicate_policy(
                     &mut ies,
                     typed,
                     ctx.duplicate_ie_policy,
-                    depth,
-                    offset,
-                    pgw_triggered_request,
-                )?;
+                    repeatable_limit.is_some(),
+                );
             }
             Some(Err(error)) => return Err(error),
             None => break,
@@ -2339,10 +2671,8 @@ fn apply_duplicate_policy<'a>(
     ies: &mut Vec<TypedIe<'a>>,
     typed: TypedIe<'a>,
     policy: DuplicateIePolicy,
-    depth: usize,
-    offset: usize,
-    pgw_triggered_request: bool,
-) -> Result<(), DecodeError> {
+    repeatable: bool,
+) {
     // TS 29.274 procedure tables explicitly use these type/instance pairs as
     // lists. Treating them as singleton duplicates would either discard
     // dedicated bearers under First/Last or reject conforming multi-bearer
@@ -2350,19 +2680,9 @@ fn apply_duplicate_policy<'a>(
     // Unknown IEs still follow the caller's duplicate policy: without a
     // dictionary entry, treating every unknown type as repeatable would
     // silently weaken `DuplicateIePolicy::Reject` for the whole crate.
-    let repeatable = depth == 0
-        && ((typed.ie_type() == IE_TYPE_BEARER_CONTEXT && typed.instance == 0)
-            || (typed.ie_type() == IE_TYPE_EBI && typed.instance == 1)
-            || (pgw_triggered_request
-                && matches!(
-                    (typed.ie_type(), typed.instance),
-                    (IE_TYPE_LOAD_CONTROL_INFORMATION, 1)
-                        | (IE_TYPE_OVERLOAD_CONTROL_INFORMATION, 0)
-                        | (IE_TYPE_PGW_CHANGE_INFO, 0)
-                )));
     if repeatable {
         ies.push(typed);
-        return Ok(());
+        return;
     }
 
     let duplicate = ies.iter().position(|existing| {
@@ -2370,19 +2690,36 @@ fn apply_duplicate_policy<'a>(
     });
 
     match duplicate {
-        Some(_) if matches!(policy, DuplicateIePolicy::Reject) => {
-            Err(DecodeError::new(DecodeErrorCode::DuplicateIe, offset).with_spec_ref(spec_ref()))
-        }
-        Some(_) if matches!(policy, DuplicateIePolicy::First) => Ok(()),
+        Some(_) if matches!(policy, DuplicateIePolicy::Reject | DuplicateIePolicy::First) => {}
         Some(index) => {
             ies.remove(index);
             ies.push(typed);
-            Ok(())
         }
         None => {
             ies.push(typed);
-            Ok(())
         }
+    }
+}
+
+fn legacy_repeatable_limit(
+    depth: usize,
+    ie_type: u8,
+    instance: u8,
+    pgw_triggered_request: bool,
+) -> Option<usize> {
+    if depth != 0 {
+        return None;
+    }
+    match (ie_type, instance) {
+        (IE_TYPE_BEARER_CONTEXT, 0) => Some(usize::MAX),
+        (IE_TYPE_EBI, 1) => Some(15),
+        (IE_TYPE_LOAD_CONTROL_INFORMATION, 1) if pgw_triggered_request => Some(10),
+        (IE_TYPE_OVERLOAD_CONTROL_INFORMATION, 0) if pgw_triggered_request => Some(11),
+        // Create, Update, and Delete Bearer Request each explicitly allow
+        // several outer PGW Change Info IEs. Session responses do not use this
+        // legacy request-only decoder and remain singleton in the scoped path.
+        (IE_TYPE_PGW_CHANGE_INFO, 0) if pgw_triggered_request => Some(usize::MAX),
+        _ => None,
     }
 }
 

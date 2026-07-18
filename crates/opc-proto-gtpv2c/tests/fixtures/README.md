@@ -87,47 +87,48 @@ reviewable without a binary viewer.
 
 | Offset | Octets | Field and spec basis |
 | --- | --- | --- |
-| 0 | `40` | Common header flags: version 2, no TEID (§5.1). |
+| 0 | `48` | Common header flags: version 2, TEID flag set (§5.1, Table 7.2.1-1). |
 | 1 | `20` | Message Type: Create Session Request in the common-header message-type field (§5.1). |
-| 2..3 | `00 9d` | Length: sequence/spare (4) + 153 octets of IEs, excluding first four octets (§5.1). |
-| 4..7 | `00 10 01 00` | Sequence number `0x001001`, spare 0 (§5.1). |
-| 8..11 | `01 00 08 00` | IMSI IE TLIV header: type 1, length 8, instance 0 (§8.2, §8.3.2). |
-| 12..19 | `00 01 01 21 43 65 87 f9` | IMSI `001010123456789` in TBCD with filler nibble (§8.3.2). |
-| 20..23 | `52 00 01 00` | RAT Type IE TLIV header (§8.2, §8.17). |
-| 24 | `03` | RAT Type: WLAN (§8.17). |
-| 25..28 | `53 00 03 00` | Serving Network IE TLIV header (§8.2, §8.18). |
-| 29..31 | `00 f1 10` | PLMN `001/01` in TBCD MCC/MNC order (§8.18). |
-| 32..35 | `57 00 19 00` | Sender F-TEID IE TLIV header (§8.2, §8.22). |
-| 36 | `ca` | F-TEID V4 + V6 flags set, interface type 10 (§8.22). |
-| 37..40 | `11 22 33 44` | F-TEID TEID/GRE key (§8.22). |
-| 41..44 | `c0 00 02 0a` | F-TEID IPv4 `192.0.2.10` (documentation prefix; §8.22). |
-| 45..60 | `20 01 0d b8 00 00 00 00 00 00 00 00 00 00 00 01` | F-TEID IPv6 `2001:db8::1` (documentation prefix; §8.22). |
-| 61..64 | `47 00 09 00` | APN IE TLIV header (§8.2, §8.6). |
-| 65..73 | `08 69 6e 74 65 72 6e 65 74` | Single APN label `internet` with one-octet label length (§8.6). |
-| 74..77 | `80 00 01 00` | Selection Mode IE TLIV header (§8.2, §8.58). |
-| 78 | `00` | MS or network provided APN, subscription verified (§8.58). |
-| 79..82 | `63 00 01 00` | PDN Type IE TLIV header (§8.2, §8.34). |
-| 83 | `01` | PDN Type: IPv4 (§8.34). |
-| 84..87 | `4f 00 05 00` | PAA IE TLIV header (§8.2, §8.14). |
-| 88..92 | `01 c6 33 64 07` | IPv4 PAA `198.51.100.7` (documentation prefix; §8.14). |
-| 93..96 | `5d 00 27 00` | Bearer Context grouped IE TLIV header (§8.2, §8.28). |
-| 97..101 | `49 00 01 00 05` | Nested EBI TLIV/value: EPS Bearer ID 5 (§8.2, §8.8, §8.28). |
-| 102..105 | `50 00 16 00` | Nested Bearer QoS IE TLIV header (§8.2, §8.15, §8.28). |
-| 106..107 | `49 01` | Bearer QoS ARP octet (PCI=1, PL=2, PVI=1, spare bits zero) and GBR QCI 1 (§8.15). |
-| 108..112 | `00 00 00 10 00` | Bearer QoS MBR uplink 4096 (§8.15). |
-| 113..117 | `00 00 00 20 00` | Bearer QoS MBR downlink 8192 (§8.15). |
-| 118..122 | `00 00 00 04 00` | Bearer QoS GBR uplink 1024 (§8.15). |
-| 123..127 | `00 00 00 08 00` | Bearer QoS GBR downlink 2048 (§8.15). |
-| 128..131 | `5e 00 04 00` | Nested Charging ID IE TLIV header (§8.2, §8.29, §8.28). |
-| 132..135 | `12 34 56 78` | Charging ID example value (§8.29). |
-| 136..139 | `4e 00 03 02` | PCO IE TLIV header, instance 2 (§8.2, §8.13). |
-| 140..142 | `80 21 00` | Opaque PCO bytes preserved by typed value (§8.13). |
-| 143..146 | `4d 00 02 00` | Indication IE TLIV header (§8.2, §8.12). |
-| 147..148 | `40 01` | Opaque Indication flags preserved by typed value (§8.12). |
-| 149..152 | `a3 00 03 01` | APCO IE TLIV header, instance 1 (§8.2, §8.104). |
-| 153..155 | `80 21 01` | Opaque APCO bytes preserved by typed value (§8.104). |
-| 156..159 | `fe 00 01 00` | Unsupported/private IE TLIV header retained by raw fallback (§8.2). |
-| 160 | `aa` | Unsupported/private IE value preserved byte-exact by raw fallback (§8.2). |
+| 2..3 | `00 a0` | Length: TEID/sequence/spare (8) + 152 octets of IEs, excluding first four octets (§5.1). |
+| 4..7 | `00 00 00 00` | Create Session Request header TEID 0 (§5.1, Table 7.2.1-1). |
+| 8..11 | `00 10 01 00` | Sequence number `0x001001`, spare 0 (§5.1). |
+| 12..15 | `01 00 08 00` | IMSI IE TLIV header: type 1, length 8, instance 0 (§8.2, §8.3.2). |
+| 16..23 | `00 01 01 21 43 65 87 f9` | IMSI `001010123456789` in TBCD with filler nibble (§8.3.2). |
+| 24..27 | `52 00 01 00` | RAT Type IE TLIV header (§8.2, §8.17). |
+| 28 | `03` | RAT Type: WLAN (§8.17). |
+| 29..32 | `53 00 03 00` | Serving Network IE TLIV header (§8.2, §8.18). |
+| 33..35 | `00 f1 10` | PLMN `001/01` in TBCD MCC/MNC order (§8.18). |
+| 36..39 | `57 00 19 00` | Sender F-TEID IE TLIV header, instance 0 (Table 7.2.1-1, §8.22). |
+| 40 | `de` | F-TEID V4 + V6 flags set, S2b ePDG GTP-C interface type 30 (§8.22, Table 8.22-1). |
+| 41..44 | `11 22 33 44` | F-TEID TEID/GRE key (§8.22). |
+| 45..48 | `c0 00 02 0a` | F-TEID IPv4 `192.0.2.10` (documentation prefix; §8.22). |
+| 49..64 | `20 01 0d b8 00 00 00 00 00 00 00 00 00 00 00 01` | F-TEID IPv6 `2001:db8::1` (documentation prefix; §8.22). |
+| 65..68 | `47 00 09 00` | APN IE TLIV header (§8.2, §8.6). |
+| 69..77 | `08 69 6e 74 65 72 6e 65 74` | Single APN label `internet` with one-octet label length (§8.6). |
+| 78..81 | `80 00 01 00` | Selection Mode IE TLIV header (§8.2, §8.58). |
+| 82 | `00` | MS or network provided APN, subscription verified (§8.58). |
+| 83..86 | `63 00 01 00` | PDN Type IE TLIV header (§8.2, §8.34). |
+| 87 | `01` | PDN Type: IPv4 (§8.34); retained pending the issue #335 profile migration. |
+| 88..91 | `4f 00 05 00` | PAA IE TLIV header (§8.2, §8.14). |
+| 92..96 | `01 c6 33 64 07` | IPv4 PAA `198.51.100.7` (documentation prefix; §8.14). |
+| 97..100 | `5d 00 2c 00` | Bearer Context-to-be-created grouped IE TLIV header, instance 0 (Table 7.2.1-1/-2, §8.28). |
+| 101..105 | `49 00 01 00 05` | Nested EBI TLIV/value: EPS Bearer ID 5 (Table 7.2.1-2, §8.8). |
+| 106..109 | `57 00 09 05` | Nested S2b-U ePDG F-TEID TLIV header, instance 5 (Table 7.2.1-2, §8.22). |
+| 110 | `9f` | V4 flag set, S2b-U ePDG GTP-U interface type 31 (§8.22, Table 8.22-1). |
+| 111..114 | `11 22 33 45` | User-plane TEID (§8.22). |
+| 115..118 | `c0 00 02 14` | User-plane IPv4 `192.0.2.20` (documentation prefix; §8.22). |
+| 119..122 | `50 00 16 00` | Nested Bearer QoS IE TLIV header (Table 7.2.1-2, §8.15). |
+| 123..124 | `49 01` | Bearer QoS ARP octet (PCI=1, PL=2, PVI=1, spare bits zero) and GBR QCI 1 (§8.15). |
+| 125..129 | `00 00 00 10 00` | Bearer QoS MBR uplink 4096 (§8.15). |
+| 130..134 | `00 00 00 20 00` | Bearer QoS MBR downlink 8192 (§8.15). |
+| 135..139 | `00 00 00 04 00` | Bearer QoS GBR uplink 1024 (§8.15). |
+| 140..144 | `00 00 00 08 00` | Bearer QoS GBR downlink 2048 (§8.15). |
+| 145..148 | `4d 00 02 00` | Indication IE TLIV header (§8.2, §8.12). |
+| 149..150 | `40 01` | Opaque Indication flags preserved by typed value (§8.12). |
+| 151..154 | `a3 00 03 00` | APCO IE TLIV header, Create Session Request instance 0 (Table 7.2.1-1, §8.104). |
+| 155..157 | `80 21 01` | Opaque APCO bytes preserved by typed value (§8.104). |
+| 158..161 | `fe 00 02 00` | IE Type Extension TLIV header: type 254, two-octet value, instance 0 (§8.2.1A). |
+| 162..163 | `01 00` | Extended IE type 256, raw-preserved because this typed subset does not interpret it (§8.2.1A). |
 
 ### `create_session_response_s2b_subset.bin`
 

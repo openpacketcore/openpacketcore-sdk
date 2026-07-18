@@ -2,10 +2,9 @@ use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
     S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
-    IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
-    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_MEI, IE_TYPE_PCO, IE_TYPE_RECOVERY,
-    INTERFACE_TYPE_S2B_EPDG_GTP_C, INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
-    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI,
+    IE_TYPE_INDICATION, IE_TYPE_MEI, IE_TYPE_RECOVERY, INTERFACE_TYPE_S2B_EPDG_GTP_C,
+    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -253,7 +252,7 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
     let fteid = find_ie(&view.ies, opc_proto_gtpv2c::IE_TYPE_F_TEID);
     match &fteid.value {
         TypedIeValue::FullyQualifiedTeid(value) => {
-            assert_eq!(value.interface_type, 0x0a);
+            assert_eq!(value.interface_type, INTERFACE_TYPE_S2B_EPDG_GTP_C);
             assert_eq!(value.teid, 0x1122_3344);
             assert_eq!(value.ipv4, Some([192, 0, 2, 10]));
             assert_eq!(
@@ -275,6 +274,17 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
                 TypedIeValue::EpsBearerId(value) => assert_eq!(value.value, 5),
                 other => panic!("unexpected EBI value: {other:?}"),
             }
+            let user_plane_fteid = find_ie(&context.members, IE_TYPE_F_TEID);
+            match &user_plane_fteid.value {
+                TypedIeValue::FullyQualifiedTeid(value) => {
+                    assert_eq!(user_plane_fteid.instance, 5);
+                    assert_eq!(value.interface_type, INTERFACE_TYPE_S2B_U_EPDG_GTP_U);
+                    assert_eq!(value.teid, 0x1122_3345);
+                    assert_eq!(value.ipv4, Some([192, 0, 2, 20]));
+                    assert_eq!(value.ipv6, None);
+                }
+                other => panic!("unexpected S2b-U ePDG F-TEID value: {other:?}"),
+            }
             let bearer_qos = find_ie(&context.members, IE_TYPE_BEARER_QOS);
             match &bearer_qos.value {
                 TypedIeValue::BearerQos(value) => {
@@ -287,23 +297,10 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
                 }
                 other => panic!("unexpected Bearer QoS value: {other:?}"),
             }
-            let charging_id = find_ie(&context.members, IE_TYPE_CHARGING_ID);
-            match &charging_id.value {
-                TypedIeValue::ChargingId(value) => assert_eq!(value.value, 0x1234_5678),
-                other => panic!("unexpected Charging ID value: {other:?}"),
-            }
         }
         other => panic!("unexpected Bearer Context value: {other:?}"),
     }
 
-    let pco = find_ie(&view.ies, IE_TYPE_PCO);
-    match &pco.value {
-        TypedIeValue::ProtocolConfigurationOptions(value) => {
-            assert_eq!(pco.instance, 2);
-            assert_eq!(value.value, [0x80, 0x21, 0x00]);
-        }
-        other => panic!("unexpected PCO value: {other:?}"),
-    }
     let indication = find_ie(&view.ies, IE_TYPE_INDICATION);
     match &indication.value {
         TypedIeValue::Indication(value) => assert_eq!(value.flags, [0x40, 0x01]),
@@ -312,7 +309,7 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
     let apco = find_ie(&view.ies, IE_TYPE_APCO);
     match &apco.value {
         TypedIeValue::AdditionalProtocolConfigurationOptions(value) => {
-            assert_eq!(apco.instance, 1);
+            assert_eq!(apco.instance, 0);
             assert_eq!(value.value, [0x80, 0x21, 0x01]);
         }
         other => panic!("unexpected APCO value: {other:?}"),
@@ -321,7 +318,7 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
     match &unsupported.value {
         TypedIeValue::Raw(raw) => {
             assert_eq!(raw.ie_type, 0xfe);
-            assert_eq!(raw.value, [0xaa]);
+            assert_eq!(raw.value, [0x01, 0x00]);
         }
         other => panic!("unexpected raw fallback value: {other:?}"),
     }

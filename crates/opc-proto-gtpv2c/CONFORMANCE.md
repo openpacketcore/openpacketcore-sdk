@@ -128,8 +128,28 @@ failures and must cover at least these rules:
   it. Malformed contexts are rejected rather than skipped.
 - F-TEID and PAA typed validation must reject ambiguous malformed address
   shapes instead of silently canonicalizing them.
-- Duplicate singleton IEs must be rejected according to the selected
-  `DecodeContext::duplicate_ie_policy`.
+- Structural and Strict typed IE decode honor the selected
+  `DecodeContext::duplicate_ie_policy`. ProcedureAware S2b receive follows TS
+  29.274 clause 7.7.10 instead: the first singleton key in each top-level or
+  grouped scope is retained, later occurrences are ignored, and bounded
+  `S2bReceiveDiagnostics` records only type, instance, scope/depth, first
+  offset, and a saturated duplicate count. A malformed or semantically invalid
+  first value remains an error and cannot be repaired by a later value.
+- ProcedureAware receive classifies every crate-known typed/control IE key
+  against one full-message grammar keyed by procedure, direction, and exact
+  enclosing Bearer Context instance before decoding its value. Unexpected
+  known type/instance combinations are discarded under clause 7.7.9, while
+  genuinely unknown optional keys remain raw-preserved. The same table entry
+  defines clause 7.7.10 cardinality, including instance-1 Bearer Context lists
+  and bounded PGW load/overload lists. Interface-specific S2b presence,
+  F-TEID role/type, and correlation checks remain owned by typed projections.
+  If discarding a key leaves a required expected key absent, the missing-key
+  error is retained. Canonical profile builders use a separate Reject policy
+  and do not emit duplicate singleton keys.
+- The current declared Create Session compatibility profile continues to
+  allow and require top-level PDN Type. Issue #335 owns the complete S2b
+  send-profile and PAA-constructor migration; this receive-policy change does
+  not pre-empt that table delta.
 
 ### Compatibility and API guarantees
 
@@ -144,7 +164,8 @@ failures and must cover at least these rules:
   crate.
 - Unknown well-formed top-level and nested optional IEs are preserved in order
   through the typed dedicated-bearer projections/builders. Unknown duplicate
-  IE keys still obey the caller's `DuplicateIePolicy`. Standardized Bearer
+  IE keys obey the caller's `DuplicateIePolicy` for Structural/Strict decode
+  and the first-wins receiver rule for ProcedureAware S2b decode. Standardized Bearer
   Context and dedicated-EBI lists are cardinality-aware, as are request-only
   Load Control Information instance 1 (up to ten), Overload Control
   Information instance 0 (one node plus up to ten APN entries), and PGW Change
@@ -369,11 +390,11 @@ The committed fixture corpus is split by provenance class:
   are the only GTPv2-C fixtures currently counted as conformance evidence:
   - Echo Request without TEID validates the no-TEID common-header shape and
     mandatory Recovery IE.
-  - Create Session Request without TEID validates mandatory S2b request
-    examples: IMSI, RAT Type, Serving Network, Sender F-TEID, APN, Selection
-    Mode, PDN Type, PAA, Bearer Context/EBI, nested Bearer QoS and Charging ID,
-    typed PCO, Indication, APCO, and raw fallback for an unsupported private
-    IE.
+  - Create Session Request with the T flag and TEID 0 validates mandatory S2b
+    request examples: IMSI, RAT Type, Serving Network, S2b ePDG control-plane
+    F-TEID, APN, Selection Mode, PDN Type, PAA, Bearer Context/EBI, nested
+    S2b-U ePDG F-TEID and Bearer QoS, Indication, APCO, and raw fallback for a
+    correctly framed extended IE type.
   - Create Session Response with TEID validates response Cause, Sender F-TEID,
     PAA, and Bearer Context examples.
   - Modify Bearer and Delete Session fixtures validate those session-oriented

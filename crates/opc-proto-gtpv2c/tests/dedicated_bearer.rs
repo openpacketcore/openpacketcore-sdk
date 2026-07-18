@@ -34,6 +34,8 @@ const RESPONSE_TEID: u32 = 0x5060_7080;
 const SEQUENCE: u32 = 0x01_0203;
 const UNKNOWN_TOP_VALUE: &[u8] = &[0xde, 0xad];
 const UNKNOWN_NESTED_VALUE: &[u8] = &[0xbe, 0xef];
+const PGW_CHANGE_INFO_ONE: &[u8] = &[74, 0, 4, 0, 192, 0, 2, 1];
+const PGW_CHANGE_INFO_TWO: &[u8] = &[74, 0, 4, 0, 192, 0, 2, 2];
 
 fn procedure_context() -> DecodeContext {
     DecodeContext {
@@ -2124,7 +2126,7 @@ fn canonical_builders_are_deterministic_for_bounded_context_counts() {
 }
 
 #[test]
-fn raw_unknown_duplicates_still_honor_reject_policy() {
+fn procedure_receive_uses_first_wins_for_unknown_singleton_keys() {
     let bytes = encode(&owned_message(
         DELETE_BEARER_REQUEST,
         Some(REQUEST_TEID),
@@ -2134,18 +2136,23 @@ fn raw_unknown_duplicates_still_honor_reject_policy() {
             raw_ie(245, 8, UNKNOWN_NESTED_VALUE),
         ],
     ));
-    assert!(S2bMessage::decode(&bytes, procedure_context()).is_err());
+    let (_, decoded) = S2bMessage::decode_with_diagnostics(&bytes, procedure_context())
+        .expect("ProcedureAware receive uses first-wins even when the key is an extension");
+    let evidence = decoded.diagnostics().duplicate_ies();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].ie_type(), 245);
+    assert_eq!(evidence[0].instance(), 8);
 }
 
 #[test]
-fn pgw_triggered_requests_preserve_bounded_standard_repeatable_ies_in_order() {
+fn pgw_triggered_requests_preserve_table_declared_repeatable_ies_in_order() {
     let repeatable = vec![
         raw_ie(IE_TYPE_LOAD_CONTROL_INFORMATION, 1, &[0x01]),
         raw_ie(IE_TYPE_OVERLOAD_CONTROL_INFORMATION, 0, &[0x02]),
-        raw_ie(IE_TYPE_PGW_CHANGE_INFO, 0, &[0x03]),
+        raw_ie(IE_TYPE_PGW_CHANGE_INFO, 0, PGW_CHANGE_INFO_ONE),
         raw_ie(IE_TYPE_LOAD_CONTROL_INFORMATION, 1, &[0x04]),
         raw_ie(IE_TYPE_OVERLOAD_CONTROL_INFORMATION, 0, &[0x05]),
-        raw_ie(IE_TYPE_PGW_CHANGE_INFO, 0, &[0x06]),
+        raw_ie(IE_TYPE_PGW_CHANGE_INFO, 0, PGW_CHANGE_INFO_TWO),
     ];
 
     let mut create = create_request(1, SEQUENCE);

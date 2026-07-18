@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **TS 29.274 singleton repetition — `opc-proto-gtpv2c`:** ProcedureAware S2b
+  receive now retains the first occurrence of each non-repeatable IE key per
+  exact top-level or Bearer-Context-instance scope, ignores later occurrences,
+  discards full-message-grammar-known unexpected type/instance keys before
+  interpreting their values, preserves unknown optional keys, and ignores
+  declared-list excess at its table bound. Interface-specific S2b roles remain
+  enforced by typed procedure projections.
+  `decode_with_diagnostics` exposes bounded redaction-safe duplicate metadata;
+  canonical builders remain strict and reject duplicate singleton input.
 - **BREAKING — fail-closed Diameter SCTP protection contract — `opc-sctp`:**
   the deprecated `DiameterSctpSecurity::Dtls` compatibility selector no longer
   maps ordinary SCTP payloads to PPID 47. It returns the typed
