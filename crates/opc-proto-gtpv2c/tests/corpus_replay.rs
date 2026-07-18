@@ -24,7 +24,12 @@ enum FixtureClass {
     Malformed,
 }
 
-const FUZZ_TARGETS: &[&str] = &["decode_message", "decode_s2b", "roundtrip"];
+const FUZZ_TARGETS: &[&str] = &[
+    "decode_message",
+    "decode_s2b",
+    "error_response_plans",
+    "roundtrip",
+];
 const FUZZ_SEED_PROVENANCE_DIRS: &[&str] = &["spec", "epdg-parity", "malformed"];
 const INDEPENDENT_EMPTY_README_MARKER: &str = "No independent GTPv2-C capture is committed yet.";
 const INDEPENDENT_METADATA_REQUIRED_KEYS: &[&str] = &[

@@ -19,7 +19,10 @@
   Delete Session, Update Bearer, Create Bearer, and Delete Bearer
   profile-owned request/response shapes. A bounded in-memory transaction
   registry provides generation-bound at-most-once dispatch and exact
-  committed-response replay for the three inbound triggered procedures.
+  committed-response replay for the three inbound triggered procedures. A
+  separate zero-allocation fixed-header inspector and bounded typed response
+  planner cover the Release 18 protocol-error response boundary without
+  retaining packet bodies or transaction state.
 
 ## S2b Production Profile v1 — Experimental Target Boundary
 
@@ -44,6 +47,48 @@ validation for these S2b procedure messages:
 | Update Bearer | Request (97), Response (98) | Mandatory APN-AMBR and one to fifteen request contexts; typed per-bearer TFT/QoS changes; mandatory correlated response contexts; message/bearer Cause hierarchy and partial acceptance. |
 | Create Bearer | Request (95), Response (96) | One or more correlated Bearer Contexts; typed Bearer TFT/QoS/Charging ID; S2b-U PGW/ePDG F-TEID instance and interface validation; message/bearer Cause hierarchy; partial acceptance. |
 | Delete Bearer | Request (99), Response (100) | Mutually exclusive linked/default-bearer and repeated dedicated-EBI request forms; correlated linked or per-bearer response form; partial failure. |
+
+### Protocol-error response boundary
+
+The error-response boundary is deliberately separate from full `Message` and
+`S2bMessage` decode. It claims these TS 29.274 Release 18 behaviors:
+
+- Fixed-header inspection allocates nothing and requires the exact eight-byte
+  no-TEID or twelve-byte TEID-present header before returning an answerable
+  envelope. It retains version, typed request/procedure, 24-bit sequence,
+  redacted TEID classification, optional Message Priority, and declared versus
+  actual datagram lengths; it never retains IE or packet bytes.
+- A complete higher unsupported version maps to header-only message type 3
+  using a checked locally supplied sequence. The received sequence is not
+  retained as correlation state. The typed continuation takes only the proven
+  unsupported-version envelope, so callers do not fabricate request-failure
+  evidence; a separate continuation accepts version-2 request envelopes plus
+  caller-owned decode/session failure evidence.
+- Known S2b requests map to the corresponding response type and copy the
+  request sequence. Invalid message length maps to Cause 67. Missing mandatory
+  and conditional IEs map to Causes 70 and 103; invalid mandatory/conditional
+  IE length maps to Cause 67; semantically incorrect mandatory/conditional IEs
+  map to Cause 69. IE failures encode only the standardized four-octet Type,
+  zero Length, and Instance identity in the Cause IE.
+- An unknown received non-zero session TEID is the only plan input that
+  produces Context Not Found with header TEID zero. Applying that failure to a
+  legitimate zero-TEID initial request is rejected as conflicting evidence.
+  Other protocol errors require either a caller-supplied non-zero remote TEID
+  or the explicit clause 5.5.2 no-lookup path. The latter uses TEID zero while
+  retaining the protocol-error Cause, so Context Not Found is unrepresentable
+  in that path.
+- Malformed Echo Request IEs map to Echo Response with the caller's local
+  Recovery value and no Cause IE. Incomplete headers, lower versions,
+  piggybacked messages, unknown message types, responses, malformed fixed
+  request header shapes, and Echo length mismatches produce no response plan.
+- Canonical output is at most 22 octets. Exact input/output lengths and the
+  TEID-zero decision are available before encoding, and `EncodeContext` bounds
+  fail before output is written. All TEID- and peer-bearing `Debug` surfaces
+  redact values.
+
+The caller retains responsibility for peer admission, reflection/rate-limit
+policy, UDP transport, session/remote-TEID lookup, transaction state, and the
+decision to send an otherwise standards-valid plan.
 
 ### Profile-owned IE families
 
@@ -355,15 +400,17 @@ coverage.
 
 9. **Fuzz shell**
    - `fuzz/Cargo.toml`, `fuzz/fuzz_targets/decode_message.rs`,
-     `fuzz/fuzz_targets/decode_s2b.rs`, and
+     `fuzz/fuzz_targets/decode_s2b.rs`,
+     `fuzz/fuzz_targets/error_response_plans.rs`, and
      `fuzz/fuzz_targets/roundtrip.rs` compile decode, typed S2b, owned-decode,
-     IE-iteration, and raw-preserving round-trip surfaces under cargo-fuzz.
-   - `fuzz/corpus/decode_message/`, `fuzz/corpus/decode_s2b/`, and
-     `fuzz/corpus/roundtrip/` are the target-specific seed directories used by
-     cargo-fuzz when the workflow runs `cargo +nightly fuzz run "$target"`
-     without explicit corpus arguments. Each directory contains a flat,
-     provenance-prefixed mirror of the committed spec, ePDG-parity, and
-     malformed seed files.
+     IE-iteration, reply-safe error planning/encoding, and raw-preserving
+     round-trip surfaces under cargo-fuzz.
+   - `fuzz/corpus/decode_message/`, `fuzz/corpus/decode_s2b/`,
+     `fuzz/corpus/error_response_plans/`, and `fuzz/corpus/roundtrip/` are the
+     target-specific seed directories used by cargo-fuzz when the workflow
+     runs `cargo +nightly fuzz run "$target"` without explicit corpus
+     arguments. Each directory contains a flat, provenance-prefixed mirror of
+     the committed spec, ePDG-parity, and malformed seed files.
    - Two legacy flat seeds, `fuzz/corpus/echo_request` and
      `fuzz/corpus/create_session_shell`, remain at the corpus root for backward
      compatibility and are replayed by the never-panic corpus test.
@@ -425,6 +472,11 @@ The committed fixture corpus is split by provenance class:
   - Delete Bearer Request validates repeated dedicated EBI instance-1 targets;
     Delete Bearer Response validates a partially accepted grouped result for
     every request EBI.
+  - `error_response_plans/*.hex` records independent hand-authored input and
+    expected-output octets for Version Not Supported, message/IE Invalid
+    Length, Context Not Found, missing/incorrect IE, Echo special handling,
+    and silent-discard cases. Tests parse these text fixtures and compare the
+    exact planned bytes rather than accepting codec round trips as evidence.
 
 - **Independent-capture fixtures** live in `tests/fixtures/independent/` once
   available. The replay harness requires a finalized metadata sidecar before any
@@ -441,8 +493,8 @@ The committed fixture corpus is split by provenance class:
   `fuzz/corpus/spec/`, `fuzz/corpus/epdg-parity/`, and
   `fuzz/corpus/malformed/`. Because cargo-fuzz uses one corpus directory per
   target by default, the same seed bytes are also copied into
-  `fuzz/corpus/decode_message/`, `fuzz/corpus/decode_s2b/`, and
-  `fuzz/corpus/roundtrip/` using names like
+  `fuzz/corpus/decode_message/`, `fuzz/corpus/decode_s2b/`,
+  `fuzz/corpus/error_response_plans/`, and `fuzz/corpus/roundtrip/` using names like
   `spec__echo_request_recovery.bin`. Scheduled fuzzing therefore starts each
   registered target from the same S2b conformance, parity, and malformed cases
   that `tests/corpus_replay.rs` replays deterministically; the replay test also

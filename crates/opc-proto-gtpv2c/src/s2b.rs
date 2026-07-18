@@ -2137,7 +2137,9 @@ pub const fn is_s2b_message_type(message_type: u8) -> bool {
     MessageType::from_u8(message_type).is_s2b()
 }
 
-fn procedure_and_direction(message_type: MessageType) -> Option<(Procedure, MessageDirection)> {
+pub(crate) fn procedure_and_direction(
+    message_type: MessageType,
+) -> Option<(Procedure, MessageDirection)> {
     match message_type {
         MessageType::EchoRequest => Some((Procedure::Echo, MessageDirection::Request)),
         MessageType::EchoResponse => Some((Procedure::Echo, MessageDirection::Response)),
@@ -2177,7 +2179,7 @@ fn procedure_and_direction(message_type: MessageType) -> Option<(Procedure, Mess
         MessageType::DeleteBearerResponse => {
             Some((Procedure::DeleteBearer, MessageDirection::Response))
         }
-        MessageType::Unknown(_) => None,
+        MessageType::VersionNotSupportedIndication | MessageType::Unknown(_) => None,
     }
 }
 

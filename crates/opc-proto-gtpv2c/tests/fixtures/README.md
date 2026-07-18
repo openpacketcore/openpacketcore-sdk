@@ -146,6 +146,36 @@ says PDN Type is never sent on S2a/S2b, while PAA carries the requested family.
 | `create_session_request_s2b_non_ip.bin` | `00 4d` | 67..71: `4f 00 01 00 04` | 72..80 | Non-IP type 4 with no PDN Address and Prefix octets (§8.14). |
 | `create_session_request_s2b_ethernet.bin` | `00 4d` | 67..71: `4f 00 01 00 05` | 72..80 | Ethernet type 5 with no PDN Address and Prefix octets (§8.14). |
 
+### GTPv2-C protocol-error response plans
+
+`spec/error_response_plans/*.hex` are text-encoded, hand-authored octets kept
+independent of the production encoder. Tests parse each whitespace-separated
+hex octet and compare planned output byte-for-byte. Addresses, TEIDs, sequence
+numbers, and payload values use documentation-only synthetic values. These are
+spec-authored conformance fixtures, not captures from an independent peer.
+
+| Fixture | Exact wire intent and TS 29.274 Release 18 basis |
+| --- | --- |
+| `unsupported_version_request.hex` | Complete twelve-octet version-3/T=1 input with received sequence `aa bb cc`; §7.7.2 makes it answerable with message 3. |
+| `version_not_supported_response.hex` | `40 03 00 04 01 02 03 00`: header-only type 3, T=0, local sequence `01 02 03`, Length 4 (§5.3, §7.1.3). |
+| `too_short_common_header.hex` | Seven octets for a T=1 request; insufficient for the required twelve-octet header and silently discarded (§7.7.3). |
+| `length_mismatch_create_session_request.hex` | Complete Create Session Request header declares 12 total octets but the datagram has a thirteenth octet (§7.7.3). |
+| `invalid_length_create_session_response_remote.hex` | Type 33, copied request sequence, caller-supplied remote TEID `11223344`, and six-octet Cause IE value 67. |
+| `invalid_length_create_session_response_no_lookup.hex` | Same protocol error with clause 5.5.2 optional no-lookup TEID zero; Cause remains 67, never Context Not Found. |
+| `unknown_teid_delete_session_request.hex` | Length-consistent type 36 request with synthetic non-zero received TEID and linked EBI. |
+| `context_not_found_delete_session_response.hex` | Type 37, copied request sequence, header TEID zero, and Cause 64 for an unknown received session TEID (§5.5.2, §8.4). |
+| `missing_mandatory_create_session_request.hex` | Length-consistent type 32 envelope used with caller evidence that APN type 71/instance 0 is missing (§7.7.6). |
+| `missing_mandatory_create_session_response.hex` | Type 33 with Cause 70 and offending field `47 00 00 00` (type 71, zero Length, instance 0; §8.4). |
+| `missing_conditional_create_session_response.hex` | Type 33 with Cause 103 and offending field `4d 00 00 00` (Indication type 77/instance 0; §7.7.6, §8.4). |
+| `invalid_ie_length_modify_bearer_request.hex` | Type 34 with a malformed Bearer Context used as caller-confirmed invalid mandatory IE length (§7.7.7). |
+| `invalid_ie_length_modify_bearer_response.hex` | Type 35 with Cause 67 and offending field `5d 00 00 00` for Bearer Context type 93/instance 0. |
+| `incorrect_ie_delete_session_request.hex` | Type 36 carrying reserved EBI value zero, used as caller-confirmed semantic failure (§7.7.8). |
+| `incorrect_ie_delete_session_response.hex` | Type 37 with Cause 69 and offending field `49 00 00 00` for EBI type 73/instance 0. |
+| `malformed_echo_request.hex` | Echo Request with a two-octet Recovery value; §7.1.2 requires ignoring the erroneous IE and sending Echo Response. |
+| `echo_response.hex` | T=0 type 2 with copied request sequence and local one-octet Recovery IE; no Cause is present. |
+| `length_mismatch_response.hex` | Type 35 response with inconsistent datagram/header length; silently discarded under §7.7.3. |
+| `unknown_message.hex` | Complete version-2/T=1 header with unknown type 254; silently discarded under §7.7.4. |
+
 ### `create_session_response_s2b_subset.bin`
 
 | Offset | Octets | Field and spec basis |
