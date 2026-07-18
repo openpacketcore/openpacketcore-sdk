@@ -190,8 +190,9 @@ pub use protected_payload_crypto::{
     seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng, seal_ikev2_sa_init_protected_payload,
     seal_ikev2_sa_init_protected_payload_with_iv_counter, Ikev2AesGcmExplicitIvCounter,
     Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadCryptoErrorCode,
-    Ikev2ProtectedPayloadDirection, Ikev2SaInitProtectedPayloadProvider,
-    ProtectedPayloadSealContext, IKEV2_AES_CBC_IV_LEN, IKEV2_AES_GCM_EXPLICIT_IV_LEN,
+    Ikev2ProtectedPayloadDirection, Ikev2ProtectedPayloadOpenError,
+    Ikev2SaInitProtectedPayloadProvider, ProtectedPayloadSealContext, IKEV2_AES_CBC_IV_LEN,
+    IKEV2_AES_GCM_EXPLICIT_IV_LEN,
 };
 pub use sa_init::{
     build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response,

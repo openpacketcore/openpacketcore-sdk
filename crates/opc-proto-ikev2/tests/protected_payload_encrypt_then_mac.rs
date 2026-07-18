@@ -8,7 +8,8 @@ use opc_proto_ikev2::{
     seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector,
     seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng, seal_ikev2_sa_init_protected_payload,
     Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm,
-    Ikev2ProtectedPayloadCryptoErrorCode, Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile,
+    Ikev2ProtectedPayloadCryptoError, Ikev2ProtectedPayloadCryptoErrorCode,
+    Ikev2ProtectedPayloadDirection, Ikev2ProtectedPayloadOpenError, Ikev2SaInitCryptoProfile,
     Ikev2SaInitKeyMaterial, Ikev2SaInitProtectedPayloadProvider, Message, ProtectedPayloadKind,
     ProtectedPayloadOpenError, ProtectedPayloadSealContext,
 };
@@ -131,7 +132,7 @@ fn open(
     profile: Ikev2SaInitCryptoProfile,
     material: &Ikev2SaInitKeyMaterial,
     direction: Ikev2ProtectedPayloadDirection,
-) -> Result<Vec<opc_proto_ikev2::OpenedProtectedPayload>, ProtectedPayloadOpenError> {
+) -> Result<Vec<opc_proto_ikev2::OpenedProtectedPayload>, Ikev2ProtectedPayloadOpenError> {
     let (tail, decoded) = Message::decode(encoded, DecodeContext::default())
         .expect("synthetic protected message decodes");
     assert!(tail.is_empty());
@@ -139,7 +140,7 @@ fn open(
     open_protected_payloads(&decoded, encoded, DecodeContext::default(), &provider)
 }
 
-fn provider_error(error: &ProtectedPayloadOpenError) -> &str {
+fn provider_error(error: &Ikev2ProtectedPayloadOpenError) -> &Ikev2ProtectedPayloadCryptoError {
     match error {
         ProtectedPayloadOpenError::ProviderRejected(failure) => &failure.provider_error,
         other => panic!("expected provider rejection, got {other:?}"),
@@ -422,8 +423,9 @@ fn aes_gcm_192_is_executable_and_skf_uses_fragment_prefix_as_aad() {
     .expect_err("authenticated SKF fragment metadata tamper must fail");
     assert_eq!(
         provider_error(&error),
-        "IKEv2 protected payload authentication failed"
+        &Ikev2ProtectedPayloadCryptoError::AuthenticationFailed
     );
+    assert_eq!(error.as_str(), "ike_protected_payload_provider_rejected");
 }
 
 #[test]
@@ -506,8 +508,9 @@ fn cbc_skf_roundtrips_and_authenticates_fragment_metadata() {
     .expect_err("CBC SKF metadata tamper must fail");
     assert_eq!(
         provider_error(&error),
-        "IKEv2 protected payload authentication failed"
+        &Ikev2ProtectedPayloadCryptoError::AuthenticationFailed
     );
+    assert_eq!(error.as_str(), "ike_protected_payload_provider_rejected");
 }
 
 #[test]
@@ -536,7 +539,7 @@ fn cbc_authenticates_before_decrypt_and_rejects_wrong_direction_and_lengths() {
         .expect_err("CBC protected field corruption must fail");
         assert_eq!(
             provider_error(&error),
-            "IKEv2 protected payload authentication failed"
+            &Ikev2ProtectedPayloadCryptoError::AuthenticationFailed
         );
     }
 
@@ -549,7 +552,7 @@ fn cbc_authenticates_before_decrypt_and_rejects_wrong_direction_and_lengths() {
     .expect_err("wrong directional keys must fail");
     assert_eq!(
         provider_error(&wrong_direction),
-        "IKEv2 protected payload authentication failed"
+        &Ikev2ProtectedPayloadCryptoError::AuthenticationFailed
     );
 
     let prefix = protected_prefix(
@@ -572,7 +575,13 @@ fn cbc_authenticates_before_decrypt_and_rejects_wrong_direction_and_lengths() {
         Ikev2ProtectedPayloadDirection::InitiatorToResponder,
     )
     .expect_err("non-block-aligned CBC ciphertext must fail");
-    assert!(provider_error(&error).starts_with("invalid IKEv2 protected payload ciphertext length"));
+    assert_eq!(
+        provider_error(&error),
+        &Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+            block_len: 16,
+            actual: 17,
+        }
+    );
 
     let truncated_iv_prefix = protected_prefix(
         ProtectedPayloadKind::Encrypted,
@@ -591,23 +600,77 @@ fn cbc_authenticates_before_decrypt_and_rejects_wrong_direction_and_lengths() {
     .expect_err("truncated CBC IV must fail");
     assert_eq!(
         provider_error(&error),
-        "invalid IKEv2 protected payload IV length: expected 16, actual 8"
+        &Ikev2ProtectedPayloadCryptoError::InvalidIvLength {
+            expected: 16,
+            actual: 8,
+        }
     );
 }
 
 #[test]
-fn authenticated_invalid_cbc_padding_is_rejected_without_an_oracle() {
+fn cbc_open_preserves_typed_failures_with_uniform_outer_rejection() {
     let profile = cbc_profile(
         Ikev2EncryptionAlgorithm::AesCbc256,
         Ikev2IntegrityAlgorithm::HmacSha2_512_256,
     );
     let material = established_material(profile);
-    let prefix = protected_prefix(
+
+    let valid_body_len =
+        ikev2_aes_cbc_protected_body_len(profile, INNER_PAYLOAD.len()).expect("CBC body length");
+    let valid_prefix = protected_prefix(
+        ProtectedPayloadKind::Encrypted,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        valid_body_len,
+        None,
+        12,
+    );
+    let valid_body = seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector(
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        ProtectedPayloadSealContext {
+            kind: ProtectedPayloadKind::Encrypted,
+            message_prefix: &valid_prefix,
+        },
+        &INNER_PAYLOAD,
+        CBC_IV,
+    )
+    .expect("valid CBC body seals");
+    let mut corrupted_icv = message(&valid_prefix, &valid_body);
+    *corrupted_icv
+        .last_mut()
+        .expect("synthetic CBC message has an ICV") ^= 1;
+    let authentication_error = open(
+        &corrupted_icv,
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+    )
+    .expect_err("corrupted CBC ICV must fail");
+
+    let malformed_body = [0_u8; 65];
+    let malformed_prefix = protected_prefix(
+        ProtectedPayloadKind::Encrypted,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+        malformed_body.len(),
+        None,
+        13,
+    );
+    let malformed = message(&malformed_prefix, &malformed_body);
+    let length_error = open(
+        &malformed,
+        profile,
+        &material,
+        Ikev2ProtectedPayloadDirection::InitiatorToResponder,
+    )
+    .expect_err("non-block-aligned CBC ciphertext must fail");
+
+    let invalid_padding_prefix = protected_prefix(
         ProtectedPayloadKind::Encrypted,
         Ikev2ProtectedPayloadDirection::InitiatorToResponder,
         64,
         None,
-        12,
+        14,
     );
     let mut invalid_plaintext = [0_u8; 16];
     invalid_plaintext[15] = 0xff;
@@ -619,19 +682,50 @@ fn authenticated_invalid_cbc_padding_is_rejected_without_an_oracle() {
     body.extend_from_slice(&CBC_IV);
     body.extend_from_slice(&invalid_plaintext);
     let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(material.sk_ai()).expect("test HMAC key");
-    mac.update(&prefix);
+    mac.update(&invalid_padding_prefix);
     mac.update(&body);
     body.extend_from_slice(&mac.finalize().into_bytes()[..32]);
-    let encoded = message(&prefix, &body);
+    let invalid_padding = message(&invalid_padding_prefix, &body);
 
-    let error = open(
-        &encoded,
+    let padding_error = open(
+        &invalid_padding,
         profile,
         &material,
         Ikev2ProtectedPayloadDirection::InitiatorToResponder,
     )
     .expect_err("authenticated invalid IKE padding must fail");
-    assert!(provider_error(&error).starts_with("invalid IKEv2 protected payload padding"));
+
+    assert_eq!(
+        provider_error(&authentication_error),
+        &Ikev2ProtectedPayloadCryptoError::AuthenticationFailed
+    );
+    assert_eq!(
+        provider_error(&length_error),
+        &Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+            block_len: 16,
+            actual: 17,
+        }
+    );
+    assert_eq!(
+        provider_error(&padding_error),
+        &Ikev2ProtectedPayloadCryptoError::InvalidPadding {
+            plaintext_len: 16,
+            pad_len: 255,
+        }
+    );
+
+    for error in [&authentication_error, &length_error, &padding_error] {
+        assert_eq!(
+            error.as_str(),
+            "ike_protected_payload_provider_rejected",
+            "peer-visible handling must use the uniform outer rejection"
+        );
+        assert_eq!(
+            error.to_string(),
+            "IKE protected payload provider rejected",
+            "outer display text must not expose the typed failure"
+        );
+    }
 }
 
 #[test]

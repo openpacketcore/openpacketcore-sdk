@@ -9,12 +9,14 @@ use opc_proto_ikev2::{
     open_protected_payloads, seal_ikev2_sa_init_aes_cbc_protected_payload, Ikev2DhGroup,
     Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2IkeAuthPayloadBuild,
     Ikev2IntegrityAlgorithm, Ikev2KeyExchangePayload, Ikev2KeyExchangePayloadBuild,
-    Ikev2NoncePayload, Ikev2NoncePayloadBuild, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadDirection,
-    Ikev2SaInitCryptoProfile, Ikev2SaInitNegotiationError, Ikev2SaInitNegotiationPolicy,
-    Ikev2SaInitPayloads, Ikev2SaInitProtectedPayloadProvider, Ikev2SaInitResponsePayloads,
-    Ikev2SaPayload, Ikev2SaProposal, Ikev2SaTransform, Ikev2TransformAttribute,
-    Ikev2TransformAttributeValue, Message, PayloadType, ProtectedPayloadKind,
-    ProtectedPayloadOpenError, ProtectedPayloadSealContext, EXCHANGE_TYPE_IKE_AUTH,
+    Ikev2NoncePayload, Ikev2NoncePayloadBuild, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
+    Ikev2ProtectedPayloadCryptoErrorCode, Ikev2ProtectedPayloadDirection,
+    Ikev2ProtectedPayloadOpenError, Ikev2SaInitCryptoProfile, Ikev2SaInitNegotiationError,
+    Ikev2SaInitNegotiationPolicy, Ikev2SaInitPayloads, Ikev2SaInitProtectedPayloadProvider,
+    Ikev2SaInitResponsePayloads, Ikev2SaPayload, Ikev2SaProposal, Ikev2SaTransform,
+    Ikev2TransformAttribute, Ikev2TransformAttributeValue, Message, PayloadType,
+    ProtectedPayloadKind, ProtectedPayloadOpenError, ProtectedPayloadSealContext,
+    EXCHANGE_TYPE_IKE_AUTH,
 };
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 use rand::{rngs::SysRng, TryRng};
@@ -170,7 +172,7 @@ fn open_protected_message(
     profile: Ikev2SaInitCryptoProfile,
     material: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
     direction: Ikev2ProtectedPayloadDirection,
-) -> Result<Vec<opc_proto_ikev2::OpenedProtectedPayload>, ProtectedPayloadOpenError> {
+) -> Result<Vec<opc_proto_ikev2::OpenedProtectedPayload>, Ikev2ProtectedPayloadOpenError> {
     let (tail, message) = Message::decode(bytes, DecodeContext::default())
         .expect("synthetic outer protected message decodes");
     assert!(tail.is_empty());
@@ -178,7 +180,7 @@ fn open_protected_message(
     open_protected_payloads(&message, bytes, DecodeContext::default(), &provider)
 }
 
-fn provider_error(error: &ProtectedPayloadOpenError) -> &str {
+fn provider_error(error: &Ikev2ProtectedPayloadOpenError) -> &Ikev2ProtectedPayloadCryptoError {
     match error {
         ProtectedPayloadOpenError::ProviderRejected(failure) => &failure.provider_error,
         other => panic!("expected protected-payload provider rejection, got {other:?}"),
@@ -504,7 +506,7 @@ fn capture_shaped_responder_proof_reaches_bidirectional_protected_ike_auth() {
         .expect_err("header, IV, ciphertext, and ICV corruption must fail");
         assert_eq!(
             provider_error(&error),
-            "IKEv2 protected payload authentication failed"
+            &Ikev2ProtectedPayloadCryptoError::AuthenticationFailed
         );
     }
     let wrong_direction = open_protected_message(
@@ -516,7 +518,7 @@ fn capture_shaped_responder_proof_reaches_bidirectional_protected_ike_auth() {
     .expect_err("wrong-direction keys must fail");
     assert_eq!(
         provider_error(&wrong_direction),
-        "IKEv2 protected payload authentication failed"
+        &Ikev2ProtectedPayloadCryptoError::AuthenticationFailed
     );
 
     let mut malformed_length = protected_request.clone();
@@ -533,7 +535,10 @@ fn capture_shaped_responder_proof_reaches_bidirectional_protected_ike_auth() {
         Ikev2ProtectedPayloadDirection::InitiatorToResponder,
     )
     .expect_err("non-block-aligned ciphertext must fail safely");
-    assert!(provider_error(&error).starts_with("invalid IKEv2 protected payload ciphertext length"));
+    assert_eq!(
+        provider_error(&error).code(),
+        Ikev2ProtectedPayloadCryptoErrorCode::InvalidCiphertextLength
+    );
 
     let mut invalid_padding = protected_request.clone();
     let icv_len = selection.profile().integrity_icv_len();
@@ -558,7 +563,10 @@ fn capture_shaped_responder_proof_reaches_bidirectional_protected_ike_auth() {
         Ikev2ProtectedPayloadDirection::InitiatorToResponder,
     )
     .expect_err("authenticated invalid padding must fail safely");
-    assert!(provider_error(&error).starts_with("invalid IKEv2 protected payload padding"));
+    assert_eq!(
+        provider_error(&error).code(),
+        Ikev2ProtectedPayloadCryptoErrorCode::InvalidPadding
+    );
 
     let mut sa_init_response_cache = Some(response_bytes.clone());
     let mut responder_material_allocations = 1_u8;

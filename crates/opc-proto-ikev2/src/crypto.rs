@@ -77,7 +77,12 @@ impl fmt::Debug for ProtectedPayloadContext<'_> {
 /// @req REQ-IETF-RFC7296-3.14-CRYPTO-BOUNDARY-004
 /// @conformance boundary-only
 pub trait CryptoProvider {
-    /// Provider-specific error type; keep it redaction-safe for logs.
+    /// Provider-specific error type.
+    ///
+    /// [`open_protected_payloads`] preserves this value unchanged inside
+    /// [`ProtectedPayloadOpenFailure`] so local callers can use typed error
+    /// codes without parsing text. The outer failure never formats this value;
+    /// callers that inspect it remain responsible for redaction.
     type Error;
 
     /// Authenticate and decrypt a protected IKEv2 payload body.
@@ -123,14 +128,15 @@ impl fmt::Debug for OpenedProtectedPayload {
 
 /// Redaction-safe provider failure evidence for one protected payload.
 ///
-/// The provider error string is included because the provider owns the
-/// redaction contract for its error type.
+/// The provider error is preserved as its original type so callers can map
+/// stable provider-specific error codes without parsing text. This wrapper's
+/// `Debug` and the outer error's `Display` never format that value.
 ///
 /// @spec IETF RFC7296 3.14
 /// @req REQ-IETF-RFC7296-3.14-CRYPTO-BOUNDARY-006
 /// @conformance boundary-only
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProtectedPayloadOpenFailure {
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProtectedPayloadOpenFailure<E = String> {
     /// Protected-payload kind whose provider open failed.
     pub kind: ProtectedPayloadKind,
     /// Byte offset of the protected generic payload from the payload region.
@@ -139,8 +145,21 @@ pub struct ProtectedPayloadOpenFailure {
     pub protected_body_len: usize,
     /// First inner payload type reported by the protected generic header.
     pub first_inner_payload: PayloadType,
-    /// Redaction-safe provider error text.
-    pub provider_error: String,
+    /// Original provider error; inspect only within the caller's redaction policy.
+    pub provider_error: E,
+}
+
+impl<E> fmt::Debug for ProtectedPayloadOpenFailure<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtectedPayloadOpenFailure")
+            .field("kind", &self.kind)
+            .field("offset", &self.offset)
+            .field("protected_body_len", &self.protected_body_len)
+            .field("first_inner_payload", &self.first_inner_payload)
+            .field("provider_error", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Error returned while locating or opening IKEv2 protected payloads.
@@ -148,8 +167,8 @@ pub struct ProtectedPayloadOpenFailure {
 /// @spec IETF RFC7296 3.14
 /// @req REQ-IETF-RFC7296-3.14-CRYPTO-BOUNDARY-007
 /// @conformance boundary-only
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProtectedPayloadOpenError {
+#[derive(Clone, PartialEq, Eq)]
+pub enum ProtectedPayloadOpenError<E = String> {
     /// Caller did not supply the exact outer IKE message length.
     MessageBytesLength {
         /// Expected complete IKE message length.
@@ -162,11 +181,36 @@ pub enum ProtectedPayloadOpenError {
     /// The generic payload chain could not be walked under the supplied decode context.
     PayloadDecode(DecodeError),
     /// The caller-owned provider rejected one protected payload.
-    ProviderRejected(ProtectedPayloadOpenFailure),
+    ProviderRejected(ProtectedPayloadOpenFailure<E>),
 }
 
-impl ProtectedPayloadOpenError {
-    /// Stable machine-readable error code.
+impl<E> fmt::Debug for ProtectedPayloadOpenError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MessageBytesLength { expected, actual } => formatter
+                .debug_struct("MessageBytesLength")
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+            Self::MessagePayloadBytesMismatch => formatter.write_str("MessagePayloadBytesMismatch"),
+            Self::PayloadDecode(error) => {
+                formatter.debug_tuple("PayloadDecode").field(error).finish()
+            }
+            Self::ProviderRejected(failure) => formatter
+                .debug_tuple("ProviderRejected")
+                .field(failure)
+                .finish(),
+        }
+    }
+}
+
+impl<E> ProtectedPayloadOpenError<E> {
+    /// Stable outer-boundary machine-readable error code.
+    ///
+    /// Every provider rejection intentionally retains the same outer code.
+    /// Local callers can inspect the typed
+    /// [`ProtectedPayloadOpenFailure::provider_error`] for diagnostics while
+    /// keeping their peer-visible rejection behavior uniform.
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::MessageBytesLength { .. } => {
@@ -179,7 +223,7 @@ impl ProtectedPayloadOpenError {
     }
 }
 
-impl fmt::Display for ProtectedPayloadOpenError {
+impl<E> fmt::Display for ProtectedPayloadOpenError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MessageBytesLength { expected, actual } => {
@@ -194,22 +238,18 @@ impl fmt::Display for ProtectedPayloadOpenError {
             Self::PayloadDecode(error) => {
                 write!(f, "IKE protected payload decode failed: {error}")
             }
-            Self::ProviderRejected(failure) => {
-                write!(
-                    f,
-                    "IKE protected payload provider rejected {:?} at offset {}: {}",
-                    failure.kind, failure.offset, failure.provider_error
-                )
-            }
+            Self::ProviderRejected(_) => f.write_str("IKE protected payload provider rejected"),
         }
     }
 }
 
-impl Error for ProtectedPayloadOpenError {
+impl<E> Error for ProtectedPayloadOpenError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::PayloadDecode(error) => Some(error),
-            _ => None,
+            Self::MessageBytesLength { .. }
+            | Self::MessagePayloadBytesMismatch
+            | Self::ProviderRejected(_) => None,
         }
     }
 }
@@ -228,16 +268,18 @@ impl Error for ProtectedPayloadOpenError {
 ///
 /// Returns [`ProtectedPayloadOpenError`] when the supplied message bytes do not
 /// match the decoded message, when payload-chain iteration fails, or when the
-/// caller-owned provider rejects a protected payload.
+/// caller-owned provider rejects a protected payload. Provider errors are
+/// preserved by value; callers must keep peer-visible rejection behavior
+/// uniform rather than exposing provider-specific structural, authentication,
+/// or authenticated-padding details.
 pub fn open_protected_payloads<P>(
     message: &Message<'_>,
     message_bytes: &[u8],
     ctx: DecodeContext,
     provider: &P,
-) -> Result<Vec<OpenedProtectedPayload>, ProtectedPayloadOpenError>
+) -> Result<Vec<OpenedProtectedPayload>, ProtectedPayloadOpenError<P::Error>>
 where
     P: CryptoProvider,
-    P::Error: fmt::Display,
 {
     validate_message_bytes(message, message_bytes)?;
 
@@ -262,7 +304,7 @@ where
                     offset: payload.offset,
                     protected_body_len: payload.body.len(),
                     first_inner_payload: payload.next_payload,
-                    provider_error: error.to_string(),
+                    provider_error: error,
                 })
             })?;
         opened.push(OpenedProtectedPayload {
@@ -277,10 +319,10 @@ where
     Ok(opened)
 }
 
-fn validate_message_bytes(
+fn validate_message_bytes<E>(
     message: &Message<'_>,
     message_bytes: &[u8],
-) -> Result<(), ProtectedPayloadOpenError> {
+) -> Result<(), ProtectedPayloadOpenError<E>> {
     let payload_len = message.payloads.bytes().len();
     let declared = HEADER_LEN.checked_add(payload_len).ok_or(
         ProtectedPayloadOpenError::MessageBytesLength {
