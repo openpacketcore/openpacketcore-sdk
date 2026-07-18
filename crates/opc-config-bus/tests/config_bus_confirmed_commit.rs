@@ -133,14 +133,14 @@ async fn slow_append_arms_rollback_from_the_persisted_absolute_deadline() {
 
     tokio::time::timeout(Duration::from_millis(600), async {
         loop {
-            if store.inner.history().await.len() == 3 {
+            if store.inner.history().await.len() == 3 && bus.load().name == "initial" {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("rollback fires from the pre-append persisted deadline");
+    .expect("rollback persists and publishes from the pre-append persisted deadline");
     assert_eq!(bus.load().name, "initial");
 }
 
