@@ -111,7 +111,9 @@ pub enum DurableReadinessState {
     Ready,
     /// Openraft could not complete the barrier before the operation deadline.
     NoQuorum,
-    /// The coordinator was not built from an admitted topology.
+    /// The coordinator was not built from an admitted topology, or production
+    /// topology evidence was absent, non-production, not yet valid, expired, or
+    /// bound to another immutable configuration.
     TopologyInvalid,
     /// Conflicting or unrepairable durable state requires recovery action.
     RecoveryRequired,
@@ -125,6 +127,27 @@ impl DurableReadinessState {
             Self::NoQuorum => "no_quorum",
             Self::TopologyInvalid => "topology_invalid",
             Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
+/// Authority scope carried by a durable-readiness report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DurableReadinessScope {
+    /// Openraft engine evidence without authenticated platform topology.
+    EngineOnly,
+    /// Result produced by the gate that requires production platform
+    /// attestation, including a typed failure from that gate.
+    ProductionTopologyAttested,
+}
+
+impl DurableReadinessScope {
+    /// Stable low-cardinality scope code suitable for health responses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EngineOnly => "engine-only",
+            Self::ProductionTopologyAttested => "production-topology-attested",
         }
     }
 }
@@ -224,12 +247,22 @@ impl ReplicaReadinessObservation {
 
 /// Fresh quorum evidence returned by a replicated session store.
 ///
+/// This is the shared result shape for both the engine/lab probe and the
+/// production topology-attested probe. [`Self::scope`] makes that distinction
+/// machine-readable. A `Ready` report from
+/// [`crate::ConsensusSessionStore::probe_durable_readiness`] proves the
+/// Openraft barrier only and MUST NOT authorize production traffic. Production
+/// traffic must use
+/// [`crate::ConsensusSessionStore::probe_production_durable_readiness`] and
+/// require [`Self::is_production_traffic_ready`].
+///
 /// This report is a point-in-time observation, not a lease and not a promise
 /// that a later operation will succeed. Authoritative operations independently
 /// repeat the same fail-closed quorum assessment.
-#[must_use = "durable readiness evidence must be checked before opening traffic"]
+#[must_use = "durable readiness evidence must be inspected"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableReadinessReport {
+    scope: DurableReadinessScope,
     state: DurableReadinessState,
     configured_voters: usize,
     fresh_reachable_voters: usize,
@@ -258,6 +291,7 @@ impl DurableReadinessReport {
             }
         };
         Self {
+            scope: DurableReadinessScope::EngineOnly,
             state,
             configured_voters,
             fresh_reachable_voters,
@@ -277,17 +311,45 @@ impl DurableReadinessReport {
         self
     }
 
+    pub(crate) const fn with_production_topology_attestation(mut self) -> Self {
+        self.scope = DurableReadinessScope::ProductionTopologyAttested;
+        self
+    }
+
+    /// Machine-readable authority scope of this report.
+    pub const fn scope(&self) -> DurableReadinessScope {
+        self.scope
+    }
+
     /// Overall point-in-time readiness state.
     pub const fn state(&self) -> DurableReadinessState {
         self.state
     }
 
     /// Whether this report contains fresh evidence from an agreeing majority.
+    ///
+    /// This does not inspect authority scope and therefore cannot alone
+    /// authorize production traffic.
     pub const fn is_ready(&self) -> bool {
         matches!(self.state, DurableReadinessState::Ready)
     }
 
+    /// Whether this report can authorize production traffic at this instant.
+    ///
+    /// The caller must still treat the result as point-in-time evidence and
+    /// continuously close traffic when a later production probe fails.
+    pub const fn is_production_traffic_ready(&self) -> bool {
+        self.is_ready()
+            && matches!(
+                self.scope,
+                DurableReadinessScope::ProductionTopologyAttested
+            )
+    }
+
     /// Stable low-cardinality status code suitable for health responses.
+    ///
+    /// Consumers must pair it with [`Self::scope`]; `"ready"` alone does not
+    /// distinguish engine-only from production-attested evidence.
     pub const fn reason_code(&self) -> &'static str {
         self.state.reason_code()
     }

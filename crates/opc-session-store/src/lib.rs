@@ -17,7 +17,8 @@
 //! | [`ownership`] | Generic CAS-backed ownership leases and bounded local cache |
 //! | [`record`] | Stored record format and encrypted payloads |
 //! | [`topology`] | Validated quorum membership and replica identity |
-//! | [`readiness`] | Fresh, bounded durable-quorum readiness evidence |
+//! | [`topology_attestation`] | Epoch-bound observed platform-fact verification |
+//! | [`readiness`] | Shared engine and topology-attested production readiness reports |
 //! | [`recovery`] | Authorized offline legacy-fork inspection and recovery |
 //! | [`fake`] | In-memory backend and lease manager for tests |
 //! | [`error`] | `StoreError` and `LeaseError` |
@@ -48,6 +49,7 @@ pub mod restore;
 pub mod sqlite;
 pub mod store;
 pub mod topology;
+pub mod topology_attestation;
 pub mod ttl;
 
 pub use backend::{
@@ -118,8 +120,9 @@ pub use payload_codec::{
 };
 pub use quorum::{QuorumSessionStore, SessionStoreBackend};
 pub use readiness::{
-    DurableReadinessReport, DurableReadinessState, DurableRecoveryProgress, DurableRecoveryState,
-    ReplicaReadinessFailure, ReplicaReadinessObservation, ReplicaReadinessOutcome,
+    DurableReadinessReport, DurableReadinessScope, DurableReadinessState, DurableRecoveryProgress,
+    DurableRecoveryState, ReplicaReadinessFailure, ReplicaReadinessObservation,
+    ReplicaReadinessOutcome,
 };
 pub use record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 pub use recovery::{
@@ -146,6 +149,15 @@ pub use topology::{
     ReplicaId, ReplicaTlsIdentity, ReplicaTopologyField, ReplicaTopologyFieldError,
     ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS, REPLICA_IDENTITY_MAX_BYTES,
     REPLICA_ID_MAX_BYTES,
+};
+pub use topology_attestation::{
+    ObservedPhysicalNodeIdentity, QuorumTopologyAttestor, TopologyAttestationBuildError,
+    TopologyAttestationClaims, TopologyAttestationEvidence, TopologyAttestationFreshness,
+    TopologyAttestationPolicy, TopologyAttestationProvenance, TopologyAttestationResult,
+    TopologyAttestationSummary, TopologyAttestationTime, TopologyAttestationVerificationError,
+    TopologyAttestationVerificationInput, TopologyCollectorId, VerifiedQuorumTopologyAttestation,
+    TOPOLOGY_ATTESTATION_MAX_PROOF_BYTES, TOPOLOGY_ATTESTATION_MAX_TRUSTED_COLLECTORS,
+    TOPOLOGY_ATTESTATION_MAX_VALIDITY,
 };
 pub use ttl::{
     checked_session_deadline, validate_record_expiry_at, validate_record_expiry_profile,

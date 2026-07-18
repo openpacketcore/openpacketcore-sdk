@@ -19,15 +19,20 @@ use opc_key::{
 };
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, ConsensusSessionStore, DurableReadinessReport,
-    DurableReadinessState, DurableRecoveryState, EncryptedSessionPayload, EncryptingSessionBackend,
-    Generation, LeaseError, OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig,
-    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
-    ReplicationOp, RestoreScanRequest, SessionBackend, SessionConsensusNodeId,
-    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionPayloadEncoding,
+    DurableReadinessScope, DurableReadinessState, DurableRecoveryState, EncryptedSessionPayload,
+    EncryptingSessionBackend, Generation, LeaseError, ObservedPhysicalNodeIdentity, OwnerId,
+    QuorumReplicaDescriptor, QuorumTopologyAttestor, QuorumTopologyConfig, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationOp,
+    RestoreScanRequest, SessionBackend, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionOp, SessionPayloadEncoding, SessionStorePlatformProfile,
     SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, SystemClock,
-    ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    TopologyAttestationClaims, TopologyAttestationEvidence, TopologyAttestationPolicy,
+    TopologyAttestationProvenance, TopologyAttestationResult, TopologyAttestationTime,
+    TopologyAttestationVerificationError, TopologyAttestationVerificationInput,
+    TopologyCollectorId, ValidatedQuorumTopology, VerifiedQuorumTopologyAttestation,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use rusqlite::OptionalExtension;
@@ -65,6 +70,7 @@ struct LoopbackPeer {
     dropped_forward_responses: Arc<AtomicUsize>,
     forward_response_delay_millis: Arc<AtomicU64>,
     delayed_forward_responses: Arc<AtomicUsize>,
+    rpc_delay_millis: Arc<AtomicU64>,
     captured_payloads: Arc<StdMutex<Vec<Bytes>>>,
 }
 
@@ -78,6 +84,7 @@ impl LoopbackPeer {
             dropped_forward_responses: Arc::new(AtomicUsize::new(0)),
             forward_response_delay_millis: Arc::new(AtomicU64::new(0)),
             delayed_forward_responses: Arc::new(AtomicUsize::new(0)),
+            rpc_delay_millis: Arc::new(AtomicU64::new(0)),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
         }
     }
@@ -117,6 +124,17 @@ impl LoopbackPeer {
 
     fn delayed_forward_responses(&self) -> usize {
         self.delayed_forward_responses.load(Ordering::SeqCst)
+    }
+
+    fn delay_calls(&self, delay: Duration) {
+        self.rpc_delay_millis.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    fn stop_delaying_calls(&self) {
+        self.rpc_delay_millis.store(0, Ordering::SeqCst);
     }
 
     fn clear_captured_payloads(&self) {
@@ -162,6 +180,11 @@ impl SessionConsensusPeer for LoopbackPeer {
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         if !self.enabled.load(Ordering::SeqCst) {
             return Err(SessionConsensusPeerError::Unavailable);
+        }
+
+        let rpc_delay = self.rpc_delay_millis.load(Ordering::SeqCst);
+        if rpc_delay != 0 {
+            tokio::time::sleep(Duration::from_millis(rpc_delay)).await;
         }
 
         {
@@ -223,13 +246,6 @@ impl TestCluster {
     }
 
     async fn start_with_operation_timeout(operation_timeout: Duration) -> Self {
-        let directory = tempfile::tempdir().expect("create fleet directory");
-        let backends = (0..MEMBER_COUNT)
-            .map(|index| {
-                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
-                    .expect("open file-backed SQLite node")
-            })
-            .collect::<Vec<_>>();
         let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
         let identity = consensus_identity(&members);
         let topologies = (0..MEMBER_COUNT)
@@ -240,6 +256,21 @@ impl TestCluster {
                     identity,
                 ))
                 .expect("validate consensus topology")
+            })
+            .collect::<Vec<_>>();
+        Self::start_with_topologies(operation_timeout, topologies).await
+    }
+
+    async fn start_with_topologies(
+        operation_timeout: Duration,
+        topologies: Vec<ValidatedQuorumTopology>,
+    ) -> Self {
+        assert_eq!(topologies.len(), MEMBER_COUNT);
+        let directory = tempfile::tempdir().expect("create fleet directory");
+        let backends = (0..MEMBER_COUNT)
+            .map(|index| {
+                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
+                    .expect("open file-backed SQLite node")
             })
             .collect::<Vec<_>>();
         let node_ids = topologies
@@ -430,6 +461,28 @@ impl TestCluster {
         }
     }
 
+    fn delay_calls(&self, source: usize, delay: Duration) {
+        for target in 0..MEMBER_COUNT {
+            if source != target {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .delay_calls(delay);
+            }
+        }
+    }
+
+    fn stop_delaying_calls(&self, source: usize) {
+        for target in 0..MEMBER_COUNT {
+            if source != target {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .stop_delaying_calls();
+            }
+        }
+    }
+
     fn delayed_forward_responses(&self, source: usize) -> usize {
         (0..MEMBER_COUNT)
             .filter(|target| *target != source)
@@ -534,15 +587,164 @@ fn member(index: usize) -> QuorumReplicaDescriptor {
 }
 
 fn consensus_identity(members: &[QuorumReplicaDescriptor]) -> ConsensusIdentity {
-    let cluster_id = ConsensusClusterId::new("session-openraft-integration-tests")
-        .expect("consensus cluster ID");
-    let epoch = ConsensusConfigurationEpoch::new(1).expect("consensus epoch");
+    consensus_identity_for_cluster(members, "session-openraft-integration-tests", 1)
+}
+
+fn consensus_identity_for_cluster(
+    members: &[QuorumReplicaDescriptor],
+    cluster_name: &str,
+    epoch: u64,
+) -> ConsensusIdentity {
+    let cluster_id = ConsensusClusterId::new(cluster_name).expect("consensus cluster ID");
+    let epoch = ConsensusConfigurationEpoch::new(epoch).expect("consensus epoch");
     let fingerprints = members
         .iter()
         .map(QuorumReplicaDescriptor::configuration_fingerprint)
         .collect::<Vec<_>>();
     let configuration_id = derive_configuration_id(cluster_id, epoch, &fingerprints);
     ConsensusIdentity::new(cluster_id, configuration_id, epoch)
+}
+
+#[derive(Debug)]
+struct DigestTopologyAttestor;
+
+impl QuorumTopologyAttestor for DigestTopologyAttestor {
+    fn verify(
+        &self,
+        input: TopologyAttestationVerificationInput<'_>,
+    ) -> Result<(), TopologyAttestationVerificationError> {
+        (input.proof() == input.canonical_digest())
+            .then_some(())
+            .ok_or(TopologyAttestationVerificationError::InvalidProof)
+    }
+}
+
+fn attestation_collector() -> TopologyCollectorId {
+    TopologyCollectorId::new("consensus-integration-attestor").expect("collector identity")
+}
+
+fn attestation_policy(
+    collector: TopologyCollectorId,
+    provenance: TopologyAttestationProvenance,
+) -> TopologyAttestationPolicy {
+    TopologyAttestationPolicy::try_new(provenance, vec![collector], Duration::from_secs(300))
+        .expect("attestation policy")
+}
+
+fn topology_evidence(
+    members: &[QuorumReplicaDescriptor],
+    identity: ConsensusIdentity,
+    collector: &TopologyCollectorId,
+    provenance: TopologyAttestationProvenance,
+    observed_at: TopologyAttestationTime,
+    expires_at: TopologyAttestationTime,
+) -> Vec<TopologyAttestationEvidence> {
+    members
+        .iter()
+        .enumerate()
+        .map(|(index, descriptor)| {
+            let claims = TopologyAttestationClaims::new(
+                descriptor.replica_id().clone(),
+                descriptor.tls_identity().clone(),
+                ObservedPhysicalNodeIdentity::new(format!(
+                    "consensus-integration-physical-node-{index}"
+                ))
+                .expect("physical node identity"),
+                descriptor.failure_domain().clone(),
+                descriptor.backing_identity().clone(),
+                descriptor.configuration_fingerprint(),
+                identity,
+                collector.clone(),
+                provenance,
+                observed_at,
+                expires_at,
+            );
+            let proof = claims.canonical_digest().to_vec();
+            TopologyAttestationEvidence::try_new(claims, proof).expect("bounded evidence")
+        })
+        .collect()
+}
+
+fn attested_topologies(
+    members: &[QuorumReplicaDescriptor],
+    identity: ConsensusIdentity,
+    collector: &TopologyCollectorId,
+    provenance: TopologyAttestationProvenance,
+    observed_at: TopologyAttestationTime,
+    expires_at: TopologyAttestationTime,
+    admitted_at: TopologyAttestationTime,
+) -> Vec<ValidatedQuorumTopology> {
+    let policy = attestation_policy(collector.clone(), provenance);
+    let evidence = topology_evidence(
+        members,
+        identity,
+        collector,
+        provenance,
+        observed_at,
+        expires_at,
+    );
+    (0..MEMBER_COUNT)
+        .map(|index| {
+            ValidatedQuorumTopology::try_from_attested(
+                QuorumTopologyConfig::new_consensus(replica_id(index), members.to_vec(), identity),
+                evidence.clone(),
+                &policy,
+                &DigestTopologyAttestor,
+                admitted_at,
+            )
+            .expect("attested topology")
+        })
+        .collect()
+}
+
+fn refreshed_attestation(
+    topology: &ValidatedQuorumTopology,
+    members: &[QuorumReplicaDescriptor],
+    identity: ConsensusIdentity,
+    collector: &TopologyCollectorId,
+    observed_at: TopologyAttestationTime,
+    expires_at: TopologyAttestationTime,
+    verified_at: TopologyAttestationTime,
+) -> VerifiedQuorumTopologyAttestation {
+    refreshed_attestation_with_provenance(
+        topology,
+        members,
+        identity,
+        collector,
+        TopologyAttestationProvenance::AuthenticatedPlatform,
+        observed_at,
+        expires_at,
+        verified_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refreshed_attestation_with_provenance(
+    topology: &ValidatedQuorumTopology,
+    members: &[QuorumReplicaDescriptor],
+    identity: ConsensusIdentity,
+    collector: &TopologyCollectorId,
+    provenance: TopologyAttestationProvenance,
+    observed_at: TopologyAttestationTime,
+    expires_at: TopologyAttestationTime,
+    verified_at: TopologyAttestationTime,
+) -> VerifiedQuorumTopologyAttestation {
+    let policy = attestation_policy(collector.clone(), provenance);
+    topology
+        .verify_attestation_evidence(
+            topology_evidence(
+                members,
+                identity,
+                collector,
+                provenance,
+                observed_at,
+                expires_at,
+            ),
+            &policy,
+            &DigestTopologyAttestor,
+            verified_at,
+        )
+        .expect("refreshed attestation")
 }
 
 fn session_key(label: impl AsRef<[u8]>) -> SessionKey {
@@ -847,6 +1049,401 @@ fn assert_raw_consensus_lease_guard<T>(result: Result<T, LeaseError>) {
         Err(LeaseError::Backend(message))
             if message.contains("consensus_authority_required")
     ));
+}
+
+#[tokio::test]
+async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_refresh() {
+    let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
+    let identity = consensus_identity(&members);
+    let collector = attestation_collector();
+    let topologies = attested_topologies(
+        &members,
+        identity,
+        &collector,
+        TopologyAttestationProvenance::AuthenticatedPlatform,
+        TopologyAttestationTime::from_unix_seconds(1_000),
+        TopologyAttestationTime::from_unix_seconds(1_010),
+        TopologyAttestationTime::from_unix_seconds(1_000),
+    );
+    let attestation_context = topologies[0].clone();
+    let cluster = TestCluster::start_with_topologies(Duration::from_secs(5), topologies).await;
+    let store = &cluster.stores[0];
+
+    assert_eq!(
+        store.platform_profile(),
+        SessionStorePlatformProfile::Unknown
+    );
+    assert_eq!(
+        store.production_platform_profile_at(TopologyAttestationTime::from_unix_seconds(1_001)),
+        SessionStorePlatformProfile::Quorum
+    );
+    let admitted =
+        store.topology_attestation_summary_at(TopologyAttestationTime::from_unix_seconds(1_001));
+    assert_eq!(
+        admitted.provenance(),
+        TopologyAttestationProvenance::AuthenticatedPlatform
+    );
+    assert_eq!(admitted.configuration_epoch(), 1);
+    assert_eq!(admitted.result(), TopologyAttestationResult::Verified);
+    let production_ready = store
+        .probe_production_durable_readiness_at(TopologyAttestationTime::from_unix_seconds(1_001))
+        .await;
+    assert_eq!(
+        production_ready.scope(),
+        DurableReadinessScope::ProductionTopologyAttested
+    );
+    assert!(production_ready.is_production_traffic_ready());
+    assert_eq!(
+        store.production_platform_profile_at(TopologyAttestationTime::from_unix_seconds(1_001)),
+        SessionStorePlatformProfile::Quorum
+    );
+    assert_eq!(
+        store.production_platform_profile_at(TopologyAttestationTime::from_unix_seconds(1_000)),
+        SessionStorePlatformProfile::Unknown
+    );
+    assert_eq!(
+        store
+            .probe_production_durable_readiness_at(TopologyAttestationTime::from_unix_seconds(
+                1_000,
+            ))
+            .await
+            .state(),
+        DurableReadinessState::TopologyInvalid
+    );
+    assert_eq!(
+        store.production_platform_profile_at(TopologyAttestationTime::from_unix_seconds(1_001)),
+        SessionStorePlatformProfile::Quorum
+    );
+
+    let (initial_leader, _, _) = cluster.observed_leader();
+    cluster.delay_calls(initial_leader, Duration::from_millis(1_500));
+    let initial_probe_started = Instant::now();
+    let initial_crossed_expiry = cluster.stores[initial_leader]
+        .probe_production_durable_readiness_at(TopologyAttestationTime::from_unix_seconds(1_009))
+        .await;
+    let initial_elapsed = initial_probe_started.elapsed();
+    cluster.stop_delaying_calls(initial_leader);
+    assert_eq!(
+        initial_crossed_expiry.state(),
+        DurableReadinessState::TopologyInvalid
+    );
+    assert!(
+        initial_elapsed >= Duration::from_millis(500) && initial_elapsed < Duration::from_secs(2),
+        "initial attestation deadline must bound the barrier; elapsed {initial_elapsed:?}"
+    );
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("cluster recovers after the bounded initial probe");
+
+    let expired =
+        store.topology_attestation_summary_at(TopologyAttestationTime::from_unix_seconds(1_010));
+    assert_eq!(expired.result(), TopologyAttestationResult::Expired);
+    assert_eq!(
+        store.production_platform_profile_at(TopologyAttestationTime::from_unix_seconds(1_010)),
+        SessionStorePlatformProfile::Unknown
+    );
+    assert_eq!(
+        store
+            .probe_production_durable_readiness_at(TopologyAttestationTime::from_unix_seconds(
+                1_010,
+            ))
+            .await
+            .state(),
+        DurableReadinessState::TopologyInvalid
+    );
+    assert_eq!(
+        store.production_platform_profile_at(TopologyAttestationTime::from_unix_seconds(1_009)),
+        SessionStorePlatformProfile::Unknown,
+        "an expired forward evaluation must prevent wall-clock rollback revival"
+    );
+
+    let refreshed = refreshed_attestation(
+        &attestation_context,
+        &members,
+        identity,
+        &collector,
+        TopologyAttestationTime::from_unix_seconds(1_020),
+        TopologyAttestationTime::from_unix_seconds(1_100),
+        TopologyAttestationTime::from_unix_seconds(1_020),
+    );
+    assert_eq!(
+        store.production_platform_profile_with_attestation_at(
+            &refreshed,
+            TopologyAttestationTime::from_unix_seconds(1_019),
+        ),
+        SessionStorePlatformProfile::Unknown,
+        "a refreshed token cannot authorize a time before its verification"
+    );
+    assert_eq!(
+        store.production_platform_profile_with_attestation_at(
+            &refreshed,
+            TopologyAttestationTime::from_unix_seconds(1_021),
+        ),
+        SessionStorePlatformProfile::Quorum
+    );
+    let refreshed_ready = store
+        .probe_production_durable_readiness_with_attestation_at(
+            &refreshed,
+            TopologyAttestationTime::from_unix_seconds(1_021),
+        )
+        .await;
+    assert_eq!(
+        refreshed_ready.scope(),
+        DurableReadinessScope::ProductionTopologyAttested
+    );
+    assert!(refreshed_ready.is_production_traffic_ready());
+    assert_eq!(
+        store.platform_profile(),
+        SessionStorePlatformProfile::Unknown
+    );
+
+    cluster.delay_calls(0, Duration::from_millis(750));
+    let older_probe = store.probe_production_durable_readiness_with_attestation_at(
+        &refreshed,
+        TopologyAttestationTime::from_unix_seconds(1_022),
+    );
+    let newer_evaluation = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        store.production_platform_profile_with_attestation_at(
+            &refreshed,
+            TopologyAttestationTime::from_unix_seconds(1_023),
+        )
+    };
+    let (older_report, newer_profile) = tokio::join!(older_probe, newer_evaluation);
+    cluster.stop_delaying_calls(0);
+    assert_eq!(newer_profile, SessionStorePlatformProfile::Quorum);
+    assert_eq!(
+        older_report.state(),
+        DurableReadinessState::TopologyInvalid,
+        "a delayed older evaluation must fail after a newer time is observed"
+    );
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("cluster recovers after the delayed rollback race");
+
+    let foreign_identity =
+        consensus_identity_for_cluster(&members, "foreign-session-openraft-cluster", 1);
+    let foreign_topologies = attested_topologies(
+        &members,
+        foreign_identity,
+        &collector,
+        TopologyAttestationProvenance::AuthenticatedPlatform,
+        TopologyAttestationTime::from_unix_seconds(9_000),
+        TopologyAttestationTime::from_unix_seconds(9_100),
+        TopologyAttestationTime::from_unix_seconds(9_000),
+    );
+    let foreign = refreshed_attestation(
+        &foreign_topologies[0],
+        &members,
+        foreign_identity,
+        &collector,
+        TopologyAttestationTime::from_unix_seconds(9_000),
+        TopologyAttestationTime::from_unix_seconds(9_100),
+        TopologyAttestationTime::from_unix_seconds(9_000),
+    );
+    assert_eq!(
+        store.production_platform_profile_with_attestation_at(
+            &foreign,
+            TopologyAttestationTime::from_unix_seconds(9_001),
+        ),
+        SessionStorePlatformProfile::Unknown
+    );
+    assert_eq!(
+        store
+            .probe_production_durable_readiness_with_attestation_at(
+                &foreign,
+                TopologyAttestationTime::from_unix_seconds(9_001),
+            )
+            .await
+            .state(),
+        DurableReadinessState::TopologyInvalid
+    );
+    let conformance_only = refreshed_attestation_with_provenance(
+        &attestation_context,
+        &members,
+        identity,
+        &collector,
+        TopologyAttestationProvenance::DeterministicConformance,
+        TopologyAttestationTime::from_unix_seconds(9_500),
+        TopologyAttestationTime::from_unix_seconds(9_600),
+        TopologyAttestationTime::from_unix_seconds(9_500),
+    );
+    assert_eq!(
+        store.production_platform_profile_with_attestation_at(
+            &conformance_only,
+            TopologyAttestationTime::from_unix_seconds(9_501),
+        ),
+        SessionStorePlatformProfile::Unknown
+    );
+    assert_eq!(
+        store.production_platform_profile_with_attestation_at(
+            &refreshed,
+            TopologyAttestationTime::from_unix_seconds(1_023),
+        ),
+        SessionStorePlatformProfile::Quorum,
+        "foreign and non-production future tokens must not poison the time authority"
+    );
+
+    let wall_start = TopologyAttestationTime::now().expect("current attestation time");
+    let wall_expiry = TopologyAttestationTime::from_unix_seconds(
+        wall_start
+            .unix_seconds()
+            .checked_add(2)
+            .expect("test wall-clock expiry"),
+    );
+    let short_lived = refreshed_attestation(
+        &attestation_context,
+        &members,
+        identity,
+        &collector,
+        wall_start,
+        wall_expiry,
+        wall_start,
+    );
+    cluster.delay_calls(0, Duration::from_millis(2_500));
+    let probe_started = Instant::now();
+    let crossed_expiry = store
+        .probe_production_durable_readiness_with_attestation_at(&short_lived, wall_start)
+        .await;
+    let elapsed = probe_started.elapsed();
+    cluster.stop_delaying_calls(0);
+    assert_eq!(
+        crossed_expiry.state(),
+        DurableReadinessState::TopologyInvalid
+    );
+    assert!(
+        elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(3),
+        "attestation deadline must bound the barrier; elapsed {elapsed:?}"
+    );
+    assert_eq!(
+        store.production_platform_profile_with_attestation_at(&short_lived, wall_start),
+        SessionStorePlatformProfile::Unknown,
+        "monotonic expiry must prevent a retry with the old pre-expiry wall time"
+    );
+    assert_eq!(
+        store
+            .probe_production_durable_readiness_with_attestation_at(&short_lived, wall_start)
+            .await
+            .state(),
+        DurableReadinessState::TopologyInvalid
+    );
+    assert_eq!(
+        store.production_platform_profile_with_attestation_at(
+            &short_lived,
+            TopologyAttestationTime::from_unix_seconds(u64::MAX),
+        ),
+        SessionStorePlatformProfile::Unknown,
+        "the bounded time authority must fail closed at the representable maximum"
+    );
+}
+
+#[tokio::test]
+async fn descriptor_only_three_node_store_cannot_be_upgraded_by_attested_token() {
+    let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
+    let identity = consensus_identity(&members);
+    let collector = attestation_collector();
+    let attested = attested_topologies(
+        &members,
+        identity,
+        &collector,
+        TopologyAttestationProvenance::AuthenticatedPlatform,
+        TopologyAttestationTime::from_unix_seconds(1_500),
+        TopologyAttestationTime::from_unix_seconds(1_600),
+        TopologyAttestationTime::from_unix_seconds(1_500),
+    );
+    let token = refreshed_attestation(
+        &attested[0],
+        &members,
+        identity,
+        &collector,
+        TopologyAttestationTime::from_unix_seconds(1_500),
+        TopologyAttestationTime::from_unix_seconds(1_600),
+        TopologyAttestationTime::from_unix_seconds(1_500),
+    );
+
+    let cluster = TestCluster::start().await;
+    let store = &cluster.stores[0];
+    let now = TopologyAttestationTime::from_unix_seconds(1_501);
+    assert_eq!(store.topology().mode().as_str(), "descriptor-only-lab-ha");
+    assert_eq!(
+        store.production_platform_profile_at(now),
+        SessionStorePlatformProfile::Unknown
+    );
+    assert_eq!(
+        store.production_platform_profile_with_attestation_at(&token, now),
+        SessionStorePlatformProfile::Unknown,
+        "a valid same-identity token must not upgrade a descriptor-only store"
+    );
+
+    let initial = store.probe_production_durable_readiness_at(now).await;
+    assert_eq!(initial.state(), DurableReadinessState::TopologyInvalid);
+    assert_eq!(
+        initial.scope(),
+        DurableReadinessScope::ProductionTopologyAttested
+    );
+    assert!(!initial.is_production_traffic_ready());
+    let refreshed = store
+        .probe_production_durable_readiness_with_attestation_at(&token, now)
+        .await;
+    assert_eq!(refreshed.state(), DurableReadinessState::TopologyInvalid);
+    assert_eq!(
+        refreshed.scope(),
+        DurableReadinessScope::ProductionTopologyAttested
+    );
+    assert!(!refreshed.is_production_traffic_ready());
+
+    let engine = store.probe_durable_readiness().await;
+    assert!(engine.is_ready());
+    assert_eq!(engine.scope(), DurableReadinessScope::EngineOnly);
+    assert!(!engine.is_production_traffic_ready());
+}
+
+#[tokio::test]
+async fn deterministic_topology_is_visible_but_never_production_ready() {
+    let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
+    let identity = consensus_identity(&members);
+    let collector = attestation_collector();
+    let topologies = attested_topologies(
+        &members,
+        identity,
+        &collector,
+        TopologyAttestationProvenance::DeterministicConformance,
+        TopologyAttestationTime::from_unix_seconds(2_000),
+        TopologyAttestationTime::from_unix_seconds(2_100),
+        TopologyAttestationTime::from_unix_seconds(2_000),
+    );
+    let cluster = TestCluster::start_with_topologies(OPERATION_TIMEOUT, topologies).await;
+    let store = &cluster.stores[0];
+    let now = TopologyAttestationTime::from_unix_seconds(2_001);
+
+    assert_eq!(
+        store.platform_profile(),
+        SessionStorePlatformProfile::Unknown
+    );
+    assert_eq!(
+        store.production_platform_profile_at(now),
+        SessionStorePlatformProfile::Unknown
+    );
+    let summary = store.topology_attestation_summary_at(now);
+    assert_eq!(
+        summary.provenance(),
+        TopologyAttestationProvenance::DeterministicConformance
+    );
+    assert_eq!(summary.result(), TopologyAttestationResult::Verified);
+    assert!(!summary.is_production_verified());
+    let production = store.probe_production_durable_readiness_at(now).await;
+    assert_eq!(production.state(), DurableReadinessState::TopologyInvalid);
+    assert_eq!(
+        production.scope(),
+        DurableReadinessScope::ProductionTopologyAttested
+    );
+    assert!(!production.is_production_traffic_ready());
+    let engine = store.probe_durable_readiness().await;
+    assert!(engine.is_ready());
+    assert_eq!(engine.scope(), DurableReadinessScope::EngineOnly);
+    assert!(!engine.is_production_traffic_ready());
 }
 
 #[tokio::test]
