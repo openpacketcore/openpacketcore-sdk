@@ -594,13 +594,38 @@ the campaign envelope.
 Unknown batch slots make dependent state, watch, and restore conclusions
 inconclusive rather than successful. Inputs remain digest-bound, closed,
 allocation-bounded, duplicate-field rejecting, and digest-only for keys,
-owners, and values. The fixture proves checker behavior only: no v5 collector,
-Kubernetes evidence, release manifest, or production credit exists yet. The
-frozen v4 manifest continues to bind v3 until a later additive contract
-explicitly replaces that binding.
+owners, and values.
+
+`qualification_concurrent_v5` provides the pure bounded collector boundary. It
+accepts only typed qualification-node replies plus an explicit fault schedule,
+initial journal head, readiness cadence, and canonical pre-acquired lease
+inventory. It derives the isolated state-type digest from the validated history
+identifier and binds every attempted and observed record to it. The collector
+validates the complete deserializable schedule before use, matches every batch
+reply slot to the exact digest-only mutation contract captured before dispatch,
+admits operation IDs transactionally, correlates successful slots with the real
+watch in serialized batch/slot order, models terminal CAS state, and rejects
+finalization unless lease, partial-batch, restore, and schedule-derived
+readiness coverage are conclusive. Its synthetic end-to-end test feeds emitted
+JSONL and the emitted schedule to the frozen independent checker and requires
+`status=pass`.
+
+Retained schedule bytes are decoded only through
+`QualificationConcurrentFaultScheduleV5::from_json`, which applies the frozen
+256-KiB artifact envelope before Serde can allocate schedule collections and
+then validates every count, order, interval, pair, and quorum lifecycle.
+Emitted history is output-only and is capped at 8 MiB total and 256 KiB per
+JSONL row; finalization preflights those bounds before returning an artifact.
+
+This collector performs no Kubernetes or control-socket I/O. Deployed v5
+orchestration, retained Kubernetes evidence, release-manifest binding, and
+production credit do not exist yet. The frozen v4 manifest continues to bind
+v3 until a later additive contract explicitly replaces that binding.
 
 Run the focused v5 contract and checker suite with:
 
+`cargo test --locked -p opc-session-testkit --all-features qualification_concurrent_v5`
+and
 `cargo test --locked -p opc-session-testkit --test qualification_history_v5`.
 
 The independent checker invocation always supplies all three digest-bound

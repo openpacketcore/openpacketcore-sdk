@@ -62,9 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority, and explicit loss/recovery-transition observations rather than
   trusting readiness rows. Openraft term/log indices
   remain distinct from journal heads. An Openraft production-path regression
-  proves success/conflict/success yields two ordered journal entries. Frozen
-  v1-v4 contracts remain unchanged; v5 adds no collector, deployed evidence,
-  or production qualification claim.
+  proves success/conflict/success yields two ordered journal entries. A pure
+  bounded collector now validates the complete fault schedule and
+  history-derived isolated state type, transactionally admits typed child
+  observations, correlates real watch events in serialized batch/slot order,
+  models terminal state, and requires conclusive lease, partial-batch, restore,
+  and readiness coverage before its synthetic output passes the frozen
+  checker. Frozen v1-v4 contracts remain unchanged; v5 still adds no deployed
+  orchestration/evidence or production qualification claim.
 - **Leader-aware management commits — gNMI/NETCONF/config bus:** an opt-in
   `ConfigAuthorityPort` projection fence redirects followers with bounded
   leader hints and returns the exact persisted `{version, plaintext-envelope
