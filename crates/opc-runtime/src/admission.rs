@@ -1,8 +1,9 @@
-//! Listener admission helpers for bounded per-source throttling.
+//! Listener admission helpers for bounded source and aggregate throttling.
 //!
 //! Products own their admission policy values, but the mechanics for
-//! concurrent source-key token buckets, first-throttle signaling, deterministic
-//! eviction, and redaction-safe diagnostics are reusable runtime plumbing.
+//! concurrent source-key token buckets, a churn-resistant aggregate rate and
+//! in-flight ceiling, deterministic eviction, cancellation-safe permits, and
+//! redaction-safe diagnostics are reusable runtime plumbing.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -128,6 +129,309 @@ impl SourceTokenBucketPolicyError {
             Self::ZeroRefillInterval => "zero_refill_interval",
             Self::ShardCountExceedsMaxEntries => "shard_count_exceeds_max_entries",
         }
+    }
+}
+
+/// Configuration for a process-wide aggregate admission budget.
+///
+/// The token bucket bounds the total admission rate across every source, while
+/// `max_in_flight` bounds work that has been admitted but not yet completed.
+/// All numeric limits are non-zero fixed-width values, so construction cannot
+/// create an unbounded table or queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateAdmissionConfig {
+    refill_tokens: NonZeroU32,
+    refill_interval: Duration,
+    burst_tokens: NonZeroU32,
+    max_in_flight: NonZeroU32,
+}
+
+impl AggregateAdmissionConfig {
+    /// Build an aggregate rate and in-flight admission configuration.
+    ///
+    /// `refill_tokens` are added every `refill_interval`, capped at
+    /// `burst_tokens`. `max_in_flight` is the number of simultaneously held
+    /// [`AggregateAdmissionPermit`] values.
+    pub fn new(
+        refill_tokens: NonZeroU32,
+        refill_interval: Duration,
+        burst_tokens: NonZeroU32,
+        max_in_flight: NonZeroU32,
+    ) -> Result<Self, AggregateAdmissionConfigError> {
+        if refill_interval.is_zero() {
+            return Err(AggregateAdmissionConfigError::ZeroRefillInterval);
+        }
+
+        Ok(Self {
+            refill_tokens,
+            refill_interval,
+            burst_tokens,
+            max_in_flight,
+        })
+    }
+
+    /// Build a per-second aggregate budget.
+    pub const fn per_second(
+        refill_per_second: NonZeroU32,
+        burst_tokens: NonZeroU32,
+        max_in_flight: NonZeroU32,
+    ) -> Self {
+        Self {
+            refill_tokens: refill_per_second,
+            refill_interval: Duration::from_secs(1),
+            burst_tokens,
+            max_in_flight,
+        }
+    }
+
+    /// Tokens added per refill interval.
+    pub const fn refill_tokens(self) -> NonZeroU32 {
+        self.refill_tokens
+    }
+
+    /// Interval between token refills.
+    pub const fn refill_interval(self) -> Duration {
+        self.refill_interval
+    }
+
+    /// Maximum aggregate tokens that can accumulate.
+    pub const fn burst_tokens(self) -> NonZeroU32 {
+        self.burst_tokens
+    }
+
+    /// Maximum number of simultaneously held permits.
+    pub const fn max_in_flight(self) -> NonZeroU32 {
+        self.max_in_flight
+    }
+}
+
+/// Redaction-safe aggregate admission configuration error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AggregateAdmissionConfigError {
+    /// Refill interval must be non-zero.
+    #[error("aggregate admission refill interval must be non-zero")]
+    ZeroRefillInterval,
+}
+
+impl AggregateAdmissionConfigError {
+    /// Stable machine-readable error code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ZeroRefillInterval => "zero_refill_interval",
+        }
+    }
+}
+
+/// Redaction-safe reason an aggregate admission attempt was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AggregateAdmissionError {
+    /// No aggregate rate token is currently available.
+    #[error("aggregate admission rate budget exhausted")]
+    RateExhausted,
+    /// Every aggregate in-flight slot is currently held.
+    #[error("aggregate admission in-flight budget exhausted")]
+    InFlightExhausted,
+}
+
+impl AggregateAdmissionError {
+    /// Stable machine-readable error code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RateExhausted => "rate_exhausted",
+            Self::InFlightExhausted => "in_flight_exhausted",
+        }
+    }
+}
+
+/// Fixed-cardinality point-in-time aggregate admission metrics.
+///
+/// Total counters saturate at `u64::MAX`. The snapshot contains no source key,
+/// peer identity, packet content, or other caller-controlled label.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AggregateAdmissionMetricsSnapshot {
+    /// Successful admissions.
+    pub admitted_total: u64,
+    /// Admissions rejected because the global rate was exhausted.
+    pub rate_exhausted_total: u64,
+    /// Admissions rejected because the in-flight ceiling was exhausted.
+    pub in_flight_exhausted_total: u64,
+    /// Permits released through normal drop or task cancellation.
+    pub released_total: u64,
+    /// Permits currently held.
+    pub in_flight: u32,
+    /// Highest observed number of simultaneously held permits.
+    pub peak_in_flight: u32,
+}
+
+/// Process-wide aggregate rate and in-flight admission budget.
+///
+/// This budget stores no source keys and has no eviction path. Rotating through
+/// new source identities therefore cannot replenish its global token bucket.
+/// Clone values share the same budget and fixed-cardinality metrics.
+///
+/// Compose it after [`SourceTokenBucket`]: first require
+/// [`SourceAdmissionDecision::Allowed`], then call [`Self::try_acquire`] and
+/// hold the returned permit for the complete expensive operation.
+#[derive(Clone)]
+pub struct AggregateAdmissionBudget {
+    inner: Arc<AggregateAdmissionInner>,
+}
+
+impl AggregateAdmissionBudget {
+    /// Construct a full-burst aggregate budget with no in-flight work.
+    pub fn new(config: AggregateAdmissionConfig) -> Self {
+        Self {
+            inner: Arc::new(AggregateAdmissionInner {
+                config,
+                state: Mutex::new(AggregateAdmissionState::new(config)),
+            }),
+        }
+    }
+
+    /// Return the immutable configuration shared by this budget.
+    pub fn config(&self) -> AggregateAdmissionConfig {
+        self.inner.config
+    }
+
+    /// Attempt to consume one global rate token and one in-flight slot.
+    ///
+    /// This method never waits. A successful call consumes one rate token and
+    /// returns a permit that releases its in-flight slot on drop, including
+    /// when an async task is cancelled. Rejections never consume a rate token.
+    pub fn try_acquire(
+        &self,
+        now: Instant,
+    ) -> Result<AggregateAdmissionPermit, AggregateAdmissionError> {
+        let mut state = self.inner.lock_state();
+        state.refill(now, self.inner.config);
+
+        if state.in_flight >= self.inner.config.max_in_flight.get() {
+            state.in_flight_exhausted_total = state.in_flight_exhausted_total.saturating_add(1);
+            return Err(AggregateAdmissionError::InFlightExhausted);
+        }
+
+        if state.tokens == 0 {
+            state.rate_exhausted_total = state.rate_exhausted_total.saturating_add(1);
+            return Err(AggregateAdmissionError::RateExhausted);
+        }
+
+        state.tokens -= 1;
+        state.in_flight += 1;
+        state.peak_in_flight = state.peak_in_flight.max(state.in_flight);
+        state.admitted_total = state.admitted_total.saturating_add(1);
+
+        Ok(AggregateAdmissionPermit {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    /// Return a fixed-cardinality point-in-time metrics snapshot.
+    pub fn metrics(&self) -> AggregateAdmissionMetricsSnapshot {
+        let state = self.inner.lock_state();
+        AggregateAdmissionMetricsSnapshot {
+            admitted_total: state.admitted_total,
+            rate_exhausted_total: state.rate_exhausted_total,
+            in_flight_exhausted_total: state.in_flight_exhausted_total,
+            released_total: state.released_total,
+            in_flight: state.in_flight,
+            peak_in_flight: state.peak_in_flight,
+        }
+    }
+}
+
+impl fmt::Debug for AggregateAdmissionBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AggregateAdmissionBudget")
+            .field("config", &self.inner.config)
+            .finish_non_exhaustive()
+    }
+}
+
+/// RAII guard for one aggregate in-flight admission slot.
+///
+/// Hold this value until the admitted operation has completed. Dropping it
+/// releases the slot synchronously; this also occurs when an owning future is
+/// cancelled. Deliberately leaking the value also deliberately leaks the slot
+/// and causes the budget to fail closed once its ceiling is reached.
+#[must_use = "hold the permit until the admitted operation completes"]
+pub struct AggregateAdmissionPermit {
+    inner: Arc<AggregateAdmissionInner>,
+}
+
+impl fmt::Debug for AggregateAdmissionPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AggregateAdmissionPermit")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AggregateAdmissionPermit {
+    fn drop(&mut self) {
+        self.inner.release();
+    }
+}
+
+struct AggregateAdmissionInner {
+    config: AggregateAdmissionConfig,
+    state: Mutex<AggregateAdmissionState>,
+}
+
+impl AggregateAdmissionInner {
+    fn lock_state(&self) -> MutexGuard<'_, AggregateAdmissionState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.lock_state();
+        if state.in_flight > 0 {
+            state.in_flight -= 1;
+            state.released_total = state.released_total.saturating_add(1);
+        }
+    }
+}
+
+struct AggregateAdmissionState {
+    tokens: u32,
+    last_refill: Option<Instant>,
+    admitted_total: u64,
+    rate_exhausted_total: u64,
+    in_flight_exhausted_total: u64,
+    released_total: u64,
+    in_flight: u32,
+    peak_in_flight: u32,
+}
+
+impl AggregateAdmissionState {
+    fn new(config: AggregateAdmissionConfig) -> Self {
+        Self {
+            tokens: config.burst_tokens.get(),
+            last_refill: None,
+            admitted_total: 0,
+            rate_exhausted_total: 0,
+            in_flight_exhausted_total: 0,
+            released_total: 0,
+            in_flight: 0,
+            peak_in_flight: 0,
+        }
+    }
+
+    fn refill(&mut self, now: Instant, config: AggregateAdmissionConfig) {
+        let Some(last_refill) = self.last_refill.as_mut() else {
+            self.last_refill = Some(now);
+            return;
+        };
+
+        refill_token_count(
+            &mut self.tokens,
+            last_refill,
+            now,
+            config.refill_tokens.get(),
+            config.refill_interval,
+            config.burst_tokens.get(),
+        );
     }
 }
 
@@ -347,34 +651,49 @@ impl BucketState {
     }
 
     fn refill(&mut self, now: Instant, policy: SourceTokenBucketPolicy) {
-        let Some(elapsed) = now.checked_duration_since(self.last_refill) else {
-            return;
-        };
-        let interval_ns = policy.refill_interval.as_nanos();
-        let intervals = elapsed.as_nanos() / interval_ns;
-        if intervals == 0 {
-            return;
-        }
-
-        let refill = intervals.saturating_mul(u128::from(policy.refill_tokens.get()));
-        let refill = refill.min(u128::from(u32::MAX)) as u32;
-        self.tokens = self
-            .tokens
-            .saturating_add(refill)
-            .min(policy.burst_tokens.get());
-
-        let advanced_ns = intervals.saturating_mul(interval_ns);
-        if let Ok(advanced_ns) = u64::try_from(advanced_ns) {
-            if let Some(next_refill) = self
-                .last_refill
-                .checked_add(Duration::from_nanos(advanced_ns))
-            {
-                self.last_refill = next_refill;
-                return;
-            }
-        }
-        self.last_refill = now;
+        refill_token_count(
+            &mut self.tokens,
+            &mut self.last_refill,
+            now,
+            policy.refill_tokens.get(),
+            policy.refill_interval,
+            policy.burst_tokens.get(),
+        );
     }
+}
+
+fn refill_token_count(
+    tokens: &mut u32,
+    last_refill: &mut Instant,
+    now: Instant,
+    refill_tokens: u32,
+    refill_interval: Duration,
+    burst_tokens: u32,
+) {
+    let Some(elapsed) = now.checked_duration_since(*last_refill) else {
+        return;
+    };
+    let interval_ns = refill_interval.as_nanos();
+    if interval_ns == 0 {
+        return;
+    }
+    let intervals = elapsed.as_nanos() / interval_ns;
+    if intervals == 0 {
+        return;
+    }
+
+    let refill = intervals.saturating_mul(u128::from(refill_tokens));
+    let refill = refill.min(u128::from(u32::MAX)) as u32;
+    *tokens = tokens.saturating_add(refill).min(burst_tokens);
+
+    let advanced_ns = intervals.saturating_mul(interval_ns);
+    if let Ok(advanced_ns) = u64::try_from(advanced_ns) {
+        if let Some(next_refill) = last_refill.checked_add(Duration::from_nanos(advanced_ns)) {
+            *last_refill = next_refill;
+            return;
+        }
+    }
+    *last_refill = now;
 }
 
 #[cfg(test)]
@@ -382,6 +701,7 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::{mpsc, Barrier};
 
     fn nonzero_u32(value: u32) -> NonZeroU32 {
         NonZeroU32::new(value).expect("non-zero u32")
@@ -400,6 +720,243 @@ mod tests {
             nonzero_usize(2),
         )
         .expect("valid policy")
+    }
+
+    fn aggregate_config(
+        refill_tokens: u32,
+        refill_interval: Duration,
+        burst_tokens: u32,
+        max_in_flight: u32,
+    ) -> AggregateAdmissionConfig {
+        AggregateAdmissionConfig::new(
+            nonzero_u32(refill_tokens),
+            refill_interval,
+            nonzero_u32(burst_tokens),
+            nonzero_u32(max_in_flight),
+        )
+        .expect("valid aggregate admission config")
+    }
+
+    #[test]
+    fn aggregate_config_is_typed_and_rejects_zero_refill_interval() {
+        let error = AggregateAdmissionConfig::new(
+            nonzero_u32(1),
+            Duration::ZERO,
+            nonzero_u32(2),
+            nonzero_u32(3),
+        )
+        .expect_err("zero refill interval rejected");
+        assert_eq!(error.code(), "zero_refill_interval");
+
+        let config =
+            AggregateAdmissionConfig::per_second(nonzero_u32(4), nonzero_u32(5), nonzero_u32(6));
+        assert_eq!(config.refill_tokens().get(), 4);
+        assert_eq!(config.refill_interval(), Duration::from_secs(1));
+        assert_eq!(config.burst_tokens().get(), 5);
+        assert_eq!(config.max_in_flight().get(), 6);
+    }
+
+    #[test]
+    fn aggregate_rate_exhaustion_and_refill_use_injected_time() {
+        let config = aggregate_config(2, Duration::from_secs(1), 2, 4);
+        let budget = AggregateAdmissionBudget::new(config);
+        let origin = Instant::now();
+        let start = origin + Duration::from_secs(10);
+
+        let first = budget.try_acquire(start).expect("first token");
+        let second = budget.try_acquire(start).expect("second token");
+        drop(first);
+        drop(second);
+
+        let rate_error = budget
+            .try_acquire(start)
+            .expect_err("empty rate budget rejected");
+        assert_eq!(rate_error, AggregateAdmissionError::RateExhausted);
+        assert_eq!(rate_error.code(), "rate_exhausted");
+        assert_eq!(
+            budget
+                .try_acquire(start + Duration::from_millis(999))
+                .expect_err("partial interval does not refill"),
+            AggregateAdmissionError::RateExhausted
+        );
+        assert_eq!(
+            budget
+                .try_acquire(origin + Duration::from_secs(9))
+                .expect_err("clock rewind does not refill"),
+            AggregateAdmissionError::RateExhausted
+        );
+
+        let refilled = budget
+            .try_acquire(start + Duration::from_secs(1))
+            .expect("interval refills tokens");
+        drop(refilled);
+
+        let metrics = budget.metrics();
+        assert_eq!(metrics.admitted_total, 3);
+        assert_eq!(metrics.rate_exhausted_total, 3);
+        assert_eq!(metrics.in_flight_exhausted_total, 0);
+        assert_eq!(metrics.released_total, 3);
+        assert_eq!(metrics.in_flight, 0);
+        assert_eq!(metrics.peak_in_flight, 2);
+    }
+
+    #[test]
+    fn in_flight_rejection_does_not_consume_rate_token() {
+        let config = aggregate_config(1, Duration::from_secs(60), 2, 1);
+        let budget = AggregateAdmissionBudget::new(config);
+        let now = Instant::now();
+
+        let first = budget.try_acquire(now).expect("first permit");
+        let in_flight_error = budget
+            .try_acquire(now)
+            .expect_err("in-flight ceiling rejects");
+        assert_eq!(in_flight_error, AggregateAdmissionError::InFlightExhausted);
+        assert_eq!(in_flight_error.code(), "in_flight_exhausted");
+        drop(first);
+
+        let second = budget
+            .try_acquire(now)
+            .expect("in-flight rejection preserves second token");
+        drop(second);
+        assert_eq!(
+            budget
+                .try_acquire(now)
+                .expect_err("both burst tokens consumed"),
+            AggregateAdmissionError::RateExhausted
+        );
+
+        let metrics = budget.metrics();
+        assert_eq!(metrics.admitted_total, 2);
+        assert_eq!(metrics.in_flight_exhausted_total, 1);
+        assert_eq!(metrics.rate_exhausted_total, 1);
+        assert_eq!(metrics.released_total, 2);
+        assert_eq!(metrics.in_flight, 0);
+        assert_eq!(metrics.peak_in_flight, 1);
+    }
+
+    #[test]
+    fn source_churn_cannot_replenish_aggregate_rate() {
+        let source_policy = SourceTokenBucketPolicy::new(
+            nonzero_u32(1),
+            Duration::from_secs(60),
+            nonzero_u32(1),
+            nonzero_usize(2),
+            nonzero_usize(1),
+        )
+        .expect("valid source policy");
+        let sources = SourceTokenBucket::new(source_policy);
+        let aggregate =
+            AggregateAdmissionBudget::new(aggregate_config(1, Duration::from_secs(60), 3, 10));
+        let now = Instant::now();
+
+        for source in ["source-a", "source-b", "source-c"] {
+            assert_eq!(sources.admit(source, now), SourceAdmissionDecision::Allowed);
+            let permit = aggregate
+                .try_acquire(now)
+                .expect("aggregate burst admits first three sources");
+            drop(permit);
+        }
+
+        assert_eq!(
+            sources.admit("source-d", now),
+            SourceAdmissionDecision::Allowed
+        );
+        assert_eq!(sources.entry_count(), 2);
+        assert_eq!(
+            aggregate
+                .try_acquire(now)
+                .expect_err("source churn does not replenish aggregate rate"),
+            AggregateAdmissionError::RateExhausted
+        );
+    }
+
+    #[test]
+    fn concurrent_acquisition_never_exceeds_in_flight_ceiling() {
+        const THREADS: usize = 32;
+        const MAX_IN_FLIGHT: usize = 4;
+
+        let budget = AggregateAdmissionBudget::new(aggregate_config(
+            64,
+            Duration::from_secs(60),
+            64,
+            MAX_IN_FLIGHT as u32,
+        ));
+        let barrier = std::sync::Arc::new(Barrier::new(THREADS));
+        let (tx, rx) = mpsc::channel();
+        let now = Instant::now();
+        let mut workers = Vec::with_capacity(THREADS);
+
+        for _ in 0..THREADS {
+            let worker_budget = budget.clone();
+            let worker_barrier = std::sync::Arc::clone(&barrier);
+            let worker_tx = tx.clone();
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                worker_tx
+                    .send(worker_budget.try_acquire(now))
+                    .expect("collector remains alive");
+            }));
+        }
+        drop(tx);
+
+        let mut permits = Vec::with_capacity(MAX_IN_FLIGHT);
+        let mut in_flight_rejections = 0;
+        for result in rx {
+            match result {
+                Ok(permit) => permits.push(permit),
+                Err(AggregateAdmissionError::InFlightExhausted) => {
+                    in_flight_rejections += 1;
+                }
+                Err(error) => panic!("unexpected aggregate admission error: {error}"),
+            }
+        }
+        for worker in workers {
+            worker.join().expect("worker completes");
+        }
+
+        assert_eq!(permits.len(), MAX_IN_FLIGHT);
+        assert_eq!(in_flight_rejections, THREADS - MAX_IN_FLIGHT);
+        let held_metrics = budget.metrics();
+        assert_eq!(held_metrics.in_flight, MAX_IN_FLIGHT as u32);
+        assert_eq!(held_metrics.peak_in_flight, MAX_IN_FLIGHT as u32);
+
+        drop(permits);
+        let released_metrics = budget.metrics();
+        assert_eq!(released_metrics.in_flight, 0);
+        assert_eq!(released_metrics.released_total, MAX_IN_FLIGHT as u64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_cancellation_releases_aggregate_permit() {
+        let budget =
+            AggregateAdmissionBudget::new(aggregate_config(1, Duration::from_secs(60), 2, 1));
+        let worker_budget = budget.clone();
+        let now = Instant::now();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            let permit = worker_budget
+                .try_acquire(now)
+                .expect("worker acquires permit");
+            let _ = acquired_tx.send(());
+            std::future::pending::<()>().await;
+            drop(permit);
+        });
+
+        acquired_rx.await.expect("worker reports acquisition");
+        assert_eq!(budget.metrics().in_flight, 1);
+        task.abort();
+        let join_error = task.await.expect_err("task is cancelled");
+        assert!(join_error.is_cancelled());
+
+        let cancelled_metrics = budget.metrics();
+        assert_eq!(cancelled_metrics.in_flight, 0);
+        assert_eq!(cancelled_metrics.released_total, 1);
+
+        let next = budget
+            .try_acquire(now)
+            .expect("cancelled task returned its in-flight slot");
+        drop(next);
     }
 
     #[test]

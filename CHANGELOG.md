@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Added
+- **Aggregate admission budget — `opc-runtime`:** a product-neutral global
+  token bucket and in-flight ceiling now compose after the existing per-source
+  limiter. The aggregate state has no source-key table or eviction path, so
+  rotating identities cannot restore burst capacity. Non-blocking admission
+  returns stable typed exhaustion errors and a non-cloneable RAII permit whose
+  drop, including task cancellation, releases the slot; fixed-cardinality
+  saturating metrics expose admits, both rejection classes, releases, current
+  in-flight work, and the observed peak without peer-controlled labels.
 - **Destination-scoped IPsec ownership keys — `opc-ipsec-lb`:** canonical,
   bounded initial-IKE, established-IKE, and ESP identities now structurally
   bind the public destination address and opaque routing-domain tag. A

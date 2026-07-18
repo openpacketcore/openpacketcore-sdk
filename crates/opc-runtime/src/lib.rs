@@ -52,6 +52,8 @@ mod tests;
 
 pub use admin::ConfigVersionMetadata;
 pub use admission::{
+    AggregateAdmissionBudget, AggregateAdmissionConfig, AggregateAdmissionConfigError,
+    AggregateAdmissionError, AggregateAdmissionMetricsSnapshot, AggregateAdmissionPermit,
     SourceAdmissionDecision, SourceTokenBucket, SourceTokenBucketPolicy,
     SourceTokenBucketPolicyError,
 };
