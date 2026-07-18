@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Added
+- **Keyless destination-aware IKE/ESP ingress classifier — `opc-ipsec-lb`:**
+  a zero-copy, allocation-free IPv4/IPv6 classifier now extracts canonical
+  destination-scoped ownership keys for initial/established IKE, RFC 3948
+  NAT-T ESP, and native ESP without accepting SA key material. It bounds IPv6
+  extension traversal, treats non-initial fragments and malformed/truncated
+  headers as typed `Unclassifiable` outcomes, preserves IKEv2 SKF identity,
+  and safely extracts supported ICMP/ICMPv6 quotes. Quoted outbound ESP remains
+  direction-typed and cannot be mistaken for an inbound ownership key;
+  address, port, and SPI diagnostics are redacted.
 - **Destination-scoped IPsec ownership keys — `opc-ipsec-lb`:** canonical,
   bounded initial-IKE, established-IKE, and ESP identities now structurally
   bind the public destination address and opaque routing-domain tag. A

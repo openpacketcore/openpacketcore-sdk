@@ -11,6 +11,9 @@
 //! [`RendezvousSelector::select_owner`] with an explicit membership generation.
 //! Initial-IKE promotion carries the selected owner forward without rehashing.
 //! These identities contain packet metadata only and never SA key material.
+//! [`classify_keyless_ingress_packet`] extracts those identities from bounded,
+//! borrowed IPv4/IPv6 headers, including native ESP, NAT-T, IKEv2 SKF, and
+//! supported ICMP error quotes. It does not accept keys or decrypt payloads.
 //!
 //! VIP advertisement is protocol-neutral: callers can gate any management or
 //! dataplane VIP on their own election, quorum, health, and monotonic fence
@@ -39,8 +42,11 @@ pub mod xdp;
 
 pub use bgp::{BgpRouteVipAdvertiser, BgpRouteVipAdvertiserConfig};
 pub use classifier::{
-    classify_swu_packet, EspFragmentPosture, IpFragment, SwuClassification, SwuClassifierConfig,
-    SwuPacket,
+    classify_keyless_ingress_packet, classify_swu_packet, EspFragmentPosture,
+    IngressEncapsulationKind, IngressIdentityProvenance, IngressPacketIdentity,
+    IngressUnclassifiableReason, IpFragment, KeylessIngressClassification, KeylessIngressMatch,
+    ObservedOuterSource, QuotedEspIdentity, SwuClassification, SwuClassifierConfig, SwuPacket,
+    MAX_INGRESS_IPV6_EXTENSION_HEADERS,
 };
 pub use cookie::{
     CookieKey, CookieSlot, IkeCookie, IkeCookieDecision, IkeCookieGate, IkeCookiePolicy,

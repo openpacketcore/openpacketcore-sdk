@@ -2627,6 +2627,7 @@ dependencies = [
  "opc-session-store",
  "opc-session-testkit",
  "opc-types",
+ "proptest",
  "rand 0.10.1",
  "serde",
  "serde_json",
