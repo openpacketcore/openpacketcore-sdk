@@ -14,6 +14,7 @@ use crate::{
     notify::{
         Ikev2NotifyPayload, Ikev2NotifyPayloadError, IKEV2_NOTIFY_INVALID_KE_PAYLOAD,
         IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+        IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
     },
     payload::{PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     HEADER_LEN,
@@ -945,7 +946,7 @@ impl Error for Ikev2SaInitBuildError {}
 /// Error returned while building an unauthenticated IKE_SA_INIT error
 /// response.
 ///
-/// @spec IETF RFC7296 2.6, 2.7, 2.21.1, 3.10.1
+/// @spec IETF RFC7296 2.5, 2.6, 2.7, 2.21.1, 3.10.1
 /// @req REQ-IETF-RFC7296-SA-INIT-ERROR-NOTIFY-BUILD-ERROR-001
 /// @conformance boundary-only
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -974,6 +975,8 @@ pub enum Ikev2SaInitNotifyBuildError {
     SpiNotEmpty,
     /// NO_PROPOSAL_CHOSEN carried notification data.
     UnexpectedNotificationData,
+    /// UNSUPPORTED_CRITICAL_PAYLOAD data was not exactly one payload-type octet.
+    UnsupportedCriticalPayloadDataLength,
     /// INVALID_KE_PAYLOAD data was not exactly one two-octet group number.
     InvalidKePayloadDataLength,
     /// INVALID_KE_PAYLOAD selected the reserved zero Diffie-Hellman group.
@@ -998,6 +1001,9 @@ impl Ikev2SaInitNotifyBuildError {
             Self::ProtocolIdNotZero => "ike_sa_init_notify_protocol_id_not_zero",
             Self::SpiNotEmpty => "ike_sa_init_notify_spi_not_empty",
             Self::UnexpectedNotificationData => "ike_sa_init_notify_unexpected_notification_data",
+            Self::UnsupportedCriticalPayloadDataLength => {
+                "ike_sa_init_notify_unsupported_critical_payload_data_length"
+            }
             Self::InvalidKePayloadDataLength => "ike_sa_init_notify_invalid_ke_payload_data_length",
             Self::InvalidDhGroup => "ike_sa_init_notify_invalid_dh_group",
             Self::LengthOverflow => "ike_sa_init_notify_length_overflow",
@@ -1074,11 +1080,12 @@ pub fn build_ike_sa_init_response(
 /// Build a bounded, notify-only IKE_SA_INIT error response.
 ///
 /// This builder accepts exactly one unauthenticated error with an IKE-SA-level
-/// Notify shape: `NO_PROPOSAL_CHOSEN` with empty notification data, or
+/// Notify shape: `UNSUPPORTED_CRITICAL_PAYLOAD` with the offending payload type
+/// as exactly one octet, `NO_PROPOSAL_CHOSEN` with empty notification data, or
 /// `INVALID_KE_PAYLOAD` with the accepted non-zero Diffie-Hellman group as an
 /// exact two-octet big-endian value. The response uses the request's initiator
 /// SPI, a zero responder SPI, Message ID zero, and canonical responder flags.
-/// The two supported failures are complete, mutually exclusive outcomes, so a
+/// The supported failures are complete, mutually exclusive outcomes, so a
 /// multi-Notify slice is rejected instead of emitting an ambiguous response.
 ///
 /// `INVALID_SYNTAX` is deliberately outside this API. RFC 7296 §3.10.1 only
@@ -1095,7 +1102,7 @@ pub fn build_ike_sa_init_response(
 /// the IKE-SA Notify Protocol ID/SPI shape is invalid, the notification data
 /// does not have its exact RFC-defined form, or a wire length overflows.
 ///
-/// @spec IETF RFC7296 1.2, 2.6, 2.7, 2.21.1, 3.10.1
+/// @spec IETF RFC7296 1.2, 2.5, 2.6, 2.7, 2.21.1, 3.10.1
 /// @req REQ-IETF-RFC7296-SA-INIT-ERROR-NOTIFY-BUILD-001
 /// @conformance boundary-only
 pub fn build_ike_sa_init_notify_response(
@@ -1134,6 +1141,38 @@ pub fn build_ike_sa_init_notify_response(
         header,
         raw_payloads: Bytes::from(raw_payloads),
     })
+}
+
+/// Build an unauthenticated IKE_SA_INIT `UNSUPPORTED_CRITICAL_PAYLOAD`
+/// response.
+///
+/// RFC 7296 requires the notification data to contain exactly one octet: the
+/// payload type of the unsupported critical payload. This typed boundary makes
+/// that length invariant unrepresentable by callers while retaining the
+/// generic builder's strict header and IKE-SA Notify validation.
+///
+/// The caller owns critical-bit inspection, source validation, response rate
+/// limiting, retransmission policy, and other anti-amplification controls.
+///
+/// # Errors
+///
+/// Returns [`Ikev2SaInitNotifyBuildError`] when the header is not a valid
+/// initial IKE_SA_INIT request or a wire length overflows.
+///
+/// @spec IETF RFC7296 2.5, 2.6, 3.10.1
+/// @req REQ-IETF-RFC7296-SA-INIT-UNSUPPORTED-CRITICAL-PAYLOAD-BUILD-001
+/// @conformance boundary-only
+pub fn build_ike_sa_init_unsupported_critical_payload_response(
+    request_header: &Header,
+    offending_payload_type: u8,
+) -> Result<OwnedMessage, Ikev2SaInitNotifyBuildError> {
+    let notify = Ikev2NotifyPayloadBuild {
+        protocol_id: IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+        spi: Vec::new(),
+        notify_message_type: IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
+        notification_data: vec![offending_payload_type],
+    };
+    build_ike_sa_init_notify_response(request_header, &[notify])
 }
 
 /// Build an unauthenticated IKE_SA_INIT `INVALID_KE_PAYLOAD` response.
@@ -1499,6 +1538,11 @@ fn validate_sa_init_error_notify(
     }
 
     match notify.notify_message_type {
+        IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD => {
+            if !matches!(notify.notification_data.as_slice(), [_]) {
+                return Err(Ikev2SaInitNotifyBuildError::UnsupportedCriticalPayloadDataLength);
+            }
+        }
         IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN => {
             if !notify.notification_data.is_empty() {
                 return Err(Ikev2SaInitNotifyBuildError::UnexpectedNotificationData);

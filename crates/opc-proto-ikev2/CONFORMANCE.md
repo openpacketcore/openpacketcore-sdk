@@ -12,7 +12,7 @@ ePDG product-readiness claim.
 | --- | --- | --- |
 | Fixed IKE header (`RFC 7296` §3.1) | Experimental structural coverage | `src/header.rs`; `tests/header.rs` decodes and raw-preserving re-encodes a hand-authored IKEv2 header, rejects bad major versions, short lengths, truncation, and strict reserved flag bits. |
 | Generic payload header and chain (`RFC 7296` §3.2) | Experimental structural coverage for unencrypted payloads | `src/payload.rs`; `tests/payload_chain.rs` walks a hand-authored SA -> Nonce chain, validates length fields, count limits, truncation, strict reserved bits, and byte-exact raw re-encode through `Message`. |
-| IKE_SA_INIT error Notify responses (`RFC 7296` §1.2, §2.6, §2.7, §2.21.1, §3.10.1) | Bounded wire-mechanism coverage | `src/sa_init.rs` and `tests/sa_init_error_notify.rs` build a single notify-only response with the non-zero request initiator SPI, zero responder SPI, Message ID zero, and canonical responder flags. The allowlist contains only IKE-SA-shaped `NO_PROPOSAL_CHOSEN` with empty data and `INVALID_KE_PAYLOAD` with an exact non-zero two-octet big-endian accepted group. Byte-exact and decode-roundtrip evidence covers both forms; malformed exchange/flag/SPI/Message ID, count, Notify Protocol ID/SPI, type, and data-length cases fail closed. `INVALID_SYNTAX` is rejected because RFC 7296 permits it only in a cryptographically validated encrypted packet. The caller retains source validation, rate limiting, retransmission behavior, and all anti-amplification policy. |
+| IKE_SA_INIT error Notify responses (`RFC 7296` §1.2, §2.5, §2.6, §2.7, §2.21.1, §3.10.1) | Bounded wire-mechanism coverage | `src/sa_init.rs` and `tests/sa_init_error_notify.rs` build a single notify-only response with the non-zero request initiator SPI, zero responder SPI, Message ID zero, and canonical responder flags. The allowlist contains only IKE-SA-shaped `UNSUPPORTED_CRITICAL_PAYLOAD` with an exact one-octet offending payload type, `NO_PROPOSAL_CHOSEN` with empty data, and `INVALID_KE_PAYLOAD` with an exact non-zero two-octet big-endian accepted group. Dedicated helpers make the unsupported-payload and invalid-KE notification-data lengths unrepresentable by callers. Byte-exact and decode-roundtrip evidence covers all three forms; malformed exchange/flag/SPI/Message ID, count, Notify Protocol ID/SPI, type, and data-length cases fail closed. `INVALID_SYNTAX` is rejected because RFC 7296 permits it only in a cryptographically validated encrypted packet. The caller retains critical-bit inspection, source validation, rate limiting, retransmission behavior, and all anti-amplification policy. |
 | IKE-SA crypto profile and KDF (`RFC 7296` §2.13, §2.14, §2.17, §2.18; `RFC 4868`) | Typed algorithm and derivation coverage | `src/sa_init_crypto.rs` preserves PRF, DH, encryption/key size, and optional typed integrity in an immutable validated profile. It supports PRF-HMAC-SHA2-256/384/512, AES-GCM-16 profile key material, and AES-CBC-128/192/256 with AUTH-HMAC-SHA2-256-128/384-192/512-256 key material. Transform selection is by type rather than wire order; duplicate, missing, unknown, and AEAD/integrity-contradictory sets fail closed. Initial IKE-SA, Child-SA, restore, PPK post-processing, and IKE-SA rekey derivation are covered; rekey uses the old PRF for `SKEYSEED` and the new PRF for the new seven-key expansion. RFC 4231/RFC 4868 HMAC-SHA2-512 vectors plus independently generated OpenSSL-based initial/rekey/Child KDF vectors provide non-round-trip evidence. Protected-payload algorithm coverage is claimed separately below. |
 | IKE_SA_INIT proposal selection (`RFC 7296` §2.7, §3.3.2, §3.3.5, §3.3.6; `RFC 5282` §8) | Product-neutral executable-suite selection | `src/sa_init_negotiation.rs` selects against an ordered set of already-executable typed profiles. Same-type transforms are OR alternatives, different types are AND requirements, and wire order is irrelevant. The selected transform and every attribute are copied exactly into a single response-ready proposal. Unknown transform types make only their proposal unacceptable; unknown attributes make only their transform unusable. Exact duplicate transforms, duplicate attributes, invalid IKE proposal SPIs/numbers, missing types, KE/DH mismatch, and invalid KE public-value length fail closed with stable typed codes. `NoAcceptableProposal` maps cleanly to `NO_PROPOSAL_CHOSEN`; a supported offered group with a different KE has a distinct mismatch result for `INVALID_KE_PAYLOAD`. `tests/sa_init_negotiation.rs` independently audits a literal synthetic ENCR→INTEG→PRF→DH fixture and proves alternate order/alternatives, unsupported DH1, and duplicate rejection. |
 | Unknown payload preservation | Experimental structural coverage | Unknown non-critical payloads remain raw-preserved; unknown critical payloads fail closed by default as required by RFC 7296 §2.2. |
@@ -95,14 +95,16 @@ They are suitable for this scaffold's structural coverage only. They are not
 independent-peer interoperability fixtures, and no source-product bytes are
 counted as conformance evidence.
 
-`tests/sa_init_error_notify.rs` separately hand-authors complete 36-octet
-`NO_PROPOSAL_CHOSEN` and 38-octet `INVALID_KE_PAYLOAD` response vectors. Both
-use RFC 7296 §2.6 for a zero responder SPI, §3.1 for the IKE header, §3.2 for
-generic-payload chaining, and §3.10 for the Notify body. The former uses §2.7
-and §3.10.1 for error type 14 with no notification data; the latter uses
-§1.2, §1.3, and §3.10.1 for error type 17 and the accepted Diffie-Hellman
-group as exactly two big-endian octets. These are specification-derived wire
-vectors, not independent-peer captures.
+`tests/sa_init_error_notify.rs` separately hand-authors complete 37-octet
+`UNSUPPORTED_CRITICAL_PAYLOAD`, 36-octet `NO_PROPOSAL_CHOSEN`, and 38-octet
+`INVALID_KE_PAYLOAD` response vectors. All use RFC 7296 §2.6 for a zero
+responder SPI, §3.1 for the IKE header, §3.2 for generic-payload chaining, and
+§3.10 for the Notify body. The first uses §2.5 and §3.10.1 for error type 1 and
+one synthetic private-use offending payload-type octet; the second uses §2.7
+and §3.10.1 for error type 14 with no notification data; the third uses §1.2,
+§1.3, and §3.10.1 for error type 17 and the accepted Diffie-Hellman group as
+exactly two big-endian octets. These are specification-derived wire vectors,
+not independent-peer captures.
 
 The SHA-2 primitive tests copy the published PRF and authenticator values from
 [RFC 4868 §2.7](https://www.rfc-editor.org/rfc/rfc4868.html#section-2.7), which

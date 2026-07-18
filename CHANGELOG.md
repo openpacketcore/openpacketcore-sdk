@@ -300,15 +300,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsing, authorization evidence, and ordinary SWm wire behavior are
   unchanged.
 - **Bounded IKE_SA_INIT error responses — `opc-proto-ikev2`:** responders can
-  now build notify-only `NO_PROPOSAL_CHOSEN` and `INVALID_KE_PAYLOAD` responses
-  with a zero responder SPI, canonical response flags, and Message ID zero.
-  The generic entry point accepts exactly one allowlisted IKE-SA-shaped error;
-  the invalid-KE convenience builder encodes the accepted non-zero
-  Diffie-Hellman group as exactly two big-endian octets. Cleartext
+  now build notify-only `UNSUPPORTED_CRITICAL_PAYLOAD`, `NO_PROPOSAL_CHOSEN`,
+  and `INVALID_KE_PAYLOAD` responses with a zero responder SPI, canonical
+  response flags, and Message ID zero. The generic entry point accepts exactly
+  one allowlisted IKE-SA-shaped error; dedicated helpers encode an unsupported
+  critical payload as exactly one offending payload-type octet and an accepted
+  non-zero Diffie-Hellman group as exactly two big-endian octets. Cleartext
   `INVALID_SYNTAX`, non-zero Protocol IDs, SPI bytes, ambiguous lists, and
-  malformed data fail closed. Source validation, response rate limiting,
-  retransmission behavior, and other unauthenticated anti-amplification policy
-  remain product responsibilities.
+  malformed data fail closed. Critical-bit inspection, source validation,
+  response rate limiting, retransmission behavior, and other unauthenticated
+  anti-amplification policy remain product responsibilities.
 - **Combined HA candidate evidence contract — `opc-session-testkit`:** an
   additive frozen v4 profile preserves the v2 runtime inventory while binding
   both the v1 sequential and v3 concurrent independent-checker contracts. A

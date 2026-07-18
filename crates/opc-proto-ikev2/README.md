@@ -35,11 +35,12 @@ control-plane stack.
   integrity or CBC without integrity combinations cannot be constructed.
   PRF-HMAC-SHA2-256/384/512 are supported for initial IKE-SA derivation,
   IKE-SA rekey (including distinct old/new PRFs), Child-SA KEYMAT, restore, and
-  AUTH calculations. The notify-only error builder is deliberately
-  bounded to one IKE-SA-shaped `NO_PROPOSAL_CHOSEN` or `INVALID_KE_PAYLOAD`;
-  the latter has a convenience builder that writes the accepted non-zero group
-  as exactly two big-endian octets. These failures are mutually exclusive, so
-  the builder rejects a multi-Notify response rather than emitting ambiguity.
+  AUTH calculations. The notify-only error builder is deliberately bounded to
+  one IKE-SA-shaped `UNSUPPORTED_CRITICAL_PAYLOAD`, `NO_PROPOSAL_CHOSEN`, or
+  `INVALID_KE_PAYLOAD`. Typed convenience builders write the offending payload
+  type as exactly one octet or the accepted non-zero group as exactly two
+  big-endian octets. These failures are mutually exclusive, so the builder
+  rejects a multi-Notify response rather than emitting ambiguity.
 - `protected_payload_crypto` provides caller-keyed AES-GCM-16 and
   AES-CBC/SHA-2 encrypt-then-MAC `SK`/`SKF` open/seal helpers for
   already-derived SA_INIT key material. Production CBC sealing obtains a fresh
