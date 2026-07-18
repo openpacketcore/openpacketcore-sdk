@@ -585,6 +585,10 @@ impl ConsensusSessionStore {
 
     /// Fresh readiness proof using the same Openraft quorum/read-index path as
     /// authoritative operations.
+    ///
+    /// The recovery-latch check and linearizable barrier share one complete
+    /// operation deadline. A delayed recovery check therefore cannot silently
+    /// grant the barrier a second operation budget.
     pub async fn probe_durable_readiness(&self) -> DurableReadinessReport {
         let configured = self.inner.members.len();
         let quorum = (configured / 2) + 1;
@@ -612,11 +616,11 @@ impl ConsensusSessionStore {
                 metrics.purged.as_ref().map(|log_id| log_id.index),
             )
         };
-        let recovery_deadline = tokio::time::Instant::now()
+        let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .unwrap_or_else(tokio::time::Instant::now);
         let recovery_pending = tokio::time::timeout_at(
-            recovery_deadline,
+            deadline,
             self.inner
                 .backend
                 .consensus_operator_recovery_pending(self.inner.identity),
@@ -649,7 +653,7 @@ impl ConsensusSessionStore {
             };
             return report_without_barrier(state, progress);
         }
-        match self.linearizable_barrier().await {
+        match self.linearizable_barrier_before(deadline).await {
             Ok(log_id) => {
                 let metrics = self.inner.raft.metrics();
                 let metrics = metrics.borrow();
@@ -1377,13 +1381,11 @@ impl ConsensusSessionStore {
         }
     }
 
-    async fn linearizable_barrier(
+    async fn linearizable_barrier_before(
         &self,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, StoreError> {
         self.require_exact_membership_admission()?;
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .ok_or_else(consensus_unavailable)?;
         let mut preferred = None;
         loop {
             let leader = match preferred.take() {

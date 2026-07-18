@@ -76,8 +76,10 @@ evidence.
   skips bootstrap and re-admits normally. Clean first formation fails closed
   when the canonical node is absent.
 - `ConsensusSessionStore::probe_durable_readiness` uses the same bounded
-  Openraft linearizable-read barrier as real authoritative operations. It does
-  not treat a bound listener or cached capabilities as quorum evidence.
+  Openraft linearizable-read barrier as real authoritative operations. Its
+  recovery-latch check and barrier share the configured complete-operation
+  deadline; it does not treat a bound listener or cached capabilities as
+  quorum evidence.
 - `recovery::LegacyForkRecovery` is the default-deny offline administrative
   boundary for a drained fleet. It creates a sealed, redaction-safe plan,
   quarantines every explicit target before mutation, installs one immutable
