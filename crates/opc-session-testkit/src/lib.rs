@@ -4,6 +4,7 @@
 //! This is an internal testkit crate and is not published.
 
 pub mod qualification;
+pub mod qualification_concurrent_v5;
 pub mod qualification_kubernetes;
 pub mod qualification_kubernetes_campaign;
 pub mod qualification_sequential;

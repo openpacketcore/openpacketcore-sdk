@@ -159,6 +159,51 @@ impl QualificationKubernetesReadinessExpectation {
                 .zip(*committed_index)
                 .is_some_and(|(applied, committed)| applied >= committed)
     }
+
+    /// Accept one structurally complete v5 readiness observation for this
+    /// exact local identity and voter set.
+    ///
+    /// Ready observations must carry fresh Openraft authority and a separately
+    /// linearized application-journal head. Not-ready observations must omit
+    /// every authority field so a collector cannot accidentally retain stale
+    /// authority across a quorum-loss interval.
+    pub fn accepts_concurrent_readiness_reply(&self, reply: &QualificationNodeReply) -> bool {
+        let QualificationNodeReply::ConcurrentReadiness { status } = reply else {
+            return false;
+        };
+        if status.node_id != self.expected_node_id
+            || status.configured_voters != self.voter_count()
+            || status.configured_voter_ids != self.expected_voter_ids
+            || status.required_quorum != self.required_quorum()
+            || status.fresh_reachable_voters > self.voter_count()
+            || status.agreeing_voters > self.voter_count()
+            || status.agreeing_voters > status.fresh_reachable_voters
+        {
+            return false;
+        }
+
+        if status.ready {
+            status.reason_code == QualificationReadinessCode::Ready
+                && status.fresh_reachable_voters == self.required_quorum()
+                && status.agreeing_voters == self.required_quorum()
+                && status.raft_term.is_some_and(|term| term != 0)
+                && status
+                    .raft_leader_id
+                    .is_some_and(|leader| self.contains_voter(leader))
+                && status
+                    .raft_applied_index
+                    .zip(status.raft_commit_index)
+                    .is_some_and(|(applied, committed)| applied >= committed)
+                && status.journal_head.is_some()
+        } else {
+            status.reason_code != QualificationReadinessCode::Ready
+                && status.raft_term.is_none()
+                && status.raft_leader_id.is_none()
+                && status.raft_commit_index.is_none()
+                && status.raft_applied_index.is_none()
+                && status.journal_head.is_none()
+        }
+    }
 }
 
 /// Redaction-safe invalid Kubernetes readiness identity contract.
@@ -992,6 +1037,79 @@ mod tests {
         .is_err());
         let debug = format!("{expectation:?}");
         assert!(!debug.contains(&expectation.expected_node_id().to_string()));
+    }
+
+    #[test]
+    fn concurrent_readiness_expectation_rejects_stale_or_mismatched_authority() {
+        let expectations =
+            qualification_kubernetes_readiness_expectations(3).expect("fixed expectations");
+        let expectation = &expectations[0];
+        let leader_id = expectations[1].expected_node_id();
+        let ready_status = crate::qualification::QualificationConcurrentReadiness {
+            ready: true,
+            reason_code: QualificationReadinessCode::Ready,
+            node_id: expectation.expected_node_id(),
+            configured_voters: expectation.voter_count(),
+            configured_voter_ids: expectation.expected_voter_ids().to_vec(),
+            fresh_reachable_voters: expectation.required_quorum(),
+            agreeing_voters: expectation.required_quorum(),
+            required_quorum: expectation.required_quorum(),
+            raft_term: Some(2),
+            raft_leader_id: Some(leader_id),
+            raft_commit_index: Some(7),
+            raft_applied_index: Some(8),
+            journal_head: Some(11),
+        };
+        let ready = QualificationNodeReply::ConcurrentReadiness {
+            status: ready_status.clone(),
+        };
+        assert!(expectation.accepts_concurrent_readiness_reply(&ready));
+
+        let mut mismatched = ready_status.clone();
+        mismatched.configured_voter_ids[2] = u64::MAX;
+        assert!(!expectation.accepts_concurrent_readiness_reply(
+            &QualificationNodeReply::ConcurrentReadiness { status: mismatched }
+        ));
+
+        let mut impossible_agreement = ready_status.clone();
+        impossible_agreement.ready = false;
+        impossible_agreement.reason_code = QualificationReadinessCode::NoQuorum;
+        impossible_agreement.fresh_reachable_voters = 1;
+        impossible_agreement.agreeing_voters = 2;
+        impossible_agreement.raft_term = None;
+        impossible_agreement.raft_leader_id = None;
+        impossible_agreement.raft_commit_index = None;
+        impossible_agreement.raft_applied_index = None;
+        impossible_agreement.journal_head = None;
+        assert!(!expectation.accepts_concurrent_readiness_reply(
+            &QualificationNodeReply::ConcurrentReadiness {
+                status: impossible_agreement,
+            }
+        ));
+
+        let not_ready_status = crate::qualification::QualificationConcurrentReadiness {
+            ready: false,
+            reason_code: QualificationReadinessCode::NoQuorum,
+            raft_term: None,
+            raft_leader_id: None,
+            raft_commit_index: None,
+            raft_applied_index: None,
+            journal_head: None,
+            ..ready_status
+        };
+        assert!(expectation.accepts_concurrent_readiness_reply(
+            &QualificationNodeReply::ConcurrentReadiness {
+                status: not_ready_status.clone(),
+            }
+        ));
+
+        let mut stale_not_ready = not_ready_status;
+        stale_not_ready.journal_head = Some(11);
+        assert!(!expectation.accepts_concurrent_readiness_reply(
+            &QualificationNodeReply::ConcurrentReadiness {
+                status: stale_not_ready,
+            }
+        ));
     }
 
     #[test]
