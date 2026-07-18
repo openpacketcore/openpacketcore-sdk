@@ -1,0 +1,14 @@
+# Independently authored RFC 6733 3001 answer for the sibling request.
+# R is clear, P/E are set, identifiers and ordered Proxy-Info are preserved,
+# request-only destination AVPs are absent.
+01 00 00 a8 60 00 fe fe 00 00 00 00 11 22 33 44 aa bb cc dd
+00 00 01 07 40 00 00 17 73 65 73 73 3b 66 69 78 74 75 72 65 3b 30 31 00
+00 00 01 08 40 00 00 11 61 61 61 2e 6c 6f 63 61 6c 00 00 00
+00 00 01 28 40 00 00 12 6c 6f 63 61 6c 2e 74 65 73 74 00 00
+00 00 01 0c 40 00 00 0c 00 00 0b b9
+00 00 01 1c 40 00 00 24
+  00 00 01 18 40 00 00 0f 70 72 6f 78 79 2d 61 00
+  00 00 00 21 40 00 00 0c de ad be ef
+00 00 01 1c 40 00 00 24
+  00 00 01 18 40 00 00 0f 70 72 6f 78 79 2d 62 00
+  00 00 00 21 40 00 00 0b 01 02 03 00

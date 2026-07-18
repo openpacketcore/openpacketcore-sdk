@@ -233,6 +233,38 @@ def main() -> None:
         "dpr_request",
     )
 
+    # Request-bound error-answer seeds. These exercise inspection of an
+    # unknown command and an unsupported application while retaining only the
+    # exact Session-Id and ordered Proxy-Info routing context.
+    error_routing_avps = b""
+    error_routing_avps += avp(263, 0x40, b"sess;error;001", None)
+    error_routing_avps += avp(283, 0x40, b"destination.example", None)
+    proxy_info = avp(280, 0x40, b"proxy.example", None)
+    proxy_info += avp(33, 0x40, b"opaque-state", None)
+    error_routing_avps += avp(284, 0x40, proxy_info, None)
+    write_corpus(
+        msg_dir,
+        header(0xC0, 0x00FEFE, 0, 0x12121212, 0x34343434, error_routing_avps),
+        "error_unknown_command_request",
+    )
+    write_corpus(
+        msg_dir,
+        header(0xC0, 268, 9999, 0x56565656, 0x78787878, error_routing_avps),
+        "error_unsupported_application_request",
+    )
+    write_corpus(
+        msg_dir,
+        header(
+            0x80,
+            280,
+            0,
+            0x90909090,
+            0xA0A0A0A0,
+            avp(284, 0x40, proxy_info, None),
+        ),
+        "error_proxy_info_resource_limits",
+    )
+
     # 6. Rf Accounting-Request (START record). Command code 271, app id 3.
     #    RFC 6733 §9.7.1 / 3GPP TS 32.299 §5.1 offline charging.
     acr_avps = b""

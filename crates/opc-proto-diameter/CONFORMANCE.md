@@ -55,7 +55,95 @@ This document defines the conformance status of the `opc-proto-diameter` crate.
   `peer` and application parsers (see below), not by the raw or command-
   cardinality validator.
 
-### 4. Base peer procedures (RFC 6733 §5.3–5.5)
+### 4. Request-bound error answers (RFC 6733 §6.2 and §7)
+
+- `inspect_diameter_request` requires a complete trusted request header and a
+  message boundary within `DecodeContext::max_message_len`; fragments,
+  answers, impossible lengths, and AVP-count excess are unanswerable.
+  Proxy-Info descent requires `max_depth >= 1`, and its child count is checked
+  against `max_ies` before child decoding or canonical-output allocation.
+- `DiameterRequestEnvelope` retains the command/application, P bit, both
+  identifiers, a SHA-256 binding to the exact request, a bounded redacted
+  exact-copy Session-Id, and ordered redacted Proxy-Info AVPs. Proxy-Info and
+  its opaque children are copied in order through a canonical encoder; invalid
+  padding or flags are never reflected. One selected offending AVP may also be
+  retained in a redacted `DiameterFailedAvp`; the envelope never retains an
+  arbitrary suffix. Classification returns a private-construction
+  `DiameterBoundRequestFailure` tied to that request digest. The answer builder
+  accepts only this bound token, not an unbound failure enum.
+- Typed failures cover RFC result codes 3001, 3007, 3008, 3009, 5001, 5004,
+  5005, 5008, 5009, 5011, 5013, and 5014. Reserved Diameter-header bits map to
+  5013, while an E/P combination inconsistent with a uniquely resolved command
+  maps to 3008. Dictionary lookup distinguishes missing application/command
+  profiles from locally ambiguous profiles. Generic `DecodeError` mapping
+  requires the byte-identical request, an exact AVP header/value offset, one
+  application and command grammar, the received M bit, and explicit command
+  occurrence provenance. 5009 requires `ZeroOrOne`; a repeatable or absent
+  rule produces no peer error plan, and classification selects the second
+  occurrence even when later duplicate evidence is supplied. 5008 requires an
+  explicit `Forbidden` rule; command-aware decode and classification reject
+  its first occurrence. An unknown M-bit AVP with no unique definition maps to
+  5001 during central classification, while an optional unknown rejected only
+  by local policy remains local. Nested 5008/5009 application evidence uses
+  only the immediate Grouped parent's declared child rule and preceding direct
+  siblings; top-level command rules/counts never authorize a nested leaf.
+  Header/P/dictionary failures and AVP offsets have deterministic first-failure
+  precedence across classification, decoder mapping, application binding, and
+  answer construction.
+- `DiameterFailedAvp` copies one complete offender, derives a zero-filled
+  missing shape from dictionary type/flag/vendor metadata, safely synthesizes
+  short or overlong AVP headers, rejects values beyond Diameter's U24 limit
+  before allocation, and can retain a bounded received or synthesized grouped
+  hierarchy. Invalid-length fixed-width AVPs are finalized only against one
+  unique dictionary definition and receive its normative zero-filled minimum;
+  unknown and Grouped definitions use an empty minimum. Missing leaves have no
+  fictitious request offset. Every received grouped ancestor retains private
+  key/range/digest provenance and is rebound only after its complete request
+  bytes, unique Grouped dictionary definition, direct-child containment, and
+  exact top-level outer root are proven. Ancestor-free received evidence must
+  itself match an exact top-level iterator entry, so AVP-shaped bytes inside an
+  OctetString cannot be rebound. Synthesized ancestors require canonical
+  encoding, a unique Grouped definition, and declared direct-child schema
+  metadata; 5005 also proves that the leaf or outer missing group is absent at
+  the request root, or that the leaf is absent from its received direct parent.
+  Both the caller's inspection limit and a fixed defensive ceiling bound
+  hierarchy depth. Diagnostics expose only code, vendor, optional offset,
+  length, depth, and retained size.
+- `build_diameter_error_answer` clears R/T, preserves P and both identifiers,
+  copies the Session-Id value bytes and Proxy-Info order, adds local Origin
+  identity and Result-Code/Failed-AVP, and never copies destination/routing
+  fields. It rejects a token produced for any other request envelope.
+  Protocol errors set E and always report the effective RFC 6733 §7.2 grammar.
+  Permanent errors keep E clear unless the caller explicitly selects the
+  §7.1.5-permitted §7.2 fallback grammar.
+- Independently authored fixtures cover 3001, 3007, 5001, 5004, 5005, 5008,
+  and 5009 across base and SWm requests. Focused tests also cover the remaining
+  listed result codes, DWA/DPA application-grammar decoding, P-bit and
+  dictionary ambiguity, M/P/V and Vendor-Id-zero handling, canonical
+  Proxy-Info, copied/missing/duplicate/malformed/nested Failed-AVP, malformed
+  DWR/DPR/SWm requests, explicit/absent/repeatable cardinality, triple
+  singleton first-excess selection, one/two forbidden Result-Code occurrences,
+  grouped-child 5008/5009 precedence, unknown M-bit first-failure selection,
+  the actual SWm DER forbidden Result-Code parser path, application/AVP ambiguity,
+  fixed-width base/vendor and grouped/unknown malformed shapes, Proxy-Info
+  depth/count limits, pre-allocation U24 bounds, exact correlation, unrelated,
+  non-Grouped, mislocated, embedded-OctetString, root/path-presence,
+  unknown-schema, and excessive-depth ancestry rejection, and redaction.
+  Corpus replay and `decode_message`
+  fuzzing run the inspector under conservative, zero-depth, and one-IE limits
+  on hostile and truncated input.
+
+Transport admission, response rate limits, connection-close policy, and
+application authorization remain downstream policy. A caller may select the
+ordinary application answer grammar only when the common generated fields
+satisfy that command's answer CCF. When composing that CCF is not possible or
+efficient, RFC 6733 §7.1.5 permits the caller to deliberately select the §7.2
+E-bit grammar for a permanent failure; the SDK does not claim that fallback is
+valid merely because an application field was omitted.
+The existing CEA/DWA/DPA APIs share the same canonical AVP encoder;
+request-correlated negative answers use the new common boundary.
+
+### 5. Base peer procedures (RFC 6733 §5.3–5.5)
 
 Feature-gated under the `peer` feature.
 
@@ -81,9 +169,11 @@ repeatable RFC 6733 capability fields as repeatable: Host-IP-Address,
 Supported-Vendor-Id, Auth-Application-Id, Inband-Security-Id,
 Acct-Application-Id, and Vendor-Specific-Application-Id. In particular,
 Failed-AVP remains singleton. DWR, DWA, DPR, and DPA declare no repeatable
-known base AVPs, and raw decode retains blanket duplicate rejection.
+known base AVPs, and raw decode retains blanket duplicate rejection. That raw
+rejection is not sufficient provenance for a 5009 answer: error mapping emits
+5009 only when the selected command profile explicitly declares `ZeroOrOne`.
 
-### 5. Application dictionaries
+### 6. Application dictionaries
 
 Feature-gated per application. Dictionary metadata (applications, commands,
 AVPs, data types, flag rules) is present; typed builders/parsers are limited to
@@ -201,7 +291,7 @@ children (for example `VPLMN-Dynamic-Address-Allowed`,
 `3GPP-Charging-Characteristics`) are deliberately not modeled yet and are
 handled by the unknown-AVP policy.
 
-### 6. Redaction
+### 7. Redaction
 
 Sensitive typed fields are wrapped in `Redacted<T>` or redaction-safe identity
 newtypes. Their `Debug` and `Display` output never exposes the underlying

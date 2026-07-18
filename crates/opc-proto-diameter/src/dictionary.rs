@@ -173,6 +173,7 @@ pub struct AvpDefinition {
     data_type: AvpDataType,
     flags: AvpFlagRules,
     spec_ref: SpecRef,
+    grouped_avp_rules: &'static [CommandAvpRule],
 }
 
 impl AvpDefinition {
@@ -190,7 +191,21 @@ impl AvpDefinition {
             data_type,
             flags,
             spec_ref,
+            grouped_avp_rules: &[],
         }
+    }
+
+    /// Attach occurrence metadata for direct children of a `Grouped` AVP.
+    ///
+    /// These rules are also the trusted schema path used when constructing a
+    /// nested, synthesized `Failed-AVP` for a missing child. Definitions that
+    /// are not [`AvpDataType::Grouped`] must not attach child rules.
+    pub const fn with_grouped_avp_rules(
+        mut self,
+        grouped_avp_rules: &'static [CommandAvpRule],
+    ) -> Self {
+        self.grouped_avp_rules = grouped_avp_rules;
+        self
     }
 
     /// Return the AVP lookup key.
@@ -217,6 +232,16 @@ impl AvpDefinition {
     pub const fn spec_ref(&self) -> &SpecRef {
         &self.spec_ref
     }
+
+    /// Return occurrence metadata for direct children of this grouped AVP.
+    pub const fn grouped_avp_rules(&self) -> &'static [CommandAvpRule] {
+        self.grouped_avp_rules
+    }
+
+    /// Return the direct-child rule for a vendor-aware AVP key, when declared.
+    pub fn find_grouped_avp_rule(&self, key: AvpKey) -> Option<&CommandAvpRule> {
+        self.grouped_avp_rules.iter().find(|rule| rule.key() == key)
+    }
 }
 
 /// Request/answer role for a Diameter command definition.
@@ -235,6 +260,8 @@ pub enum CommandKind {
 /// using this metadata to exempt an AVP from duplicate rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AvpCardinality {
+    /// The command grammar explicitly prohibits this AVP.
+    Forbidden,
     /// The AVP may be absent and may occur at most once.
     ZeroOrOne,
     /// The AVP may occur any number of times.
@@ -245,6 +272,11 @@ impl AvpCardinality {
     /// Return whether this cardinality permits more than one occurrence.
     pub const fn allows_multiple(self) -> bool {
         matches!(self, Self::ZeroOrMore)
+    }
+
+    /// Return whether the command grammar explicitly prohibits the AVP.
+    pub const fn is_forbidden(self) -> bool {
+        matches!(self, Self::Forbidden)
     }
 }
 

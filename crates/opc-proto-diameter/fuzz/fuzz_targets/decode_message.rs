@@ -2,10 +2,32 @@
 
 use libfuzzer_sys::fuzz_target;
 use opc_proto_diameter::apps::{APP_DICTIONARIES, SWM_PROJECTED_PROFILE_DICTIONARIES};
+use opc_proto_diameter::error_answer::{inspect_diameter_request, DiameterRequestInspection};
 use opc_proto_diameter::{Message, OwnedMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode, ValidationLevel};
 
 fuzz_target!(|data: &[u8]| {
+    // Bounded request inspection and error-context capture.
+    if let DiameterRequestInspection::Request(envelope) =
+        inspect_diameter_request(data, DecodeContext::conservative())
+    {
+        let _ = envelope.classify(data, APP_DICTIONARIES);
+    }
+    let _ = inspect_diameter_request(
+        data,
+        DecodeContext {
+            max_depth: 0,
+            ..DecodeContext::conservative()
+        },
+    );
+    let _ = inspect_diameter_request(
+        data,
+        DecodeContext {
+            max_ies: 1,
+            ..DecodeContext::conservative()
+        },
+    );
+
     // Borrowed decode at the default (Structural) level.
     let ctx = DecodeContext::default();
     let _ = Message::decode(data, ctx);

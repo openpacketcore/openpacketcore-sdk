@@ -1,0 +1,13 @@
+# Independently authored RFC 6733 request shape: unknown command, common
+# application, P bit, Session-Id, request-only destinations, and two ordered
+# Proxy-Info AVPs. Values are synthetic.
+01 00 00 a0 c0 00 fe fe 00 00 00 00 11 22 33 44 aa bb cc dd
+00 00 01 07 40 00 00 17 73 65 73 73 3b 66 69 78 74 75 72 65 3b 30 31 00
+00 00 01 25 40 00 00 1b 64 65 73 74 69 6e 61 74 69 6f 6e 2e 65 78 61 6d 70 6c 65 00
+00 00 01 1b 40 00 00 0f 65 78 61 6d 70 6c 65 00
+00 00 01 1c 40 00 00 24
+  00 00 01 18 40 00 00 0f 70 72 6f 78 79 2d 61 00
+  00 00 00 21 40 00 00 0c de ad be ef
+00 00 01 1c 40 00 00 24
+  00 00 01 18 40 00 00 0f 70 72 6f 78 79 2d 62 00
+  00 00 00 21 40 00 00 0b 01 02 03 00

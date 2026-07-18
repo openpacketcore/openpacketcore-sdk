@@ -168,6 +168,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the adapter-owned proof/replay policy. No Kubernetes, cloud, CSI, TPM, SPIFFE
   collection, or dynamic
   membership policy is embedded in the store.
+- **Request-bound Diameter error answers — `opc-proto-diameter`:** bounded
+  inspection now separates answerable requests from fragments and
+  untrustworthy boundaries, retaining only redacted Session-Id, ordered
+  canonically re-encoded Proxy-Info, and one selected Failed-AVP context. Typed
+  RFC 6733 failures cover unknown command/application, header/AVP flags,
+  unsupported/invalid/missing/forbidden/excess AVPs, unsupported version,
+  reserved header bits (5013), and invalid AVP length. Classification binds to
+  the exact request, distinguishes missing from ambiguous dictionaries, checks
+  command P and AVP M/P/V rules, and maps generic decoder failures only after
+  proving offset, M-bit/local-policy, and explicit command-cardinality
+  provenance. 5009 requires `ZeroOrOne`, 5008 requires an explicit
+  `Forbidden` rule, and missing rules remain unmapped. The command-aware decoder
+  and classifier reject the first forbidden occurrence, while triple singleton
+  inputs bind 5009 to the second occurrence even if later evidence is supplied;
+  earlier unknown M-bit AVPs centrally map to 5001. Nested 5008/5009 evidence
+  uses only its immediate Grouped parent's schema and preceding siblings.
+  Missing nested AVPs use parent-relative structures without fake offsets and
+  prove absence at the request root or received direct parent;
+  malformed fixed-width AVPs use a unique dictionary's zero-filled minimum;
+  U24 synthesis bounds are checked before allocation. Received grouped ancestry
+  carries exact private request range/digest provenance and must prove unique
+  Grouped definitions, direct containment, and an exact top-level root;
+  ancestor-free evidence must itself be an exact top-level iterator entry, so
+  AVP-shaped value bytes cannot be rebound. Synthesized ancestry requires a
+  declared grouped-child schema path and bounded depth. Proxy-Info
+  canonicalization enforces caller depth and child-count limits. Classification
+  and decoder/application mapping return a request-digest-bound failure token,
+  and the builder accepts only that token, rejecting unrelated copied evidence
+  or a different envelope. The builder preserves P and both identifiers,
+  removes request-only routing fields, exposes exact amplification sizing, and
+  requires an explicit §7.2 fallback before a 5xxx result sets E; 3xxx plans
+  report their necessarily effective §7.2 grammar.
 - **Bounded GTPv2-C protocol-error responses — `opc-proto-gtpv2c`:** a
   zero-allocation fixed-header inspector now separates answerable requests
   from TS 29.274 silent-discard cases. Typed plans cover header-only Version

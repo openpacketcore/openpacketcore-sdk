@@ -25,6 +25,8 @@ pub const COMMAND_DISCONNECT_PEER: CommandCode = CommandCode::new(282);
 
 /// User-Name AVP code.
 pub const AVP_USER_NAME: AvpCode = AvpCode::new(1);
+/// Proxy-State AVP code.
+pub const AVP_PROXY_STATE: AvpCode = AvpCode::new(33);
 /// Host-IP-Address AVP code.
 pub const AVP_HOST_IP_ADDRESS: AvpCode = AvpCode::new(257);
 /// Auth-Application-Id AVP code.
@@ -53,10 +55,16 @@ pub const AVP_DISCONNECT_CAUSE: AvpCode = AvpCode::new(273);
 pub const AVP_ORIGIN_STATE_ID: AvpCode = AvpCode::new(278);
 /// Failed-AVP AVP code.
 pub const AVP_FAILED_AVP: AvpCode = AvpCode::new(279);
+/// Proxy-Host AVP code.
+pub const AVP_PROXY_HOST: AvpCode = AvpCode::new(280);
 /// Error-Message AVP code.
 pub const AVP_ERROR_MESSAGE: AvpCode = AvpCode::new(281);
+/// Route-Record AVP code.
+pub const AVP_ROUTE_RECORD: AvpCode = AvpCode::new(282);
 /// Destination-Realm AVP code.
 pub const AVP_DESTINATION_REALM: AvpCode = AvpCode::new(283);
+/// Proxy-Info AVP code.
+pub const AVP_PROXY_INFO: AvpCode = AvpCode::new(284);
 /// Destination-Host AVP code.
 pub const AVP_DESTINATION_HOST: AvpCode = AvpCode::new(293);
 /// Error-Reporting-Host AVP code.
@@ -74,8 +82,30 @@ pub const AVP_INBAND_SECURITY_ID: AvpCode = AvpCode::new(299);
 pub const RESULT_CODE_DIAMETER_SUCCESS: u32 = 2001;
 /// Command unsupported protocol-error result code.
 pub const RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED: u32 = 3001;
+/// Application unsupported protocol-error result code.
+pub const RESULT_CODE_DIAMETER_APPLICATION_UNSUPPORTED: u32 = 3007;
+/// Invalid Diameter header bits protocol-error result code.
+pub const RESULT_CODE_DIAMETER_INVALID_HDR_BITS: u32 = 3008;
+/// Invalid AVP flag bits protocol-error result code.
+pub const RESULT_CODE_DIAMETER_INVALID_AVP_BITS: u32 = 3009;
+/// Unsupported mandatory AVP permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_AVP_UNSUPPORTED: u32 = 5001;
+/// Invalid AVP value permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_INVALID_AVP_VALUE: u32 = 5004;
+/// Missing mandatory AVP permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_MISSING_AVP: u32 = 5005;
+/// Forbidden AVP permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_AVP_NOT_ALLOWED: u32 = 5008;
+/// Excess AVP occurrence permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_AVP_OCCURS_TOO_MANY_TIMES: u32 = 5009;
 /// No common application permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION: u32 = 5010;
+/// Unsupported Diameter version permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_UNSUPPORTED_VERSION: u32 = 5011;
+/// Invalid reserved or otherwise incorrect Diameter header bit permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_INVALID_BIT_IN_HEADER: u32 = 5013;
+/// Invalid AVP length permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH: u32 = 5014;
 /// Inband-Security-Id value for no in-band security.
 pub const INBAND_SECURITY_ID_NO_INBAND_SECURITY: u32 = 0;
 /// Inband-Security-Id value for TLS.
@@ -117,6 +147,11 @@ const CAPABILITIES_EXCHANGE_REPEATABLE_AVP_RULES: [CommandAvpRule; 6] = [
         AvpKey::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID),
         AvpCardinality::ZeroOrMore,
     ),
+];
+
+const PROXY_INFO_AVP_RULES: [CommandAvpRule; 2] = [
+    CommandAvpRule::new(AvpKey::ietf(AVP_PROXY_HOST), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(AvpKey::ietf(AVP_PROXY_STATE), AvpCardinality::ZeroOrOne),
 ];
 
 const BASE_COMMANDS: [CommandDefinition; 6] = [
@@ -172,13 +207,20 @@ const BASE_COMMANDS: [CommandDefinition; 6] = [
     ),
 ];
 
-const BASE_AVPS: [AvpDefinition; 23] = [
+const BASE_AVPS: [AvpDefinition; 27] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_USER_NAME),
         "User-Name",
         AvpDataType::Utf8String,
         AvpFlagRules::base_mandatory(),
         SpecRef::new("ietf", "RFC6733", "8.14"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_PROXY_STATE),
+        "Proxy-State",
+        AvpDataType::OctetString,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "6.7.4"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_HOST_IP_ADDRESS),
@@ -279,11 +321,25 @@ const BASE_AVPS: [AvpDefinition; 23] = [
         SpecRef::new("ietf", "RFC6733", "7.5"),
     ),
     AvpDefinition::new(
+        AvpKey::ietf(AVP_PROXY_HOST),
+        "Proxy-Host",
+        AvpDataType::DiameterIdentity,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "6.7.3"),
+    ),
+    AvpDefinition::new(
         AvpKey::ietf(AVP_ERROR_MESSAGE),
         "Error-Message",
         AvpDataType::Utf8String,
         AvpFlagRules::base_must_not_set_m(),
         SpecRef::new("ietf", "RFC6733", "7.3"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_ROUTE_RECORD),
+        "Route-Record",
+        AvpDataType::DiameterIdentity,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "6.7.1"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_DESTINATION_REALM),
@@ -292,6 +348,14 @@ const BASE_AVPS: [AvpDefinition; 23] = [
         AvpFlagRules::base_mandatory(),
         SpecRef::new("ietf", "RFC6733", "6.6"),
     ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_PROXY_INFO),
+        "Proxy-Info",
+        AvpDataType::Grouped,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "6.7.2"),
+    )
+    .with_grouped_avp_rules(&PROXY_INFO_AVP_RULES),
     AvpDefinition::new(
         AvpKey::ietf(AVP_DESTINATION_HOST),
         "Destination-Host",
@@ -439,6 +503,31 @@ mod tests {
         let dictionary = dictionary();
         let origin_host = dictionary.find_avp(AvpKey::ietf(AVP_ORIGIN_HOST));
         assert!(matches!(origin_host, Some(definition) if definition.name() == "Origin-Host"));
+    }
+
+    #[test]
+    fn base_dictionary_contains_normative_proxy_routing_definitions() {
+        for (code, name, data_type) in [
+            (AVP_PROXY_STATE, "Proxy-State", AvpDataType::OctetString),
+            (AVP_PROXY_HOST, "Proxy-Host", AvpDataType::DiameterIdentity),
+            (
+                AVP_ROUTE_RECORD,
+                "Route-Record",
+                AvpDataType::DiameterIdentity,
+            ),
+            (AVP_PROXY_INFO, "Proxy-Info", AvpDataType::Grouped),
+        ] {
+            let definition = dictionary()
+                .find_avp(AvpKey::ietf(code))
+                .unwrap_or_else(|| panic!("{name} missing from base dictionary"));
+            assert_eq!(definition.name(), name);
+            assert_eq!(definition.data_type(), data_type);
+            assert_eq!(
+                definition.flags(),
+                AvpFlagRules::base_mandatory(),
+                "{name} must use RFC 6733 M=1, V=0, P=0 flags"
+            );
+        }
     }
 
     /// Regression test for RFC 6733 §4.5 M-bit flag rules.

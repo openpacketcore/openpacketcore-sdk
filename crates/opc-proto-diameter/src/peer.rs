@@ -15,7 +15,7 @@ use std::str;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
-    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, Encode, EncodeContext, EncodeError,
+    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, EncodeContext, EncodeError,
     EncodeErrorCode, SpecRef, UnknownIePolicy,
 };
 
@@ -2274,16 +2274,7 @@ fn append_avp(
     value: &[u8],
     ctx: EncodeContext,
 ) -> Result<(), EncodeError> {
-    let avp = RawAvp {
-        header,
-        value,
-        padding: &[],
-    };
-    let canonical_ctx = EncodeContext {
-        raw_preserving: false,
-        ..ctx
-    };
-    avp.encode(dst, canonical_ctx)
+    crate::append_canonical_avp(dst, header, value, ctx)
 }
 
 fn build_message(
@@ -2871,7 +2862,7 @@ mod tests {
     };
     use crate::{AvpFlags, AVP_HEADER_LEN};
     use bytes::Bytes;
-    use opc_protocol::{DecodeErrorCode, ValidationLevel};
+    use opc_protocol::{DecodeErrorCode, Encode, ValidationLevel};
 
     fn sample_capabilities() -> PeerCapabilities {
         let mut capabilities = PeerCapabilities::new(
