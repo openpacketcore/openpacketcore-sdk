@@ -118,7 +118,11 @@ pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
     SpecRef::new("3gpp", "TS29273", "SWm Diameter application"),
 );
 
-static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 3] = [
+static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 5] = [
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_SESSION_ID),
+        AvpCardinality::ZeroOrOne,
+    ),
     CommandAvpRule::new(AvpKey::ietf(AVP_STATE), AvpCardinality::ZeroOrMore),
     CommandAvpRule::new(
         AvpKey::vendor(AVP_EMERGENCY_SERVICES, VENDOR_ID_3GPP),
@@ -127,6 +131,10 @@ static SWM_REQUEST_AVP_RULES: [CommandAvpRule; 3] = [
     CommandAvpRule::new(
         AvpKey::vendor(AVP_TERMINAL_INFORMATION, VENDOR_ID_3GPP),
         AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(base::AVP_RESULT_CODE),
+        AvpCardinality::Forbidden,
     ),
 ];
 

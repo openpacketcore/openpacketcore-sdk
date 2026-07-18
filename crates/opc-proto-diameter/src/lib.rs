@@ -10,6 +10,9 @@
 //! initial 3GPP application work. It deliberately does **not** implement product
 //! policy such as realm routing, AAA/HSS behavior, charging decisions, watchdog
 //! thresholds, or peer transport operations.
+//! `error_answer` adds the bounded RFC 6733 request envelope and negative-
+//! answer boundary without exposing sensitive AVP contents or retaining an
+//! unbounded request suffix.
 //!
 //! The crate is experimental and not yet an ADR 0015 conformance claim; see
 //! `CONFORMANCE.md` before treating any fixture or dictionary entry as release
@@ -35,6 +38,8 @@ pub mod avp;
 #[cfg(feature = "base")]
 pub mod base;
 pub mod dictionary;
+#[cfg(feature = "base")]
+pub mod error_answer;
 #[cfg(feature = "peer")]
 pub mod peer;
 
@@ -654,6 +659,14 @@ impl<'a> ToOwnedPdu for Message<'a> {
 
 /// Owned Diameter message preserving raw AVP bytes.
 ///
+/// # Logging safety
+///
+/// This low-level type intentionally derives `Debug`, which includes
+/// `raw_avps` byte-for-byte and may therefore disclose Session-Id, proxy state,
+/// subscriber identity, or authentication material. Never log or format an
+/// `OwnedMessage` from untrusted or production traffic. Prefer redacted typed
+/// projections such as `DiameterErrorAnswerPlan` for diagnostics.
+///
 /// @spec IETF RFC6733 3
 /// @req REQ-IETF-RFC6733-3-007
 /// @conformance scaffold
@@ -830,6 +843,30 @@ pub struct RawAvp<'a> {
     pub value: &'a [u8],
     /// Padding bytes after the AVP value.
     pub padding: &'a [u8],
+}
+
+#[cfg(feature = "base")]
+pub(crate) fn append_canonical_avp(
+    dst: &mut BytesMut,
+    header: AvpHeader,
+    value: &[u8],
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    let avp = RawAvp {
+        header,
+        value,
+        padding: &[],
+    };
+    let canonical_ctx = EncodeContext {
+        raw_preserving: false,
+        ..ctx
+    };
+    let required = dst
+        .len()
+        .checked_add(avp.wire_len(canonical_ctx)?)
+        .ok_or_else(EncodeError::length_overflow)?;
+    ctx.check_capacity(required)?;
+    avp.encode(dst, canonical_ctx)
 }
 
 impl<'a> BorrowDecode<'a> for RawAvp<'a> {
@@ -1110,8 +1147,16 @@ fn validate_avp_region_at(
             Err(error) => return Err(shift_decode_error(error, offset)),
         };
 
+        let key = avp.header.key();
+        if command
+            .and_then(|definition| definition.find_avp_rule(key))
+            .is_some_and(|rule| rule.cardinality().is_forbidden())
+        {
+            return Err(DecodeError::new(DecodeErrorCode::UnknownCriticalIe, offset)
+                .with_spec_ref(spec_ref));
+        }
+
         if ctx.duplicate_ie_policy == DuplicateIePolicy::Reject {
-            let key = avp.header.key();
             let repeated = !seen_keys.get_or_insert_with(HashSet::new).insert(key);
             let repeatable = command
                 .map(|definition| definition.allows_multiple(key))

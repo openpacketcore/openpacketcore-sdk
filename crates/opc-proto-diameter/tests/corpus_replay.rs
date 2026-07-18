@@ -10,6 +10,8 @@
 //! offending input.
 
 use bytes::Bytes;
+#[cfg(feature = "base")]
+use opc_proto_diameter::error_answer::inspect_diameter_request;
 use opc_proto_diameter::{validate_avp_region, Message, OwnedMessage, RawAvp, DIAMETER_HEADER_LEN};
 use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode, ValidationLevel};
 
@@ -29,6 +31,26 @@ use opc_proto_diameter::apps::SWM_PROJECTED_PROFILE_DICTIONARIES;
 /// Every decode entry point the fuzz targets exercise. Must never panic,
 /// regardless of input. Decode returning `Err` is expected and fine.
 fn exercise_message(data: &[u8]) {
+    // Request-bound RFC 6733 error-answer inspection must remain panic-free.
+    #[cfg(feature = "base")]
+    {
+        let _ = inspect_diameter_request(data, DecodeContext::conservative());
+        let _ = inspect_diameter_request(
+            data,
+            DecodeContext {
+                max_depth: 0,
+                ..DecodeContext::conservative()
+            },
+        );
+        let _ = inspect_diameter_request(
+            data,
+            DecodeContext {
+                max_ies: 1,
+                ..DecodeContext::conservative()
+            },
+        );
+    }
+
     // Borrowed decode at the default (Structural) level.
     let _ = Message::decode(data, DecodeContext::default());
 

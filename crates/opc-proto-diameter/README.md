@@ -25,6 +25,28 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   application id, command code, and request/answer role before applying its
   top-level AVP cardinality. Missing or overlapping command profiles fail
   closed; raw `Message::decode` retains reject-all duplicate behavior.
+- `error_answer` provides a bounded `DiameterRequestEnvelope`, typed RFC 6733
+  request failures, redacted `DiameterFailedAvp` context, and one
+  `build_diameter_error_answer` boundary. Classification produces a
+  private-construction `DiameterBoundRequestFailure` tied to the inspected
+  request digest; the builder accepts only that token. It preserves request
+  identifiers, P, exact Session-Id value bytes, and ordered, canonically
+  re-encoded Proxy-Info while never copying Destination-Host,
+  Destination-Realm, Route-Record, or an unbounded suffix. Classification
+  fails closed on ambiguous dictionaries, validates the command P bit and
+  known AVP M/P/V rules, and selects an earlier proven failure over later
+  parser evidence. Explicit `Forbidden` command rules fail during
+  dictionary-aware decode and classification, and `ZeroOrOne` rules always
+  select the second occurrence as the first excess value. Earlier unknown
+  M-bit AVPs are classified as 5001, while unknown optional AVPs remain
+  ignored. Ancestor-free received Failed-AVP evidence must be an exact
+  top-level iterator entry; nested evidence is rebound only after every exact
+  request range, digest, direct-parent containment, and unique Grouped
+  definition is proven. Synthesized 5005 evidence additionally requires a
+  declared grouped-child schema path and proves absence at the request root or
+  received parent.
+  Proxy-Info descent and child count honor `max_depth` and `max_ies`;
+  truncation and resource-limit failures are explicitly unanswerable.
 - `dictionary` exposes `Dictionary`, `DictionarySet`, `ApplicationDefinition`,
   `CommandDefinition`, `CommandAvpRule`, `AvpCardinality`, `AvpDefinition`,
   `AvpDataType`, `AvpFlagRules`, and related metadata types.
@@ -69,6 +91,71 @@ assert!(tail.is_empty());
 assert_eq!(msg.header.length, 20);
 # Ok::<(), opc_protocol::DecodeError>(())
 ```
+
+Request-bound negative answers are constructed separately from ordinary full
+decode so malformed input never has to be manually reflected:
+
+```rust
+use bytes::BytesMut;
+use opc_proto_diameter::base;
+use opc_proto_diameter::error_answer::{
+    build_diameter_error_answer, inspect_diameter_request,
+    DiameterErrorAnswerGrammar, DiameterErrorOrigin, DiameterRequestInspection,
+};
+use opc_proto_diameter::DictionarySet;
+use opc_protocol::{DecodeContext, Encode, EncodeContext};
+
+# let request = [
+#     1, 0, 0, 20, 0x80, 0, 0xfe, 0xfe, 0, 0, 0, 0,
+#     0, 0, 0, 1, 0, 0, 0, 2,
+# ];
+let origin = DiameterErrorOrigin::new("aaa.local", "local.test")?;
+let dictionary_refs = [base::dictionary()];
+let dictionaries = DictionarySet::new(&dictionary_refs);
+if let DiameterRequestInspection::Request(envelope) =
+    inspect_diameter_request(&request, DecodeContext::conservative())
+{
+    if let Some(failure) = envelope.classify(&request, dictionaries)? {
+        let plan = build_diameter_error_answer(
+            &envelope,
+            &failure,
+            &origin,
+            DiameterErrorAnswerGrammar::Application,
+            EncodeContext::default(),
+        )?;
+        let sizing = plan.amplification_metadata();
+        assert!(sizing.planned_response_len <= EncodeContext::default().max_message_len);
+        let mut response = BytesMut::new();
+        plan.encode(&mut response, EncodeContext::default())?;
+    }
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`Application` keeps E clear for 5xxx failures and is suitable only when the
+builder's common fields satisfy the command answer grammar (including DWA and
+DPA). Select `Rfc6733ErrorBitFallback` explicitly when composing the ordinary
+CCF is not possible or efficient and RFC 6733 §7.1.5 permits the generic §7.2
+grammar. Protocol errors always set E, so `plan.grammar()` reports the effective
+§7.2 grammar for every 3xxx result regardless of the requested grammar. The
+returned plan has redacted diagnostics and exact sizing; transport admission,
+rate limits, peer lifecycle, and whether a fatal error closes a connection
+remain consumer policy. `DiameterErrorAnswerPlan::to_owned_message` is an
+explicit sensitive escape: `OwnedMessage` has raw-byte `Debug` output and must
+not be logged.
+
+Command-specific parsers use `DiameterRequestEnvelope::bind_application_failure`
+or `DiameterRequestFailure::from_decode_error` to obtain the bound token. A
+5009 mapping requires an explicit `ZeroOrOne` command rule; `ZeroOrMore`, a
+missing rule, and ambiguous metadata never become 5009, and the first excess
+occurrence is selected even if a parser reports a later duplicate. Likewise,
+5008 is available only for an explicitly `Forbidden` command rule, which the
+dictionary-aware decoder rejects on its first occurrence, while an unknown
+M-bit AVP maps to 5001. Nested application failures use only their immediate
+parent's declared grouped-child rule and preceding siblings; top-level command
+rules are never reused for nested leaves. These fail-closed distinctions
+prevent local parser or dictionary incompleteness from being reported as peer
+fault.
 
 ## Features
 
