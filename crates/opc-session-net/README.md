@@ -501,12 +501,15 @@ campaigns.
   `ConsensusSessionStore`; it is not a backend nested under that store.
 - The feature-gated legacy `RemoteSessionBackend` implements session backend
   and lease traits only for controlled migration and compatibility work. It
-  cannot become a member or vote in descriptor-only Openraft topology.
+  cannot become a member or vote in descriptor-only or attested Openraft
+  topology.
 - Uses the opaque authenticated client/server configs from `opc-tls` for
   production mTLS transport. The consensus and legacy compatibility profiles
   set and require separate exact ALPN values.
-- HA-shaped composition admits descriptor-only `ValidatedQuorumTopology` and
-  separately supplies the local SQLite backend plus exact consensus peer map.
+- HA-shaped lab composition may admit descriptor-only
+  `ValidatedQuorumTopology`; production composition authenticates epoch-bound
+  platform facts through `QuorumTopologyAttestor` first. Both paths separately
+  supply the local SQLite backend plus exact consensus peer map.
   Logical replica ID, dial endpoint, expected TLS identity, failure domain,
   backing identity, and exact local self remain independent descriptor fields.
 
@@ -846,8 +849,12 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   and is not consumed by `ValidatedQuorumTopology`.
 - Consensus peer binding is static admission evidence, not current health.
   Capability declarations and a successful handshake do not replace
-  `ConsensusSessionStore::probe_durable_readiness` or continuous traffic
-  gating. Long-running network/resource qualification remains #143; watch
+  the Openraft engine probe. That base `probe_durable_readiness` result is
+  lab/conformance evidence only; production traffic requires attested topology
+  plus `ConsensusSessionStore::probe_production_durable_readiness`, a
+  `ProductionTopologyAttested` report scope, and
+  `is_production_traffic_ready()` with continuous gating. Long-running
+  network/resource qualification remains #143; watch
   handoff and bounded journal cursor/retention semantics are implemented under
   #145/#171.
 - Replication entry sequence zero and malformed rebuild prefixes are rejected

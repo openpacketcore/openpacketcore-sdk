@@ -237,10 +237,13 @@ node ID, expected TLS identity, descriptor fingerprints, configured member
 count, cluster, configuration digest, and epoch. Route aliases remain outside
 this identity.
 
-This admission result is not a durable-ready signal. Capability declarations
-and `SessionStorePlatformProfile::Quorum` are also admission evidence only. A
-production operator must separately require fresh durable readiness before
-traffic readiness.
+Descriptor admission is not a production topology claim or a durable-ready
+signal. Production operators must build the topology through
+`ValidatedQuorumTopology::try_from_attested` with one freshly authenticated
+`AuthenticatedPlatform` token per exact member. Capability declarations and
+configuration-parsed `SessionStorePlatformProfile::Quorum` remain intent only;
+traffic requires the store's time-aware production profile and production
+durable-readiness probe.
 
 ### Session identity admission and #135 upgrade
 
@@ -516,12 +519,31 @@ CRL/OCSP/certificate-or-identity-denylist revocation is not implemented.
 Openraft linearizable-read barrier. It discovers or follows the current leader,
 runs `ensure_linearizable` against the admitted voting configuration, and does
 not return `Ready` until the local state machine has applied through the
-barrier's log index. This is the same authority path used by real linearizable
+barrier's log index. This is the same engine path used by real linearizable
 reads; listener bind, successful TLS setup, cached capabilities, and a local
-SQLite read cannot satisfy it.
+SQLite read cannot satisfy it. It is nevertheless an engine/lab probe: it does
+not authenticate physical node, failure-domain, or durable-backing facts, and
+its `Ready` result MUST NOT authorize production traffic.
 
-Require `DurableReadinessState::Ready`; a barrier, leader-discovery, peer RPC,
-or local-apply timeout reports `NoQuorum`. `TopologyInvalid` and
+Production traffic requires topology built with
+`ValidatedQuorumTopology::try_from_attested`, `Quorum` from
+`production_platform_profile_at`, then
+`DurableReadinessScope::ProductionTopologyAttested` and
+`is_production_traffic_ready()` from `probe_production_durable_readiness` (or
+the refreshed-attestation form). That probe accepts only
+`AuthenticatedPlatform` provenance bound to the exact
+cluster/configuration/epoch, combines its remaining validity with the Openraft
+deadline, and repeats authority checks after asynchronous work. Verification
+anchors an absolute monotonic expiry. The store also retains a bounded
+nondecreasing wall-clock high-water, so backward time, exact expiry, and an
+older delayed probe racing a newer evaluation fail closed. Explicit `*_at`
+calls must use one trusted nondecreasing clock source.
+
+Require `is_production_traffic_ready()` from a
+`ProductionTopologyAttested` report; a bare
+`DurableReadinessState::Ready` comparison is insufficient. A barrier,
+leader-discovery, peer RPC, or local-apply timeout reports
+`NoQuorum`. `TopologyInvalid` and
 `RecoveryRequired` remain stable compatibility states for admission/recovery
 failures. The report retains its bounded compatibility fields, including the
 configured and required voter counts and an optional index accessor historically
@@ -530,30 +552,45 @@ is Openraft barrier/committed-apply evidence, not a custom majority-log-prefix
 calculation. Do not reconstruct authority from the individual report counters
 or observations.
 
-The same report exposes `recovery_progress()` with a closed state set:
+The shared report carries a bounded `DurableReadinessScope`: require
+`ProductionTopologyAttested` and `is_production_traffic_ready()` in the
+production traffic-gate path. `EngineOnly` must remain in lab/conformance
+paths. The report exposes `recovery_progress()` with a closed state set:
 `synchronized`, `catching_up`, `awaiting_quorum`, or `recovery_required`, and
 optional local log/applied/snapshot/purged indexes. These are redaction-safe
 progress counters, not branch-selection evidence and not authorization to
-truncate, rebuild, or serve traffic.
+truncate, rebuild, or serve traffic. Likewise,
+`topology_attestation_summary_at` is bounded diagnostic output, not authority;
+it does not apply monotonic expiry or the store clock high-water.
 
 The store's one bounded operation deadline applies to the complete leader,
 network, barrier, and local-apply path. Do not log raw peer errors or turn
 replica IDs, endpoints, DNS names, or SPIFFE identities into metric labels.
 
-Readiness evidence can become stale immediately. AMF-lite therefore starts
+Production readiness evidence can become stale immediately. A product starts
 with its session-store gate closed, probes immediately and continuously, and
 keeps both the health gate and supervised-task readiness closed whenever the
-fresh report is not `Ready`. Each authoritative store operation independently
-repeats the same assessment. Downstream CNFs must apply the same continuous
-traffic-readiness pattern rather than opening traffic permanently after one
-successful startup probe.
+fresh report is not `ProductionTopologyAttested` or its
+`is_production_traffic_ready()` result is false. Each authoritative store
+operation independently repeats the Openraft assessment. Downstream CNFs must
+apply the same continuous traffic-readiness pattern rather than opening traffic
+permanently after one successful startup probe.
 
 Ownership publication is part of that gate, not a separate optimistic path.
 Do not publish or renew shard/session ownership, claim a floating VIP, or
-advertise service traffic until the report is `Ready`. On later quorum loss,
-stop new ownership publication and traffic advertisement immediately and enter
-the product's fenced relinquish/handoff workflow; a prior readiness report is
-not an ownership lease.
+advertise service traffic unless the report is `ProductionTopologyAttested`
+and `is_production_traffic_ready()` is true. On later quorum loss, stop new
+ownership publication and traffic advertisement immediately and enter the
+product's fenced relinquish/handoff workflow; a prior readiness report is not
+an ownership lease.
+
+The in-process wall-clock high-water, monotonic expiry anchor, and verified
+token are intentionally not persisted. On every process restart, authenticate
+evidence again against the current descriptor set, epoch, and time before
+opening the store's production traffic gate; do not deserialize or reuse a
+prior verified token. The platform adapter's proof/replay policy decides
+whether a still-unexpired underlying proof may be re-presented or replacement
+evidence is required.
 
 For a converged shared-L2 product where that floating VIP itself delivers
 packets, report `SteeringProbe::vip_delivered()` rather than a testkit mock.
@@ -1388,9 +1425,11 @@ The standard SQLite-backed config and session store profiles (`SqliteBackend` an
   positive epoch. Stable node IDs derive from cluster plus logical
   `ReplicaId`; endpoints and FQDNs are routing only. The dedicated
   `opc-session-consensus/2` mTLS profile binds SPIFFE, logical/stable IDs,
-  cluster/configuration/epoch, peer role, and nonce. `probe_durable_readiness`
-  uses an Openraft linearizable barrier and local-apply wait, not bind or cached
-  capability evidence. Its exact profile uses transport/wire-schema revision 2
+  cluster/configuration/epoch, peer role, and nonce. The engine/lab
+  `probe_durable_readiness` uses an Openraft linearizable barrier and local-apply
+  wait, not bind or cached capability evidence; only attested topology plus
+  `probe_production_durable_readiness` may gate production traffic. Its exact
+  profile uses transport/wire-schema revision 2
   and error-set revision 4, including the bounded payload-free expiry
   authority preflight and `RecordExpiryPreflightLimitExceeded`.
   Revision-1/error-revision-3-or-older peers fail before dispatch and all

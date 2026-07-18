@@ -918,6 +918,9 @@ async fn spawn_session_store_readiness(
 
                 Box::pin(async move {
                     loop {
+                        // `opc-amf-lite` is an unpublished engine/conformance
+                        // harness. A production CNF must use attested topology
+                        // and `probe_production_durable_readiness` instead.
                         let report = tokio::select! {
                             _ = shutdown.shutdown_acknowledged() => return Ok(()),
                             report = session_store.probe_durable_readiness() => report,

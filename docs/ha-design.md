@@ -172,11 +172,19 @@ implements bounded log-range cursor semantics.
 Operational construction consumes `ValidatedQuorumTopology`. HA admission
 requires an odd set of 3 through 31 members, one exact local `ReplicaId`, and
 unique logical IDs, canonical endpoints, expected TLS identities, failure
-domains, backing-store identities, and derived stable node IDs. The topology is
-descriptor-only: the node's one local SQLite backend and exact remote
-consensus-peer map are supplied separately after admission. Admission also
-requires a cluster ID, monotonic configuration epoch, and an
+domains, backing-store identities, and derived stable node IDs. Descriptor-only
+admission is explicitly lab/compatibility scoped: the node's one local SQLite
+backend and exact remote consensus-peer map are supplied separately after
+admission. Production admission additionally authenticates one bounded
+platform-fact token per member through `QuorumTopologyAttestor`, binding the
+physical node, service identity, failure domain, durable backing, collector,
+configuration digest, epoch, and freshness window. Both paths require a
+cluster ID, monotonic configuration epoch, and an
 order-independent configuration digest that exactly matches the descriptors.
+Static profile methods report `Unknown` for both descriptor-only and attested
+HA because they cannot evaluate time-bound evidence. Only a time-aware
+production profile evaluation over fresh authenticated evidence reports
+`Quorum`; its readiness barrier is bounded by the remaining evidence validity.
 Stable Openraft node IDs are derived from cluster plus logical `ReplicaId`, fit
 SQLite's positive signed-64-bit domain, and do not change when other members
 are reordered, added, or removed. Openraft owns vote accounting and quorum.
@@ -189,9 +197,11 @@ consensus lab singleton uses the same engine but reports `single-replica`.
 Production peers use the dedicated `opc-session-consensus/2` ALPN. Every RPC
 binds the live SPIFFE identity, configured local and remote logical IDs, stable
 node IDs, cluster/configuration/epoch, sender field, expected server profile,
-and a fresh challenge before Openraft dispatch. This is authentication and
-composition evidence, not physical-store provenance. A CNF must still map each
-logical voter to exactly one durable backing volume.
+and a fresh challenge before Openraft dispatch. Transport authentication is
+composition evidence, not physical-store provenance. The separate topology
+attestor supplies that provenance; the CNF chooses and configures the
+Kubernetes/cloud/CSI/TPM/SPIFFE adapter and must still map each logical voter
+to exactly one durable backing volume.
 
 The exact consensus contract is transport/wire-schema revision 2 and error-set
 revision 4. It carries only the bounded payload-free expiry-authority
@@ -266,17 +276,36 @@ while seamless SVID/trust rotation follows the dedicated rotation issue chain.
 Capability declarations and `SessionStorePlatformProfile::Quorum` remain
 admission evidence only. `QuorumSessionStore::probe_durable_readiness` bypasses
 cached capabilities and invokes Openraft's bounded linearizable-read barrier,
-then waits until the local state machine has applied through that log ID.
-`Ready` therefore proves the same fresh quorum path required by real reads, not
-merely that a listener was bound. Writes use `client_write_ff` under the shared
-eight-slot supervised admission bound; reads use the barrier every time and
-never trust a prior readiness result.
+then waits until the local state machine has applied through that log ID, but it
+is deliberately an engine/lab probe: it does not authenticate physical node,
+failure-domain, or durable-backing facts and its `Ready` result cannot authorize
+production traffic. Production topology is built through
+`ValidatedQuorumTopology::try_from_attested`; traffic requires `Quorum` from a
+time-aware production profile evaluation, then
+`DurableReadinessScope::ProductionTopologyAttested` and
+`is_production_traffic_ready()` from `probe_production_durable_readiness` (or
+its refreshed-attestation form).
 
-The report remains point-in-time evidence rather than an ownership lease.
-Products must continuously close ownership publication and traffic
-advertisement when it becomes `NoQuorum`. Diagnostics remain bounded and
-redacted; peer identities and peer-controlled errors are not labels or report
-payloads.
+The production probe composes that same Openraft barrier with fresh
+`AuthenticatedPlatform` evidence. Verification anchors an absolute monotonic
+expiry, and each store retains a bounded nondecreasing wall-clock high-water;
+clock rollback, exact expiry, or a newer concurrent evaluation therefore fails
+closed before and after asynchronous work. Explicit `*_at` calls must use one
+trusted nondecreasing clock source. The verified token and monotonic
+anchor/high-water are process-local, so restart authenticates evidence again
+against current time. The adapter's proof/replay policy decides whether a
+still-unexpired proof may be re-presented or replacement evidence is required.
+Writes use `client_write_ff` under the shared eight-slot supervised admission
+bound; reads use the barrier every time and never trust a prior readiness
+result.
+
+The shared report type remains point-in-time evidence rather than an ownership
+lease. Its bounded `DurableReadinessScope` distinguishes `EngineOnly` from
+`ProductionTopologyAttested`; products must require the latter and
+`is_production_traffic_ready()` for traffic admission, then continuously close
+ownership publication and traffic advertisement whenever a later production
+result fails. Diagnostics remain bounded and redacted; peer identities and
+peer-controlled errors are not labels or report payloads.
 
 Openraft reconciles current-format follower log divergence. SQLite refuses a
 truncate at or below either persisted committed or applied index. Snapshot
@@ -636,7 +665,7 @@ recovery remains an offline, operator-authorized campaign.
 - **Raw Authority Rejection**: Direct `replicate_entry`, whole-state rebuild,
   and caller-selected lease metadata operations are rejected by
   `ConsensusSessionStore`.
-- **Feature Declarations**: Replicated adapters declare `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe implemented methods; they are not fresh-quorum readiness or production qualification. Consumers must use `probe_durable_readiness` for current evidence.
+- **Feature Declarations**: Replicated adapters declare `ordered_replication_log = true` and `watch = true`, while standalone SQLite reports `false`. These bits describe implemented methods; they are not fresh-quorum readiness or production qualification. Engine/lab checks may use `probe_durable_readiness`; production traffic must use attested topology plus `probe_production_durable_readiness`.
 - **Low-Cardinality Readiness Telemetry**: Metrics expose probe success/failure and bounded Openraft state without replica IDs, endpoints, SPIFFE IDs, tenants, keys, or raw errors as labels.
 
 ---

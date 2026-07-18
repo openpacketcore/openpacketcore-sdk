@@ -102,7 +102,12 @@ pub enum SessionStateProfile {
 /// the operator/platform profile selected for a workload, not every low-level
 /// storage feature. Products should map their CRD/backend strings through
 /// [`SessionStorePlatformProfile::from_backend_profile_name`] before checking
-/// whether app HA state may claim traffic readiness.
+/// static compatibility only. A session HA traffic gate must obtain `Quorum`
+/// from [`crate::ConsensusSessionStore::production_platform_profile_at`] and
+/// then require a
+/// [`crate::DurableReadinessScope::ProductionTopologyAttested`] report whose
+/// [`crate::DurableReadinessReport::is_production_traffic_ready`] result is
+/// true from [`crate::ConsensusSessionStore::probe_production_durable_readiness`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "kebab-case")]
@@ -111,10 +116,11 @@ pub enum SessionStorePlatformProfile {
     /// accepted single-replica deployments, but not for active/standby traffic
     /// readiness claims.
     SingleReplica,
-    /// Platform-selected quorum profile. A runtime store may return this value
-    /// only after configured membership passed topology validation; this value
-    /// alone is not peer reachability, authenticated membership, or durable
-    /// commit evidence.
+    /// Platform-selected quorum profile. Configuration parsing may produce this
+    /// as static intent; a runtime session store may produce an authoritative
+    /// value only from its time-aware production evaluation with fresh
+    /// authenticated topology evidence. This value alone is not current peer
+    /// reachability, authenticated live membership, or durable commit evidence.
     Quorum,
     /// The platform profile name is not recognized by this SDK contract.
     Unknown,
@@ -127,8 +133,8 @@ impl SessionStorePlatformProfile {
     /// Unknown inputs collapse to [`Self::Unknown`] without retaining the raw
     /// text, so status paths can fail closed without leaking platform object
     /// names or deployment-specific labels. Parsing a name is configuration
-    /// intent only; use the constructed store's topology profile before a
-    /// runtime readiness claim.
+    /// intent only; use the constructed store's production topology profile and
+    /// production readiness probe before a runtime traffic-readiness claim.
     pub fn from_backend_profile_name(profile: &str) -> Self {
         let canonical = profile.trim().to_lowercase().replace(['_', ' '], "-");
         match canonical.as_str() {
@@ -189,14 +195,18 @@ impl AppHaDurabilityRequirement {
 /// platform session-store profile.
 ///
 /// This type does not carry runtime reachability, agreement, or repair
-/// evidence. A compatible quorum profile must still pass a fresh
-/// [`crate::DurableReadinessReport`] before traffic readiness is opened.
+/// evidence. A compatible quorum profile must still pass
+/// [`crate::ConsensusSessionStore::production_platform_profile_at`] and a fresh
+/// [`crate::ConsensusSessionStore::probe_production_durable_readiness`] before
+/// traffic readiness is opened. A `Ready` report from the engine/lab probe does
+/// not satisfy that production contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionStoreHaCompatibility {
     /// The declared profile statically satisfies the app HA requirement.
-    /// Runtime durable readiness remains a separate mandatory gate.
+    /// Runtime production topology and durable readiness remain separate
+    /// mandatory gates.
     Compatible,
     /// The platform profile is unknown, so readiness must fail closed until the
     /// product/operator maps it to a known SDK capability profile.
@@ -210,7 +220,7 @@ impl SessionStoreHaCompatibility {
     /// Whether static profile admission is compatible.
     ///
     /// `true` does not authorize traffic readiness without fresh runtime
-    /// durable-readiness evidence.
+    /// production-topology and production-durable-readiness evidence.
     pub const fn is_compatible(self) -> bool {
         matches!(self, Self::Compatible)
     }

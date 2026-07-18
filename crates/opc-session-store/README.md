@@ -77,6 +77,12 @@ evidence.
 - `ReplicaId`, `ReplicaEndpoint`, `ReplicaTlsIdentity`,
   `ReplicaFailureDomain`, and `ReplicaBackingIdentity` keep logical, network,
   authentication, placement, and physical-store identities distinct.
+- `TopologyAttestationClaims` and `TopologyAttestationEvidence` bind an
+  attestor-observed logical member, authenticated service identity, physical
+  node, failure domain, durable backing, exact descriptor digest, collector,
+  configuration epoch, and bounded validity window to one canonical digest.
+  `QuorumTopologyAttestor` is the consumer-selected proof-verification port;
+  constructing SDK values alone is not platform authentication.
 - `BackendPeerBinding` is redaction-safe composition evidence retained for the
   legacy remote-backend compatibility transport. Production Openraft topology
   does not contain backend adapters; its consensus peer map performs live
@@ -84,10 +90,16 @@ evidence.
 - `QuorumTopologyConfig::new_consensus` requires a cluster ID, exact
   configuration digest, and monotonic configuration epoch. Stable Openraft
   node IDs are derived from the cluster and logical `ReplicaId`; endpoint text
-  is never identity. `ValidatedQuorumTopology::try_from` performs admission:
-  an odd HA membership from 3 through `QUORUM_TOPOLOGY_MAX_MEMBERS` (31), one
-  exact local logical ID, unique declared identities, and a descriptor digest
-  matching the supplied configuration before any backend I/O.
+  is never identity. `ValidatedQuorumTopology::try_from` retains an explicitly
+  labelled descriptor-only lab/compatibility admission. Production consumers
+  use `ValidatedQuorumTopology::try_from_attested`, an explicit
+  `TopologyAttestationPolicy`, one evidence token per exact member, and a
+  selected `QuorumTopologyAttestor`. Both paths require an odd membership from
+  3 through `QUORUM_TOPOLOGY_MAX_MEMBERS` (31), one exact local logical ID,
+  unique declared identities, and an exact configuration digest before any
+  backend I/O. Static profile methods report the fail-closed `Unknown` value
+  for both descriptor-only and attested HA; only a time-aware production
+  profile evaluation over fresh authenticated evidence may report `Quorum`.
 - `ConsensusSessionStore::open` is the operational construction path.
   `QuorumSessionStore` is a compatibility type alias to that same Openraft
   implementation, not a second quorum algorithm. Callers install its
@@ -101,7 +113,9 @@ evidence.
   Openraft linearizable-read barrier as real authoritative operations. Its
   recovery-latch check and barrier share the configured complete-operation
   deadline; it does not treat a bound listener or cached capabilities as
-  quorum evidence.
+  quorum evidence. Descriptor-only labs may use that engine-only probe;
+  production traffic uses `probe_production_durable_readiness`, which first
+  requires still-fresh `AuthenticatedPlatform` topology evidence.
 - `recovery::LegacyForkRecovery` is the default-deny offline administrative
   boundary for a drained fleet. It creates a sealed, redaction-safe plan,
   quarantines every explicit target before mutation, installs one immutable
@@ -499,22 +513,115 @@ sub-bound and does not receive additive time. A directed peer caches a fixed
 primary/overflow pool of at most two authenticated connections after correlated
 validated successes, with one in-flight RPC per lane.
 
-Topology admission validates the complete descriptor set, its exact local
+Descriptor admission validates the complete descriptor set, its exact local
 logical member, configuration digest, and stable derived node IDs without
-holding a storage or network adapter. The dedicated consensus transport then
+holding a storage or network adapter. It is reported as
+`descriptor-only-lab-ha`, not as observed platform proof. Production admission
+additionally calls `ValidatedQuorumTopology::try_from_attested`. Each bounded
+opaque proof is authenticated by the selected `QuorumTopologyAttestor`; the
+SDK then independently rejects a wrong member/TLS/descriptor binding, a stale
+cluster/configuration/epoch, an untrusted collector or provenance class, an
+expired observation, or duplicate observed physical node, failure domain, or
+durable backing identity. The dedicated consensus transport then
 binds each descriptor's logical ID, node ID, endpoint, TLS identity, cluster,
 configuration, and epoch to the live authenticated connection. Declared
-failure-domain and backing identities remain operator-supplied placement
-evidence rather than storage discovery.
+failure-domain and backing strings remain configuration until an attestor
+observes and authenticates matching platform facts.
+
+The proof format is intentionally adapter-owned. A platform adapter creates
+`TopologyAttestationClaims`, signs or otherwise authenticates
+`canonical_digest()`, and carries that proof in
+`TopologyAttestationEvidence::try_new`. Admission requires an explicit
+`TopologyAttestationPolicy` containing the expected provenance, trusted
+collector identities, and maximum observation age. Opaque proofs are limited
+to 64 KiB each, collector lists and topology membership are bounded, and a
+token validity window cannot exceed one hour. `DeterministicConformance`
+evidence supports reproducible three-/five-member tests but cannot satisfy the
+production readiness gate; production adapters select
+`AuthenticatedPlatform` and must verify their real trust mechanism.
+
+```rust,ignore
+let policy = TopologyAttestationPolicy::try_new(
+    TopologyAttestationProvenance::AuthenticatedPlatform,
+    trusted_collector_ids,
+    Duration::from_secs(300),
+)?;
+let topology = ValidatedQuorumTopology::try_from_attested(
+    topology_config,
+    one_token_per_exact_member,
+    &policy,
+    &platform_attestor,
+    TopologyAttestationTime::now()?,
+)?;
+let attestation_context = topology.clone();
+let store = ConsensusSessionStore::open(topology, local_sqlite, snapshots, peers).await?;
+if !store
+    .probe_production_durable_readiness()
+    .await
+    .is_production_traffic_ready()
+{
+    // Keep traffic readiness closed.
+}
+
+// Before the current observation expires, authenticate replacement evidence
+// for the same immutable configuration and use it for subsequent probes.
+let refreshed = attestation_context.verify_attestation_evidence(
+    refreshed_tokens,
+    &policy,
+    &platform_attestor,
+    TopologyAttestationTime::now()?,
+)?;
+if !store
+    .probe_production_durable_readiness_with_attestation(&refreshed)
+    .await
+    .is_production_traffic_ready()
+{
+    // Keep traffic readiness closed.
+}
+```
+
+The platform adapter, its trust roots, and token refresh/collection lifecycle
+remain product-owned. Evidence is immutable and epoch-bound, but can be
+refreshed for the same descriptor set without restarting the store. Membership
+change requires freshly collected tokens for the new configuration epoch
+rather than reuse of an old member or backing-store token. Verification anchors
+each evidence set to an absolute monotonic expiry.
+`VerifiedQuorumTopologyAttestation` deliberately implements neither
+`Serialize` nor `Deserialize`, and its monotonic anchor is process-local.
+Process restart therefore cannot carry that verified token or its monotonic
+anchor: authenticate evidence again against current time before reopening
+production traffic. An adapter may re-present a still-unexpired underlying
+proof only when its proof-format replay policy permits that; otherwise it must
+collect replacement evidence. Non-serializability is not a single-use or
+anti-replay property for the opaque proof. The per-store wall-clock high-water
+is likewise intentionally not persisted.
 
 ### Fresh durable readiness
 
-`BackendCapabilities` and `SessionStorePlatformProfile::Quorum` are admission
-evidence. They describe implemented methods and configured shape, but do not
-prove that peers are reachable now. Before opening traffic, call
-`probe_durable_readiness()` and require `DurableReadinessState::Ready`. The
-probe uses the same complete operation deadline configured when opening the
-store; it does not scan replica application logs or run a second majority
+`BackendCapabilities` and the static `platform_profile()` describe implemented
+methods and engine shape, not observed platform provenance or current peer
+reachability. Static HA profiles are therefore always `Unknown`. Before
+opening production traffic, call `production_platform_profile_at(now)` and
+require `Quorum`, then call `probe_production_durable_readiness()`. Require both
+`DurableReadinessScope::ProductionTopologyAttested` and
+`is_production_traffic_ready()` from that report; a bare
+`DurableReadinessState::Ready` check is insufficient. The probe bounds all
+asynchronous recovery and Openraft barrier work by both the configured
+operation timeout and the evidence's remaining validity, then rechecks
+wall-clock freshness before it can return `Ready`. The store also retains a
+bounded nondecreasing wall-clock
+high-water, so a forward or expired evaluation cannot be revived by a later
+clock rollback; final checks repeat after the asynchronous barrier. Explicit
+`*_at` calls must all use one trusted nondecreasing clock source. Descriptor-only
+labs can call `probe_durable_readiness()` directly, but its `Ready` result is
+engine evidence and must not authorize production traffic.
+`topology_attestation_summary_at(now)` exposes only provenance, configuration
+epoch, freshness durations, and result for diagnostics; the summary does not
+apply monotonic expiry or the store clock high-water and is not authority.
+Every report exposes a bounded `DurableReadinessScope`; production gates require
+`ProductionTopologyAttested` and `is_production_traffic_ready()`, never merely
+the generic `is_ready()` result of an `EngineOnly` report.
+The probe does not scan replica application logs or run a second majority
 algorithm. Openraft performs leader discovery and the quorum barrier, then the
 adapter waits for local apply through the returned index. The report's `Debug`
 output redacts replica identities and contains no raw transport, backend, or
@@ -997,12 +1104,14 @@ by issue #143.
 - `StateClass` drives monotonic-generation and profile requirements.
 - SQLite file backends use WAL in tests and persist across restart.
 - `FakeSessionBackend` is for tests.
-- Configured topology validation proves only an odd, distinct voting set and
-  one exact local member. Authenticated consensus peers add exact identity
-  binding at admission. Openraft supplies durable commit and fresh linearizable
-  readiness. #129 supplies operator-safe legacy-fork recovery, while #133
-  supplies bounded local applied-state restore without becoming a second
-  consensus authority. Production qualification remains a separate gate.
+- Descriptor-only topology validation proves only an odd, distinct voting set
+  and one exact local member and is explicitly lab-labelled. Attested admission
+  adds authenticated, epoch-bound platform facts; authenticated consensus peers
+  add exact identity binding at admission. Openraft supplies durable commit and
+  fresh linearizable readiness. #129 supplies operator-safe legacy-fork
+  recovery, while #133 supplies bounded local applied-state restore without
+  becoming a second consensus authority. Production qualification remains a
+  separate gate.
 - A bare logical self ID such as `epdg-app-0` may select a member whose endpoint
   is the full `epdg-app-0.<headless-service>.<namespace>.svc.cluster.local`
   FQDN. The SDK never shortens endpoints or treats endpoint text as identity.
@@ -1106,7 +1215,13 @@ by issue #143.
 - Source checked: `Cargo.toml`, `src/lib.rs`, backend, lease, TTL, model, record,
   SQLite, topology, quorum, restore, and tests.
 - `tests/quorum_topology.rs` covers descriptor fingerprinting, descriptor-only
-  three-node construction, identity uniqueness, and redacted diagnostics.
+  and attested construction, exact binding/uniqueness/time/policy bounds,
+  expiry-driven re-admission, non-serializable process-local token semantics,
+  unexpired replacement-backing rejection, and full attestation Debug/summary
+  redaction.
+- `tests/consensus_openraft.rs` covers the production probe's monotonic expiry,
+  nondecreasing time authority, rollback/retry and concurrent-evaluation races,
+  refreshed evidence, and foreign/non-production token rejection.
 - `tests/replication_sequence_bounds.rs` covers direct Fake/SQLite sequence and
   rebuild-prefix admission, signed persistence boundaries, and corrupt-row
   rejection; quorum, encryption, cache, and session-net suites cover their own

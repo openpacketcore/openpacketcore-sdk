@@ -123,6 +123,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Added
+- **BREAKING — observed quorum topology attestation — `opc-session-store`:** a bounded,
+  product-neutral `QuorumTopologyAttestor` port now authenticates opaque proofs
+  over SDK-canonical replica, service, physical-node, failure-domain, durable
+  backing, descriptor, collector, configuration-epoch, and freshness claims.
+  Attested admission rejects duplicate observed infrastructure, stale/replayed
+  or replaced backing evidence, untrusted collectors, wrong bindings, and
+  expired proofs before HA readiness. Static HA profiles now return the
+  fail-closed `Unknown` value because time-unaware capability methods cannot
+  prove freshness; only the new time-aware production capability/readiness
+  methods may return `Quorum`/`Ready`. Production readiness bounds its Openraft
+  barrier by both wall and verification-anchored monotonic validity, retains a
+  bounded nondecreasing per-store wall-clock high-water, and repeats both checks
+  after asynchronous work. Clock rollback and older concurrent probes cannot
+  revive evidence. `DurableReadinessScope` now machine-labels `EngineOnly`
+  versus `ProductionTopologyAttested` reports, and
+  `is_production_traffic_ready` requires the latter. Deterministic conformance
+  evidence can exercise three- and five-member admission without claiming
+  production provenance.
+  Long-running consumers can authenticate replacement evidence for the same
+  immutable configuration without restarting Openraft; cross-epoch reuse still
+  fails. The verified token and monotonic anchor/high-water are process-local,
+  so restart must authenticate evidence again against current time. Whether a
+  still-unexpired proof may be re-presented or must be replaced remains part of
+  the adapter-owned proof/replay policy. No Kubernetes, cloud, CSI, TPM, SPIFFE
+  collection, or dynamic
+  membership policy is embedded in the store.
 - **Bounded GTPv2-C protocol-error responses — `opc-proto-gtpv2c`:** a
   zero-allocation fixed-header inspector now separates answerable requests
   from TS 29.274 silent-discard cases. Typed plans cover header-only Version
@@ -1241,7 +1267,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus the committed barrier index through the compatibility-named index
   accessor; and use typed, redaction-safe replica
   failure classes instead of raw errors. Capability declarations and
-  `SessionStorePlatformProfile::Quorum` remain admission evidence only.
+  `SessionStorePlatformProfile::Quorum` remain admission evidence only. This
+  base probe is now explicitly engine/lab evidence; production traffic uses
+  authenticated topology and `probe_production_durable_readiness`.
 - `opc-session-store`: Openraft-owned follower recovery now has a second
   fail-closed SQLite boundary: truncation cannot cross the persisted committed
   or applied index, and snapshot install cannot regress either floor or cross
@@ -1258,10 +1286,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-store`: immutable replica descriptors and
   `ValidatedQuorumTopology` admission with distinct logical ID, canonical
   endpoint, expected TLS identity, failure domain, backing identity, and exact
-  local-self selection. Production topology is descriptor-only: the one local
-  SQLite backend and consensus-only remote peer map are supplied separately,
-  so remote votes require no dummy backend or legacy remote-backend client. An
-  explicit lab singleton reports `single-replica`, never quorum HA.
+  local-self selection. Engine topology is adapter-free: the one local SQLite
+  backend and consensus-only remote peer map are supplied separately, so remote
+  votes require no dummy backend or legacy remote-backend client. Descriptor-
+  only admission is lab-scoped; production admission adds authenticated
+  platform evidence. An explicit lab singleton reports `single-replica`, never
+  quorum HA.
 - `opc-session-store`/`opc-session-net`: redaction-safe authenticated peer
   bindings connect legacy compatibility adapters to exact peer scope, while the
   production Openraft transport binds descriptor identity and stable node IDs
@@ -1561,11 +1591,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle; fleet credential/trust evidence remains #164/#158, while distributed
   resource/failover/soak plus payload-protection qualification remains #143.
 - **BREAKING — `opc-session-store`:** the old backend-bearing quorum member and
-  raw-vector coordinator surfaces are removed. Migrate HA callers through a
-  descriptor-only `QuorumTopologyConfig`/`ValidatedQuorumTopology`; migrate
-  one-replica tests and labs through `try_new_consensus_lab_singleton`. Supply
-  exactly one local SQLite backend and the remote consensus-peer map when
-  opening each node.
+  raw-vector coordinator surfaces are removed. Migrate HA engine callers
+  through an adapter-free `QuorumTopologyConfig`/`ValidatedQuorumTopology`;
+  production callers additionally use `try_from_attested`, while descriptor-only
+  and `try_new_consensus_lab_singleton` paths remain lab-scoped. Supply exactly
+  one local SQLite backend and the remote consensus-peer map when opening each
+  node.
 - **BREAKING — `opc-session-net`:** protocol v3 introduced remote restore scans
   and authenticated replica identity before the v4 boundary above. Production
   constructors
@@ -1958,7 +1989,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AMF-lite now keeps traffic readiness behind a continuously supervised
   session-store gate, and low-cardinality metrics expose probe outcomes,
   configured/required counts, the committed barrier index, and bounded failure
-  reasons. #127 closes durable sequencing; #128 hardens current-format
+  reasons. AMF-lite is an unpublished engine/conformance harness; this base
+  probe gate is not production platform-topology authority. Production CNFs
+  must use attested topology and the production readiness APIs described above.
+  #127 closes durable sequencing; #128 hardens current-format
   Openraft recovery; operator-safe legacy-fork recovery (#129) and
   majority-authoritative restore (#133) remain blockers.
   Protocol-v4 wire stabilization is now

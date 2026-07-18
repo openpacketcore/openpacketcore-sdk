@@ -1171,9 +1171,11 @@ where
 /// migrations of pre-envelope plaintext rows.
 ///
 /// Standalone forwarding/compatibility adapters may expose a process-local
-/// instance root and an authenticated legacy peer binding. Production
-/// consensus topology is descriptor-only and never derives votes, membership,
-/// or peer identity from these adapter tokens.
+/// instance root and an authenticated legacy peer binding. Consensus topology
+/// never derives votes, membership, or peer identity from these adapter
+/// tokens. Descriptor-only topology is an engine/lab boundary; production
+/// traffic additionally requires authenticated platform topology evidence and
+/// the production readiness API.
 ///
 /// Backend futures are cancellation boundaries. Dropping one signals
 /// cancellation; implementations MUST retain bounded admission and supervision

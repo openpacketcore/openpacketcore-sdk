@@ -81,15 +81,19 @@ The target session-store contract includes:
   linearizable read; they never infer rollback from a missing response.
 - Truthful capability reporting so standalone SQLite does not claim replicated
   behavior.
-- Fresh, bounded durable readiness through the same Openraft linearizable-read
+- Fresh, bounded engine readiness through the same Openraft linearizable-read
   barrier and local apply wait used by real operations, independent of a bound
-  listener or cached capability declarations.
+  listener or cached capability declarations. Production traffic composes that
+  barrier with authenticated platform topology through the separate production
+  profile/readiness APIs.
 
 Configured topology admission now rejects empty/even/undersized or over-31 HA sets,
-missing or ambiguous self, and duplicate declared identities before I/O. The
-topology is descriptor-only; each node supplies its one local SQLite backend
-and exact remote consensus-peer map separately, so remote votes do not require
-dummy storage adapters or the legacy remote-backend protocol.
+missing or ambiguous self, and duplicate declared identities before I/O.
+Descriptor-only admission is explicitly lab/compatibility scoped. Production
+admission authenticates bounded platform-fact tokens for the exact epoch before
+the immutable descriptors reach the engine. Each node supplies its one local
+SQLite backend and exact remote consensus-peer map separately, so remote votes
+do not require dummy storage adapters or the legacy remote-backend protocol.
 `ValidatedQuorumTopology::try_new_consensus_lab_singleton` is a separate
 one-replica Openraft profile that reports `single-replica`, never HA, while
 exercising the same durable engine and state machine.
@@ -156,7 +160,24 @@ waits for local state-machine application through the returned log ID.
 Authoritative reads perform that same barrier; writes use `client_write_ff`
 under the shared eight-slot supervised admission bound. Listener readiness
 therefore cannot disagree with the store merely because a server socket is
-bound.
+bound. This base method remains engine/lab evidence and MUST NOT authorize
+production traffic.
+
+Production traffic uses topology created through
+`ValidatedQuorumTopology::try_from_attested`, the time-aware production profile,
+and a `ProductionTopologyAttested` report whose
+`is_production_traffic_ready()` result is true from
+`probe_production_durable_readiness` (or its refreshed-attestation form).
+Verified `AuthenticatedPlatform` evidence carries an absolute monotonic expiry;
+the open store retains a nondecreasing wall-clock high-water and repeats both
+checks after the Openraft await. A backward clock, exact expiry, foreign or
+non-production token, and an older delayed evaluation all fail closed. The
+process-local time authority is rebuilt by authenticating evidence again
+against current time after restart; the adapter decides whether a
+still-unexpired proof may be re-presented or must be replaced. The shared
+report's bounded `DurableReadinessScope`
+marks engine-only versus production-topology-attested evidence; consumers
+require the latter in production traffic gates.
 
 The SDK state machine, rather than a competing quorum algorithm, deterministically
 applies session commands, advances leader-selected logical time, maintains

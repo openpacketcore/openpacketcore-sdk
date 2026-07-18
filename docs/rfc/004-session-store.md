@@ -801,9 +801,40 @@ linearizable-read barrier against the admitted voting configuration, and wait
 until the local state machine has applied through the returned log index. A
 bound listener, completed TLS handshake, cached capability set, local SQLite
 availability, or successful single-node restore scan MUST NOT produce `Ready`.
-The readiness result is point-in-time evidence, never an ownership lease.
-Products MUST continuously gate ownership publication, VIP/service
-advertisement, and traffic on fresh readiness. Restore scans MUST execute only
+That method is engine/lab evidence only: it does not authenticate observed
+physical node, failure-domain, or durable-backing facts, and its `Ready` result
+MUST NOT authorize production traffic.
+
+Production session traffic MUST use topology admitted through
+`ValidatedQuorumTopology::try_from_attested`, require `Quorum` from the store's
+time-aware production profile, then require
+`DurableReadinessScope::ProductionTopologyAttested` and
+`is_production_traffic_ready()` from `probe_production_durable_readiness` or
+its refreshed-attestation form. The
+evidence MUST have `AuthenticatedPlatform` provenance and bind every exact
+member, service identity, observed physical node, failure domain, durable
+backing, descriptor digest, collector, cluster/configuration/epoch, observation
+time, and expiry. Verification MUST anchor a monotonic expiry. Each open store
+MUST retain a bounded nondecreasing wall-clock high-water and MUST recheck both
+authorities after asynchronous quorum work, so clock rollback, exact expiry,
+and an older delayed probe racing a newer evaluation fail closed. Identity and
+production provenance MUST be rejected before a supplied time can advance that
+high-water. Explicit-time calls on one store MUST use one trusted nondecreasing
+clock source. The high-water and monotonic anchor are process-local. Restart
+MUST NOT deserialize or reuse a prior
+`VerifiedQuorumTopologyAttestation`; it MUST authenticate evidence again
+against current time and establish a new monotonic anchor. The adapter-owned
+proof/replay policy decides whether a still-unexpired underlying proof may be
+re-presented or replacement evidence is required. Token non-serializability
+alone is not proof anti-replay.
+
+The shared readiness report MUST carry the bounded `DurableReadinessScope`.
+Production callers MUST require `ProductionTopologyAttested` and
+`is_production_traffic_ready()` and MUST NOT route an `EngineOnly` report into
+the traffic gate. Every readiness result is point-in-time evidence, never an
+ownership lease. Products MUST continuously gate ownership publication,
+VIP/service advertisement, and traffic on fresh production readiness. Restore
+scans MUST execute only
 after the Openraft barrier and local apply. One absolute deadline MUST begin at
 the public restore entry and cover the barrier/apply path, blocking-worker and
 asynchronous connection admission, SQLite progress, and blocking-task join.

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,6 +59,9 @@ use crate::record::StoredSessionRecord;
 use crate::restore::{RestoreScanPage, RestoreScanRequest};
 use crate::sqlite::SqliteSessionBackend;
 use crate::topology::{QuorumTopologyMode, QuorumTopologySummary, ValidatedQuorumTopology};
+use crate::topology_attestation::{
+    TopologyAttestationSummary, TopologyAttestationTime, VerifiedQuorumTopologyAttestation,
+};
 use crate::ttl::{
     checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at,
 };
@@ -69,6 +72,13 @@ pub const DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT: Duration =
     DURABLE_CONSENSUS_OPERATION_TIMEOUT;
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
+fn attestation_deadline_from_verification_start(
+    verification_started_at: tokio::time::Instant,
+    valid_for: Duration,
+) -> Option<tokio::time::Instant> {
+    verification_started_at.checked_add(valid_for)
+}
 
 /// Fail-closed construction or cluster-formation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -264,6 +274,7 @@ struct ConsensusSessionStoreInner {
     clock: Arc<dyn Clock>,
     operation_timeout: Duration,
     admitted: AtomicBool,
+    topology_attestation_time_high_water: AtomicU64,
     linearizability: EnsureLinearizableSupervisor<SessionRaftTypeConfig>,
     read_barrier: LinearizableReadBarrier<SessionRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
@@ -353,7 +364,9 @@ impl ConsensusSessionStore {
         }
         if !matches!(
             topology.summary().mode(),
-            QuorumTopologyMode::ValidatedHa | QuorumTopologyMode::LabSingleton
+            QuorumTopologyMode::ValidatedHa
+                | QuorumTopologyMode::AttestedHa
+                | QuorumTopologyMode::LabSingleton
         ) {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);
         }
@@ -402,6 +415,11 @@ impl ConsensusSessionStore {
             LinearizableReadLease::Disabled,
         );
         let topology_summary = topology.summary().clone();
+        let topology_attestation_time_high_water = topology_summary
+            .attestation_admission()
+            .production_verified_at()
+            .map(TopologyAttestationTime::unix_seconds)
+            .unwrap_or(0);
 
         Ok(Self {
             inner: Arc::new(ConsensusSessionStoreInner {
@@ -416,6 +434,9 @@ impl ConsensusSessionStore {
                 clock,
                 operation_timeout,
                 admitted: AtomicBool::new(false),
+                topology_attestation_time_high_water: AtomicU64::new(
+                    topology_attestation_time_high_water,
+                ),
                 linearizability,
                 read_barrier,
                 proposal_admission: Arc::new(tokio::sync::Semaphore::new(
@@ -518,9 +539,76 @@ impl ConsensusSessionStore {
         &self.inner.members
     }
 
-    /// This adapter is the only store allowed to claim the quorum profile.
+    /// Static, fail-closed engine profile admitted from descriptor shape.
+    ///
+    /// Time-bound HA evidence cannot safely produce a static quorum claim, so
+    /// HA topologies return [`SessionStorePlatformProfile::Unknown`]. Production
+    /// callers must use [`Self::production_platform_profile_at`] and
+    /// [`Self::probe_production_durable_readiness`].
     pub fn platform_profile(&self) -> SessionStorePlatformProfile {
         self.inner.topology.mode().platform_profile()
+    }
+
+    /// Redaction-safe topology evidence provenance and freshness at `now`.
+    ///
+    /// The summary contains only provenance class, configuration epoch,
+    /// freshness durations, and result. It never exposes member identities,
+    /// endpoints, TLS identities, placement, backing identities, collectors,
+    /// proof bytes, or canonical digests. This wall-clock summary is diagnostic
+    /// only; it does not apply the store's monotonic expiry or clock high-water
+    /// and cannot authorize traffic.
+    pub fn topology_attestation_summary_at(
+        &self,
+        now: TopologyAttestationTime,
+    ) -> TopologyAttestationSummary {
+        self.inner.topology.attestation_at(now)
+    }
+
+    /// Platform profile after requiring fresh production-eligible topology
+    /// evidence at `now`.
+    ///
+    /// Descriptor-only HA returns [`SessionStorePlatformProfile::Unknown`]
+    /// rather than presenting configuration strings as observed proof. Calls
+    /// share a nondecreasing per-store time authority; a backward `now` fails
+    /// closed and cannot revive evidence after a forward/expired evaluation.
+    pub fn production_platform_profile_at(
+        &self,
+        now: TopologyAttestationTime,
+    ) -> SessionStorePlatformProfile {
+        match self.inner.topology.mode() {
+            QuorumTopologyMode::LabSingleton => SessionStorePlatformProfile::SingleReplica,
+            QuorumTopologyMode::AttestedHa
+                if self
+                    .initial_production_attestation_valid_for_at(now)
+                    .is_some() =>
+            {
+                SessionStorePlatformProfile::Quorum
+            }
+            QuorumTopologyMode::ValidatedHa | QuorumTopologyMode::AttestedHa => {
+                SessionStorePlatformProfile::Unknown
+            }
+        }
+    }
+
+    /// Platform profile gated by a separately refreshed attestation for this
+    /// exact immutable topology. Identity and production provenance are checked
+    /// before the supplied nondecreasing time can advance the store high-water.
+    pub fn production_platform_profile_with_attestation_at(
+        &self,
+        attestation: &VerifiedQuorumTopologyAttestation,
+        now: TopologyAttestationTime,
+    ) -> SessionStorePlatformProfile {
+        if self.inner.topology.mode() != QuorumTopologyMode::AttestedHa {
+            return SessionStorePlatformProfile::Unknown;
+        }
+        if self
+            .refreshed_production_attestation_valid_for_at(attestation, now)
+            .is_some()
+        {
+            SessionStorePlatformProfile::Quorum
+        } else {
+            SessionStorePlatformProfile::Unknown
+        }
     }
 
     async fn wait_for_exact_membership(
@@ -586,10 +674,29 @@ impl ConsensusSessionStore {
     /// Fresh readiness proof using the same Openraft quorum/read-index path as
     /// authoritative operations.
     ///
+    /// This is an engine/lab/conformance probe and does not evaluate platform
+    /// topology evidence. Its `Ready` result MUST NOT authorize production
+    /// traffic; use [`Self::probe_production_durable_readiness`] for that gate.
+    ///
     /// The recovery-latch check and linearizable barrier share one complete
     /// operation deadline. A delayed recovery check therefore cannot silently
     /// grant the barrier a second operation budget.
     pub async fn probe_durable_readiness(&self) -> DurableReadinessReport {
+        let start = tokio::time::Instant::now();
+        let deadline = self.operation_deadline_from(start);
+        self.probe_durable_readiness_before(deadline).await
+    }
+
+    fn operation_deadline_from(&self, start: tokio::time::Instant) -> tokio::time::Instant {
+        start
+            .checked_add(self.inner.operation_timeout)
+            .unwrap_or(start)
+    }
+
+    async fn probe_durable_readiness_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> DurableReadinessReport {
         let configured = self.inner.members.len();
         let quorum = (configured / 2) + 1;
         let report_without_barrier = |state, recovery_progress| {
@@ -616,9 +723,6 @@ impl ConsensusSessionStore {
                 metrics.purged.as_ref().map(|log_id| log_id.index),
             )
         };
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .unwrap_or_else(tokio::time::Instant::now);
         let recovery_pending = tokio::time::timeout_at(
             deadline,
             self.inner
@@ -699,6 +803,219 @@ impl ConsensusSessionStore {
                 report_without_barrier(state, progress)
             }
         }
+    }
+
+    /// Fresh Openraft readiness gated by currently valid, production-eligible
+    /// platform topology evidence.
+    ///
+    /// Unlike [`Self::probe_durable_readiness`], this is the production traffic
+    /// gate. Descriptor-only, deterministic-conformance, expired, or
+    /// not-yet-valid evidence returns [`DurableReadinessState::TopologyInvalid`]
+    /// without attempting to turn a successful quorum barrier into readiness.
+    pub async fn probe_production_durable_readiness(&self) -> DurableReadinessReport {
+        let Ok(now) = TopologyAttestationTime::now() else {
+            return self.topology_invalid_readiness_report();
+        };
+        let report = self.probe_production_durable_readiness_at(now).await;
+        let Ok(finished_at) = TopologyAttestationTime::now() else {
+            return self.topology_invalid_readiness_report();
+        };
+        if self
+            .initial_production_attestation_valid_for_at(finished_at)
+            .is_none()
+        {
+            return self.topology_invalid_readiness_report();
+        }
+        report
+    }
+
+    /// Deterministic-time form of [`Self::probe_production_durable_readiness`]
+    /// for conformance harnesses and platform clocks.
+    ///
+    /// `now` is the wall-clock evaluation origin. Monotonic elapsed time during
+    /// the asynchronous probe still consumes the evidence's remaining validity.
+    /// Every call on one store must come from one nondecreasing trusted clock;
+    /// a backward value fails closed. The no-argument production method uses
+    /// the platform system clock directly.
+    pub async fn probe_production_durable_readiness_at(
+        &self,
+        now: TopologyAttestationTime,
+    ) -> DurableReadinessReport {
+        self.probe_durable_readiness_with_production_attestation(
+            self.inner.topology.attestation_admission(),
+            now,
+        )
+        .await
+    }
+
+    /// Fresh Openraft readiness gated by a separately refreshed attestation
+    /// and the current platform wall clock.
+    ///
+    /// The proof is bound to the exact immutable store topology. The probe also
+    /// uses a monotonic deadline and rechecks wall-clock freshness after the
+    /// asynchronous barrier, so evidence expiring during the operation cannot
+    /// produce a ready result.
+    pub async fn probe_production_durable_readiness_with_attestation(
+        &self,
+        attestation: &VerifiedQuorumTopologyAttestation,
+    ) -> DurableReadinessReport {
+        let Ok(now) = TopologyAttestationTime::now() else {
+            return self.topology_invalid_readiness_report();
+        };
+        let report = self
+            .probe_production_durable_readiness_with_attestation_at(attestation, now)
+            .await;
+        let Ok(finished_at) = TopologyAttestationTime::now() else {
+            return self.topology_invalid_readiness_report();
+        };
+        if self
+            .refreshed_production_attestation_valid_for_at(attestation, finished_at)
+            .is_none()
+        {
+            return self.topology_invalid_readiness_report();
+        }
+        report
+    }
+
+    /// Fresh Openraft readiness gated by a separately refreshed attestation
+    /// for this exact immutable topology.
+    ///
+    /// This is the long-running form of the production gate: consumers may
+    /// periodically authenticate replacement evidence through
+    /// [`ValidatedQuorumTopology::verify_attestation_evidence`] and pass the
+    /// resulting opaque value here. The token cannot change membership and a
+    /// token for another cluster/configuration/epoch fails closed. Monotonic
+    /// elapsed time during the probe consumes the token's remaining validity.
+    /// Every explicit `now` on one store must come from the same nondecreasing
+    /// trusted clock authority. A process restart must authenticate evidence
+    /// again against current time; the in-process clock high-water and verified
+    /// token are intentionally not persisted. The attestor's proof/replay policy
+    /// decides whether a still-unexpired underlying proof may be re-presented.
+    pub async fn probe_production_durable_readiness_with_attestation_at(
+        &self,
+        attestation: &VerifiedQuorumTopologyAttestation,
+        now: TopologyAttestationTime,
+    ) -> DurableReadinessReport {
+        if self.inner.topology.mode() != QuorumTopologyMode::AttestedHa
+            || attestation.consensus_identity() != self.inner.identity
+        {
+            return self.topology_invalid_readiness_report();
+        }
+        self.probe_durable_readiness_with_production_attestation(attestation.admission(), now)
+            .await
+    }
+
+    async fn probe_durable_readiness_with_production_attestation(
+        &self,
+        admission: &crate::topology_attestation::TopologyAttestationAdmission,
+        now: TopologyAttestationTime,
+    ) -> DurableReadinessReport {
+        // Capture the operation origin before evaluating freshness. Any time
+        // consumed by wall/monotonic verification must reduce, never extend,
+        // the asynchronous barrier budget.
+        let start = tokio::time::Instant::now();
+        let Some(valid_for) = self.production_attestation_valid_for_at(admission, now) else {
+            return self.topology_invalid_readiness_report();
+        };
+        let Some(attestation_deadline) =
+            attestation_deadline_from_verification_start(start, valid_for)
+        else {
+            return self.topology_invalid_readiness_report();
+        };
+        let deadline = self
+            .operation_deadline_from(start)
+            .min(attestation_deadline);
+        let report = self
+            .probe_durable_readiness_before(deadline)
+            .await
+            .with_production_topology_attestation();
+        if tokio::time::Instant::now() >= attestation_deadline
+            || self
+                .production_attestation_valid_for_at(admission, now)
+                .is_none()
+        {
+            self.topology_invalid_readiness_report()
+        } else {
+            report
+        }
+    }
+
+    fn initial_production_attestation_valid_for_at(
+        &self,
+        now: TopologyAttestationTime,
+    ) -> Option<Duration> {
+        (self.inner.topology.mode() == QuorumTopologyMode::AttestedHa).then_some(())?;
+        self.production_attestation_valid_for_at(self.inner.topology.attestation_admission(), now)
+    }
+
+    fn refreshed_production_attestation_valid_for_at(
+        &self,
+        attestation: &VerifiedQuorumTopologyAttestation,
+        now: TopologyAttestationTime,
+    ) -> Option<Duration> {
+        (self.inner.topology.mode() == QuorumTopologyMode::AttestedHa).then_some(())?;
+        (attestation.consensus_identity() == self.inner.identity).then_some(())?;
+        self.production_attestation_valid_for_at(attestation.admission(), now)
+    }
+
+    fn production_attestation_valid_for_at(
+        &self,
+        admission: &crate::topology_attestation::TopologyAttestationAdmission,
+        now: TopologyAttestationTime,
+    ) -> Option<Duration> {
+        (self.inner.topology.mode() == QuorumTopologyMode::AttestedHa).then_some(())?;
+        let verified_at = admission.production_verified_at()?;
+        if self.inner.topology.configured_members() < 3
+            || now < verified_at
+            || !self.advance_topology_attestation_time(now)
+        {
+            return None;
+        }
+        let valid_for = admission.production_valid_for_at(now, std::time::Instant::now())?;
+        (self
+            .inner
+            .topology_attestation_time_high_water
+            .load(Ordering::Acquire)
+            == now.unix_seconds())
+        .then_some(valid_for)
+    }
+
+    fn advance_topology_attestation_time(&self, now: TopologyAttestationTime) -> bool {
+        let candidate = now.unix_seconds();
+        let high_water = &self.inner.topology_attestation_time_high_water;
+        let mut current = high_water.load(Ordering::Acquire);
+        loop {
+            if candidate < current {
+                return false;
+            }
+            if candidate == current {
+                return true;
+            }
+            match high_water.compare_exchange_weak(
+                current,
+                candidate,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn topology_invalid_readiness_report(&self) -> DurableReadinessReport {
+        let configured = self.inner.members.len();
+        let quorum = (configured / 2) + 1;
+        DurableReadinessReport::new(
+            DurableReadinessState::TopologyInvalid,
+            configured,
+            0,
+            0,
+            quorum,
+            None,
+            Vec::new(),
+        )
+        .with_production_topology_attestation()
     }
 
     async fn submit_intent(
@@ -2167,6 +2484,24 @@ mod membership_tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn attestation_deadline_is_anchored_before_verification_work() {
+        let verification_started_at = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(400)).await;
+
+        let deadline = attestation_deadline_from_verification_start(
+            verification_started_at,
+            Duration::from_secs(1),
+        )
+        .expect("representable attestation deadline");
+
+        assert_eq!(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            Duration::from_millis(600),
+            "verification work must consume the original validity budget"
+        );
+    }
+
     #[test]
     fn corrupt_durable_state_is_typed_as_recovery_required() {
         assert_eq!(
@@ -2468,6 +2803,12 @@ mod membership_tests {
 
         let uninitialized = store.probe_durable_readiness().await;
         assert_eq!(uninitialized.state(), DurableReadinessState::NoQuorum);
+        let production = store
+            .probe_production_durable_readiness_at(TopologyAttestationTime::from_unix_seconds(
+                1_000,
+            ))
+            .await;
+        assert_eq!(production.state(), DurableReadinessState::TopologyInvalid);
         assert_eq!(
             uninitialized.recovery_progress().state(),
             DurableRecoveryState::AwaitingQuorum
@@ -2502,6 +2843,12 @@ mod membership_tests {
         assert!(store.exact_membership_is_admitted());
         let initialized = store.probe_durable_readiness().await;
         assert!(initialized.is_ready());
+        let production = store
+            .probe_production_durable_readiness_at(TopologyAttestationTime::from_unix_seconds(
+                1_000,
+            ))
+            .await;
+        assert_eq!(production.state(), DurableReadinessState::TopologyInvalid);
         assert_eq!(
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized

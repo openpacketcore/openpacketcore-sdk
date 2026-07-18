@@ -1,9 +1,11 @@
 //! Validated identity and membership for replicated session stores.
 //!
-//! Topology admission is deliberately separate from backend capabilities and
-//! runtime readiness. It proves that configured votes are distinct and that
-//! exactly one member is the local replica; it does not prove reachability,
-//! authenticated peer identity, durable commit authority, or repair safety.
+//! Descriptor admission is deliberately separate from backend capabilities
+//! and runtime readiness. It proves that configured votes are distinct and
+//! that exactly one member is local. Production callers add the verifier port
+//! in [`crate::topology_attestation`] to bind observed physical facts to the
+//! exact configuration epoch. Neither path proves current peer reachability,
+//! durable commit authority, or repair safety.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -14,6 +16,11 @@ use thiserror::Error;
 
 use crate::capability::SessionStorePlatformProfile;
 use crate::consensus::{SessionConsensusIdentity, SessionConsensusNodeId};
+use crate::topology_attestation::{
+    verify_topology_attestations, QuorumTopologyAttestor, TopologyAttestationAdmission,
+    TopologyAttestationEvidence, TopologyAttestationPolicy, TopologyAttestationSummary,
+    TopologyAttestationTime, VerifiedQuorumTopologyAttestation,
+};
 
 /// Maximum encoded length of a logical replica ID.
 pub const REPLICA_ID_MAX_BYTES: usize = 253;
@@ -154,6 +161,62 @@ pub enum QuorumTopologyError {
     /// node ID. Admission fails rather than aliasing votes.
     #[error("configured members contain a duplicate consensus node ID")]
     DuplicateConsensusNodeId,
+    /// The evidence set did not contain exactly one token per admitted member.
+    #[error("topology evidence count does not match admitted membership")]
+    TopologyEvidenceCountMismatch,
+    /// A descriptor-only or singleton topology attempted to verify refreshed
+    /// production evidence. Evidence can refresh only an originally attested
+    /// immutable HA topology; it cannot upgrade a lab topology after admission.
+    #[error("topology evidence refresh requires an attested HA topology")]
+    TopologyEvidenceRequiresAttestedHa,
+    /// More than one evidence token claimed the same logical member.
+    #[error("topology evidence contains a duplicate logical member")]
+    DuplicateTopologyEvidenceMember,
+    /// Evidence claimed a member outside the exact admitted configuration.
+    #[error("topology evidence names an unexpected logical member")]
+    UnexpectedTopologyEvidenceMember,
+    /// Evidence provenance did not match the explicitly selected trust policy.
+    #[error("topology evidence provenance does not match admission policy")]
+    TopologyEvidenceProvenanceMismatch,
+    /// Evidence came from a collector outside the explicit trust policy.
+    #[error("topology evidence collector is not trusted")]
+    UntrustedTopologyEvidenceCollector,
+    /// Evidence was bound to another cluster, configuration, or epoch.
+    #[error("topology evidence does not match the consensus epoch")]
+    TopologyEvidenceEpochMismatch,
+    /// Evidence begins after the admission evaluation time.
+    #[error("topology evidence is not yet valid")]
+    TopologyEvidenceNotYetValid,
+    /// Evidence had an empty, overflowing, or excessive validity window.
+    #[error("topology evidence validity window is invalid")]
+    TopologyEvidenceValidityInvalid,
+    /// Evidence was expired or older than the selected freshness policy.
+    #[error("topology evidence is expired")]
+    TopologyEvidenceExpired,
+    /// The selected attestor did not authenticate the opaque proof.
+    #[error("topology evidence verification failed")]
+    TopologyEvidenceVerificationFailed,
+    /// Two logical votes were observed on the same physical node.
+    #[error("topology evidence contains a duplicate physical node")]
+    DuplicateObservedPhysicalNode,
+    /// Two logical votes were observed in the same failure domain.
+    #[error("topology evidence contains a duplicate failure domain")]
+    DuplicateObservedFailureDomain,
+    /// Two logical votes were observed on the same durable backing store.
+    #[error("topology evidence contains a duplicate backing identity")]
+    DuplicateObservedBackingIdentity,
+    /// Evidence did not cover the exact configured member descriptor.
+    #[error("topology evidence does not match the member descriptor")]
+    TopologyEvidenceDescriptorMismatch,
+    /// The authenticated service identity did not match the configured member.
+    #[error("topology evidence does not match the member TLS identity")]
+    TopologyEvidenceTlsIdentityMismatch,
+    /// The observed failure domain did not match the configured member.
+    #[error("topology evidence does not match the member failure domain")]
+    TopologyEvidenceFailureDomainMismatch,
+    /// The observed durable backing did not match the configured member.
+    #[error("topology evidence does not match the member backing identity")]
+    TopologyEvidenceBackingIdentityMismatch,
 }
 
 fn validate_opaque(
@@ -518,6 +581,10 @@ impl QuorumTopologyConfig {
     }
 
     /// Define an HA membership set scoped to one exact consensus identity.
+    ///
+    /// Converting this value with [`ValidatedQuorumTopology::try_from`] is the
+    /// descriptor-only lab/compatibility path. Production admission passes the
+    /// same value to [`ValidatedQuorumTopology::try_from_attested`].
     pub fn new_consensus(
         local_replica_id: ReplicaId,
         members: Vec<QuorumReplicaDescriptor>,
@@ -535,9 +602,13 @@ impl QuorumTopologyConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum QuorumTopologyMode {
-    /// Odd membership of 3 through [`QUORUM_TOPOLOGY_MAX_MEMBERS`] validated
-    /// distinct replicas.
+    /// Descriptor-only odd membership used by labs and compatibility callers.
+    ///
+    /// The descriptors are distinct but carry no observed platform proof.
     ValidatedHa,
+    /// Odd membership whose platform facts were authenticated and bound to the
+    /// exact consensus epoch.
+    AttestedHa,
     /// Explicit one-member lab profile; never an HA claim.
     LabSingleton,
 }
@@ -546,15 +617,21 @@ impl QuorumTopologyMode {
     /// Stable diagnostic code for this topology mode.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ValidatedHa => "validated-ha",
+            Self::ValidatedHa => "descriptor-only-lab-ha",
+            Self::AttestedHa => "attested-ha",
             Self::LabSingleton => "lab-singleton",
         }
     }
 
-    /// Platform capability this topology is allowed to advertise.
+    /// Static platform capability this topology is allowed to advertise.
+    ///
+    /// HA provenance is time-bound, so neither descriptor-only nor attested HA
+    /// can safely advertise a static quorum capability. Consumers must use the
+    /// constructed store's time-aware production profile methods. The explicit
+    /// lab singleton remains a stable single-replica profile.
     pub const fn platform_profile(self) -> SessionStorePlatformProfile {
         match self {
-            Self::ValidatedHa => SessionStorePlatformProfile::Quorum,
+            Self::ValidatedHa | Self::AttestedHa => SessionStorePlatformProfile::Unknown,
             Self::LabSingleton => SessionStorePlatformProfile::SingleReplica,
         }
     }
@@ -567,6 +644,7 @@ pub struct QuorumTopologySummary {
     configured_members: usize,
     required_quorum: usize,
     local_replica_id: Option<ReplicaId>,
+    attestation: TopologyAttestationAdmission,
 }
 
 impl QuorumTopologySummary {
@@ -590,9 +668,22 @@ impl QuorumTopologySummary {
     pub fn local_replica_id(&self) -> Option<&ReplicaId> {
         self.local_replica_id.as_ref()
     }
+
+    /// Evaluate redaction-safe wall-clock platform-fact status for diagnostics.
+    ///
+    /// This summary does not apply the store's monotonic expiry or
+    /// nondecreasing clock authority and therefore cannot authorize production
+    /// traffic.
+    pub fn attestation_at(&self, now: TopologyAttestationTime) -> TopologyAttestationSummary {
+        self.attestation.summary_at(now)
+    }
+
+    pub(crate) const fn attestation_admission(&self) -> &TopologyAttestationAdmission {
+        &self.attestation
+    }
 }
 
-/// Immutable descriptor-only topology that passed HA or singleton admission.
+/// Immutable topology that passed descriptor or attested HA/singleton admission.
 ///
 /// Storage backends and network clients are deliberately absent. A consensus
 /// node receives its one local backend and exact remote peer map separately,
@@ -606,6 +697,58 @@ pub struct ValidatedQuorumTopology {
 }
 
 impl ValidatedQuorumTopology {
+    /// Validate HA descriptors and authenticate one fresh platform-fact token
+    /// for every exact member.
+    ///
+    /// `attestor` is the consumer-selected trust boundary. The SDK then
+    /// independently enforces exact descriptor, TLS, physical-node,
+    /// failure-domain, backing-store, collector, configuration-epoch, and
+    /// freshness bindings. The resulting admission has an absolute monotonic
+    /// lifetime anchored at verification. That process-local anchor cannot be
+    /// persisted across restart: the consumer must authenticate an evidence
+    /// set again against current time (or collect replacement evidence) before
+    /// reopening production traffic. Whether an adapter may re-present a
+    /// still-unexpired proof is owned by that proof format and its replay
+    /// policy. Dynamic membership remains a separate API.
+    pub fn try_from_attested(
+        config: QuorumTopologyConfig,
+        evidence: Vec<TopologyAttestationEvidence>,
+        policy: &TopologyAttestationPolicy,
+        attestor: &dyn QuorumTopologyAttestor,
+        now: TopologyAttestationTime,
+    ) -> Result<Self, QuorumTopologyError> {
+        let mut topology = validate_topology(
+            config.local_replica_id,
+            config.members,
+            QuorumTopologyMode::AttestedHa,
+            config.consensus_identity,
+        )?;
+        let verified = verify_topology_attestations(&topology, evidence, policy, attestor, now)?;
+        topology.summary.attestation = verified.admission().clone();
+        Ok(topology)
+    }
+
+    /// Authenticate a replacement evidence set for this exact immutable
+    /// topology without changing membership.
+    ///
+    /// The returned opaque value can gate later production readiness after the
+    /// evidence stored at construction expires. It cannot change the cluster,
+    /// descriptor set, configuration epoch, member count, or Openraft voter
+    /// state; those remain outside this refresh boundary. Replacement evidence
+    /// receives a new monotonic lifetime at verification and is process-local.
+    pub fn verify_attestation_evidence(
+        &self,
+        evidence: Vec<TopologyAttestationEvidence>,
+        policy: &TopologyAttestationPolicy,
+        attestor: &dyn QuorumTopologyAttestor,
+        now: TopologyAttestationTime,
+    ) -> Result<VerifiedQuorumTopologyAttestation, QuorumTopologyError> {
+        if self.summary.mode != QuorumTopologyMode::AttestedHa {
+            return Err(QuorumTopologyError::TopologyEvidenceRequiresAttestedHa);
+        }
+        verify_topology_attestations(self, evidence, policy, attestor, now)
+    }
+
     /// Validate an explicit one-member lab topology backed by Openraft.
     ///
     /// This remains a single-replica platform profile, but exercises the same
@@ -629,7 +772,13 @@ impl ValidatedQuorumTopology {
         &self.summary
     }
 
-    /// Platform profile this admitted topology is permitted to advertise.
+    /// Static, fail-closed platform profile admitted from topology shape.
+    ///
+    /// HA evidence is time-bound, so this method returns
+    /// [`SessionStorePlatformProfile::Unknown`] for both descriptor-only and
+    /// attested HA. Use [`QuorumTopologySummary::attestation_at`] and the
+    /// constructed store's production capability/readiness methods for a
+    /// production claim.
     pub const fn platform_profile(&self) -> SessionStorePlatformProfile {
         self.summary.mode.platform_profile()
     }
@@ -686,12 +835,14 @@ fn validate_topology(
     }
 
     match mode {
-        QuorumTopologyMode::ValidatedHa if members.len() < 3 => {
+        QuorumTopologyMode::ValidatedHa | QuorumTopologyMode::AttestedHa if members.len() < 3 => {
             return Err(QuorumTopologyError::HaMemberCountTooSmall {
                 configured: members.len(),
             });
         }
-        QuorumTopologyMode::ValidatedHa if members.len().is_multiple_of(2) => {
+        QuorumTopologyMode::ValidatedHa | QuorumTopologyMode::AttestedHa
+            if members.len().is_multiple_of(2) =>
+        {
             return Err(QuorumTopologyError::HaMemberCountMustBeOdd {
                 configured: members.len(),
             });
@@ -765,17 +916,24 @@ fn validate_topology(
             }
             consensus_node_ids.insert(descriptor.replica_id().clone(), node_id);
         }
-    } else if mode == QuorumTopologyMode::ValidatedHa {
+    } else if matches!(
+        mode,
+        QuorumTopologyMode::ValidatedHa | QuorumTopologyMode::AttestedHa
+    ) {
         return Err(QuorumTopologyError::MissingConsensusIdentity);
     }
 
     let required_quorum = (configured_members / 2) + 1;
+    let configuration_epoch = consensus_identity
+        .map(|identity| identity.configuration_epoch().get())
+        .unwrap_or(0);
     Ok(ValidatedQuorumTopology {
         summary: QuorumTopologySummary {
             mode,
             configured_members,
             required_quorum,
             local_replica_id: Some(local_replica_id),
+            attestation: TopologyAttestationAdmission::descriptor_only(configuration_epoch),
         },
         members,
         consensus_identity,
