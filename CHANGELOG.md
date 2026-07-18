@@ -30,6 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Added
+- **Atomic candidate-only v5 Kubernetes HA artifacts — `opc-session-testkit`:**
+  a separate executable and reusable composition API now preflight a trusted
+  Linux output parent and Python interpreter before campaign mutation, run the
+  deployed v5 batch/watch/restore/readiness campaign, and publish only after
+  cleanup completes and both the frozen checker and additive workload verifier
+  pass. Private descriptor-relative staging retains
+  the exact v5 JSONL history, fault schedule, generated workload schedule,
+  closed candidate evidence, unchanged frozen independent checker, separate
+  additive workload verifier, both bounded outputs, and digest summary;
+  `renameat2(NOREPLACE)` prevents replacement. Reusable-API callers must supply
+  both expected digests; the dedicated CLI binds the exact programs embedded in
+  the invoked binary and is not an independent provenance trust root.
+  Descriptor-pinned interpreter/input access, full parent-ancestry validation,
+  isolated Python, bounded pre-reap process-group cleanup, and explicit
+  cleanup-unknown handling fail closed. Normal success never signals a reaped
+  process's old numeric group. A post-rename parent-sync failure is
+  quarantine-only outcome-unknown; no authenticated acceptance verifier is
+  claimed. Every
+  artifact remains
+  `experimental=true`, `qualification_complete=false`, and
+  `counts_for_production=false`; this is no live-cluster or production
+  qualification claim.
 - **Exact authenticated-control-plane SA relocation — `opc-ipsec-xfrm`:** a
   typed `RelocateSaRequest` carries a query-proven old SA identity plus new
   outer addresses and ESP-in-UDP ports. Linux uses the exact single-state

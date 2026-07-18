@@ -656,12 +656,56 @@ contradicts the no-pairs schedule and fails immediately; it is never omitted
 from an otherwise passing history.
 
 The adapter returns a checker-ready in-memory history only for a conclusive
-run. It does not yet atomically retain candidate evidence, bind the exact OCI
-image/release manifest/platform inventory, or execute a cluster in CI. No run
-was performed as part of this source change. The frozen v4 manifest continues
-to bind v3, the current qualification node still uses its documented
-`MemoryKeyProvider`, and no production credit exists until a later additive
-evidence contract binds and verifies an actual release campaign.
+run. The separate `qualification_kubernetes_concurrent_v5_artifacts` boundary
+now preflights publication before Kubernetes mutation, accepts only a
+`Passed`, cleanup-complete outcome with history, and privately stages the exact
+history JSONL, fault schedule, generated fixed-workload schedule, closed v5
+evidence, unchanged frozen-checker bytes, additive workload-verifier bytes,
+both bounded outputs, and digest summary. Reusable-API callers explicitly pin
+both expected program digests. The dedicated CLI binds the exact programs
+embedded in the invoked binary; that self-binding is not an independent
+provenance trust root.
+It pins the validated interpreter descriptor and SHA-256 before the campaign,
+revalidates it before each execution, and runs Python with `-I -B -S`, without
+a shell, under a 30-second deadline and fixed stdout/stderr caps. Verification
+program and input paths are descriptor-pinned `/proc/<publisher-pid>/fd/<fd>` paths with
+`CLOEXEC` retained; Linux procfs access to the publisher's own descriptors is
+therefore a preflight requirement. Root or the publisher effective user is the
+explicit interpreter-file trust boundary. Pre/post execution digest checks
+detect persistent same-inode changes, but cannot defend against that trusted
+owner changing and restoring bytes inside the execution race; production
+operators should provide a root-owned immutable/fs-verity-backed interpreter
+where that threat is in scope. Before the atomic commit point, any launch,
+timeout, output-bound, non-pass, digest, token cancellation, or staging failure
+withholds the destination. Cancellation racing commit is outcome-unknown and
+requires the quarantine procedure below.
+
+On Linux, publication requires every configured parent ancestor to be
+root/effective-user-owned and not group/world-writable, pins the parent
+device/inode, re-resolves that binding immediately before publication, and uses
+descriptor-relative `renameat2(NOREPLACE)` plus directory `fsync`; existing
+destinations are never replaced. Other platforms return
+`UnsupportedAtomicPublication` rather than use check-then-rename. If the rename
+succeeds but the final parent `fsync` fails, the API returns
+`PublicationOutcomeUnknown`. This SDK deliberately supplies no authenticated
+receipt or acceptance verifier: quarantine the path, do not accept or count it,
+do not treat `summary.json` self-consistency as provenance, and never overwrite
+it. Inspection or removal requires a separate audited operator procedure. A
+`StagingCleanupOutcomeUnknown` similarly quarantines the parent because private
+staging may remain. An invalid bundle requires a new output name and a new
+`history_id`; an ambiguous durable campaign must not be replayed under the old
+identity.
+
+Source revision/tree status and artifact name/version/digest are explicitly
+caller-asserted and unauthenticated. The publisher always writes
+`exact_release_artifact=false`; it generates and retains the workload schedule
+from the completed history contract. It does not prove an OCI image, source
+checkout, release manifest, platform inventory, or live cluster by itself. No
+Kubernetes run was performed as part of this source change. The frozen v4
+manifest continues to bind v3, the current qualification node still uses its
+documented `MemoryKeyProvider`, and all v5 documents remain fixed to
+`experimental=true`, `qualification_complete=false`, and
+`counts_for_production=false`.
 
 The reusable composition boundary is:
 
@@ -695,6 +739,47 @@ let schedule_json = history.fault_schedule().encode_json()?;
 # }
 ```
 
+For the checked atomic path, use
+`run_and_publish_qualification_kubernetes_concurrent_v5_campaign` with a
+`QualificationKubernetesConcurrentV5ArtifactConfig`, or invoke the dedicated
+binary:
+
+```console
+opc-session-kubernetes-concurrent-v5-campaign \
+  --namespace session-ha-qualification --members 3 \
+  --history-id unique-candidate-attempt-001 \
+  --output-directory /var/lib/opc-evidence/candidate-attempt-001 \
+  --checker-interpreter /usr/bin/python3 \
+  --asserted-source-revision 0123456789abcdef0123456789abcdef01234567 \
+  --asserted-source-tree-status dirty_unqualified \
+  --asserted-artifact-name opc-session-quorum-node \
+  --asserted-artifact-version 0.2.0-candidate \
+  --asserted-artifact-sha256 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+```
+
+The executable records the canonical interpreter path, descriptor-bound digest,
+and bounded, whitespace-trimmed version output. Its success means only that this
+candidate run passed both explicitly digest-pinned verification programs and
+was retained atomically; it does not grant production credit. Callers must
+request cancellation through `QualificationKubernetesCampaignCancellation` and
+await the combined campaign/publication future to receive typed cleanup results.
+Dropping it while the deployed campaign is still running skips the adapter's
+later asynchronous fleet cleanup. Before fleet reuse, an audited operator
+procedure must then restore every RPC gate, abort the watch, forget local lease
+handles, and reset the custom Pod condition.
+
+After the campaign has returned and artifact publication has begun, dropping
+the future attempts synchronous private-staging cleanup and, while the direct
+verification process remains unreaped, best-effort process-group termination;
+it cannot return cleanup/outcome status. A successfully reaped process is never
+signalled by its old numeric process-group identifier. The trusted interpreter
+and verifier programs must not daemonize or escape their process group; this
+publisher is not a cgroup sandbox. An abort racing the atomic
+rename may still leave a complete destination and emits a stable
+outcome-unknown event when observed; after any unacknowledged abort, callers
+must check for and quarantine both staging and destination paths. They must not
+accept, count, or overwrite either path.
+
 Run the focused v5 contract and checker suite with:
 
 `cargo test --locked -p opc-session-testkit --all-features qualification_concurrent_v5`
@@ -704,8 +789,13 @@ The focused deployed-adapter fake-port and independent-checker proof is:
 
 `cargo test --locked -p opc-session-testkit --all-features qualification_kubernetes_concurrent_v5`.
 
-The independent checker invocation always supplies all three digest-bound
-artifacts:
+The artifact publisher and CLI boundary are covered with:
+
+`cargo test --locked -p opc-session-testkit --all-features qualification_kubernetes_concurrent_v5_artifacts`
+and
+`cargo test --locked -p opc-session-testkit --all-features --bin opc-session-kubernetes-concurrent-v5-campaign`.
+
+The original frozen three-input checker invocation and bytes remain unchanged:
 
 ```console
 python3 scripts/check-session-ha-concurrent-history-v5.py \
@@ -713,6 +803,20 @@ python3 scripts/check-session-ha-concurrent-history-v5.py \
   --fault-schedule fault-schedule-v5.json \
   --history concurrent-history-v5.jsonl
 ```
+
+The publisher separately runs the additive, independently digest-pinned
+workload verifier. It validates the retained schedule digest, closed operation
+inventory, and equality with the evidence workload contract without changing
+the frozen checker's name, version, inputs, or bytes:
+
+```console
+python3 scripts/check-session-ha-kubernetes-concurrent-v5-workload-v1.py \
+  --evidence candidate-evidence-v5.json \
+  --workload-schedule workload-schedule-v5.json
+```
+
+This additive verification does not alter the existing evidence schema or
+grant new maturity.
 
 ## Combined HA Candidate Manifest
 

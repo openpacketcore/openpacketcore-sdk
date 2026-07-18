@@ -8,6 +8,7 @@ pub mod qualification_concurrent_v5;
 pub mod qualification_kubernetes;
 pub mod qualification_kubernetes_campaign;
 pub mod qualification_kubernetes_concurrent_v5;
+pub mod qualification_kubernetes_concurrent_v5_artifacts;
 pub mod qualification_sequential;
 
 use std::collections::BTreeMap;

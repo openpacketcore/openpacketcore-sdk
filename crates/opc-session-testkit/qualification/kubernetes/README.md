@@ -233,14 +233,76 @@ or deadline withholds history and runs the same all-gates-available cleanup. A
 `Ready` reply after the complete disable actuation is a contradictory result
 and fails immediately rather than being filtered from candidate evidence.
 
-This source slice adds no retained artifact publisher or executable CLI mode.
-Consumers must atomically retain and digest-bind the returned history and fault
-schedule with the exact release/image/platform evidence before running the
-independent checker. The included fake-port tests prove both three- and
-five-member adapter output against that checker, but are not live Kubernetes
-evidence. The adapter controls only the existing qualification RPC fault gate;
-it does not claim NetworkPolicy, packet impairment, process/host/PVC failure,
-remote-HKMS, rotation, soak, or production qualification coverage.
+The separate `opc-session-kubernetes-concurrent-v5-campaign` executable now
+provides the candidate-only retained-artifact mode around this adapter. Before
+any Kubernetes mutation it validates a new absolute destination whose complete
+configured ancestry is root/effective-user-owned and not group/world-writable,
+pins the parent device/inode, descriptor-pins and digest-checks the trusted
+Python interpreter, probes it through procfs, and verifies both expected
+embedded-program digests. Reusable-API callers supply those expected digests;
+the CLI binds the exact programs in the invoked binary and supplies no
+independent provenance trust root. Only a `Passed`, cleanup-complete result with
+history proceeds to private descriptor-relative staging. The atomic bundle
+contains:
+
+- `concurrent-history-v5.jsonl`;
+- `fault-schedule-v5.json`;
+- `workload-schedule-v5.json`;
+- `candidate-evidence-v5.json`;
+- the exact `check-session-ha-concurrent-history-v5.py` bytes;
+- the exact additive
+  `check-session-ha-kubernetes-concurrent-v5-workload-v1.py` bytes;
+- bounded exact `checker-output-v5.json`;
+- bounded exact `workload-verifier-output-v1.json`; and
+- `summary.json` with all retained digests and serialized
+  interpreter/path/version/digest identity.
+
+Both verification programs are launched directly with Python `-I -B -S`,
+without a shell, and have a 30-second deadline, 64-KiB stdout and 16-KiB stderr
+bounds. Interpreter and verifier inputs use descriptor-pinned
+`/proc/<publisher-pid>/fd/<fd>` paths
+while retaining `CLOEXEC`, so procfs access to the publisher's own descriptors
+is an explicit Linux preflight requirement. Root/effective-user ownership is
+the trust boundary; pre/post digest checks detect persistent same-inode
+changes, while immutable/fs-verity-backed interpreter deployment is
+operator-owned when the trusted owner itself is in the threat model.
+Cancellation, launch/reap failure, timeout, oversized output, stderr, a
+nonzero/non-pass result, any digest change, or publication failure attempts
+private-staging cleanup and withholds the destination before the commit point.
+Group termination is attempted only while the direct child remains unreaped;
+normal success never signals its old numeric process-group identifier. The
+trusted interpreter and verifiers must not daemonize or escape their process
+group; this is not cgroup containment.
+Linux publication re-resolves the pinned parent immediately before
+descriptor-relative `renameat2(NOREPLACE)`; unsupported platforms fail
+explicitly. A final
+parent-sync failure is outcome-unknown because the complete directory may
+already be visible. The SDK supplies no authenticated receipt or acceptance
+verifier: quarantine it, never accept/count/replace it, and use a separate
+audited operator inspection/removal procedure. `summary.json` self-consistency
+is not provenance. A cleanup-unknown result likewise quarantines the parent.
+
+The included fake-port tests prove both three- and five-member adapter output
+against that checker, and artifact tests prove private atomic visibility,
+no-replace races, explicit cancellation, artifact-phase future abort,
+same-group process cleanup on timeout/cancellation, hostile verifier output,
+and untrusted-parent rejection. API callers must cancel through the supplied
+token and await to obtain typed campaign and publication cleanup status. A
+combined-future drop during the deployed campaign cannot run the adapter's
+asynchronous cleanup and requires audited operator recovery of gates, watch,
+lease handles, and Pod condition. During the later artifact phase, future abort
+performs a cleanup attempt, but an abort racing the atomic rename can leave a
+destination and only stable outcome-unknown logging; callers must inspect for
+and quarantine both staging and destination paths after any unacknowledged
+abort, never accept/count/overwrite them.
+
+These tests are not live Kubernetes evidence. Source/artifact metadata is
+caller-asserted, `exact_release_artifact` is always false, and does not prove a
+release image or platform inventory. The adapter
+controls only the existing qualification RPC fault gate; it does not claim
+NetworkPolicy, packet impairment, process/host/PVC failure, remote-HKMS,
+rotation, soak, or production qualification coverage. Every v5 evidence and
+summary maturity field remains experimental and false for production credit.
 
 The rendered ServiceAccount remains tokenless and the manifest grants no RBAC
 or controller identity. Kubernetes authorization to use `pods/exec` for this

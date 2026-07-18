@@ -1587,7 +1587,7 @@ fn pod_name(index: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
@@ -1672,6 +1672,8 @@ mod tests {
         gate_failure: Mutex<Option<FakeGateFailure>>,
         gate_events: Mutex<Vec<FakeGateEvent>>,
         conditions: Mutex<Vec<(String, QualificationKubernetesConditionStatus)>>,
+        cancel_after_watch_start: Option<Arc<QualificationKubernetesCampaignCancellation>>,
+        watch_abort_invocations: AtomicUsize,
     }
 
     impl FakePort {
@@ -1700,6 +1702,8 @@ mod tests {
                 gate_failure: Mutex::new(None),
                 gate_events: Mutex::new(Vec::new()),
                 conditions: Mutex::new(Vec::new()),
+                cancel_after_watch_start: None,
+                watch_abort_invocations: AtomicUsize::new(0),
             }
         }
 
@@ -1740,6 +1744,14 @@ mod tests {
                 member_index,
                 availability,
             });
+            self
+        }
+
+        fn with_cancellation_after_watch_start(
+            mut self,
+            cancellation: Arc<QualificationKubernetesCampaignCancellation>,
+        ) -> Self {
+            self.cancel_after_watch_start = Some(cancellation);
             self
         }
 
@@ -1927,10 +1939,15 @@ mod tests {
                 QualificationNodeCommand::StartConcurrentWatch {
                     subscription_id,
                     requested_after_journal_sequence,
-                } => Ok(QualificationNodeReply::ConcurrentWatchStarted {
-                    subscription_id: subscription_id.clone(),
-                    requested_after_journal_sequence: *requested_after_journal_sequence,
-                }),
+                } => {
+                    if let Some(cancellation) = &self.cancel_after_watch_start {
+                        cancellation.cancel();
+                    }
+                    Ok(QualificationNodeReply::ConcurrentWatchStarted {
+                        subscription_id: subscription_id.clone(),
+                        requested_after_journal_sequence: *requested_after_journal_sequence,
+                    })
+                }
                 QualificationNodeCommand::ConcurrentBatch { slots } => {
                     self.batch_invocations.fetch_add(1, Ordering::SeqCst);
                     if self.fail_batch {
@@ -1993,6 +2010,7 @@ mod tests {
                     }],
                 }),
                 QualificationNodeCommand::AbortConcurrentWatch { subscription_id } => {
+                    self.watch_abort_invocations.fetch_add(1, Ordering::SeqCst);
                     Ok(QualificationNodeReply::ConcurrentWatchAborted {
                         subscription_id: subscription_id.clone(),
                     })
@@ -2031,6 +2049,71 @@ mod tests {
             member_count,
             history_id: format!("deployed-v5-{member_count}"),
         }
+    }
+
+    pub(crate) async fn passing_outcome_for_artifact_test(
+        member_count: usize,
+    ) -> QualificationKubernetesConcurrentV5Outcome {
+        let config = config(member_count);
+        let clock = Arc::new(FakeClock::new());
+        let port = FakePort::new(&config.history_id, member_count, false, Arc::clone(&clock));
+        run_qualification_kubernetes_concurrent_v5_campaign(
+            &config,
+            &port,
+            clock.as_ref(),
+            &QualificationKubernetesCampaignCancellation::new(),
+        )
+        .await
+        .expect("valid artifact-test campaign")
+    }
+
+    pub(crate) async fn cancelled_artifact_outcome() -> QualificationKubernetesConcurrentV5Outcome {
+        let config = config(3);
+        let clock = Arc::new(FakeClock::new());
+        let port = FakePort::new(&config.history_id, 3, false, Arc::clone(&clock));
+        let cancellation = QualificationKubernetesCampaignCancellation::new();
+        cancellation.cancel();
+        run_qualification_kubernetes_concurrent_v5_campaign(
+            &config,
+            &port,
+            clock.as_ref(),
+            &cancellation,
+        )
+        .await
+        .expect("valid cancelled artifact-test campaign")
+    }
+
+    pub(crate) async fn active_cancelled_artifact_result(
+        artifact_config: &crate::qualification_kubernetes_concurrent_v5_artifacts::QualificationKubernetesConcurrentV5ArtifactConfig,
+    ) -> Result<
+        crate::qualification_kubernetes_concurrent_v5_artifacts::QualificationKubernetesConcurrentV5ArtifactSummary,
+        crate::qualification_kubernetes_concurrent_v5_artifacts::QualificationKubernetesConcurrentV5ArtifactError,
+    >{
+        let config = config(3);
+        let clock = Arc::new(FakeClock::new());
+        let cancellation = Arc::new(QualificationKubernetesCampaignCancellation::new());
+        let port = FakePort::new(&config.history_id, 3, false, Arc::clone(&clock))
+            .with_cancellation_after_watch_start(Arc::clone(&cancellation));
+        let result = crate::qualification_kubernetes_concurrent_v5_artifacts::run_and_publish_qualification_kubernetes_concurrent_v5_campaign(
+            &config,
+            artifact_config,
+            &port,
+            clock.as_ref(),
+            cancellation.as_ref(),
+        )
+        .await;
+
+        assert_eq!(port.batch_invocations.load(Ordering::SeqCst), 0);
+        assert_eq!(port.watch_abort_invocations.load(Ordering::SeqCst), 1);
+        assert!(port.fences.lock().expect("fake fences").is_empty());
+        assert!(port
+            .rpc_available
+            .lock()
+            .expect("fake RPC state")
+            .iter()
+            .all(|available| *available));
+        assert!(port.final_conditions_are_false());
+        result
     }
 
     fn assert_frozen_checker_passes(history: &QualificationConcurrentHistoryV5) {
@@ -2387,6 +2470,40 @@ mod tests {
         );
         assert!(outcome.cleanup_complete());
         assert_eq!(port.batch_invocations.load(Ordering::SeqCst), 0);
+        assert!(port.final_conditions_are_false());
+    }
+
+    #[tokio::test]
+    async fn awaited_cancellation_during_active_campaign_runs_complete_cleanup() {
+        let config = config(3);
+        let clock = Arc::new(FakeClock::new());
+        let cancellation = Arc::new(QualificationKubernetesCampaignCancellation::new());
+        let port = FakePort::new(&config.history_id, 3, false, Arc::clone(&clock))
+            .with_cancellation_after_watch_start(Arc::clone(&cancellation));
+        let outcome = run_qualification_kubernetes_concurrent_v5_campaign(
+            &config,
+            &port,
+            clock.as_ref(),
+            cancellation.as_ref(),
+        )
+        .await
+        .expect("valid active-cancellation campaign");
+
+        assert_eq!(
+            outcome.status(),
+            QualificationKubernetesConcurrentV5Status::Cancelled
+        );
+        assert!(outcome.history().is_none());
+        assert!(outcome.cleanup_complete());
+        assert_eq!(port.batch_invocations.load(Ordering::SeqCst), 0);
+        assert_eq!(port.watch_abort_invocations.load(Ordering::SeqCst), 1);
+        assert!(port.fences.lock().expect("fake fences").is_empty());
+        assert!(port
+            .rpc_available
+            .lock()
+            .expect("fake RPC state")
+            .iter()
+            .all(|available| *available));
         assert!(port.final_conditions_are_false());
     }
 
