@@ -5,7 +5,7 @@ use opc_proto_gtpv2c::{
     encode_typed_ie_sequence, CauseValue, ChargingId, EpsBearerId, Header, Message, OwnedMessage,
     RawIe, Recovery, S2bMessage, TypedIe, TypedIeValue, IE_TYPE_AMBR, IE_TYPE_APCO, IE_TYPE_APN,
     IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE,
-    IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_LOAD_CONTROL_INFORMATION,
+    IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_LOAD_CONTROL_INFORMATION,
     IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PCO, IE_TYPE_PDN_TYPE, IE_TYPE_PGW_CHANGE_INFO,
     IE_TYPE_RECOVERY, IE_TYPE_SERVING_NETWORK, MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES,
     MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES,
@@ -685,11 +685,6 @@ fn every_instance_one_bearer_context_uses_its_own_member_table() {
         IE_TYPE_CHARGING_ID,
     );
     assert_instance_one_discards_malformed_member(
-        MODIFY_BEARER_REQUEST_FIXTURE,
-        EBI,
-        IE_TYPE_F_TEID,
-    );
-    assert_instance_one_discards_malformed_member(
         MODIFY_BEARER_RESPONSE_FIXTURE,
         EBI_AND_CAUSE,
         IE_TYPE_CHARGING_ID,
@@ -712,11 +707,6 @@ fn instance_one_bearer_context_lists_preserve_multiple_entries() {
             CREATE_SESSION_RESPONSE_FIXTURE,
             RESPONSE_MEMBER_ONE,
             RESPONSE_MEMBER_TWO,
-        ),
-        (
-            MODIFY_BEARER_REQUEST_FIXTURE,
-            REQUEST_MEMBER_ONE,
-            REQUEST_MEMBER_TWO,
         ),
         (
             MODIFY_BEARER_RESPONSE_FIXTURE,
@@ -849,14 +839,14 @@ fn response_pgw_change_info_is_singleton_and_keeps_first_grouped_value() {
 }
 
 #[test]
-fn modify_bearer_preserves_serving_network_and_top_and_nested_charging_ids() {
+fn s2b_modify_bearer_discards_s4_request_ies_but_preserves_assigned_response_ies() {
     let request = append_raw_ies(
         MODIFY_BEARER_REQUEST_FIXTURE,
         &raw_ie(IE_TYPE_SERVING_NETWORK, 0, &[0x00, 0xf1, 0x10]),
     );
     let (_, decoded) = S2bMessage::decode(&request, procedure_context())
-        .expect("Modify Bearer Serving Network is assigned by Table 7.2.7-1");
-    assert!(decoded
+        .expect("known S4/S11/S5/S8 request IE must be discarded on S2b");
+    assert!(!decoded
         .as_view()
         .expect("typed request")
         .ies

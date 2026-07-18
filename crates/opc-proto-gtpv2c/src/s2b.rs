@@ -29,15 +29,16 @@ use crate::ie::typed::{
 };
 use crate::ie::{
     encode_typed_ie_sequence, AccessPointName, BearerContext, Cause, CauseValue,
-    DuplicateIeEvidence, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation,
-    ProtocolConfigurationOptions, RatType, Recovery, SelectionMode, ServingNetwork, TbcdDigits,
-    TypedIe, TypedIeValue, IE_TYPE_AMBR, IE_TYPE_APCO, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION,
-    IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE,
-    IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_INDICATION,
-    IE_TYPE_LOAD_CONTROL_INFORMATION, IE_TYPE_MEI, IE_TYPE_MSISDN,
-    IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE,
-    IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE,
-    IE_TYPE_SERVING_NETWORK,
+    DuplicateIeEvidence, EpsBearerId, FullyQualifiedTeid, IpAddress, PdnAddressAllocation,
+    PortNumber, ProtocolConfigurationOptions, RatType, Recovery, SelectionMode, ServingNetwork,
+    TbcdDigits, TwanIdentifier, TwanIdentifierTimestamp, TypedIe, TypedIeValue, IE_TYPE_AMBR,
+    IE_TYPE_APCO, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS,
+    IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
+    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_IP_ADDRESS, IE_TYPE_LOAD_CONTROL_INFORMATION,
+    IE_TYPE_MEI, IE_TYPE_MSISDN, IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO,
+    IE_TYPE_PDN_TYPE, IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_PORT_NUMBER, IE_TYPE_RAT_TYPE,
+    IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK, IE_TYPE_TWAN_IDENTIFIER,
+    IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
 };
 use crate::{Message, OwnedMessage};
 
@@ -53,10 +54,10 @@ pub const CREATE_SESSION_REQUEST: u8 = 32;
 /// Create Session Response message type.
 pub const CREATE_SESSION_RESPONSE: u8 = 33;
 
-/// Modify Bearer Request message type used by the S2b Modify Session view.
+/// Modify Bearer Request message type used for the S2b UE-initiated IPsec tunnel update.
 pub const MODIFY_BEARER_REQUEST: u8 = 34;
 
-/// Modify Bearer Response message type used by the S2b Modify Session view.
+/// Modify Bearer Response message type used for the S2b UE-initiated IPsec tunnel update.
 pub const MODIFY_BEARER_RESPONSE: u8 = 35;
 
 /// Delete Session Request message type.
@@ -205,7 +206,15 @@ pub struct S2bCreateSessionRejectedResponse<'a> {
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
-/// Input for building an S2b Production Profile v1 Modify Bearer Request.
+/// Legacy bearer-context-shaped Modify Bearer input.
+///
+/// This shape belongs to S4/S11/S5/S8 procedures and is not valid as an S2b
+/// UE-initiated IPsec tunnel update. Use
+/// [`S2bUeIpsecTunnelUpdateRequest`] instead.
+#[deprecated(
+    since = "0.2.0",
+    note = "use S2bUeIpsecTunnelUpdateRequest; S2b does not use Bearer Context for this procedure"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S2bModifyBearerRequest<'a> {
     /// GTPv2-C sequence number.
@@ -216,6 +225,65 @@ pub struct S2bModifyBearerRequest<'a> {
     pub bearer_context: BearerContext<'a>,
     /// Additional typed IEs to append after Bearer Context.
     pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+/// Access-specific fields of an S2b UE-initiated IPsec tunnel update.
+///
+/// The general form carries no endpoint fields. The Fixed Broadband form
+/// makes UE Local IP mandatory and permits UE UDP Port only in the same typed
+/// branch, so a UDP port cannot be represented without its local address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S2bUeIpsecTunnelUpdateEndpoint {
+    /// General S2b update with no Fixed Broadband endpoint fields.
+    General,
+    /// Fixed Broadband/local-policy endpoint update.
+    FixedBroadband {
+        /// Changed UE Local IP Address, encoded as IP Address instance 1.
+        ue_local_ip: IpAddress,
+        /// UE UDP Port, encoded as Port Number instance 1 when NAT was
+        /// detected and UDP encapsulation applies.
+        ue_udp_port: Option<PortNumber>,
+    },
+}
+
+/// Input for an S2b UE-initiated IPsec tunnel update (Modify Bearer Request).
+///
+/// WLAN location and its acquisition timestamp are independently optional.
+/// `additional_ies` is restricted to unknown/private extension IEs and the
+/// S2b-assigned ePDG Overload Control Information at instance 2, so callers
+/// cannot bypass the typed S2b instances or inject an S5/S8 Bearer Context.
+///
+/// @spec 3GPP TS29274 R18 7.2.7 Table 7.2.7-1
+/// @req REQ-3GPP-TS29274-R18-S2B-MODIFY-BEARER-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bUeIpsecTunnelUpdateRequest<'a> {
+    /// GTPv2-C sequence number.
+    pub sequence_number: u32,
+    /// Non-zero PGW control-plane TEID carried in the request header.
+    pub teid: u32,
+    /// WLAN Location Information, encoded as TWAN Identifier instance 0.
+    pub wlan_location: Option<TwanIdentifier>,
+    /// WLAN Location Timestamp, encoded as TWAN Identifier Timestamp instance 0.
+    pub wlan_location_timestamp: Option<TwanIdentifierTimestamp>,
+    /// General or Fixed Broadband/local-policy endpoint form.
+    pub endpoint: S2bUeIpsecTunnelUpdateEndpoint,
+    /// Unknown/private extension IEs or ePDG Overload Control Information at
+    /// instance 2, appended after profile-owned fields.
+    pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+impl fmt::Debug for S2bUeIpsecTunnelUpdateRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bUeIpsecTunnelUpdateRequest")
+            .field("sequence_number", &self.sequence_number)
+            .field("teid", &"<redacted>")
+            .field("wlan_location", &self.wlan_location)
+            .field("wlan_location_timestamp", &self.wlan_location_timestamp)
+            .field("endpoint", &self.endpoint)
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
 }
 
 /// Input for building an S2b Production Profile v1 Modify Bearer Response.
@@ -230,6 +298,99 @@ pub struct S2bModifyBearerResponse<'a> {
     /// Additional typed IEs to append after Cause.
     pub additional_ies: Vec<TypedIe<'a>>,
 }
+
+/// Typed projection of a decoded S2b UE-initiated IPsec tunnel update request.
+///
+/// Procedure-aware receive applies TS 29.274 clause 7.7.10 before building
+/// this value, so every optional singleton is the first received occurrence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bUeIpsecTunnelUpdateRequestSummary {
+    /// Request sequence number used for transaction correlation.
+    pub sequence_number: u32,
+    /// Non-zero PGW control-plane TEID from the request header.
+    pub teid: u32,
+    /// First applicable WLAN Location Information value.
+    pub wlan_location: Option<TwanIdentifier>,
+    /// First applicable WLAN Location Timestamp value.
+    pub wlan_location_timestamp: Option<TwanIdentifierTimestamp>,
+    /// Projected general or Fixed Broadband endpoint form.
+    pub endpoint: S2bUeIpsecTunnelUpdateEndpoint,
+}
+
+impl fmt::Debug for S2bUeIpsecTunnelUpdateRequestSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bUeIpsecTunnelUpdateRequestSummary")
+            .field("sequence_number", &self.sequence_number)
+            .field("teid", &"<redacted>")
+            .field("wlan_location", &self.wlan_location)
+            .field("wlan_location_timestamp", &self.wlan_location_timestamp)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+/// Typed projection of the correlated Modify Bearer Response.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct S2bUeIpsecTunnelUpdateResponseSummary {
+    /// Response sequence number used for request correlation.
+    pub sequence_number: u32,
+    /// ePDG control-plane TEID from the response header.
+    pub teid: u32,
+    /// Response Cause, including both accepted and rejected outcomes.
+    pub cause: CauseValue,
+}
+
+impl fmt::Debug for S2bUeIpsecTunnelUpdateResponseSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bUeIpsecTunnelUpdateResponseSummary")
+            .field("sequence_number", &self.sequence_number)
+            .field("teid", &"<redacted>")
+            .field("cause", &self.cause)
+            .finish()
+    }
+}
+
+/// Stable error returned by S2b tunnel-update projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S2bUeIpsecTunnelUpdateProjectionError {
+    /// The view is not a Modify Bearer Request.
+    NotRequest,
+    /// The view is not a Modify Bearer Response.
+    NotResponse,
+    /// The common header did not carry a TEID.
+    MissingTeid,
+    /// The common-header TEID used the reserved zero value.
+    ZeroTeid,
+    /// A received UE UDP Port had no UE Local IP Address.
+    UdpPortWithoutLocalIp,
+    /// Modify Bearer Response omitted its mandatory Cause IE.
+    MissingCause,
+}
+
+impl S2bUeIpsecTunnelUpdateProjectionError {
+    /// Return a stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequest => "gtpv2c_s2b_tunnel_update_not_request",
+            Self::NotResponse => "gtpv2c_s2b_tunnel_update_not_response",
+            Self::MissingTeid => "gtpv2c_s2b_tunnel_update_teid_missing",
+            Self::ZeroTeid => "gtpv2c_s2b_tunnel_update_teid_zero",
+            Self::UdpPortWithoutLocalIp => "gtpv2c_s2b_tunnel_update_udp_port_without_local_ip",
+            Self::MissingCause => "gtpv2c_s2b_tunnel_update_cause_missing",
+        }
+    }
+}
+
+impl fmt::Display for S2bUeIpsecTunnelUpdateProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for S2bUeIpsecTunnelUpdateProjectionError {}
 
 /// Input for building an S2b Production Profile v1 Delete Session Request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,21 +536,112 @@ pub fn s2b_create_session_rejected_response(
     )
 }
 
-/// Build an S2b Production Profile v1 Modify Bearer Request.
+/// Reject the legacy S5/S8 bearer-context-shaped Modify Bearer input.
+///
+/// S2b uses Modify Bearer for the UE-initiated IPsec tunnel update and does
+/// not assign Bearer Context to that request. Use
+/// [`s2b_ue_ipsec_tunnel_update_request`] instead.
 ///
 /// # Errors
 ///
-/// Returns [`S2bProfileBuildError`] when Bearer Context cannot encode or the
-/// constructed request fails procedure-aware validation.
+/// Always returns a structural error because emitting this shape on S2b would
+/// be non-conforming.
+#[deprecated(
+    since = "0.2.0",
+    note = "use s2b_ue_ipsec_tunnel_update_request; S2b does not use Bearer Context for this procedure"
+)]
+#[allow(deprecated)]
 pub fn s2b_modify_bearer_request(
-    request: S2bModifyBearerRequest<'_>,
+    _request: S2bModifyBearerRequest<'_>,
 ) -> S2bProfileBuildResult<OwnedMessage> {
-    build_bearer_context_request(
-        MODIFY_BEARER_REQUEST,
-        request.sequence_number,
-        request.teid,
-        request.bearer_context,
-        request.additional_ies,
+    Err(EncodeError::new(EncodeErrorCode::Structural {
+        reason: "S2b Modify Bearer must use UE-initiated IPsec tunnel-update fields, not Bearer Context",
+    })
+    .with_spec_ref(spec_ref())
+    .into())
+}
+
+/// Build an S2b UE-initiated IPsec tunnel update.
+///
+/// The constructor emits only the Table 7.2.7-1 S2b fields at their exact
+/// instances: TWAN Identifier and timestamp at instance 0, and Fixed Broadband
+/// UE Local IP/UDP Port at instance 1. A UDP port is representable only in the
+/// Fixed Broadband branch that also carries a local IP address.
+///
+/// # Errors
+///
+/// Returns [`S2bProfileBuildError`] for a zero header TEID, a malformed typed
+/// IE, or any additional known IE other than ePDG Overload Control Information
+/// at instance 2 that could bypass the S2b intent.
+pub fn s2b_ue_ipsec_tunnel_update_request(
+    request: S2bUeIpsecTunnelUpdateRequest<'_>,
+) -> S2bProfileBuildResult<OwnedMessage> {
+    if request.teid == 0 {
+        return Err(EncodeError::new(EncodeErrorCode::Structural {
+            reason: "S2b UE-initiated IPsec tunnel update requires a non-zero header TEID",
+        })
+        .with_spec_ref(spec_ref())
+        .into());
+    }
+    if request
+        .additional_ies
+        .iter()
+        .any(|ie| !is_allowed_tunnel_update_additional_ie(ie))
+    {
+        return Err(EncodeError::new(EncodeErrorCode::Structural {
+            reason: "S2b UE-initiated IPsec tunnel update additional IEs must be unknown/private extensions or ePDG Overload Control Information at instance 2",
+        })
+        .with_spec_ref(spec_ref())
+        .into());
+    }
+
+    let mut ies = Vec::with_capacity(
+        request.additional_ies.len()
+            + usize::from(request.wlan_location.is_some())
+            + usize::from(request.wlan_location_timestamp.is_some())
+            + match request.endpoint {
+                S2bUeIpsecTunnelUpdateEndpoint::General => 0,
+                S2bUeIpsecTunnelUpdateEndpoint::FixedBroadband { ue_udp_port, .. } => {
+                    1 + usize::from(ue_udp_port.is_some())
+                }
+            },
+    );
+    if let Some(location) = request.wlan_location {
+        ies.push(typed_ie(0, TypedIeValue::TwanIdentifier(location)));
+    }
+    if let Some(timestamp) = request.wlan_location_timestamp {
+        ies.push(typed_ie(
+            0,
+            TypedIeValue::TwanIdentifierTimestamp(timestamp),
+        ));
+    }
+    if let S2bUeIpsecTunnelUpdateEndpoint::FixedBroadband {
+        ue_local_ip,
+        ue_udp_port,
+    } = request.endpoint
+    {
+        ies.push(typed_ie(1, TypedIeValue::IpAddress(ue_local_ip)));
+        if let Some(port) = ue_udp_port {
+            ies.push(typed_ie(1, TypedIeValue::PortNumber(port)));
+        }
+    }
+    ies.extend(request.additional_ies);
+    build_s2b_profile_message(
+        Header::with_teid(MODIFY_BEARER_REQUEST, request.teid, request.sequence_number),
+        ies,
+    )
+}
+
+fn is_allowed_tunnel_update_additional_ie(ie: &TypedIe<'_>) -> bool {
+    if !is_known_s2b_ie_type(ie.ie_type()) {
+        return true;
+    }
+    matches!(
+        &ie.value,
+        TypedIeValue::Raw(raw)
+            if raw.ie_type == IE_TYPE_OVERLOAD_CONTROL_INFORMATION
+                && raw.instance == 2
+                && ie.instance == 2
     )
 }
 
@@ -448,18 +700,6 @@ pub fn s2b_delete_session_response(
         response.cause,
         response.additional_ies,
     )
-}
-
-fn build_bearer_context_request<'a>(
-    message_type: u8,
-    sequence_number: u32,
-    teid: u32,
-    bearer_context: BearerContext<'a>,
-    additional_ies: Vec<TypedIe<'a>>,
-) -> S2bProfileBuildResult<OwnedMessage> {
-    let mut ies = vec![typed_ie(0, TypedIeValue::BearerContext(bearer_context))];
-    ies.extend(additional_ies);
-    build_s2b_profile_message(Header::with_teid(message_type, teid, sequence_number), ies)
 }
 
 fn build_cause_response<'a>(
@@ -2079,7 +2319,7 @@ pub enum Procedure {
     Echo,
     /// Create Session request/response exchange.
     CreateSession,
-    /// Modify Bearer request/response exchange, exposed as the S2b Modify Session view.
+    /// Modify Bearer request/response exchange used for the S2b tunnel update.
     ModifyBearer,
     /// Delete Session request/response exchange.
     DeleteSession,
@@ -2231,6 +2471,31 @@ impl<'a> S2bProcedureMessage<'a> {
         project_create_session_response(self)
     }
 
+    /// Project an S2b UE-initiated IPsec tunnel update request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`S2bUeIpsecTunnelUpdateProjectionError`] when this is not the
+    /// request direction, the header TEID is absent/zero, or a UDP port is not
+    /// accompanied by the Fixed Broadband UE Local IP field.
+    pub fn ue_ipsec_tunnel_update_request_summary(
+        &self,
+    ) -> Result<S2bUeIpsecTunnelUpdateRequestSummary, S2bUeIpsecTunnelUpdateProjectionError> {
+        project_ue_ipsec_tunnel_update_request(self)
+    }
+
+    /// Project Cause and correlation fields from an S2b tunnel-update response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`S2bUeIpsecTunnelUpdateProjectionError`] when this is not the
+    /// response direction, TEID is absent/zero, or mandatory Cause is absent.
+    pub fn ue_ipsec_tunnel_update_response_summary(
+        &self,
+    ) -> Result<S2bUeIpsecTunnelUpdateResponseSummary, S2bUeIpsecTunnelUpdateProjectionError> {
+        project_ue_ipsec_tunnel_update_response(self)
+    }
+
     fn encoded_raw_ies(&self, ctx: EncodeContext) -> Result<BytesMut, EncodeError> {
         if ctx.raw_preserving && !self.raw_ies.is_empty() {
             return Ok(BytesMut::from(self.raw_ies));
@@ -2317,9 +2582,9 @@ pub enum S2bMessage<'a> {
     CreateSessionRequest(S2bProcedureMessage<'a>),
     /// Create Session Response view.
     CreateSessionResponse(S2bProcedureMessage<'a>),
-    /// Modify Bearer / S2b Modify Session Request view.
+    /// Modify Bearer / S2b UE-initiated IPsec tunnel-update Request view.
     ModifySessionRequest(S2bProcedureMessage<'a>),
-    /// Modify Bearer / S2b Modify Session Response view.
+    /// Modify Bearer / S2b UE-initiated IPsec tunnel-update Response view.
     ModifySessionResponse(S2bProcedureMessage<'a>),
     /// Delete Session Request view.
     DeleteSessionRequest(S2bProcedureMessage<'a>),
@@ -2805,6 +3070,7 @@ const KNOWN_RECEIVE_IE_TYPES: &[u8] = &[
     IE_TYPE_APN,
     IE_TYPE_AMBR,
     IE_TYPE_EBI,
+    IE_TYPE_IP_ADDRESS,
     IE_TYPE_MEI,
     IE_TYPE_MSISDN,
     IE_TYPE_INDICATION,
@@ -2820,6 +3086,9 @@ const KNOWN_RECEIVE_IE_TYPES: &[u8] = &[
     IE_TYPE_APN_RESTRICTION,
     IE_TYPE_SELECTION_MODE,
     IE_TYPE_APCO,
+    IE_TYPE_PORT_NUMBER,
+    IE_TYPE_TWAN_IDENTIFIER,
+    IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
     IE_TYPE_OVERLOAD_CONTROL_INFORMATION,
     IE_TYPE_LOAD_CONTROL_INFORMATION,
     IE_TYPE_PGW_CHANGE_INFO,
@@ -2990,16 +3259,7 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         procedure: Procedure::ModifyBearer,
         direction: MessageDirection::Request,
         scope: ReceiveIeScope::TopLevel,
-        ie_types: &[
-            IE_TYPE_IMSI,
-            IE_TYPE_MEI,
-            IE_TYPE_RAT_TYPE,
-            IE_TYPE_SERVING_NETWORK,
-            IE_TYPE_INDICATION,
-            IE_TYPE_F_TEID,
-            IE_TYPE_AMBR,
-            IE_TYPE_RECOVERY,
-        ],
+        ie_types: &[IE_TYPE_TWAN_IDENTIFIER, IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP],
         instances: &[0],
         max_occurrences: ONE,
     },
@@ -3007,16 +3267,16 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         procedure: Procedure::ModifyBearer,
         direction: MessageDirection::Request,
         scope: ReceiveIeScope::TopLevel,
-        ie_types: &[IE_TYPE_BEARER_CONTEXT],
-        instances: &[0, 1],
-        max_occurrences: UNBOUNDED_BY_TABLE,
+        ie_types: &[IE_TYPE_IP_ADDRESS, IE_TYPE_PORT_NUMBER],
+        instances: &[1],
+        max_occurrences: ONE,
     },
     ReceiveIeRule {
         procedure: Procedure::ModifyBearer,
         direction: MessageDirection::Request,
         scope: ReceiveIeScope::TopLevel,
         ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
-        instances: &[0, 1, 2],
+        instances: &[2],
         max_occurrences: ONE,
     },
     ReceiveIeRule {
@@ -3477,30 +3737,6 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
     },
     ReceiveIeRule {
         procedure: Procedure::ModifyBearer,
-        direction: MessageDirection::Request,
-        scope: ReceiveIeScope::BearerContext(0),
-        ie_types: &[IE_TYPE_EBI],
-        instances: &[0],
-        max_occurrences: ONE,
-    },
-    ReceiveIeRule {
-        procedure: Procedure::ModifyBearer,
-        direction: MessageDirection::Request,
-        scope: ReceiveIeScope::BearerContext(0),
-        ie_types: &[IE_TYPE_F_TEID],
-        instances: &[0, 1, 2, 3, 4],
-        max_occurrences: ONE,
-    },
-    ReceiveIeRule {
-        procedure: Procedure::ModifyBearer,
-        direction: MessageDirection::Request,
-        scope: ReceiveIeScope::BearerContext(1),
-        ie_types: &[IE_TYPE_EBI],
-        instances: &[0],
-        max_occurrences: ONE,
-    },
-    ReceiveIeRule {
-        procedure: Procedure::ModifyBearer,
         direction: MessageDirection::Response,
         scope: ReceiveIeScope::BearerContext(0),
         ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID],
@@ -3894,6 +4130,78 @@ fn project_create_session_response(
     }
 }
 
+fn project_ue_ipsec_tunnel_update_request(
+    view: &S2bProcedureMessage<'_>,
+) -> Result<S2bUeIpsecTunnelUpdateRequestSummary, S2bUeIpsecTunnelUpdateProjectionError> {
+    if view.procedure != Procedure::ModifyBearer || view.direction != MessageDirection::Request {
+        return Err(S2bUeIpsecTunnelUpdateProjectionError::NotRequest);
+    }
+    let teid = view
+        .header
+        .teid
+        .ok_or(S2bUeIpsecTunnelUpdateProjectionError::MissingTeid)?;
+    if teid == 0 {
+        return Err(S2bUeIpsecTunnelUpdateProjectionError::ZeroTeid);
+    }
+
+    let wlan_location = view.ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::TwanIdentifier(value) if ie.instance == 0 => Some(value.clone()),
+        _ => None,
+    });
+    let wlan_location_timestamp = view.ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::TwanIdentifierTimestamp(value) if ie.instance == 0 => Some(*value),
+        _ => None,
+    });
+    let ue_local_ip = view.ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::IpAddress(value) if ie.instance == 1 => Some(*value),
+        _ => None,
+    });
+    let ue_udp_port = view.ies.iter().find_map(|ie| match &ie.value {
+        TypedIeValue::PortNumber(value) if ie.instance == 1 => Some(*value),
+        _ => None,
+    });
+    let endpoint = match (ue_local_ip, ue_udp_port) {
+        (Some(ue_local_ip), ue_udp_port) => S2bUeIpsecTunnelUpdateEndpoint::FixedBroadband {
+            ue_local_ip,
+            ue_udp_port,
+        },
+        (None, None) => S2bUeIpsecTunnelUpdateEndpoint::General,
+        (None, Some(_)) => {
+            return Err(S2bUeIpsecTunnelUpdateProjectionError::UdpPortWithoutLocalIp);
+        }
+    };
+
+    Ok(S2bUeIpsecTunnelUpdateRequestSummary {
+        sequence_number: view.header.sequence_number,
+        teid,
+        wlan_location,
+        wlan_location_timestamp,
+        endpoint,
+    })
+}
+
+fn project_ue_ipsec_tunnel_update_response(
+    view: &S2bProcedureMessage<'_>,
+) -> Result<S2bUeIpsecTunnelUpdateResponseSummary, S2bUeIpsecTunnelUpdateProjectionError> {
+    if view.procedure != Procedure::ModifyBearer || view.direction != MessageDirection::Response {
+        return Err(S2bUeIpsecTunnelUpdateProjectionError::NotResponse);
+    }
+    let teid = view
+        .header
+        .teid
+        .ok_or(S2bUeIpsecTunnelUpdateProjectionError::MissingTeid)?;
+    if teid == 0 {
+        return Err(S2bUeIpsecTunnelUpdateProjectionError::ZeroTeid);
+    }
+    let cause =
+        find_cause_value(&view.ies).ok_or(S2bUeIpsecTunnelUpdateProjectionError::MissingCause)?;
+    Ok(S2bUeIpsecTunnelUpdateResponseSummary {
+        sequence_number: view.header.sequence_number,
+        teid,
+        cause,
+    })
+}
+
 fn missing_ie_error(reason: &'static str) -> DecodeError {
     DecodeError::new(DecodeErrorCode::Structural { reason }, 0).with_spec_ref(spec_ref())
 }
@@ -4031,18 +4339,44 @@ fn validate_required_ies(
                 ))
             }
         }
-        (Procedure::ModifyBearer, MessageDirection::Request) => require_ie_instance(
-            &view.ies,
-            IE_TYPE_BEARER_CONTEXT,
-            0,
-            "Modify Bearer Request requires Bearer Context IE at instance 0",
-        ),
-        (Procedure::ModifyBearer, MessageDirection::Response) => require_ie_instance(
-            &view.ies,
-            IE_TYPE_CAUSE,
-            0,
-            "Modify Bearer Response requires Cause IE at instance 0",
-        ),
+        (Procedure::ModifyBearer, MessageDirection::Request) => {
+            if !view.header.teid_flag || view.header.teid.is_none() {
+                return Err(missing_ie_error(
+                    "S2b UE-initiated IPsec tunnel update requires a header TEID",
+                ));
+            }
+            if view.header.teid == Some(0) {
+                return Err(missing_ie_error(
+                    "S2b UE-initiated IPsec tunnel update requires a non-zero header TEID",
+                ));
+            }
+            if contains_ie_instance(&view.ies, IE_TYPE_PORT_NUMBER, 1)
+                && !contains_ie_instance(&view.ies, IE_TYPE_IP_ADDRESS, 1)
+            {
+                return Err(missing_ie_error(
+                    "S2b UE UDP Port at instance 1 requires UE Local IP Address at instance 1",
+                ));
+            }
+            Ok(())
+        }
+        (Procedure::ModifyBearer, MessageDirection::Response) => {
+            if !view.header.teid_flag || view.header.teid.is_none() {
+                return Err(missing_ie_error(
+                    "S2b Modify Bearer Response requires a header TEID",
+                ));
+            }
+            if view.header.teid == Some(0) {
+                return Err(missing_ie_error(
+                    "S2b Modify Bearer Response requires a non-zero header TEID",
+                ));
+            }
+            require_ie_instance(
+                &view.ies,
+                IE_TYPE_CAUSE,
+                0,
+                "Modify Bearer Response requires Cause IE at instance 0",
+            )
+        }
         (Procedure::DeleteSession, MessageDirection::Request) => require_ie_instance(
             &view.ies,
             IE_TYPE_EBI,

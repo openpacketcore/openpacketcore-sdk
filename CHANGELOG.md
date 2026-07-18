@@ -38,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytes happen to satisfy the final checksum equation. Full-range software
   checksumming uses the bounded `bpf_loop` helper so maximum-length IPv4 UDP
   packets remain within the kernel verifier's finite state budget.
+- **BREAKING — S2b UE-initiated IPsec tunnel update — `opc-proto-gtpv2c`:**
+  Modify Bearer Request no longer requires or emits the S5/S8 Bearer Context
+  shape on S2b. New `S2bUeIpsecTunnelUpdateRequest` and
+  `s2b_ue_ipsec_tunnel_update_request` APIs model independently optional WLAN
+  Location/Timestamp values and a typed Fixed Broadband endpoint whose UDP
+  port cannot exist without its local IP address. Typed IP Address, Port
+  Number, complete bounded TWAN Identifier, and TWAN Identifier Timestamp
+  codecs use their exact TS 29.274 instances and redact subscriber endpoint
+  and location values from `Debug`. Extendable tunnel-update IEs accept their
+  known Release 18 prefix while raw-preserving message encode retains later
+  suffixes; TWAN receive ignores spare flags and canonical encode zeroes them.
+  The relay FQDN bound accounts for RFC 1035's terminating root label.
+  Procedure-aware receive retains the first applicable singleton and optional
+  ePDG Overload Control Information instance 2, discards known unexpected
+  Bearer Context/wrong-instance fields under clause 7.7.9, and exposes
+  request/response correlation summaries including response Cause. The old
+  bearer-context-shaped `s2b_modify_bearer_request` is deprecated and fails
+  closed; callers must migrate to `s2b_ue_ipsec_tunnel_update_request` and
+  select either `S2bUeIpsecTunnelUpdateEndpoint::General` or `FixedBroadband`.
 - **BREAKING — S2b Create Session PAA profile — `opc-proto-gtpv2c`:**
   `S2bCreateSessionRequest` no longer accepts or emits the top-level PDN Type
   IE prohibited by TS 29.274 Table 7.2.1-1 Note 1. The required PAA now owns

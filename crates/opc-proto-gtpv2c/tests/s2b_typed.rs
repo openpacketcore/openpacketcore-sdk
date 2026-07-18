@@ -208,7 +208,6 @@ fn s2b_echo_create_modify_delete_update_fixtures_roundtrip() {
             CREATE_SESSION_RESPONSE_FIXTURE,
             s2b::CREATE_SESSION_RESPONSE,
         ),
-        (MODIFY_BEARER_REQUEST_FIXTURE, s2b::MODIFY_BEARER_REQUEST),
         (MODIFY_BEARER_RESPONSE_FIXTURE, s2b::MODIFY_BEARER_RESPONSE),
         (DELETE_SESSION_REQUEST_FIXTURE, s2b::DELETE_SESSION_REQUEST),
         (
@@ -236,6 +235,27 @@ fn s2b_echo_create_modify_delete_update_fixtures_roundtrip() {
         );
         assert_eq!(raw_preserving.as_ref(), *fixture);
     }
+
+    // The retained legacy Modify Bearer Request fixture carries a known but
+    // unexpected S5/S8 Bearer Context. Procedure-aware S2b receive discards it
+    // under TS 29.274 clause 7.7.9. Canonical encoding therefore emits the
+    // empty S2b update, while raw-preserving encoding remains byte-exact.
+    let legacy_modify = decode_s2b(MODIFY_BEARER_REQUEST_FIXTURE);
+    assert_eq!(
+        encode_s2b(&legacy_modify, EncodeContext::default()).as_ref(),
+        &[0x48, 0x22, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x00, 0x10, 0x03, 0x00]
+    );
+    assert_eq!(
+        encode_s2b(
+            &legacy_modify,
+            EncodeContext {
+                raw_preserving: true,
+                ..EncodeContext::default()
+            }
+        )
+        .as_ref(),
+        MODIFY_BEARER_REQUEST_FIXTURE
+    );
 
     assert_eq!(&MODIFY_BEARER_REQUEST_FIXTURE[12..], BEARER_CONTEXT_IE);
     assert_eq!(&MODIFY_BEARER_RESPONSE_FIXTURE[12..], CAUSE_IE);
@@ -1567,7 +1587,6 @@ fn procedure_aware_validation_rejects_missing_mandatory_ies_for_every_claimed_pa
 
     for (message_type, seq) in [
         (s2b::CREATE_SESSION_RESPONSE, 0x03),
-        (s2b::MODIFY_BEARER_REQUEST, 0x04),
         (s2b::MODIFY_BEARER_RESPONSE, 0x05),
         (s2b::DELETE_SESSION_REQUEST, 0x06),
         (s2b::DELETE_SESSION_RESPONSE, 0x07),

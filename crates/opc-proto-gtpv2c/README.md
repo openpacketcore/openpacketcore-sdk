@@ -21,7 +21,12 @@ control-plane stack.
 - `ie` exposes `RawIe`, `OwnedRawIe`, `RawIeIterator`, `validate_ie_region`,
   `TypedIe`, `TypedIeValue`, and typed S2b IE structs such as `Cause`,
   `Recovery`, `AccessPointName`, `BearerContext`, `FullyQualifiedTeid`, and
-  `PdnAddressAllocation`. PAA has explicit dynamic IPv4/IPv6/IPv4v6,
+  `PdnAddressAllocation`. S2b tunnel updates additionally use redaction-safe
+  typed `IpAddress`, `PortNumber`, complete bounded `TwanIdentifier`, and
+  `TwanIdentifierTimestamp` values. Their Extendable IE decoders retain the
+  known Release 18 prefix while raw-preserving message encode retains accepted
+  later-release suffixes; canonical encode emits only understood fields and
+  zero TWAN spare flags. PAA has explicit dynamic IPv4/IPv6/IPv4v6,
   AAA-provided static IPv4/IPv6/IPv4v6, Non-IP, and Ethernet constructors;
   encode validates that the selected family matches its address fields.
 - `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
@@ -38,6 +43,15 @@ control-plane stack.
   raw fallback for unsupported message types. `decode_with_diagnostics`
   additionally returns bounded, value-free `S2bReceiveDiagnostics` evidence
   for ignored duplicate singleton keys.
+- `S2bUeIpsecTunnelUpdateRequest` is the S2b-specific Modify Bearer intent.
+  WLAN location and timestamp are independently optional. Its endpoint enum
+  makes the general and Fixed Broadband/local-policy forms distinct; UE UDP
+  Port cannot be represented without UE Local IP. Procedure-aware receive
+  keeps the first applicable singleton and discards the S5/S8 Bearer Context
+  shape as a known unexpected IE before interpreting it. The request permits
+  the Table 7.2.7-1 ePDG Overload Control Information only at instance 2.
+  Request and response summary methods retain Cause, sequence, and TEID
+  correlation metadata.
 - `S2bCreateBearerRequest`/`Response`, `S2bUpdateBearerRequest`/`Response`,
   and `S2bDeleteBearerRequest`/`Response` project the complete S2b
   dedicated-bearer shapes claimed by this crate. Their builders enforce
@@ -69,9 +83,11 @@ control-plane stack.
   `s2b_create_session_request`,
   `s2b_create_session_accepted_response`,
   `s2b_create_session_rejected_response`,
-  `s2b_modify_bearer_request`, `s2b_modify_bearer_response`,
+  `s2b_ue_ipsec_tunnel_update_request`, `s2b_modify_bearer_response`,
   `s2b_delete_session_request`, `s2b_delete_session_response`,
   `s2b_update_bearer_request`, and `s2b_update_bearer_response`.
+  The old bearer-context-shaped `s2b_modify_bearer_request` is deprecated and
+  fails closed because that form belongs to S4/S11/S5/S8, not S2b.
 - Accepted Create Session Responses use the PGW S2b control-plane F-TEID at
   instance 1 with interface type 32. The endpoint must carry a non-zero TEID
   and at least one IPv4 or IPv6 address. Instance-0 Sender F-TEID remains the
@@ -108,6 +124,33 @@ let (tail, decoded) = S2bMessage::decode_with_diagnostics(&encoded, ctx)?;
 assert!(tail.is_empty());
 assert!(decoded.message().as_view().is_some());
 assert!(decoded.diagnostics().is_empty());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+An S2b UE-initiated IPsec tunnel update uses the dedicated intent rather than
+an S5/S8 bearer context:
+
+```rust
+use opc_proto_gtpv2c::{
+    s2b_ue_ipsec_tunnel_update_request, IpAddress, PortNumber,
+    S2bUeIpsecTunnelUpdateEndpoint, S2bUeIpsecTunnelUpdateRequest,
+};
+
+let update = s2b_ue_ipsec_tunnel_update_request(
+    S2bUeIpsecTunnelUpdateRequest {
+        sequence_number: 0x010203,
+        teid: 0x1122_3344,
+        wlan_location: None,
+        wlan_location_timestamp: None,
+        endpoint: S2bUeIpsecTunnelUpdateEndpoint::FixedBroadband {
+            ue_local_ip: IpAddress::Ipv4([198, 51, 100, 7]),
+            // Presence means NAT was detected and UDP encapsulation applies.
+            ue_udp_port: Some(PortNumber::new(45_000)),
+        },
+        additional_ies: Vec::new(),
+    },
+)?;
+assert_eq!(update.header.message_type, 34);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

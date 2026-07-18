@@ -42,7 +42,7 @@ validation for these S2b procedure messages:
 |:---|:---|:---|
 | Echo | Request (1), Response (2) | Recovery IE decode/encode, no-TEID header shape, sequence preservation, restart-counter evidence. |
 | Create Session | Request (32), Response (33) | S2b request/response required-IE validation, including the conditional request identity, PAA-owned requested family with no top-level PDN Type, request Sender F-TEID, response Cause classification, instance-1 PGW S2b control F-TEID, and bearer-context projection. |
-| Modify Bearer / S2b Modify Session | Request (34), Response (35) | Bearer Context request validation and Cause-bearing response validation. |
+| Modify Bearer / S2b UE-initiated IPsec tunnel update | Request (34), Response (35) | Independently optional WLAN location/timestamp, typed Fixed Broadband UE Local IP plus conditional UDP Port, clause 7.7.9 discard of the non-S2b Bearer Context request shape, and Cause-bearing response correlation. |
 | Delete Session | Request (36), Response (37) | Linked EPS Bearer ID request validation and Cause-bearing response validation. |
 | Update Bearer | Request (97), Response (98) | Mandatory APN-AMBR and one to fifteen request contexts; typed per-bearer TFT/QoS changes; mandatory correlated response contexts; message/bearer Cause hierarchy and partial acceptance. |
 | Create Bearer | Request (95), Response (96) | One or more correlated Bearer Contexts; typed Bearer TFT/QoS/Charging ID; S2b-U PGW/ePDG F-TEID instance and interface validation; message/bearer Cause hierarchy; partial acceptance. |
@@ -102,6 +102,10 @@ The profile owns the typed IE families required by the S2b messages above:
   F-TEID, Bearer Context, EPS Bearer ID, Bearer QoS, Charging ID, AMBR, APN
   Restriction, and Bearer TFT backed by the shared `opc-proto-tft` TS 24.008
   codec.
+- S2b tunnel-update endpoint/location IEs: IP Address (IPv4/IPv6), Port Number,
+  complete bounded TWAN Identifier fields, and TWAN Identifier Timestamp.
+  Their Debug surfaces redact addresses, ports, SSIDs, operator/location
+  contents, relay identities, Circuit-ID, and timestamp values.
 - Response and policy containers: Cause, Indication, PCO, APCO.
 - Unknown, private, and unsupported future IEs remain raw-preserved and are not
   interpreted as product policy.
@@ -130,7 +134,20 @@ failures and must cover at least these rules:
   The control endpoint requires a non-zero TEID and at least one address;
   instance-0 Sender F-TEID is unexpected on this S2b response profile and is
   discarded. Rejected responses may expose Cause-only summaries.
-- Modify Bearer requests must include Bearer Context.
+- S2b Modify Bearer Request is the UE-initiated IPsec tunnel-update profile.
+  It requires a non-zero header TEID but no mandatory IE. WLAN Location
+  Information (TWAN Identifier instance 0) and WLAN Location Timestamp (TWAN
+  Identifier Timestamp instance 0) are independently conditional on
+  availability. The Fixed Broadband/local-policy form carries changed UE
+  Local IP Address at instance 1 and may carry UE UDP Port at instance 1 only
+  when NAT was detected and the local address is present. A UDP port without
+  local IP fails closed. The S2b sender intent cannot emit Bearer Context or
+  known fields through `additional_ies`, except for the ePDG Overload Control
+  Information assigned to instance 2 by Table 7.2.7-1. ProcedureAware receive
+  retains that exact optional key, discards an unexpected Bearer Context or
+  wrong known instance under clause 7.7.9, and continues with the applicable
+  S2b fields. First-occurrence receive applies independently to every allowed
+  singleton key.
 - Delete Session Request must include linked EPS Bearer ID.
 - Procedure responses must include Cause where the profile claims response
   semantics.
@@ -307,6 +324,17 @@ coverage.
      canonicalized.
    - Bearer Context is decoded as a grouped IE with bounded recursion and raw
      fallback for unsupported nested members.
+   - IP Address accepts exactly four or sixteen value octets. The Extendable
+     Port Number and TWAN Identifier Timestamp IEs require their two- and
+     four-octet Release 18 prefixes and ignore a later-release suffix.
+     TWAN Identifier validates its flag-directed field order, 32-octet SSID
+     bound, fixed six-octet BSSID, one-octet variable-field bounds, mutually
+     exclusive operator PLMN/name forms, typed relay IP/FQDN identity, RFC
+     1035 label and 254-octet rootless-name boundaries, Circuit-ID, and
+     truncation. As an Extendable IE it ignores unknown trailing fields and,
+     per clause 7.7.8, ignores receive-side spare flag bits. Canonical encoding
+     emits only the understood prefix with spare bits zero; raw-preserving
+     message encoding retains accepted extension octets and spare bits.
    - Top-level and grouped typed IE sequences enforce
      `DecodeContext::duplicate_ie_policy` by IE type and instance.
    - Unsupported/private/future IEs outside the typed subset remain available as
@@ -314,16 +342,17 @@ coverage.
 
 4. **S2b message views**
    - `S2bMessage` decodes Echo Request/Response, Create Session
-     Request/Response, Modify Bearer Request/Response (the S2b Modify Session
-     view), Delete Session Request/Response, and the triggered Create, Update,
-     and Delete Bearer Request/Response procedures.
+     Request/Response, Modify Bearer Request/Response (the S2b UE-initiated
+     IPsec tunnel-update view), Delete Session Request/Response, and the
+     triggered Create, Update, and Delete Bearer Request/Response procedures.
    - `ValidationLevel::ProcedureAware` checks the required IE subset claimed
      by this crate's S2b examples: Echo Request/Response Recovery; Create
      Session Request IMSI or emergency MEI plus UIMSI Indication, followed by
      RAT Type/Serving Network/Sender F-TEID/APN/Selection Mode/PAA/Bearer
      Context with nested EBI; Create Session Response Cause/PGW S2b
-     control F-TEID instance 1/Bearer Context; Modify request Bearer Context;
-     Delete Session request linked EBI; and response Cause IEs. Dedicated
+     control F-TEID instance 1/Bearer Context; Modify request non-zero TEID and
+     UDP-Port/local-IP conditional relationship; Delete Session request linked
+     EBI; and response Cause IEs. Dedicated
      Create, Update, and Delete Bearer validation follows the stricter rules
      above.
    - Non-S2b message types fall back to the raw `Message` shell.
@@ -411,6 +440,10 @@ coverage.
      runs `cargo +nightly fuzz run "$target"` without explicit corpus
      arguments. Each directory contains a flat, provenance-prefixed mirror of
      the committed spec, ePDG-parity, and malformed seed files.
+   - `decode_s2b` additionally accepts bounded, reviewable `hex:` seeds. Its
+     tunnel-update seeds cover accepted TWAN/Port/Timestamp extension suffixes,
+     ignored TWAN spare flags, ePDG overload-control instance 2, and a
+     flag-directed TWAN truncation boundary; ordinary fuzz inputs stay raw.
    - Two legacy flat seeds, `fuzz/corpus/echo_request` and
      `fuzz/corpus/create_session_shell`, remain at the corpus root for backward
      compatibility and are replayed by the never-panic corpus test.
@@ -458,8 +491,19 @@ The committed fixture corpus is split by provenance class:
   - Create Session Response with TEID validates response Cause, PGW S2b
     control-plane F-TEID instance 1/interface type 32, PAA, and Bearer Context
     examples.
-  - Modify Bearer and Delete Session fixtures validate those session-oriented
-    views and ProcedureAware mandatory checks.
+  - `tests/s2b_tunnel_update.rs` contains independent spec-authored bytes for
+    all WLAN-location/timestamp presence combinations and both Fixed Broadband
+    endpoint forms. It also covers exact instances, the optional ePDG Overload
+    Control Information instance 2, every typed TWAN field, each flag-directed
+    truncation boundary, the 254/255-octet rootless FQDN boundary, fixed and
+    Extendable IE lengths, ignored TWAN spare flags, canonical extension
+    stripping, raw-preserving extension retention, first-occurrence receive,
+    unexpected Bearer Context discard, Cause projection, and request/response
+    transaction success, rejection, loss/retry, and duplicate receive. The
+    retained legacy Modify Bearer fixture is explicit clause 7.7.9 discard
+    evidence; raw-preserving encode remains byte-exact while canonical encode
+    omits its non-S2b Bearer Context. Delete Session fixtures retain their
+    mandatory checks.
   - Create Bearer Request validates linked EBI instance 0 plus a grouped
     request EBI value 0, canonical Bearer TFT, Bearer QoS, S2b-U PGW F-TEID
     instance 4/interface 33, and Charging ID.
@@ -509,7 +553,8 @@ missing-mandatory-IE rejection, and malformed profile-critical F-TEID/PAA
 rejection.
 
 `examples/production_profile_v1.rs` exercises the downstream constructor path
-for Echo, Create Session, Modify Bearer, Delete Session, and Update Bearer S2b
+for Echo, Create Session, S2b UE-initiated IPsec tunnel update, Delete Session,
+and Update Bearer S2b
 messages by performing typed construction → encode → decode → ProcedureAware
 validation without manual raw byte assembly.
 

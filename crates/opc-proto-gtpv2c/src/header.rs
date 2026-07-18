@@ -124,9 +124,9 @@ pub enum MessageType {
     CreateSessionRequest,
     /// Create Session Response (33).
     CreateSessionResponse,
-    /// Modify Bearer Request (34), used by the S2b Modify Session view.
+    /// Modify Bearer Request (34), used for the S2b UE-initiated tunnel update.
     ModifyBearerRequest,
-    /// Modify Bearer Response (35), used by the S2b Modify Session view.
+    /// Modify Bearer Response (35), used for the S2b UE-initiated tunnel update.
     ModifyBearerResponse,
     /// Delete Session Request (36).
     DeleteSessionRequest,

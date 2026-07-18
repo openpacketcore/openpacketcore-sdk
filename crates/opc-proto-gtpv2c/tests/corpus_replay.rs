@@ -256,6 +256,22 @@ fn assert_spec_s2b_roundtrip(path: &Path, data: &[u8]) {
 
     let mut canonical = BytesMut::new();
     match message.encode(&mut canonical, EncodeContext::default()) {
+        Ok(())
+            if path.file_name().and_then(|name| name.to_str())
+                == Some("modify_bearer_request_bearer_context.bin") =>
+        {
+            // This legacy fixture is retained as independent byte evidence for
+            // TS 29.274 clause 7.7.9. Bearer Context is known but unexpected
+            // in the S2b UE-initiated IPsec tunnel-update profile, so receive
+            // discards it and canonical encode emits the remaining empty
+            // request. Raw-preserving encode below must still be byte-exact.
+            assert_eq!(
+                canonical.as_ref(),
+                &[72, 34, 0, 8, 1, 2, 3, 4, 0, 16, 3, 0],
+                "{} did not canonically discard unexpected Bearer Context",
+                path.display()
+            );
+        }
         Ok(()) => assert_eq!(
             canonical.as_ref(),
             data,

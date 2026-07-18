@@ -2,17 +2,17 @@ use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_echo_message_evidence, s2b_create_session_accepted_response,
     s2b_create_session_rejected_response, s2b_create_session_request, s2b_delete_session_request,
-    s2b_delete_session_response, s2b_echo_request, s2b_echo_response, s2b_modify_bearer_request,
-    s2b_modify_bearer_response, s2b_update_bearer_request, s2b_update_bearer_response,
+    s2b_delete_session_response, s2b_echo_request, s2b_echo_response, s2b_modify_bearer_response,
+    s2b_ue_ipsec_tunnel_update_request, s2b_update_bearer_request, s2b_update_bearer_response,
     AccessPointName, AggregateMaximumBitRate, BearerContext, Cause, CauseValue, EpsBearerId,
     FullyQualifiedTeid, MessageDirection, PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId,
     RatType, RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse,
     S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bDeleteSessionRequest,
-    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerRequest, S2bModifyBearerResponse,
-    S2bProfileBuildError, S2bUpdateBearerRequest, S2bUpdateBearerRequestContext,
-    S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode, SelectionModeValue,
-    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_F_TEID, IE_TYPE_PDN_TYPE,
-    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerResponse, S2bProfileBuildError,
+    S2bUeIpsecTunnelUpdateEndpoint, S2bUeIpsecTunnelUpdateRequest, S2bUpdateBearerRequest,
+    S2bUpdateBearerRequestContext, S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode,
+    SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_F_TEID,
+    IE_TYPE_PDN_TYPE, INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{DecodeContext, DecodeErrorCode, Encode, EncodeContext, ValidationLevel};
 
@@ -359,13 +359,15 @@ fn create_session_request_builder_rejects_family_mismatched_paa() {
 
 #[test]
 fn lifecycle_request_builders_roundtrip_without_raw_byte_assembly() {
-    let modify = s2b_modify_bearer_request(S2bModifyBearerRequest {
+    let modify = s2b_ue_ipsec_tunnel_update_request(S2bUeIpsecTunnelUpdateRequest {
         sequence_number: 0x010206,
         teid: 0x0102_0304,
-        bearer_context: bearer_context(7),
+        wlan_location: None,
+        wlan_location_timestamp: None,
+        endpoint: S2bUeIpsecTunnelUpdateEndpoint::General,
         additional_ies: Vec::new(),
     })
-    .expect("modify bearer request builds");
+    .expect("S2b tunnel-update request builds");
     with_decoded_profile_message(&modify, |decoded| {
         assert!(matches!(decoded, S2bMessage::ModifySessionRequest(_)));
         assert_eq!(
