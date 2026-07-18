@@ -11,7 +11,8 @@ steer layer:
 - rendezvous selection for shard and `IKE_SA_INIT` bootstrap routing;
 - destination-scoped canonical ownership keys and generation-bound rendezvous
   owner selection for routed, multi-ingress deployments;
-- UDP/500 and UDP/4500 SWu classifier with RFC 3948 non-ESP marker handling;
+- zero-copy raw IPv4/IPv6 SWu classifier for UDP/500, RFC 3948 UDP/4500,
+  native ESP, IKEv2 SKF, fragments, and ICMP/ICMPv6 error quotes;
 - stateless IKE cookie helper for edge DoS posture;
 - failover safety guards for IV-counter and replay-window restoration;
 - audited same-SPI re-pin coordination with monotonic ownership fencing;
@@ -96,9 +97,69 @@ Adding or removing a member has HRW/rendezvous minimal-disruption behavior.
 within one destination/routing-domain context; allocation and collision policy
 remain with the consumer.
 
-This layer performs no I/O, fencing, leasing, packet classification, redirect,
-route advertisement, or key handling. Those effects remain separate ports and
-consumer policy.
+The ownership model itself performs no I/O, fencing, leasing, redirect, route
+advertisement, or key handling. The adjacent keyless classifier constructs
+these keys from public packet headers; owner selection and all effects remain
+separate ports and consumer policy.
+
+## Keyless raw ingress classification
+
+`classify_keyless_ingress_packet` accepts a borrowed network-layer packet
+(starting at the IPv4/IPv6 version octet) plus an opaque `RoutingDomainTag`.
+It extracts the observed destination into a `DestinationContext`, the outer
+source address and optional UDP port, the wire encapsulation, and typed IKE or
+ESP SPI discriminators. Direct packets return the canonical
+`SessionOwnershipKey` from the section above. No API accepts SA key material,
+decrypts IKE/ESP, or retains packet bytes.
+
+The parser recognizes initial and established IKE on UDP/500, marked IKE and
+ESP on UDP/4500, native ESP, and IKEv2 SKF using the same fixed IKE header as
+unfragmented traffic. Complete UDP/IKE packets must have one consistent set of
+declared envelope lengths. Unfragmented and atomic packets require the UDP and
+terminal IP payload lengths to agree exactly. A first fragment must declare a
+UDP datagram larger than that fragment's terminal payload, and an ICMP quote
+prefix is accepted only when the quoted IP length proves bytes are absent.
+IPv6 extension traversal is capped at eight headers, intentionally enforces a
+strict fail-closed order, and validates AH's encoded length and eight-octet
+alignment. Non-initial IP fragments, malformed lengths, truncated fixed
+headers, and unsupported protocols produce a typed `Unclassifiable` verdict;
+the parser never guesses a SPI. Parsing allocates nothing and does not walk
+encrypted payloads.
+
+Supported ICMPv4/ICMPv6 errors are bound to the address on which the error
+arrived, and their quote must show that address as the quoted packet source.
+An established IKE SPI pair is direction-neutral and can use its canonical
+ownership key. A quoted ESP SPI is normally the peer-owned outbound SPI, so it
+is deliberately returned as `QuotedEspIdentity`; `ownership_key()` returns
+`None` rather than misrepresenting it as an inbound `EspOwnershipKey`.
+
+```rust
+use opc_ipsec_lb::{
+    classify_keyless_ingress_packet, KeylessIngressClassification,
+    RoutingDomainTag,
+};
+
+# fn classify(raw_ipv4_or_ipv6: &[u8]) {
+let verdict = classify_keyless_ingress_packet(
+    raw_ipv4_or_ipv6,
+    RoutingDomainTag::new(7),
+);
+match verdict {
+    KeylessIngressClassification::Classified(packet) => {
+        // Direct IKE/ESP returns Some; quoted outbound ESP intentionally does not.
+        let destination = packet.destination();
+        let ownership_key = packet.ownership_key();
+        # let _ = (destination, ownership_key);
+    }
+    KeylessIngressClassification::NatTraversalKeepalive { .. } => {}
+    KeylessIngressClassification::Unclassifiable { reason } => {
+        let stable_code = reason.as_str();
+        # let _ = stable_code;
+    }
+    _ => {}
+}
+# }
+```
 
 ## Leadership-gated VIP ownership
 
