@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Exhaustive downstream error matches must also handle
   `Ikev2SaPayloadError::ReservedNonZero` and
   `Ikev2IkeAuthBuildError::ConfigurationAttributeTypeTooLarge`.
+- **Complete eBPF GTP-U downlink envelope validation — `opc-gtpu-dataplane`:**
+  the tc ingress datapath now binds variable-IHL IPv4 Total Length, UDP Length,
+  and GTP-U Length to one exact nested boundary, validates the complete IPv4
+  header and every non-zero UDP checksum unless Linux positively reports
+  `CHECKSUM_UNNECESSARY`, trims only legal layer-2 padding, and drops malformed
+  UDP/2152 candidates before PDR lookup with the existing bounded counter.
+  `CHECKSUM_NONE`, `CHECKSUM_COMPLETE`, and metadata-helper failures require a
+  reversible non-pseudoheader checksum probe followed by exact byte
+  verification. The probe distinguishes complete bytes and legal zero IPv4
+  UDP omission from any pending `CHECKSUM_PARTIAL` operation, restores the
+  exact original bytes, and fails closed on every helper or restoration error.
+  Pending checksums are never trusted or repaired, even when their current
+  bytes happen to satisfy the final checksum equation. Full-range software
+  checksumming uses the bounded `bpf_loop` helper so maximum-length IPv4 UDP
+  packets remain within the kernel verifier's finite state budget.
 - **BREAKING — S2b Create Session PAA profile — `opc-proto-gtpv2c`:**
   `S2bCreateSessionRequest` no longer accepts or emits the top-level PDN Type
   IE prohibited by TS 29.274 Table 7.2.1-1 Note 1. The required PAA now owns

@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y iproute2 kmod nftables
+          sudo apt-get install -y ethtool iproute2 kmod nftables wireguard-tools
 
       - name: Check privileged GTP kernel support
         run: |
@@ -44,6 +44,7 @@ jobs:
             sudo modprobe gtp
           fi
           lsmod | grep '^gtp'
+          sudo modprobe wireguard
           sudo unshare -n -- ip link set lo up
 
       - name: Build privileged GTP-U test
@@ -84,6 +85,9 @@ jobs:
       # selection of a dedicated TEID, and marked GTP-U decap -> forwarding ->
       # selection of the dedicated XFRM OUT policy/SA rather than the default,
       # using the shared wildcard-SPI/reqid profile deployed by an ePDG;
+      # exact IPv4/UDP/GTP envelope boundaries, legal L2 padding, zero and
+      # nonzero NONE/UNNECESSARY handling, and zero/nonzero PARTIAL rejection
+      # (including exact checksum-byte restoration) before PDR lookup;
       # exact attached-program/pinned-map identity and per-CPU counter sums,
       # byte-compatible unmarked traffic, v1 live-filter/schema adoption,
       # unknown-mark/TEID drops, echo passthrough, restore/adoption, and
@@ -156,12 +160,25 @@ jobs:
           ./scripts/build-gtpu-ebpf.sh
           rebuilt="crates/opc-gtpu-dataplane-ebpf/target/bpfel-unknown-none/release/opc-gtpu-datapath"
           inventory() {
-            readelf -sW "$1" | awk '$4 == "FUNC" || $4 == "OBJECT" {print $4, $8}' | sort
+            # The private bpf_loop callback must retain local linkage for the
+            # verifier. Rust therefore gives it a v0-mangled symbol whose
+            # crate-disambiguator prefix can differ across build hosts. Keep
+            # checking that the callback exists, while normalizing only that
+            # non-ABI prefix before comparing the complete inventory.
+            readelf -sW "$1" | awk '
+              $4 == "FUNC" || $4 == "OBJECT" {
+                name = $8
+                if (name ~ /checksum_loop_chunk$/) {
+                  name = "checksum_loop_chunk"
+                }
+                print $4, name
+              }
+            ' | sort
           }
           inventory "${committed}" > committed.inventory
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_gtpu_uplink opc_gtpu_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
+          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
             grep -q " ${symbol}$" committed.inventory
           done

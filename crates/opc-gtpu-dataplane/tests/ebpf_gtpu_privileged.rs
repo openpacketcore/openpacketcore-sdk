@@ -5,7 +5,8 @@
 //! ```text
 //!   [ue netns]            [main netns = ePDG]              [pgw netns]
 //!   ue1 10.45.0.2 ─veth─ ue0 10.45.0.1   192.0.2.1 s2bu ─veth─ s2bup 192.0.2.10
-//!                         (forwarding, tc clsact eBPF on s2bu)
+//!                         (forwarding, tc clsact eBPF on s2bu)     │
+//!                                                       wgp ─ authenticated ─ [auth netns]
 //! ```
 //!
 //! - **Uplink**: a plain UDP datagram sent from the UE address to 8.8.8.8 is
@@ -27,6 +28,11 @@
 //!   The production-boundary case installs disjoint default and dedicated
 //!   XFRM OUT policies/SAs; a marked dedicated G-PDU must leave under the
 //!   dedicated SPI, never the default SPI.
+//!   Independently authored raw envelopes cover exact IPv4/UDP/GTP nesting,
+//!   padding, checksums, and options. A WireGuard-authenticated packet supplies
+//!   genuine `CHECKSUM_UNNECESSARY`; veth injections prove legal zero/nonzero
+//!   NONE and rejection of zero/nonzero PARTIAL. The zero-field probe must
+//!   restore the exact bytes. Malformed candidates never reach PDR/decap maps.
 //! - **Identity/counters**: the attached tc program map-ID sets must equal the
 //!   exact bpffs pins. The public diagnostic snapshot must report those live
 //!   program/map IDs and correctly aggregate the exact per-CPU counter map.
@@ -38,11 +44,11 @@
 
 use std::env;
 use std::fs;
-use std::io::IoSliceMut;
+use std::io::{IoSliceMut, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapInfo, PerCpuArray};
@@ -53,18 +59,19 @@ use nix::libc;
 use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
-    EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpPdpContext, GtpVersion, GtpuCapability,
-    GtpuDataplaneBackend, GtpuError, RemovePdpContextRequest, Teid,
+    EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
+    GtpuCapability, GtpuDataplaneBackend, GtpuError, RemovePdpContextRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
-    ipv4_header_checksum, DownlinkPdr, MarkedBearerOwner, MarkedBearerOwnerPhase, UplinkFar,
-    UplinkFarKey, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED,
-    COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_PDR_VALUE_LEN,
-    MAP_CONFIG, MAP_COUNTERS, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER,
+    internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkPdr, MarkedBearerOwner,
+    MarkedBearerOwnerPhase, UplinkFar, UplinkFarKey, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
+    COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS,
+    DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG,
+    MAP_COUNTERS, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER,
     MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR,
-    MARKED_BEARER_OWNER_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
-    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN,
+    MARKED_BEARER_OWNER_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN,
+    UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -85,6 +92,7 @@ const EPDG_S2BU_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const PGW_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
 const EPDG_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const UE_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
+const AUTH_GTP_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
 const UE_PAA: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 2);
 const REMOTE_HOST: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 const LOCAL_TEID: u32 = 0x1000_0001;
@@ -125,6 +133,36 @@ fn run(program: &str, args: &[&str]) {
     );
 }
 
+fn parse_link_address(value: &str) -> [u8; 6] {
+    let mut address = [0_u8; 6];
+    let mut components = value.trim().split(':');
+    for octet in &mut address {
+        let component = components.next().expect("link address octet");
+        *octet = u8::from_str_radix(component, 16).expect("hexadecimal link address octet");
+    }
+    assert!(
+        components.next().is_none(),
+        "link address must have six octets"
+    );
+    address
+}
+
+fn main_link_address(interface: &str) -> [u8; 6] {
+    let output = Command::new("ip")
+        .args(["link", "show", "dev", interface])
+        .output()
+        .expect("read main-namespace link address");
+    assert!(output.status.success(), "main link-address read failed");
+    let value = std::str::from_utf8(&output.stdout).expect("UTF-8 main link output");
+    let address = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|fields| (fields[0] == "link/ether").then_some(fields[1]))
+        .expect("main link output must contain an Ethernet address");
+    parse_link_address(address)
+}
+
 /// Kernel-visible tc filter listing for one hook of the S2b-U interface.
 fn tc_filters(direction: &str) -> String {
     let output = Command::new("tc")
@@ -162,6 +200,7 @@ fn in_netns<T: Send + 'static>(namespace: &str, f: impl FnOnce() -> T + Send + '
 }
 
 struct TestNet {
+    auth_ns: String,
     pgw_ns: String,
     ue_ns: String,
     pin_root: PathBuf,
@@ -171,11 +210,13 @@ struct TestNet {
 impl TestNet {
     fn provision() -> Self {
         let pid = std::process::id();
+        let auth_ns = format!("opc-auth-{pid}");
         let pgw_ns = format!("opc-pgw-{pid}");
         let ue_ns = format!("opc-ue-{pid}");
         let pin_root = PathBuf::from(format!("/sys/fs/bpf/opc-gtpu-test-{pid}"));
         let nft_table = format!("opc_gtpu_{pid}");
 
+        run("ip", &["netns", "add", &auth_ns]);
         run("ip", &["netns", "add", &pgw_ns]);
         run("ip", &["netns", "add", &ue_ns]);
 
@@ -246,6 +287,16 @@ impl TestNet {
             ],
         );
         run("ip", &["-n", &pgw_ns, "link", "set", "s2bup", "up"]);
+        // A veth peer can otherwise present locally generated UDP at tc
+        // ingress as CHECKSUM_PARTIAL, whose on-frame checksum bytes are not
+        // yet verifiable. Emit completed wire-equivalent checksums so this
+        // test exercises the datapath's software-validation path.
+        run(
+            "ip",
+            &[
+                "netns", "exec", &pgw_ns, "ethtool", "-K", "s2bup", "tx", "off",
+            ],
+        );
         run("ip", &["-n", &pgw_ns, "link", "set", "lo", "up"]);
         run(
             "ip",
@@ -298,6 +349,7 @@ impl TestNet {
         );
 
         Self {
+            auth_ns,
             pgw_ns,
             ue_ns,
             pin_root,
@@ -372,6 +424,39 @@ impl TestNet {
             ],
         );
     }
+
+    fn set_pgw_tx_checksum_offload(&self, enabled: bool) {
+        let state = if enabled { "on" } else { "off" };
+        run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &self.pgw_ns,
+                "ethtool",
+                "-K",
+                "s2bup",
+                "tx",
+                state,
+            ],
+        );
+    }
+
+    fn pgw_link_address(&self, interface: &str) -> [u8; 6] {
+        let output = Command::new("ip")
+            .args(["-n", &self.pgw_ns, "link", "show", "dev", interface])
+            .output()
+            .expect("read PGW link address");
+        assert!(output.status.success(), "PGW link-address read failed");
+        let value = std::str::from_utf8(&output.stdout).expect("UTF-8 PGW link output");
+        let address = value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find_map(|fields| (fields[0] == "link/ether").then_some(fields[1]))
+            .expect("PGW link output must contain an Ethernet address");
+        parse_link_address(address)
+    }
 }
 
 impl Drop for TestNet {
@@ -379,6 +464,9 @@ impl Drop for TestNet {
         // Best-effort teardown; the CI netns is discarded anyway.
         let _ = Command::new("ip").args(["link", "del", "s2bu"]).output();
         let _ = Command::new("ip").args(["link", "del", "ue0"]).output();
+        let _ = Command::new("ip")
+            .args(["netns", "del", &self.auth_ns])
+            .output();
         let _ = Command::new("ip")
             .args(["netns", "del", &self.pgw_ns])
             .output();
@@ -763,6 +851,837 @@ fn build_gpdu(teid: u32, sequence: Option<u16>, inner: &[u8]) -> Vec<u8> {
     }
     gpdu.extend_from_slice(inner);
     gpdu
+}
+
+#[derive(Clone, Copy)]
+enum RawChecksumMetadata {
+    Unverified,
+    Partial,
+}
+
+impl RawChecksumMetadata {
+    const fn argument(self) -> &'static str {
+        match self {
+            Self::Unverified => "none",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+/// Inject one complete Ethernet frame through AF_PACKET with explicit virtio
+/// checksum metadata. The frame is delivered over the PGW veth to the real tc
+/// ingress hook. Payload bytes and endpoint addresses never enter arguments,
+/// stdout, stderr, or failure text.
+fn send_raw_gtpu_frame(
+    namespace: &str,
+    interface: &str,
+    frame: &[u8],
+    metadata: RawChecksumMetadata,
+) {
+    const PYTHON_SENDER: &str = r#"
+import socket
+import struct
+import sys
+
+SOL_PACKET = 263
+PACKET_VNET_HDR = 15
+VIRTIO_NET_HDR_F_NEEDS_CSUM = 1
+
+mode = sys.argv[1]
+interface = sys.argv[2]
+frame = sys.stdin.buffer.read()
+flags = {
+    "none": 0,
+    "partial": VIRTIO_NET_HDR_F_NEEDS_CSUM,
+}[mode]
+checksum_start = 14 + ((frame[14] & 0x0f) * 4) if mode == "partial" else 0
+checksum_offset = 6 if mode == "partial" else 0
+vnet = struct.pack("=BBHHHH", flags, 0, 0, 0, checksum_start, checksum_offset)
+
+sender = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+sender.setsockopt(SOL_PACKET, PACKET_VNET_HDR, struct.pack("=I", 1))
+sender.bind((interface, 0))
+if sender.send(vnet + frame) != len(vnet) + len(frame):
+    raise SystemExit(1)
+"#;
+
+    let mut child = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            namespace,
+            "python3",
+            "-c",
+            PYTHON_SENDER,
+            metadata.argument(),
+            interface,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn redaction-safe raw frame sender");
+    let mut stdin = child.stdin.take().expect("raw frame sender stdin");
+    stdin
+        .write_all(frame)
+        .expect("write synthetic frame to raw sender");
+    drop(stdin);
+    assert!(
+        child.wait().expect("wait for raw frame sender").success(),
+        "raw frame sender failed"
+    );
+}
+
+struct EphemeralWireGuardPrivateKey(Vec<u8>);
+
+impl AsRef<[u8]> for EphemeralWireGuardPrivateKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for EphemeralWireGuardPrivateKey {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+fn wireguard_keypair() -> (EphemeralWireGuardPrivateKey, String) {
+    let private = Command::new("wg")
+        .arg("genkey")
+        .output()
+        .expect("generate ephemeral WireGuard private key");
+    assert!(
+        private.status.success(),
+        "ephemeral WireGuard key generation failed"
+    );
+    let private = EphemeralWireGuardPrivateKey(private.stdout);
+    let mut child = Command::new("wg")
+        .arg("pubkey")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("derive ephemeral WireGuard public key");
+    child
+        .stdin
+        .take()
+        .expect("WireGuard pubkey stdin")
+        .write_all(private.as_ref())
+        .expect("write ephemeral private key to pubkey derivation");
+    let public = child
+        .wait_with_output()
+        .expect("wait for WireGuard public-key derivation");
+    assert!(
+        public.status.success(),
+        "ephemeral WireGuard public-key derivation failed"
+    );
+    (
+        private,
+        String::from_utf8(public.stdout)
+            .expect("WireGuard public key must be UTF-8")
+            .trim()
+            .to_owned(),
+    )
+}
+
+fn configure_wireguard_peer(
+    namespace: &str,
+    interface: &str,
+    private_key: &[u8],
+    listen_port: &str,
+    peer_public_key: &str,
+    allowed_ips: &str,
+    endpoint: &str,
+) {
+    let mut child = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            namespace,
+            "wg",
+            "set",
+            interface,
+            "private-key",
+            "/dev/stdin",
+            "listen-port",
+            listen_port,
+            "peer",
+            peer_public_key,
+            "allowed-ips",
+            allowed_ips,
+            "endpoint",
+            endpoint,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("configure ephemeral WireGuard peer");
+    child
+        .stdin
+        .take()
+        .expect("WireGuard configuration stdin")
+        .write_all(private_key)
+        .expect("write ephemeral WireGuard private key");
+    assert!(
+        child
+            .wait()
+            .expect("wait for WireGuard peer configuration")
+            .success(),
+        "ephemeral WireGuard peer configuration failed"
+    );
+}
+
+/// Configure an authenticated L3 path that decrypts in the PGW namespace and
+/// forwards the verified inner IPv4 packet over `s2bup` to the production tc
+/// ingress hook. WireGuard marks successfully authenticated inner packets as
+/// CHECKSUM_UNNECESSARY for every encapsulation level.
+fn configure_checksum_metadata_path(net: &TestNet) {
+    run(
+        "ip",
+        &[
+            "link", "add", "wgauth", "type", "veth", "peer", "name", "wgpgw",
+        ],
+    );
+    run("ip", &["link", "set", "wgauth", "netns", &net.auth_ns]);
+    run("ip", &["link", "set", "wgpgw", "netns", &net.pgw_ns]);
+    run(
+        "ip",
+        &[
+            "-n",
+            &net.auth_ns,
+            "addr",
+            "add",
+            "203.0.113.2/24",
+            "dev",
+            "wgauth",
+        ],
+    );
+    run(
+        "ip",
+        &[
+            "-n",
+            &net.pgw_ns,
+            "addr",
+            "add",
+            "203.0.113.1/24",
+            "dev",
+            "wgpgw",
+        ],
+    );
+    for (namespace, interface) in [(&net.auth_ns, "wgauth"), (&net.pgw_ns, "wgpgw")] {
+        run("ip", &["-n", namespace, "link", "set", interface, "up"]);
+    }
+    run("ip", &["-n", &net.auth_ns, "link", "set", "lo", "up"]);
+    run(
+        "ip",
+        &[
+            "-n",
+            &net.auth_ns,
+            "link",
+            "add",
+            "wg0",
+            "type",
+            "wireguard",
+        ],
+    );
+    run(
+        "ip",
+        &["-n", &net.pgw_ns, "link", "add", "wgp", "type", "wireguard"],
+    );
+    run(
+        "ip",
+        &[
+            "-n",
+            &net.auth_ns,
+            "addr",
+            "add",
+            "198.51.100.10/32",
+            "dev",
+            "wg0",
+        ],
+    );
+    run(
+        "ip",
+        &[
+            "-n",
+            &net.pgw_ns,
+            "addr",
+            "add",
+            "10.255.0.1/32",
+            "dev",
+            "wgp",
+        ],
+    );
+
+    let (auth_private, auth_public) = wireguard_keypair();
+    let (pgw_private, pgw_public) = wireguard_keypair();
+    configure_wireguard_peer(
+        &net.auth_ns,
+        "wg0",
+        auth_private.as_ref(),
+        "51821",
+        &pgw_public,
+        "192.0.2.1/32",
+        "203.0.113.1:51820",
+    );
+    configure_wireguard_peer(
+        &net.pgw_ns,
+        "wgp",
+        pgw_private.as_ref(),
+        "51820",
+        &auth_public,
+        "198.51.100.10/32",
+        "203.0.113.2:51821",
+    );
+    run("ip", &["-n", &net.auth_ns, "link", "set", "wg0", "up"]);
+    run("ip", &["-n", &net.pgw_ns, "link", "set", "wgp", "up"]);
+    run(
+        "ip",
+        &[
+            "-n",
+            &net.auth_ns,
+            "route",
+            "add",
+            "192.0.2.1/32",
+            "dev",
+            "wg0",
+        ],
+    );
+    for setting in [
+        "net.ipv4.ip_forward=1",
+        "net.ipv4.conf.all.rp_filter=0",
+        "net.ipv4.conf.default.rp_filter=0",
+        "net.ipv4.conf.wgp.rp_filter=0",
+        "net.ipv4.conf.s2bup.rp_filter=0",
+    ] {
+        run(
+            "ip",
+            &["netns", "exec", &net.pgw_ns, "sysctl", "-q", "-w", setting],
+        );
+    }
+}
+
+/// Send one complete IPv4 packet through the authenticated metadata path.
+/// Packet bytes remain on stdin and are never included in diagnostics.
+fn send_wireguard_ipv4_packet(namespace: &str, packet: &[u8]) {
+    const PYTHON_SENDER: &str = r#"
+import socket
+import sys
+
+packet = sys.stdin.buffer.read()
+destination = socket.inet_ntoa(packet[16:20])
+sender = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+sender.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+if sender.sendto(packet, (destination, 0)) != len(packet):
+    raise SystemExit(1)
+"#;
+
+    let mut child = Command::new("ip")
+        .args(["netns", "exec", namespace, "python3", "-c", PYTHON_SENDER])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn authenticated raw IPv4 sender");
+    child
+        .stdin
+        .take()
+        .expect("authenticated raw IPv4 sender stdin")
+        .write_all(packet)
+        .expect("write synthetic IPv4 packet to authenticated sender");
+    assert!(
+        child
+            .wait()
+            .expect("wait for authenticated raw IPv4 sender")
+            .success(),
+        "authenticated raw IPv4 sender failed"
+    );
+}
+
+fn build_outer_gtpu_frame(
+    destination_mac: [u8; 6],
+    source_mac: [u8; 6],
+    ip_options: &[u8],
+    gtpu: &[u8],
+    udp_checksum_present: bool,
+    padding_len: usize,
+) -> Vec<u8> {
+    assert_eq!(ip_options.len() % 4, 0);
+    assert!(ip_options.len() <= 40);
+    let ip_header_len = IPV4_MIN_HDR_LEN + ip_options.len();
+    let udp_len = UDP_HDR_LEN + gtpu.len();
+    let ip_total_len = ip_header_len + udp_len;
+    let ip_end = ETH_HDR_LEN + ip_total_len;
+    let mut frame = vec![0xa5_u8; ip_end + padding_len];
+    frame[..6].copy_from_slice(&destination_mac);
+    frame[6..12].copy_from_slice(&source_mac);
+    frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+
+    let ip = ETH_HDR_LEN;
+    frame[ip] = 0x40 | u8::try_from(ip_header_len / 4).expect("bounded IHL");
+    frame[ip + 2..ip + 4].copy_from_slice(
+        &u16::try_from(ip_total_len)
+            .expect("bounded outer IPv4 length")
+            .to_be_bytes(),
+    );
+    frame[ip + 6..ip + 8].copy_from_slice(&0x4000_u16.to_be_bytes());
+    frame[ip + 8] = 64;
+    frame[ip + 9] = IPPROTO_UDP;
+    frame[ip + 10..ip + 12].fill(0);
+    frame[ip + 12..ip + 16].copy_from_slice(&PGW_IP.octets());
+    frame[ip + 16..ip + 20].copy_from_slice(&EPDG_S2BU_IP.octets());
+    frame[ip + IPV4_MIN_HDR_LEN..ip + ip_header_len].copy_from_slice(ip_options);
+
+    let udp = ip + ip_header_len;
+    frame[udp..udp + 2].copy_from_slice(&GTPU_PORT.to_be_bytes());
+    frame[udp + 2..udp + 4].copy_from_slice(&GTPU_PORT.to_be_bytes());
+    frame[udp + 4..udp + 6].copy_from_slice(
+        &u16::try_from(udp_len)
+            .expect("bounded outer UDP length")
+            .to_be_bytes(),
+    );
+    frame[udp + 6..udp + 8].fill(0);
+    frame[udp + UDP_HDR_LEN..ip_end].copy_from_slice(gtpu);
+
+    let ip_checksum = internet_checksum(&frame[ip..udp]);
+    frame[ip + 10..ip + 12].copy_from_slice(&ip_checksum.to_be_bytes());
+    if udp_checksum_present {
+        let udp_checksum =
+            udp_ipv4_checksum(PGW_IP.octets(), EPDG_S2BU_IP.octets(), &frame[udp..ip_end])
+                .expect("bounded outer UDP checksum input");
+        frame[udp + 6..udp + 8].copy_from_slice(&udp_checksum.to_be_bytes());
+    }
+    frame
+}
+
+fn outer_udp_offset(frame: &[u8]) -> usize {
+    ETH_HDR_LEN + usize::from(frame[ETH_HDR_LEN] & 0x0f) * 4
+}
+
+fn outer_gtpu_offset(frame: &[u8]) -> usize {
+    outer_udp_offset(frame) + UDP_HDR_LEN
+}
+
+fn refresh_outer_ipv4_checksum(frame: &mut [u8]) {
+    let ip = ETH_HDR_LEN;
+    let ip_header_len = usize::from(frame[ip] & 0x0f) * 4;
+    frame[ip + 10..ip + 12].fill(0);
+    let checksum = internet_checksum(&frame[ip..ip + ip_header_len]);
+    frame[ip + 10..ip + 12].copy_from_slice(&checksum.to_be_bytes());
+}
+
+fn refresh_outer_udp_checksum(frame: &mut [u8]) {
+    let ip = ETH_HDR_LEN;
+    let udp = outer_udp_offset(frame);
+    let udp_len = usize::from(u16::from_be_bytes([frame[udp + 4], frame[udp + 5]]));
+    frame[udp + 6..udp + 8].fill(0);
+    let checksum = udp_ipv4_checksum(
+        frame[ip + 12..ip + 16]
+            .try_into()
+            .expect("outer source IPv4 bytes"),
+        frame[ip + 16..ip + 20]
+            .try_into()
+            .expect("outer destination IPv4 bytes"),
+        &frame[udp..udp + udp_len],
+    )
+    .expect("bounded outer UDP checksum input");
+    frame[udp + 6..udp + 8].copy_from_slice(&checksum.to_be_bytes());
+}
+
+fn set_partial_outer_udp_checksum(frame: &mut [u8]) {
+    let udp = outer_udp_offset(frame);
+    let udp_len = [frame[udp + 4], frame[udp + 5]];
+    let mut pseudo_header = [0_u8; 12];
+    pseudo_header[..4].copy_from_slice(&PGW_IP.octets());
+    pseudo_header[4..8].copy_from_slice(&EPDG_S2BU_IP.octets());
+    pseudo_header[9] = IPPROTO_UDP;
+    pseudo_header[10..12].copy_from_slice(&udp_len);
+    let seed = internet_checksum(&pseudo_header);
+    frame[udp + 6..udp + 8].copy_from_slice(&seed.to_be_bytes());
+}
+
+fn build_extension_gpdu(teid: u32, inner: &[u8]) -> Vec<u8> {
+    let post_header_len = 8 + inner.len();
+    let mut gpdu = Vec::with_capacity(GTPU_MANDATORY_HDR_LEN + post_header_len);
+    gpdu.extend_from_slice(&[
+        0x34,
+        0xff,
+        (post_header_len >> 8) as u8,
+        post_header_len as u8,
+    ]);
+    gpdu.extend_from_slice(&teid.to_be_bytes());
+    gpdu.extend_from_slice(&[0, 7, 0, 0x85]);
+    gpdu.extend_from_slice(&[1, 0x11, 0x22, 0]);
+    gpdu.extend_from_slice(inner);
+    gpdu
+}
+
+fn receive_raw_downlink(socket: &UdpSocket, expected: &[u8]) {
+    let mut buffer = [0_u8; 2048];
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set raw downlink receive timeout");
+    let (length, source) = socket
+        .recv_from(&mut buffer)
+        .expect("validated raw GTP-U frame must decapsulate");
+    assert_eq!(&buffer[..length], expected);
+    assert_eq!(source, SocketAddr::from((REMOTE_HOST, 53)));
+}
+
+async fn exercise_outer_envelope_validation(
+    net: &TestNet,
+    backend: &EbpfGtpuDataplaneBackend,
+    device: &GtpDevice,
+    ue_socket: &UdpSocket,
+) {
+    let destination_mac = main_link_address("s2bu");
+    let source_mac = net.pgw_link_address("s2bup");
+    let build_frame = |payload: &[u8], options: &[u8], checksum: bool, padding: usize| {
+        let inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, payload);
+        let gpdu = build_gpdu(LOCAL_TEID, None, &inner);
+        build_outer_gtpu_frame(
+            destination_mac,
+            source_mac,
+            options,
+            &gpdu,
+            checksum,
+            padding,
+        )
+    };
+
+    let valid_cases = [
+        (
+            build_frame(b"z0", &[], false, 0),
+            RawChecksumMetadata::Unverified,
+            b"z0".as_slice(),
+        ),
+        (
+            build_frame(b"o", &[], true, 0),
+            RawChecksumMetadata::Unverified,
+            b"o".as_slice(),
+        ),
+        (
+            build_frame(b"ev", &[], true, 0),
+            RawChecksumMetadata::Unverified,
+            b"ev".as_slice(),
+        ),
+        (
+            build_frame(b"options-padding", &[1, 1, 0, 0], true, 23),
+            RawChecksumMetadata::Unverified,
+            b"options-padding".as_slice(),
+        ),
+    ];
+    let valid_before = backend
+        .datapath_snapshot(device)
+        .await
+        .expect("snapshot before valid outer-envelope cases")
+        .counters
+        .downlink_decapsulated;
+    for (frame, metadata, expected) in &valid_cases {
+        drain_datagrams(ue_socket);
+        send_raw_gtpu_frame(&net.pgw_ns, "s2bup", frame, *metadata);
+        receive_raw_downlink(ue_socket, expected);
+    }
+
+    let extension_payload = b"extension-boundary";
+    let extension_inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, extension_payload);
+    let extension_gpdu = build_extension_gpdu(LOCAL_TEID, &extension_inner);
+    let extension_frame =
+        build_outer_gtpu_frame(destination_mac, source_mac, &[], &extension_gpdu, true, 0);
+    drain_datagrams(ue_socket);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &extension_frame,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_raw_downlink(ue_socket, extension_payload);
+
+    let valid_after = backend
+        .datapath_snapshot(device)
+        .await
+        .expect("snapshot after valid outer-envelope cases")
+        .counters
+        .downlink_decapsulated;
+    assert_eq!(
+        valid_after,
+        valid_before + u64::try_from(valid_cases.len() + 1).expect("bounded valid case count"),
+        "every exact zero/nonzero/options/padding/extension envelope must decapsulate once",
+    );
+
+    // WireGuard authenticates the complete inner packet before publishing
+    // CHECKSUM_UNNECESSARY for every encapsulation level. The PGW namespace
+    // forwards that authenticated packet over the existing veth to this exact
+    // tc ingress hook. A deliberately non-matching UDP checksum proves that
+    // only the positive kernel query bypasses byte verification. Structural
+    // boundaries remain mandatory and are still rejected before PDR lookup.
+    configure_checksum_metadata_path(net);
+    let verified_payload = b"kernel-verified";
+    let mut verified_frame = build_frame(verified_payload, &[], true, 0);
+    verified_frame[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&AUTH_GTP_IP.octets());
+    refresh_outer_ipv4_checksum(&mut verified_frame);
+    refresh_outer_udp_checksum(&mut verified_frame);
+    let verified_udp = outer_udp_offset(&verified_frame);
+    verified_frame[verified_udp + 6] ^= 0x5a;
+    let verified_before = backend
+        .datapath_snapshot(device)
+        .await
+        .expect("snapshot before CHECKSUM_UNNECESSARY cases")
+        .counters;
+    drain_datagrams(ue_socket);
+    send_wireguard_ipv4_packet(&net.auth_ns, &verified_frame[ETH_HDR_LEN..]);
+    receive_raw_downlink(ue_socket, verified_payload);
+
+    let verified_zero_payload = b"kernel-verified-zero";
+    let mut verified_zero_frame = build_frame(verified_zero_payload, &[], false, 0);
+    verified_zero_frame[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&AUTH_GTP_IP.octets());
+    refresh_outer_ipv4_checksum(&mut verified_zero_frame);
+    drain_datagrams(ue_socket);
+    send_wireguard_ipv4_packet(&net.auth_ns, &verified_zero_frame[ETH_HDR_LEN..]);
+    receive_raw_downlink(ue_socket, verified_zero_payload);
+
+    let mut verified_bad_boundary = verified_frame;
+    let verified_gtpu = outer_gtpu_offset(&verified_bad_boundary);
+    let verified_gtpu_len = u16::from_be_bytes([
+        verified_bad_boundary[verified_gtpu + 2],
+        verified_bad_boundary[verified_gtpu + 3],
+    ]);
+    verified_bad_boundary[verified_gtpu + 2..verified_gtpu + 4]
+        .copy_from_slice(&(verified_gtpu_len + 1).to_be_bytes());
+    drain_datagrams(ue_socket);
+    send_wireguard_ipv4_packet(&net.auth_ns, &verified_bad_boundary[ETH_HDR_LEN..]);
+    expect_no_datagram(ue_socket);
+    let verified_after = backend
+        .datapath_snapshot(device)
+        .await
+        .expect("snapshot after CHECKSUM_UNNECESSARY cases")
+        .counters;
+    assert_eq!(
+        verified_after.downlink_decapsulated,
+        verified_before.downlink_decapsulated + 2,
+        "kernel-verified nonzero and exactly restored zero checksums must decapsulate once each",
+    );
+    assert_eq!(
+        verified_after.downlink_malformed,
+        verified_before.downlink_malformed + 1,
+        "kernel-verified checksum metadata must not bypass structural validation",
+    );
+    assert_eq!(
+        verified_after.downlink_unknown_teid, verified_before.downlink_unknown_teid,
+        "kernel-verified malformed structure must not reach PDR lookup",
+    );
+
+    let invalid_base = build_frame(b"invalid-envelope", &[], true, 0);
+    let ip = ETH_HDR_LEN;
+    let udp = outer_udp_offset(&invalid_base);
+    let gtpu = outer_gtpu_offset(&invalid_base);
+    let ip_total = u16::from_be_bytes([invalid_base[ip + 2], invalid_base[ip + 3]]);
+    let udp_len = u16::from_be_bytes([invalid_base[udp + 4], invalid_base[udp + 5]]);
+    let gtpu_len = u16::from_be_bytes([invalid_base[gtpu + 2], invalid_base[gtpu + 3]]);
+    let mut invalid_cases = Vec::new();
+
+    let mut bad_ip_checksum = invalid_base.clone();
+    bad_ip_checksum[ip + 8] ^= 1;
+    invalid_cases.push((bad_ip_checksum, RawChecksumMetadata::Unverified));
+
+    let mut too_small_ip = invalid_base.clone();
+    too_small_ip[ip + 2..ip + 4].copy_from_slice(&35_u16.to_be_bytes());
+    refresh_outer_ipv4_checksum(&mut too_small_ip);
+    invalid_cases.push((too_small_ip, RawChecksumMetadata::Unverified));
+
+    let mut short_ip = invalid_base.clone();
+    short_ip[ip + 2..ip + 4].copy_from_slice(&(ip_total - 1).to_be_bytes());
+    refresh_outer_ipv4_checksum(&mut short_ip);
+    invalid_cases.push((short_ip, RawChecksumMetadata::Unverified));
+
+    let mut long_ip = invalid_base.clone();
+    long_ip[ip + 2..ip + 4].copy_from_slice(&(ip_total + 1).to_be_bytes());
+    refresh_outer_ipv4_checksum(&mut long_ip);
+    invalid_cases.push((long_ip, RawChecksumMetadata::Unverified));
+
+    let mut tiny_udp = invalid_base.clone();
+    tiny_udp[udp + 4..udp + 6].copy_from_slice(&7_u16.to_be_bytes());
+    invalid_cases.push((tiny_udp, RawChecksumMetadata::Unverified));
+
+    for declared in [udp_len - 1, udp_len + 1] {
+        let mut inconsistent_udp = invalid_base.clone();
+        inconsistent_udp[udp + 4..udp + 6].copy_from_slice(&declared.to_be_bytes());
+        invalid_cases.push((inconsistent_udp, RawChecksumMetadata::Unverified));
+    }
+
+    for payload in [&b"x"[..], &b"yz"[..]] {
+        let mut bad_udp_checksum = build_frame(payload, &[], true, 0);
+        let checksum = outer_udp_offset(&bad_udp_checksum) + 6;
+        bad_udp_checksum[checksum] ^= 1;
+        invalid_cases.push((bad_udp_checksum, RawChecksumMetadata::Unverified));
+    }
+
+    for declared in [gtpu_len - 1, gtpu_len + 1] {
+        let mut inconsistent_gtpu = invalid_base.clone();
+        inconsistent_gtpu[gtpu + 2..gtpu + 4].copy_from_slice(&declared.to_be_bytes());
+        refresh_outer_udp_checksum(&mut inconsistent_gtpu);
+        invalid_cases.push((inconsistent_gtpu, RawChecksumMetadata::Unverified));
+    }
+
+    let trailing_inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, b"gtpu-trailing");
+    let mut trailing_gpdu = build_gpdu(LOCAL_TEID, None, &trailing_inner);
+    trailing_gpdu.push(0xee);
+    invalid_cases.push((
+        build_outer_gtpu_frame(destination_mac, source_mac, &[], &trailing_gpdu, true, 0),
+        RawChecksumMetadata::Unverified,
+    ));
+
+    let mut truncated_optional = vec![0x32, 0xff, 0, 3];
+    truncated_optional.extend_from_slice(&LOCAL_TEID.to_be_bytes());
+    truncated_optional.extend_from_slice(&[1, 2, 3]);
+    invalid_cases.push((
+        build_outer_gtpu_frame(
+            destination_mac,
+            source_mac,
+            &[],
+            &truncated_optional,
+            true,
+            0,
+        ),
+        RawChecksumMetadata::Unverified,
+    ));
+
+    for extension_prefix in [[0_u8, 0, 0, 0], [10, 0, 0, 0]] {
+        let inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, b"bad-extension");
+        let post_header_len = 4 + extension_prefix.len() + inner.len();
+        let mut invalid_extension = vec![
+            0x34,
+            0xff,
+            (post_header_len >> 8) as u8,
+            post_header_len as u8,
+        ];
+        invalid_extension.extend_from_slice(&LOCAL_TEID.to_be_bytes());
+        invalid_extension.extend_from_slice(&[0, 1, 0, 0x85]);
+        invalid_extension.extend_from_slice(&extension_prefix);
+        invalid_extension.extend_from_slice(&inner);
+        invalid_cases.push((
+            build_outer_gtpu_frame(
+                destination_mac,
+                source_mac,
+                &[],
+                &invalid_extension,
+                true,
+                0,
+            ),
+            RawChecksumMetadata::Unverified,
+        ));
+    }
+
+    let truncated_inner_gpdu = build_gpdu(LOCAL_TEID, None, &[0x45; IPV4_MIN_HDR_LEN - 1]);
+    invalid_cases.push((
+        build_outer_gtpu_frame(
+            destination_mac,
+            source_mac,
+            &[],
+            &truncated_inner_gpdu,
+            true,
+            0,
+        ),
+        RawChecksumMetadata::Unverified,
+    ));
+
+    let mut unverified_partial_bytes = build_frame(b"unverified-partial", &[], true, 0);
+    set_partial_outer_udp_checksum(&mut unverified_partial_bytes);
+    invalid_cases.push((unverified_partial_bytes, RawChecksumMetadata::Unverified));
+
+    let partial_inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, b"partial-metadata");
+    let partial_gpdu = build_gpdu(0xdead_beef, None, &partial_inner);
+    let mut partial_frame =
+        build_outer_gtpu_frame(destination_mac, source_mac, &[], &partial_gpdu, false, 0);
+    set_partial_outer_udp_checksum(&mut partial_frame);
+
+    // Even checksum bytes that already satisfy the final wire equation are
+    // not authoritative while the skb still advertises CHECKSUM_PARTIAL. This
+    // proves the datapath detects the metadata state instead of relying on a
+    // coincidental software-checksum failure.
+    let partial_complete_inner =
+        build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, b"partial-complete-bytes");
+    let partial_complete_gpdu = build_gpdu(LOCAL_TEID, None, &partial_complete_inner);
+    let partial_complete_frame = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &partial_complete_gpdu,
+        true,
+        0,
+    );
+
+    // Linux CHECKSUM_PARTIAL permits a zero on-frame seed. Prove that this
+    // unfinished metadata state cannot be mistaken for IPv4's legal zero
+    // checksum omission before it reaches the PDR lookup.
+    let partial_zero_inner = build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, b"partial-zero-seed");
+    let partial_zero_gpdu = build_gpdu(LOCAL_TEID, None, &partial_zero_inner);
+    let partial_zero_frame = build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &partial_zero_gpdu,
+        false,
+        0,
+    );
+
+    drain_datagrams(ue_socket);
+    let invalid_before = backend
+        .datapath_snapshot(device)
+        .await
+        .expect("snapshot before invalid outer-envelope cases")
+        .counters;
+    for (frame, metadata) in &invalid_cases {
+        send_raw_gtpu_frame(&net.pgw_ns, "s2bup", frame, *metadata);
+    }
+    net.set_pgw_tx_checksum_offload(true);
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &partial_frame,
+        RawChecksumMetadata::Partial,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &partial_complete_frame,
+        RawChecksumMetadata::Partial,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &partial_zero_frame,
+        RawChecksumMetadata::Partial,
+    );
+    net.set_pgw_tx_checksum_offload(false);
+    expect_no_datagram(ue_socket);
+
+    let invalid_after = backend
+        .datapath_snapshot(device)
+        .await
+        .expect("snapshot after invalid outer-envelope cases")
+        .counters;
+    let invalid_count = u64::try_from(invalid_cases.len() + 3).expect("bounded invalid case count");
+    assert_eq!(
+        invalid_after.downlink_malformed,
+        invalid_before.downlink_malformed + invalid_count,
+        "every malformed or unverified-partial candidate must be counted exactly once",
+    );
+    assert_eq!(
+        invalid_after.downlink_unknown_teid, invalid_before.downlink_unknown_teid,
+        "malformed and CHECKSUM_PARTIAL candidates must not reach the TEID lookup",
+    );
+    assert_eq!(
+        invalid_after.downlink_decapsulated, invalid_before.downlink_decapsulated,
+        "malformed and CHECKSUM_PARTIAL candidates must not decapsulate",
+    );
+    assert_eq!(
+        invalid_after.downlink_destination_mismatches,
+        invalid_before.downlink_destination_mismatches,
+        "malformed and CHECKSUM_PARTIAL candidates must not reach inner-destination validation",
+    );
 }
 
 /// Send `send()` up to ten times until `recv` yields a datagram; retries
@@ -1269,6 +2188,8 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     });
     // Local control-plane socket that must still see non-G-PDU GTP-U.
     let epdg_cp_socket = UdpSocket::bind((EPDG_S2BU_IP, GTPU_PORT))?;
+
+    exercise_outer_envelope_validation(&net, &backend, &device, &ue_socket).await;
 
     // --- Uplink: UE -> 8.8.8.8 must arrive at the PGW as a G-PDU. ---
     let mut buffer = [0_u8; 2048];
