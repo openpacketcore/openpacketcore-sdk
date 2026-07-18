@@ -89,7 +89,7 @@ reviewable without a binary viewer.
 | --- | --- | --- |
 | 0 | `48` | Common header flags: version 2, TEID flag set (§5.1, Table 7.2.1-1). |
 | 1 | `20` | Message Type: Create Session Request in the common-header message-type field (§5.1). |
-| 2..3 | `00 a0` | Length: TEID/sequence/spare (8) + 152 octets of IEs, excluding first four octets (§5.1). |
+| 2..3 | `00 9b` | Length: TEID/sequence/spare (8) + 147 octets of IEs, excluding first four octets (§5.1). |
 | 4..7 | `00 00 00 00` | Create Session Request header TEID 0 (§5.1, Table 7.2.1-1). |
 | 8..11 | `00 10 01 00` | Sequence number `0x001001`, spare 0 (§5.1). |
 | 12..15 | `01 00 08 00` | IMSI IE TLIV header: type 1, length 8, instance 0 (§8.2, §8.3.2). |
@@ -107,28 +107,44 @@ reviewable without a binary viewer.
 | 69..77 | `08 69 6e 74 65 72 6e 65 74` | Single APN label `internet` with one-octet label length (§8.6). |
 | 78..81 | `80 00 01 00` | Selection Mode IE TLIV header (§8.2, §8.58). |
 | 82 | `00` | MS or network provided APN, subscription verified (§8.58). |
-| 83..86 | `63 00 01 00` | PDN Type IE TLIV header (§8.2, §8.34). |
-| 87 | `01` | PDN Type: IPv4 (§8.34); retained pending the issue #335 profile migration. |
-| 88..91 | `4f 00 05 00` | PAA IE TLIV header (§8.2, §8.14). |
-| 92..96 | `01 c6 33 64 07` | IPv4 PAA `198.51.100.7` (documentation prefix; §8.14). |
-| 97..100 | `5d 00 2c 00` | Bearer Context-to-be-created grouped IE TLIV header, instance 0 (Table 7.2.1-1/-2, §8.28). |
-| 101..105 | `49 00 01 00 05` | Nested EBI TLIV/value: EPS Bearer ID 5 (Table 7.2.1-2, §8.8). |
-| 106..109 | `57 00 09 05` | Nested S2b-U ePDG F-TEID TLIV header, instance 5 (Table 7.2.1-2, §8.22). |
-| 110 | `9f` | V4 flag set, S2b-U ePDG GTP-U interface type 31 (§8.22, Table 8.22-1). |
-| 111..114 | `11 22 33 45` | User-plane TEID (§8.22). |
-| 115..118 | `c0 00 02 14` | User-plane IPv4 `192.0.2.20` (documentation prefix; §8.22). |
-| 119..122 | `50 00 16 00` | Nested Bearer QoS IE TLIV header (Table 7.2.1-2, §8.15). |
-| 123..124 | `49 01` | Bearer QoS ARP octet (PCI=1, PL=2, PVI=1, spare bits zero) and GBR QCI 1 (§8.15). |
-| 125..129 | `00 00 00 10 00` | Bearer QoS MBR uplink 4096 (§8.15). |
-| 130..134 | `00 00 00 20 00` | Bearer QoS MBR downlink 8192 (§8.15). |
-| 135..139 | `00 00 00 04 00` | Bearer QoS GBR uplink 1024 (§8.15). |
-| 140..144 | `00 00 00 08 00` | Bearer QoS GBR downlink 2048 (§8.15). |
-| 145..148 | `4d 00 02 00` | Indication IE TLIV header (§8.2, §8.12). |
-| 149..150 | `40 01` | Opaque Indication flags preserved by typed value (§8.12). |
-| 151..154 | `a3 00 03 00` | APCO IE TLIV header, Create Session Request instance 0 (Table 7.2.1-1, §8.104). |
-| 155..157 | `80 21 01` | Opaque APCO bytes preserved by typed value (§8.104). |
-| 158..161 | `fe 00 02 00` | IE Type Extension TLIV header: type 254, two-octet value, instance 0 (§8.2.1A). |
-| 162..163 | `01 00` | Extended IE type 256, raw-preserved because this typed subset does not interpret it (§8.2.1A). |
+| 83..86 | `4f 00 05 00` | PAA IE TLIV header (§8.2, §8.14). TS 29.274 Table 7.2.1-1 Note 1 prohibits a separate PDN Type IE on S2b. |
+| 87..91 | `01 c6 33 64 07` | Static IPv4 PAA `198.51.100.7` (documentation prefix; §8.14). |
+| 92..95 | `5d 00 2c 00` | Bearer Context-to-be-created grouped IE TLIV header, instance 0 (Table 7.2.1-1/-2, §8.28). |
+| 96..100 | `49 00 01 00 05` | Nested EBI TLIV/value: EPS Bearer ID 5 (Table 7.2.1-2, §8.8). |
+| 101..104 | `57 00 09 05` | Nested S2b-U ePDG F-TEID TLIV header, instance 5 (Table 7.2.1-2, §8.22). |
+| 105 | `9f` | V4 flag set, S2b-U ePDG GTP-U interface type 31 (§8.22, Table 8.22-1). |
+| 106..109 | `11 22 33 45` | User-plane TEID (§8.22). |
+| 110..113 | `c0 00 02 14` | User-plane IPv4 `192.0.2.20` (documentation prefix; §8.22). |
+| 114..117 | `50 00 16 00` | Nested Bearer QoS IE TLIV header (Table 7.2.1-2, §8.15). |
+| 118..119 | `49 01` | Bearer QoS ARP octet (PCI=1, PL=2, PVI=1, spare bits zero) and GBR QCI 1 (§8.15). |
+| 120..124 | `00 00 00 10 00` | Bearer QoS MBR uplink 4096 (§8.15). |
+| 125..129 | `00 00 00 20 00` | Bearer QoS MBR downlink 8192 (§8.15). |
+| 130..134 | `00 00 00 04 00` | Bearer QoS GBR uplink 1024 (§8.15). |
+| 135..139 | `00 00 00 08 00` | Bearer QoS GBR downlink 2048 (§8.15). |
+| 140..143 | `4d 00 02 00` | Indication IE TLIV header (§8.2, §8.12). |
+| 144..145 | `40 01` | Opaque Indication flags preserved by typed value (§8.12). |
+| 146..149 | `a3 00 03 00` | APCO IE TLIV header, Create Session Request instance 0 (Table 7.2.1-1, §8.104). |
+| 150..152 | `80 21 01` | Opaque APCO bytes preserved by typed value (§8.104). |
+| 153..156 | `fe 00 02 00` | IE Type Extension TLIV header: type 254, two-octet value, instance 0 (§8.2.1A). |
+| 157..158 | `01 00` | Extended IE type 256, raw-preserved because this typed subset does not interpret it (§8.2.1A). |
+
+### S2b Create Session PAA family fixtures
+
+The following five compact Create Session Requests independently exercise the
+complete PAA family registry. They share the same hand-authored required S2b
+fields at offsets 0 through 66: TEID-present Create Session Request header with
+TEID zero, synthetic IMSI, WLAN RAT, serving PLMN `001/01`, S2b ePDG control
+F-TEID, `internet` APN, and Selection Mode. Each ends with the same instance-0
+Bearer Context containing EBI 5. None contains IE type 99: Table 7.2.1-1 Note 1
+says PDN Type is never sent on S2a/S2b, while PAA carries the requested family.
+
+| Fixture | Header Length | PAA offsets and octets | Bearer Context | Spec basis |
+| --- | --- | --- | --- | --- |
+| `create_session_request_s2b_ipv4_dynamic.bin` | `00 51` | 67..75: `4f 00 05 00 01 00 00 00 00` | 76..84 | IPv4 type 1 with dynamic address `0.0.0.0` (Table 7.2.1-1, §8.14). |
+| `create_session_request_s2b_ipv6_dynamic.bin` | `00 5e` | 67..88: `4f 00 12 00 02 00` followed by 16 zero octets | 89..97 | IPv6 type 2 with dynamic prefix length/address all zero (Table 7.2.1-1, §8.14). |
+| `create_session_request_s2b_ipv4v6_dynamic.bin` | `00 62` | 67..92: `4f 00 16 00 03 00` followed by 20 zero octets | 93..101 | IPv4v6 type 3 with both dynamic family values all zero (Table 7.2.1-1, §8.14). |
+| `create_session_request_s2b_non_ip.bin` | `00 4d` | 67..71: `4f 00 01 00 04` | 72..80 | Non-IP type 4 with no PDN Address and Prefix octets (§8.14). |
+| `create_session_request_s2b_ethernet.bin` | `00 4d` | 67..71: `4f 00 01 00 05` | 72..80 | Ethernet type 5 with no PDN Address and Prefix octets (§8.14). |
 
 ### `create_session_response_s2b_subset.bin`
 

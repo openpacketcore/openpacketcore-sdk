@@ -457,7 +457,7 @@ fn fixture_corpus_is_split_by_provenance() {
             "missing fixture provenance directory {subdir}"
         );
     }
-    assert_eq!(fixture_files(FixtureClass::Spec).len(), 14);
+    assert_eq!(fixture_files(FixtureClass::Spec).len(), 19);
     assert!(fixture_files(FixtureClass::EpdgParity).len() >= 3);
     assert!(fixture_files(FixtureClass::Malformed).len() >= 16);
     assert!(

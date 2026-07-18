@@ -14,6 +14,9 @@
 //! paired with the bounded [`Gtpv2cTriggeredTransactions`] registry for
 //! generation-bound at-most-once application dispatch and exact committed
 //! response replay. Unsupported IEs remain raw-preserved.
+//! S2b Create Session Requests carry the requested family only in
+//! [`PdnAddressAllocation`]; explicit dynamic/static constructors prevent a
+//! top-level PDN Type IE or family/address-shape mismatch from being emitted.
 //!
 //! @spec 3GPP TS29274 R18
 //! @req REQ-3GPP-TS29274-R18-S2B-001
@@ -60,8 +63,8 @@ pub use ie::{
     AdditionalProtocolConfigurationOptions, AggregateMaximumBitRate, AllocationRetentionPriority,
     ApnRestriction, BearerContext, BearerQos, BearerQosResourceType, BearerQosValidationError,
     Cause, CauseValue, ChargingId, DuplicateIeEvidence, EpsBearerId, FullyQualifiedTeid,
-    Indication, OwnedRawIe, PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId,
-    ProtocolConfigurationOptions, RatType, RatTypeValue, RawIe, RawIeIterator, Recovery,
+    Indication, OwnedRawIe, PdnAddressAllocation, PdnAddressAllocationError, PdnType, PdnTypeValue,
+    PlmnId, ProtocolConfigurationOptions, RatType, RatTypeValue, RawIe, RawIeIterator, Recovery,
     SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue,
     IE_HEADER_LEN, IE_TYPE_AMBR, IE_TYPE_APCO, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION,
     IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE,
@@ -70,6 +73,7 @@ pub use ie::{
     IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE,
     IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE,
     IE_TYPE_SERVING_NETWORK, MAX_BEARER_QOS_BITRATE_KBPS, MAX_DUPLICATE_IE_EVIDENCE,
+    PAA_ASSIGNED_IPV6_PREFIX_LENGTH,
 };
 pub use message::{Message, OwnedMessage};
 pub use pco::{

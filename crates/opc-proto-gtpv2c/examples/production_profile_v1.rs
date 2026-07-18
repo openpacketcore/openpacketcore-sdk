@@ -5,13 +5,12 @@ use opc_proto_gtpv2c::{
     s2b_echo_request, s2b_echo_response, s2b_modify_bearer_request, s2b_modify_bearer_response,
     s2b_update_bearer_request, s2b_update_bearer_response, AccessPointName,
     AggregateMaximumBitRate, BearerContext, CauseValue, EpsBearerId, FullyQualifiedTeid,
-    MessageDirection, MessageType, OwnedMessage, PdnAddressAllocation, PdnType, PdnTypeValue,
-    PlmnId, RatType, RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse,
-    S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bDeleteSessionRequest,
-    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerRequest, S2bModifyBearerResponse,
-    S2bUpdateBearerRequest, S2bUpdateBearerRequestContext, S2bUpdateBearerResponse,
-    S2bUpdateBearerResult, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe,
-    TypedIeValue,
+    MessageDirection, MessageType, OwnedMessage, PdnAddressAllocation, PlmnId, RatType,
+    RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse, S2bCreateSessionRejectedResponse,
+    S2bCreateSessionRequest, S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage,
+    S2bModifyBearerRequest, S2bModifyBearerResponse, S2bUpdateBearerRequest,
+    S2bUpdateBearerRequestContext, S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode,
+    SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue,
 };
 use opc_protocol::{DecodeContext, DuplicateIePolicy, Encode, EncodeContext, ValidationLevel};
 use std::io::{Error as IoError, ErrorKind};
@@ -43,15 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             selection_mode: SelectionMode {
                 value: SelectionModeValue::MsOrNetworkProvidedSubscriptionVerified,
             },
-            pdn_type: PdnType {
-                value: PdnTypeValue::Ipv4,
-            },
-            paa: PdnAddressAllocation {
-                pdn_type: PdnTypeValue::Ipv4,
-                ipv6_prefix_length: None,
-                ipv6_prefix: None,
-                ipv4: Some([10, 0, 0, 1]),
-            },
+            paa: PdnAddressAllocation::static_ipv4([10, 0, 0, 1])?,
             bearer_context: bearer_context(5),
             additional_ies: Vec::new(),
         })?,

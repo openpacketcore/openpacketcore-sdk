@@ -11,7 +11,7 @@ use opc_proto_gtpv2c::{
     S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerRequest, S2bModifyBearerResponse,
     S2bProfileBuildError, S2bUpdateBearerRequest, S2bUpdateBearerRequestContext,
     S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode, SelectionModeValue,
-    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_F_TEID,
+    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_F_TEID, IE_TYPE_PDN_TYPE,
     INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{DecodeContext, DecodeErrorCode, Encode, EncodeContext, ValidationLevel};
@@ -101,15 +101,7 @@ fn create_session_request_input() -> S2bCreateSessionRequest<'static> {
         selection_mode: SelectionMode {
             value: SelectionModeValue::MsOrNetworkProvidedSubscriptionVerified,
         },
-        pdn_type: PdnType {
-            value: PdnTypeValue::Ipv4,
-        },
-        paa: PdnAddressAllocation {
-            pdn_type: PdnTypeValue::Ipv4,
-            ipv6_prefix_length: None,
-            ipv6_prefix: None,
-            ipv4: Some([10, 0, 0, 1]),
-        },
+        paa: PdnAddressAllocation::static_ipv4([10, 0, 0, 1]).expect("test static PAA is valid"),
         bearer_context: bearer_context(5),
         additional_ies: Vec::new(),
     }
@@ -170,6 +162,8 @@ fn create_session_request_builder_roundtrips_without_raw_byte_assembly() {
     let view = decoded.as_view().expect("typed S2b view");
     assert_eq!(view.direction, MessageDirection::Request);
     assert_eq!(view.header.sequence_number, 0x010203);
+    assert!(view.has_ie(opc_proto_gtpv2c::IE_TYPE_PAA));
+    assert!(!view.has_ie(IE_TYPE_PDN_TYPE));
     assert!(matches!(decoded, S2bMessage::CreateSessionRequest(_)));
 }
 
@@ -309,6 +303,56 @@ fn create_session_request_builder_rejects_duplicate_profile_singletons() {
         }
         S2bProfileBuildError::Encode(source) => {
             panic!("expected validation error, got encode error: {source}");
+        }
+    }
+}
+
+#[test]
+fn create_session_request_builder_rejects_pdn_type_in_additional_ies() {
+    let mut request = create_session_request_input();
+    request.additional_ies.push(TypedIe {
+        instance: 0,
+        value: TypedIeValue::PdnType(PdnType {
+            value: PdnTypeValue::Ipv4,
+        }),
+    });
+
+    let error = s2b_create_session_request(request)
+        .expect_err("the S2b sender profile must never emit PDN Type");
+    match error {
+        S2bProfileBuildError::Encode(source) => assert!(matches!(
+            source.code(),
+            opc_protocol::EncodeErrorCode::Structural {
+                reason: "S2b Create Session Request must not contain a top-level PDN Type IE"
+            }
+        )),
+        S2bProfileBuildError::Validate(source) => {
+            panic!("expected sender encode error, got validation error: {source}");
+        }
+    }
+}
+
+#[test]
+fn create_session_request_builder_rejects_family_mismatched_paa() {
+    let mut request = create_session_request_input();
+    request.paa = PdnAddressAllocation {
+        pdn_type: PdnTypeValue::Ethernet,
+        ipv6_prefix_length: None,
+        ipv6_prefix: None,
+        ipv4: Some([198, 51, 100, 7]),
+    };
+
+    let error = s2b_create_session_request(request)
+        .expect_err("family-mismatched PAA must fail construction");
+    match error {
+        S2bProfileBuildError::Encode(source) => assert!(matches!(
+            source.code(),
+            opc_protocol::EncodeErrorCode::Structural {
+                reason: "PAA PDN type prohibits an IPv4 address"
+            }
+        )),
+        S2bProfileBuildError::Validate(source) => {
+            panic!("expected encode error, got validation error: {source}");
         }
     }
 }

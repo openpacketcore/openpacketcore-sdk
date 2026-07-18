@@ -21,7 +21,9 @@ control-plane stack.
 - `ie` exposes `RawIe`, `OwnedRawIe`, `RawIeIterator`, `validate_ie_region`,
   `TypedIe`, `TypedIeValue`, and typed S2b IE structs such as `Cause`,
   `Recovery`, `AccessPointName`, `BearerContext`, `FullyQualifiedTeid`, and
-  `PdnAddressAllocation`.
+  `PdnAddressAllocation`. PAA has explicit dynamic IPv4/IPv6/IPv4v6,
+  AAA-provided static IPv4/IPv6/IPv4v6, Non-IP, and Ethernet constructors;
+  encode validates that the selected family matches its address fields.
 - `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
   shells and implement the shared `opc-protocol` codec traits.
 - `S2bMessage<'a>` and `S2bProcedureMessage<'a>` provide typed S2b views and
@@ -115,11 +117,11 @@ of the first retained value still fail closed. Canonical builders deliberately
 use a separate sender-validation path: duplicate profile-owned or additional
 singleton keys remain construction errors and are never emitted.
 
-The current Create Session profile still treats top-level PDN Type as an
-allowed and required compatibility field. Issue #335 owns the separate
-send-profile/PAA-constructor migration that will remove that field for S2b; the
-receive-policy change here deliberately does not partially implement that API
-migration.
+The S2b Create Session sender profile emits PAA at instance 0 and never emits a
+separate top-level PDN Type IE, as required by TS 29.274 Table 7.2.1-1 Note 1.
+PAA carries the requested family. On receive, a conforming request without IE
+99 is accepted; an unexpected known PDN Type IE is discarded under clause
+7.7.9 while the rest of the request continues to be processed.
 
 The runnable [`dedicated_bearer` example](examples/dedicated_bearer.rs) shows
 the GTP transaction boundary for receiving a triggered request, projecting its
@@ -159,6 +161,45 @@ override priority. Exact retransmission replay always returns the byte-identical
 committed response.
 
 ## Migration notes
+
+`S2bCreateSessionRequest::pdn_type` has been removed. S2b callers must select
+the family and dynamic/static intent through `paa`; do not append a PDN Type IE
+through `additional_ies` because the S2b builder rejects it. Other interface
+profiles may continue to use the separately exported `PdnType` IE.
+
+```rust
+use opc_proto_gtpv2c::{PdnAddressAllocation, S2bCreateSessionRequest};
+
+# let sequence_number = 1;
+# let imsi = opc_proto_gtpv2c::TbcdDigits::new("001010123456789");
+# let rat_type = opc_proto_gtpv2c::RatType { value: opc_proto_gtpv2c::RatTypeValue::Wlan };
+# let serving_network = opc_proto_gtpv2c::ServingNetwork { plmn: opc_proto_gtpv2c::PlmnId::new("001", "01") };
+# let sender_f_teid = opc_proto_gtpv2c::FullyQualifiedTeid { interface_type: 30, teid: 1, ipv4: Some([192, 0, 2, 1]), ipv6: None };
+# let apn = opc_proto_gtpv2c::AccessPointName::new(vec!["internet".to_string()]);
+# let selection_mode = opc_proto_gtpv2c::SelectionMode { value: opc_proto_gtpv2c::SelectionModeValue::MsOrNetworkProvidedSubscriptionVerified };
+# let bearer_context = opc_proto_gtpv2c::BearerContext { members: Vec::new() };
+let request = S2bCreateSessionRequest {
+    sequence_number,
+    imsi,
+    rat_type,
+    serving_network,
+    sender_f_teid,
+    apn,
+    selection_mode,
+    paa: PdnAddressAllocation::dynamic_ipv4v6(),
+    bearer_context,
+    additional_ies: Vec::new(),
+};
+
+let static_ipv4 = PdnAddressAllocation::static_ipv4([198, 51, 100, 7])?;
+# let _ = (request, static_ipv4);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Static IPv6 constructors require the TS 29.274 assigned prefix length /64 and
+reject all-zero values that would be ambiguous with dynamic allocation. A
+dual-stack static allocation accepts either family or both and encodes an
+unprovided family as the required all-zero value.
 
 Accepted Create Session Response callers must replace
 `S2bCreateSessionAcceptedResponse::sender_f_teid` with

@@ -29,7 +29,7 @@ use crate::ie::typed::{
 };
 use crate::ie::{
     encode_typed_ie_sequence, AccessPointName, BearerContext, Cause, CauseValue,
-    DuplicateIeEvidence, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation, PdnType,
+    DuplicateIeEvidence, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation,
     ProtocolConfigurationOptions, RatType, Recovery, SelectionMode, ServingNetwork, TbcdDigits,
     TypedIe, TypedIeValue, IE_TYPE_AMBR, IE_TYPE_APCO, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION,
     IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE,
@@ -161,9 +161,11 @@ pub struct S2bCreateSessionRequest<'a> {
     pub apn: AccessPointName,
     /// Selection Mode IE.
     pub selection_mode: SelectionMode,
-    /// PDN Type IE.
-    pub pdn_type: PdnType,
-    /// PDN Address Allocation IE.
+    /// PDN Address Allocation IE carrying both the requested PDN family and
+    /// dynamic or static address-allocation values.
+    ///
+    /// Use the explicit [`PdnAddressAllocation`] constructors rather than
+    /// hand-assembling its family-dependent fields.
     pub paa: PdnAddressAllocation,
     /// Bearer Context IE containing at least an EBI member. A Create Session
     /// Request may also carry the ePDG S2b-U user-plane F-TEID here.
@@ -296,6 +298,17 @@ pub fn s2b_echo_response(
 pub fn s2b_create_session_request(
     request: S2bCreateSessionRequest<'_>,
 ) -> S2bProfileBuildResult<OwnedMessage> {
+    if request
+        .additional_ies
+        .iter()
+        .any(|ie| ie.ie_type() == IE_TYPE_PDN_TYPE)
+    {
+        return Err(EncodeError::new(EncodeErrorCode::Structural {
+            reason: "S2b Create Session Request must not contain a top-level PDN Type IE",
+        })
+        .with_spec_ref(spec_ref())
+        .into());
+    }
     let mut ies = vec![
         typed_ie(0, TypedIeValue::Imsi(request.imsi)),
         typed_ie(0, TypedIeValue::RatType(request.rat_type)),
@@ -303,7 +316,6 @@ pub fn s2b_create_session_request(
         typed_ie(0, TypedIeValue::FullyQualifiedTeid(request.sender_f_teid)),
         typed_ie(0, TypedIeValue::AccessPointName(request.apn)),
         typed_ie(0, TypedIeValue::SelectionMode(request.selection_mode)),
-        typed_ie(0, TypedIeValue::PdnType(request.pdn_type)),
         typed_ie(0, TypedIeValue::PdnAddressAllocation(request.paa)),
         typed_ie(0, TypedIeValue::BearerContext(request.bearer_context)),
     ];
@@ -2803,7 +2815,6 @@ const KNOWN_RECEIVE_IE_TYPES: &[u8] = &[
     IE_TYPE_F_TEID,
     IE_TYPE_BEARER_CONTEXT,
     IE_TYPE_CHARGING_ID,
-    IE_TYPE_PDN_TYPE,
     IE_TYPE_APN_RESTRICTION,
     IE_TYPE_SELECTION_MODE,
     IE_TYPE_APCO,
@@ -2811,6 +2822,11 @@ const KNOWN_RECEIVE_IE_TYPES: &[u8] = &[
     IE_TYPE_LOAD_CONTROL_INFORMATION,
     IE_TYPE_PGW_CHANGE_INFO,
 ];
+
+// Known IEs that this exact S2b profile never accepts in any declared scope.
+// They remain known to ProcedureAware receive so clause 7.7.9 discards them
+// rather than preserving them as unknown.
+const GLOBALLY_DISCARDED_S2B_IE_TYPES: &[u8] = &[IE_TYPE_PDN_TYPE];
 
 const ONE: usize = 1;
 const UNBOUNDED_BY_TABLE: usize = usize::MAX;
@@ -2857,9 +2873,6 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
             IE_TYPE_APN,
             IE_TYPE_AMBR,
             IE_TYPE_SELECTION_MODE,
-            // Issue #335 owns removal of this currently declared S2b
-            // compatibility field from sender and receiver profiles.
-            IE_TYPE_PDN_TYPE,
             IE_TYPE_PAA,
             IE_TYPE_APN_RESTRICTION,
             IE_TYPE_EBI,
@@ -3650,7 +3663,7 @@ fn receive_repeatable_limit(
 }
 
 fn is_known_s2b_ie_type(ie_type: u8) -> bool {
-    KNOWN_RECEIVE_IE_TYPES.contains(&ie_type)
+    KNOWN_RECEIVE_IE_TYPES.contains(&ie_type) || GLOBALLY_DISCARDED_S2B_IE_TYPES.contains(&ie_type)
 }
 
 fn contains_ie(ies: &[TypedIe<'_>], ie_type: u8) -> bool {
@@ -3960,12 +3973,6 @@ fn validate_required_ies(
             )?;
             require_ie_instance(
                 &view.ies,
-                IE_TYPE_PDN_TYPE,
-                0,
-                "Create Session Request requires PDN Type IE at instance 0",
-            )?;
-            require_ie_instance(
-                &view.ies,
                 IE_TYPE_PAA,
                 0,
                 "Create Session Request requires PAA IE at instance 0",
@@ -4056,7 +4063,7 @@ fn validate_required_ies(
 mod tests {
     use super::*;
     use crate::header::{HEADER_LEN_WITHOUT_TEID, HEADER_LEN_WITH_TEID};
-    use crate::ie::{PdnTypeValue, PlmnId, RatTypeValue, Recovery, SelectionModeValue};
+    use crate::ie::{PlmnId, RatTypeValue, Recovery, SelectionModeValue};
     use opc_protocol::{DecodeContext, Encode, EncodeContext};
 
     #[test]
@@ -4095,6 +4102,23 @@ mod tests {
                     .iter()
                     .any(|rule| rule.ie_types.contains(ie_type)),
                 "recognized IE type {ie_type} has no receive grammar rule"
+            );
+        }
+        for ie_type in GLOBALLY_DISCARDED_S2B_IE_TYPES {
+            assert!(!KNOWN_RECEIVE_IE_TYPES.contains(ie_type));
+            assert!(is_known_s2b_ie_type(*ie_type));
+            assert!(!RECEIVE_IE_RULES
+                .iter()
+                .any(|rule| rule.ie_types.contains(ie_type)));
+            assert_eq!(
+                receive_ie_disposition(
+                    Procedure::CreateSession,
+                    MessageDirection::Request,
+                    Some(ReceiveIeScope::TopLevel),
+                    *ie_type,
+                    0,
+                ),
+                ReceiveIeDisposition::DiscardKnown
             );
         }
 
@@ -4311,11 +4335,9 @@ mod tests {
     }
 
     fn response_paa(ipv4: [u8; 4]) -> PdnAddressAllocation {
-        PdnAddressAllocation {
-            pdn_type: PdnTypeValue::Ipv4,
-            ipv6_prefix_length: None,
-            ipv6_prefix: None,
-            ipv4: Some(ipv4),
+        match PdnAddressAllocation::static_ipv4(ipv4) {
+            Ok(paa) => paa,
+            Err(error) => panic!("test PAA must be valid: {error}"),
         }
     }
 
@@ -4350,10 +4372,7 @@ mod tests {
             selection_mode: SelectionMode {
                 value: SelectionModeValue::MsOrNetworkProvidedSubscriptionVerified,
             },
-            pdn_type: PdnType {
-                value: PdnTypeValue::Ipv4,
-            },
-            paa: response_paa([0, 0, 0, 0]),
+            paa: PdnAddressAllocation::dynamic_ipv4(),
             bearer_context: bearer_context(vec![bearer_ebi(5)]),
             additional_ies: Vec::new(),
         }
