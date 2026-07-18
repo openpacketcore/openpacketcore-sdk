@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle expiry, and pool shutdown invalidate it before dispatch.
 
 ### Added
+- **Destination-scoped IPsec ownership keys — `opc-ipsec-lb`:** canonical,
+  bounded initial-IKE, established-IKE, and ESP identities now structurally
+  bind the public destination address and opaque routing-domain tag. A
+  generation-carrying rendezvous selector provides deterministic eligible-owner
+  decisions with minimal remapping on member changes, while an explicit
+  initial-to-established promotion preserves the already-selected owner.
+  Versioned strict encoding, Serde support, typed SPI-collision detection, and
+  address/SPI-redacted diagnostics keep the product-neutral layer suitable for
+  stores and redirect/datapath adapters without accepting SA key material or
+  performing I/O.
 - **IKEv2 encrypt-then-MAC suites — `opc-proto-ikev2`:** typed executable
   IKE-SA profiles now preserve the negotiated PRF, DH group, encryption/key
   size, and optional integrity algorithm. PRF-HMAC-SHA2-512 (Transform ID 7),

@@ -2568,6 +2568,7 @@ dependencies = [
  "opc-session-testkit",
  "opc-types",
  "rand 0.10.1",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "subtle",

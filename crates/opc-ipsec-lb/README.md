@@ -9,6 +9,8 @@ steer layer:
 - clone-shared tagged-SPI reservations for excluding HA-restored live SAs from
   fresh and rekey allocation, with explicit release on SA retirement;
 - rendezvous selection for shard and `IKE_SA_INIT` bootstrap routing;
+- destination-scoped canonical ownership keys and generation-bound rendezvous
+  owner selection for routed, multi-ingress deployments;
 - UDP/500 and UDP/4500 SWu classifier with RFC 3948 non-ESP marker handling;
 - stateless IKE cookie helper for edge DoS posture;
 - failover safety guards for IV-counter and replay-window restoration;
@@ -28,6 +30,75 @@ steer layer:
   FIPS/HSM key-custody scope;
 - reusable ports for steering backends, VIP advertisement, ownership reads,
   ownership fencing, and re-pin audit.
+
+## Destination-scoped ownership
+
+`SessionOwnershipKey` has typed initial-IKE, established-IKE, and ESP forms.
+Every form structurally includes a `DestinationContext`: the public destination
+address plus an opaque fixed-width `RoutingDomainTag`. Initial IKE additionally
+binds the observed outer source tuple, initiator SPI, and wire exchange type;
+established IKE binds both SPIs; ESP binds native versus UDP encapsulation and
+the inbound SPI. IKE SPIs must be non-zero and RFC 4303's reserved ESP range
+`0..=255` is rejected.
+
+Keys implement ordering, hashing, and Serde. For persistence, redirect, or map
+ABI boundaries, use the independent `to_canonical_bytes` /
+`from_canonical_bytes` format: version 1 is at most 59 bytes and rejects
+truncation, trailing data, unknown variants, and reserved values. Serde's shape
+is not the stable wire format. `Debug` and `Display` redact the destination,
+source tuple, and SPI values; applications must apply the same posture when
+using explicit field accessors.
+
+```rust
+use opc_ipsec_lb::{
+    DestinationContext, EligibleOwnershipMembers, IkeSpi,
+    InitialExchangeDiscriminator, InitialIkeOwnershipKey, IpAddress,
+    MembershipGeneration, OuterSourceTuple, RendezvousSelector,
+    RoutingDomainTag, SessionOwnershipKey, ShardId,
+};
+
+# fn select_initial_owner() -> Result<(), Box<dyn std::error::Error>> {
+let destination = DestinationContext::new(
+    IpAddress::V4([192, 0, 2, 10]),
+    RoutingDomainTag::new(7),
+);
+let initial = InitialIkeOwnershipKey::new(
+    destination,
+    OuterSourceTuple::new(IpAddress::V4([198, 51, 100, 9]), 45_000),
+    IkeSpi::new(0x0102_0304_0506_0708)?,
+    InitialExchangeDiscriminator::IKE_SA_INIT,
+);
+let members = EligibleOwnershipMembers::new(
+    MembershipGeneration::new(42)?,
+    vec![ShardId::new(0), ShardId::new(1), ShardId::new(2)],
+)?;
+let selector = RendezvousSelector;
+let selected = selector.select_owner(&members, &SessionOwnershipKey::from(initial))?;
+
+// Once the responder SPI is allocated, retain the same owner. Do not rerun
+// rendezvous selection for an active initial exchange.
+let promotion = initial.promote(IkeSpi::new(0x1112_1314_1516_1718)?);
+let established = selected.carry_forward(promotion)?;
+assert_eq!(selected.owner(), established.owner());
+assert_eq!(
+    established.owner_for_generation(members.generation())?,
+    selected.owner()
+);
+# Ok(())
+# }
+```
+
+`OwnerSelection` carries the membership generation and refuses consumption
+against another generation. The generation is deliberately excluded from the
+rendezvous score: advancing an unchanged view does not remap all sessions.
+Adding or removing a member has HRW/rendezvous minimal-disruption behavior.
+`collision_with` separately reports exact-key reuse and protocol-SPI reuse
+within one destination/routing-domain context; allocation and collision policy
+remain with the consumer.
+
+This layer performs no I/O, fencing, leasing, packet classification, redirect,
+route advertisement, or key handling. Those effects remain separate ports and
+consumer policy.
 
 ## Leadership-gated VIP ownership
 
