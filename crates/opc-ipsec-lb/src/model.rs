@@ -2,6 +2,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use serde::{Deserialize, Serialize};
+
 /// Worker shard identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct ShardId(u16);
@@ -41,7 +43,7 @@ impl ClusterNode {
 }
 
 /// IP address without depending on platform socket types in public wire models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum IpAddress {
     /// IPv4 address.
     V4([u8; 4]),

@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::IpsecLbError;
 use crate::model::{IpAddress, ShardId};
+use crate::ownership::{EligibleOwnershipMembers, OwnerSelection, SessionOwnershipKey};
 
 /// A validated sorted set of unique shards.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +106,42 @@ impl RendezvousSelector {
         best.map(|(_, shard)| shard)
             .ok_or(IpsecLbError::EmptyShardSet)
     }
+
+    /// Select the deterministic owner for one destination-scoped session key.
+    ///
+    /// The membership generation is intentionally not mixed into the HRW
+    /// score: advancing an otherwise identical membership view therefore does
+    /// not move every session. The returned [`OwnerSelection`] carries the
+    /// generation so an effect point can reject a selection made from a stale
+    /// view.
+    pub fn select_owner(
+        &self,
+        membership: &EligibleOwnershipMembers,
+        key: &SessionOwnershipKey,
+    ) -> Result<OwnerSelection, crate::ownership::OwnershipSelectionError> {
+        let mut best: Option<(u128, ShardId)> = None;
+        let key_digest = key.canonical_digest();
+        for member in membership.members() {
+            let score = score_ownership_key(*member, &key_digest);
+            match best {
+                Some((best_score, best_member))
+                    if score < best_score || (score == best_score && *member >= best_member) => {}
+                _ => best = Some((score, *member)),
+            }
+        }
+
+        // EligibleOwnershipMembers structurally contains at least one member.
+        // Avoid unwrap/expect so this remains robust if the representation is
+        // refactored later.
+        let owner = best
+            .map(|(_, owner)| owner)
+            .ok_or(crate::ownership::OwnershipSelectionError::EmptyMembership)?;
+        Ok(OwnerSelection::new(
+            owner,
+            membership.generation(),
+            key_digest,
+        ))
+    }
 }
 
 fn score_key(shard: ShardId, key: &SelectionKey) -> u128 {
@@ -112,6 +149,17 @@ fn score_key(shard: ShardId, key: &SelectionKey) -> u128 {
     hasher.update(b"opc-ipsec-lb/rendezvous/v1");
     hasher.update(shard.get().to_be_bytes());
     key.feed_hasher(&mut hasher);
+    let digest = hasher.finalize();
+    let mut score = [0u8; 16];
+    score.copy_from_slice(&digest[..16]);
+    u128::from_be_bytes(score)
+}
+
+fn score_ownership_key(member: ShardId, key_digest: &[u8; 32]) -> u128 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"opc-ipsec-lb/ownership-rendezvous/v1");
+    hasher.update(member.get().to_be_bytes());
+    hasher.update(key_digest);
     let digest = hasher.finalize();
     let mut score = [0u8; 16];
     score.copy_from_slice(&digest[..16]);

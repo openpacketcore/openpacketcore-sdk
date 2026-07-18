@@ -6,6 +6,12 @@
 //! evidence; this crate keeps kernel-independent conformance deterministic and
 //! CI-provable.
 //!
+//! Routed multi-ingress deployments can use [`SessionOwnershipKey`] to bind
+//! every IKE/ESP lookup to its public destination and routing domain, then use
+//! [`RendezvousSelector::select_owner`] with an explicit membership generation.
+//! Initial-IKE promotion carries the selected owner forward without rehashing.
+//! These identities contain packet metadata only and never SA key material.
+//!
 //! VIP advertisement is protocol-neutral: callers can gate any management or
 //! dataplane VIP on their own election, quorum, health, and monotonic fence
 //! evidence without coupling that signal to IPsec SA ownership.
@@ -21,6 +27,7 @@ pub mod failover;
 pub mod mock;
 pub mod model;
 pub mod offload;
+pub mod ownership;
 pub mod ports;
 pub mod repin;
 pub mod selector;
@@ -54,6 +61,14 @@ pub use model::{
     SteeringProbe, SteeringRule, VipAdvertisement, VipAdvertiserKind, VipProbe,
 };
 pub use offload::NicOffloadSecurityPosture;
+pub use ownership::{
+    DestinationContext, EligibleOwnershipMembers, EspEncapsulationKind, EspOwnershipKey, EspSpi,
+    EstablishedIkeOwnershipKey, IkeSpi, InitialExchangeDiscriminator, InitialIkeOwnershipKey,
+    MembershipGeneration, OuterSourceTuple, OwnerSelection, OwnershipCollision, OwnershipKeyError,
+    OwnershipKeyKind, OwnershipKeyPromotion, OwnershipSelectionError, RoutingDomainTag,
+    SessionOwnershipKey, MAX_ELIGIBLE_OWNERS, OWNERSHIP_KEY_ENCODING_VERSION,
+    OWNERSHIP_KEY_MAX_ENCODED_BYTES,
+};
 pub use ports::{
     OwnershipFencer, OwnershipSource, RePinAuditSink, SpiAllocator, SteeringBackend, VipAdvertiser,
 };
