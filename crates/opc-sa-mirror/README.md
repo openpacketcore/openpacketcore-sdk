@@ -19,7 +19,10 @@ type is deliberately not serializable.
 - `SaMirrorSink` — standby-side inbound port fed by the transport server.
 - `StandbyKeymatSource` — standby-side takeover port; `take_for_repin` yields
   `LiveMirroredTakeover { keymat, epoch, resume }` with the resume evidence
-  already validated (mandatory forward-jump, bounded anti-replay reopening).
+  already validated (mandatory counter forward-jump, bounded anti-replay
+  reopening). This existing wire contract always yields
+  `SameSpiOutboundIvResume::CounterBased`; it never infers random-IV IKE from a
+  zero or absent legacy counter.
 - `InMemoryStandbyHolder` implements both standby ports with epoch
   anti-rollback, constant-time idempotency, and a fail-closed capacity bound.
 - `RemoteMirrorProducer::new(addr, tls_config, deadline)` — mTLS producer

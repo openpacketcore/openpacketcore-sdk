@@ -18,6 +18,12 @@
 //! VIP advertisement is protocol-neutral: callers can gate any management or
 //! dataplane VIP on their own election, quorum, health, and monotonic fence
 //! evidence without coupling that signal to IPsec SA ownership.
+//!
+//! Same-SPI re-pin keeps counter-based ESP/IKE AEAD evidence distinct from IKE
+//! encrypt-then-MAC suites that generate a fresh independent CSPRNG IV for each
+//! protected message. Random-IV evidence is valid only for IKE and never
+//! carries placeholder counter fields; ownership fencing, key custody, SA
+//! identity, and inbound anti-replay evidence remain mandatory in both modes.
 
 #![forbid(unsafe_code)]
 
@@ -99,10 +105,11 @@ pub use redirect::{
     INGRESS_REDIRECT_CONTROL_ALPN,
 };
 pub use repin::{
-    ForwardingProof, OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest,
-    OwnershipRetryProof, OwnershipSnapshot, OwnershipTransitionFingerprint, OwnershipTransitionId,
-    RePinAuditEvent, RePinAuditEventKind, RePinCoordinator, RePinError, RePinOutcome,
-    RePinPartialFailure, RePinRequest, RePinRetryStage, ResumeKeySource, SameSpiResume,
+    ForwardingProof, IkeRandomIvAttestation, OwnershipFence, OwnershipFenceGrant,
+    OwnershipFenceRequest, OwnershipRetryProof, OwnershipSnapshot, OwnershipTransitionFingerprint,
+    OwnershipTransitionId, RePinAuditEvent, RePinAuditEventKind, RePinCoordinator, RePinError,
+    RePinOutcome, RePinPartialFailure, RePinRequest, RePinRetryStage, ResumeKeySource,
+    SameSpiOutboundIvResume, SameSpiResume,
 };
 pub use selector::{
     measure_disruption, RendezvousSelector, SelectionKey, ShardDisruption, ShardSet,

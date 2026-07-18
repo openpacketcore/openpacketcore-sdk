@@ -145,6 +145,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adds a privileged bidirectional packet/tamper proof. Existing AES-CBC and
   AES-GCM mappings are unchanged. Downstream exhaustive matches on
   `Ikev2EncryptionAlgorithm` must add the Child-SA-only `Null` arm.
+- **BREAKING — typed random-IV IKE same-SPI resume — `opc-ipsec-lb`:**
+  `SameSpiResume` replaces its three unconditional outbound-counter fields with
+  `outbound_iv: SameSpiOutboundIvResume`. Existing IKE-AEAD and ESP-ESN callers
+  must move their checkpoint, restored counter, and optional forward-jump into
+  `CounterBased`; validation and safety floors are unchanged. IKE
+  encrypt-then-MAC callers may instead select `IkeRandomIv` with the mandatory
+  `FreshIndependentCsprngIvPerMessage` attestation and no placeholder counters.
+  Random-IV evidence is rejected for ESP, while `Unspecified` preserves a
+  fail-closed boundary for legacy or ambiguous evidence. Existing
+  counter-based requests retain their byte-identical v1 transition fingerprint
+  so an in-flight transition remains recoverable across a rolling upgrade; new
+  random-IV and unspecified evidence use the v2 domain and bind the outbound
+  mode and attestation. The existing `opc-sa-mirror` wire path remains
+  counter-based and does not infer random-IV mode from legacy counter values.
 - **Atomic candidate-only v5 Kubernetes HA artifacts — `opc-session-testkit`:**
   a separate executable and reusable composition API now preflight a trusted
   Linux output parent and Python interpreter before campaign mutation, run the

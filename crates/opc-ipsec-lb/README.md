@@ -238,15 +238,16 @@ does not claim Host-XDP, VF-XDP, NIC offload, key custody, or datapath rule
 mutation. The default probe remains `Unsupported`; this constructor does not
 add a generic production no-op backend or select the tier automatically.
 
-Same-SPI resume supports ESP Child SAs with 64-bit ESN and IKE SAs with a
-64-bit AEAD explicit-IV counter; protocol-typed evidence must match the SA and
-its steering SPI. Both persisted and live-mirrored key/counter sources must
-supply an [RFC 6311](https://www.rfc-editor.org/rfc/rfc6311.html) send-IV
-forward-jump of at least `2^30`, and the restored next IV must exactly match the
-checked `checkpointed_next + forward_jump` result. The configured jump must
-also bound the deployment's maximum packets sent between checkpoints. ESP ESN
-evidence must additionally attest `max_peer_sequence_lag`: how far the peer's
-highest authenticated sequence may trail `checkpointed_next - 1`, including
+`SameSpiOutboundIvResume` makes the outbound cryptographic mode explicit.
+`CounterBased` supports ESP Child SAs with 64-bit ESN and IKE SAs with a
+64-bit AEAD explicit-IV counter; its protocol-typed evidence must match the SA
+and steering SPI. Persisted and live-mirrored counter sources must supply an
+[RFC 6311](https://www.rfc-editor.org/rfc/rfc6311.html) send-IV forward-jump of
+at least `2^30`, and the restored next IV must exactly match the checked
+`checkpointed_next + forward_jump` result. The configured jump must also bound
+the deployment's maximum packets sent between checkpoints. ESP ESN evidence
+must additionally attest `max_peer_sequence_lag`: how far the peer's highest
+authenticated sequence may trail `checkpointed_next - 1`, including
 pre-checkpoint packet loss. [RFC 4303 Appendix
 A2.2](https://www.rfc-editor.org/rfc/rfc4303.html#appendix-A.2.2) reconstructs
 the untransmitted high-order bits from receiver replay-window state and assumes
@@ -257,8 +258,41 @@ peer; any lag reduces it. ESP checkpoints and all resumed SA identifiers must
 be non-zero. IKE's explicit-IV checkpoint may be zero and has no ESP-specific
 maximum, but checked `u64` overflow always fails closed and requires rekey.
 
-Inbound anti-replay evidence explicitly selects either a bit-for-bit exact
-replay-window restore or bounded reopening with no bitmap-continuity claim.
+`IkeRandomIv` is the separate IKE encrypt-then-MAC path. It carries no counter
+fields and requires
+`IkeRandomIvAttestation::FreshIndependentCsprngIvPerMessage`. The caller may
+select it only when the protected-payload owner already obtains an independent,
+unpredictable IV from a CSPRNG for every newly encrypted IKE message. The
+attestation neither generates nor inspects IVs; it binds that product-owned
+invariant into the fenced transition. It is rejected for ESP. `Unspecified`
+exists only for legacy or ambiguously decoded evidence and always fails closed.
+
+```rust
+use opc_ipsec_lb::{
+    AntiReplayResume, IkeRandomIvAttestation, ResumeKeySource, SaId,
+    SameSpiOutboundIvResume, SameSpiResume,
+};
+
+let sa = SaId::Ike { responder_spi: 7 };
+let resume = SameSpiResume {
+    previous_sa: sa,
+    resumed_sa: sa,
+    outbound_iv: SameSpiOutboundIvResume::IkeRandomIv {
+        attestation: IkeRandomIvAttestation::FreshIndependentCsprngIvPerMessage,
+    },
+    anti_replay: AntiReplayResume::ExactWindowRestore {
+        checkpoint_highest_accepted: 42,
+        restored_highest_accepted: 42,
+    },
+    key_source: ResumeKeySource::PersistedKeyMaterial,
+};
+resume.validate_for_repin(sa)?;
+# Ok::<(), opc_ipsec_lb::IpsecLbError>(())
+```
+
+Inbound anti-replay evidence (ESP sequence state or IKE Message-ID state)
+explicitly selects either a bit-for-bit exact replay-window restore or bounded
+reopening with no bitmap-continuity claim.
 The latter carries the caller-attested total number of previously accepted
 values that might reopen, including lost bitmap state and post-checkpoint lag;
 the SDK does not invent a deployment policy default. High-watermark rollback,
@@ -270,10 +304,14 @@ deployment-unique `OwnershipTransitionId` for that logical transition and reuse
 it only when retrying the identical request; a later transition, including an
 A→B→A owner cycle, requires a new ID. The coordinator computes a canonical
 SHA-256 fingerprint over the complete safety-critical request and verifies that
-the committed grant matches it. Session-store birth records use an empty
-plaintext metadata payload; successful promotions replace it with versioned
-transition-ID/fingerprint metadata. Ownership records with an expiry, an
-arbitrary payload, or any mismatched key/type/owner/fence metadata fail closed.
+the committed grant matches it. Counter-based requests preserve the original
+v1 fingerprint encoding, allowing an already-committed IKE-AEAD or ESP
+transition to recover after a rolling SDK upgrade. Random-IV and unspecified
+evidence use the distinct v2 domain, so they cannot alias the v1 counter mode.
+Session-store birth records use an empty plaintext metadata payload; successful
+promotions replace it with versioned transition-ID/fingerprint metadata.
+Ownership records with an expiry, an arbitrary payload, or any mismatched
+key/type/owner/fence metadata fail closed.
 
 After a store-backed ownership commit, recoverable audit or steering failures
 return a non-cloneable partial for `RePinCoordinator::retry`; callers should

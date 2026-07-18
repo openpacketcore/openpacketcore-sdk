@@ -46,8 +46,8 @@ mod integration_tests {
     use opc_ipsec_lb::{
         ClusterNode, MockOwnershipFencer, MockOwnershipSource, MockRePinAuditSink,
         MockSteeringBackend, OwnershipFence, OwnershipTransitionId, RePinCoordinator, RePinRequest,
-        ResumeKeySource, SaId, SendIvCounterMode, SendIvForwardJump, ShardId, SteerKey,
-        SteeringRule, MIN_SEND_IV_FORWARD_JUMP,
+        ResumeKeySource, SaId, SameSpiOutboundIvResume, SendIvCounterMode, SendIvForwardJump,
+        ShardId, SteerKey, SteeringRule, MIN_SEND_IV_FORWARD_JUMP,
     };
     use zeroize::Zeroizing;
 
@@ -107,7 +107,13 @@ mod integration_tests {
         // Owner loss: the standby yields keymat plus validated evidence.
         let takeover = holder.take_for_repin(sa, esp_params()).unwrap();
         assert_eq!(takeover.resume.key_source, ResumeKeySource::LiveMirrored);
-        assert_eq!(takeover.resume.checkpointed_send_iv_next, 5_000);
+        assert!(matches!(
+            takeover.resume.outbound_iv,
+            SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 5_000,
+                ..
+            }
+        ));
         assert_eq!(takeover.keymat.expose_secret_bytes(), &[0x5C; 36]);
 
         // The evidence rides an ordinary fenced re-pin; the fencer stays the
@@ -267,7 +273,13 @@ mod integration_tests {
         assert_eq!(response, MirrorResponse::Accepted);
 
         let takeover = holder.take_for_repin(sa, esp_params()).unwrap();
-        assert_eq!(takeover.resume.checkpointed_send_iv_next, 900);
+        assert!(matches!(
+            takeover.resume.outbound_iv,
+            SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 900,
+                ..
+            }
+        ));
         assert_eq!(takeover.keymat.expose_secret_bytes(), &[0xEE; 32]);
 
         write_frame(
