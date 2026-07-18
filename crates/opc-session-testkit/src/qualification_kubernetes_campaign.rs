@@ -128,7 +128,7 @@ impl QualificationKubernetesCampaignCancellation {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         loop {
             let notified = self.notification.notified();
             if self.is_cancelled() {
@@ -341,7 +341,7 @@ pub struct QualificationKubernetesReadinessCondition {
 }
 
 impl QualificationKubernetesReadinessCondition {
-    fn ready() -> Self {
+    pub(crate) fn ready() -> Self {
         Self {
             condition_type: QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION.to_owned(),
             status: QualificationKubernetesConditionStatus::True,
@@ -350,7 +350,7 @@ impl QualificationKubernetesReadinessCondition {
         }
     }
 
-    fn not_ready(reason: QualificationKubernetesReadinessReason) -> Self {
+    pub(crate) fn not_ready(reason: QualificationKubernetesReadinessReason) -> Self {
         Self {
             condition_type: QUALIFICATION_KUBERNETES_DURABLE_READINESS_CONDITION.to_owned(),
             status: QualificationKubernetesConditionStatus::False,

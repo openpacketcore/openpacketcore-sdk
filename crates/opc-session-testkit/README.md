@@ -617,16 +617,92 @@ then validates every count, order, interval, pair, and quorum lifecycle.
 Emitted history is output-only and is capped at 8 MiB total and 256 KiB per
 JSONL row; finalization preflights those bounds before returning an artifact.
 
-This collector performs no Kubernetes or control-socket I/O. Deployed v5
-orchestration, retained Kubernetes evidence, release-manifest binding, and
-production credit do not exist yet. The frozen v4 manifest continues to bind
-v3 until a later additive contract explicitly replaces that binding.
+The collector itself performs no Kubernetes or control-socket I/O.
+`qualification_kubernetes_concurrent_v5` is the additive deployed adapter: it
+drives the existing `QualificationKubernetesCampaignPort`, so production use
+inherits the shell-free `kubectl exec` and private same-binary control-client
+boundary. A fixed run pre-acquires two campaign-scoped leases on one Pod,
+proves the history-derived restore scope is empty, registers a watch, submits
+one two-slot partial-success batch exactly once, and samples every voter before,
+during, and after an acknowledged all-member consensus-RPC isolation. Gate
+acknowledgements retain every member's command interval: the conservative
+no-pairs schedule begins at the earliest disable dispatch and full reachability
+resumes only after the latest enable acknowledgement. No readiness observation
+straddles either actuation. Loss and recovery are sampled at a one-second
+cadence inside separate 35-second transition bounds; transient recovery
+`NotReady` observations are retained and every voter must recover the same
+terminal journal head. It then consumes the watch through that head, scans
+terminal restore state on another Pod, and passes only typed replies and
+confirmed fault boundaries to the pure collector. Three- and five-member
+fake-port tests, including staggered actuation and delayed healthy recovery,
+feed the resulting history and schedule to the frozen independent checker.
+
+The caller must provide a unique `history_id` for every attempt and an
+exclusive application-journal window on a dedicated qualification fleet.
+Missing lease or batch replies are not retried. The eight-minute retained
+campaign window is covered by a fixed fifteen-minute durable lease; cleanup
+does not release that lease because the v5 contract requires it to remain valid
+through the campaign. Cleanup does idempotently restore every RPC gate, abort
+the retained watch, forget process-local handles, and set every custom Pod
+condition fail-closed, using a fresh bounded cancellation context even when the
+campaign was cancelled.
+
+A partial, contradictory, or missing gate acknowledgement withholds history
+even if some members may already have changed state. Bounded cleanup still
+drives every gate available. A transition that never reaches all-voter loss or
+recovered durable authority also withholds history rather than inventing a
+fault boundary. After every disable acknowledgement, any typed `Ready` reply
+contradicts the no-pairs schedule and fails immediately; it is never omitted
+from an otherwise passing history.
+
+The adapter returns a checker-ready in-memory history only for a conclusive
+run. It does not yet atomically retain candidate evidence, bind the exact OCI
+image/release manifest/platform inventory, or execute a cluster in CI. No run
+was performed as part of this source change. The frozen v4 manifest continues
+to bind v3, the current qualification node still uses its documented
+`MemoryKeyProvider`, and no production credit exists until a later additive
+evidence contract binds and verifies an actual release campaign.
+
+The reusable composition boundary is:
+
+```rust,no_run
+use opc_session_testkit::qualification_kubernetes_campaign::{
+    KubectlQualificationKubernetesCampaignPort, QualificationKubernetesCampaignCancellation,
+    QualificationKubernetesSystemClock,
+};
+use opc_session_testkit::qualification_kubernetes_concurrent_v5::{
+    run_qualification_kubernetes_concurrent_v5_campaign,
+    QualificationKubernetesConcurrentV5Config,
+};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let outcome = run_qualification_kubernetes_concurrent_v5_campaign(
+    &QualificationKubernetesConcurrentV5Config {
+        namespace: "session-ha-qualification".to_owned(),
+        member_count: 3,
+        history_id: "unique-candidate-attempt-001".to_owned(),
+    },
+    &KubectlQualificationKubernetesCampaignPort::new(),
+    &QualificationKubernetesSystemClock::new(),
+    &QualificationKubernetesCampaignCancellation::new(),
+)
+.await?;
+let history = outcome.history().ok_or("candidate campaign did not pass")?;
+let history_jsonl = history.encode_json_lines()?;
+let schedule_json = history.fault_schedule().encode_json()?;
+# let _ = (history_jsonl, schedule_json);
+# Ok(())
+# }
+```
 
 Run the focused v5 contract and checker suite with:
 
 `cargo test --locked -p opc-session-testkit --all-features qualification_concurrent_v5`
 and
 `cargo test --locked -p opc-session-testkit --test qualification_history_v5`.
+The focused deployed-adapter fake-port and independent-checker proof is:
+
+`cargo test --locked -p opc-session-testkit --all-features qualification_kubernetes_concurrent_v5`.
 
 The independent checker invocation always supplies all three digest-bound
 artifacts:

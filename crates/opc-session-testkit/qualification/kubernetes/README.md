@@ -193,6 +193,55 @@ keeps `experimental`,
 remaining #143 fault, concurrency, platform, HKMS, alerting, or signed-release
 acceptance by itself.
 
+## Candidate v5 concurrent adapter
+
+The additive `qualification_kubernetes_concurrent_v5` API reuses the same
+shell-free `KubectlQualificationKubernetesCampaignPort` and private UDS client.
+It provides the deployed operation adapter that the pure v5 collector lacks:
+
+- reset the external Pod condition fail-closed on every voter;
+- pre-acquire two history-scoped leases and prove the derived restore scope is
+  empty before opening the retained campaign window;
+- sample exact-identity concurrent readiness on all voters in parallel;
+- register a real watch, send one protected partial-success batch once only,
+  and observe its common committed application-journal head;
+- disable all member consensus-RPC gates, conservatively remove all schedule
+  pairs at the earliest disable dispatch, boundedly require all-member
+  fail-closed samples, restore the gates, and expose full schedule reachability
+  only after the latest enable acknowledgement;
+- retain one-second recovery samples for at most 35 seconds and require every
+  voter to regain durable authority at the same terminal journal head;
+- finish the watch and terminal restore concurrently on distinct Pods, then
+  feed the typed observations and acknowledged fault boundaries to the frozen
+  v5 collector; and
+- on every exit, restore the idempotent gates, abort the watch, forget local
+  lease handles, and clear the Pod condition with a fresh cleanup token.
+
+Every attempt requires a new bounded `history_id` and a dedicated fleet with an
+exclusive application-journal window. The adapter never retries an acquisition
+or batch with an ambiguous reply. Its fixed fifteen-minute lease covers the
+eight-minute retained campaign bound and remains durable until normal expiry;
+cleanup intentionally does not fabricate a release after the evidence window.
+The condition patch and control invocations use the same narrowly audited
+`pods/status` and `pods/exec` permissions described above.
+
+Per-member gate command intervals are part of the in-memory campaign input to
+the schedule builder. Readiness sampling begins only after the complete
+disable or enable actuation, so no observation crosses an uncertain boundary.
+Any partial/ambiguous gate actuation, non-converging transition, cancellation,
+or deadline withholds history and runs the same all-gates-available cleanup. A
+`Ready` reply after the complete disable actuation is a contradictory result
+and fails immediately rather than being filtered from candidate evidence.
+
+This source slice adds no retained artifact publisher or executable CLI mode.
+Consumers must atomically retain and digest-bind the returned history and fault
+schedule with the exact release/image/platform evidence before running the
+independent checker. The included fake-port tests prove both three- and
+five-member adapter output against that checker, but are not live Kubernetes
+evidence. The adapter controls only the existing qualification RPC fault gate;
+it does not claim NetworkPolicy, packet impairment, process/host/PVC failure,
+remote-HKMS, rotation, soak, or production qualification coverage.
+
 The rendered ServiceAccount remains tokenless and the manifest grants no RBAC
 or controller identity. Kubernetes authorization to use `pods/exec` for this
 client is nevertheless node-administrator-equivalent qualification authority:
