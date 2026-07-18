@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection; configuration identity, TLS material, explicit reauthentication,
   lifecycle expiry, and pool shutdown invalidate it before dispatch.
 
+### Changed
+- **Certificate-generation test dependency:** upgraded `rcgen` from 0.13.2 to
+  0.14.8 and migrated every certificate fixture, including generated gNMI
+  scratch source, to its typed `CertifiedIssuer`/`Issuer` signing API. Existing
+  root, intermediate, workload, validity, and trust-rotation test semantics are
+  preserved; production TLS, key storage, HKMS, and encrypted-at-rest paths are
+  unchanged.
+
 ### Added
 - **Destination-scoped IPsec ownership keys — `opc-ipsec-lb`:** canonical,
   bounded initial-IKE, established-IKE, and ESP identities now structurally

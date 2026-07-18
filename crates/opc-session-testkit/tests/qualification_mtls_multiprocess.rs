@@ -85,7 +85,7 @@ use opc_session_testkit::qualification::{
     SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use opc_types::Timestamp;
-use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, SanType};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
 use rustix::fs::{
     fchmod, fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, FileType, Mode,
     OFlags, RenameFlags,
@@ -132,8 +132,7 @@ fn single_attempt_removed_root_probe_lifecycle() -> ConnectionLifecyclePolicy {
 }
 
 struct Issuer {
-    certificate: Certificate,
-    key: KeyPair,
+    certified: rcgen::CertifiedIssuer<'static, KeyPair>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1677,10 +1676,9 @@ impl Issuer {
         parameters
             .distinguished_name
             .push(DnType::CommonName, common_name);
-        let certificate = parameters
-            .self_signed(&key)
-            .expect("sign qualification root");
-        Self { certificate, key }
+        let certified =
+            rcgen::CertifiedIssuer::self_signed(parameters, key).expect("sign qualification root");
+        Self { certified }
     }
 
     fn intermediate(common_name: &str, root: &Self) -> Self {
@@ -1690,10 +1688,9 @@ impl Issuer {
         parameters
             .distinguished_name
             .push(DnType::CommonName, common_name);
-        let certificate = parameters
-            .signed_by(&key, &root.certificate, &root.key)
+        let certified = rcgen::CertifiedIssuer::signed_by(parameters, key, &root.certified)
             .expect("sign qualification intermediate");
-        Self { certificate, key }
+        Self { certified }
     }
 
     fn issue_workload(&self, spiffe_id: &str) -> ProjectedCredential {
@@ -1714,7 +1711,7 @@ impl Issuer {
             .distinguished_name
             .push(DnType::CommonName, "session qualification workload");
         parameters.subject_alt_names.push(SanType::URI(
-            rcgen::Ia5String::try_from(spiffe_id).expect("valid qualification SPIFFE URI"),
+            rcgen::string::Ia5String::try_from(spiffe_id).expect("valid qualification SPIFFE URI"),
         ));
         let now = time::OffsetDateTime::now_utc()
             .replace_nanosecond(0)
@@ -1726,10 +1723,10 @@ impl Issuer {
         parameters.not_before = now - time::Duration::hours(1);
         parameters.not_after = not_after;
         let certificate = parameters
-            .signed_by(&key, &self.certificate, &self.key)
+            .signed_by(&key, &self.certified)
             .expect("sign qualification workload certificate");
         ProjectedCredential {
-            certificate_chain_pem: certificate.pem() + &self.certificate.pem(),
+            certificate_chain_pem: certificate.pem() + &self.certified.pem(),
             private_key_pem: key.serialize_pem(),
         }
     }
@@ -1793,8 +1790,8 @@ impl TestPki {
             })
             .collect();
         Self {
-            old_root_pem: old_root.certificate.pem(),
-            new_root_pem: new_root.certificate.pem(),
+            old_root_pem: old_root.certified.pem(),
+            new_root_pem: new_root.certified.pem(),
             old_intermediate,
             members,
         }

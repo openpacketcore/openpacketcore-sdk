@@ -29,29 +29,27 @@ fn mtls_configs() -> TestMtls {
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "SA Mirror Test CA");
-    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca cert");
 
     let (server_cert, server_key) = signed_leaf(
-        &ca_cert,
-        &ca_key,
+        &ca,
         "Mirror Standby",
         "spiffe://test-domain/tenant/test/ns/default/sa/mirror-standby/nf/epdg/instance/1",
     );
     let (client_cert, client_key) = signed_leaf(
-        &ca_cert,
-        &ca_key,
+        &ca,
         "Mirror Owner",
         "spiffe://test-domain/tenant/test/ns/default/sa/mirror-owner/nf/epdg/instance/0",
     );
     let server_state = identity_state_from_pem(
-        &(server_cert.pem() + &ca_cert.pem()),
+        &(server_cert.pem() + &ca.pem()),
         &server_key.serialize_pem(),
-        &ca_cert.pem(),
+        &ca.pem(),
     );
     let client_state = identity_state_from_pem(
-        &(client_cert.pem() + &ca_cert.pem()),
+        &(client_cert.pem() + &ca.pem()),
         &client_key.serialize_pem(),
-        &ca_cert.pem(),
+        &ca.pem(),
     );
     let (_server_tx, server_rx) = tokio::sync::watch::channel(Some(server_state));
     let (_client_tx, client_rx) = tokio::sync::watch::channel(Some(client_state));
@@ -71,8 +69,7 @@ fn mtls_configs() -> TestMtls {
 }
 
 fn signed_leaf(
-    ca_cert: &rcgen::Certificate,
-    ca_key: &rcgen::KeyPair,
+    issuer: &rcgen::Issuer<'_, impl rcgen::SigningKey>,
     common_name: &str,
     spiffe_id: &str,
 ) -> (rcgen::Certificate, rcgen::KeyPair) {
@@ -81,14 +78,14 @@ fn signed_leaf(
         .distinguished_name
         .push(rcgen::DnType::CommonName, common_name);
     params.subject_alt_names.push(rcgen::SanType::URI(
-        rcgen::Ia5String::try_from(spiffe_id).expect("spiffe id"),
+        rcgen::string::Ia5String::try_from(spiffe_id).expect("spiffe id"),
     ));
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::days(1);
     params.not_after = now + time::Duration::days(1);
 
     let key = rcgen::KeyPair::generate().expect("leaf key");
-    let cert = params.signed_by(&key, ca_cert, ca_key).expect("leaf cert");
+    let cert = params.signed_by(&key, issuer).expect("leaf cert");
     (cert, key)
 }
 

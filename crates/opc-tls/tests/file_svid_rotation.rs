@@ -11,8 +11,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 fn generate_identity_files(
     dir: &std::path::Path,
     spiffe_id: &str,
-    ca_cert: &rcgen::Certificate,
-    ca_key: &rcgen::KeyPair,
+    ca: &rcgen::CertifiedIssuer<'_, impl rcgen::SigningKey>,
     prefix: &str,
 ) -> (PathBuf, PathBuf, PathBuf) {
     let mut params = rcgen::CertificateParams::default();
@@ -20,7 +19,7 @@ fn generate_identity_files(
         .distinguished_name
         .push(rcgen::DnType::CommonName, "Workload");
     params.subject_alt_names.push(rcgen::SanType::URI(
-        rcgen::Ia5String::try_from(spiffe_id).unwrap(),
+        rcgen::string::Ia5String::try_from(spiffe_id).unwrap(),
     ));
 
     let now = time::OffsetDateTime::now_utc();
@@ -28,15 +27,15 @@ fn generate_identity_files(
     params.not_after = now + time::Duration::days(1);
 
     let key = rcgen::KeyPair::generate().unwrap();
-    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let cert = params.signed_by(&key, ca).unwrap();
 
     let cert_path = dir.join(format!("{prefix}-cert.pem"));
     let key_path = dir.join(format!("{prefix}-key.pem"));
     let bundle_path = dir.join("bundle.pem");
 
-    fs::write(&cert_path, cert.pem() + &ca_cert.pem()).unwrap();
+    fs::write(&cert_path, cert.pem() + &ca.pem()).unwrap();
     fs::write(&key_path, key.serialize_pem()).unwrap();
-    fs::write(&bundle_path, ca_cert.pem()).unwrap();
+    fs::write(&bundle_path, ca.pem()).unwrap();
 
     (cert_path, key_path, bundle_path)
 }
@@ -90,11 +89,10 @@ async fn test_file_svid_source_rotates_tls_identity() {
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "Test CA");
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
     let spiffe1 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/0";
-    let (cert_path, key_path, bundle_path) =
-        generate_identity_files(&dir, spiffe1, &ca_cert, &ca_key, "id");
+    let (cert_path, key_path, bundle_path) = generate_identity_files(&dir, spiffe1, &ca, "id");
 
     let source = FileSvidSource::new(
         &cert_path,
@@ -131,8 +129,7 @@ async fn test_file_svid_source_rotates_tls_identity() {
 
     // Rotate to a new identity (different SPIFFE ID).
     let spiffe2 = "spiffe://test-domain/tenant/test/ns/default/sa/svc/nf/test/instance/1";
-    let (cert_path2, key_path2, bundle_path2) =
-        generate_identity_files(&dir, spiffe2, &ca_cert, &ca_key, "id2");
+    let (cert_path2, key_path2, bundle_path2) = generate_identity_files(&dir, spiffe2, &ca, "id2");
 
     // Overwrite the original files so FileSvidSource picks up the change.
     fs::copy(&cert_path2, &cert_path).unwrap();

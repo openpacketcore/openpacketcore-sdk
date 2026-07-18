@@ -620,27 +620,26 @@ mod tests {
             .distinguished_name
             .push(DnType::CommonName, "Test CA");
         let ca_key = KeyPair::generate().expect("ca key");
-        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+        let ca =
+            rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca cert and issuer");
 
         let mut leaf_params = CertificateParams::default();
         leaf_params
             .distinguished_name
             .push(DnType::CommonName, "gNMI Workload");
         leaf_params.subject_alt_names.push(SanType::URI(
-            rcgen::Ia5String::try_from(spiffe_id).expect("spiffe san"),
+            rcgen::string::Ia5String::try_from(spiffe_id).expect("spiffe san"),
         ));
         let now = ::time::OffsetDateTime::now_utc();
         leaf_params.not_before = now - ::time::Duration::days(1);
         leaf_params.not_after = now + ::time::Duration::days(1);
 
         let leaf_key = KeyPair::generate().expect("leaf key");
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
-            .expect("leaf cert");
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca).expect("leaf cert");
 
-        let ca_certs = opc_identity::parse_certs_pem(&ca_cert.pem()).expect("ca pem");
+        let ca_certs = opc_identity::parse_certs_pem(&ca.pem()).expect("ca pem");
         let cert_chain =
-            opc_identity::parse_certs_pem(&(leaf_cert.pem() + &ca_cert.pem())).expect("chain");
+            opc_identity::parse_certs_pem(&(leaf_cert.pem() + &ca.pem())).expect("chain");
 
         let trust_domain = opc_identity::TrustDomain::new("test-domain").expect("trust domain");
         let mut trust_bundles = opc_identity::TrustBundleSet::new();

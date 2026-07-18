@@ -50,8 +50,7 @@ pub fn short_unix_socket_path(name: &str) -> PathBuf {
 pub struct FakeCa {
     pub ca_cert_pem: String,
     pub ca_key_pem: String,
-    ca_cert: rcgen::Certificate,
-    ca_key_pair: rcgen::KeyPair,
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 }
 
 impl FakeCa {
@@ -63,13 +62,12 @@ impl FakeCa {
             .push(DnType::CommonName, format!("CA for {trust_domain}"));
 
         let key_pair = rcgen::KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key_pair).unwrap();
+        let ca = rcgen::CertifiedIssuer::self_signed(params, key_pair).unwrap();
 
         Self {
-            ca_cert_pem: cert.pem(),
-            ca_key_pem: key_pair.serialize_pem(),
-            ca_cert: cert,
-            ca_key_pair: key_pair,
+            ca_cert_pem: ca.pem(),
+            ca_key_pem: ca.key().serialize_pem(),
+            ca,
         }
     }
 
@@ -78,18 +76,16 @@ impl FakeCa {
         params
             .distinguished_name
             .push(DnType::CommonName, "Workload");
-        params
-            .subject_alt_names
-            .push(SanType::URI(rcgen::Ia5String::try_from(spiffe_id).unwrap()));
+        params.subject_alt_names.push(SanType::URI(
+            rcgen::string::Ia5String::try_from(spiffe_id).unwrap(),
+        ));
 
         let now = ::time::OffsetDateTime::now_utc();
         params.not_before = now - ::time::Duration::days(1);
         params.not_after = now + ::time::Duration::seconds(expires_in_secs);
 
         let key_pair = rcgen::KeyPair::generate().unwrap();
-        let cert = params
-            .signed_by(&key_pair, &self.ca_cert, &self.ca_key_pair)
-            .unwrap();
+        let cert = params.signed_by(&key_pair, &self.ca).unwrap();
 
         (cert.pem(), key_pair.serialize_pem())
     }

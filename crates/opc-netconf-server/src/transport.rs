@@ -251,21 +251,26 @@ mod tests {
 
     fn generate_test_certs(
         spiffe_id: &str,
-    ) -> (rcgen::Certificate, KeyPair, rcgen::Certificate, KeyPair) {
+    ) -> (
+        rcgen::CertifiedIssuer<'static, KeyPair>,
+        rcgen::Certificate,
+        KeyPair,
+    ) {
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params
             .distinguished_name
             .push(DnType::CommonName, "Test CA");
         let ca_key = KeyPair::generate().expect("ca key");
-        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+        let ca =
+            rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca cert and issuer");
 
         let mut wl_params = CertificateParams::default();
         wl_params
             .distinguished_name
             .push(DnType::CommonName, "Workload");
         wl_params.subject_alt_names.push(SanType::URI(
-            rcgen::Ia5String::try_from(spiffe_id).expect("spiffe san"),
+            rcgen::string::Ia5String::try_from(spiffe_id).expect("spiffe san"),
         ));
 
         let now = ::time::OffsetDateTime::now_utc();
@@ -273,19 +278,17 @@ mod tests {
         wl_params.not_after = now + ::time::Duration::days(1);
 
         let wl_key = KeyPair::generate().expect("workload key");
-        let wl_cert = wl_params
-            .signed_by(&wl_key, &ca_cert, &ca_key)
-            .expect("workload cert");
+        let wl_cert = wl_params.signed_by(&wl_key, &ca).expect("workload cert");
 
-        (ca_cert, ca_key, wl_cert, wl_key)
+        (ca, wl_cert, wl_key)
     }
 
     fn identity_state_and_peer_chain(
         spiffe_id: &str,
     ) -> (IdentityState, Vec<CertificateDer<'static>>) {
-        let (ca_cert, _ca_key, wl_cert, wl_key) = generate_test_certs(spiffe_id);
-        let ca_certs = parse_certs_pem(&ca_cert.pem()).expect("ca cert pem");
-        let peer_chain = parse_certs_pem(&(wl_cert.pem() + &ca_cert.pem())).expect("peer chain");
+        let (ca, wl_cert, wl_key) = generate_test_certs(spiffe_id);
+        let ca_certs = parse_certs_pem(&ca.pem()).expect("ca cert pem");
+        let peer_chain = parse_certs_pem(&(wl_cert.pem() + &ca.pem())).expect("peer chain");
 
         let trust_domain_name = spiffe_id
             .strip_prefix("spiffe://")

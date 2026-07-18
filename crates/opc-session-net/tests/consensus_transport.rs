@@ -68,13 +68,11 @@ fn run_openraft_fleet_test(worker_threads: usize, scenario: impl std::future::Fu
 }
 
 struct TestPki {
-    ca_cert: rcgen::Certificate,
-    ca_key: rcgen::KeyPair,
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 }
 
 struct RotationRoot {
-    certificate: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 }
 
 impl RotationRoot {
@@ -88,8 +86,9 @@ impl RotationRoot {
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::days(1);
         params.not_after = now + time::Duration::days(30);
-        let certificate = params.self_signed(&key).expect("rotation root certificate");
-        Self { certificate, key }
+        let issuer =
+            rcgen::CertifiedIssuer::self_signed(params, key).expect("rotation root certificate");
+        Self { issuer }
     }
 
     fn issue_intermediate(&self, label: &str) -> RotationIntermediate {
@@ -103,16 +102,14 @@ impl RotationRoot {
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::days(1);
         params.not_after = now + time::Duration::days(14);
-        let certificate = params
-            .signed_by(&key, &self.certificate, &self.key)
+        let issuer = rcgen::CertifiedIssuer::signed_by(params, key, &self.issuer)
             .expect("rotation intermediate certificate");
-        RotationIntermediate { certificate, key }
+        RotationIntermediate { issuer }
     }
 }
 
 struct RotationIntermediate {
-    certificate: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
 }
 
 impl RotationIntermediate {
@@ -123,13 +120,13 @@ impl RotationIntermediate {
             .distinguished_name
             .push(rcgen::DnType::CommonName, format!("replica-{replica}"));
         params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::Ia5String::try_from(replica_spiffe(replica)).expect("SPIFFE URI"),
+            rcgen::string::Ia5String::try_from(replica_spiffe(replica)).expect("SPIFFE URI"),
         ));
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::days(1);
         params.not_after = now + time::Duration::days(1);
         let certificate = params
-            .signed_by(&key, &self.certificate, &self.key)
+            .signed_by(&key, &self.issuer)
             .expect("rotation leaf certificate");
         RotationLeaf { certificate, key }
     }
@@ -146,14 +143,13 @@ impl RotationLeaf {
         intermediate: &RotationIntermediate,
         trust_roots: &[&RotationRoot],
     ) -> opc_identity::IdentityState {
-        let cert_chain =
-            parse_certs_pem(&(self.certificate.pem() + &intermediate.certificate.pem()))
-                .expect("rotation certificate chain PEM");
+        let cert_chain = parse_certs_pem(&(self.certificate.pem() + &intermediate.issuer.pem()))
+            .expect("rotation certificate chain PEM");
         let private_key = parse_key_pem(&self.key.serialize_pem()).expect("rotation key PEM");
         let trust_domain = opc_identity::TrustDomain::new("test-domain").expect("trust domain");
         let trust_pem = trust_roots
             .iter()
-            .map(|root| root.certificate.pem())
+            .map(|root| root.issuer.pem())
             .collect::<String>();
         let mut trust_bundles = opc_identity::TrustBundleSet::new();
         trust_bundles.insert(TrustBundle {
@@ -173,8 +169,8 @@ impl TestPki {
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "Session consensus test CA");
-        let ca_cert = params.self_signed(&ca_key).expect("CA certificate");
-        Self { ca_cert, ca_key }
+        let ca = rcgen::CertifiedIssuer::self_signed(params, ca_key).expect("CA certificate");
+        Self { ca }
     }
 
     fn client_config(&self, replica: u16) -> AuthenticatedClientConfig {
@@ -201,22 +197,20 @@ impl TestPki {
             .distinguished_name
             .push(rcgen::DnType::CommonName, format!("replica-{replica}"));
         params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::Ia5String::try_from(replica_spiffe(replica)).expect("SPIFFE URI"),
+            rcgen::string::Ia5String::try_from(replica_spiffe(replica)).expect("SPIFFE URI"),
         ));
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::days(1);
         params.not_after = now + time::Duration::days(1);
         let key = rcgen::KeyPair::generate().expect("leaf key");
-        let cert = params
-            .signed_by(&key, &self.ca_cert, &self.ca_key)
-            .expect("leaf certificate");
-        let certs = parse_certs_pem(&(cert.pem() + &self.ca_cert.pem())).expect("certificate PEM");
+        let cert = params.signed_by(&key, &self.ca).expect("leaf certificate");
+        let certs = parse_certs_pem(&(cert.pem() + &self.ca.pem())).expect("certificate PEM");
         let private_key = parse_key_pem(&key.serialize_pem()).expect("private key PEM");
         let trust_domain = opc_identity::TrustDomain::new("test-domain").expect("trust domain");
         let mut trust_bundles = opc_identity::TrustBundleSet::new();
         trust_bundles.insert(TrustBundle {
             trust_domain,
-            certificates: parse_certs_pem(&self.ca_cert.pem()).expect("CA PEM"),
+            certificates: parse_certs_pem(&self.ca.pem()).expect("CA PEM"),
         });
         build_identity_state(certs, private_key, trust_bundles).expect("identity state")
     }

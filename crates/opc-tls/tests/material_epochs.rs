@@ -30,34 +30,33 @@ struct TestMaterial {
     leaf_der: Vec<u8>,
 }
 
-fn test_ca(name: &str) -> (rcgen::Certificate, KeyPair) {
+type TestIssuer = rcgen::CertifiedIssuer<'static, KeyPair>;
+
+fn test_ca(name: &str) -> TestIssuer {
     let mut parameters = CertificateParams::default();
     parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     parameters.distinguished_name.push(DnType::CommonName, name);
     let key = KeyPair::generate().expect("generate CA key");
-    let certificate = parameters.self_signed(&key).expect("sign CA");
-    (certificate, key)
+    rcgen::CertifiedIssuer::self_signed(parameters, key).expect("sign CA")
 }
 
 fn test_ca_with_validity(
     name: &str,
     not_before: time::OffsetDateTime,
     not_after: time::OffsetDateTime,
-) -> (rcgen::Certificate, KeyPair) {
+) -> TestIssuer {
     let mut parameters = CertificateParams::default();
     parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     parameters.distinguished_name.push(DnType::CommonName, name);
     parameters.not_before = not_before;
     parameters.not_after = not_after;
     let key = KeyPair::generate().expect("generate bounded CA key");
-    let certificate = parameters.self_signed(&key).expect("sign bounded CA");
-    (certificate, key)
+    rcgen::CertifiedIssuer::self_signed(parameters, key).expect("sign bounded CA")
 }
 
 fn material(
     spiffe_id: &str,
-    ca: &rcgen::Certificate,
-    ca_key: &KeyPair,
+    ca: &TestIssuer,
     validity: Option<(time::OffsetDateTime, time::OffsetDateTime)>,
 ) -> TestMaterial {
     let now = time::OffsetDateTime::now_utc();
@@ -67,12 +66,12 @@ fn material(
     ));
     let mut parameters = CertificateParams::default();
     parameters.subject_alt_names.push(SanType::URI(
-        rcgen::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
+        rcgen::string::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
     ));
     parameters.not_before = not_before;
     parameters.not_after = not_after;
     let key = KeyPair::generate().expect("generate leaf key");
-    let certificate = parameters.signed_by(&key, ca, ca_key).expect("sign leaf");
+    let certificate = parameters.signed_by(&key, ca).expect("sign leaf");
     let mut bundles = TrustBundleSet::new();
     bundles.insert(TrustBundle {
         trust_domain: opc_identity::TrustDomain::new("example.test").expect("trust domain"),
@@ -91,11 +90,10 @@ fn material(
 }
 
 fn test_intermediate_ca(
-    root: &rcgen::Certificate,
-    root_key: &KeyPair,
+    root: &TestIssuer,
     not_before: time::OffsetDateTime,
     not_after: time::OffsetDateTime,
-) -> (rcgen::Certificate, KeyPair) {
+) -> TestIssuer {
     let mut parameters = CertificateParams::default();
     parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
     parameters
@@ -104,29 +102,25 @@ fn test_intermediate_ca(
     parameters.not_before = not_before;
     parameters.not_after = not_after;
     let key = KeyPair::generate().expect("generate intermediate key");
-    let certificate = parameters
-        .signed_by(&key, root, root_key)
-        .expect("sign intermediate");
-    (certificate, key)
+    rcgen::CertifiedIssuer::signed_by(parameters, key, root).expect("sign intermediate")
 }
 
 fn material_via_intermediate(
     spiffe_id: &str,
-    intermediate: &rcgen::Certificate,
-    intermediate_key: &KeyPair,
-    root: &rcgen::Certificate,
+    intermediate: &TestIssuer,
+    root: &TestIssuer,
     not_before: time::OffsetDateTime,
     not_after: time::OffsetDateTime,
 ) -> TestMaterial {
     let mut parameters = CertificateParams::default();
     parameters.subject_alt_names.push(SanType::URI(
-        rcgen::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
+        rcgen::string::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
     ));
     parameters.not_before = not_before;
     parameters.not_after = not_after;
     let key = KeyPair::generate().expect("generate leaf key");
     let certificate = parameters
-        .signed_by(&key, intermediate, intermediate_key)
+        .signed_by(&key, intermediate)
         .expect("sign leaf through intermediate");
     let mut bundles = TrustBundleSet::new();
     bundles.insert(TrustBundle {
@@ -151,21 +145,20 @@ fn material_via_intermediate(
 
 fn material_via_root(
     spiffe_id: &str,
-    root: &rcgen::Certificate,
-    root_key: &KeyPair,
+    root: &TestIssuer,
     not_before: time::OffsetDateTime,
     not_after: time::OffsetDateTime,
     present_root: bool,
 ) -> TestMaterial {
     let mut parameters = CertificateParams::default();
     parameters.subject_alt_names.push(SanType::URI(
-        rcgen::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
+        rcgen::string::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
     ));
     parameters.not_before = not_before;
     parameters.not_after = not_after;
     let key = KeyPair::generate().expect("generate leaf key");
     let certificate = parameters
-        .signed_by(&key, root, root_key)
+        .signed_by(&key, root)
         .expect("sign root-issued leaf");
     let mut cert_chain = vec![certificate.der().clone()];
     if present_root {
@@ -191,28 +184,22 @@ fn material_via_root(
 fn unchecked_intermediate_temporal_material(
     baseline: &IdentityState,
     spiffe_id: &str,
-    root: &rcgen::Certificate,
-    root_key: &KeyPair,
+    root: &TestIssuer,
     intermediate_validity: (time::OffsetDateTime, time::OffsetDateTime),
     leaf_validity: (time::OffsetDateTime, time::OffsetDateTime),
 ) -> IdentityState {
     let (intermediate_not_before, intermediate_not_after) = intermediate_validity;
     let (leaf_not_before, leaf_not_after) = leaf_validity;
-    let (intermediate, intermediate_key) = test_intermediate_ca(
-        root,
-        root_key,
-        intermediate_not_before,
-        intermediate_not_after,
-    );
+    let intermediate = test_intermediate_ca(root, intermediate_not_before, intermediate_not_after);
     let mut parameters = CertificateParams::default();
     parameters.subject_alt_names.push(SanType::URI(
-        rcgen::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
+        rcgen::string::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
     ));
     parameters.not_before = leaf_not_before;
     parameters.not_after = leaf_not_after;
     let key = KeyPair::generate().expect("generate temporal-chain leaf key");
     let certificate = parameters
-        .signed_by(&key, &intermediate, &intermediate_key)
+        .signed_by(&key, &intermediate)
         .expect("sign temporal-chain leaf");
     let mut identity = baseline.identity.clone();
     identity.expires_at = Timestamp::from_offset_datetime(leaf_not_after);
@@ -235,21 +222,18 @@ fn unchecked_intermediate_temporal_material(
 fn unchecked_temporal_material(
     baseline: &IdentityState,
     spiffe_id: &str,
-    ca: &rcgen::Certificate,
-    ca_key: &KeyPair,
+    ca: &TestIssuer,
     not_before: time::OffsetDateTime,
     not_after: time::OffsetDateTime,
 ) -> IdentityState {
     let mut parameters = CertificateParams::default();
     parameters.subject_alt_names.push(SanType::URI(
-        rcgen::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
+        rcgen::string::Ia5String::try_from(spiffe_id).expect("SPIFFE test identity"),
     ));
     parameters.not_before = not_before;
     parameters.not_after = not_after;
     let key = KeyPair::generate().expect("generate temporal leaf key");
-    let certificate = parameters
-        .signed_by(&key, ca, ca_key)
-        .expect("sign temporal leaf");
+    let certificate = parameters.signed_by(&key, ca).expect("sign temporal leaf");
     let mut identity = baseline.identity.clone();
     identity.expires_at = Timestamp::from_offset_datetime(not_after);
     IdentityState {
@@ -343,11 +327,11 @@ fn assert_limit_rejection_retains_epoch(controller: &TlsMaterialController, epoc
 
 #[tokio::test]
 async fn controller_pins_identity_retains_invalid_candidates_and_versions_rollbacks() {
-    let (ca, ca_key) = test_ca("stable CA");
-    let (other_ca, other_ca_key) = test_ca("other CA");
-    let material_a = material(CLIENT_ID, &ca, &ca_key, None);
-    let material_b = material(CLIENT_ID, &ca, &ca_key, None);
-    let other_identity = material(OTHER_CLIENT_ID, &ca, &ca_key, None);
+    let ca = test_ca("stable CA");
+    let other_ca = test_ca("other CA");
+    let material_a = material(CLIENT_ID, &ca, None);
+    let material_b = material(CLIENT_ID, &ca, None);
+    let other_identity = material(OTHER_CLIENT_ID, &ca, None);
     let (source_tx, source_rx) = watch::channel(Some(material_a.state.clone()));
     let controller = TlsMaterialController::new(source_rx);
     assert_eq!(controller.status().epoch().get(), 1);
@@ -375,7 +359,7 @@ async fn controller_pins_identity_retains_invalid_candidates_and_versions_rollba
     );
     assert_eq!(controller.status().epoch().get(), 1);
 
-    let other_chain = material(CLIENT_ID, &other_ca, &other_ca_key, None);
+    let other_chain = material(CLIENT_ID, &other_ca, None);
     let mut wrong_chain = other_chain.state;
     wrong_chain.trust_bundles = material_a.state.trust_bundles.clone();
     source_tx
@@ -420,7 +404,6 @@ async fn controller_pins_identity_retains_invalid_candidates_and_versions_rollba
         &material_a.state,
         CLIENT_ID,
         &ca,
-        &ca_key,
         now - time::Duration::minutes(2),
         now - time::Duration::minutes(1),
     );
@@ -434,7 +417,6 @@ async fn controller_pins_identity_retains_invalid_candidates_and_versions_rollba
         &material_a.state,
         CLIENT_ID,
         &ca,
-        &ca_key,
         now + time::Duration::minutes(1),
         now + time::Duration::minutes(2),
     );
@@ -492,8 +474,8 @@ async fn controller_pins_identity_retains_invalid_candidates_and_versions_rollba
 
 #[test]
 fn controller_rejects_oversized_candidates_and_retains_last_good() {
-    let (ca, ca_key) = test_ca("bounded CA");
-    let baseline = material(CLIENT_ID, &ca, &ca_key, None).state;
+    let ca = test_ca("bounded CA");
+    let baseline = material(CLIENT_ID, &ca, None).state;
     let (source_tx, source_rx) = watch::channel(Some(baseline.clone()));
     let controller = TlsMaterialController::new(source_rx);
     assert_eq!(controller.status().epoch().get(), 1);
@@ -567,10 +549,10 @@ fn controller_rejects_oversized_candidates_and_retains_last_good() {
 #[tokio::test]
 async fn rotation_in_each_handshake_phase_retries_without_mixed_material() {
     for rotate_phase in 0..=4 {
-        let (ca, ca_key) = test_ca(&format!("phase-{rotate_phase} CA"));
-        let client_a = material(CLIENT_ID, &ca, &ca_key, None);
-        let client_b = material(CLIENT_ID, &ca, &ca_key, None);
-        let server = material(SERVER_ID, &ca, &ca_key, None);
+        let ca = test_ca(&format!("phase-{rotate_phase} CA"));
+        let client_a = material(CLIENT_ID, &ca, None);
+        let client_b = material(CLIENT_ID, &ca, None);
+        let server = material(SERVER_ID, &ca, None);
         let (client_tx, client_rx) = watch::channel(Some(client_a.state.clone()));
         let (_server_tx, server_rx) = watch::channel(Some(server.state));
         let client_controller = TlsMaterialController::new(client_rx);
@@ -659,15 +641,15 @@ async fn rotation_in_each_handshake_phase_retries_without_mixed_material() {
 
 #[tokio::test]
 async fn repeated_rotation_is_retry_bounded_and_cancellation_safe() {
-    let (ca, ca_key) = test_ca("retry CA");
-    let initial = material(CLIENT_ID, &ca, &ca_key, None);
+    let ca = test_ca("retry CA");
+    let initial = material(CLIENT_ID, &ca, None);
     let (source_tx, source_rx) = watch::channel(Some(initial.state));
     let config = TlsConfigBuilder::from_material_controller(TlsMaterialController::new(source_rx))
         .allow_any_trusted_peer()
         .build_authenticated_client_config()
         .expect("client config");
     let attempts = Arc::new(AtomicUsize::new(0));
-    let rotation_state = material(CLIENT_ID, &ca, &ca_key, None).state;
+    let rotation_state = material(CLIENT_ID, &ca, None).state;
 
     let result = config
         .run_handshake({
@@ -698,7 +680,7 @@ async fn repeated_rotation_is_retry_bounded_and_cancellation_safe() {
     );
 
     let stale_error_attempts = Arc::new(AtomicUsize::new(0));
-    let stale_rotation = material(CLIENT_ID, &ca, &ca_key, None).state;
+    let stale_rotation = material(CLIENT_ID, &ca, None).state;
     let recovered = config
         .run_handshake({
             let stale_error_attempts = stale_error_attempts.clone();
@@ -741,8 +723,8 @@ async fn repeated_rotation_is_retry_bounded_and_cancellation_safe() {
 
 #[tokio::test]
 async fn concurrent_handshake_operations_are_bounded_and_drop_cancellable() {
-    let (ca, ca_key) = test_ca("concurrency CA");
-    let initial = material(CLIENT_ID, &ca, &ca_key, None);
+    let ca = test_ca("concurrency CA");
+    let initial = material(CLIENT_ID, &ca, None);
     let (_source_tx, source_rx) = watch::channel(Some(initial.state));
     let config = TlsConfigBuilder::from_material_controller(TlsMaterialController::new(source_rx))
         .allow_any_trusted_peer()
@@ -806,19 +788,18 @@ async fn concurrent_handshake_operations_are_bounded_and_drop_cancellable() {
 
 #[tokio::test]
 async fn last_good_expiry_fails_closed_with_stable_status() {
-    let (ca, ca_key) = test_ca("expiry CA");
+    let ca = test_ca("expiry CA");
     let now = time::OffsetDateTime::now_utc();
     let short = material(
         CLIENT_ID,
         &ca,
-        &ca_key,
         Some((
             now - time::Duration::minutes(1),
             now + time::Duration::seconds(2),
         )),
     );
-    let mut malformed_after_expiry = material(CLIENT_ID, &ca, &ca_key, None).state;
-    malformed_after_expiry.svid.private_key = material(CLIENT_ID, &ca, &ca_key, None)
+    let mut malformed_after_expiry = material(CLIENT_ID, &ca, None).state;
+    malformed_after_expiry.svid.private_key = material(CLIENT_ID, &ca, None)
         .state
         .svid
         .private_key
@@ -861,9 +842,9 @@ async fn last_good_expiry_fails_closed_with_stable_status() {
 
 #[test]
 fn initial_malformed_svid_without_predecessor_is_rejected_as_svid() {
-    let (ca, ca_key) = test_ca("initial malformed metrics CA");
-    let mut malformed = material(CLIENT_ID, &ca, &ca_key, None).state;
-    malformed.svid.private_key = material(CLIENT_ID, &ca, &ca_key, None)
+    let ca = test_ca("initial malformed metrics CA");
+    let mut malformed = material(CLIENT_ID, &ca, None).state;
+    malformed.svid.private_key = material(CLIENT_ID, &ca, None)
         .state
         .svid
         .private_key
@@ -880,8 +861,8 @@ fn initial_malformed_svid_without_predecessor_is_rejected_as_svid() {
 
 #[test]
 fn intermediate_temporal_failures_are_classified_before_initial_and_update_rebuilds() {
-    let (root, root_key) = test_ca("temporal intermediate root");
-    let baseline = material(CLIENT_ID, &root, &root_key, None).state;
+    let root = test_ca("temporal intermediate root");
+    let baseline = material(CLIENT_ID, &root, None).state;
     let base = time::OffsetDateTime::now_utc()
         .replace_nanosecond(0)
         .expect("second-aligned test time");
@@ -903,7 +884,6 @@ fn intermediate_temporal_failures_are_classified_before_initial_and_update_rebui
             &baseline,
             CLIENT_ID,
             &root,
-            &root_key,
             (intermediate_not_before, intermediate_not_after),
             (
                 base - time::Duration::minutes(1),
@@ -939,7 +919,7 @@ fn intermediate_temporal_failures_are_classified_before_initial_and_update_rebui
 
 #[tokio::test]
 async fn intermediate_expiry_bounds_local_and_peer_chain_evidence() {
-    let (root, root_key) = test_ca("chain-expiry root");
+    let root = test_ca("chain-expiry root");
     let base = time::OffsetDateTime::now_utc()
         .replace_nanosecond(0)
         .expect("second-aligned test time");
@@ -948,16 +928,14 @@ async fn intermediate_expiry_bounds_local_and_peer_chain_evidence() {
     let intermediate_not_after = base + time::Duration::seconds(10);
     let leaf_not_after = base + time::Duration::hours(1);
     let expected_chain_expiry = Timestamp::from_offset_datetime(intermediate_not_after);
-    let (intermediate, intermediate_key) = test_intermediate_ca(
+    let intermediate = test_intermediate_ca(
         &root,
-        &root_key,
         base - time::Duration::minutes(1),
         intermediate_not_after,
     );
     let client = material_via_intermediate(
         CLIENT_ID,
         &intermediate,
-        &intermediate_key,
         &root,
         base - time::Duration::minutes(1),
         leaf_not_after,
@@ -965,7 +943,6 @@ async fn intermediate_expiry_bounds_local_and_peer_chain_evidence() {
     let server = material_via_intermediate(
         SERVER_ID,
         &intermediate,
-        &intermediate_key,
         &root,
         base - time::Duration::minutes(1),
         leaf_not_after,
@@ -1081,7 +1058,7 @@ fn only_redundantly_presented_roots_bound_local_and_peer_chain_expiry() {
     let leaf_not_after = base + time::Duration::hours(2);
     let expected_root_expiry = Timestamp::from_offset_datetime(root_not_after);
     let expected_leaf_expiry = Timestamp::from_offset_datetime(leaf_not_after);
-    let (root, root_key) = test_ca_with_validity(
+    let root = test_ca_with_validity(
         "presentation-boundary root",
         base - time::Duration::hours(1),
         root_not_after,
@@ -1089,7 +1066,6 @@ fn only_redundantly_presented_roots_bound_local_and_peer_chain_expiry() {
     let trust_bundle_only_root = material_via_root(
         CLIENT_ID,
         &root,
-        &root_key,
         base - time::Duration::minutes(1),
         leaf_not_after,
         false,
@@ -1097,7 +1073,6 @@ fn only_redundantly_presented_roots_bound_local_and_peer_chain_expiry() {
     let redundantly_presented_root = material_via_root(
         SERVER_ID,
         &root,
-        &root_key,
         base - time::Duration::minutes(1),
         leaf_not_after,
         true,

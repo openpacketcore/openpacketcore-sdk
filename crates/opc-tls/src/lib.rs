@@ -1089,24 +1089,23 @@ mod policy_tests {
         HashSet::from([TrustDomain::new(v).unwrap()])
     }
 
-    fn test_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+    fn test_ca() -> rcgen::CertifiedIssuer<'static, rcgen::KeyPair> {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::default();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        (params.self_signed(&key).unwrap(), key)
+        rcgen::CertifiedIssuer::self_signed(params, key).unwrap()
     }
 
     fn identity_state(
         spiffe_id: &str,
-        ca: &rcgen::Certificate,
-        ca_key: &rcgen::KeyPair,
+        ca: &rcgen::CertifiedIssuer<'_, impl rcgen::SigningKey>,
     ) -> IdentityState {
         let mut params = rcgen::CertificateParams::default();
         params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::Ia5String::try_from(spiffe_id).unwrap(),
+            rcgen::string::Ia5String::try_from(spiffe_id).unwrap(),
         ));
         let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, ca, ca_key).unwrap();
+        let cert = params.signed_by(&key, ca).unwrap();
         let trust_domain = TrustDomain::new("example.test").unwrap();
         let mut trust_bundles = TrustBundleSet::new();
         trust_bundles.insert(TrustBundle {
@@ -1364,8 +1363,8 @@ mod policy_tests {
     fn peer_identity_evidence_rejects_a_malformed_non_leaf_certificate() {
         const CLIENT_ID: &str =
             "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/client-0";
-        let (ca, ca_key) = test_ca();
-        let mut certificates = identity_state(CLIENT_ID, &ca, &ca_key).svid.cert_chain;
+        let ca = test_ca();
+        let mut certificates = identity_state(CLIENT_ID, &ca).svid.cert_chain;
         certificates.insert(1, CertificateDer::from(vec![0xde, 0xad]));
 
         assert_eq!(
@@ -1381,9 +1380,9 @@ mod policy_tests {
         const SERVER_ID: &str =
             "spiffe://example.test/tenant/tenant-a/ns/core/sa/session/nf/smf/instance/server-0";
 
-        let (ca, ca_key) = test_ca();
-        let (_client_tx, client_rx) = watch::channel(Some(identity_state(CLIENT_ID, &ca, &ca_key)));
-        let (_server_tx, server_rx) = watch::channel(Some(identity_state(SERVER_ID, &ca, &ca_key)));
+        let ca = test_ca();
+        let (_client_tx, client_rx) = watch::channel(Some(identity_state(CLIENT_ID, &ca)));
+        let (_server_tx, server_rx) = watch::channel(Some(identity_state(SERVER_ID, &ca)));
         let client_config = TlsConfigBuilder::new(client_rx)
             .allow_any_trusted_peer()
             .build_authenticated_client_config()
