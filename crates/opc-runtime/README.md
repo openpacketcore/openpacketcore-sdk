@@ -24,8 +24,11 @@ resource budgets, source admission, and deterministic test clocks.
 - Health APIs include `HealthModel`, `HealthGateSet`, `HealthGate`,
   `GateStatus`, `Readiness`, `StartupPhase`, and `known_gates`.
 - Shutdown APIs include `ShutdownToken`, `ShutdownPhase`, and `DrainHook`.
-- Admission APIs include `SourceTokenBucketPolicy`,
-  `SourceTokenBucket`, and `SourceAdmissionDecision`.
+- Admission APIs include per-source `SourceTokenBucketPolicy`,
+  `SourceTokenBucket`, and `SourceAdmissionDecision`, plus the process-wide
+  `AggregateAdmissionConfig`, `AggregateAdmissionBudget`, RAII
+  `AggregateAdmissionPermit`, typed exhaustion errors, and fixed-cardinality
+  metrics.
 - UDP helpers receive the concrete local destination and can send a reply from
   that exact endpoint. Linux and Android use per-datagram packet-info ancillary
   data; platforms without it only allow the send when a concrete socket bind
@@ -42,6 +45,51 @@ async fn start() -> Result<opc_runtime::RuntimeHandle, opc_runtime::RuntimeError
     Ok(runtime)
 }
 ```
+
+Layer the aggregate gate after the source gate and hold its permit until the
+expensive operation finishes:
+
+```rust,no_run
+use std::{net::IpAddr, num::NonZeroU32, time::Instant};
+
+use opc_runtime::{
+    AggregateAdmissionBudget, AggregateAdmissionConfig, AggregateAdmissionError,
+    AggregateAdmissionPermit, SourceAdmissionDecision, SourceTokenBucket,
+};
+
+fn admit_expensive_work(
+    sources: &SourceTokenBucket<IpAddr>,
+    aggregate: &AggregateAdmissionBudget,
+    source: IpAddr,
+    now: Instant,
+) -> Result<Option<AggregateAdmissionPermit>, AggregateAdmissionError> {
+    if sources.admit(source, now) != SourceAdmissionDecision::Allowed {
+        return Ok(None);
+    }
+    aggregate.try_acquire(now).map(Some)
+}
+
+let Some(rate) = NonZeroU32::new(200) else {
+    return;
+};
+let Some(burst) = NonZeroU32::new(400) else {
+    return;
+};
+let Some(in_flight) = NonZeroU32::new(16) else {
+    return;
+};
+let aggregate = AggregateAdmissionBudget::new(AggregateAdmissionConfig::per_second(
+    rate, burst, in_flight,
+));
+let _ = aggregate.metrics();
+```
+
+The aggregate budget stores no source identities and performs no eviction, so
+source-address churn cannot restore its rate tokens. `try_acquire` never waits;
+rate and in-flight exhaustion are distinct stable typed errors. Dropping the
+non-cloneable permit, including through future cancellation, synchronously
+returns its in-flight slot. Consumers still own cookie ordering, policy values,
+and placement of synchronous cryptography on an appropriate blocking pool.
 
 Pair the receive metadata with `send_to_from` for wildcard-bound VIP listeners:
 
