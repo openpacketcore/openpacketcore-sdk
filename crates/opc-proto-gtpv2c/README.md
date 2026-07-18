@@ -62,6 +62,10 @@ control-plane stack.
   `s2b_modify_bearer_request`, `s2b_modify_bearer_response`,
   `s2b_delete_session_request`, `s2b_delete_session_response`,
   `s2b_update_bearer_request`, and `s2b_update_bearer_response`.
+- Accepted Create Session Responses use the PGW S2b control-plane F-TEID at
+  instance 1 with interface type 32. The endpoint must carry a non-zero TEID
+  and at least one IPv4 or IPv6 address. Instance-0 Sender F-TEID remains the
+  Create Session Request role and is not substituted for the response role.
 - `Gtpv2cEchoPeer` and the client-transaction helper types are
   transport-neutral state helpers; callers still own UDP, timers, persistence,
   and product policy.
@@ -99,15 +103,16 @@ assert!(decoded.diagnostics().is_empty());
 
 `ProcedureAware` is a receiver profile. In accordance with TS 29.274 clauses
 7.7.9 and 7.7.10, it classifies each crate-known IE type/instance against one
-full-message grammar keyed by procedure, direction, and exact enclosing Bearer
-Context instance before decoding its value. It discards unexpected known keys,
-preserves genuinely unknown optional keys, retains the first non-repeatable
-type/instance key in each exact scope, ignores later occurrences, and truncates
-declared lists at their procedure-table bounds. Interface-specific S2b
-presence, F-TEID role/type, and correlation checks remain in the typed
-procedure projections. Length, mandatory-field, and semantic validation of the
-first retained value still fail closed. Canonical builders deliberately use a
-separate sender-validation path: duplicate profile-owned or additional
+message grammar keyed by procedure, direction, and exact enclosing Bearer
+Context instance before decoding its value. The grammar applies explicit S2b
+applicability where the profile assigns an exact endpoint role. It discards
+unexpected known keys, preserves genuinely unknown optional keys, retains the
+first non-repeatable type/instance key in each exact scope, ignores later
+occurrences, and truncates declared lists at their procedure-table bounds.
+Typed procedure projections enforce required presence, F-TEID interface/value
+semantics, and correlation. Length, mandatory-field, and semantic validation
+of the first retained value still fail closed. Canonical builders deliberately
+use a separate sender-validation path: duplicate profile-owned or additional
 singleton keys remain construction errors and are never emitted.
 
 The current Create Session profile still treats top-level PDN Type as an
@@ -154,6 +159,42 @@ override priority. Exact retransmission replay always returns the byte-identical
 committed response.
 
 ## Migration notes
+
+Accepted Create Session Response callers must replace
+`S2bCreateSessionAcceptedResponse::sender_f_teid` with
+`pgw_control_f_teid` and supply `FullyQualifiedTeid` interface type
+`INTERFACE_TYPE_S2B_PGW_GTP_C` (32), a non-zero control-plane TEID, and at
+least one address. Consumers of `CreateSessionAcceptedResponseSummary` must
+likewise read `pgw_control_f_teid` instead of `sender_f_teid`. Exhaustive
+matches over `CreateSessionResponseSummaryError` must replace
+`AcceptedResponseMissingSenderFTeid` with
+`AcceptedResponseMissingPgwControlFTeid` and handle the new typed
+`AcceptedResponsePgwControlFTeidInterfaceMismatch`,
+`AcceptedResponseZeroPgwControlFTeid`, and
+`AcceptedResponseMalformedPgwControlFTeid` variants. The wire role changes
+from IE 87 instance 0 to instance 1; applications must not rewrite the
+request-side Sender F-TEID role.
+
+```rust
+use opc_proto_gtpv2c::{
+    FullyQualifiedTeid, S2bCreateSessionAcceptedResponse,
+    INTERFACE_TYPE_S2B_PGW_GTP_C,
+};
+
+# let bearer_context = opc_proto_gtpv2c::BearerContext { members: Vec::new() };
+let response = S2bCreateSessionAcceptedResponse {
+    sequence_number: 0x010203,
+    response_teid: 0x1020_3040,
+    pgw_control_f_teid: FullyQualifiedTeid {
+        interface_type: INTERFACE_TYPE_S2B_PGW_GTP_C,
+        teid: 0x5060_7080,
+        ipv4: Some([192, 0, 2, 20]),
+        ipv6: None,
+    },
+    bearer_context,
+    additional_ies: Vec::new(),
+};
+```
 
 The former loose Update Bearer shell with a single `bearer_context` has been
 replaced by the strict dedicated-bearer API. Construct

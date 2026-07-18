@@ -179,11 +179,14 @@ pub struct S2bCreateSessionAcceptedResponse<'a> {
     pub sequence_number: u32,
     /// TEID carried in the response common header.
     pub response_teid: u32,
-    /// Sender F-TEID IE; encoded at instance 0.
-    pub sender_f_teid: FullyQualifiedTeid,
+    /// PGW S2b control-plane F-TEID IE; encoded at instance 1.
+    ///
+    /// The endpoint must use [`INTERFACE_TYPE_S2B_PGW_GTP_C`], carry a
+    /// non-zero TEID, and include at least one IPv4 or IPv6 address.
+    pub pgw_control_f_teid: FullyQualifiedTeid,
     /// Bearer Context IE containing the accepted bearer EBI.
     pub bearer_context: BearerContext<'a>,
-    /// Additional typed IEs to append after Cause, Sender F-TEID, and Bearer Context.
+    /// Additional typed IEs to append after Cause, PGW control F-TEID, and Bearer Context.
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
@@ -322,7 +325,10 @@ pub fn s2b_create_session_accepted_response(
 ) -> S2bProfileBuildResult<OwnedMessage> {
     let mut ies = vec![
         typed_ie(0, TypedIeValue::Cause(accepted_cause())),
-        typed_ie(0, TypedIeValue::FullyQualifiedTeid(response.sender_f_teid)),
+        typed_ie(
+            1,
+            TypedIeValue::FullyQualifiedTeid(response.pgw_control_f_teid),
+        ),
         typed_ie(0, TypedIeValue::BearerContext(response.bearer_context)),
     ];
     ies.extend(response.additional_ies);
@@ -527,8 +533,8 @@ pub struct CreateSessionAcceptedResponseSummary {
     pub sequence_number: u32,
     /// Cause value from the Cause IE.
     pub cause: CauseValue,
-    /// Top-level Sender F-TEID at instance 0.
-    pub sender_f_teid: FullyQualifiedTeid,
+    /// Top-level PGW S2b control-plane F-TEID at instance 1.
+    pub pgw_control_f_teid: FullyQualifiedTeid,
     /// Linked bearer EBI from the first Bearer Context IE.
     pub bearer_ebi: EpsBearerId,
     /// PGW S2b-U user-plane F-TEID from the accepted Bearer Context.
@@ -551,7 +557,19 @@ impl fmt::Debug for CreateSessionAcceptedResponseSummary {
             .field("response_teid_present", &true)
             .field("sequence_number", &self.sequence_number)
             .field("cause", &self.cause)
-            .field("sender_f_teid_present", &true)
+            .field("pgw_control_f_teid_present", &true)
+            .field(
+                "pgw_control_interface_type",
+                &self.pgw_control_f_teid.interface_type,
+            )
+            .field(
+                "pgw_control_ipv4_present",
+                &self.pgw_control_f_teid.ipv4.is_some(),
+            )
+            .field(
+                "pgw_control_ipv6_present",
+                &self.pgw_control_f_teid.ipv6.is_some(),
+            )
             .field("bearer_ebi", &self.bearer_ebi)
             .field(
                 "bearer_user_plane_interface_type",
@@ -589,7 +607,7 @@ impl fmt::Debug for CreateSessionAcceptedResponseSummary {
 /// Rejected Create Session Response projection.
 ///
 /// Rejected responses do not require accepted-bearer-only fields such as
-/// Sender F-TEID or Bearer Context EBI.
+/// PGW control F-TEID or Bearer Context EBI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSessionRejectedResponseSummary {
     /// TEID carried in the Create Session Response common header.
@@ -620,8 +638,14 @@ pub enum CreateSessionResponseSummaryError {
     MissingCause,
     /// Create Session Response did not carry a response-header TEID.
     MissingResponseTeid,
-    /// Accepted Create Session Response did not include Sender F-TEID instance 0.
-    AcceptedResponseMissingSenderFTeid,
+    /// Accepted response did not include the PGW S2b control F-TEID at instance 1.
+    AcceptedResponseMissingPgwControlFTeid,
+    /// Accepted response PGW control F-TEID did not use S2b PGW GTP-C type 32.
+    AcceptedResponsePgwControlFTeidInterfaceMismatch,
+    /// Accepted response PGW control F-TEID carried the reserved zero TEID.
+    AcceptedResponseZeroPgwControlFTeid,
+    /// Accepted response PGW control F-TEID carried no endpoint address.
+    AcceptedResponseMalformedPgwControlFTeid,
     /// Accepted Create Session Response did not include a Bearer Context IE.
     AcceptedResponseMissingBearerContext,
     /// Accepted Create Session Response Bearer Context did not include an EBI IE.
@@ -647,8 +671,17 @@ impl CreateSessionResponseSummaryError {
             }
             Self::MissingCause => "s2b_create_session_response_missing_cause",
             Self::MissingResponseTeid => "s2b_create_session_response_missing_teid",
-            Self::AcceptedResponseMissingSenderFTeid => {
-                "s2b_create_session_response_missing_sender_f_teid"
+            Self::AcceptedResponseMissingPgwControlFTeid => {
+                "s2b_create_session_response_missing_pgw_control_f_teid"
+            }
+            Self::AcceptedResponsePgwControlFTeidInterfaceMismatch => {
+                "s2b_create_session_response_pgw_control_f_teid_interface_mismatch"
+            }
+            Self::AcceptedResponseZeroPgwControlFTeid => {
+                "s2b_create_session_response_zero_pgw_control_f_teid"
+            }
+            Self::AcceptedResponseMalformedPgwControlFTeid => {
+                "s2b_create_session_response_malformed_pgw_control_f_teid"
             }
             Self::AcceptedResponseMissingBearerContext => {
                 "s2b_create_session_response_missing_bearer_context"
@@ -2642,7 +2675,9 @@ impl<'a> S2bMessage<'a> {
 /// This helper preserves decode limits from `ctx` but performs the final
 /// Create Session Response checks through [`CreateSessionResponseSummaryError`]
 /// so callers receive stable error codes for missing Cause, missing response
-/// TEID, and accepted responses with incomplete accepted-bearer fields.
+/// TEID, and accepted responses with incomplete accepted-bearer fields. A
+/// ProcedureAware context always retains the first singleton occurrence even
+/// when its caller-provided duplicate policy is Last.
 ///
 /// # Errors
 ///
@@ -2716,6 +2751,11 @@ impl Encode for S2bMessage<'_> {
 
 fn create_session_response_projection_context(mut ctx: DecodeContext) -> DecodeContext {
     if ctx.validation_level == ValidationLevel::ProcedureAware {
+        // Keep the public projection helper's stable, field-specific errors by
+        // deferring procedure validation, but retain ProcedureAware receive
+        // semantics: an invalid first singleton must never be repaired by a
+        // later duplicate under a caller/default Last policy.
+        ctx.duplicate_ie_policy = DuplicateIePolicy::First;
         ctx.validation_level = ValidationLevel::Strict;
     }
     ctx
@@ -2776,11 +2816,11 @@ const ONE: usize = 1;
 const UNBOUNDED_BY_TABLE: usize = usize::MAX;
 const MAX_DEDICATED_EBI_VALUES: usize = 15;
 
-// One full-message grammar drives both clause 7.7.9 disposition and clause
-// 7.7.10 cardinality. Conditional interface requirements are intentionally not
-// mixed into this classifier: a type/instance assigned anywhere in the
-// procedure table is syntactically known here, while the typed S2b projections
-// enforce S2b-specific presence, interface type, and correlation rules.
+// One message grammar drives both clause 7.7.9 disposition and clause 7.7.10
+// cardinality. It retains the full procedure-table shape while applying
+// explicit S2b applicability where the profile assigns an exact endpoint role;
+// typed projections enforce required presence, interface type, value semantics,
+// and correlation.
 //
 // Top-level rules come from TS 29.274 R18 Tables 7.1.1-1, 7.1.2-1,
 // 7.2.1-1, 7.2.2-1, 7.2.3-1, 7.2.4-1, 7.2.7-1, 7.2.8-1,
@@ -2878,7 +2918,9 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         direction: MessageDirection::Response,
         scope: ReceiveIeScope::TopLevel,
         ie_types: &[IE_TYPE_F_TEID],
-        instances: &[0, 1],
+        // Table 7.2.2-1 marks Sender F-TEID instance 0 as not needed on S2b;
+        // the PGW control endpoint for S2b is instance 1.
+        instances: &[1],
         max_occurrences: ONE,
     },
     ReceiveIeRule {
@@ -3665,15 +3707,32 @@ fn find_recovery_restart_counter(ies: &[TypedIe<'_>]) -> Option<u8> {
     })
 }
 
-fn find_sender_f_teid(ies: &[TypedIe<'_>]) -> Option<FullyQualifiedTeid> {
-    ies.iter().find_map(|ie| match &ie.value {
-        TypedIeValue::FullyQualifiedTeid(f_teid)
-            if ie.ie_type() == IE_TYPE_F_TEID && ie.instance == 0 =>
-        {
-            Some(f_teid.clone())
-        }
-        _ => None,
-    })
+fn find_pgw_control_f_teid(
+    ies: &[TypedIe<'_>],
+) -> Result<FullyQualifiedTeid, CreateSessionResponseSummaryError> {
+    let f_teid = ies
+        .iter()
+        .find_map(|ie| match &ie.value {
+            TypedIeValue::FullyQualifiedTeid(f_teid)
+                if ie.ie_type() == IE_TYPE_F_TEID && ie.instance == 1 =>
+            {
+                Some(f_teid)
+            }
+            _ => None,
+        })
+        .ok_or(CreateSessionResponseSummaryError::AcceptedResponseMissingPgwControlFTeid)?;
+    if f_teid.interface_type != INTERFACE_TYPE_S2B_PGW_GTP_C {
+        return Err(
+            CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch,
+        );
+    }
+    if f_teid.teid == 0 {
+        return Err(CreateSessionResponseSummaryError::AcceptedResponseZeroPgwControlFTeid);
+    }
+    if f_teid.ipv4.is_none() && f_teid.ipv6.is_none() {
+        return Err(CreateSessionResponseSummaryError::AcceptedResponseMalformedPgwControlFTeid);
+    }
+    Ok(f_teid.clone())
 }
 
 fn find_bearer_context_ebi(
@@ -3791,8 +3850,7 @@ fn project_create_session_response(
         find_cause_value(&view.ies).ok_or(CreateSessionResponseSummaryError::MissingCause)?;
 
     if is_accepted_create_session_cause(cause) {
-        let sender_f_teid = find_sender_f_teid(&view.ies)
-            .ok_or(CreateSessionResponseSummaryError::AcceptedResponseMissingSenderFTeid)?;
+        let pgw_control_f_teid = find_pgw_control_f_teid(&view.ies)?;
         let bearer_ebi = find_bearer_context_ebi(&view.ies)?;
         let bearer_user_plane_f_teid = find_bearer_context_s2b_u_f_teid(&view.ies)?;
         let paa = find_response_paa(&view.ies)?;
@@ -3803,7 +3861,7 @@ fn project_create_session_response(
                 response_teid,
                 sequence_number,
                 cause,
-                sender_f_teid,
+                pgw_control_f_teid,
                 bearer_ebi,
                 bearer_user_plane_f_teid,
                 paa,
@@ -3932,12 +3990,24 @@ fn validate_required_ies(
             if !is_accepted_create_session_cause(cause) {
                 return Ok(());
             }
-            require_ie_instance(
-                &view.ies,
-                IE_TYPE_F_TEID,
-                0,
-                "Create Session Response requires Sender F-TEID IE at instance 0",
-            )?;
+            find_pgw_control_f_teid(&view.ies).map_err(|error| {
+                let reason = match error {
+                    CreateSessionResponseSummaryError::AcceptedResponseMissingPgwControlFTeid => {
+                        "Create Session Response requires PGW S2b control F-TEID IE at instance 1"
+                    }
+                    CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch => {
+                        "Create Session Response PGW control F-TEID must use S2b PGW GTP-C interface type"
+                    }
+                    CreateSessionResponseSummaryError::AcceptedResponseZeroPgwControlFTeid => {
+                        "Create Session Response PGW control F-TEID must use a non-zero TEID"
+                    }
+                    CreateSessionResponseSummaryError::AcceptedResponseMalformedPgwControlFTeid => {
+                        "Create Session Response PGW control F-TEID requires an endpoint address"
+                    }
+                    _ => "Create Session Response PGW control F-TEID is invalid",
+                };
+                missing_ie_error(reason)
+            })?;
             require_ie_instance(
                 &view.ies,
                 IE_TYPE_BEARER_CONTEXT,
@@ -4256,7 +4326,7 @@ mod tests {
         match s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
             sequence_number: 0x0001_0203,
             response_teid: 0x0102_0304,
-            sender_f_teid: f_teid(32, 0x1111_2222, [192, 0, 2, 1]),
+            pgw_control_f_teid: f_teid(32, 0x1111_2222, [192, 0, 2, 1]),
             bearer_context: bearer_context(bearer_members),
             additional_ies,
         }) {
@@ -5017,7 +5087,7 @@ mod tests {
             ies: vec![
                 typed_ie(0, TypedIeValue::Cause(accepted_cause())),
                 typed_ie(
-                    0,
+                    1,
                     TypedIeValue::FullyQualifiedTeid(f_teid(32, 1, [192, 0, 2, 1])),
                 ),
                 typed_ie(
@@ -5052,6 +5122,56 @@ mod tests {
         assert_eq!(
             error.as_str(),
             "s2b_create_session_response_malformed_bearer_f_teid"
+        );
+    }
+
+    #[test]
+    fn accepted_create_session_summary_rejects_malformed_typed_pgw_control_f_teid() {
+        let view = S2bProcedureMessage {
+            header: Header::with_teid(CREATE_SESSION_RESPONSE, 0x0102_0304, 0x0001_0203),
+            procedure: Procedure::CreateSession,
+            direction: MessageDirection::Response,
+            ies: vec![
+                typed_ie(0, TypedIeValue::Cause(accepted_cause())),
+                typed_ie(
+                    1,
+                    TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+                        interface_type: INTERFACE_TYPE_S2B_PGW_GTP_C,
+                        teid: 0x1111_2222,
+                        ipv4: None,
+                        ipv6: None,
+                    }),
+                ),
+                typed_ie(
+                    0,
+                    TypedIeValue::BearerContext(bearer_context(vec![
+                        bearer_ebi(5),
+                        typed_ie(
+                            0,
+                            TypedIeValue::FullyQualifiedTeid(f_teid(
+                                INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                                0x1122_3344,
+                                [203, 0, 113, 1],
+                            )),
+                        ),
+                    ])),
+                ),
+            ],
+            raw_ies: &[],
+            tail: &[],
+        };
+
+        let error = match project_create_session_response(&view) {
+            Ok(summary) => panic!("unexpected summary: {summary:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            CreateSessionResponseSummaryError::AcceptedResponseMalformedPgwControlFTeid
+        );
+        assert_eq!(
+            error.as_str(),
+            "s2b_create_session_response_malformed_pgw_control_f_teid"
         );
     }
 

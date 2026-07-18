@@ -11,7 +11,8 @@ use opc_proto_gtpv2c::{
     S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerRequest, S2bModifyBearerResponse,
     S2bProfileBuildError, S2bUpdateBearerRequest, S2bUpdateBearerRequestContext,
     S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode, SelectionModeValue,
-    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_F_TEID,
+    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{DecodeContext, DecodeErrorCode, Encode, EncodeContext, ValidationLevel};
 
@@ -45,6 +46,15 @@ fn sender_f_teid(teid: u32) -> FullyQualifiedTeid {
         interface_type: 11,
         teid,
         ipv4: Some([192, 0, 2, 1]),
+        ipv6: None,
+    }
+}
+
+fn pgw_control_f_teid(teid: u32) -> FullyQualifiedTeid {
+    FullyQualifiedTeid {
+        interface_type: INTERFACE_TYPE_S2B_PGW_GTP_C,
+        teid,
+        ipv4: Some([192, 0, 2, 2]),
         ipv6: None,
     }
 }
@@ -168,15 +178,37 @@ fn create_session_response_builders_project_stable_summaries() {
     let accepted = s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
         sequence_number: 0x010204,
         response_teid: 0x5566_7788,
-        sender_f_teid: sender_f_teid(0x2030_4050),
+        pgw_control_f_teid: pgw_control_f_teid(0x2030_4050),
         bearer_context: accepted_bearer_context(6, 0x1122_3344),
         additional_ies: Vec::new(),
     })
     .expect("accepted response builds");
     let encoded_accepted = encode(&accepted);
-    let accepted_summary = match S2bMessage::decode(&encoded_accepted, procedure_context())
-        .expect("accepted response decodes")
-        .1
+    let decoded_accepted = S2bMessage::decode(
+        &encoded_accepted,
+        DecodeContext {
+            validation_level: ValidationLevel::Strict,
+            ..DecodeContext::default()
+        },
+    )
+    .expect("accepted response decodes structurally without S2b receive filtering")
+    .1;
+    let accepted_view = decoded_accepted.as_view().expect("typed accepted response");
+    let top_level_f_teids: Vec<_> = accepted_view
+        .ies
+        .iter()
+        .filter(|ie| ie.ie_type() == IE_TYPE_F_TEID)
+        .collect();
+    assert_eq!(top_level_f_teids.len(), 1);
+    assert_eq!(top_level_f_teids[0].instance, 1);
+    let TypedIeValue::FullyQualifiedTeid(control_endpoint) = &top_level_f_teids[0].value else {
+        panic!("profile-owned control endpoint must be typed");
+    };
+    assert_eq!(
+        control_endpoint.interface_type,
+        INTERFACE_TYPE_S2B_PGW_GTP_C
+    );
+    let accepted_summary = match decoded_accepted
         .create_session_response_summary()
         .expect("accepted response projects")
     {
@@ -186,6 +218,7 @@ fn create_session_response_builders_project_stable_summaries() {
         }
     };
     assert_eq!(accepted_summary.response_teid, 0x5566_7788);
+    assert_eq!(accepted_summary.pgw_control_f_teid.teid, 0x2030_4050);
     assert_eq!(accepted_summary.bearer_ebi.value, 6);
     assert_eq!(
         accepted_summary.bearer_user_plane_f_teid.interface_type,
@@ -215,6 +248,50 @@ fn create_session_response_builders_project_stable_summaries() {
     };
     assert_eq!(rejected_summary.response_teid, 0x5566_7788);
     assert_eq!(rejected_summary.cause, CauseValue::InvalidMessageFormat);
+}
+
+#[test]
+fn create_session_accepted_response_builder_rejects_invalid_control_endpoints() {
+    let invalid_endpoints = [
+        (
+            "wrong interface",
+            FullyQualifiedTeid {
+                interface_type: 11,
+                teid: 0x2030_4050,
+                ipv4: Some([192, 0, 2, 2]),
+                ipv6: None,
+            },
+        ),
+        (
+            "zero TEID",
+            FullyQualifiedTeid {
+                interface_type: INTERFACE_TYPE_S2B_PGW_GTP_C,
+                teid: 0,
+                ipv4: Some([192, 0, 2, 2]),
+                ipv6: None,
+            },
+        ),
+        (
+            "no address",
+            FullyQualifiedTeid {
+                interface_type: INTERFACE_TYPE_S2B_PGW_GTP_C,
+                teid: 0x2030_4050,
+                ipv4: None,
+                ipv6: None,
+            },
+        ),
+    ];
+
+    for (label, pgw_control_f_teid) in invalid_endpoints {
+        let result = s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
+            sequence_number: 0x010204,
+            response_teid: 0x5566_7788,
+            pgw_control_f_teid,
+            bearer_context: accepted_bearer_context(6, 0x1122_3344),
+            additional_ies: Vec::new(),
+        });
+        assert!(result.is_err(), "builder accepted {label}");
+    }
 }
 
 #[test]

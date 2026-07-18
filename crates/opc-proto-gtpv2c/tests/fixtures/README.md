@@ -140,10 +140,10 @@ reviewable without a binary viewer.
 | 4..7 | `01 02 03 04` | Header TEID (§5.1). |
 | 8..11 | `00 10 02 00` | Sequence number `0x001002`, spare 0 (§5.1). |
 | 12..17 | `02 00 02 00 10 00` | Cause IE TLIV/value: Request accepted, flags 0 (§8.2, §8.4). |
-| 18..21 | `57 00 09 00` | Sender F-TEID IE TLIV header (§8.2, §8.22). |
-| 22 | `8b` | F-TEID V4 flag set, interface type 11 (§8.22). |
-| 23..26 | `55 66 77 88` | Sender F-TEID TEID/GRE key (§8.22). |
-| 27..30 | `c0 00 02 01` | Sender F-TEID IPv4 `192.0.2.1` (documentation prefix; §8.22). |
+| 18..21 | `57 00 09 01` | PGW S2b control-plane F-TEID IE TLIV header, instance 1 (Table 7.2.2-1, §8.2, §8.22). |
+| 22 | `a0` | F-TEID V4 flag set, S2b PGW GTP-C interface type 32 (§8.22). |
+| 23..26 | `55 66 77 88` | PGW control-plane TEID (§8.22). |
+| 27..30 | `c0 00 02 01` | PGW control-plane IPv4 `192.0.2.1` (documentation prefix; §8.22). |
 | 31..39 | `4f 00 05 00 01 c6 33 64 07` | PAA IE TLIV/value: IPv4 `198.51.100.7` (§8.2, §8.14). |
 | 40..48 | `5d 00 05 00 49 00 01 00 05` | Bearer Context grouped IE containing nested EBI 5 (§8.2, §8.28, §8.8). |
 
