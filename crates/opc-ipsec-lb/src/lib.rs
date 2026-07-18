@@ -32,6 +32,7 @@ pub mod model;
 pub mod offload;
 pub mod ownership;
 pub mod ports;
+pub mod redirect;
 pub mod repin;
 pub mod selector;
 pub mod session;
@@ -77,6 +78,25 @@ pub use ownership::{
 };
 pub use ports::{
     OwnershipFencer, OwnershipSource, RePinAuditSink, SpiAllocator, SteeringBackend, VipAdvertiser,
+};
+pub use redirect::{
+    establish_ingress_redirect_client, establish_ingress_redirect_server,
+    ingress_redirect_client_tls_config, ingress_redirect_server_tls_config,
+    reconcile_ingress_redirect_client, reconcile_ingress_redirect_server,
+    rotate_ingress_redirect_client, rotate_ingress_redirect_server, DeliveredIngressRedirectPacket,
+    ForwardableIngressRedirectPacket, InMemoryIngressRedirectDatagram,
+    IngressRedirectAeadUsageStatus, IngressRedirectAuthenticationStatus,
+    IngressRedirectConfigError, IngressRedirectDatagram, IngressRedirectDatagramError,
+    IngressRedirectDeliveryReceiver, IngressRedirectEndpoint,
+    IngressRedirectEndpointMetricsSnapshot, IngressRedirectError, IngressRedirectInboundOutcome,
+    IngressRedirectMetricsSnapshot, IngressRedirectMtuBudget, IngressRedirectNotSentReason,
+    IngressRedirectOperation, IngressRedirectOperationOutcome, IngressRedirectPacketTooBigEvent,
+    IngressRedirectPacketTooBigReportError, IngressRedirectPacketTooBigReporter,
+    IngressRedirectPeerExpectation, IngressRedirectPeerManifest, IngressRedirectPeerSession,
+    IngressRedirectProfile, IngressRedirectProtectionEpoch, IngressRedirectReceiptCode,
+    IngressRedirectRotationStatus, IngressRedirectSecurityMode, RejectedIngressRedirectPacket,
+    UdpIngressRedirectDatagram, DEFAULT_INGRESS_REDIRECT_SECURITY_MODE,
+    INGRESS_REDIRECT_CONTROL_ALPN,
 };
 pub use repin::{
     ForwardingProof, OwnershipFence, OwnershipFenceGrant, OwnershipFenceRequest,

@@ -115,6 +115,75 @@ policy/dataplane behavior.
 
 ---
 
+## Current authenticated ingress-redirect foundation — 2026-07-18
+
+`opc-ipsec-lb` now implements the SDK portion of
+[issue #307](https://github.com/openpacketcore/openpacketcore-sdk/issues/307):
+a versioned, authenticated cross-node redirect boundary for already-observed
+IKE/ESP packets. Fresh SPIFFE mTLS handshakes authenticate an exact peer
+manifest and derive directional AES-256-GCM (default) or explicit
+HMAC-SHA-256 packet keys through a dedicated exporter context. The data format
+contains canonical destination ownership and public fencing metadata but no SA
+keys. Strict framing, mode binding, sender binding, replay windows, hop bounds,
+routing-domain admission, exact MTU accounting, bounded packet/byte queues,
+typed receipts, exact-datagram retries, committed receipt replay, mandatory
+packet-too-big feedback, hard authentication lifetimes, and bounded AES-GCM
+usage fail closed. Raw authenticated frames and cryptographic open/seal methods
+are crate-private. A peer session is permanently consumed by one endpoint; a
+fresh mTLS session is required after shutdown or failure.
+
+The receiver's only delivery authority is a fresh `FencedOwnershipCache`
+lookup plus exact packet reclassification, repeated at application dequeue.
+Endpoint-owned operation handles distinguish proven-not-sent, authenticated
+receipt, and unknown-delivery outcomes without making task cancellation an
+implicit transport cancellation. Receipt-cache admission never evicts a live
+entry: its authenticated capacity is reserved before cryptographic open, and
+saturation or commit failure sends no uncached receipt and publishes no effect.
+Committed entries expire at the retry horizon or either participating epoch,
+while queued delivery capabilities retain their independent epoch lifetime.
+Admission, materialization, stale capability, cache saturation, commit failure,
+and current/peak cache occupancy have separate metrics. Forwardable outcomes
+are opaque, one-shot capabilities rather than public packet containers.
+Graceful shutdown drains admitted operations and remains cancellation-safe;
+terminal receive failure resolves pending work. Every detached task uses the
+runtime captured at endpoint start, and packet-too-big work consumes the same
+bounded queue and absolute deadline as ordinary sends.
+
+Tests cover delivery, dequeue-time ownership invalidation, fresh non-owner
+forwarding, superseded and receiver-ahead generation evidence, stale committed
+views, terminal classification mismatch, cryptographic tamper before queue
+admission, two-node forwarding cycles, maximum MTU packets, non-evicting cache
+pressure and progress after expiry, exact cached rejection replay, commit
+failure with no effect, queued delivery beyond receipt expiry, queue
+saturation/closure, receipt loss/replay/expiry, dropped operation observers,
+outside-runtime operation starts, checked lifecycle-counter overflow, every
+adapter-send error, hung sends/reporters, bounded oversize feedback, absolute
+PTB deadlines, authenticated malformed exact-length frames, UDP truncation,
+Linux IPv4/IPv6 `DO` path-MTU socket policy, transient PMTU refresh failure,
+runtime PMTU shrink, cancellation-safe shutdown, committed-queue drain,
+generation-before-owner precedence, AES-GCM data/receipt shared budgets,
+peer-open and failed-authentication caps, RFC 4231 HMAC-SHA-256 vectors, and
+redaction. Control tests cover canonical peer negotiation, full mTLS exporter
+establishment and rotation, serialized lifecycle operations, live-previous and
+expired-pending handling, every logical two-phase failure boundary,
+cancellation before every initial-establishment await, final authentication
+expiry, ambiguous-outcome retention, reconciliation selection, and compile-time
+`Send` assertions for every public async control operation. The integration
+evidence rotates independent CA/leaf material A to B through overlapping trust
+and mixed endpoint epochs while sending bidirectional traffic in
+`crates/opc-ipsec-lb/tests/ingress_redirect_tls.rs`; wire, crypto, ownership,
+and transport evidence is colocated under
+`redirect::{tests,control::tests,transport::tests}` and
+`opc-ipsec-lb-ebpf-common`.
+
+This is an implemented SDK foundation, not production-deployment attestation.
+Credential issuance and revocation, peer membership, Kubernetes/CNI reachability,
+routing/BGP/VIP failover, packet capture/redirect attachment, ICMP policy,
+application ingress reinjection, and candidate-specific fault/performance
+qualification remain product and deployment responsibilities.
+
+---
+
 ## Historical EPC/untrusted-access hardening snapshot — T-8c57ecee (2026-06-28)
 
 This snapshot records the final EPC/untrusted-access SDK readiness pass after
