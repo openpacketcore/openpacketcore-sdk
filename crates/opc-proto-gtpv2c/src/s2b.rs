@@ -28,17 +28,19 @@ use crate::ie::typed::{
     decode_s2b_receive_ie_sequence_with_evidence, decode_typed_ie_sequence_with_evidence,
 };
 use crate::ie::{
-    encode_typed_ie_sequence, AccessPointName, BearerContext, Cause, CauseValue,
-    DuplicateIeEvidence, EpsBearerId, FullyQualifiedTeid, IpAddress, PdnAddressAllocation,
-    PortNumber, ProtocolConfigurationOptions, RatType, Recovery, SelectionMode, ServingNetwork,
-    TbcdDigits, TwanIdentifier, TwanIdentifierTimestamp, TypedIe, TypedIeValue, IE_TYPE_AMBR,
-    IE_TYPE_APCO, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS,
-    IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
-    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_IP_ADDRESS, IE_TYPE_LOAD_CONTROL_INFORMATION,
-    IE_TYPE_MEI, IE_TYPE_MSISDN, IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO,
-    IE_TYPE_PDN_TYPE, IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_PORT_NUMBER, IE_TYPE_RAT_TYPE,
-    IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK, IE_TYPE_TWAN_IDENTIFIER,
-    IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
+    encode_typed_ie_sequence, AccessPointName, AdditionalProtocolConfigurationOptions,
+    BearerContext, Cause, CauseValue, ChargingCharacteristics, DuplicateIeEvidence, EpsBearerId,
+    FullyQualifiedTeid, Indication, IpAddress, PdnAddressAllocation, PortNumber,
+    ProtocolConfigurationOptions, RanNasCause, RatType, Recovery, SelectionMode, ServingNetwork,
+    TbcdDigits, TraceInformation, TwanIdentifier, TwanIdentifierTimestamp, TypedIe, TypedIeValue,
+    IE_TYPE_AMBR, IE_TYPE_APCO, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT,
+    IE_TYPE_BEARER_QOS, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE, IE_TYPE_CHARGING_CHARACTERISTICS,
+    IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_INDICATION,
+    IE_TYPE_IP_ADDRESS, IE_TYPE_LOAD_CONTROL_INFORMATION, IE_TYPE_MEI, IE_TYPE_MSISDN,
+    IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE,
+    IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_PORT_NUMBER, IE_TYPE_RAN_NAS_CAUSE, IE_TYPE_RAT_TYPE,
+    IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK, IE_TYPE_TRACE_INFORMATION,
+    IE_TYPE_TWAN_IDENTIFIER, IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
 };
 use crate::{Message, OwnedMessage};
 
@@ -145,13 +147,297 @@ impl From<DecodeError> for S2bProfileBuildError {
     }
 }
 
+/// Identity fields for an S2b Create Session Request.
+///
+/// The variants make the TS 29.274 UICC-less emergency exception explicit.
+/// A normal request always carries IMSI; the emergency form carries MEI and an
+/// Indication value whose UIMSI flag is validated by the builder.
+///
+/// @spec 3GPP TS29274 R18 7.2.1 Table 7.2.1-1
+/// @req REQ-3GPP-TS29274-R18-S2B-CREATE-IDENTITY-001
+#[derive(Clone, PartialEq, Eq)]
+pub enum S2bCreateSessionIdentity {
+    /// IMSI-bearing subscriber identity, with optional terminal identity and
+    /// indication flags supplied by product policy.
+    Subscriber {
+        /// Subscriber IMSI encoded at instance 0.
+        imsi: TbcdDigits,
+        /// Optional MEI encoded at instance 0.
+        mei: Option<TbcdDigits>,
+        /// Optional Indication IE encoded at instance 0.
+        indication: Option<Indication>,
+    },
+    /// UICC-less emergency identity with no IMSI.
+    UiccLessEmergency {
+        /// Mandatory MEI encoded at instance 0.
+        mei: TbcdDigits,
+        /// Mandatory Indication IE whose UIMSI flag must be set.
+        indication: Indication,
+    },
+}
+
+impl S2bCreateSessionIdentity {
+    /// Construct the common IMSI-only identity form.
+    #[must_use]
+    pub fn subscriber(imsi: TbcdDigits) -> Self {
+        Self::Subscriber {
+            imsi,
+            mei: None,
+            indication: None,
+        }
+    }
+}
+
+impl fmt::Debug for S2bCreateSessionIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Subscriber {
+                imsi,
+                mei,
+                indication,
+            } => formatter
+                .debug_struct("S2bCreateSessionIdentity")
+                .field("kind", &"subscriber")
+                .field("imsi", imsi)
+                .field("mei", mei)
+                .field("indication", indication)
+                .finish(),
+            Self::UiccLessEmergency { mei, indication } => formatter
+                .debug_struct("S2bCreateSessionIdentity")
+                .field("kind", &"uicc_less_emergency")
+                .field("mei", mei)
+                .field("indication", indication)
+                .finish(),
+        }
+    }
+}
+
+/// MSISDN supplied to the ePDG by AAA/HSS subscription data.
+///
+/// The wrapper records the only S2b-applicable provenance and prevents an
+/// arbitrary locally invented number from being passed as an unlabelled field.
+///
+/// @spec 3GPP TS29274 R18 7.2.1 Table 7.2.1-1
+/// @req REQ-3GPP-TS29274-R18-S2B-CREATE-MSISDN-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bAaaProvidedMsisdn {
+    value: TbcdDigits,
+}
+
+impl S2bAaaProvidedMsisdn {
+    /// Mark an MSISDN as supplied by the S2b AAA/HSS authorization result.
+    #[must_use]
+    pub fn new(value: TbcdDigits) -> Self {
+        Self { value }
+    }
+
+    /// Return the typed digits for protocol processing.
+    #[must_use]
+    pub const fn value(&self) -> &TbcdDigits {
+        &self.value
+    }
+
+    fn into_value(self) -> TbcdDigits {
+        self.value
+    }
+}
+
+impl fmt::Debug for S2bAaaProvidedMsisdn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bAaaProvidedMsisdn")
+            .field("provenance", &"aaa_or_hss")
+            .field("digit_len", &self.value.digits.len())
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// NAT metadata for an S2b UE endpoint.
+///
+/// Product code declares whether NAT was observed. The SDK validates that a
+/// `Detected` decision carries at least one applicable encapsulation port.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum S2bUeNatTraversal {
+    /// NAT was not detected; no port IE is emitted.
+    NotDetected,
+    /// NAT was detected. UDP, TCP, or both observed encapsulation ports may be
+    /// carried; at least one must be present.
+    Detected {
+        /// UDP encapsulation port.
+        udp_port: Option<PortNumber>,
+        /// TCP encapsulation port.
+        tcp_port: Option<PortNumber>,
+    },
+}
+
+impl fmt::Debug for S2bUeNatTraversal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotDetected => formatter
+                .debug_struct("S2bUeNatTraversal")
+                .field("detected", &false)
+                .finish(),
+            Self::Detected { udp_port, tcp_port } => formatter
+                .debug_struct("S2bUeNatTraversal")
+                .field("detected", &true)
+                .field("udp_port_present", &udp_port.is_some())
+                .field("tcp_port_present", &tcp_port.is_some())
+                .finish(),
+        }
+    }
+}
+
+/// UE-side IKE tunnel endpoint carried by S2b session procedures.
+///
+/// This type never represents the ePDG endpoint. Create Session models the
+/// optional ePDG IKEv2 endpoint separately so its IP Address instance 3 cannot
+/// leak into Delete Session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct S2bUeEndpoint {
+    /// UE local IKE tunnel address.
+    pub local_ip: IpAddress,
+    /// Product-declared NAT and encapsulation-port state.
+    pub nat: S2bUeNatTraversal,
+}
+
+impl S2bUeEndpoint {
+    /// Construct a UE endpoint for which NAT was not detected.
+    #[must_use]
+    pub const fn without_nat(local_ip: IpAddress) -> Self {
+        Self {
+            local_ip,
+            nat: S2bUeNatTraversal::NotDetected,
+        }
+    }
+
+    /// Construct a NATed UE endpoint using UDP encapsulation.
+    #[must_use]
+    pub const fn with_udp_nat(local_ip: IpAddress, udp_port: PortNumber) -> Self {
+        Self {
+            local_ip,
+            nat: S2bUeNatTraversal::Detected {
+                udp_port: Some(udp_port),
+                tcp_port: None,
+            },
+        }
+    }
+
+    /// Construct a NATed UE endpoint using TCP encapsulation.
+    #[must_use]
+    pub const fn with_tcp_nat(local_ip: IpAddress, tcp_port: PortNumber) -> Self {
+        Self {
+            local_ip,
+            nat: S2bUeNatTraversal::Detected {
+                udp_port: None,
+                tcp_port: Some(tcp_port),
+            },
+        }
+    }
+
+    fn validate(self) -> Result<(), EncodeError> {
+        if matches!(
+            self.nat,
+            S2bUeNatTraversal::Detected {
+                udp_port: None,
+                tcp_port: None
+            }
+        ) {
+            return Err(EncodeError::new(EncodeErrorCode::Structural {
+                reason: "S2b NAT-detected UE endpoint requires a UDP or TCP encapsulation port",
+            })
+            .with_spec_ref(spec_ref()));
+        }
+        Ok(())
+    }
+
+    const fn udp_port(self) -> Option<PortNumber> {
+        match self.nat {
+            S2bUeNatTraversal::NotDetected => None,
+            S2bUeNatTraversal::Detected { udp_port, .. } => udp_port,
+        }
+    }
+
+    const fn tcp_port(self) -> Option<PortNumber> {
+        match self.nat {
+            S2bUeNatTraversal::NotDetected => None,
+            S2bUeNatTraversal::Detected { tcp_port, .. } => tcp_port,
+        }
+    }
+}
+
+impl fmt::Debug for S2bUeEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bUeEndpoint")
+            .field("local_ip", &self.local_ip)
+            .field("nat", &self.nat)
+            .finish()
+    }
+}
+
+/// Conditional S2b context for a Create Session Request.
+///
+/// Every field is a product-declared applicability decision. `ue_endpoint`
+/// being absent means local policy intentionally omitted the UE address; that
+/// is rejected for the UICC-less emergency identity form. The optional ePDG
+/// address is a distinct Fixed Broadband/local-policy IKEv2 endpoint role.
+///
+/// @spec 3GPP TS29274 R18 7.2.1 Table 7.2.1-1
+/// @req REQ-3GPP-TS29274-R18-S2B-CREATE-CONTEXT-001
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct S2bCreateSessionContext {
+    /// AAA/HSS-provided MSISDN at instance 0.
+    pub msisdn: Option<S2bAaaProvidedMsisdn>,
+    /// UE-originated PCO at instance 0.
+    pub pco: Option<ProtocolConfigurationOptions>,
+    /// UE-originated or ePDG-generated APCO at instance 0.
+    pub apco: Option<AdditionalProtocolConfigurationOptions>,
+    /// Peer-restart counter at instance 0 when first contacting the PGW.
+    pub recovery: Option<Recovery>,
+    /// Charging characteristics at instance 0 when charging policy applies.
+    pub charging_characteristics: Option<ChargingCharacteristics>,
+    /// PGW trace activation information at instance 0.
+    pub trace_information: Option<TraceInformation>,
+    /// WLAN Location Information at TWAN Identifier instance 1.
+    pub wlan_location: Option<TwanIdentifier>,
+    /// WLAN Location Timestamp at timestamp instance 0.
+    pub wlan_location_timestamp: Option<TwanIdentifierTimestamp>,
+    /// Optional UE local endpoint. Mandatory for UICC-less emergency attach.
+    pub ue_endpoint: Option<S2bUeEndpoint>,
+    /// Optional Fixed Broadband/local-policy ePDG IKEv2 endpoint at IP Address
+    /// instance 3. This is not a UE endpoint.
+    pub epdg_ikev2_endpoint: Option<IpAddress>,
+}
+
+impl fmt::Debug for S2bCreateSessionContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bCreateSessionContext")
+            .field("msisdn", &self.msisdn)
+            .field("pco_present", &self.pco.is_some())
+            .field("apco_present", &self.apco.is_some())
+            .field("recovery_present", &self.recovery.is_some())
+            .field(
+                "charging_characteristics_present",
+                &self.charging_characteristics.is_some(),
+            )
+            .field("trace_information", &self.trace_information)
+            .field("wlan_location", &self.wlan_location)
+            .field("wlan_location_timestamp", &self.wlan_location_timestamp)
+            .field("ue_endpoint", &self.ue_endpoint)
+            .field("epdg_ikev2_endpoint", &self.epdg_ikev2_endpoint)
+            .finish()
+    }
+}
+
 /// Input for building an S2b Production Profile v1 Create Session Request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bCreateSessionRequest<'a> {
     /// GTPv2-C sequence number.
     pub sequence_number: u32,
-    /// IMSI IE.
-    pub imsi: TbcdDigits,
+    /// Subscriber or UICC-less emergency identity fields.
+    pub identity: S2bCreateSessionIdentity,
     /// RAT Type IE.
     pub rat_type: RatType,
     /// Serving Network IE.
@@ -171,8 +457,29 @@ pub struct S2bCreateSessionRequest<'a> {
     /// Bearer Context IE containing at least an EBI member. A Create Session
     /// Request may also carry the ePDG S2b-U user-plane F-TEID here.
     pub bearer_context: BearerContext<'a>,
+    /// Typed conditional attach/session context.
+    pub context: S2bCreateSessionContext,
     /// Additional typed IEs to append after the mandatory profile-owned IEs.
     pub additional_ies: Vec<TypedIe<'a>>,
+}
+
+impl fmt::Debug for S2bCreateSessionRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bCreateSessionRequest")
+            .field("sequence_number", &self.sequence_number)
+            .field("identity", &self.identity)
+            .field("rat_type", &self.rat_type)
+            .field("serving_network", &"<redacted>")
+            .field("sender_f_teid", &self.sender_f_teid)
+            .field("apn", &self.apn)
+            .field("selection_mode", &self.selection_mode)
+            .field("paa", &self.paa)
+            .field("bearer_context", &self.bearer_context)
+            .field("context", &self.context)
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
 }
 
 /// Input for building an accepted S2b Production Profile v1 Create Session Response.
@@ -392,8 +699,46 @@ impl fmt::Display for S2bUeIpsecTunnelUpdateProjectionError {
 
 impl std::error::Error for S2bUeIpsecTunnelUpdateProjectionError {}
 
+/// Conditional S2b context for a Delete Session Request.
+///
+/// Unlike Create Session, the UE Local IP Address is mandatory on S2b. The
+/// release cause remains optional because forwarding it is subject to product
+/// policy; when present, its typed value can only be Diameter or IKEv2.
+///
+/// @spec 3GPP TS29274 R18 7.2.9.1 Table 7.2.9.1-1
+/// @req REQ-3GPP-TS29274-R18-S2B-DELETE-CONTEXT-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bDeleteSessionContext {
+    /// Optional Diameter or IKEv2 release cause at RAN/NAS Cause instance 0.
+    pub release_cause: Option<RanNasCause>,
+    /// Optional Indication flags at instance 0.
+    pub indication: Option<Indication>,
+    /// Optional UE-originated PCO at instance 0.
+    pub pco: Option<ProtocolConfigurationOptions>,
+    /// WLAN Location Information at TWAN Identifier instance 1.
+    pub wlan_location: Option<TwanIdentifier>,
+    /// WLAN Location Timestamp at timestamp instance 1.
+    pub wlan_location_timestamp: Option<TwanIdentifierTimestamp>,
+    /// Mandatory UE local endpoint and product-declared NAT state.
+    pub ue_endpoint: S2bUeEndpoint,
+}
+
+impl fmt::Debug for S2bDeleteSessionContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bDeleteSessionContext")
+            .field("release_cause", &self.release_cause)
+            .field("indication_present", &self.indication.is_some())
+            .field("pco_present", &self.pco.is_some())
+            .field("wlan_location", &self.wlan_location)
+            .field("wlan_location_timestamp", &self.wlan_location_timestamp)
+            .field("ue_endpoint", &self.ue_endpoint)
+            .finish()
+    }
+}
+
 /// Input for building an S2b Production Profile v1 Delete Session Request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S2bDeleteSessionRequest<'a> {
     /// GTPv2-C sequence number.
     pub sequence_number: u32,
@@ -401,9 +746,149 @@ pub struct S2bDeleteSessionRequest<'a> {
     pub teid: u32,
     /// Linked EPS Bearer ID IE.
     pub linked_ebi: EpsBearerId,
+    /// Typed S2b release, endpoint, and optional location context.
+    pub context: S2bDeleteSessionContext,
     /// Additional typed IEs to append after linked EBI.
     pub additional_ies: Vec<TypedIe<'a>>,
 }
+
+impl fmt::Debug for S2bDeleteSessionRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bDeleteSessionRequest")
+            .field("sequence_number", &self.sequence_number)
+            .field("teid", &"<redacted>")
+            .field("linked_ebi", &self.linked_ebi)
+            .field("context", &self.context)
+            .field("additional_ie_count", &self.additional_ies.len())
+            .finish()
+    }
+}
+
+/// Typed conditional context projected from a received S2b Create Session Request.
+///
+/// MSISDN is peer-asserted at this boundary; its AAA/HSS provenance is a
+/// sender-side application fact and is therefore not reconstructed from wire
+/// bytes. All sensitive members retain redaction-safe Debug implementations.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bCreateSessionContextSummary {
+    /// Peer-supplied MSISDN at instance 0.
+    pub msisdn: Option<TbcdDigits>,
+    /// Optional MEI at instance 0.
+    pub mei: Option<TbcdDigits>,
+    /// Optional Indication IE at instance 0.
+    pub indication: Option<Indication>,
+    /// Optional PCO at instance 0.
+    pub pco: Option<ProtocolConfigurationOptions>,
+    /// Optional APCO at instance 0.
+    pub apco: Option<AdditionalProtocolConfigurationOptions>,
+    /// Optional Recovery IE at instance 0.
+    pub recovery: Option<Recovery>,
+    /// Optional Charging Characteristics at instance 0.
+    pub charging_characteristics: Option<ChargingCharacteristics>,
+    /// Optional Trace Information at instance 0.
+    pub trace_information: Option<TraceInformation>,
+    /// Optional WLAN Location Information at TWAN Identifier instance 1.
+    pub wlan_location: Option<TwanIdentifier>,
+    /// Optional WLAN Location Timestamp at timestamp instance 0.
+    pub wlan_location_timestamp: Option<TwanIdentifierTimestamp>,
+    /// Optional UE endpoint reconstructed from IP Address instance 0 and its
+    /// procedure-specific port instances.
+    pub ue_endpoint: Option<S2bUeEndpoint>,
+    /// Optional ePDG IKEv2 endpoint from IP Address instance 3.
+    pub epdg_ikev2_endpoint: Option<IpAddress>,
+}
+
+impl fmt::Debug for S2bCreateSessionContextSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bCreateSessionContextSummary")
+            .field("msisdn", &self.msisdn)
+            .field("mei", &self.mei)
+            .field("indication_present", &self.indication.is_some())
+            .field("pco_present", &self.pco.is_some())
+            .field("apco_present", &self.apco.is_some())
+            .field("recovery_present", &self.recovery.is_some())
+            .field(
+                "charging_characteristics_present",
+                &self.charging_characteristics.is_some(),
+            )
+            .field("trace_information", &self.trace_information)
+            .field("wlan_location", &self.wlan_location)
+            .field("wlan_location_timestamp", &self.wlan_location_timestamp)
+            .field("ue_endpoint", &self.ue_endpoint)
+            .field("epdg_ikev2_endpoint", &self.epdg_ikev2_endpoint)
+            .finish()
+    }
+}
+
+/// Typed conditional context projected from a received S2b Delete Session Request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bDeleteSessionContextSummary {
+    /// Optional Diameter or IKEv2 release cause at instance 0.
+    pub release_cause: Option<RanNasCause>,
+    /// Optional Indication IE at instance 0.
+    pub indication: Option<Indication>,
+    /// Optional PCO at instance 0.
+    pub pco: Option<ProtocolConfigurationOptions>,
+    /// Optional WLAN Location Information at TWAN Identifier instance 1.
+    pub wlan_location: Option<TwanIdentifier>,
+    /// Optional WLAN Location Timestamp at timestamp instance 1.
+    pub wlan_location_timestamp: Option<TwanIdentifierTimestamp>,
+    /// Mandatory UE endpoint reconstructed with Delete Session port instances.
+    pub ue_endpoint: S2bUeEndpoint,
+}
+
+impl fmt::Debug for S2bDeleteSessionContextSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bDeleteSessionContextSummary")
+            .field("release_cause", &self.release_cause)
+            .field("indication_present", &self.indication.is_some())
+            .field("pco_present", &self.pco.is_some())
+            .field("wlan_location", &self.wlan_location)
+            .field("wlan_location_timestamp", &self.wlan_location_timestamp)
+            .field("ue_endpoint", &self.ue_endpoint)
+            .finish()
+    }
+}
+
+/// Stable failure returned by S2b Create/Delete Session context projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S2bSessionContextProjectionError {
+    /// The message is not a Create Session Request.
+    NotCreateSessionRequest,
+    /// The message is not a Delete Session Request.
+    NotDeleteSessionRequest,
+    /// A Create Session port exists without UE Local IP Address instance 0.
+    CreatePortWithoutLocalIp,
+    /// A UICC-less emergency Create Session omitted UE Local IP Address.
+    EmergencyWithoutLocalIp,
+    /// Delete Session omitted its mandatory UE Local IP Address instance 0.
+    DeleteMissingLocalIp,
+}
+
+impl S2bSessionContextProjectionError {
+    /// Return a stable machine-readable error code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotCreateSessionRequest => "gtpv2c_s2b_context_not_create_session_request",
+            Self::NotDeleteSessionRequest => "gtpv2c_s2b_context_not_delete_session_request",
+            Self::CreatePortWithoutLocalIp => "gtpv2c_s2b_create_session_port_without_local_ip",
+            Self::EmergencyWithoutLocalIp => "gtpv2c_s2b_create_session_emergency_without_local_ip",
+            Self::DeleteMissingLocalIp => "gtpv2c_s2b_delete_session_local_ip_missing",
+        }
+    }
+}
+
+impl fmt::Display for S2bSessionContextProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for S2bSessionContextProjectionError {}
 
 /// Input for building an S2b Production Profile v1 Delete Session Response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,6 +944,22 @@ pub fn s2b_echo_response(
 pub fn s2b_create_session_request(
     request: S2bCreateSessionRequest<'_>,
 ) -> S2bProfileBuildResult<OwnedMessage> {
+    let emergency_identity = matches!(
+        &request.identity,
+        S2bCreateSessionIdentity::UiccLessEmergency { .. }
+    );
+    if emergency_identity
+        && request
+            .additional_ies
+            .iter()
+            .any(|ie| ie.ie_type() == IE_TYPE_IMSI)
+    {
+        return Err(EncodeError::new(EncodeErrorCode::Structural {
+            reason: "S2b UICC-less emergency Create Session must not inject IMSI through additional IEs",
+        })
+        .with_spec_ref(spec_ref())
+        .into());
+    }
     if request
         .additional_ies
         .iter()
@@ -470,21 +971,156 @@ pub fn s2b_create_session_request(
         .with_spec_ref(spec_ref())
         .into());
     }
-    let mut ies = vec![
-        typed_ie(0, TypedIeValue::Imsi(request.imsi)),
-        typed_ie(0, TypedIeValue::RatType(request.rat_type)),
-        typed_ie(0, TypedIeValue::ServingNetwork(request.serving_network)),
-        typed_ie(0, TypedIeValue::FullyQualifiedTeid(request.sender_f_teid)),
-        typed_ie(0, TypedIeValue::AccessPointName(request.apn)),
-        typed_ie(0, TypedIeValue::SelectionMode(request.selection_mode)),
-        typed_ie(0, TypedIeValue::PdnAddressAllocation(request.paa)),
-        typed_ie(0, TypedIeValue::BearerContext(request.bearer_context)),
-    ];
+    if request
+        .additional_ies
+        .iter()
+        .any(|ie| !is_allowed_create_session_additional_ie(ie))
+    {
+        return Err(EncodeError::new(EncodeErrorCode::Structural {
+            reason: "S2b Create Session Request additional IEs must use procedure-applicable type/instance pairs and must not bypass profile-owned identity, endpoint, charging, trace, location, PCO/APCO, or recovery fields",
+        })
+        .with_spec_ref(spec_ref())
+        .into());
+    }
+
+    if emergency_identity && request.context.ue_endpoint.is_none() {
+        return Err(EncodeError::new(EncodeErrorCode::Structural {
+            reason: "S2b UICC-less emergency Create Session requires UE Local IP Address",
+        })
+        .with_spec_ref(spec_ref())
+        .into());
+    }
+    if let Some(endpoint) = request.context.ue_endpoint {
+        endpoint.validate()?;
+    }
+
+    let mut ies = Vec::with_capacity(request.additional_ies.len().saturating_add(24));
+    let (mei, indication) = match request.identity {
+        S2bCreateSessionIdentity::Subscriber {
+            imsi,
+            mei,
+            indication,
+        } => {
+            ies.push(typed_ie(0, TypedIeValue::Imsi(imsi)));
+            (mei, indication)
+        }
+        S2bCreateSessionIdentity::UiccLessEmergency { mei, indication } => {
+            if !indication_has_uimsi(&indication) {
+                return Err(EncodeError::new(EncodeErrorCode::Structural {
+                    reason: "S2b UICC-less emergency Create Session requires UIMSI Indication",
+                })
+                .with_spec_ref(spec_ref())
+                .into());
+            }
+            (Some(mei), Some(indication))
+        }
+    };
+    if let Some(msisdn) = request.context.msisdn {
+        ies.push(typed_ie(0, TypedIeValue::Msisdn(msisdn.into_value())));
+    }
+    if let Some(mei) = mei {
+        ies.push(typed_ie(0, TypedIeValue::Mei(mei)));
+    }
+    ies.push(typed_ie(
+        0,
+        TypedIeValue::ServingNetwork(request.serving_network),
+    ));
+    ies.push(typed_ie(0, TypedIeValue::RatType(request.rat_type)));
+    if let Some(indication) = indication {
+        ies.push(typed_ie(0, TypedIeValue::Indication(indication)));
+    }
+    ies.push(typed_ie(
+        0,
+        TypedIeValue::FullyQualifiedTeid(request.sender_f_teid),
+    ));
+    ies.push(typed_ie(0, TypedIeValue::AccessPointName(request.apn)));
+    ies.push(typed_ie(
+        0,
+        TypedIeValue::SelectionMode(request.selection_mode),
+    ));
+    ies.push(typed_ie(0, TypedIeValue::PdnAddressAllocation(request.paa)));
+    if let Some(pco) = request.context.pco {
+        ies.push(typed_ie(0, TypedIeValue::ProtocolConfigurationOptions(pco)));
+    }
+    ies.push(typed_ie(
+        0,
+        TypedIeValue::BearerContext(request.bearer_context),
+    ));
+    if let Some(trace_information) = request.context.trace_information {
+        ies.push(typed_ie(
+            0,
+            TypedIeValue::TraceInformation(trace_information),
+        ));
+    }
+    if let Some(recovery) = request.context.recovery {
+        ies.push(typed_ie(0, TypedIeValue::Recovery(recovery)));
+    }
+    if let Some(charging_characteristics) = request.context.charging_characteristics {
+        ies.push(typed_ie(
+            0,
+            TypedIeValue::ChargingCharacteristics(charging_characteristics),
+        ));
+    }
+    if let Some(endpoint) = request.context.ue_endpoint {
+        ies.push(typed_ie(0, TypedIeValue::IpAddress(endpoint.local_ip)));
+        if let Some(port) = endpoint.udp_port() {
+            ies.push(typed_ie(0, TypedIeValue::PortNumber(port)));
+        }
+    }
+    if let Some(endpoint) = request.context.epdg_ikev2_endpoint {
+        ies.push(typed_ie(3, TypedIeValue::IpAddress(endpoint)));
+    }
+    if let Some(location) = request.context.wlan_location {
+        ies.push(typed_ie(1, TypedIeValue::TwanIdentifier(location)));
+    }
+    if let Some(timestamp) = request.context.wlan_location_timestamp {
+        ies.push(typed_ie(
+            0,
+            TypedIeValue::TwanIdentifierTimestamp(timestamp),
+        ));
+    }
+    if let Some(apco) = request.context.apco {
+        ies.push(typed_ie(
+            0,
+            TypedIeValue::AdditionalProtocolConfigurationOptions(apco),
+        ));
+    }
+    if let Some(endpoint) = request.context.ue_endpoint {
+        if let Some(port) = endpoint.tcp_port() {
+            ies.push(typed_ie(2, TypedIeValue::PortNumber(port)));
+        }
+    }
     ies.extend(request.additional_ies);
     build_s2b_profile_message(
         Header::with_teid(CREATE_SESSION_REQUEST, 0, request.sequence_number),
         ies,
     )
+}
+
+fn is_allowed_create_session_additional_ie(ie: &TypedIe<'_>) -> bool {
+    // Preserve the established duplicate-IMSI validation contract: instance 0
+    // reaches the canonical builder's DuplicateIe check. Other instances are
+    // still blocked rather than being silently discarded from builder input.
+    if ie.ie_type() == IE_TYPE_IMSI {
+        return additional_ie_wire_instance(ie) == 0
+            && is_procedure_applicable_top_level_additional_ie(Procedure::CreateSession, ie);
+    }
+    !matches!(
+        ie.ie_type(),
+        IE_TYPE_MSISDN
+            | IE_TYPE_MEI
+            | IE_TYPE_INDICATION
+            | IE_TYPE_PCO
+            | IE_TYPE_APCO
+            | IE_TYPE_RECOVERY
+            | IE_TYPE_IP_ADDRESS
+            | IE_TYPE_PORT_NUMBER
+            | IE_TYPE_CHARGING_CHARACTERISTICS
+            | IE_TYPE_TRACE_INFORMATION
+            | IE_TYPE_TWAN_IDENTIFIER
+            | IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP
+            | IE_TYPE_PDN_TYPE
+    ) && is_procedure_applicable_top_level_additional_ie(Procedure::CreateSession, ie)
 }
 
 /// Build an accepted S2b Production Profile v1 Create Session Response.
@@ -672,7 +1308,53 @@ pub fn s2b_modify_bearer_response(
 pub fn s2b_delete_session_request(
     request: S2bDeleteSessionRequest<'_>,
 ) -> S2bProfileBuildResult<OwnedMessage> {
+    if request.teid == 0 {
+        return Err(EncodeError::new(EncodeErrorCode::Structural {
+            reason: "S2b Delete Session Request requires a non-zero header TEID",
+        })
+        .with_spec_ref(spec_ref())
+        .into());
+    }
+    request.context.ue_endpoint.validate()?;
+    if request
+        .additional_ies
+        .iter()
+        .any(|ie| !is_allowed_delete_session_additional_ie(ie))
+    {
+        return Err(EncodeError::new(EncodeErrorCode::Structural {
+            reason: "S2b Delete Session Request additional IEs must use procedure-applicable type/instance pairs and must not bypass profile-owned linked EBI, release, endpoint, location, indication, or PCO fields",
+        })
+        .with_spec_ref(spec_ref())
+        .into());
+    }
+
     let mut ies = vec![typed_ie(0, TypedIeValue::EpsBearerId(request.linked_ebi))];
+    if let Some(indication) = request.context.indication {
+        ies.push(typed_ie(0, TypedIeValue::Indication(indication)));
+    }
+    if let Some(pco) = request.context.pco {
+        ies.push(typed_ie(0, TypedIeValue::ProtocolConfigurationOptions(pco)));
+    }
+    if let Some(release_cause) = request.context.release_cause {
+        ies.push(typed_ie(0, TypedIeValue::RanNasCause(release_cause)));
+    }
+    if let Some(location) = request.context.wlan_location {
+        ies.push(typed_ie(1, TypedIeValue::TwanIdentifier(location)));
+    }
+    if let Some(timestamp) = request.context.wlan_location_timestamp {
+        ies.push(typed_ie(
+            1,
+            TypedIeValue::TwanIdentifierTimestamp(timestamp),
+        ));
+    }
+    let endpoint = request.context.ue_endpoint;
+    ies.push(typed_ie(0, TypedIeValue::IpAddress(endpoint.local_ip)));
+    if let Some(port) = endpoint.udp_port() {
+        ies.push(typed_ie(0, TypedIeValue::PortNumber(port)));
+    }
+    if let Some(port) = endpoint.tcp_port() {
+        ies.push(typed_ie(1, TypedIeValue::PortNumber(port)));
+    }
     ies.extend(request.additional_ies);
     build_s2b_profile_message(
         Header::with_teid(
@@ -682,6 +1364,40 @@ pub fn s2b_delete_session_request(
         ),
         ies,
     )
+}
+
+fn is_allowed_delete_session_additional_ie(ie: &TypedIe<'_>) -> bool {
+    !matches!(
+        ie.ie_type(),
+        IE_TYPE_EBI
+            | IE_TYPE_INDICATION
+            | IE_TYPE_PCO
+            | IE_TYPE_RAN_NAS_CAUSE
+            | IE_TYPE_IP_ADDRESS
+            | IE_TYPE_PORT_NUMBER
+            | IE_TYPE_TWAN_IDENTIFIER
+            | IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP
+    ) && is_procedure_applicable_top_level_additional_ie(Procedure::DeleteSession, ie)
+}
+
+fn is_procedure_applicable_top_level_additional_ie(procedure: Procedure, ie: &TypedIe<'_>) -> bool {
+    matches!(
+        receive_ie_disposition(
+            procedure,
+            MessageDirection::Request,
+            Some(ReceiveIeScope::TopLevel),
+            ie.ie_type(),
+            additional_ie_wire_instance(ie),
+        ),
+        ReceiveIeDisposition::AllowedKnown | ReceiveIeDisposition::PreserveUnknown
+    )
+}
+
+fn additional_ie_wire_instance(ie: &TypedIe<'_>) -> u8 {
+    match &ie.value {
+        TypedIeValue::Raw(raw) => raw.instance & 0x0f,
+        _ => ie.instance & 0x0f,
+    }
 }
 
 /// Build an S2b Production Profile v1 Delete Session Response.
@@ -2458,6 +3174,30 @@ impl<'a> S2bProcedureMessage<'a> {
         contains_ie(&self.ies, ie_type)
     }
 
+    /// Project the conditional S2b Create Session context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`S2bSessionContextProjectionError`] when this is not a Create
+    /// Session Request or its endpoint/emergency cross-fields are incomplete.
+    pub fn create_session_context(
+        &self,
+    ) -> Result<S2bCreateSessionContextSummary, S2bSessionContextProjectionError> {
+        project_create_session_context(self)
+    }
+
+    /// Project the conditional S2b Delete Session context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`S2bSessionContextProjectionError`] when this is not a Delete
+    /// Session Request or its mandatory UE local endpoint is absent.
+    pub fn delete_session_context(
+        &self,
+    ) -> Result<S2bDeleteSessionContextSummary, S2bSessionContextProjectionError> {
+        project_delete_session_context(self)
+    }
+
     /// Project this view as an accepted or rejected Create Session Response.
     ///
     /// # Errors
@@ -3083,11 +3823,14 @@ const KNOWN_RECEIVE_IE_TYPES: &[u8] = &[
     IE_TYPE_F_TEID,
     IE_TYPE_BEARER_CONTEXT,
     IE_TYPE_CHARGING_ID,
+    IE_TYPE_CHARGING_CHARACTERISTICS,
+    IE_TYPE_TRACE_INFORMATION,
     IE_TYPE_APN_RESTRICTION,
     IE_TYPE_SELECTION_MODE,
     IE_TYPE_APCO,
     IE_TYPE_PORT_NUMBER,
     IE_TYPE_TWAN_IDENTIFIER,
+    IE_TYPE_RAN_NAS_CAUSE,
     IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
     IE_TYPE_OVERLOAD_CONTROL_INFORMATION,
     IE_TYPE_LOAD_CONTROL_INFORMATION,
@@ -3151,6 +3894,46 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
             IE_TYPE_APCO,
             IE_TYPE_RECOVERY,
         ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_CHARGING_CHARACTERISTICS, IE_TYPE_TRACE_INFORMATION],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_IP_ADDRESS],
+        instances: &[0, 3],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_PORT_NUMBER],
+        instances: &[0, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_TWAN_IDENTIFIER],
+        instances: &[1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP],
         instances: &[0],
         max_occurrences: ONE,
     },
@@ -3356,6 +4139,30 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
             IE_TYPE_F_TEID,
         ],
         instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_RAN_NAS_CAUSE, IE_TYPE_IP_ADDRESS],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_PORT_NUMBER],
+        instances: &[0, 1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_TWAN_IDENTIFIER, IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP],
+        instances: &[1],
         max_occurrences: ONE,
     },
     ReceiveIeRule {
@@ -3914,20 +4721,23 @@ fn contains_ie_instance(ies: &[TypedIe<'_>], ie_type: u8, instance: u8) -> bool 
 }
 
 fn contains_uimsi_indication(ies: &[TypedIe<'_>]) -> bool {
-    const UIMSI_FLAG_OCTET_INDEX: usize = 1;
-    const UIMSI_FLAG_MASK: u8 = 0x40;
-
     ies.iter().any(|ie| {
         ie.instance == 0
             && matches!(
                 &ie.value,
-                TypedIeValue::Indication(indication)
-                    if indication
-                        .flags
-                        .get(UIMSI_FLAG_OCTET_INDEX)
-                        .is_some_and(|flags| flags & UIMSI_FLAG_MASK != 0)
+                TypedIeValue::Indication(indication) if indication_has_uimsi(indication)
             )
     })
+}
+
+fn indication_has_uimsi(indication: &Indication) -> bool {
+    const UIMSI_FLAG_OCTET_INDEX: usize = 1;
+    const UIMSI_FLAG_MASK: u8 = 0x40;
+
+    indication
+        .flags
+        .get(UIMSI_FLAG_OCTET_INDEX)
+        .is_some_and(|flags| flags & UIMSI_FLAG_MASK != 0)
 }
 
 fn contains_create_session_identity(ies: &[TypedIe<'_>]) -> bool {
@@ -4035,6 +4845,154 @@ fn find_response_pco(ies: &[TypedIe<'_>]) -> Option<ProtocolConfigurationOptions
             Some(pco.clone())
         }
         _ => None,
+    })
+}
+
+fn find_ie_value<'a, 'b>(
+    ies: &'b [TypedIe<'a>],
+    ie_type: u8,
+    instance: u8,
+) -> Option<&'b TypedIeValue<'a>> {
+    ies.iter()
+        .find(|ie| ie.ie_type() == ie_type && ie.instance == instance)
+        .map(|ie| &ie.value)
+}
+
+fn project_ue_endpoint(
+    ies: &[TypedIe<'_>],
+    udp_instance: u8,
+    tcp_instance: u8,
+) -> Option<S2bUeEndpoint> {
+    let local_ip = match find_ie_value(ies, IE_TYPE_IP_ADDRESS, 0) {
+        Some(TypedIeValue::IpAddress(value)) => Some(*value),
+        _ => None,
+    }?;
+    let udp_port = match find_ie_value(ies, IE_TYPE_PORT_NUMBER, udp_instance) {
+        Some(TypedIeValue::PortNumber(value)) => Some(*value),
+        _ => None,
+    };
+    let tcp_port = match find_ie_value(ies, IE_TYPE_PORT_NUMBER, tcp_instance) {
+        Some(TypedIeValue::PortNumber(value)) => Some(*value),
+        _ => None,
+    };
+    let nat = if udp_port.is_some() || tcp_port.is_some() {
+        S2bUeNatTraversal::Detected { udp_port, tcp_port }
+    } else {
+        S2bUeNatTraversal::NotDetected
+    };
+    Some(S2bUeEndpoint { local_ip, nat })
+}
+
+fn project_create_session_context(
+    view: &S2bProcedureMessage<'_>,
+) -> Result<S2bCreateSessionContextSummary, S2bSessionContextProjectionError> {
+    if view.procedure != Procedure::CreateSession || view.direction != MessageDirection::Request {
+        return Err(S2bSessionContextProjectionError::NotCreateSessionRequest);
+    }
+    let has_udp_port = contains_ie_instance(&view.ies, IE_TYPE_PORT_NUMBER, 0);
+    let has_tcp_port = contains_ie_instance(&view.ies, IE_TYPE_PORT_NUMBER, 2);
+    let ue_endpoint = project_ue_endpoint(&view.ies, 0, 2);
+    if (has_udp_port || has_tcp_port) && ue_endpoint.is_none() {
+        return Err(S2bSessionContextProjectionError::CreatePortWithoutLocalIp);
+    }
+    if !contains_ie_instance(&view.ies, IE_TYPE_IMSI, 0) && ue_endpoint.is_none() {
+        return Err(S2bSessionContextProjectionError::EmergencyWithoutLocalIp);
+    }
+
+    Ok(S2bCreateSessionContextSummary {
+        msisdn: match find_ie_value(&view.ies, IE_TYPE_MSISDN, 0) {
+            Some(TypedIeValue::Msisdn(value)) => Some(value.clone()),
+            _ => None,
+        },
+        mei: match find_ie_value(&view.ies, IE_TYPE_MEI, 0) {
+            Some(TypedIeValue::Mei(value)) => Some(value.clone()),
+            _ => None,
+        },
+        indication: match find_ie_value(&view.ies, IE_TYPE_INDICATION, 0) {
+            Some(TypedIeValue::Indication(value)) => Some(value.clone()),
+            _ => None,
+        },
+        pco: match find_ie_value(&view.ies, IE_TYPE_PCO, 0) {
+            Some(TypedIeValue::ProtocolConfigurationOptions(value)) => Some(value.clone()),
+            _ => None,
+        },
+        apco: match find_ie_value(&view.ies, IE_TYPE_APCO, 0) {
+            Some(TypedIeValue::AdditionalProtocolConfigurationOptions(value)) => {
+                Some(value.clone())
+            }
+            _ => None,
+        },
+        recovery: match find_ie_value(&view.ies, IE_TYPE_RECOVERY, 0) {
+            Some(TypedIeValue::Recovery(value)) => Some(*value),
+            _ => None,
+        },
+        charging_characteristics: match find_ie_value(
+            &view.ies,
+            IE_TYPE_CHARGING_CHARACTERISTICS,
+            0,
+        ) {
+            Some(TypedIeValue::ChargingCharacteristics(value)) => Some(*value),
+            _ => None,
+        },
+        trace_information: match find_ie_value(&view.ies, IE_TYPE_TRACE_INFORMATION, 0) {
+            Some(TypedIeValue::TraceInformation(value)) => Some(value.clone()),
+            _ => None,
+        },
+        wlan_location: match find_ie_value(&view.ies, IE_TYPE_TWAN_IDENTIFIER, 1) {
+            Some(TypedIeValue::TwanIdentifier(value)) => Some(value.clone()),
+            _ => None,
+        },
+        wlan_location_timestamp: match find_ie_value(
+            &view.ies,
+            IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
+            0,
+        ) {
+            Some(TypedIeValue::TwanIdentifierTimestamp(value)) => Some(*value),
+            _ => None,
+        },
+        ue_endpoint,
+        epdg_ikev2_endpoint: match find_ie_value(&view.ies, IE_TYPE_IP_ADDRESS, 3) {
+            Some(TypedIeValue::IpAddress(value)) => Some(*value),
+            _ => None,
+        },
+    })
+}
+
+fn project_delete_session_context(
+    view: &S2bProcedureMessage<'_>,
+) -> Result<S2bDeleteSessionContextSummary, S2bSessionContextProjectionError> {
+    if view.procedure != Procedure::DeleteSession || view.direction != MessageDirection::Request {
+        return Err(S2bSessionContextProjectionError::NotDeleteSessionRequest);
+    }
+    let ue_endpoint = project_ue_endpoint(&view.ies, 0, 1)
+        .ok_or(S2bSessionContextProjectionError::DeleteMissingLocalIp)?;
+
+    Ok(S2bDeleteSessionContextSummary {
+        release_cause: match find_ie_value(&view.ies, IE_TYPE_RAN_NAS_CAUSE, 0) {
+            Some(TypedIeValue::RanNasCause(value)) => Some(*value),
+            _ => None,
+        },
+        indication: match find_ie_value(&view.ies, IE_TYPE_INDICATION, 0) {
+            Some(TypedIeValue::Indication(value)) => Some(value.clone()),
+            _ => None,
+        },
+        pco: match find_ie_value(&view.ies, IE_TYPE_PCO, 0) {
+            Some(TypedIeValue::ProtocolConfigurationOptions(value)) => Some(value.clone()),
+            _ => None,
+        },
+        wlan_location: match find_ie_value(&view.ies, IE_TYPE_TWAN_IDENTIFIER, 1) {
+            Some(TypedIeValue::TwanIdentifier(value)) => Some(value.clone()),
+            _ => None,
+        },
+        wlan_location_timestamp: match find_ie_value(
+            &view.ies,
+            IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
+            1,
+        ) {
+            Some(TypedIeValue::TwanIdentifierTimestamp(value)) => Some(*value),
+            _ => None,
+        },
+        ue_endpoint,
     })
 }
 
@@ -4293,6 +5251,21 @@ fn validate_required_ies(
                 0,
                 "Create Session Request requires Bearer Context IE at instance 0",
             )?;
+            if (contains_ie_instance(&view.ies, IE_TYPE_PORT_NUMBER, 0)
+                || contains_ie_instance(&view.ies, IE_TYPE_PORT_NUMBER, 2))
+                && !contains_ie_instance(&view.ies, IE_TYPE_IP_ADDRESS, 0)
+            {
+                return Err(missing_ie_error(
+                    "S2b Create Session UE UDP/TCP Port requires UE Local IP Address at instance 0",
+                ));
+            }
+            if !contains_ie_instance(&view.ies, IE_TYPE_IMSI, 0)
+                && !contains_ie_instance(&view.ies, IE_TYPE_IP_ADDRESS, 0)
+            {
+                return Err(missing_ie_error(
+                    "S2b UICC-less emergency Create Session requires UE Local IP Address at instance 0",
+                ));
+            }
             if contains_bearer_context_with_ebi(&view.ies) {
                 Ok(())
             } else {
@@ -4377,12 +5350,30 @@ fn validate_required_ies(
                 "Modify Bearer Response requires Cause IE at instance 0",
             )
         }
-        (Procedure::DeleteSession, MessageDirection::Request) => require_ie_instance(
-            &view.ies,
-            IE_TYPE_EBI,
-            0,
-            "Delete Session Request requires linked EBI IE at instance 0",
-        ),
+        (Procedure::DeleteSession, MessageDirection::Request) => {
+            if !view.header.teid_flag || view.header.teid.is_none() {
+                return Err(missing_ie_error(
+                    "S2b Delete Session Request requires a header TEID",
+                ));
+            }
+            if view.header.teid == Some(0) {
+                return Err(missing_ie_error(
+                    "S2b Delete Session Request requires a non-zero header TEID",
+                ));
+            }
+            require_ie_instance(
+                &view.ies,
+                IE_TYPE_EBI,
+                0,
+                "Delete Session Request requires linked EBI IE at instance 0",
+            )?;
+            require_ie_instance(
+                &view.ies,
+                IE_TYPE_IP_ADDRESS,
+                0,
+                "S2b Delete Session Request requires UE Local IP Address at instance 0",
+            )
+        }
         (Procedure::DeleteSession, MessageDirection::Response) => require_ie_instance(
             &view.ies,
             IE_TYPE_CAUSE,
@@ -4696,7 +5687,7 @@ mod tests {
     fn valid_create_session_request() -> S2bCreateSessionRequest<'static> {
         S2bCreateSessionRequest {
             sequence_number: 0x0000_0102,
-            imsi: TbcdDigits::new("001010123456789"),
+            identity: S2bCreateSessionIdentity::subscriber(TbcdDigits::new("001010123456789")),
             rat_type: RatType {
                 value: RatTypeValue::Wlan,
             },
@@ -4710,6 +5701,7 @@ mod tests {
             },
             paa: PdnAddressAllocation::dynamic_ipv4(),
             bearer_context: bearer_context(vec![bearer_ebi(5)]),
+            context: S2bCreateSessionContext::default(),
             additional_ies: Vec::new(),
         }
     }

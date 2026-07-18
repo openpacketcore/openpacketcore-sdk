@@ -6,13 +6,14 @@ use opc_proto_gtpv2c::{
     s2b_ue_ipsec_tunnel_update_request, s2b_update_bearer_request, s2b_update_bearer_response,
     AccessPointName, AggregateMaximumBitRate, BearerContext, Cause, CauseValue, EpsBearerId,
     FullyQualifiedTeid, MessageDirection, PdnAddressAllocation, PdnType, PdnTypeValue, PlmnId,
-    RatType, RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse,
-    S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bDeleteSessionRequest,
-    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerResponse, S2bProfileBuildError,
-    S2bUeIpsecTunnelUpdateEndpoint, S2bUeIpsecTunnelUpdateRequest, S2bUpdateBearerRequest,
-    S2bUpdateBearerRequestContext, S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode,
-    SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_F_TEID,
-    IE_TYPE_PDN_TYPE, INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    RatType, RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse, S2bCreateSessionContext,
+    S2bCreateSessionIdentity, S2bCreateSessionRejectedResponse, S2bCreateSessionRequest,
+    S2bDeleteSessionContext, S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage,
+    S2bModifyBearerResponse, S2bProfileBuildError, S2bUeEndpoint, S2bUeIpsecTunnelUpdateEndpoint,
+    S2bUeIpsecTunnelUpdateRequest, S2bUpdateBearerRequest, S2bUpdateBearerRequestContext,
+    S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode, SelectionModeValue,
+    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_F_TEID, IE_TYPE_PDN_TYPE,
+    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{DecodeContext, DecodeErrorCode, Encode, EncodeContext, ValidationLevel};
 
@@ -91,7 +92,7 @@ fn accepted_bearer_context(ebi: u8, teid: u32) -> BearerContext<'static> {
 fn create_session_request_input() -> S2bCreateSessionRequest<'static> {
     S2bCreateSessionRequest {
         sequence_number: 0x010203,
-        imsi: imsi(),
+        identity: S2bCreateSessionIdentity::subscriber(imsi()),
         rat_type: RatType {
             value: RatTypeValue::Wlan,
         },
@@ -103,6 +104,7 @@ fn create_session_request_input() -> S2bCreateSessionRequest<'static> {
         },
         paa: PdnAddressAllocation::static_ipv4([10, 0, 0, 1]).expect("test static PAA is valid"),
         bearer_context: bearer_context(5),
+        context: S2bCreateSessionContext::default(),
         additional_ies: Vec::new(),
     }
 }
@@ -380,6 +382,16 @@ fn lifecycle_request_builders_roundtrip_without_raw_byte_assembly() {
         sequence_number: 0x010207,
         teid: 0x0102_0304,
         linked_ebi: EpsBearerId { value: 5 },
+        context: S2bDeleteSessionContext {
+            release_cause: None,
+            indication: None,
+            pco: None,
+            wlan_location: None,
+            wlan_location_timestamp: None,
+            ue_endpoint: S2bUeEndpoint::without_nat(opc_proto_gtpv2c::IpAddress::Ipv4([
+                192, 0, 2, 44,
+            ])),
+        },
         additional_ies: Vec::new(),
     })
     .expect("delete session request builds");

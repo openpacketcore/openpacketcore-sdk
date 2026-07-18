@@ -3,9 +3,9 @@ use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
     PdnTypeValue, S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO,
     IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID,
-    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_MEI, IE_TYPE_PAA, IE_TYPE_PDN_TYPE, IE_TYPE_RECOVERY,
-    INTERFACE_TYPE_S2B_EPDG_GTP_C, INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
-    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_IP_ADDRESS, IE_TYPE_MEI, IE_TYPE_PAA,
+    IE_TYPE_PDN_TYPE, IE_TYPE_RECOVERY, INTERFACE_TYPE_S2B_EPDG_GTP_C,
+    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -161,6 +161,7 @@ const MEI_IE: &[u8] = &[
 ];
 const UIMSI_INDICATION_IE: &[u8] = &[IE_TYPE_INDICATION, 0x00, 0x02, 0x00, 0x00, 0x40];
 const INDICATION_WITHOUT_UIMSI_IE: &[u8] = &[IE_TYPE_INDICATION, 0x00, 0x01, 0x00, 0x00];
+const UE_LOCAL_IP_ADDRESS_IE: &[u8] = &[IE_TYPE_IP_ADDRESS, 0x00, 0x04, 0x00, 192, 0, 2, 44];
 
 fn decode_s2b(bytes: &[u8]) -> S2bMessage<'_> {
     match S2bMessage::decode(bytes, procedure_context()) {
@@ -259,7 +260,11 @@ fn s2b_echo_create_modify_delete_update_fixtures_roundtrip() {
 
     assert_eq!(&MODIFY_BEARER_REQUEST_FIXTURE[12..], BEARER_CONTEXT_IE);
     assert_eq!(&MODIFY_BEARER_RESPONSE_FIXTURE[12..], CAUSE_IE);
-    assert_eq!(&DELETE_SESSION_REQUEST_FIXTURE[12..], EBI_IE);
+    assert_eq!(&DELETE_SESSION_REQUEST_FIXTURE[12..17], EBI_IE);
+    assert_eq!(
+        &DELETE_SESSION_REQUEST_FIXTURE[17..],
+        &[IE_TYPE_IP_ADDRESS, 0, 4, 0, 192, 0, 2, 44]
+    );
 }
 
 #[test]
@@ -821,7 +826,11 @@ fn create_session_request_with_identity_ies_and_bearer_context(
 
 #[test]
 fn procedure_aware_accepts_uicc_less_emergency_create_session_identity() {
-    let request = create_session_request_with_identity_ies(&[MEI_IE, UIMSI_INDICATION_IE]);
+    let request = create_session_request_with_identity_ies(&[
+        MEI_IE,
+        UIMSI_INDICATION_IE,
+        UE_LOCAL_IP_ADDRESS_IE,
+    ]);
 
     let message = decode_s2b(&request);
     assert!(matches!(message, S2bMessage::CreateSessionRequest(_)));

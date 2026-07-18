@@ -54,6 +54,16 @@ fuzz_target!(|data: &[u8]| {
             {
                 let _ = view.ue_ipsec_tunnel_update_request_summary();
             }
+            if view.procedure == Procedure::CreateSession
+                && view.direction == MessageDirection::Request
+            {
+                let _ = view.create_session_context();
+            }
+            if view.procedure == Procedure::DeleteSession
+                && view.direction == MessageDirection::Request
+            {
+                let _ = view.delete_session_context();
+            }
         }
     }
 

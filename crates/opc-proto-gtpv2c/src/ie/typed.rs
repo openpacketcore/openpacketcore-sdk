@@ -217,6 +217,10 @@ pub const IE_TYPE_F_TEID: u8 = 87;
 pub const IE_TYPE_BEARER_CONTEXT: u8 = 93;
 /// GTPv2-C Charging ID IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_CHARGING_ID: u8 = 94;
+/// GTPv2-C Charging Characteristics IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_CHARGING_CHARACTERISTICS: u8 = 95;
+/// GTPv2-C Trace Information IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_TRACE_INFORMATION: u8 = 96;
 /// GTPv2-C PDN Type IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_PDN_TYPE: u8 = 99;
 /// GTPv2-C Port Number IE type (TS 29.274 Table 8.1-1).
@@ -229,6 +233,8 @@ pub const IE_TYPE_SELECTION_MODE: u8 = 128;
 pub const IE_TYPE_APCO: u8 = 163;
 /// GTPv2-C TWAN Identifier IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_TWAN_IDENTIFIER: u8 = 169;
+/// GTPv2-C RAN/NAS Cause IE type (TS 29.274 Table 8.1-1).
+pub const IE_TYPE_RAN_NAS_CAUSE: u8 = 172;
 /// GTPv2-C TWAN Identifier Timestamp IE type (TS 29.274 Table 8.1-1).
 pub const IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP: u8 = 179;
 /// GTPv2-C Overload Control Information IE type (TS 29.274 Table 8.1-1).
@@ -2476,6 +2482,411 @@ impl ChargingId {
     }
 }
 
+/// Charging Characteristics IE (type 95).
+///
+/// TS 29.274 carries the TS 32.298 charging characteristics as two opaque
+/// octets. The value is inspectable for policy code but deliberately redacted
+/// from [`fmt::Debug`] because it describes subscriber charging treatment.
+///
+/// @spec 3GPP TS29274 R18 8.30
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-CHARGING-CHARACTERISTICS-001
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChargingCharacteristics([u8; 2]);
+
+impl ChargingCharacteristics {
+    /// Construct charging characteristics from their TS 32.298 wire octets.
+    #[must_use]
+    pub const fn from_octets(value: [u8; 2]) -> Self {
+        Self(value)
+    }
+
+    /// Return the two TS 32.298 charging-characteristics octets.
+    #[must_use]
+    pub const fn octets(self) -> [u8; 2] {
+        self.0
+    }
+
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_min_len(
+            value,
+            2,
+            offset,
+            "Charging Characteristics IE must contain its two fixed octets",
+        )?;
+        // Clause 8.30 declares this IE extendable. Later-release octets are
+        // ignored by this typed Release 18 view; raw-preserving message decode
+        // retains the complete original IE.
+        Ok(Self([value[0], value[1]]))
+    }
+
+    fn encode_value(self, dst: &mut BytesMut) {
+        dst.put_slice(&self.0);
+    }
+}
+
+impl fmt::Debug for ChargingCharacteristics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChargingCharacteristics")
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// TS 32.422 Session Trace Depth carried by Trace Information.
+///
+/// @spec 3GPP TS32422 R18 5.3
+/// @req REQ-3GPP-TS32422-R18-TRACE-DEPTH-001
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionTraceDepth {
+    /// Minimum trace depth (0).
+    Minimum,
+    /// Medium trace depth (1).
+    Medium,
+    /// Maximum trace depth (2).
+    Maximum,
+    /// Minimum trace depth without vendor-specific extensions (3).
+    MinimumWithoutVendorSpecificExtension,
+    /// Medium trace depth without vendor-specific extensions (4).
+    MediumWithoutVendorSpecificExtension,
+    /// Maximum trace depth without vendor-specific extensions (5).
+    MaximumWithoutVendorSpecificExtension,
+}
+
+impl SessionTraceDepth {
+    fn decode(value: u8, offset: usize) -> Result<Self, DecodeError> {
+        match value {
+            0 => Ok(Self::Minimum),
+            1 => Ok(Self::Medium),
+            2 => Ok(Self::Maximum),
+            3 => Ok(Self::MinimumWithoutVendorSpecificExtension),
+            4 => Ok(Self::MediumWithoutVendorSpecificExtension),
+            5 => Ok(Self::MaximumWithoutVendorSpecificExtension),
+            other => Err(DecodeError::new(
+                DecodeErrorCode::InvalidEnumValue {
+                    field: "session_trace_depth",
+                    value: u64::from(other),
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref())),
+        }
+    }
+
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Minimum => 0,
+            Self::Medium => 1,
+            Self::Maximum => 2,
+            Self::MinimumWithoutVendorSpecificExtension => 3,
+            Self::MediumWithoutVendorSpecificExtension => 4,
+            Self::MaximumWithoutVendorSpecificExtension => 5,
+        }
+    }
+}
+
+impl fmt::Debug for SessionTraceDepth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionTraceDepth(<redacted>)")
+    }
+}
+
+/// Release 18 Trace Information IE (type 96).
+///
+/// The fixed-width trace masks remain byte-oriented because their individual
+/// bit assignments are owned by TS 32.422 and vary by traced network element.
+/// Their lengths are nevertheless fixed and checked here. Debug output exposes
+/// only shape metadata: the trace reference, masks, depth, and collection
+/// endpoint are operationally sensitive.
+///
+/// @spec 3GPP TS29274 R18 8.31; 3GPP TS32422 R18 5
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-TRACE-INFORMATION-001
+#[derive(Clone, PartialEq, Eq)]
+pub struct TraceInformation {
+    /// PLMN portion of the globally unique trace reference.
+    pub plmn: PlmnId,
+    /// Three-octet Trace ID portion of the trace reference.
+    pub trace_id: [u8; 3],
+    /// First nine TS 32.422 Triggering Events octets.
+    pub triggering_events: [u8; 9],
+    /// TS 32.422 two-octet List of NE Types.
+    pub network_element_types: [u8; 2],
+    /// TS 32.422 Session Trace Depth.
+    pub session_trace_depth: SessionTraceDepth,
+    /// First twelve TS 32.422 List of Interfaces octets.
+    pub interfaces: [u8; 12],
+    /// IPv4 or IPv6 Trace Collection Entity address.
+    pub collection_entity: IpAddress,
+}
+
+impl TraceInformation {
+    const FIXED_LEN_BEFORE_COLLECTION_ENTITY: usize = 30;
+    const IPV4_VALUE_LEN: usize = Self::FIXED_LEN_BEFORE_COLLECTION_ENTITY + 4;
+    const IPV6_VALUE_LEN: usize = Self::FIXED_LEN_BEFORE_COLLECTION_ENTITY + 16;
+
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        if value.len() != Self::IPV4_VALUE_LEN && value.len() != Self::IPV6_VALUE_LEN {
+            return Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "Trace Information IE must contain 30 fixed octets and one IPv4 or IPv6 collection address",
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref()));
+        }
+
+        let plmn = PlmnId::decode_value(&value[..3], offset)?;
+        let trace_id = value[3..6].try_into().map_err(|_| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, offset).with_spec_ref(spec_ref())
+        })?;
+        let triggering_events = value[6..15].try_into().map_err(|_| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, offset).with_spec_ref(spec_ref())
+        })?;
+        let network_element_types = value[15..17].try_into().map_err(|_| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, offset).with_spec_ref(spec_ref())
+        })?;
+        let trace_depth_offset = checked_add_offset(offset, 17)?;
+        let session_trace_depth = SessionTraceDepth::decode(value[17], trace_depth_offset)?;
+        let interfaces = value[18..30].try_into().map_err(|_| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, offset).with_spec_ref(spec_ref())
+        })?;
+        let collection_offset =
+            checked_add_offset(offset, Self::FIXED_LEN_BEFORE_COLLECTION_ENTITY)?;
+        let collection_entity = IpAddress::decode_value(
+            &value[Self::FIXED_LEN_BEFORE_COLLECTION_ENTITY..],
+            collection_offset,
+        )?;
+
+        Ok(Self {
+            plmn,
+            trace_id,
+            triggering_events,
+            network_element_types,
+            session_trace_depth,
+            interfaces,
+            collection_entity,
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        self.plmn.encode_value(dst)?;
+        dst.put_slice(&self.trace_id);
+        dst.put_slice(&self.triggering_events);
+        dst.put_slice(&self.network_element_types);
+        dst.put_u8(self.session_trace_depth.encode());
+        dst.put_slice(&self.interfaces);
+        self.collection_entity.encode_value(dst);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for TraceInformation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TraceInformation")
+            .field("trace_reference", &"<redacted>")
+            .field("triggering_events_len", &self.triggering_events.len())
+            .field(
+                "network_element_types_len",
+                &self.network_element_types.len(),
+            )
+            .field("session_trace_depth", &"<redacted>")
+            .field("interfaces_len", &self.interfaces.len())
+            .field("collection_entity", &self.collection_entity)
+            .finish()
+    }
+}
+
+/// Largest IKEv2 Notify type in RFC 7296's error-type range.
+pub const MAX_IKEV2_ERROR_NOTIFY_TYPE: u16 = 16_383;
+
+/// Validated IKEv2 Notify error type carried by an S2b release cause.
+///
+/// RFC 7296 assigns Notify types `0..=16383` to the error range. Notify types
+/// in the higher status/private-use range cannot be represented, so an accepted
+/// [`RanNasCause`] remains executable without a later range failure. Debug
+/// output redacts the numeric error type because it is release metadata.
+///
+/// @spec IETF RFC7296 3.10.1; 3GPP TS29274 R18 8.103
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-RAN-NAS-CAUSE-002
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ikev2ErrorNotifyType(u16);
+
+impl Ikev2ErrorNotifyType {
+    /// Validate an IKEv2 Notify error type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2ErrorNotifyTypeError::NotErrorType`] for values above
+    /// [`MAX_IKEV2_ERROR_NOTIFY_TYPE`].
+    pub const fn new(value: u16) -> Result<Self, Ikev2ErrorNotifyTypeError> {
+        if value <= MAX_IKEV2_ERROR_NOTIFY_TYPE {
+            Ok(Self(value))
+        } else {
+            Err(Ikev2ErrorNotifyTypeError::NotErrorType)
+        }
+    }
+
+    /// Return the validated numeric Notify error type.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl TryFrom<u16> for Ikev2ErrorNotifyType {
+    type Error = Ikev2ErrorNotifyTypeError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<Ikev2ErrorNotifyType> for u16 {
+    fn from(value: Ikev2ErrorNotifyType) -> Self {
+        value.get()
+    }
+}
+
+impl fmt::Debug for Ikev2ErrorNotifyType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Ikev2ErrorNotifyType")
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Stable validation failure for [`Ikev2ErrorNotifyType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ikev2ErrorNotifyTypeError {
+    /// The value does not belong to the IKEv2 error range.
+    NotErrorType,
+}
+
+impl Ikev2ErrorNotifyTypeError {
+    /// Return a stable machine-readable validation code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotErrorType => "gtpv2c_ikev2_notify_type_not_error",
+        }
+    }
+}
+
+impl fmt::Display for Ikev2ErrorNotifyTypeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for Ikev2ErrorNotifyTypeError {}
+
+/// S2b-applicable Diameter or IKEv2 RAN/NAS Cause (IE type 172).
+///
+/// Both cause families are encoded as unsigned two-octet integers. Their
+/// values are hidden from Debug so disconnect reasons cannot leak into logs.
+///
+/// @spec 3GPP TS29274 R18 8.103
+/// @req REQ-3GPP-TS29274-R18-S2B-IE-RAN-NAS-CAUSE-001
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RanNasCause {
+    /// Diameter Termination-Cause AVP value (protocol type 4).
+    Diameter(u16),
+    /// IKEv2 Notify error type (protocol type 5).
+    Ikev2(Ikev2ErrorNotifyType),
+}
+
+impl RanNasCause {
+    const DIAMETER_PROTOCOL_TYPE: u8 = 4;
+    const IKEV2_PROTOCOL_TYPE: u8 = 5;
+
+    /// Construct a Diameter Termination-Cause value.
+    #[must_use]
+    pub const fn diameter(value: u16) -> Self {
+        Self::Diameter(value)
+    }
+
+    /// Construct a validated IKEv2 Notify error-type value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2ErrorNotifyTypeError::NotErrorType`] when `value` is an
+    /// IKEv2 Notify type outside the error range.
+    pub const fn ikev2(value: u16) -> Result<Self, Ikev2ErrorNotifyTypeError> {
+        match Ikev2ErrorNotifyType::new(value) {
+            Ok(value) => Ok(Self::Ikev2(value)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return the two-octet cause value without changing its protocol family.
+    #[must_use]
+    pub const fn value(self) -> u16 {
+        match self {
+            Self::Diameter(value) => value,
+            Self::Ikev2(value) => value.get(),
+        }
+    }
+
+    fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
+        require_min_len(
+            value,
+            3,
+            offset,
+            "S2b RAN/NAS Cause IE must contain one protocol/cause-type octet and two cause octets",
+        )?;
+        let protocol_type = value[0] >> 4;
+        let cause = u16::from_be_bytes([value[1], value[2]]);
+        match protocol_type {
+            Self::DIAMETER_PROTOCOL_TYPE => Ok(Self::Diameter(cause)),
+            Self::IKEV2_PROTOCOL_TYPE => Self::ikev2(cause).map_err(|_| {
+                DecodeError::new(
+                    DecodeErrorCode::Structural {
+                        reason: "S2b IKEv2 RAN/NAS Cause must use a Notify error type from 0 through 16383",
+                    },
+                    offset,
+                )
+                .with_spec_ref(spec_ref())
+            }),
+            other => Err(DecodeError::new(
+                DecodeErrorCode::InvalidEnumValue {
+                    field: "s2b_ran_nas_cause_protocol_type",
+                    value: u64::from(other),
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref())),
+        }
+    }
+
+    fn encode_value(self, dst: &mut BytesMut) {
+        let protocol_type = match self {
+            Self::Diameter(_) => Self::DIAMETER_PROTOCOL_TYPE,
+            Self::Ikev2(_) => Self::IKEV2_PROTOCOL_TYPE,
+        };
+        // Cause Type is ignored for Diameter and IKEv2 and is emitted as zero.
+        dst.put_u8(protocol_type << 4);
+        dst.put_u16(self.value());
+    }
+}
+
+impl fmt::Debug for RanNasCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RanNasCause")
+            .field(
+                "protocol",
+                &match self {
+                    Self::Diameter(_) => "diameter",
+                    Self::Ikev2(_) => "ikev2",
+                },
+            )
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Maximum SSID length carried by a TWAN Identifier.
 pub const MAX_TWAN_SSID_LEN: usize = 32;
 /// Maximum length of any one-octet-length TWAN Identifier subfield.
@@ -3084,6 +3495,10 @@ pub enum TypedIeValue<'a> {
     BearerContext(BearerContext<'a>),
     /// Charging ID IE (type 94).
     ChargingId(ChargingId),
+    /// Charging Characteristics IE (type 95).
+    ChargingCharacteristics(ChargingCharacteristics),
+    /// Trace Information IE (type 96).
+    TraceInformation(TraceInformation),
     /// PDN Type IE (type 99).
     PdnType(PdnType),
     /// Port Number IE (type 126).
@@ -3096,6 +3511,8 @@ pub enum TypedIeValue<'a> {
     AdditionalProtocolConfigurationOptions(AdditionalProtocolConfigurationOptions),
     /// TWAN Identifier IE (type 169).
     TwanIdentifier(TwanIdentifier),
+    /// RAN/NAS Cause IE (type 172), restricted to S2b cause families.
+    RanNasCause(RanNasCause),
     /// TWAN Identifier Timestamp IE (type 179).
     TwanIdentifierTimestamp(TwanIdentifierTimestamp),
     /// Unsupported, unknown, private, or future IE preserved byte-exact.
@@ -3214,6 +3631,12 @@ impl<'a> TypedIe<'a> {
             IE_TYPE_CHARGING_ID => {
                 TypedIeValue::ChargingId(ChargingId::decode_value(raw.value, value_offset)?)
             }
+            IE_TYPE_CHARGING_CHARACTERISTICS => TypedIeValue::ChargingCharacteristics(
+                ChargingCharacteristics::decode_value(raw.value, value_offset)?,
+            ),
+            IE_TYPE_TRACE_INFORMATION => TypedIeValue::TraceInformation(
+                TraceInformation::decode_value(raw.value, value_offset)?,
+            ),
             IE_TYPE_PDN_TYPE => {
                 TypedIeValue::PdnType(PdnType::decode_value(raw.value, value_offset, ctx)?)
             }
@@ -3233,6 +3656,9 @@ impl<'a> TypedIe<'a> {
             ),
             IE_TYPE_TWAN_IDENTIFIER => {
                 TypedIeValue::TwanIdentifier(TwanIdentifier::decode_value(raw.value, value_offset)?)
+            }
+            IE_TYPE_RAN_NAS_CAUSE => {
+                TypedIeValue::RanNasCause(RanNasCause::decode_value(raw.value, value_offset)?)
             }
             IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP => TypedIeValue::TwanIdentifierTimestamp(
                 TwanIdentifierTimestamp::decode_value(raw.value, value_offset)?,
@@ -3273,12 +3699,15 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::FullyQualifiedTeid(_) => IE_TYPE_F_TEID,
             TypedIeValue::BearerContext(_) => IE_TYPE_BEARER_CONTEXT,
             TypedIeValue::ChargingId(_) => IE_TYPE_CHARGING_ID,
+            TypedIeValue::ChargingCharacteristics(_) => IE_TYPE_CHARGING_CHARACTERISTICS,
+            TypedIeValue::TraceInformation(_) => IE_TYPE_TRACE_INFORMATION,
             TypedIeValue::PdnType(_) => IE_TYPE_PDN_TYPE,
             TypedIeValue::PortNumber(_) => IE_TYPE_PORT_NUMBER,
             TypedIeValue::ApnRestriction(_) => IE_TYPE_APN_RESTRICTION,
             TypedIeValue::SelectionMode(_) => IE_TYPE_SELECTION_MODE,
             TypedIeValue::AdditionalProtocolConfigurationOptions(_) => IE_TYPE_APCO,
             TypedIeValue::TwanIdentifier(_) => IE_TYPE_TWAN_IDENTIFIER,
+            TypedIeValue::RanNasCause(_) => IE_TYPE_RAN_NAS_CAUSE,
             TypedIeValue::TwanIdentifierTimestamp(_) => IE_TYPE_TWAN_IDENTIFIER_TIMESTAMP,
             TypedIeValue::Raw(raw) => raw.ie_type,
         }
@@ -3339,6 +3768,11 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::FullyQualifiedTeid(value) => value.encode_value(dst),
             TypedIeValue::BearerContext(value) => value.encode_value(dst, ctx),
             TypedIeValue::ChargingId(value) => value.encode_value(dst),
+            TypedIeValue::ChargingCharacteristics(value) => {
+                value.encode_value(dst);
+                Ok(())
+            }
+            TypedIeValue::TraceInformation(value) => value.encode_value(dst),
             TypedIeValue::PdnType(value) => value.encode_value(dst),
             TypedIeValue::PortNumber(value) => {
                 value.encode_value(dst);
@@ -3348,6 +3782,10 @@ impl<'a> TypedIe<'a> {
             TypedIeValue::SelectionMode(value) => value.encode_value(dst),
             TypedIeValue::AdditionalProtocolConfigurationOptions(value) => value.encode_value(dst),
             TypedIeValue::TwanIdentifier(value) => value.encode_value(dst),
+            TypedIeValue::RanNasCause(value) => {
+                value.encode_value(dst);
+                Ok(())
+            }
             TypedIeValue::TwanIdentifierTimestamp(value) => {
                 value.encode_value(dst);
                 Ok(())
@@ -3391,6 +3829,13 @@ impl fmt::Debug for TypedIeValue<'_> {
             }
             Self::BearerContext(value) => f.debug_tuple("BearerContext").field(value).finish(),
             Self::ChargingId(value) => f.debug_tuple("ChargingId").field(value).finish(),
+            Self::ChargingCharacteristics(value) => f
+                .debug_tuple("ChargingCharacteristics")
+                .field(value)
+                .finish(),
+            Self::TraceInformation(value) => {
+                f.debug_tuple("TraceInformation").field(value).finish()
+            }
             Self::PdnType(value) => f.debug_tuple("PdnType").field(value).finish(),
             Self::PortNumber(value) => f.debug_tuple("PortNumber").field(value).finish(),
             Self::ApnRestriction(value) => f.debug_tuple("ApnRestriction").field(value).finish(),
@@ -3400,6 +3845,7 @@ impl fmt::Debug for TypedIeValue<'_> {
                 .field(value)
                 .finish(),
             Self::TwanIdentifier(value) => f.debug_tuple("TwanIdentifier").field(value).finish(),
+            Self::RanNasCause(value) => f.debug_tuple("RanNasCause").field(value).finish(),
             Self::TwanIdentifierTimestamp(value) => f
                 .debug_tuple("TwanIdentifierTimestamp")
                 .field(value)

@@ -5,13 +5,15 @@ use opc_proto_gtpv2c::{
     s2b_echo_request, s2b_echo_response, s2b_modify_bearer_response,
     s2b_ue_ipsec_tunnel_update_request, s2b_update_bearer_request, s2b_update_bearer_response,
     AccessPointName, AggregateMaximumBitRate, BearerContext, CauseValue, EpsBearerId,
-    FullyQualifiedTeid, MessageDirection, MessageType, OwnedMessage, PdnAddressAllocation, PlmnId,
-    RatType, RatTypeValue, Recovery, S2bCreateSessionAcceptedResponse,
-    S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bDeleteSessionRequest,
-    S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerResponse, S2bUeIpsecTunnelUpdateEndpoint,
-    S2bUeIpsecTunnelUpdateRequest, S2bUpdateBearerRequest, S2bUpdateBearerRequestContext,
-    S2bUpdateBearerResponse, S2bUpdateBearerResult, SelectionMode, SelectionModeValue,
-    ServingNetwork, TbcdDigits, TypedIe, TypedIeValue,
+    FullyQualifiedTeid, IpAddress, MessageDirection, MessageType, OwnedMessage,
+    PdnAddressAllocation, PlmnId, RatType, RatTypeValue, Recovery,
+    S2bCreateSessionAcceptedResponse, S2bCreateSessionContext, S2bCreateSessionIdentity,
+    S2bCreateSessionRejectedResponse, S2bCreateSessionRequest, S2bDeleteSessionContext,
+    S2bDeleteSessionRequest, S2bDeleteSessionResponse, S2bMessage, S2bModifyBearerResponse,
+    S2bUeEndpoint, S2bUeIpsecTunnelUpdateEndpoint, S2bUeIpsecTunnelUpdateRequest,
+    S2bUpdateBearerRequest, S2bUpdateBearerRequestContext, S2bUpdateBearerResponse,
+    S2bUpdateBearerResult, SelectionMode, SelectionModeValue, ServingNetwork, TbcdDigits, TypedIe,
+    TypedIeValue,
 };
 use opc_protocol::{DecodeContext, DuplicateIePolicy, Encode, EncodeContext, ValidationLevel};
 use std::io::{Error as IoError, ErrorKind};
@@ -31,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     round_trip_profile_message(
         s2b_create_session_request(S2bCreateSessionRequest {
             sequence_number: 0x010202,
-            imsi: TbcdDigits::new("001010123456789"),
+            identity: S2bCreateSessionIdentity::subscriber(TbcdDigits::new("001010123456789")),
             rat_type: RatType {
                 value: RatTypeValue::Wlan,
             },
@@ -45,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             paa: PdnAddressAllocation::static_ipv4([10, 0, 0, 1])?,
             bearer_context: bearer_context(5),
+            context: S2bCreateSessionContext::default(),
             additional_ies: Vec::new(),
         })?,
         MessageType::CreateSessionRequest,
@@ -102,6 +105,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sequence_number: 0x010207,
             teid: 0x0102_0304,
             linked_ebi: EpsBearerId { value: 5 },
+            context: S2bDeleteSessionContext {
+                release_cause: None,
+                indication: None,
+                pco: None,
+                wlan_location: None,
+                wlan_location_timestamp: None,
+                ue_endpoint: S2bUeEndpoint::without_nat(IpAddress::Ipv4([192, 0, 2, 44])),
+            },
             additional_ies: Vec::new(),
         })?,
         MessageType::DeleteSessionRequest,
