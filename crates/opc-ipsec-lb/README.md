@@ -22,8 +22,9 @@ steer layer:
 - an external-load-balancer advertiser tier that composes with fenced ownership
   while intentionally performing no local route mutation;
 - session-store backed ownership reads and fenced SA-owner promotion;
-- Host-XDP cross-node redirect config that fails closed unless mTLS/SPIFFE
-  with no plaintext fallback is declared;
+- authenticated cross-node ingress redirect over a dedicated SPIFFE mTLS
+  control channel and bounded connected UDP data channel, with exporter keys,
+  replay protection, ownership fencing, receipts, and hop limits;
 - a `VipDelivered` production probe for converged shared-L2 deployments where
   a floating VIP supplies packet delivery and steering mutations are
   intentional no-ops;
@@ -286,6 +287,245 @@ final target-shard owner snapshot immediately before installing steering.
 Those separate reads cannot make the current `SteeringBackend` mutation atomic
 or order repeated A→B→C failovers; fence-aware steering replacement is tracked in
 [issue #103](https://github.com/openpacketcore/openpacketcore-sdk/issues/103).
+
+## Authenticated cross-node ingress redirect
+
+Routed multi-ingress products can use the `redirect` module to carry an
+already-observed IKE/ESP network-layer packet to its current fenced owner. A
+fresh, non-resumed SPIFFE mTLS control connection authenticates a bounded peer
+manifest and derives directional packet keys with the dedicated
+`opc-ipsec-ingress-redirect/1` exporter context. The versioned `OPCR` data
+format carries the original packet, canonical ownership key, public fence
+generation, sender-identity digest, protection epoch, replay sequence, and hop
+state. It never carries IKE, ESP, Child-SA, or other SA key material.
+
+`IngressRedirectProfile::production` selects AES-256-GCM. HMAC-SHA-256 is an
+explicit integrity-only profile for deployments whose confidentiality posture
+permits it; the unauthenticated wire mode never selects an algorithm. Both
+peers must authenticate the same MTU, security mode, hop/replay bounds, queue
+limits, receipt-cache capacity, retry policy, maximum authentication age, and
+sorted routing-domain allowlist. The real UDP adapter requires safe connected
+endpoints in one IP family. The bounded in-memory adapter may deliberately pair
+IPv4 and IPv6 to test each direction's exact outer-header ceiling.
+
+The following schematic shows the public composition boundary. The caller
+supplies TLS material snapshots, the committed ownership cache, the connected
+datagram adapter, and the mandatory packet-too-big reporter; the SDK owns the
+authenticated session, exact receipt correlation, and sole receive task.
+
+```rust,no_run
+use std::sync::Arc;
+
+use opc_ipsec_lb::{
+    establish_ingress_redirect_client, IngressRedirectDatagram,
+    IngressRedirectDeliveryReceiver, IngressRedirectEndpoint,
+    IngressRedirectError, IngressRedirectInboundOutcome,
+    IngressRedirectOperationOutcome,
+    IngressRedirectPacketTooBigReporter, IngressRedirectPeerExpectation,
+    IngressRedirectPeerManifest, SessionOwnershipKey,
+};
+use opc_session_store::{
+    Clock, FencedOwnershipCache, FencedOwnershipGeneration,
+};
+use opc_tls::TlsClientHandshake;
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+async fn redirect_one<IO, C>(
+    control_io: IO,
+    server_name: ServerName<'static>,
+    handshake: TlsClientHandshake,
+    local: &IngressRedirectPeerManifest,
+    expected_peer: &IngressRedirectPeerExpectation,
+    ownership: Arc<FencedOwnershipCache<C>>,
+    datagram: Arc<dyn IngressRedirectDatagram>,
+    reporter: Arc<dyn IngressRedirectPacketTooBigReporter>,
+    packet: &[u8],
+    key: SessionOwnershipKey,
+    generation: FencedOwnershipGeneration,
+) -> Result<IngressRedirectOperationOutcome, IngressRedirectError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send,
+    C: Clock + 'static,
+{
+    let session = Arc::new(
+        establish_ingress_redirect_client(
+            control_io,
+            server_name,
+            handshake,
+            local,
+            expected_peer,
+        )
+        .await?,
+    );
+    let (endpoint, _inbound_deliveries) = IngressRedirectEndpoint::start(
+        session,
+        ownership,
+        datagram,
+        reporter,
+    )?;
+
+    // The endpoint owns the operation after begin_redirect returns. Cancelling
+    // wait, or dropping this handle, does not cancel or reseal the operation.
+    let mut operation = endpoint.begin_redirect(packet, key, generation)?;
+    let outcome = operation.wait().await;
+    endpoint.shutdown().await?;
+    Ok(outcome)
+}
+
+async fn handle_one_inbound<C>(
+    deliveries: &mut IngressRedirectDeliveryReceiver,
+    forward_endpoint: &IngressRedirectEndpoint<C>,
+    target_generation: FencedOwnershipGeneration,
+) -> Result<(), IngressRedirectError>
+where
+    C: Clock + 'static,
+{
+    // Run this independently for packets redirected *from* the peer.
+    let outcome = deliveries.receive().await?;
+    match outcome {
+        IngressRedirectInboundOutcome::Delivered(packet) => {
+            // Apply the packet only through the product's local ingress path.
+            let _ = packet;
+        }
+        IngressRedirectInboundOutcome::Forwardable(packet) => {
+            // Select another authenticated endpoint, then consume this
+            // one-shot capability without exposing or resetting its packet.
+            let mut operation =
+                forward_endpoint.begin_forward(packet, target_generation)?;
+            let _outcome = operation.wait().await;
+        }
+        IngressRedirectInboundOutcome::Rejected(packet) => {
+            let _ = packet.receipt_code();
+        }
+    }
+    Ok(())
+}
+```
+
+One `IngressRedirectPeerSession` is permanently consumed by exactly one
+`IngressRedirectEndpoint`. Any later start from the same session is rejected
+with `EndpointAlreadyConsumed`, even after shutdown or drop; reusing it could
+split authenticated receipts across independent pending maps. Reconnect with a
+fresh authenticated session to replace an endpoint. Graceful shutdown moves
+the endpoint from active to draining, rejects new operations, lets admitted
+endpoint-owned operations finish, then stops and reaps the sole receive task.
+The shutdown coordinator survives cancellation of a caller waiting on
+`shutdown`. A receive-task failure is terminal and resolves pending operations.
+Already committed inbound queue entries remain drainable after shutdown.
+
+Queue admission is bounded independently by packet count and retained bytes.
+`begin_redirect` and `begin_forward` synchronously admit and seal once, then
+return a must-use `IngressRedirectOperation`. The endpoint retains queue,
+pending-receipt, retry, and cleanup ownership; dropping the observation handle
+does not cancel the operation. Its terminal observation distinguishes proven
+`NotSent`, an `AuthenticatedReceipt`, and `DeliveryOutcomeUnknown`. One attempt
+has one `receipt_timeout` shared by adapter send and receipt arrival; the
+absolute retry horizon is exactly `(max_retries + 1) * receipt_timeout` and
+cannot be extended by scheduling delays. A profile is rejected unless rotation
+overlap covers that horizon, and an epoch too near expiry refuses a new seal.
+Retries reuse the identical already-sealed datagram. The endpoint retains the
+runtime handle captured by `start`, so admitted operations, packet-too-big
+feedback, the receive loop, and shutdown remain attached to that runtime even
+when a synchronous `begin_*` call occurs from a thread with no entered runtime.
+Oversize feedback consumes the same packet/byte permit and the same absolute
+deadline as normal sends; it cannot create an unbounded side queue.
+
+Before cryptographic open or replay-window mutation, the receiver reserves a
+slot in the manifest-bound receipt cache. A vacant identity is shed without a
+receipt or application effect when the cache is full; the receiver never emits
+an uncached rejection that it could not replay. After authentication it
+reserves both byte and delivery-queue capacity, performs final validation,
+seals and commits the exact receipt, and only then publishes the inbound outcome
+or sends that receipt. Commit failure publishes and sends nothing. An exact
+same-frame retry receives the committed byte-identical receipt without another
+application publication; a same epoch/sequence carrying different bytes still
+reaches authentication and replay rejection. Live entries are never evicted
+for newer frames and expire at the earliest of the full retry horizon, the data
+epoch, and the receipt-sealing epoch. The production capacity is 65,536 entries
+and is configurable through `with_receipt_cache_entries`; it must cover at
+least the packet queue and is capped at 1,048,576. Sustainable unique-frame
+rate is `entries / receipt_retry_horizon`, while bursts cannot exceed `entries`
+until an entry expires.
+
+An authenticated `Delivered` receipt proves bounded local queue admission, not
+a downstream application effect. Receipt retention does not shorten a queued
+delivery capability: the latter remains bounded by its authenticated epoch and
+fresh ownership evidence. Dequeue revalidates the exact current generation
+before owner identity; stale or receiver-behind generations cannot be hidden by
+an owner change. Metrics distinguish queue admission, materialized delivery,
+and dequeue-time stale-capability rejection, and expose receipt-cache current,
+peak, saturation, and commit-failure counters. The raw authenticated
+frame/open/seal boundary is crate-private.
+
+Immediate adapter backpressure and deterministic configuration, size, or
+closure failures are not blindly retried. Ambiguous I/O or send timeout can
+retry the exact sealed frame; if no later authenticated receipt resolves the
+operation, the outcome remains unknown. Oversize packets are never fragmented
+by this layer: the mandatory borrowed reporter receives the exact effective
+original-packet MTU so the product can produce ICMP/PTB feedback. On Linux the
+real UDP adapter sets and verifies IPv4/IPv6 `DO` path-MTU discovery, budgets
+against the smaller of configured and kernel-reported PMTU, refreshes that
+ceiling downward, and converts runtime `EMSGSIZE` into exact PTB feedback. The
+last proven ceiling survives a transient refresh failure; the failed send
+returns a typed I/O error instead of replacing that ceiling with zero or an
+unproven value. The real UDP adapter fails closed on platforms where those
+socket guarantees are not implemented; a platform adapter must provide
+equivalent non-fragmenting semantics through `IngressRedirectDatagram`.
+
+Every receive reclassifies the packet and performs a fresh lookup in the sole
+`FencedOwnershipCache` authority. Delivery requires the exact local owner and
+generation. Superseded generations and classification mismatches are terminal;
+missing, stale, non-local, or receiver-behind evidence produces a typed,
+one-time `ForwardableIngressRedirectPacket`. Only consuming that capability
+through another endpoint's `begin_forward` can forward it, preserving and
+incrementing its authenticated hop count. The public capability exposes only
+its reason, hop bounds, and ownership key, not the packet bytes. Callers cannot
+copy it or reset a forwarded packet to hop one.
+
+AES-256-GCM data and receipt frames share a maximum of `2^23` new protected
+frames per directional epoch. Successful peer opens have the same bound, and
+known-epoch authentication failures are capped at `2^36`. The session exposes
+fixed-cardinality headroom through `aead_usage_status`; warning thresholds and
+hard exhaustion request a fresh authenticated epoch, while hard exhaustion
+fails closed with `AeadUsageExhausted`. Integrity-only HMAC mode does not claim
+AES-GCM invocation counters and reports no AEAD headroom. Its private
+HMAC-SHA-256 composition zeroizes normalized keys, pads, digest outputs, and
+hash state; public APIs never expose raw redirect keys.
+
+Certificate and trust rotation uses a new full mTLS connection and a new
+exporter epoch. The receiver stages the new epoch before either sender cuts
+over; current/previous acceptance is bounded by the configured overlap, peer
+certificate expiry, local certificate expiry, and maximum authentication age.
+The maximum age must be strictly greater than both the overlap and the fixed
+45-second staging horizon. Rotation and reconciliation operations are
+serialized per session. A new stage is rejected while a pending or live
+previous receive epoch exists; expired pending/previous epochs are purged before
+status, match, stage, activation, or reconciliation decisions. Initial
+establishment performs a final authentication-lifetime check after the
+peer-visible acknowledgement; expiry there retires the unreturned session as
+`InitialOutcomeUnknown`.
+`RotationOutcomeUnknown` retains reconcilable state and requires one of the
+authenticated `reconcile_ingress_redirect_*` operations on a fresh connection.
+`InitialOutcomeUnknown` returns no session: discard local state, use the
+product's connection lifecycle to retire or replace any potentially installed
+remote association, and only then attempt a fresh full TLS establishment. A
+one-sided peer installation is not readiness evidence; blind immediate retry
+is not the recovery contract. Initial establishment owns an armed cancellation
+guard from the first peer-visible control operation until final admission, so
+cancelling any handshake boundary cannot leak a usable half-installed local
+session. Integration tests rotate independent CA/leaf material A to B through
+the A-only, A+B, mixed A/B, B/B, and B-only trust phases while exercising
+bidirectional endpoint traffic and old-epoch overlap.
+
+Threat model: an unauthenticated network attacker cannot forge a peer, change
+the authenticated route/fence/hop metadata, replay outside the bounded window,
+or inject a packet into the delivery queue. A holder of an admitted peer
+credential remains trusted for exactly its authenticated identity, owner,
+endpoint, routing domains, profile, and epoch lifetime; compromise can inject
+packets within that contract. Credential issuance/revocation, network
+isolation, peer membership, route selection, ICMP policy, and application
+dataplane effects remain deployment responsibilities.
 
 ## Entropy note
 

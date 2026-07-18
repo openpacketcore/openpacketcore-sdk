@@ -92,6 +92,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original addresses. A required direction contract distinguishes incoming
   migration from outgoing migration after the upstream-mandated temporary
   block policy, preventing cleartext fallback and AES-GCM IV reuse.
+- **Authenticated fenced ingress redirect — `opc-ipsec-lb`:** a versioned
+  mTLS-exporter-protected cross-node IKE/ESP packet path now combines canonical
+  destination ownership keys, exact committed generation checks, bounded
+  replay/hop/queue/MTU policy, correlated receipts with exact retry replay,
+  connected UDP and deterministic in-memory adapters, mandatory packet-too-big
+  feedback, fixed-cardinality metrics, and two-phase certificate/trust rotation
+  with authenticated reconciliation. Endpoint-owned cancellation-safe
+  operations expose proven-not-sent/authenticated-receipt/unknown outcomes;
+  one-shot peer sessions, draining shutdown, dequeue-time fence validation, and
+  non-evicting dual-epoch receipt-cache commits prevent capability reuse or
+  acknowledgement/effect divergence. Receipt capacity is an authenticated,
+  bounded profile value; slots are reserved before cryptographic open, and
+  saturation or commit failure cannot emit an uncached receipt or publish an
+  effect. Admission, materialized delivery, stale capability, cache load, and
+  cache occupancy are independently observable. Linux UDP enforces IPv4/IPv6
+  `DO` PMTU discovery, retains its last proven ceiling across transient refresh
+  failures, and reports runtime shrink through the mandatory PTB boundary.
+  AES-256-GCM is the production default with shared data/receipt invocation
+  caps, peer-open and failed-authentication limits, and proactive rotation
+  status; integrity-only HMAC-SHA-256 is explicit. Raw authenticated frames are
+  crate-private, its HMAC composition zeroizes keys, pads, digest outputs, and
+  hash state, and no API accepts or transports SA key material. Rotation and
+  reconciliation are serialized per session, expired staged/previous epochs
+  are purged before lifecycle decisions, and final initial establishment fails
+  unknown if authentication expires. Rotation evidence covers independent
+  CA/leaf A-to-B replacement through overlapping trust and mixed authenticated
+  epochs.
 - **Aggregate admission budget — `opc-runtime`:** a product-neutral global
   token bucket and in-flight ceiling now compose after the existing per-source
   limiter. The aggregate state has no source-key table or eviction path, so

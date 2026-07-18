@@ -14,29 +14,40 @@ categories = ["network-programming"]
 publish = false
 
 [dependencies]
+aes-gcm = { workspace = true }
 opc-ipsec-lb-ebpf-common = { path = "../opc-ipsec-lb-ebpf-common", version = "0.2.0" }
 opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
 opc-route-steering = { path = "../opc-route-steering", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
+opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+# Redirect integrity mode requires zeroizing SHA-256 state and owned HMAC pads.
+sha2-zeroize = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio-rustls = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.14" }
+rustix = { version = "1", features = ["net"] }
 
 [dev-dependencies]
+opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-session-testkit = { path = "../opc-session-testkit", version = "0.2.0" }
 proptest = "1.9"
+rcgen = { workspace = true }
 serde_json = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]
