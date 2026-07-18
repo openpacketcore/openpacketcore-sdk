@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **BREAKING — fail-closed Diameter SCTP protection contract — `opc-sctp`:**
+  the deprecated `DiameterSctpSecurity::Dtls` compatibility selector no longer
+  maps ordinary SCTP payloads to PPID 47. It returns the typed
+  `diameter_sctp_protected_transport_unavailable` error before configuration
+  validation, socket setup, or payload framing. New
+  `DiameterSctpPeer::new_unprotected` and
+  `DiameterSctpAssociation::connect_unprotected_with_config*` APIs make the
+  remaining PPID-46 path explicit, while every peer carries the sole typed
+  `DiameterSctpProtection::Unprotected` value; PPID-0 compatibility stays
+  bounded and inbound-only. PPID metadata, SCTP readiness, health, and metrics
+  make no DTLS or protected-transport claim. The named
+  `DIAMETER_DTLS_SCTP_PPID` constant is removed so ordinary
+  `SctpAssociation` callers cannot mistake raw PPID-47 metadata for a protected
+  Diameter path. Existing callers must replace `new` with `new_unprotected`,
+  replace `connect_with_config*` with the corresponding
+  `connect_unprotected_with_config*` method, and use a real protected transport
+  rather than the rejected legacy `Dtls` option.
 - **Typed IKEv2 protected-payload open failures — `opc-proto-ikev2`:** `SK`
   and `SKF` provider errors now pass through `open_protected_payloads` as their
   original type instead of being reduced to `Display` text. The concrete
@@ -388,10 +405,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   priority, and raw-preserving encode retains ignored/spare wire bits.
 - `opc-sctp`: an explicit, default-off `DiameterInboundPpidPolicy` escape hatch
   can accept inbound PPID 0 from a configured legacy clear-text Diameter peer.
-  Standard PPID 46 remains accepted and is always used outbound; DTLS remains
-  strict. The policy survives single-address and static-multihoming Diameter
-  construction, while association metrics count accepted legacy messages and
-  a redaction-safe warning is emitted at most once per association.
+  Standard PPID 46 remains accepted and is always used outbound; the policy
+  cannot enable PPID 47 or provide DTLS. The policy survives single-address and
+  static-multihoming Diameter construction, while association metrics count
+  accepted legacy messages and a redaction-safe warning is emitted at most
+  once per association.
 - `opc-sctp`: Linux `SCTP_PEER_ADDR_CHANGE` notifications now decode into
   typed, address-redacted events and update a bounded per-association path
   health snapshot with reachability and primary-path state. An event-capable

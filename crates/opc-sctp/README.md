@@ -8,11 +8,18 @@ Linux SCTP sockets from `opc-libsctp-sys` with validation, Tokio readiness,
 message-boundary preserving APIs, metadata, health, metrics, and redaction-safe
 errors.
 
+The Diameter helper is explicitly **unprotected** SCTP framing. PPID 46 or 47
+is payload metadata, not evidence of encryption or peer authentication. A site
+using this helper must separately protect and attest the path, for example with
+IPsec. Real TLS/TCP and DTLS/SCTP Diameter transports are outside the current
+crate boundary.
+
 ## API Shape
 
 - PPID helpers: `PayloadProtocolIdentifier`, `NGAP_PPID`,
-  `DIAMETER_SCTP_PPID`, `DIAMETER_DTLS_SCTP_PPID`, and
-  `DIAMETER_DEFAULT_STREAM_ID`.
+  `DIAMETER_SCTP_PPID`, and `DIAMETER_DEFAULT_STREAM_ID`. PPID 47 is not
+  exposed as a Diameter helper until the SDK has a real protected association
+  that can emit it safely.
 - Config: `SctpEndpointConfig`, `SctpConnectConfig`, `SctpMode`, `InitConfig`,
   `RtoConfig`, `HeartbeatConfig`, `DeliveryOrder`, `SctpCapabilities`, and
   `MAX_STATIC_MULTIHOMING_ADDRESSES`.
@@ -21,9 +28,11 @@ errors.
 - Observability: `SctpHealth`, `SctpPathHealth`, `SctpPathStatus`,
   `SctpMetrics`, and `SctpMetricsSnapshot`.
 - Diameter helpers: `DiameterSctpPeer`, `DiameterSctpAssociation`,
-  `DiameterSctpInbound`, `DiameterSctpSecurity`, `DiameterInboundPpidPolicy`,
+  `DiameterSctpInbound`, `DiameterSctpProtection`, `DiameterInboundPpidPolicy`,
   `DiameterSctpConnectProjection`, `DiameterSctpConnectOutcome`, and
-  `DiameterSctpError`.
+  `DiameterSctpError`. Primary constructors include `new_unprotected` and
+  `connect_unprotected_with_config`; the old `DiameterSctpSecurity` selector is
+  deprecated and rejects `Dtls` before socket setup or payload framing.
 - Errors: `SctpError` and Diameter-specific wrappers expose stable,
   redaction-safe classifications.
 
@@ -173,19 +182,19 @@ use opc_sctp::{
 async fn connect_legacy_diameter_peer(
     remote: std::net::SocketAddr,
 ) -> Result<DiameterSctpAssociation, DiameterSctpError> {
-    DiameterSctpPeer::new(remote)
+    DiameterSctpPeer::new_unprotected(remote)
         .with_inbound_ppid_policy(DiameterInboundPpidPolicy::AcceptLegacyZero)
         .connect_association()
         .await
 }
 ```
 
-This escape hatch accepts inbound PPID 0 in addition to PPID 46 only for
-clear-text Diameter. Outbound clear-text messages remain PPID 46 and never
-mirror the peer's zero value. DTLS/protected Diameter remains strict. Static
-multihoming callers opt in with
-`DiameterSctpAssociation::connect_with_config_and_inbound_ppid_policy`; the
-existing `connect_with_config` remains strict. No Cargo feature is required.
+This escape hatch accepts inbound PPID 0 in addition to PPID 46 only for the
+explicitly unprotected Diameter path. Outbound messages remain PPID 46 and
+never mirror the peer's zero value. It cannot enable PPID 47 or turn ordinary
+SCTP into a protected transport. Static multihoming callers opt in with
+`DiameterSctpAssociation::connect_unprotected_with_config_and_inbound_ppid_policy`;
+`connect_unprotected_with_config` remains strict. No Cargo feature is required.
 Each live association counts accepted legacy messages in
 `SctpMetricsSnapshot::accepted_legacy_diameter_zero_ppid_messages` and emits at
 most one redaction-safe warning without payload or peer-address data.
@@ -197,8 +206,7 @@ allowing the caller to supply the complete static-multihoming address sets:
 ```rust,no_run
 use bytes::Bytes;
 use opc_sctp::{
-    DiameterSctpAssociation, DiameterSctpError, DiameterSctpSecurity,
-    SctpConnectConfig,
+    DiameterSctpAssociation, DiameterSctpError, SctpConnectConfig,
 };
 
 async fn send_diameter(
@@ -208,15 +216,38 @@ async fn send_diameter(
 ) -> Result<(), DiameterSctpError> {
     let mut config = SctpConnectConfig::new(primary_remote);
     config.remote_addrs.extend(additional_remotes);
-    let association = DiameterSctpAssociation::connect_with_config(
-        config,
-        DiameterSctpSecurity::ClearText,
-    )
-    .await?;
+    let association =
+        DiameterSctpAssociation::connect_unprotected_with_config(config).await?;
     association.send_diameter_payload(payload).await?;
     Ok(())
 }
 ```
+
+### PPID-only DTLS migration
+
+Earlier releases exposed `DiameterSctpSecurity::Dtls`, but that selector only
+changed SCTP metadata to PPID 47; it never ran DTLS. The selector and its
+overloaded connect methods are deprecated. A legacy `Dtls` request now returns
+`DiameterSctpError::ProtectedTransportUnavailable` before config validation,
+socket setup, or payload framing. It never falls back to PPID 46.
+
+Migrate ordinary SCTP callers explicitly:
+
+```rust,no_run
+use opc_sctp::{DiameterSctpAssociation, DiameterSctpError, SctpConnectConfig};
+
+async fn connect_unprotected(
+    config: SctpConnectConfig,
+) -> Result<DiameterSctpAssociation, DiameterSctpError> {
+    DiameterSctpAssociation::connect_unprotected_with_config(config).await
+}
+```
+
+`DiameterSctpPeer::new` is likewise deprecated in favor of
+`DiameterSctpPeer::new_unprotected`. Applications that require DTLS must not
+use `opc-sctp`'s ordinary association as a substitute; they must use a real
+mutually authenticated protected transport. No Cargo feature enables DTLS in
+this crate.
 
 ## Relationships
 
@@ -233,13 +264,19 @@ async fn send_diameter(
 - Static multihoming binds every configured local address and connects with the
   complete remote address set on Linux. Address sets are bounded and must use
   one family and port; exactly one address preserves the original syscall path.
-- `DiameterSctpAssociation::connect_with_config` applies the existing Diameter
-  framing to that complete connect configuration. Unsupported kernel or
-  namespace multihoming remains a typed capability error; no address is
-  silently discarded.
+- `DiameterSctpAssociation::connect_unprotected_with_config` applies explicit
+  unprotected PPID-46 Diameter framing to the complete connect configuration.
+  Unsupported kernel or namespace multihoming remains a typed capability
+  error; no address is silently discarded.
+- Every `DiameterSctpPeer`, including one built with a public struct literal,
+  carries `DiameterSctpProtection::Unprotected`; there is no protected variant
+  or implicit external-IPsec attestation.
 - Diameter inbound PPID validation is strict by default. Legacy clear-text
   PPID 0 acceptance is an explicit per-peer policy; it never affects outbound
-  PPIDs or protected Diameter.
+  PPIDs and never implies protected Diameter.
+- The deprecated PPID-only `Dtls` selector fails closed with
+  `diameter_sctp_protected_transport_unavailable`. No readiness, health, or
+  metric emitted by an ordinary SCTP association claims DTLS or protection.
 - `capabilities()` advertises build support, kernel policy failures are a typed
   `CapabilityUnavailable` error, and `local_addresses()`/`peer_addresses()`
   expose the kernel-active set. Consumers may therefore choose an explicit
