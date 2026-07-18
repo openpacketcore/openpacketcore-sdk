@@ -196,15 +196,15 @@ pub use protected_payload_crypto::{
 };
 pub use sa_init::{
     build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response,
-    build_ike_sa_init_response, decode_ike_sa_init_request_payloads, encode_nonce_payload_build,
-    Ikev2KeyExchangePayload, Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError,
-    Ikev2NoncePayload, Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild,
-    Ikev2SaInitBuildError, Ikev2SaInitNotifyBuildError, Ikev2SaInitPayloadError,
-    Ikev2SaInitPayloads, Ikev2SaInitResponsePayloads, Ikev2SaPayload, Ikev2SaPayloadBuild,
-    Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform,
-    Ikev2SaTransformBuild, Ikev2TransformAttribute, Ikev2TransformAttributeBuild,
-    Ikev2TransformAttributeBuildValue, Ikev2TransformAttributeValue, Ikev2VendorIdPayload,
-    Ikev2VendorIdPayloadError,
+    build_ike_sa_init_response, build_ike_sa_init_unsupported_critical_payload_response,
+    decode_ike_sa_init_request_payloads, encode_nonce_payload_build, Ikev2KeyExchangePayload,
+    Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError, Ikev2NoncePayload,
+    Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError,
+    Ikev2SaInitNotifyBuildError, Ikev2SaInitPayloadError, Ikev2SaInitPayloads,
+    Ikev2SaInitResponsePayloads, Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaPayloadError,
+    Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform, Ikev2SaTransformBuild,
+    Ikev2TransformAttribute, Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
+    Ikev2TransformAttributeValue, Ikev2VendorIdPayload, Ikev2VendorIdPayloadError,
 };
 pub use sa_init_crypto::{
     derive_child_sa_key_material, derive_ike_sa_init_key_material,

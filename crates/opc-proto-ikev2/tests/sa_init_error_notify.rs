@@ -1,13 +1,64 @@
 use bytes::BytesMut;
 use opc_proto_ikev2::{
-    build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response, Header, HeaderFlags,
+    build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response,
+    build_ike_sa_init_unsupported_critical_payload_response, Header, HeaderFlags,
     Ikev2NotifyPayload, Ikev2NotifyPayloadBuild, Ikev2SaInitNotifyBuildError, Message, PayloadType,
     EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_IKE_SA_INIT, IKEV2_NOTIFY_INVALID_KE_PAYLOAD,
     IKEV2_NOTIFY_INVALID_SYNTAX, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+    IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
 };
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 
 const INITIATOR_SPI: u64 = 0x0102_0304_0506_0708;
+const SYNTHETIC_UNSUPPORTED_PAYLOAD_TYPE: u8 = 0xfa;
+
+// Specification-authored fixture from RFC 7296 §§2.5, 3.1, 3.2, and 3.10.1.
+// The payload type is a synthetic private-use value, not capture material.
+const UNSUPPORTED_CRITICAL_PAYLOAD_RESPONSE_FIXTURE: [u8; 37] = [
+    // IKE header: initiator SPI A, responder SPI zero.
+    0x01,
+    0x02,
+    0x03,
+    0x04,
+    0x05,
+    0x06,
+    0x07,
+    0x08,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    // First payload Notify, IKEv2, IKE_SA_INIT, R=1/I=0.
+    0x29,
+    0x20,
+    0x22,
+    0x20,
+    // Message ID zero; complete message length 37.
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x25,
+    // Final generic payload, length 9.
+    0x00,
+    0x00,
+    0x00,
+    0x09,
+    // Protocol ID zero, SPI size zero, UNSUPPORTED_CRITICAL_PAYLOAD (1).
+    0x00,
+    0x00,
+    0x00,
+    0x01,
+    // The offending critical payload type, exactly one octet.
+    SYNTHETIC_UNSUPPORTED_PAYLOAD_TYPE,
+];
 
 fn request_header() -> Header {
     Header::new(
@@ -96,6 +147,72 @@ fn invalid_ke_response_is_byte_exact_and_decodes_roundtrip() {
         IKEV2_NOTIFY_INVALID_KE_PAYLOAD
     );
     assert_eq!(decoded_notify.notification_data, [0x00, 0x13]);
+}
+
+#[test]
+fn unsupported_critical_payload_response_is_byte_exact_and_decodes_roundtrip() {
+    let request = request_header();
+    let response = match build_ike_sa_init_unsupported_critical_payload_response(
+        &request,
+        SYNTHETIC_UNSUPPORTED_PAYLOAD_TYPE,
+    ) {
+        Ok(value) => value,
+        Err(error) => panic!("UNSUPPORTED_CRITICAL_PAYLOAD response build failed: {error:?}"),
+    };
+    let encoded = encode_response(&response);
+    assert_eq!(
+        encoded.as_ref(),
+        UNSUPPORTED_CRITICAL_PAYLOAD_RESPONSE_FIXTURE
+    );
+
+    let generic_response = match build_ike_sa_init_notify_response(
+        &request,
+        &[notify(
+            IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
+            vec![SYNTHETIC_UNSUPPORTED_PAYLOAD_TYPE],
+        )],
+    ) {
+        Ok(value) => value,
+        Err(error) => panic!("generic UNSUPPORTED_CRITICAL_PAYLOAD build failed: {error:?}"),
+    };
+    assert_eq!(encode_response(&generic_response), encoded);
+
+    let (tail, decoded) = match Message::decode(&encoded, DecodeContext::default()) {
+        Ok(value) => value,
+        Err(error) => panic!("UNSUPPORTED_CRITICAL_PAYLOAD response decode failed: {error:?}"),
+    };
+    assert!(tail.is_empty());
+    assert_eq!(decoded.header.initiator_spi, INITIATOR_SPI);
+    assert_eq!(decoded.header.responder_spi, 0);
+    assert_eq!(decoded.header.exchange_type, EXCHANGE_TYPE_IKE_SA_INIT);
+    assert_eq!(decoded.header.message_id, 0);
+    assert!(!decoded.header.flags.initiator());
+    assert!(decoded.header.flags.response());
+    assert_eq!(decoded.header.flags.canonical_raw(), 0x20);
+
+    let mut payloads = decoded.payloads();
+    let raw = match payloads.next() {
+        Some(Ok(value)) => value,
+        other => panic!("unexpected UNSUPPORTED_CRITICAL_PAYLOAD response payload: {other:?}"),
+    };
+    assert_eq!(raw.payload_type, PayloadType::Notify);
+    assert_eq!(raw.next_payload, PayloadType::NoNext);
+    assert!(payloads.next().is_none());
+    let decoded_notify = match Ikev2NotifyPayload::decode(raw) {
+        Ok(value) => value,
+        Err(error) => panic!("UNSUPPORTED_CRITICAL_PAYLOAD Notify decode failed: {error:?}"),
+    };
+    assert_eq!(decoded_notify.protocol_id, IKEV2_NOTIFY_PROTOCOL_ID_NONE);
+    assert_eq!(decoded_notify.spi_size, 0);
+    assert!(decoded_notify.spi.is_empty());
+    assert_eq!(
+        decoded_notify.notify_message_type,
+        IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD
+    );
+    assert_eq!(
+        decoded_notify.notification_data,
+        [SYNTHETIC_UNSUPPORTED_PAYLOAD_TYPE]
+    );
 }
 
 #[test]
@@ -251,6 +368,17 @@ fn notify_response_builder_enforces_ike_sa_notify_shapes_and_lengths() {
     with_spi.spi = vec![0xaa];
     cases.push((with_spi, Ikev2SaInitNotifyBuildError::SpiNotEmpty));
 
+    cases.push((
+        notify(IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD, Vec::new()),
+        Ikev2SaInitNotifyBuildError::UnsupportedCriticalPayloadDataLength,
+    ));
+    cases.push((
+        notify(
+            IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
+            vec![SYNTHETIC_UNSUPPORTED_PAYLOAD_TYPE, 0x2b],
+        ),
+        Ikev2SaInitNotifyBuildError::UnsupportedCriticalPayloadDataLength,
+    ));
     cases.push((
         notify(IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, vec![0]),
         Ikev2SaInitNotifyBuildError::UnexpectedNotificationData,
