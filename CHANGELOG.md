@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **BREAKING — S2b Create Session PAA profile — `opc-proto-gtpv2c`:**
+  `S2bCreateSessionRequest` no longer accepts or emits the top-level PDN Type
+  IE prohibited by TS 29.274 Table 7.2.1-1 Note 1. The required PAA now owns
+  the requested IPv4, IPv6, IPv4v6, Non-IP, or Ethernet family. Explicit
+  dynamic and AAA-static constructors validate family/address shape; the S2b
+  sender rejects IE 99 even through `additional_ies`, while ProcedureAware
+  receive discards an unexpected IE 99 under clause 7.7.9 and continues.
+  Callers must remove `pdn_type` and construct `paa` with
+  `PdnAddressAllocation::{dynamic_*,static_*,non_ip,ethernet}`.
 - **S2b Create Session Response control endpoint — `opc-proto-gtpv2c`:**
   accepted responses now encode, require, and project the PGW S2b GTP-C
   F-TEID at instance 1/interface type 32 instead of treating instance-0 Sender

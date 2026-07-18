@@ -38,7 +38,7 @@ validation for these S2b procedure messages:
 | Procedure | Message types | Profile requirement |
 |:---|:---|:---|
 | Echo | Request (1), Response (2) | Recovery IE decode/encode, no-TEID header shape, sequence preservation, restart-counter evidence. |
-| Create Session | Request (32), Response (33) | S2b request/response required-IE validation, including the conditional request identity, request Sender F-TEID, response Cause classification, instance-1 PGW S2b control F-TEID, and bearer-context projection. |
+| Create Session | Request (32), Response (33) | S2b request/response required-IE validation, including the conditional request identity, PAA-owned requested family with no top-level PDN Type, request Sender F-TEID, response Cause classification, instance-1 PGW S2b control F-TEID, and bearer-context projection. |
 | Modify Bearer / S2b Modify Session | Request (34), Response (35) | Bearer Context request validation and Cause-bearing response validation. |
 | Delete Session | Request (36), Response (37) | Linked EPS Bearer ID request validation and Cause-bearing response validation. |
 | Update Bearer | Request (97), Response (98) | Mandatory APN-AMBR and one to fifteen request contexts; typed per-bearer TFT/QoS changes; mandatory correlated response contexts; message/bearer Cause hierarchy and partial acceptance. |
@@ -50,8 +50,9 @@ validation for these S2b procedure messages:
 The profile owns the typed IE families required by the S2b messages above:
 
 - Node and liveness IEs: Recovery.
-- Subscriber/session IEs: IMSI, APN, PDN Type, PAA, Selection Mode, RAT Type,
-  Serving Network, MEI, MSISDN.
+- Subscriber/session IEs: IMSI, APN, PAA, Selection Mode, RAT Type, Serving
+  Network, MEI, and MSISDN. PDN Type remains a typed generic IE for non-S2b
+  profiles but is prohibited from the S2b Create Session sender profile.
 - Tunnel and bearer IEs: request Sender F-TEID, response PGW S2b control
   F-TEID, Bearer Context, EPS Bearer ID, Bearer QoS, Charging ID, AMBR, APN
   Restriction, and Bearer TFT backed by the shared `opc-proto-tft` TS 24.008
@@ -73,8 +74,12 @@ failures and must cover at least these rules:
   requires a caller-supplied non-zero response-routing TEID.
 - Create Session Request must include IMSI or, for a UICC-less emergency
   attach, MEI instance 0 plus an instance-0 Indication carrying the UIMSI bit.
-  RAT Type, Serving Network, Sender F-TEID, APN, Selection Mode, PDN Type, PAA,
-  and Bearer Context with nested EBI remain required in either case.
+  RAT Type, Serving Network, Sender F-TEID, APN, Selection Mode, PAA, and
+  Bearer Context with nested EBI remain required in either case. PAA carries
+  the requested family; a separate top-level PDN Type IE is never sent on S2b.
+  Explicit PAA constructors distinguish dynamic all-zero IP requests from
+  AAA-provided static allocation and validate the IPv4, IPv6, IPv4v6, Non-IP,
+  or Ethernet field shape before encode.
 - Create Session Response must include Cause, PGW S2b control F-TEID instance
   1/interface type 32, and Bearer Context for accepted responses (Cause 16/17).
   The control endpoint requires a non-zero TEID and at least one address;
@@ -150,10 +155,10 @@ failures and must cover at least these rules:
   If discarding a key leaves a required expected key absent, the missing-key
   error is retained. Canonical profile builders use a separate Reject policy
   and do not emit duplicate singleton keys.
-- The current declared Create Session compatibility profile continues to
-  allow and require top-level PDN Type. Issue #335 owns the complete S2b
-  send-profile and PAA-constructor migration; this receive-policy change does
-  not pre-empt that table delta.
+- S2b Create Session receive accepts the required PAA without top-level PDN
+  Type. If an otherwise valid request includes the unexpected known IE 99,
+  ProcedureAware receive discards it under clause 7.7.9 and continues; the
+  canonical S2b sender rejects any attempt to append IE 99.
 
 ### Compatibility and API guarantees
 
@@ -270,8 +275,8 @@ coverage.
    - `ValidationLevel::ProcedureAware` checks the required IE subset claimed
      by this crate's S2b examples: Echo Request/Response Recovery; Create
      Session Request IMSI or emergency MEI plus UIMSI Indication, followed by
-     RAT Type/Serving Network/Sender F-TEID/APN/Selection Mode/PDN Type/PAA/
-     Bearer Context with nested EBI; Create Session Response Cause/PGW S2b
+     RAT Type/Serving Network/Sender F-TEID/APN/Selection Mode/PAA/Bearer
+     Context with nested EBI; Create Session Response Cause/PGW S2b
      control F-TEID instance 1/Bearer Context; Modify request Bearer Context;
      Delete Session request linked EBI; and response Cause IEs. Dedicated
      Create, Update, and Delete Bearer validation follows the stricter rules
@@ -397,9 +402,12 @@ The committed fixture corpus is split by provenance class:
     mandatory Recovery IE.
   - Create Session Request with the T flag and TEID 0 validates mandatory S2b
     request examples: IMSI, RAT Type, Serving Network, S2b ePDG control-plane
-    F-TEID, APN, Selection Mode, PDN Type, PAA, Bearer Context/EBI, nested
+    F-TEID, APN, Selection Mode, PAA (without top-level PDN Type), Bearer Context/EBI, nested
     S2b-U ePDG F-TEID and Bearer QoS, Indication, APCO, and raw fallback for a
     correctly framed extended IE type.
+  - Five compact Create Session Request fixtures independently cover dynamic
+    IPv4, dynamic IPv6, dynamic IPv4v6, Non-IP, and Ethernet PAA encodings;
+    the full request fixture covers AAA-static IPv4. All omit IE 99.
   - Create Session Response with TEID validates response Cause, PGW S2b
     control-plane F-TEID instance 1/interface type 32, PAA, and Bearer Context
     examples.

@@ -1,10 +1,11 @@
 use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
-    S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
-    IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI,
-    IE_TYPE_INDICATION, IE_TYPE_MEI, IE_TYPE_RECOVERY, INTERFACE_TYPE_S2B_EPDG_GTP_C,
-    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    PdnTypeValue, S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO,
+    IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID,
+    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_MEI, IE_TYPE_PAA, IE_TYPE_PDN_TYPE, IE_TYPE_RECOVERY,
+    INTERFACE_TYPE_S2B_EPDG_GTP_C, INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
+    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -24,6 +25,16 @@ const ECHO_REQUEST_FIXTURE: &[u8] = include_bytes!("fixtures/spec/echo_request_r
 const ECHO_RESPONSE_FIXTURE: &[u8] = include_bytes!("fixtures/spec/echo_response_recovery.bin");
 const CREATE_SESSION_REQUEST_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/create_session_request_s2b_subset.bin");
+const CREATE_SESSION_IPV4_DYNAMIC_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/create_session_request_s2b_ipv4_dynamic.bin");
+const CREATE_SESSION_IPV6_DYNAMIC_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/create_session_request_s2b_ipv6_dynamic.bin");
+const CREATE_SESSION_IPV4V6_DYNAMIC_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/create_session_request_s2b_ipv4v6_dynamic.bin");
+const CREATE_SESSION_NON_IP_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/create_session_request_s2b_non_ip.bin");
+const CREATE_SESSION_ETHERNET_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/create_session_request_s2b_ethernet.bin");
 const CREATE_SESSION_RESPONSE_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/create_session_response_s2b_subset.bin");
 const MODIFY_BEARER_REQUEST_FIXTURE: &[u8] =
@@ -321,6 +332,87 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
             assert_eq!(raw.value, [0x01, 0x00]);
         }
         other => panic!("unexpected raw fallback value: {other:?}"),
+    }
+}
+
+#[test]
+fn create_session_request_family_fixtures_use_paa_without_pdn_type() {
+    let cases = [
+        (
+            "static IPv4",
+            CREATE_SESSION_REQUEST_FIXTURE,
+            PdnTypeValue::Ipv4,
+            None,
+            None,
+            Some([198, 51, 100, 7]),
+        ),
+        (
+            "dynamic IPv4",
+            CREATE_SESSION_IPV4_DYNAMIC_FIXTURE,
+            PdnTypeValue::Ipv4,
+            None,
+            None,
+            Some([0; 4]),
+        ),
+        (
+            "dynamic IPv6",
+            CREATE_SESSION_IPV6_DYNAMIC_FIXTURE,
+            PdnTypeValue::Ipv6,
+            Some(0),
+            Some([0; 16]),
+            None,
+        ),
+        (
+            "dynamic IPv4v6",
+            CREATE_SESSION_IPV4V6_DYNAMIC_FIXTURE,
+            PdnTypeValue::Ipv4v6,
+            Some(0),
+            Some([0; 16]),
+            Some([0; 4]),
+        ),
+        (
+            "Non-IP",
+            CREATE_SESSION_NON_IP_FIXTURE,
+            PdnTypeValue::NonIp,
+            None,
+            None,
+            None,
+        ),
+        (
+            "Ethernet",
+            CREATE_SESSION_ETHERNET_FIXTURE,
+            PdnTypeValue::Ethernet,
+            None,
+            None,
+            None,
+        ),
+    ];
+
+    for (label, fixture, pdn_type, ipv6_prefix_length, ipv6_prefix, ipv4) in cases {
+        let (_, raw_message) = Message::decode(fixture, procedure_context())
+            .expect("family fixture has a valid raw message envelope");
+        let mut raw_paa_count = 0usize;
+        for raw_ie in raw_message.ies() {
+            let raw_ie = raw_ie.expect("family fixture has valid raw IE boundaries");
+            assert_ne!(raw_ie.ie_type, IE_TYPE_PDN_TYPE, "{label}");
+            if raw_ie.ie_type == IE_TYPE_PAA && raw_ie.instance == 0 {
+                raw_paa_count = raw_paa_count.saturating_add(1);
+            }
+        }
+        assert_eq!(raw_paa_count, 1, "{label}");
+
+        let message = decode_s2b(fixture);
+        let view = procedure_view(&message);
+        assert!(!view.has_ie(IE_TYPE_PDN_TYPE), "{label}");
+        let paa = find_ie(&view.ies, IE_TYPE_PAA);
+        let TypedIeValue::PdnAddressAllocation(paa) = &paa.value else {
+            panic!("{label}: expected typed PAA");
+        };
+        assert_eq!(paa.pdn_type, pdn_type, "{label}");
+        assert_eq!(paa.ipv6_prefix_length, ipv6_prefix_length, "{label}");
+        assert_eq!(paa.ipv6_prefix, ipv6_prefix, "{label}");
+        assert_eq!(paa.ipv4, ipv4, "{label}");
+        assert_eq!(paa.validate(), Ok(()), "{label}");
     }
 }
 
@@ -691,7 +783,6 @@ fn create_session_request_with_identity_ies_and_bearer_context(
             0x47, 0x00, 0x09, 0x00, 0x08, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x65, 0x74,
         ], // APN.
         &[0x80, 0x00, 0x01, 0x00, 0x00],             // Selection Mode.
-        &[0x63, 0x00, 0x01, 0x00, 0x01],             // PDN Type.
         &[0x4f, 0x00, 0x05, 0x00, 0x01, 0xc6, 0x33, 0x64, 0x07], // PAA.
         bearer_context,
     ];

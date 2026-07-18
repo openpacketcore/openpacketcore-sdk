@@ -1736,6 +1736,11 @@ impl PdnType {
 ///
 /// @spec 3GPP TS29274 R18 8.14
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-PAA-001
+///
+/// Use the explicit dynamic/static constructors when building S2b Create
+/// Session Requests. They distinguish the all-zero dynamic-allocation wire
+/// form from an AAA-provided static allocation and keep the PDN family and
+/// address fields consistent.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PdnAddressAllocation {
     /// PDN type encoded in the low three bits of the first value octet.
@@ -1747,6 +1752,94 @@ pub struct PdnAddressAllocation {
     /// IPv4 address, present for IPv4 and IPv4v6 PAA values.
     pub ipv4: Option<[u8; 4]>,
 }
+
+/// Fixed IPv6 prefix length used by an assigned PAA value.
+///
+/// TS 29.274 clause 8.14 fixes an assigned IPv6 PAA prefix at /64. A dynamic
+/// Create Session Request instead carries a zero prefix length and all-zero
+/// prefix/address fields.
+pub const PAA_ASSIGNED_IPV6_PREFIX_LENGTH: u8 = 64;
+
+/// Validation error for a typed [`PdnAddressAllocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdnAddressAllocationError {
+    /// The PDN type uses a reserved value.
+    ReservedPdnType,
+    /// The selected PDN type requires an IPv4 address field.
+    MissingIpv4Address,
+    /// The selected PDN type prohibits an IPv4 address field.
+    UnexpectedIpv4Address,
+    /// The selected PDN type requires an IPv6 prefix-length field.
+    MissingIpv6PrefixLength,
+    /// The selected PDN type prohibits an IPv6 prefix-length field.
+    UnexpectedIpv6PrefixLength,
+    /// The IPv6 prefix length is neither the dynamic value 0 nor assigned value 64.
+    InvalidIpv6PrefixLength,
+    /// The selected PDN type requires an IPv6 prefix/address field.
+    MissingIpv6Prefix,
+    /// The selected PDN type prohibits an IPv6 prefix/address field.
+    UnexpectedIpv6Prefix,
+    /// A static IPv4 allocation used the all-zero dynamic-allocation value.
+    StaticIpv4AddressUnspecified,
+    /// A static IPv6 allocation used an all-zero prefix/address value.
+    StaticIpv6PrefixUnspecified,
+    /// A static IPv4v6 allocation did not provide either address family.
+    StaticIpv4v6AddressMissing,
+}
+
+impl PdnAddressAllocationError {
+    /// Stable machine-readable label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReservedPdnType => "gtpv2c_paa_reserved_pdn_type",
+            Self::MissingIpv4Address => "gtpv2c_paa_ipv4_missing",
+            Self::UnexpectedIpv4Address => "gtpv2c_paa_ipv4_unexpected",
+            Self::MissingIpv6PrefixLength => "gtpv2c_paa_ipv6_prefix_length_missing",
+            Self::UnexpectedIpv6PrefixLength => "gtpv2c_paa_ipv6_prefix_length_unexpected",
+            Self::InvalidIpv6PrefixLength => "gtpv2c_paa_ipv6_prefix_length_invalid",
+            Self::MissingIpv6Prefix => "gtpv2c_paa_ipv6_prefix_missing",
+            Self::UnexpectedIpv6Prefix => "gtpv2c_paa_ipv6_prefix_unexpected",
+            Self::StaticIpv4AddressUnspecified => "gtpv2c_paa_static_ipv4_unspecified",
+            Self::StaticIpv6PrefixUnspecified => "gtpv2c_paa_static_ipv6_unspecified",
+            Self::StaticIpv4v6AddressMissing => "gtpv2c_paa_static_ipv4v6_missing",
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ReservedPdnType => "PAA PDN type is reserved",
+            Self::MissingIpv4Address => "PAA PDN type requires an IPv4 address",
+            Self::UnexpectedIpv4Address => "PAA PDN type prohibits an IPv4 address",
+            Self::MissingIpv6PrefixLength => "PAA PDN type requires an IPv6 prefix length",
+            Self::UnexpectedIpv6PrefixLength => {
+                "PAA PDN type prohibits an IPv6 prefix length"
+            }
+            Self::InvalidIpv6PrefixLength => {
+                "PAA IPv6 prefix length must be zero for dynamic allocation or 64 for assigned allocation"
+            }
+            Self::MissingIpv6Prefix => "PAA PDN type requires an IPv6 prefix",
+            Self::UnexpectedIpv6Prefix => "PAA PDN type prohibits an IPv6 prefix",
+            Self::StaticIpv4AddressUnspecified => {
+                "static PAA IPv4 address must not be the dynamic all-zero value"
+            }
+            Self::StaticIpv6PrefixUnspecified => {
+                "static PAA IPv6 prefix must not be the dynamic all-zero value"
+            }
+            Self::StaticIpv4v6AddressMissing => {
+                "static IPv4v6 PAA requires at least one assigned address family"
+            }
+        }
+    }
+}
+
+impl fmt::Display for PdnAddressAllocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for PdnAddressAllocationError {}
 
 impl fmt::Debug for PdnAddressAllocation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1761,6 +1854,179 @@ impl fmt::Debug for PdnAddressAllocation {
 }
 
 impl PdnAddressAllocation {
+    /// Build the all-zero dynamic IPv4 allocation request.
+    #[must_use]
+    pub const fn dynamic_ipv4() -> Self {
+        Self {
+            pdn_type: PdnTypeValue::Ipv4,
+            ipv6_prefix_length: None,
+            ipv6_prefix: None,
+            ipv4: Some([0; 4]),
+        }
+    }
+
+    /// Build the all-zero dynamic IPv6 allocation request.
+    #[must_use]
+    pub const fn dynamic_ipv6() -> Self {
+        Self {
+            pdn_type: PdnTypeValue::Ipv6,
+            ipv6_prefix_length: Some(0),
+            ipv6_prefix: Some([0; 16]),
+            ipv4: None,
+        }
+    }
+
+    /// Build the all-zero dynamic dual-stack allocation request.
+    #[must_use]
+    pub const fn dynamic_ipv4v6() -> Self {
+        Self {
+            pdn_type: PdnTypeValue::Ipv4v6,
+            ipv6_prefix_length: Some(0),
+            ipv6_prefix: Some([0; 16]),
+            ipv4: Some([0; 4]),
+        }
+    }
+
+    /// Build an AAA-provided static IPv4 allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdnAddressAllocationError::StaticIpv4AddressUnspecified`]
+    /// when `ipv4` is the all-zero dynamic-allocation value.
+    pub fn static_ipv4(ipv4: [u8; 4]) -> Result<Self, PdnAddressAllocationError> {
+        if ipv4 == [0; 4] {
+            return Err(PdnAddressAllocationError::StaticIpv4AddressUnspecified);
+        }
+        Ok(Self {
+            pdn_type: PdnTypeValue::Ipv4,
+            ipv6_prefix_length: None,
+            ipv6_prefix: None,
+            ipv4: Some(ipv4),
+        })
+    }
+
+    /// Build an AAA-provided static IPv6 allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the assigned prefix length is 64 and the
+    /// supplied prefix/address is non-zero.
+    pub fn static_ipv6(
+        ipv6_prefix_length: u8,
+        ipv6_prefix: [u8; 16],
+    ) -> Result<Self, PdnAddressAllocationError> {
+        validate_static_ipv6(ipv6_prefix_length, ipv6_prefix)?;
+        Ok(Self {
+            pdn_type: PdnTypeValue::Ipv6,
+            ipv6_prefix_length: Some(ipv6_prefix_length),
+            ipv6_prefix: Some(ipv6_prefix),
+            ipv4: None,
+        })
+    }
+
+    /// Build an AAA-provided static dual-stack allocation.
+    ///
+    /// A subscription may provide either family or both. A missing family is
+    /// encoded with the all-zero values required by TS 29.274 Table 7.2.1-1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither family is supplied, if a supplied family
+    /// uses its all-zero dynamic value, or if an IPv6 allocation is not /64.
+    pub fn static_ipv4v6(
+        ipv4: Option<[u8; 4]>,
+        ipv6: Option<(u8, [u8; 16])>,
+    ) -> Result<Self, PdnAddressAllocationError> {
+        if ipv4.is_none() && ipv6.is_none() {
+            return Err(PdnAddressAllocationError::StaticIpv4v6AddressMissing);
+        }
+        if ipv4.is_some_and(|address| address == [0; 4]) {
+            return Err(PdnAddressAllocationError::StaticIpv4AddressUnspecified);
+        }
+        if let Some((prefix_length, prefix)) = ipv6 {
+            validate_static_ipv6(prefix_length, prefix)?;
+        }
+        let (ipv6_prefix_length, ipv6_prefix) = ipv6
+            .map_or((Some(0), Some([0; 16])), |(prefix_length, prefix)| {
+                (Some(prefix_length), Some(prefix))
+            });
+        Ok(Self {
+            pdn_type: PdnTypeValue::Ipv4v6,
+            ipv6_prefix_length,
+            ipv6_prefix,
+            ipv4: Some(ipv4.unwrap_or([0; 4])),
+        })
+    }
+
+    /// Build a Non-IP PAA value with no address octets.
+    #[must_use]
+    pub const fn non_ip() -> Self {
+        Self {
+            pdn_type: PdnTypeValue::NonIp,
+            ipv6_prefix_length: None,
+            ipv6_prefix: None,
+            ipv4: None,
+        }
+    }
+
+    /// Build an Ethernet PAA value with no address octets.
+    #[must_use]
+    pub const fn ethernet() -> Self {
+        Self {
+            pdn_type: PdnTypeValue::Ethernet,
+            ipv6_prefix_length: None,
+            ipv6_prefix: None,
+            ipv4: None,
+        }
+    }
+
+    /// Validate the PDN type and address-field shape.
+    ///
+    /// Dynamic IP requests use zero values, while assigned IPv6 values use the
+    /// fixed /64 prefix length from TS 29.274 clause 8.14.
+    pub fn validate(&self) -> Result<(), PdnAddressAllocationError> {
+        match self.pdn_type {
+            PdnTypeValue::Ipv4 => {
+                if self.ipv4.is_none() {
+                    return Err(PdnAddressAllocationError::MissingIpv4Address);
+                }
+                if self.ipv6_prefix_length.is_some() {
+                    return Err(PdnAddressAllocationError::UnexpectedIpv6PrefixLength);
+                }
+                if self.ipv6_prefix.is_some() {
+                    return Err(PdnAddressAllocationError::UnexpectedIpv6Prefix);
+                }
+            }
+            PdnTypeValue::Ipv6 => {
+                if self.ipv4.is_some() {
+                    return Err(PdnAddressAllocationError::UnexpectedIpv4Address);
+                }
+                validate_ipv6_shape(self.ipv6_prefix_length, self.ipv6_prefix)?;
+            }
+            PdnTypeValue::Ipv4v6 => {
+                if self.ipv4.is_none() {
+                    return Err(PdnAddressAllocationError::MissingIpv4Address);
+                }
+                validate_ipv6_shape(self.ipv6_prefix_length, self.ipv6_prefix)?;
+            }
+            PdnTypeValue::NonIp | PdnTypeValue::Ethernet => {
+                if self.ipv4.is_some() {
+                    return Err(PdnAddressAllocationError::UnexpectedIpv4Address);
+                }
+                if self.ipv6_prefix_length.is_some() {
+                    return Err(PdnAddressAllocationError::UnexpectedIpv6PrefixLength);
+                }
+                if self.ipv6_prefix.is_some() {
+                    return Err(PdnAddressAllocationError::UnexpectedIpv6Prefix);
+                }
+            }
+            PdnTypeValue::Unknown(_) => {
+                return Err(PdnAddressAllocationError::ReservedPdnType);
+            }
+        }
+        Ok(())
+    }
+
     fn decode_value(value: &[u8], offset: usize, ctx: DecodeContext) -> Result<Self, DecodeError> {
         require_min_len(value, 1, offset, "PAA IE must contain the PDN type octet")?;
         if crate::is_strict(ctx.validation_level) && (value[0] & 0xf8) != 0 {
@@ -1773,28 +2039,28 @@ impl PdnAddressAllocation {
             .with_spec_ref(spec_ref()));
         }
         let pdn_type = PdnTypeValue::from(value[0]);
-        match pdn_type {
+        let decoded = match pdn_type {
             PdnTypeValue::Ipv4 => {
                 require_exact_len(value, 5, offset, "IPv4 PAA must be five octets")?;
                 let mut ipv4 = [0u8; 4];
                 ipv4.copy_from_slice(&value[1..5]);
-                Ok(Self {
+                Self {
                     pdn_type,
                     ipv6_prefix_length: None,
                     ipv6_prefix: None,
                     ipv4: Some(ipv4),
-                })
+                }
             }
             PdnTypeValue::Ipv6 => {
                 require_exact_len(value, 18, offset, "IPv6 PAA must be eighteen octets")?;
                 let mut ipv6 = [0u8; 16];
                 ipv6.copy_from_slice(&value[2..18]);
-                Ok(Self {
+                Self {
                     pdn_type,
                     ipv6_prefix_length: Some(value[1]),
                     ipv6_prefix: Some(ipv6),
                     ipv4: None,
-                })
+                }
             }
             PdnTypeValue::Ipv4v6 => {
                 require_exact_len(value, 22, offset, "IPv4v6 PAA must be twenty-two octets")?;
@@ -1802,12 +2068,12 @@ impl PdnAddressAllocation {
                 ipv6.copy_from_slice(&value[2..18]);
                 let mut ipv4 = [0u8; 4];
                 ipv4.copy_from_slice(&value[18..22]);
-                Ok(Self {
+                Self {
                     pdn_type,
                     ipv6_prefix_length: Some(value[1]),
                     ipv6_prefix: Some(ipv6),
                     ipv4: Some(ipv4),
-                })
+                }
             }
             PdnTypeValue::NonIp | PdnTypeValue::Ethernet | PdnTypeValue::Unknown(_) => {
                 require_exact_len(
@@ -1816,17 +2082,31 @@ impl PdnAddressAllocation {
                     offset,
                     "Non-IP, Ethernet, and unknown PAA values must be one octet",
                 )?;
-                Ok(Self {
+                Self {
                     pdn_type,
                     ipv6_prefix_length: None,
                     ipv6_prefix: None,
                     ipv4: None,
-                })
+                }
             }
+        };
+        if crate::is_strict(ctx.validation_level) {
+            decoded.validate().map_err(|error| {
+                DecodeError::new(
+                    DecodeErrorCode::Structural {
+                        reason: error.reason(),
+                    },
+                    offset,
+                )
+                .with_spec_ref(spec_ref())
+            })?;
         }
+        Ok(decoded)
     }
 
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        self.validate()
+            .map_err(|error| encode_structural_error(error.reason()))?;
         dst.put_u8(u8::from(self.pdn_type) & 0x07);
         match self.pdn_type {
             PdnTypeValue::Ipv4 => {
@@ -1863,6 +2143,35 @@ impl PdnAddressAllocation {
         }
         Ok(())
     }
+}
+
+fn validate_ipv6_shape(
+    prefix_length: Option<u8>,
+    prefix: Option<[u8; 16]>,
+) -> Result<(), PdnAddressAllocationError> {
+    let Some(prefix_length) = prefix_length else {
+        return Err(PdnAddressAllocationError::MissingIpv6PrefixLength);
+    };
+    if prefix_length != 0 && prefix_length != PAA_ASSIGNED_IPV6_PREFIX_LENGTH {
+        return Err(PdnAddressAllocationError::InvalidIpv6PrefixLength);
+    }
+    if prefix.is_none() {
+        return Err(PdnAddressAllocationError::MissingIpv6Prefix);
+    }
+    Ok(())
+}
+
+fn validate_static_ipv6(
+    prefix_length: u8,
+    prefix: [u8; 16],
+) -> Result<(), PdnAddressAllocationError> {
+    if prefix_length != PAA_ASSIGNED_IPV6_PREFIX_LENGTH {
+        return Err(PdnAddressAllocationError::InvalidIpv6PrefixLength);
+    }
+    if prefix == [0; 16] {
+        return Err(PdnAddressAllocationError::StaticIpv6PrefixUnspecified);
+    }
+    Ok(())
 }
 
 /// APN Restriction IE (type 127).
@@ -2814,6 +3123,146 @@ mod tests {
             }
         ));
         assert_eq!(error.offset(), 7);
+    }
+
+    #[test]
+    fn paa_constructors_distinguish_dynamic_and_static_allocations() {
+        let dynamic_cases = [
+            (PdnAddressAllocation::dynamic_ipv4(), vec![1, 0, 0, 0, 0]),
+            (
+                PdnAddressAllocation::dynamic_ipv6(),
+                [vec![2, 0], vec![0; 16]].concat(),
+            ),
+            (
+                PdnAddressAllocation::dynamic_ipv4v6(),
+                [vec![3, 0], vec![0; 16], vec![0; 4]].concat(),
+            ),
+            (PdnAddressAllocation::non_ip(), vec![4]),
+            (PdnAddressAllocation::ethernet(), vec![5]),
+        ];
+        for (paa, expected) in dynamic_cases {
+            assert_eq!(paa.validate(), Ok(()));
+            let mut encoded = BytesMut::new();
+            assert_eq!(paa.encode_value(&mut encoded), Ok(()));
+            assert_eq!(encoded.as_ref(), expected.as_slice());
+        }
+
+        let static_ipv4 = PdnAddressAllocation::static_ipv4([198, 51, 100, 7]);
+        assert_eq!(
+            static_ipv4.as_ref().map(|paa| paa.ipv4),
+            Ok(Some([198, 51, 100, 7]))
+        );
+        let mut encoded_static_ipv4 = BytesMut::new();
+        let static_ipv4_encode = match &static_ipv4 {
+            Ok(paa) => paa.encode_value(&mut encoded_static_ipv4),
+            Err(error) => panic!("static IPv4 construction failed: {error}"),
+        };
+        assert_eq!(static_ipv4_encode, Ok(()));
+        assert_eq!(encoded_static_ipv4.as_ref(), &[1, 198, 51, 100, 7]);
+        let ipv6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+        let static_ipv6 = PdnAddressAllocation::static_ipv6(64, ipv6);
+        assert_eq!(
+            static_ipv6.as_ref().map(|paa| paa.ipv6_prefix),
+            Ok(Some(ipv6))
+        );
+        let mut encoded_static_ipv6 = BytesMut::new();
+        let static_ipv6_encode = match &static_ipv6 {
+            Ok(paa) => paa.encode_value(&mut encoded_static_ipv6),
+            Err(error) => panic!("static IPv6 construction failed: {error}"),
+        };
+        assert_eq!(static_ipv6_encode, Ok(()));
+        assert_eq!(
+            encoded_static_ipv6.as_ref(),
+            [vec![2, 64], ipv6.to_vec()].concat()
+        );
+        let static_dual = PdnAddressAllocation::static_ipv4v6(None, Some((64, ipv6)));
+        assert_eq!(static_dual.as_ref().map(|paa| paa.ipv4), Ok(Some([0; 4])));
+        assert_eq!(
+            static_dual.as_ref().map(|paa| paa.ipv6_prefix),
+            Ok(Some(ipv6))
+        );
+        let mut encoded_static_dual = BytesMut::new();
+        let static_dual_encode = match &static_dual {
+            Ok(paa) => paa.encode_value(&mut encoded_static_dual),
+            Err(error) => panic!("static IPv4v6 construction failed: {error}"),
+        };
+        assert_eq!(static_dual_encode, Ok(()));
+        assert_eq!(
+            encoded_static_dual.as_ref(),
+            [vec![3, 64], ipv6.to_vec(), vec![0; 4]].concat()
+        );
+    }
+
+    #[test]
+    fn paa_constructors_and_encode_reject_ambiguous_or_mismatched_shapes() {
+        assert_eq!(
+            PdnAddressAllocation::static_ipv4([0; 4]),
+            Err(PdnAddressAllocationError::StaticIpv4AddressUnspecified)
+        );
+        assert_eq!(
+            PdnAddressAllocation::static_ipv6(0, [1; 16]),
+            Err(PdnAddressAllocationError::InvalidIpv6PrefixLength)
+        );
+        assert_eq!(
+            PdnAddressAllocation::static_ipv6(64, [0; 16]),
+            Err(PdnAddressAllocationError::StaticIpv6PrefixUnspecified)
+        );
+        assert_eq!(
+            PdnAddressAllocation::static_ipv4v6(None, None),
+            Err(PdnAddressAllocationError::StaticIpv4v6AddressMissing)
+        );
+
+        let mismatched = PdnAddressAllocation {
+            pdn_type: PdnTypeValue::NonIp,
+            ipv6_prefix_length: None,
+            ipv6_prefix: None,
+            ipv4: Some([198, 51, 100, 7]),
+        };
+        assert_eq!(
+            mismatched.validate(),
+            Err(PdnAddressAllocationError::UnexpectedIpv4Address)
+        );
+        let mut encoded = BytesMut::new();
+        let error = match mismatched.encode_value(&mut encoded) {
+            Ok(()) => panic!("family-mismatched PAA unexpectedly encoded"),
+            Err(error) => error,
+        };
+        assert!(encoded.is_empty());
+        assert!(matches!(
+            error.code(),
+            EncodeErrorCode::Structural {
+                reason: "PAA PDN type prohibits an IPv4 address"
+            }
+        ));
+        assert_eq!(
+            PdnAddressAllocationError::UnexpectedIpv4Address.as_str(),
+            "gtpv2c_paa_ipv4_unexpected"
+        );
+    }
+
+    #[test]
+    fn strict_paa_decode_rejects_reserved_type_and_invalid_prefix_length() {
+        let strict = DecodeContext {
+            validation_level: opc_protocol::ValidationLevel::Strict,
+            ..DecodeContext::default()
+        };
+        let reserved = PdnAddressAllocation::decode_value(&[6], 9, strict);
+        assert!(matches!(
+            reserved.as_ref().map_err(DecodeError::code),
+            Err(DecodeErrorCode::Structural {
+                reason: "PAA PDN type is reserved"
+            })
+        ));
+
+        let mut invalid_ipv6 = vec![2, 63];
+        invalid_ipv6.extend_from_slice(&[0; 16]);
+        let invalid_prefix = PdnAddressAllocation::decode_value(&invalid_ipv6, 11, strict);
+        assert!(matches!(
+            invalid_prefix.as_ref().map_err(DecodeError::code),
+            Err(DecodeErrorCode::Structural {
+                reason: "PAA IPv6 prefix length must be zero for dynamic allocation or 64 for assigned allocation"
+            })
+        ));
     }
 
     #[test]

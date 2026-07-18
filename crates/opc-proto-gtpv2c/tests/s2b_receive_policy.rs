@@ -6,8 +6,8 @@ use opc_proto_gtpv2c::{
     RawIe, Recovery, S2bMessage, TypedIe, TypedIeValue, IE_TYPE_AMBR, IE_TYPE_APCO, IE_TYPE_APN,
     IE_TYPE_APN_RESTRICTION, IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE,
     IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_LOAD_CONTROL_INFORMATION,
-    IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PCO, IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_RECOVERY,
-    IE_TYPE_SERVING_NETWORK, MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES,
+    IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PCO, IE_TYPE_PDN_TYPE, IE_TYPE_PGW_CHANGE_INFO,
+    IE_TYPE_RECOVERY, IE_TYPE_SERVING_NETWORK, MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES,
     MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES,
 };
 use opc_protocol::{
@@ -538,15 +538,16 @@ fn assigned_create_session_response_optionals_are_preserved() {
 }
 
 #[test]
-fn current_create_session_profile_retains_pdn_type_until_issue_335() {
-    let (_, decoded) = S2bMessage::decode(CREATE_SESSION_REQUEST_FIXTURE, procedure_context())
-        .expect("current declared profile still requires PDN Type");
-    assert!(decoded
-        .as_view()
-        .expect("typed request view")
-        .ies
-        .iter()
-        .any(|ie| ie.ie_type() == opc_proto_gtpv2c::IE_TYPE_PDN_TYPE && ie.instance == 0));
+fn create_session_discards_unexpected_pdn_type_and_continues_processing() {
+    let bytes = append_raw_ies(
+        CREATE_SESSION_REQUEST_FIXTURE,
+        &[IE_TYPE_PDN_TYPE, 0, 1, 0, 1],
+    );
+    let (_, decoded) = S2bMessage::decode(&bytes, procedure_context())
+        .expect("unexpected PDN Type is discarded under clause 7.7.9");
+    let view = decoded.as_view().expect("typed request view");
+    assert!(view.has_ie(opc_proto_gtpv2c::IE_TYPE_PAA));
+    assert!(!view.has_ie(IE_TYPE_PDN_TYPE));
 }
 
 #[test]
