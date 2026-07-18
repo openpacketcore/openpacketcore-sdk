@@ -74,6 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Added
+- **Bounded GTPv2-C protocol-error responses — `opc-proto-gtpv2c`:** a
+  zero-allocation fixed-header inspector now separates answerable requests
+  from TS 29.274 silent-discard cases. Typed plans cover header-only Version
+  Not Supported with a checked local sequence, Echo Response special handling,
+  and Cause-bearing S2b responses for invalid message/IE length,
+  missing/incorrect mandatory or conditional IE, and Context Not Found. The
+  clause 5.5.2 no-lookup path uses TEID zero without permitting Context Not
+  Found, and the unknown-TEID classification requires a received non-zero TEID
+  rather than a legitimate zero-TEID initial request. Exact amplification
+  sizing and redacted caller-metadata reversal are available before bounded
+  encoding.
 - **Atomic candidate-only v5 Kubernetes HA artifacts — `opc-session-testkit`:**
   a separate executable and reusable composition API now preflight a trusted
   Linux output parent and Python interpreter before campaign mutation, run the

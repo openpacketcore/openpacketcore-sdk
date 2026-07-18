@@ -108,7 +108,7 @@ impl fmt::Display for InvalidMessagePriority {
 
 impl std::error::Error for InvalidMessagePriority {}
 
-/// GTPv2-C message type values covered by the S2b typed subset.
+/// GTPv2-C message type values typed by this crate.
 ///
 /// Unsupported values remain available through [`MessageType::Unknown`] so
 /// callers can use a typed API without losing raw message-type bytes.
@@ -118,6 +118,8 @@ pub enum MessageType {
     EchoRequest,
     /// Echo Response (2).
     EchoResponse,
+    /// Version Not Supported Indication (3).
+    VersionNotSupportedIndication,
     /// Create Session Request (32).
     CreateSessionRequest,
     /// Create Session Response (33).
@@ -152,6 +154,7 @@ impl MessageType {
         match value {
             1 => Self::EchoRequest,
             2 => Self::EchoResponse,
+            3 => Self::VersionNotSupportedIndication,
             32 => Self::CreateSessionRequest,
             33 => Self::CreateSessionResponse,
             34 => Self::ModifyBearerRequest,
@@ -173,6 +176,7 @@ impl MessageType {
         match self {
             Self::EchoRequest => 1,
             Self::EchoResponse => 2,
+            Self::VersionNotSupportedIndication => 3,
             Self::CreateSessionRequest => 32,
             Self::CreateSessionResponse => 33,
             Self::ModifyBearerRequest => 34,
@@ -191,7 +195,7 @@ impl MessageType {
 
     /// Return `true` when this is one of the S2b typed subset message values.
     pub const fn is_s2b(self) -> bool {
-        !matches!(self, Self::Unknown(_))
+        !matches!(self, Self::VersionNotSupportedIndication | Self::Unknown(_))
     }
 }
 

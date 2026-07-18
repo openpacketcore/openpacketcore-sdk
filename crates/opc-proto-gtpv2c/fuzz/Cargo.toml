@@ -29,3 +29,8 @@ test = false
 name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"
 test = false
+
+[[bin]]
+name = "error_response_plans"
+path = "fuzz_targets/error_response_plans.rs"
+test = false

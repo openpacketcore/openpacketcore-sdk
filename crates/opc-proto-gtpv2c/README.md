@@ -26,6 +26,14 @@ control-plane stack.
   encode validates that the selected family matches its address fields.
 - `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
   shells and implement the shared `opc-protocol` codec traits.
+- `inspect_gtpv2c_request` and `Gtpv2cErrorResponsePlanner` form a separate
+  zero-allocation error boundary. Inspection retains only a reply-safe fixed
+  header envelope; planning returns either an explicit standards-required
+  discard or a bounded Version Not Supported, Echo, or ordinary S2b response.
+  Ordinary protocol failures require a caller-owned non-zero remote TEID or an
+  explicit no-lookup TEID-zero choice. An unknown received non-zero TEID is a
+  separate type that alone can produce Context Not Found; applying it to a
+  legitimate zero-TEID initial request fails closed without a response plan.
 - `S2bMessage<'a>` and `S2bProcedureMessage<'a>` provide typed S2b views and
   raw fallback for unsupported message types. `decode_with_diagnostics`
   additionally returns bounded, value-free `S2bReceiveDiagnostics` evidence
@@ -102,6 +110,70 @@ assert!(decoded.message().as_view().is_some());
 assert!(decoded.diagnostics().is_empty());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+Protocol-error planning remains independent of full decode, session lookup,
+and transaction state:
+
+```rust
+use core::num::NonZeroU32;
+use bytes::BytesMut;
+use opc_proto_gtpv2c::{
+    inspect_gtpv2c_request, Gtpv2cErrorResponseDecision,
+    Gtpv2cErrorResponsePlanner, Gtpv2cOffendingIe, Gtpv2cProtocolError,
+    Gtpv2cProtocolErrorKind, Gtpv2cProtocolErrorResponseTeid,
+    Gtpv2cRequestFailure, Gtpv2cRequestInspection, Gtpv2cSequenceNumber,
+    Recovery,
+};
+use opc_protocol::{Encode, EncodeContext};
+
+let local_vns_sequence = Gtpv2cSequenceNumber::new(7)?;
+let planner = Gtpv2cErrorResponsePlanner::new(
+    local_vns_sequence,
+    Recovery { restart_counter: 3 },
+);
+let offending = Gtpv2cOffendingIe::new(71, 0)?; // APN, instance 0.
+let remote_teid = NonZeroU32::new(0x0102_0304).ok_or("remote TEID is zero")?;
+let failure = Gtpv2cRequestFailure::Protocol(Gtpv2cProtocolError::new(
+    Gtpv2cProtocolErrorKind::MissingMandatoryIe(offending),
+    Gtpv2cProtocolErrorResponseTeid::Remote(remote_teid),
+));
+# let datagram = [0x48, 0x20, 0, 8, 0, 0, 0, 0, 0, 0, 1, 0];
+let decision = match inspect_gtpv2c_request(&datagram) {
+    Gtpv2cRequestInspection::Request(envelope) => {
+        planner.plan_request_failure(envelope, failure)
+    }
+    Gtpv2cRequestInspection::UnsupportedVersion(envelope) => {
+        Gtpv2cErrorResponseDecision::Respond(
+            planner.plan_unsupported_version(envelope),
+        )
+    }
+    Gtpv2cRequestInspection::Unanswerable(reason) => {
+        Gtpv2cErrorResponseDecision::Unanswerable(reason)
+    }
+};
+if let Gtpv2cErrorResponseDecision::Respond(plan) = decision {
+    let sizing = plan.amplification_metadata();
+    assert!(sizing.planned_output_len <= 22);
+    let mut response = BytesMut::new();
+    plan.encode(&mut response, EncodeContext::default())?;
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Message type 3 always uses the checked locally supplied sequence rather than
+the received higher-version value. `plan_unsupported_version` therefore takes
+only the proven envelope and never requires dummy decode-failure evidence.
+Ordinary responses copy the request's 24-bit sequence and, when present,
+Message Priority. The no-lookup path keeps the protocol-error Cause while
+using header TEID zero; it cannot represent Context Not Found. Malformed Echo
+IEs instead produce an Echo Response with the configured local Recovery IE and
+no Cause. Unknown message types, responses, incomplete headers, piggybacked
+inputs, lower versions, and the other TS 29.274 silent-discard cases do not
+yield response bytes. A zero-TEID initial request misclassified as an unknown
+received TEID is separately rejected as conflicting caller evidence. Plans
+expose exact input/output sizing before encoding and redact TEID/peer/payload
+values from `Debug`; the product still owns admission, reflection defense, rate
+limits, UDP source selection, session lookup, and logging policy.
 
 `ProcedureAware` is a receiver profile. In accordance with TS 29.274 clauses
 7.7.9 and 7.7.10, it classifies each crate-known IE type/instance against one
@@ -286,6 +358,7 @@ cargo test -p opc-proto-gtpv2c --all-features
 cargo run -p opc-proto-gtpv2c --example production_profile_v1
 cargo run -p opc-proto-gtpv2c --example dedicated_bearer
 (cd crates/opc-proto-gtpv2c && cargo +nightly fuzz list)
+(cd crates/opc-proto-gtpv2c && cargo +nightly fuzz run error_response_plans -- -runs=1000)
 ```
 
 See [CONFORMANCE.md](CONFORMANCE.md) and `examples/production_profile_v1.rs`

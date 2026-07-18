@@ -17,6 +17,12 @@
 //! S2b Create Session Requests carry the requested family only in
 //! [`PdnAddressAllocation`]; explicit dynamic/static constructors prevent a
 //! top-level PDN Type IE or family/address-shape mismatch from being emitted.
+//! [`inspect_gtpv2c_request`] and [`Gtpv2cErrorResponsePlanner`] provide a
+//! separate zero-allocation, reply-safe boundary for TS 29.274 protocol errors:
+//! header-only Version Not Supported, Echo special handling, or bounded
+//! Cause-bearing S2b response plans. Typed envelope continuations keep
+//! unsupported-version planning independent of decode-failure evidence.
+//! Transport admission and rate limits remain caller owned.
 //!
 //! @spec 3GPP TS29274 R18
 //! @req REQ-3GPP-TS29274-R18-S2B-001
@@ -33,6 +39,7 @@ pub(crate) const fn is_strict(level: ValidationLevel) -> bool {
 }
 
 pub mod dedicated_bearer;
+pub mod error_response;
 pub mod header;
 pub mod ie;
 pub mod message;
@@ -52,6 +59,17 @@ pub use dedicated_bearer::{
     S2bUpdateBearerRequestContext, S2bUpdateBearerResponse, S2bUpdateBearerResult,
     MAX_DEDICATED_BEARER_CONTEXTS, MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES,
     MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES,
+};
+
+pub use error_response::{
+    inspect_gtpv2c_request, Gtpv2cAmplificationMetadata, Gtpv2cErrorResponseDecision,
+    Gtpv2cErrorResponseKind, Gtpv2cErrorResponsePlan, Gtpv2cErrorResponsePlanner,
+    Gtpv2cInvalidOffendingIeInstance, Gtpv2cInvalidSequenceNumber, Gtpv2cOffendingIe,
+    Gtpv2cPlannedSend, Gtpv2cProtocolError, Gtpv2cProtocolErrorKind,
+    Gtpv2cProtocolErrorResponseTeid, Gtpv2cReceivedPeerMetadata, Gtpv2cReceivedTeid,
+    Gtpv2cRequestEnvelope, Gtpv2cRequestFailure, Gtpv2cRequestInspection, Gtpv2cSendTuple,
+    Gtpv2cSequenceNumber, Gtpv2cUnanswerableReason, Gtpv2cUnsupportedVersionEnvelope,
+    MAX_GTPV2C_ERROR_RESPONSE_WIRE_LEN,
 };
 
 pub use header::{
