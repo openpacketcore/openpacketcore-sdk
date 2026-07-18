@@ -299,15 +299,21 @@ pub struct LiveMirroredTakeover {
 }
 ```
 
-- `checkpointed_send_iv_next` is the holder's merged (monotonic-max) counter
-  checkpoint; `restored_send_iv_next` is computed as
-  `checkpoint + forward_jump` — never chosen by the caller — and the whole
-  `SameSpiResume` is passed through `validate_for_repin` before the entry is
-  removed. A mirrored counter is a **stale lower bound** (the owner kept
-  sending after the last checkpoint), so the mandatory forward-jump floor
+- `resume.outbound_iv` is always
+  `SameSpiOutboundIvResume::CounterBased` on this existing mirror path.
+  `checkpointed_send_iv_next` is the holder's merged (monotonic-max) counter
+  checkpoint; `restored_send_iv_next` is computed as `checkpoint +
+  forward_jump` — never chosen by the caller — and the whole `SameSpiResume`
+  is passed through `validate_for_repin` before the entry is removed. A
+  mirrored counter is a **stale lower bound** (the owner kept sending after the
+  last checkpoint), so the mandatory forward-jump floor
   (`MIN_SEND_IV_FORWARD_JUMP`) and the ESP ESN reconstruction ceiling apply to
   live-mirrored resumes exactly as to persisted ones; nonce reuse on AES-GCM
   would be catastrophic (RFC 5282).
+- This version of the mirror wire contract does not carry a typed random-IV
+  generation mode. A zero, absent, or legacy `send_iv_next` is therefore never
+  reinterpreted as IKE-CBC evidence. Random-IV IKE attestation remains explicit
+  at the consumer/re-pin boundary.
 - Anti-replay evidence is always `AntiReplayResume::BoundedReopening` with the
   holder's watermark as both checkpoint and restored value. Live mirroring is
   asynchronous, so bitmap continuity can never be honestly claimed;
@@ -330,8 +336,8 @@ pub struct LiveMirroredTakeover {
 1. `take_for_repin` → validated evidence + keymat in hand.
 2. `RePinCoordinator::repin` → fence commit, audit, steering install.
 3. Install keymat + restored counters into the standby's dataplane
-   (`restored_send_iv_next` MUST be the counter actually installed — the
-   transition fingerprint binds it).
+   (`CounterBased::restored_send_iv_next` MUST be the counter actually
+   installed — the transition fingerprint binds it).
 4. Drop the takeover buffer (zeroize). Inject `ForwardingProof` when observed.
 
 A CNF MAY pre-install **receive-side** SA state before step 2 to shrink the

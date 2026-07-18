@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_ipsec_lb::{
-    ResumeKeySource, SaId, SendIvCounterMode, SendIvForwardJump, MIN_SEND_IV_FORWARD_JUMP,
+    ResumeKeySource, SaId, SameSpiOutboundIvResume, SendIvCounterMode, SendIvForwardJump,
+    MIN_SEND_IV_FORWARD_JUMP,
 };
 use opc_sa_mirror::{
     InMemoryStandbyHolder, KeyEpoch, KeymatFormat, MirroredSaKeymat, RemoteMirrorProducer,
@@ -187,11 +188,14 @@ async fn producer_mirrors_over_mtls_and_standby_yields_a_validated_takeover() {
     // live-mirrored resume evidence.
     let takeover = holder.take_for_repin(sa, esp_params()).expect("takeover");
     assert_eq!(takeover.resume.key_source, ResumeKeySource::LiveMirrored);
-    assert_eq!(takeover.resume.checkpointed_send_iv_next, 7_000);
-    assert_eq!(
-        takeover.resume.restored_send_iv_next,
-        7_000 + MIN_SEND_IV_FORWARD_JUMP
-    );
+    assert!(matches!(
+        takeover.resume.outbound_iv,
+        SameSpiOutboundIvResume::CounterBased {
+            checkpointed_send_iv_next: 7_000,
+            restored_send_iv_next,
+            forward_jump: Some(_),
+        } if restored_send_iv_next == 7_000 + MIN_SEND_IV_FORWARD_JUMP
+    ));
     assert_eq!(takeover.keymat.expose_secret_bytes(), &[0xA5; 36]);
     takeover
         .resume

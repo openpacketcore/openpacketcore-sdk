@@ -7,7 +7,9 @@ use std::num::NonZeroUsize;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
-use opc_ipsec_lb::{AntiReplayResume, IpsecLbError, ResumeKeySource, SaId, SameSpiResume};
+use opc_ipsec_lb::{
+    AntiReplayResume, IpsecLbError, ResumeKeySource, SaId, SameSpiOutboundIvResume, SameSpiResume,
+};
 
 use crate::error::SaMirrorError;
 use crate::keymat::{KeyEpoch, MirroredSaKeymat, SaCounterCheckpoint, SaMirrorInstall};
@@ -213,9 +215,11 @@ impl StandbyKeymatSource for InMemoryStandbyHolder {
         let resume = SameSpiResume {
             previous_sa: sa,
             resumed_sa: sa,
-            checkpointed_send_iv_next,
-            restored_send_iv_next,
-            send_iv_forward_jump: Some(params.forward_jump),
+            outbound_iv: SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next,
+                restored_send_iv_next,
+                forward_jump: Some(params.forward_jump),
+            },
             // Live mirroring is asynchronous: bitmap continuity can never be
             // honestly claimed, so exact-window restore is unrepresentable on
             // this path.
@@ -297,11 +301,14 @@ mod tests {
         assert_eq!(takeover.epoch, KeyEpoch::new(1).unwrap());
         assert_eq!(takeover.keymat.expose_secret_bytes(), &[0xAB; 36]);
         assert_eq!(takeover.resume.key_source, ResumeKeySource::LiveMirrored);
-        assert_eq!(takeover.resume.checkpointed_send_iv_next, 100);
-        assert_eq!(
-            takeover.resume.restored_send_iv_next,
-            100 + MIN_SEND_IV_FORWARD_JUMP
-        );
+        assert!(matches!(
+            takeover.resume.outbound_iv,
+            SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 100,
+                restored_send_iv_next,
+                forward_jump: Some(_),
+            } if restored_send_iv_next == 100 + MIN_SEND_IV_FORWARD_JUMP
+        ));
         takeover.resume.validate_for_repin(sa).unwrap();
 
         // Take semantics: custody is gone after a successful yield.
@@ -354,7 +361,13 @@ mod tests {
         // Retried install with older counters must not lower the base.
         holder.install(install(sa, 1, &[3; 32], 40)).unwrap();
         let takeover = holder.take_for_repin(sa, esp_params()).unwrap();
-        assert_eq!(takeover.resume.checkpointed_send_iv_next, 50);
+        assert!(matches!(
+            takeover.resume.outbound_iv,
+            SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 50,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -367,7 +380,13 @@ mod tests {
         let takeover = holder.take_for_repin(sa, esp_params()).unwrap();
         assert_eq!(takeover.epoch, KeyEpoch::new(2).unwrap());
         assert_eq!(takeover.keymat.expose_secret_bytes(), &[2; 32]);
-        assert_eq!(takeover.resume.checkpointed_send_iv_next, 5);
+        assert!(matches!(
+            takeover.resume.outbound_iv,
+            SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 5,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -396,7 +415,13 @@ mod tests {
             .unwrap();
 
         let takeover = holder.take_for_repin(sa, esp_params()).unwrap();
-        assert_eq!(takeover.resume.checkpointed_send_iv_next, 500);
+        assert!(matches!(
+            takeover.resume.outbound_iv,
+            SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 500,
+                ..
+            }
+        ));
         assert!(matches!(
             takeover.resume.anti_replay,
             AntiReplayResume::BoundedReopening {

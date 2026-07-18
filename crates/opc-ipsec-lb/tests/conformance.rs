@@ -20,13 +20,13 @@ use opc_ipsec_lb::{
     OwnershipFencer, OwnershipRetryProof, OwnershipSource, OwnershipTransitionFingerprint,
     OwnershipTransitionId, RePinAuditEvent, RePinAuditEventKind, RePinAuditSink, RePinCoordinator,
     RePinError, RePinRequest, RePinRetryStage, RekeyRequest, RendezvousSelector, ResumeKeySource,
-    SaId, SameSpiResume, SelectionKey, SendIvCounter, SendIvCounterMode, SendIvForwardJump,
-    SessionOwnershipKeyResolver, SessionOwnershipKeyspace, SessionStoreOwnershipSource, ShardId,
-    ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind, SteerKey, SteeringBackend,
-    SteeringBackendKind, SteeringProbe, SteeringRule, SwuClassification, SwuClassifierConfig,
-    SwuPacket, TaggedSpiAllocator, TaggedSpiLayout, VipAdvertisement, VipAdvertiser,
-    VipAdvertiserKind, VipOwnershipCoordinator, VipOwnershipIntent, MAX_ESP_SEND_IV_FORWARD_JUMP,
-    MIN_SEND_IV_FORWARD_JUMP,
+    SaId, SameSpiOutboundIvResume, SameSpiResume, SelectionKey, SendIvCounter, SendIvCounterMode,
+    SendIvForwardJump, SessionOwnershipKeyResolver, SessionOwnershipKeyspace,
+    SessionStoreOwnershipSource, ShardId, ShardSet, SpiAllocationRequest, SpiAllocator, SpiKind,
+    SteerKey, SteeringBackend, SteeringBackendKind, SteeringProbe, SteeringRule, SwuClassification,
+    SwuClassifierConfig, SwuPacket, TaggedSpiAllocator, TaggedSpiLayout, VipAdvertisement,
+    VipAdvertiser, VipAdvertiserKind, VipOwnershipCoordinator, VipOwnershipIntent,
+    MAX_ESP_SEND_IV_FORWARD_JUMP, MIN_SEND_IV_FORWARD_JUMP,
 };
 
 const IKE_HEADER_LEN: usize = 28;
@@ -245,12 +245,14 @@ fn valid_repin_request(sa: SaId, key: SteerKey) -> RePinRequest {
         resume: SameSpiResume {
             previous_sa: sa,
             resumed_sa: sa,
-            checkpointed_send_iv_next: 10,
-            restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
-            send_iv_forward_jump: Some(SendIvForwardJump {
-                forward_jump: MIN_SEND_IV_FORWARD_JUMP,
-                counter_mode,
-            }),
+            outbound_iv: SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 10,
+                restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
+                forward_jump: Some(SendIvForwardJump {
+                    forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+                    counter_mode,
+                }),
+            },
             anti_replay: AntiReplayResume::ExactWindowRestore {
                 checkpoint_highest_accepted: 5,
                 restored_highest_accepted: 5,
@@ -766,14 +768,16 @@ async fn persisted_resume_repins_only_after_forward_jump_and_external_forwarding
             resume: SameSpiResume {
                 previous_sa: sa,
                 resumed_sa: sa,
-                checkpointed_send_iv_next: 41,
-                restored_send_iv_next: 41 + MIN_SEND_IV_FORWARD_JUMP,
-                send_iv_forward_jump: Some(SendIvForwardJump {
-                    forward_jump: MIN_SEND_IV_FORWARD_JUMP,
-                    counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
-                        max_peer_sequence_lag: 40,
-                    },
-                }),
+                outbound_iv: SameSpiOutboundIvResume::CounterBased {
+                    checkpointed_send_iv_next: 41,
+                    restored_send_iv_next: 41 + MIN_SEND_IV_FORWARD_JUMP,
+                    forward_jump: Some(SendIvForwardJump {
+                        forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+                        counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
+                            max_peer_sequence_lag: 40,
+                        },
+                    }),
+                },
                 anti_replay: AntiReplayResume::BoundedReopening {
                     checkpoint_highest_accepted: 100,
                     restored_highest_accepted: 100,
@@ -838,14 +842,16 @@ async fn repin_fails_closed_when_audit_or_resume_is_unsafe() {
         resume: SameSpiResume {
             previous_sa: sa,
             resumed_sa: sa,
-            checkpointed_send_iv_next: 10,
-            restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
-            send_iv_forward_jump: Some(SendIvForwardJump {
-                forward_jump: MIN_SEND_IV_FORWARD_JUMP,
-                counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
-                    max_peer_sequence_lag: 0,
-                },
-            }),
+            outbound_iv: SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 10,
+                restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
+                forward_jump: Some(SendIvForwardJump {
+                    forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+                    counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
+                        max_peer_sequence_lag: 0,
+                    },
+                }),
+            },
             anti_replay: AntiReplayResume::ExactWindowRestore {
                 checkpoint_highest_accepted: 5,
                 restored_highest_accepted: 5,
@@ -865,14 +871,16 @@ async fn repin_fails_closed_when_audit_or_resume_is_unsafe() {
         resume: SameSpiResume {
             previous_sa: sa,
             resumed_sa: SaId::Esp { spi: 8 },
-            checkpointed_send_iv_next: 10,
-            restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
-            send_iv_forward_jump: Some(SendIvForwardJump {
-                forward_jump: MIN_SEND_IV_FORWARD_JUMP,
-                counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
-                    max_peer_sequence_lag: 0,
-                },
-            }),
+            outbound_iv: SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 10,
+                restored_send_iv_next: 10 + MIN_SEND_IV_FORWARD_JUMP,
+                forward_jump: Some(SendIvForwardJump {
+                    forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+                    counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
+                        max_peer_sequence_lag: 0,
+                    },
+                }),
+            },
             anti_replay: AntiReplayResume::ExactWindowRestore {
                 checkpoint_highest_accepted: 5,
                 restored_highest_accepted: 5,
@@ -1163,8 +1171,16 @@ async fn replaying_the_same_request_recovers_the_committed_fence_without_refenci
 
     let altered_resume = RePinRequest {
         resume: SameSpiResume {
-            checkpointed_send_iv_next: request.resume.checkpointed_send_iv_next + 1,
-            restored_send_iv_next: request.resume.restored_send_iv_next + 1,
+            outbound_iv: SameSpiOutboundIvResume::CounterBased {
+                checkpointed_send_iv_next: 11,
+                restored_send_iv_next: 11 + MIN_SEND_IV_FORWARD_JUMP,
+                forward_jump: Some(SendIvForwardJump {
+                    forward_jump: MIN_SEND_IV_FORWARD_JUMP,
+                    counter_mode: SendIvCounterMode::EspExtendedSequenceNumbers {
+                        max_peer_sequence_lag: 0,
+                    },
+                }),
+            },
             ..request.resume
         },
         ..request.clone()

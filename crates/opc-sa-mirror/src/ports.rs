@@ -60,6 +60,11 @@ pub trait SaMirrorSink: Send + Sync + fmt::Debug {
 }
 
 /// Deployment-attested safety parameters for a live-mirrored takeover.
+///
+/// This legacy mirror contract carries counter checkpoints and therefore
+/// always yields [`opc_ipsec_lb::SameSpiOutboundIvResume::CounterBased`]. A
+/// zero counter is not evidence of random-IV IKE and must never be interpreted
+/// as such.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RepinTakeoverParams {
     /// Outbound-IV forward-jump evidence.
@@ -86,8 +91,9 @@ pub struct LiveMirroredTakeover {
     /// Resume evidence with `key_source == ResumeKeySource::LiveMirrored`,
     /// already accepted by `SameSpiResume::validate_for_repin`.
     ///
-    /// `restored_send_iv_next` MUST be the outbound counter actually
-    /// installed on the survivor; the re-pin transition fingerprint binds it.
+    /// Its `CounterBased::restored_send_iv_next` MUST be the outbound counter
+    /// actually installed on the survivor; the re-pin transition fingerprint
+    /// binds it.
     pub resume: SameSpiResume,
 }
 

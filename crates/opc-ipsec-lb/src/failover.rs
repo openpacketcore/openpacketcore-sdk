@@ -121,9 +121,9 @@ pub enum IvResumeDecision {
 ///
 /// Both live-mirrored and durably persisted counters can be stale when an
 /// active owner fails. This evidence deliberately says nothing about key
-/// provenance: every same-SPI takeover must skip the uncertain outbound IV
-/// interval. Fields remain public so untrusted or decoded evidence can be
-/// represented and rejected at [`Self::validate_restored_next`].
+/// provenance: every counter-based same-SPI takeover must skip the uncertain
+/// outbound IV interval. Fields remain public so untrusted or decoded evidence
+/// can be represented and rejected at [`Self::validate_restored_next`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SendIvForwardJump {
     /// Number of counter values reserved past the checkpointed next IV.
