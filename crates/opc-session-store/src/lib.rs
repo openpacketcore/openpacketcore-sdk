@@ -14,6 +14,7 @@
 //! | [`capability`] | Backend capability declarations |
 //! | [`backend`] | Storage API trait, CAS, batch operations |
 //! | [`lease`] | Lease manager and fencing rules |
+//! | [`ownership`] | Generic CAS-backed ownership leases and bounded local cache |
 //! | [`record`] | Stored record format and encrypted payloads |
 //! | [`topology`] | Validated quorum membership and replica identity |
 //! | [`readiness`] | Fresh, bounded durable-quorum readiness evidence |
@@ -36,6 +37,7 @@ mod hex;
 pub mod lease;
 pub mod model;
 pub mod owned_session;
+pub mod ownership;
 pub mod payload_codec;
 pub mod quorum;
 pub mod readiness;
@@ -98,6 +100,16 @@ pub use model::{
     STABLE_ID_PRIVACY_KEY_MIN_BYTES, STATE_TYPE_MAX_BYTES,
 };
 pub use owned_session::{OwnedSession, OwnedSessionMutationContext, OwnedSessionMutationError};
+pub use ownership::{
+    FencedOwnershipCache, FencedOwnershipCacheConfig, FencedOwnershipCacheLookup,
+    FencedOwnershipCacheMetricsSnapshot, FencedOwnershipCacheReplayHead, FencedOwnershipCacheSeed,
+    FencedOwnershipCapabilities, FencedOwnershipError, FencedOwnershipGeneration,
+    FencedOwnershipKey, FencedOwnershipMetadata, FencedOwnershipMutation,
+    FencedOwnershipMutationId, FencedOwnershipNamespace, FencedOwnershipRecord,
+    FencedOwnershipStore, FencedOwnershipToken, FencedOwnershipWatchExit,
+    OWNERSHIP_CACHE_MAX_ENTRIES, OWNERSHIP_CACHE_MAX_RETAINED_BYTES, OWNERSHIP_KEY_MAX_BYTES,
+    OWNERSHIP_METADATA_MAX_BYTES,
+};
 pub use payload_codec::{
     decode_json_payload, decode_session_payload_envelope, encode_json_payload,
     encode_session_payload_envelope, validate_session_payload_size,

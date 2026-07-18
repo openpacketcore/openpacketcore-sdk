@@ -40,6 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address/SPI-redacted diagnostics keep the product-neutral layer suitable for
   stores and redirect/datapath adapters without accepting SA key material or
   performing I/O.
+- **Generalized fenced ownership — `opc-session-store`:** bounded opaque keys
+  and metadata now compose with the existing lease/CAS/Openraft authority to
+  provide expiring logical ownership records, strictly monotonic
+  fence-derived generations, atomic renew/transfer, retained-mutation replay,
+  effect-point validation, and deterministic injected-clock expiry. A bounded
+  synchronous local cache consumes only contiguous committed watch entries,
+  shares hit records through `Arc`, and independently caps entries and retained
+  bytes. Empty views replay from sequence 1 through a proven committed head and
+  remain stale during a partial backlog; later starts require an explicitly
+  caller-proven namespace-bound coherent seed. An ordered expiry index reclaims
+  passive expiry without an unbounded capacity scan. Excess lag produces a
+  distinct owner-free stale outcome; gaps, malformed or future evidence, clock
+  regression, capacity failure, and feed shutdown additionally clear the view.
+  Metrics cover lag/bytes/hits/misses/stale/failures. The facade adds no consensus,
+  encryption, placement, redirect, or packet policy: at-rest payload protection
+  is inherited only when composed over the existing encryption/HKMS backend.
 - **IKEv2 encrypt-then-MAC suites — `opc-proto-ikev2`:** typed executable
   IKE-SA profiles now preserve the negotiated PRF, DH group, encryption/key
   size, and optional integrity algorithm. PRF-HMAC-SHA2-512 (Transform ID 7),
