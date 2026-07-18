@@ -27,6 +27,7 @@ use crate::{
         Ikev2TransformAttributeValue,
     },
     sa_init_crypto::{Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial},
+    validation::Ikev2ValidationProfile,
 };
 
 const ID_FIXED_BODY_LEN: usize = 4;
@@ -34,6 +35,8 @@ const AUTH_FIXED_BODY_LEN: usize = 4;
 const CERT_FIXED_BODY_LEN: usize = 1;
 const CP_FIXED_BODY_LEN: usize = 4;
 const CP_ATTR_HEADER_LEN: usize = 4;
+const CP_ATTR_RESERVED_BIT: u16 = 0x8000;
+const CP_ATTR_TYPE_MASK: u16 = 0x7fff;
 const TS_FIXED_BODY_LEN: usize = 4;
 const TS_SELECTOR_HEADER_LEN: usize = 8;
 const DELETE_FIXED_BODY_LEN: usize = 4;
@@ -84,6 +87,11 @@ pub const IKEV2_CERT_ENCODING_X509_SIGNATURE: u8 = 4;
 pub struct Ikev2IdentificationPayload<'a> {
     /// Identification type.
     pub id_type: u8,
+    /// Exact RFC 7296 receiver-ignored reserved octets from the ID body.
+    ///
+    /// They are retained because the complete received ID body participates in
+    /// AUTH computation. Outbound builders always emit three zero octets.
+    pub reserved: [u8; 3],
     /// Identification data bytes.
     pub id_data: &'a [u8],
 }
@@ -91,9 +99,17 @@ pub struct Ikev2IdentificationPayload<'a> {
 impl<'a> Ikev2IdentificationPayload<'a> {
     /// Decode IDi or IDr from a raw payload.
     pub fn decode(raw: RawPayload<'a>) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        Self::decode_with_profile(raw, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode IDi or IDr with an explicit IKEv2 validation profile.
+    pub fn decode_with_profile(
+        raw: RawPayload<'a>,
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2IkeAuthPayloadError> {
         match raw.payload_type {
             PayloadType::IdentificationInitiator | PayloadType::IdentificationResponder => {
-                Self::decode_body(raw.body)
+                Self::decode_body_with_profile(raw.body, profile)
             }
             _ => Err(Ikev2IkeAuthPayloadError::UnexpectedPayloadType),
         }
@@ -101,10 +117,19 @@ impl<'a> Ikev2IdentificationPayload<'a> {
 
     /// Decode IDi or IDr body bytes.
     pub fn decode_body(body: &'a [u8]) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        Self::decode_body_with_profile(body, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode IDi or IDr body bytes with an explicit validation profile.
+    pub fn decode_body_with_profile(
+        body: &'a [u8],
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2IkeAuthPayloadError> {
         if body.len() < ID_FIXED_BODY_LEN {
             return Err(Ikev2IkeAuthPayloadError::IdentificationTooShort);
         }
-        if body[1..ID_FIXED_BODY_LEN].iter().any(|byte| *byte != 0) {
+        let reserved = [body[1], body[2], body[3]];
+        if profile.requires_sender_canonical_fields() && reserved != [0, 0, 0] {
             return Err(Ikev2IkeAuthPayloadError::ReservedNonZero);
         }
         if body[0] == 0 {
@@ -116,18 +141,20 @@ impl<'a> Ikev2IdentificationPayload<'a> {
         }
         Ok(Self {
             id_type: body[0],
+            reserved,
             id_data,
         })
     }
 
     /// Rebuild the ID payload body used by RFC 7296 AUTH signed-octets input.
     ///
-    /// The decoded view has already verified that the reserved bytes were zero,
-    /// so this produces the byte-equivalent `IDi'`/`IDr'` body.
+    /// This preserves the exact received reserved octets because RFC 7296 AUTH
+    /// authenticates `IDi'`/`IDr'` byte-for-byte. Use
+    /// [`build_ike_auth_identification_payload`] for canonical outbound bytes.
     pub fn to_payload_body(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(ID_FIXED_BODY_LEN + self.id_data.len());
         out.push(self.id_type);
-        out.extend_from_slice(&[0, 0, 0]);
+        out.extend_from_slice(&self.reserved);
         out.extend_from_slice(self.id_data);
         out
     }
@@ -154,18 +181,36 @@ pub struct Ikev2AuthenticationPayload<'a> {
 impl<'a> Ikev2AuthenticationPayload<'a> {
     /// Decode AUTH from a raw payload.
     pub fn decode(raw: RawPayload<'a>) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        Self::decode_with_profile(raw, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode AUTH with an explicit IKEv2 validation profile.
+    pub fn decode_with_profile(
+        raw: RawPayload<'a>,
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2IkeAuthPayloadError> {
         if raw.payload_type != PayloadType::Authentication {
             return Err(Ikev2IkeAuthPayloadError::UnexpectedPayloadType);
         }
-        Self::decode_body(raw.body)
+        Self::decode_body_with_profile(raw.body, profile)
     }
 
     /// Decode AUTH body bytes.
     pub fn decode_body(body: &'a [u8]) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        Self::decode_body_with_profile(body, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode AUTH body bytes with an explicit validation profile.
+    pub fn decode_body_with_profile(
+        body: &'a [u8],
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2IkeAuthPayloadError> {
         if body.len() < AUTH_FIXED_BODY_LEN {
             return Err(Ikev2IkeAuthPayloadError::AuthenticationTooShort);
         }
-        if body[1..AUTH_FIXED_BODY_LEN].iter().any(|byte| *byte != 0) {
+        if profile.requires_sender_canonical_fields()
+            && body[1..AUTH_FIXED_BODY_LEN].iter().any(|byte| *byte != 0)
+        {
             return Err(Ikev2IkeAuthPayloadError::ReservedNonZero);
         }
         if body[0] == 0 {
@@ -334,18 +379,36 @@ pub struct Ikev2ConfigurationPayload<'a> {
 impl<'a> Ikev2ConfigurationPayload<'a> {
     /// Decode CP from a raw payload.
     pub fn decode(raw: RawPayload<'a>) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        Self::decode_with_profile(raw, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode CP with an explicit IKEv2 validation profile.
+    pub fn decode_with_profile(
+        raw: RawPayload<'a>,
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2IkeAuthPayloadError> {
         if raw.payload_type != PayloadType::Configuration {
             return Err(Ikev2IkeAuthPayloadError::UnexpectedPayloadType);
         }
-        Self::decode_body(raw.body)
+        Self::decode_body_with_profile(raw.body, profile)
     }
 
     /// Decode CP body bytes.
     pub fn decode_body(body: &'a [u8]) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        Self::decode_body_with_profile(body, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode CP body bytes with an explicit validation profile.
+    pub fn decode_body_with_profile(
+        body: &'a [u8],
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2IkeAuthPayloadError> {
         if body.len() < CP_FIXED_BODY_LEN {
             return Err(Ikev2IkeAuthPayloadError::ConfigurationTooShort);
         }
-        if body[1..CP_FIXED_BODY_LEN].iter().any(|byte| *byte != 0) {
+        if profile.requires_sender_canonical_fields()
+            && body[1..CP_FIXED_BODY_LEN].iter().any(|byte| *byte != 0)
+        {
             return Err(Ikev2IkeAuthPayloadError::ReservedNonZero);
         }
         if body[0] == 0 {
@@ -357,7 +420,13 @@ impl<'a> Ikev2ConfigurationPayload<'a> {
             if remaining.len() < CP_ATTR_HEADER_LEN {
                 return Err(Ikev2IkeAuthPayloadError::ConfigurationAttributeTooShort);
             }
-            let attribute_type = u16::from_be_bytes([remaining[0], remaining[1]]);
+            let raw_attribute_type = u16::from_be_bytes([remaining[0], remaining[1]]);
+            if profile.requires_sender_canonical_fields()
+                && (raw_attribute_type & CP_ATTR_RESERVED_BIT) != 0
+            {
+                return Err(Ikev2IkeAuthPayloadError::ReservedNonZero);
+            }
+            let attribute_type = raw_attribute_type & CP_ATTR_TYPE_MASK;
             let len = usize::from(u16::from_be_bytes([remaining[2], remaining[3]]));
             let value_start = CP_ATTR_HEADER_LEN;
             let value_end = value_start
@@ -417,9 +486,17 @@ pub struct Ikev2TrafficSelectorPayload<'a> {
 impl<'a> Ikev2TrafficSelectorPayload<'a> {
     /// Decode TSi or TSr from a raw payload.
     pub fn decode(raw: RawPayload<'a>) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        Self::decode_with_profile(raw, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode TSi or TSr with an explicit IKEv2 validation profile.
+    pub fn decode_with_profile(
+        raw: RawPayload<'a>,
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2IkeAuthPayloadError> {
         match raw.payload_type {
             PayloadType::TrafficSelectorInitiator | PayloadType::TrafficSelectorResponder => {
-                Self::decode_body(raw.body)
+                Self::decode_body_with_profile(raw.body, profile)
             }
             _ => Err(Ikev2IkeAuthPayloadError::UnexpectedPayloadType),
         }
@@ -427,6 +504,14 @@ impl<'a> Ikev2TrafficSelectorPayload<'a> {
 
     /// Decode TSi or TSr body bytes.
     pub fn decode_body(body: &'a [u8]) -> Result<Self, Ikev2IkeAuthPayloadError> {
+        Self::decode_body_with_profile(body, Ikev2ValidationProfile::NetworkReceive)
+    }
+
+    /// Decode TSi or TSr body bytes with an explicit validation profile.
+    pub fn decode_body_with_profile(
+        body: &'a [u8],
+        profile: Ikev2ValidationProfile,
+    ) -> Result<Self, Ikev2IkeAuthPayloadError> {
         if body.len() < TS_FIXED_BODY_LEN {
             return Err(Ikev2IkeAuthPayloadError::TrafficSelectorPayloadTooShort);
         }
@@ -434,7 +519,9 @@ impl<'a> Ikev2TrafficSelectorPayload<'a> {
         if count == 0 {
             return Err(Ikev2IkeAuthPayloadError::TrafficSelectorMissing);
         }
-        if body[1..TS_FIXED_BODY_LEN].iter().any(|byte| *byte != 0) {
+        if profile.requires_sender_canonical_fields()
+            && body[1..TS_FIXED_BODY_LEN].iter().any(|byte| *byte != 0)
+        {
             return Err(Ikev2IkeAuthPayloadError::ReservedNonZero);
         }
 
@@ -679,20 +766,46 @@ pub fn decode_ike_auth_cleartext_payloads(
     first_payload: PayloadType,
     cleartext_payloads: &[u8],
 ) -> Result<Ikev2IkeAuthCleartextPayloads<'_>, Ikev2IkeAuthPayloadError> {
+    decode_ike_auth_cleartext_payloads_with_profile(
+        first_payload,
+        cleartext_payloads,
+        Ikev2ValidationProfile::NetworkReceive,
+    )
+}
+
+/// Decode an opened IKE_AUTH cleartext chain with an explicit IKEv2 validation
+/// profile.
+///
+/// Network receive mode ignores RFC-defined reserved fields while retaining
+/// the exact ID reserved octets for AUTH transcript construction.
+pub fn decode_ike_auth_cleartext_payloads_with_profile(
+    first_payload: PayloadType,
+    cleartext_payloads: &[u8],
+    profile: Ikev2ValidationProfile,
+) -> Result<Ikev2IkeAuthCleartextPayloads<'_>, Ikev2IkeAuthPayloadError> {
     let chain = PayloadChain::new(first_payload, cleartext_payloads);
     let mut out = Ikev2IkeAuthCleartextPayloads::default();
-    for payload in chain.iter() {
+    for payload in chain.iter_with_profile(opc_protocol::DecodeContext::default(), profile) {
         let payload = payload.map_err(|_| Ikev2IkeAuthPayloadError::PayloadDecode)?;
         match payload.payload_type {
-            PayloadType::IdentificationInitiator => out
-                .identification_initiators
-                .push(Ikev2IdentificationPayload::decode(payload)?),
-            PayloadType::IdentificationResponder => out
-                .identification_responders
-                .push(Ikev2IdentificationPayload::decode(payload)?),
-            PayloadType::Authentication => out
-                .authentications
-                .push(Ikev2AuthenticationPayload::decode(payload)?),
+            PayloadType::IdentificationInitiator => {
+                out.identification_initiators
+                    .push(Ikev2IdentificationPayload::decode_with_profile(
+                        payload, profile,
+                    )?)
+            }
+            PayloadType::IdentificationResponder => {
+                out.identification_responders
+                    .push(Ikev2IdentificationPayload::decode_with_profile(
+                        payload, profile,
+                    )?)
+            }
+            PayloadType::Authentication => {
+                out.authentications
+                    .push(Ikev2AuthenticationPayload::decode_with_profile(
+                        payload, profile,
+                    )?)
+            }
             PayloadType::Certificate => out
                 .certificates
                 .push(Ikev2CertificatePayload::decode(payload)?),
@@ -702,18 +815,22 @@ pub fn decode_ike_auth_cleartext_payloads(
             PayloadType::ExtensibleAuthentication => {
                 out.eap.push(Ikev2EapPayload::decode(payload)?)
             }
-            PayloadType::Configuration => out
-                .configurations
-                .push(Ikev2ConfigurationPayload::decode(payload)?),
-            PayloadType::SecurityAssociation => out
-                .security_associations
-                .push(Ikev2SaPayload::decode(payload).map_err(Ikev2IkeAuthPayloadError::Sa)?),
-            PayloadType::TrafficSelectorInitiator => out
-                .traffic_selectors_initiator
-                .push(Ikev2TrafficSelectorPayload::decode(payload)?),
-            PayloadType::TrafficSelectorResponder => out
-                .traffic_selectors_responder
-                .push(Ikev2TrafficSelectorPayload::decode(payload)?),
+            PayloadType::Configuration => {
+                out.configurations
+                    .push(Ikev2ConfigurationPayload::decode_with_profile(
+                        payload, profile,
+                    )?)
+            }
+            PayloadType::SecurityAssociation => out.security_associations.push(
+                Ikev2SaPayload::decode_with_profile(payload, profile)
+                    .map_err(Ikev2IkeAuthPayloadError::Sa)?,
+            ),
+            PayloadType::TrafficSelectorInitiator => out.traffic_selectors_initiator.push(
+                Ikev2TrafficSelectorPayload::decode_with_profile(payload, profile)?,
+            ),
+            PayloadType::TrafficSelectorResponder => out.traffic_selectors_responder.push(
+                Ikev2TrafficSelectorPayload::decode_with_profile(payload, profile)?,
+            ),
             PayloadType::Notify => out.notifies.push(
                 Ikev2NotifyPayload::decode(payload).map_err(Ikev2IkeAuthPayloadError::Notify)?,
             ),
@@ -1008,8 +1125,9 @@ pub struct Ikev2IkeAuthSignedOctets<'a> {
     ///
     /// Use `Nr` for initiator AUTH and `Ni` for responder AUTH.
     pub peer_nonce: &'a [u8],
-    /// Exact ID payload body (`IDi'` or `IDr'`), including the ID type octet and
-    /// three reserved zero octets but excluding the generic payload header.
+    /// Exact received ID payload body (`IDi'` or `IDr'`), including the ID type
+    /// octet and the three receiver-ignored reserved octets but excluding the
+    /// generic payload header.
     pub identity_payload_body: &'a [u8],
 }
 
@@ -1277,6 +1395,9 @@ pub fn build_ike_auth_configuration_payload(
     out.push(input.config_type);
     out.extend_from_slice(&[0, 0, 0]);
     for attribute in &input.attributes {
+        if attribute.attribute_type > CP_ATTR_TYPE_MASK {
+            return Err(Ikev2IkeAuthBuildError::ConfigurationAttributeTypeTooLarge);
+        }
         let len = u16::try_from(attribute.value.len())
             .map_err(|_| Ikev2IkeAuthBuildError::LengthOverflow)?;
         out.extend_from_slice(&attribute.attribute_type.to_be_bytes());
@@ -1983,12 +2104,6 @@ pub(crate) fn validate_signed_octets(
     if signed_octets.identity_payload_body.len() < ID_FIXED_BODY_LEN {
         return Err(Ikev2IkeAuthVerificationError::IdentityPayloadTooShort);
     }
-    if signed_octets.identity_payload_body[1..ID_FIXED_BODY_LEN]
-        .iter()
-        .any(|byte| *byte != 0)
-    {
-        return Err(Ikev2IkeAuthVerificationError::ReservedNonZero);
-    }
     if signed_octets.identity_payload_body[0] == 0 {
         return Err(Ikev2IkeAuthVerificationError::InvalidIdentificationType);
     }
@@ -2043,7 +2158,7 @@ pub enum Ikev2IkeAuthPayloadError {
     UnexpectedPayloadType,
     /// Generic payload-chain decode failed.
     PayloadDecode,
-    /// Reserved bytes were not zero.
+    /// Reserved bytes were not zero under sender-canonical validation.
     ReservedNonZero,
     /// ID body ended before the fixed header.
     IdentificationTooShort,
@@ -2209,6 +2324,8 @@ pub enum Ikev2IkeAuthBuildError {
     RekeySpiLengthInvalid,
     /// CP type was zero.
     InvalidConfigurationType,
+    /// CP attribute type exceeded the RFC 7296 15-bit field.
+    ConfigurationAttributeTypeTooLarge,
     /// TS payload had no selectors.
     TrafficSelectorMissing,
     /// TS selector type was not an IPv4 or IPv6 address range.
@@ -2259,6 +2376,9 @@ impl Ikev2IkeAuthBuildError {
             Self::InvalidRekeyProtocolId => "ike_auth_build_rekey_protocol_id_invalid",
             Self::RekeySpiLengthInvalid => "ike_auth_build_rekey_spi_length_invalid",
             Self::InvalidConfigurationType => "ike_auth_build_cp_invalid_type",
+            Self::ConfigurationAttributeTypeTooLarge => {
+                "ike_auth_build_cp_attribute_type_too_large"
+            }
             Self::TrafficSelectorMissing => "ike_auth_build_ts_missing",
             Self::TrafficSelectorTypeUnsupported => "ike_auth_build_ts_type_unsupported",
             Self::TrafficSelectorAddressLengthInvalid => "ike_auth_build_ts_address_length_invalid",
@@ -2304,7 +2424,10 @@ pub enum Ikev2IkeAuthVerificationError {
     },
     /// Identity payload body ended before the fixed ID header.
     IdentityPayloadTooShort,
-    /// Reserved bytes were not zero.
+    /// Legacy sender-canonical transcript error retained for API compatibility.
+    ///
+    /// RFC 7296 network AUTH validation no longer returns this error because
+    /// received ID reserved octets are ignored and authenticated byte-exact.
     ReservedNonZero,
     /// ID type was zero.
     InvalidIdentificationType,

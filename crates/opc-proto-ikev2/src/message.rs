@@ -10,8 +10,9 @@ use opc_protocol::{
 };
 
 use crate::{
-    header::{decode_header, encode_header, Header, HEADER_LEN},
-    payload::{validate_payload_chain, PayloadChain, PayloadType, RawPayloadIterator},
+    header::{decode_header_with_profile, encode_header, Header, HEADER_LEN},
+    payload::{validate_payload_chain_with_profile, PayloadChain, PayloadType, RawPayloadIterator},
+    validation::Ikev2ValidationProfile,
 };
 
 fn spec_ref() -> SpecRef {
@@ -46,6 +47,68 @@ impl<'a> Message<'a> {
     /// Iterate over raw payloads with explicit decode limits.
     pub fn payloads_with_context(&self, ctx: DecodeContext) -> RawPayloadIterator<'a> {
         self.payloads.iter_with_context(ctx)
+    }
+
+    /// Iterate over raw payloads with explicit decode limits and IKEv2
+    /// validation profile.
+    pub fn payloads_with_profile(
+        &self,
+        ctx: DecodeContext,
+        profile: Ikev2ValidationProfile,
+    ) -> RawPayloadIterator<'a> {
+        self.payloads.iter_with_profile(ctx, profile)
+    }
+
+    /// Decode a borrowed IKEv2 message with an explicit validation profile.
+    ///
+    /// Network receive mode follows RFC 7296 receiver behavior for ignored
+    /// minor-version and reserved fields. Sender-canonical mode is intended for
+    /// generated outbound fixture validation. Both modes enforce the same
+    /// hostile-length, payload-chain, count, major-version, and unknown
+    /// critical-payload checks.
+    pub fn decode_with_profile(
+        input: &'a [u8],
+        ctx: DecodeContext,
+        profile: Ikev2ValidationProfile,
+    ) -> DecodeResult<'a, Self> {
+        let spec = spec_ref();
+        let (_, header) = decode_header_with_profile(input, ctx, profile)?;
+        let msg_end = usize::try_from(header.length).map_err(|_| {
+            DecodeError::new(DecodeErrorCode::LengthOverflow, 24).with_spec_ref(spec.clone())
+        })?;
+        if msg_end > ctx.max_message_len {
+            return Err(
+                DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 24).with_spec_ref(spec)
+            );
+        }
+        if msg_end < HEADER_LEN {
+            return Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "IKEv2 length shorter than fixed header",
+                },
+                24,
+            )
+            .with_spec_ref(spec));
+        }
+        if input.len() < msg_end {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, input.len()).with_spec_ref(spec)
+            );
+        }
+
+        let payload_region = &input[HEADER_LEN..msg_end];
+        let first_payload = PayloadType::from_u8(header.next_payload);
+        validate_payload_chain_with_profile(first_payload, payload_region, ctx, profile)?;
+        let tail = &input[msg_end..];
+
+        Ok((
+            tail,
+            Self {
+                header,
+                payloads: PayloadChain::new(first_payload, payload_region),
+                tail,
+            },
+        ))
     }
 
     fn encoded_lens(&self) -> Result<(usize, u32), EncodeError> {
@@ -83,44 +146,7 @@ impl<'a> BorrowDecode<'a> for Message<'a> {
     /// @req REQ-IETF-RFC7296-MESSAGE-DECODE-001
     /// @conformance experimental-scaffold
     fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
-        let spec = spec_ref();
-        let (_, header) = decode_header(input, ctx)?;
-        let msg_end = usize::try_from(header.length).map_err(|_| {
-            DecodeError::new(DecodeErrorCode::LengthOverflow, 24).with_spec_ref(spec.clone())
-        })?;
-        if msg_end > ctx.max_message_len {
-            return Err(
-                DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 24).with_spec_ref(spec)
-            );
-        }
-        if msg_end < HEADER_LEN {
-            return Err(DecodeError::new(
-                DecodeErrorCode::InvalidLength {
-                    reason: "IKEv2 length shorter than fixed header",
-                },
-                24,
-            )
-            .with_spec_ref(spec));
-        }
-        if input.len() < msg_end {
-            return Err(
-                DecodeError::new(DecodeErrorCode::Truncated, input.len()).with_spec_ref(spec)
-            );
-        }
-
-        let payload_region = &input[HEADER_LEN..msg_end];
-        let first_payload = PayloadType::from_u8(header.next_payload);
-        validate_payload_chain(first_payload, payload_region, ctx)?;
-        let tail = &input[msg_end..];
-
-        Ok((
-            tail,
-            Self {
-                header,
-                payloads: PayloadChain::new(first_payload, payload_region),
-                tail,
-            },
-        ))
+        Self::decode_with_profile(input, ctx, Ikev2ValidationProfile::NetworkReceive)
     }
 }
 

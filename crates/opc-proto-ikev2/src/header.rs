@@ -9,7 +9,7 @@ use opc_protocol::{
     EncodeErrorCode, SpecRef,
 };
 
-use crate::payload::PayloadType;
+use crate::{payload::PayloadType, validation::Ikev2ValidationProfile};
 
 /// IKEv2 fixed header length in octets.
 pub const HEADER_LEN: usize = 28;
@@ -232,6 +232,28 @@ impl Header {
 /// @req REQ-IETF-RFC7296-3.1-DECODE-001
 /// @conformance experimental-scaffold
 pub fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Header> {
+    decode_header_with_profile(input, ctx, Ikev2ValidationProfile::NetworkReceive)
+}
+
+/// Decode an IKEv2 fixed header using an explicit validation profile.
+///
+/// [`Ikev2ValidationProfile::NetworkReceive`] follows RFC 7296 receiver
+/// behavior and ignores higher minor versions and reserved flag bits while
+/// preserving their raw values in [`Header`].
+/// [`Ikev2ValidationProfile::SenderCanonical`] additionally diagnoses those
+/// fields when validating generated outbound fixtures.
+///
+/// All profiles reject invalid major versions and malformed or hostile length
+/// fields.
+///
+/// @spec IETF RFC7296 3.1
+/// @req REQ-IETF-RFC7296-3.1-DECODE-002
+/// @conformance experimental-scaffold
+pub fn decode_header_with_profile(
+    input: &[u8],
+    ctx: DecodeContext,
+    profile: Ikev2ValidationProfile,
+) -> DecodeResult<'_, Header> {
     let spec = spec_ref();
     if input.len() < HEADER_LEN {
         return Err(truncated(&spec, input.len()));
@@ -259,7 +281,7 @@ pub fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Heade
         .with_spec_ref(spec));
     }
 
-    if crate::is_strict(ctx.validation_level) && minor_version != IKEV2_MINOR_VERSION {
+    if profile.requires_sender_canonical_fields() && minor_version != IKEV2_MINOR_VERSION {
         return Err(DecodeError::new(
             DecodeErrorCode::InvalidEnumValue {
                 field: "minor_version",
@@ -270,10 +292,11 @@ pub fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Heade
         .with_spec_ref(spec));
     }
 
-    if crate::is_strict(ctx.validation_level) && flags.reserved_bits() != 0 {
+    if profile.requires_sender_canonical_fields() && (flags.version() || flags.reserved_bits() != 0)
+    {
         return Err(DecodeError::new(
             DecodeErrorCode::Structural {
-                reason: "reserved IKEv2 header flag bits must be zero",
+                reason: "IKEv2 Version and reserved header flag bits must be zero on send",
             },
             19,
         )

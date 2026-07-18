@@ -1,9 +1,9 @@
 use bytes::{Bytes, BytesMut};
 use opc_proto_ikev2::{
-    open_protected_payloads, CryptoProvider, Header, HeaderFlags, Message, OpenedProtectedPayload,
-    PayloadChain, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
-    ProtectedPayloadOpenError, RawPayload, EXCHANGE_TYPE_IKE_SA_INIT, GENERIC_PAYLOAD_HEADER_LEN,
-    HEADER_LEN,
+    open_protected_payloads, CryptoProvider, Header, HeaderFlags, Ikev2ValidationProfile, Message,
+    OpenedProtectedPayload, PayloadChain, PayloadType, ProtectedPayloadContext,
+    ProtectedPayloadKind, ProtectedPayloadOpenError, RawPayload, EXCHANGE_TYPE_IKE_SA_INIT,
+    GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode, ToOwnedPdu,
@@ -456,7 +456,7 @@ fn open_protected_payloads_rejects_non_matching_outer_message_bytes() {
 }
 
 #[test]
-fn malformed_payload_chain_rejects_length_truncation_limits_and_reserved_bits() {
+fn malformed_payload_chain_rejects_lengths_limits_and_sender_noncanonical_reserved_bits() {
     let too_short = [0x00, 0x00, 0x00, 0x03];
     let mut iter = PayloadChain::new(PayloadType::Nonce, &too_short).iter();
     let result = match iter.next() {
@@ -498,11 +498,18 @@ fn malformed_payload_chain_rejects_length_truncation_limits_and_reserved_bits() 
         validation_level: ValidationLevel::Strict,
         ..DecodeContext::default()
     };
-    let mut iter =
-        PayloadChain::new(PayloadType::Nonce, &[0x00, 0x01, 0x00, 0x04]).iter_with_context(ctx);
+    let chain = PayloadChain::new(PayloadType::Nonce, &[0x00, 0x01, 0x00, 0x04]);
+    let mut iter = chain.iter_with_context(ctx);
     let result = match iter.next() {
         Some(value) => value,
-        None => panic!("iterator ended before reserved-bit rejection"),
+        None => panic!("iterator ended before receiver-ignored field decode"),
+    };
+    assert!(matches!(result, Ok(payload) if payload.reserved == 1));
+
+    let mut iter = chain.iter_with_profile(ctx, Ikev2ValidationProfile::SenderCanonical);
+    let result = match iter.next() {
+        Some(value) => value,
+        None => panic!("iterator ended before sender-canonical rejection"),
     };
     assert!(matches!(
         result,

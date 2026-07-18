@@ -1,7 +1,8 @@
 use bytes::BytesMut;
 use opc_proto_ikev2::{
-    decode_header, encode_header, Header, HeaderFlags, PayloadType, EXCHANGE_TYPE_IKE_SA_INIT,
-    HEADER_LEN, IKEV2_MAJOR_VERSION, IKEV2_MINOR_VERSION,
+    decode_header, decode_header_with_profile, encode_header, Header, HeaderFlags,
+    Ikev2ValidationProfile, PayloadType, EXCHANGE_TYPE_IKE_SA_INIT, HEADER_LEN,
+    IKEV2_MAJOR_VERSION, IKEV2_MINOR_VERSION,
 };
 use opc_protocol::{
     DecodeContext, DecodeErrorCode, EncodeContext, EncodeErrorCode, ValidationLevel,
@@ -119,7 +120,7 @@ fn encode_header_capacity_counts_only_fixed_header_bytes() {
 }
 
 #[test]
-fn strict_decode_rejects_reserved_header_flags() {
+fn network_receive_ignores_reserved_header_flags_and_sender_canonical_rejects_them() {
     let bytes = [
         0x01,
         0x02,
@@ -151,9 +152,41 @@ fn strict_decode_rejects_reserved_header_flags() {
         0x1c,
     ];
     let decoded = decode_header(&bytes, strict_context());
+    assert!(matches!(decoded, Ok((_tail, header)) if header.flags.reserved_bits() == 1));
+
+    let decoded = decode_header_with_profile(
+        &bytes,
+        strict_context(),
+        Ikev2ValidationProfile::SenderCanonical,
+    );
     assert!(matches!(
         decoded,
         Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+    ));
+}
+
+#[test]
+fn network_receive_ignores_higher_minor_version_and_sender_canonical_rejects_it() {
+    let mut bytes = [0u8; HEADER_LEN];
+    bytes[17] = 0x2f;
+    bytes[18] = EXCHANGE_TYPE_IKE_SA_INIT;
+    bytes[19] = 0x08;
+    bytes[24..28].copy_from_slice(&(HEADER_LEN as u32).to_be_bytes());
+
+    let decoded = decode_header(&bytes, strict_context());
+    assert!(matches!(decoded, Ok((_tail, header)) if header.minor_version == 15));
+
+    let decoded = decode_header_with_profile(
+        &bytes,
+        strict_context(),
+        Ikev2ValidationProfile::SenderCanonical,
+    );
+    assert!(matches!(
+        decoded,
+        Err(error) if matches!(
+            error.code(),
+            DecodeErrorCode::InvalidEnumValue { field: "minor_version", value: 15 }
+        )
     ));
 }
 
@@ -196,6 +229,16 @@ fn strict_decode_ignores_rfc7296_version_flag_bit() {
     bytes[19] = 0x18;
     let decoded = decode_header(&bytes, strict_context());
     assert!(matches!(decoded, Ok((_tail, header)) if header.flags.version()));
+
+    let decoded = decode_header_with_profile(
+        &bytes,
+        strict_context(),
+        Ikev2ValidationProfile::SenderCanonical,
+    );
+    assert!(matches!(
+        decoded,
+        Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
+    ));
 }
 
 #[test]

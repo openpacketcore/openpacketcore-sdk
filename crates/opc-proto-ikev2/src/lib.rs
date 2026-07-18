@@ -22,11 +22,16 @@
 //! EAP-AKA, retransmission policy, cookie policy, Child SA installation, XFRM
 //! programming, or any product-specific 3GPP ePDG policy.
 //!
+//! Network decoders follow RFC 7296 receiver rules through
+//! [`Ikev2ValidationProfile::NetworkReceive`]: sender-zero reserved fields and
+//! higher minor versions are ignored without weakening structural, critical
+//! payload, integrity, or authentication checks. Use
+//! [`Ikev2ValidationProfile::SenderCanonical`] only to audit generated
+//! outbound fixtures.
+//!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
 //! @conformance experimental-mechanism boundary — see CONFORMANCE.md
-
-use opc_protocol::ValidationLevel;
 
 pub mod crypto;
 pub mod dedicated_bearer;
@@ -48,6 +53,7 @@ pub mod sa_init_crypto;
 pub mod sa_init_negotiation;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+pub mod validation;
 
 pub use crypto::{
     open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,
@@ -112,9 +118,10 @@ pub use fragmentation::{
     IKEV2_ENCRYPTED_FRAGMENT_FIXED_BODY_LEN, IKEV2_FRAGMENTATION_SUPPORTED_NOTIFY_TYPE,
 };
 pub use header::{
-    decode_header, encode_header, Header, HeaderFlags, EXCHANGE_TYPE_CREATE_CHILD_SA,
-    EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_IKE_SA_INIT, EXCHANGE_TYPE_INFORMATIONAL, HEADER_LEN,
-    IKEV2_MAJOR_VERSION, IKEV2_MINOR_VERSION, IKEV2_VERSION_OCTET,
+    decode_header, decode_header_with_profile, encode_header, Header, HeaderFlags,
+    EXCHANGE_TYPE_CREATE_CHILD_SA, EXCHANGE_TYPE_IKE_AUTH, EXCHANGE_TYPE_IKE_SA_INIT,
+    EXCHANGE_TYPE_INFORMATIONAL, HEADER_LEN, IKEV2_MAJOR_VERSION, IKEV2_MINOR_VERSION,
+    IKEV2_VERSION_OCTET,
 };
 pub use ike_auth::{
     build_child_sa_response_payloads, build_create_child_sa_rekey_request_payloads,
@@ -125,6 +132,7 @@ pub use ike_auth::{
     build_ike_auth_identification_payload, build_ike_auth_notify_payload,
     build_ike_auth_sa_payload, build_ike_auth_traffic_selector_payload,
     compute_ike_auth_shared_key_mic, decode_ike_auth_cleartext_payloads,
+    decode_ike_auth_cleartext_payloads_with_profile,
     ike_auth_shared_key_authentication_payload_body_len, negotiate_child_sa,
     verify_ike_auth_shared_key_mic, Ikev2AuthenticationPayload, Ikev2AuthenticationPayloadBuild,
     Ikev2CertificatePayload, Ikev2CertificatePayloadBuild, Ikev2CertificateRequestPayload,
@@ -178,8 +186,8 @@ pub use notify::{
     IKEV2_NOTIFY_TS_UNACCEPTABLE, IKEV2_NOTIFY_UNSUPPORTED_CRITICAL_PAYLOAD,
 };
 pub use payload::{
-    validate_payload_chain, PayloadChain, PayloadType, RawPayload, RawPayloadIterator,
-    GENERIC_PAYLOAD_HEADER_LEN,
+    validate_payload_chain, validate_payload_chain_with_profile, PayloadChain, PayloadType,
+    RawPayload, RawPayloadIterator, GENERIC_PAYLOAD_HEADER_LEN,
 };
 pub use protected_payload_crypto::{
     decrypt_ikev2_sa_init_protected_payload, ikev2_aes_cbc_padding_len,
@@ -197,9 +205,10 @@ pub use protected_payload_crypto::{
 pub use sa_init::{
     build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response,
     build_ike_sa_init_response, build_ike_sa_init_unsupported_critical_payload_response,
-    decode_ike_sa_init_request_payloads, encode_nonce_payload_build, Ikev2KeyExchangePayload,
-    Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError, Ikev2NoncePayload,
-    Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError,
+    decode_ike_sa_init_request_payloads, decode_ike_sa_init_request_payloads_with_profile,
+    encode_nonce_payload_build, Ikev2KeyExchangePayload, Ikev2KeyExchangePayloadBuild,
+    Ikev2KeyExchangePayloadError, Ikev2NoncePayload, Ikev2NoncePayloadBuild,
+    Ikev2NoncePayloadError, Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError,
     Ikev2SaInitNotifyBuildError, Ikev2SaInitPayloadError, Ikev2SaInitPayloads,
     Ikev2SaInitResponsePayloads, Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaPayloadError,
     Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform, Ikev2SaTransformBuild,
@@ -217,10 +226,4 @@ pub use sa_init_negotiation::{
     negotiate_ike_sa_init, Ikev2SaInitNegotiation, Ikev2SaInitNegotiationError,
     Ikev2SaInitNegotiationPolicy,
 };
-
-pub(crate) const fn is_strict(level: ValidationLevel) -> bool {
-    matches!(
-        level,
-        ValidationLevel::Strict | ValidationLevel::ProcedureAware
-    )
-}
+pub use validation::Ikev2ValidationProfile;
