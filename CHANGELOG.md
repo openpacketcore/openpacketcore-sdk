@@ -84,8 +84,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observations, correlates real watch events in serialized batch/slot order,
   models terminal state, and requires conclusive lease, partial-batch, restore,
   and readiness coverage before its synthetic output passes the frozen
-  checker. Frozen v1-v4 contracts remain unchanged; v5 still adds no deployed
-  orchestration/evidence or production qualification claim.
+  checker. A bounded deployed-Kubernetes adapter now uses the existing
+  shell-free kubectl/private-control boundary to preflight an isolated scope,
+  execute the batch once, drive an acknowledged all-member consensus-RPC
+  isolation/recovery cycle, sample exact-identity readiness, consume the real
+  watch, scan terminal restore state, and feed the typed replies into that
+  collector. Per-member actuation timing conservatively removes reachability
+  at the earliest disable dispatch and restores it only after the latest enable
+  acknowledgement. Bounded transition sampling retains transient recovery
+  observations and requires an unchanged common journal head. Cancellation,
+  partial/ambiguous gate actuation, non-convergence, and ambiguous mutation
+  replies fail closed; cleanup
+  restores the idempotent RPC gates, forgets process-local lease handles, and
+  clears the external readiness condition without releasing the still-valid
+  durable lease. Frozen v1-v4 contracts remain unchanged; v5 still adds no
+  retained release-manifest binding, executed cluster evidence, or production
+  qualification claim.
 - **Leader-aware management commits — gNMI/NETCONF/config bus:** an opt-in
   `ConfigAuthorityPort` projection fence redirects followers with bounded
   leader hints and returns the exact persisted `{version, plaintext-envelope
