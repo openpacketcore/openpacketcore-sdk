@@ -66,7 +66,7 @@ pub use model::{
     XfrmAction, XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmMark, XfrmMode,
     XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
     XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512,
-    XFRM_ENCR_CBC_AES,
+    XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
 pub use opc_types::DscpCodepoint;
 pub use unsupported::UnsupportedXfrmBackend;

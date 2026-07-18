@@ -1385,9 +1385,10 @@ fn limit_or_infinite(value: u64) -> u64 {
 }
 
 fn encode_algorithm(name: &str, key: &[u8]) -> Result<SensitiveBuffer, XfrmError> {
-    validate_key_material(key)?;
+    let encoded_name = encode_algorithm_name(name)?;
+    validate_encryption_key_material(name, key)?;
     let mut out = sensitive_buffer_with_capacity(XFRM_ALGO_HEADER_LEN + key.len());
-    out.extend_from_slice(&encode_algorithm_name(name)?);
+    out.extend_from_slice(&encoded_name);
     push_u32_ne(&mut out, key_len_bits(key)?);
     out.extend_from_slice(key);
     Ok(out)
@@ -1969,6 +1970,16 @@ fn validate_sa_parameters(
             "aead is mutually exclusive with auth/crypt",
         ));
     }
+    if parameters.id.protocol == IPPROTO_ESP
+        && parameters.auth.is_some()
+        && parameters.crypt.is_none()
+        && parameters.aead.is_none()
+    {
+        return Err(XfrmError::invalid_config(
+            "crypt",
+            "authenticated-only ESP requires the explicit Linux NULL cipher",
+        ));
+    }
     if let Some(encap) = parameters.encap {
         if encap.encap_type == 0 {
             return Err(XfrmError::invalid_config(
@@ -1989,6 +2000,12 @@ fn validate_sa_parameters(
             return Err(XfrmError::invalid_config(
                 "crypt",
                 "aead algorithm must use the aead slot",
+            ));
+        }
+        if algorithm.name == crate::XFRM_ENCR_NULL && parameters.auth.is_none() {
+            return Err(XfrmError::invalid_config(
+                "auth",
+                "NULL encryption requires a separate authentication algorithm",
             ));
         }
     }
@@ -2192,6 +2209,19 @@ fn validate_key_material(key: &[u8]) -> Result<(), XfrmError> {
     }
     let _ = key_len_bits(key)?;
     Ok(())
+}
+
+fn validate_encryption_key_material(name: &str, key: &[u8]) -> Result<(), XfrmError> {
+    if name == crate::XFRM_ENCR_NULL {
+        if key.is_empty() {
+            return Ok(());
+        }
+        return Err(XfrmError::invalid_config(
+            "crypt.key_material",
+            "NULL encryption key material must be empty",
+        ));
+    }
+    validate_key_material(key)
 }
 
 fn key_len_bits(key: &[u8]) -> Result<u32, XfrmError> {
@@ -2527,6 +2557,7 @@ mod tests {
     use crate::{
         AeadAlgorithm, Algorithm, AuthAlgorithm, InstallSaRequest, KeyMaterial,
         SaRelocationDirection, UDP_ENCAP_ESPINUDP, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES,
+        XFRM_ENCR_NULL,
     };
 
     #[derive(Debug, Default, Clone)]
@@ -3989,6 +4020,47 @@ mod tests {
     }
 
     #[test]
+    fn encodes_authenticated_only_sa_with_linux_null_cipher_attribute() {
+        let mut params = sa_parameters();
+        params.crypt = Some((Algorithm::null(), KeyMaterial::new(Vec::new())));
+
+        let body = encode_sa_info(&params).unwrap();
+        assert_sensitive_buffer(&body);
+        let auth = route_attr_payload(&body, XFRMA_ALG_AUTH_TRUNC).expect("auth-trunc attr");
+
+        assert_eq!(auth.len(), XFRM_ALGO_AUTH_HEADER_LEN + 32);
+        assert_eq!(
+            &auth[..XFRM_ALG_NAME_LEN],
+            &encode_algorithm_name(XFRM_AUTH_HMAC_SHA256).unwrap()
+        );
+        assert_eq!(
+            u32::from_ne_bytes([
+                auth[XFRM_ALG_NAME_LEN],
+                auth[XFRM_ALG_NAME_LEN + 1],
+                auth[XFRM_ALG_NAME_LEN + 2],
+                auth[XFRM_ALG_NAME_LEN + 3],
+            ]),
+            32 * 8
+        );
+        let crypt = route_attr_payload(&body, XFRMA_ALG_CRYPT).expect("NULL crypt attr");
+        assert_eq!(crypt.len(), XFRM_ALGO_HEADER_LEN);
+        assert_eq!(
+            &crypt[..XFRM_ALG_NAME_LEN],
+            &encode_algorithm_name(XFRM_ENCR_NULL).unwrap()
+        );
+        assert_eq!(
+            u32::from_ne_bytes([
+                crypt[XFRM_ALG_NAME_LEN],
+                crypt[XFRM_ALG_NAME_LEN + 1],
+                crypt[XFRM_ALG_NAME_LEN + 2],
+                crypt[XFRM_ALG_NAME_LEN + 3],
+            ]),
+            0
+        );
+        assert!(route_attr_payload(&body, XFRMA_ALG_AEAD).is_none());
+    }
+
+    #[test]
     fn encodes_sa_install_with_aead_attr() {
         let mut params = sa_parameters();
         params.auth = None;
@@ -4111,6 +4183,39 @@ mod tests {
             XfrmError::InvalidConfig {
                 field: "aead",
                 reason: "aead is mutually exclusive with auth/crypt"
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_esp_auth_without_explicit_linux_null_cipher() {
+        let mut params = sa_parameters();
+        params.crypt = None;
+
+        let error = encode_sa_info(&params).unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "crypt",
+                reason: "authenticated-only ESP requires the explicit Linux NULL cipher"
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_linux_null_cipher_without_authentication() {
+        let mut params = sa_parameters();
+        params.auth = None;
+        params.crypt = Some((Algorithm::null(), KeyMaterial::new(Vec::new())));
+
+        let error = encode_sa_info(&params).unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "auth",
+                reason: "NULL encryption requires a separate authentication algorithm"
             }
         ));
     }
@@ -5023,11 +5128,44 @@ mod tests {
     }
 
     #[test]
+    fn null_cipher_rejects_nonempty_key_material_without_leaking_it() {
+        let secret = vec![0x7a; 16];
+        let error = encode_algorithm(XFRM_ENCR_NULL, &secret).unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "crypt.key_material",
+                ..
+            }
+        ));
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        assert!(!debug.contains("7a"));
+        assert!(!display.contains("7a"));
+    }
+
+    #[test]
+    fn non_null_cipher_still_rejects_empty_key_material() {
+        let error = encode_algorithm(XFRM_ENCR_CBC_AES, &[]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "key_material",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn algorithm_encoders_return_zeroizing_buffers() {
+        let null = encode_algorithm(XFRM_ENCR_NULL, &[]).unwrap();
         let crypt = encode_algorithm(XFRM_ENCR_CBC_AES, &[0xcd; 16]).unwrap();
         let auth = encode_auth_algorithm(XFRM_AUTH_HMAC_SHA256, &[0xab; 32], 96).unwrap();
         let aead = encode_aead_algorithm(XFRM_AEAD_RFC4106_GCM_AES, &[0xef; 36], 128).unwrap();
 
+        assert_sensitive_buffer(&null);
         assert_sensitive_buffer(&crypt);
         assert_sensitive_buffer(&auth);
         assert_sensitive_buffer(&aead);

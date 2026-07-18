@@ -41,6 +41,7 @@ const TRANSFORM_TYPE_DH: u8 = 4;
 const TRANSFORM_ATTRIBUTE_KEY_LENGTH: u16 = 14;
 const PROTOCOL_ID_IKE: u8 = 1;
 
+const ENCR_NULL: u16 = 11;
 const ENCR_AES_CBC: u16 = 12;
 const ENCR_AES_GCM_16: u16 = 20;
 const PRF_HMAC_SHA2_256: u16 = 5;
@@ -216,9 +217,14 @@ impl TryFrom<u16> for Ikev2PrfAlgorithm {
     }
 }
 
-/// IKEv2 encryption algorithms supported by the SDK SA_INIT material helper.
+/// IKEv2 encryption algorithms supported by the SDK IKE/Child-SA helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ikev2EncryptionAlgorithm {
+    /// ENCR_NULL, Transform ID 11, for authenticated-only ESP Child SAs.
+    ///
+    /// This transform has no key, salt, or Key Length attribute. It is not an
+    /// executable IKE-SA protected-payload algorithm.
+    Null,
     /// ENCR_AES_CBC with a 128-bit AES key.
     AesCbc128,
     /// ENCR_AES_CBC with a 192-bit AES key.
@@ -238,13 +244,19 @@ impl Ikev2EncryptionAlgorithm {
     ///
     /// # Errors
     ///
-    /// Returns an unsupported encryption error for unsupported Transform IDs
-    /// or unsupported/missing AES-GCM key lengths.
+    /// Returns an unsupported encryption error for unsupported Transform IDs,
+    /// prohibited ENCR_NULL Key Length attributes, or unsupported/missing AES
+    /// key lengths.
     pub const fn from_transform_id(
         transform_id: u16,
         key_bits: Option<u16>,
     ) -> Result<Self, Ikev2SaInitCryptoError> {
         match (transform_id, key_bits) {
+            (ENCR_NULL, None) => Ok(Self::Null),
+            (ENCR_NULL, other) => Err(Ikev2SaInitCryptoError::UnsupportedEncryptionKeyLength {
+                transform_id,
+                key_bits: other,
+            }),
             (ENCR_AES_CBC, Some(AES_128_KEY_BITS)) => Ok(Self::AesCbc128),
             (ENCR_AES_CBC, Some(AES_192_KEY_BITS)) => Ok(Self::AesCbc192),
             (ENCR_AES_CBC, Some(AES_256_KEY_BITS)) => Ok(Self::AesCbc256),
@@ -286,18 +298,51 @@ impl Ikev2EncryptionAlgorithm {
     /// IKEv2 encryption Transform ID.
     pub const fn transform_id(self) -> u16 {
         match self {
+            Self::Null => ENCR_NULL,
             Self::AesCbc128 | Self::AesCbc192 | Self::AesCbc256 => ENCR_AES_CBC,
             Self::AesGcm16_128 | Self::AesGcm16_192 | Self::AesGcm16_256 => ENCR_AES_GCM_16,
         }
     }
 
-    /// Key Length transform attribute value in bits.
+    /// Raw encryption-key length in bits.
+    ///
+    /// ENCR_NULL returns zero. Use [`Self::key_length_attribute_bits`] when
+    /// building a transform because ENCR_NULL prohibits the Key Length
+    /// attribute rather than encoding an attribute with value zero.
     pub const fn key_bits(self) -> u16 {
         match self {
+            Self::Null => 0,
             Self::AesCbc128 | Self::AesGcm16_128 => AES_128_KEY_BITS,
             Self::AesCbc192 | Self::AesGcm16_192 => AES_192_KEY_BITS,
             Self::AesCbc256 | Self::AesGcm16_256 => AES_256_KEY_BITS,
         }
+    }
+
+    /// Key Length transform attribute value, when the transform permits one.
+    pub const fn key_length_attribute_bits(self) -> Option<u16> {
+        match self {
+            Self::Null => None,
+            _ => Some(self.key_bits()),
+        }
+    }
+
+    /// Raw per-direction encryption-key length in octets, excluding any salt.
+    pub const fn encryption_key_len(self) -> usize {
+        self.key_bits() as usize / 8
+    }
+
+    /// Per-direction salt length in octets.
+    pub const fn salt_len(self) -> usize {
+        if self.is_aead() {
+            AES_GCM_SALT_LEN
+        } else {
+            0
+        }
+    }
+
+    /// True when this is the authenticated-only ESP ENCR_NULL transform.
+    pub const fn is_null(self) -> bool {
+        matches!(self, Self::Null)
     }
 
     /// True for combined-mode AEAD algorithms that do not use a separate
@@ -305,26 +350,22 @@ impl Ikev2EncryptionAlgorithm {
     pub const fn is_aead(self) -> bool {
         match self {
             Self::AesGcm16_128 | Self::AesGcm16_192 | Self::AesGcm16_256 => true,
-            Self::AesCbc128 | Self::AesCbc192 | Self::AesCbc256 => false,
+            Self::Null | Self::AesCbc128 | Self::AesCbc192 | Self::AesCbc256 => false,
         }
     }
 
     /// Directional key-material length in octets.
     ///
     /// AES-GCM includes the 4-octet RFC 4106 salt. AES-CBC is the raw cipher
-    /// key length only.
+    /// key length only, and ENCR_NULL is zero.
     pub const fn key_material_len(self) -> usize {
-        let key_len = self.key_bits() as usize / 8;
-        if self.is_aead() {
-            key_len + AES_GCM_SALT_LEN
-        } else {
-            key_len
-        }
+        self.encryption_key_len() + self.salt_len()
     }
 
     /// Human-readable algorithm name safe for diagnostics.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Null => "NULL",
             Self::AesCbc128 => "AES-CBC-128",
             Self::AesCbc192 => "AES-CBC-192",
             Self::AesCbc256 => "AES-CBC-256",
@@ -446,6 +487,67 @@ impl Ikev2ChildSaCryptoProfile {
         }
     }
 
+    /// Build an authenticated-only ESP Child SA using ENCR_NULL.
+    ///
+    /// This profile derives only the selected directional integrity keys. It
+    /// does not fabricate encryption key or salt bytes.
+    #[must_use]
+    pub const fn new_authenticated_only(
+        prf: Ikev2PrfAlgorithm,
+        integrity: Ikev2IntegrityAlgorithm,
+    ) -> Self {
+        Self {
+            prf,
+            encryption: Ikev2EncryptionAlgorithm::Null,
+            integrity: Some(integrity),
+        }
+    }
+
+    /// Restore a Child-SA profile from its exact negotiated Transform IDs.
+    ///
+    /// `encryption_key_bits` is the received Key Length attribute. It must be
+    /// `None` for ENCR_NULL. `integrity_transform_id` is required for
+    /// ENCR_NULL and AES-CBC and prohibited for AEAD transforms.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2SaInitCryptoError`] when a transform is unsupported or
+    /// the restored transform relationship is inconsistent.
+    pub const fn from_transform_ids(
+        prf_transform_id: u16,
+        encryption_transform_id: u16,
+        encryption_key_bits: Option<u16>,
+        integrity_transform_id: Option<u16>,
+    ) -> Result<Self, Ikev2SaInitCryptoError> {
+        let prf = match Ikev2PrfAlgorithm::from_transform_id(prf_transform_id) {
+            Ok(prf) => prf,
+            Err(error) => return Err(error),
+        };
+        let encryption = match Ikev2EncryptionAlgorithm::from_transform_id(
+            encryption_transform_id,
+            encryption_key_bits,
+        ) {
+            Ok(encryption) => encryption,
+            Err(error) => return Err(error),
+        };
+        let integrity = match integrity_transform_id {
+            Some(transform_id) => match Ikev2IntegrityAlgorithm::from_transform_id(transform_id) {
+                Ok(integrity) => Some(integrity),
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let profile = Self {
+            prf,
+            encryption,
+            integrity,
+        };
+        match profile.validate_executable() {
+            Ok(()) => Ok(profile),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Build a Child SA profile from a negotiated proposal and IKE-SA PRF.
     ///
     /// # Errors
@@ -488,7 +590,7 @@ impl Ikev2ChildSaCryptoProfile {
             encryption: encryption.ok_or(Ikev2SaInitCryptoError::IncompleteTransformSet)?,
             integrity,
         };
-        profile.validate_consistency()?;
+        profile.validate_executable()?;
         Ok(profile)
     }
 
@@ -527,7 +629,7 @@ impl Ikev2ChildSaCryptoProfile {
     /// Returns [`Ikev2SaInitCryptoError`] when the profile is inconsistent,
     /// overflows `usize`, or exceeds the RFC 7296 PRF+ 255-block limit.
     pub fn keymat_len(self) -> Result<usize, Ikev2SaInitCryptoError> {
-        self.validate_consistency()?;
+        self.validate_executable()?;
         let directional = self
             .directional_encryption_len()
             .checked_add(self.directional_integrity_len())
@@ -546,7 +648,13 @@ impl Ikev2ChildSaCryptoProfile {
         Ok(total)
     }
 
-    fn validate_consistency(self) -> Result<(), Ikev2SaInitCryptoError> {
+    /// Validate the Child-SA transform relationship before deriving KEYMAT.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ikev2SaInitCryptoError::InconsistentTransformSet`] for
+    /// ENCR_NULL/AES-CBC without integrity or AEAD with separate integrity.
+    pub const fn validate_executable(self) -> Result<(), Ikev2SaInitCryptoError> {
         match (self.encryption.is_aead(), self.integrity) {
             (true, None) | (false, Some(_)) => Ok(()),
             _ => Err(Ikev2SaInitCryptoError::InconsistentTransformSet),
@@ -663,6 +771,11 @@ impl Ikev2SaInitCryptoProfile {
         if encryption.is_aead() {
             return Err(Ikev2SaInitCryptoError::UnexpectedIntegrityTransform);
         }
+        if encryption.is_null() {
+            return Err(Ikev2SaInitCryptoError::UnsupportedEncryptionTransform {
+                transform_id: ENCR_NULL,
+            });
+        }
         Ok(Self {
             prf,
             dh_group,
@@ -718,6 +831,11 @@ impl Ikev2SaInitCryptoProfile {
     ///
     /// Returns a typed crypto error if the profile is not executable.
     pub const fn validate_executable(self) -> Result<(), Ikev2SaInitCryptoError> {
+        if self.encryption.is_null() {
+            return Err(Ikev2SaInitCryptoError::UnsupportedEncryptionTransform {
+                transform_id: ENCR_NULL,
+            });
+        }
         match (self.encryption.is_aead(), self.integrity) {
             (true, None) | (false, Some(_)) => Ok(()),
             (true, Some(_)) => Err(Ikev2SaInitCryptoError::UnexpectedIntegrityTransform),
@@ -2070,6 +2188,20 @@ mod tests {
         assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.output_len(), 64);
         assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.name(), "HMAC-SHA2-512");
         assert_eq!(
+            must_ok(Ikev2EncryptionAlgorithm::from_transform_id(11, None)),
+            Ikev2EncryptionAlgorithm::Null
+        );
+        assert_eq!(Ikev2EncryptionAlgorithm::Null.transform_id(), 11);
+        assert_eq!(Ikev2EncryptionAlgorithm::Null.key_bits(), 0);
+        assert_eq!(
+            Ikev2EncryptionAlgorithm::Null.key_length_attribute_bits(),
+            None
+        );
+        assert_eq!(Ikev2EncryptionAlgorithm::Null.encryption_key_len(), 0);
+        assert_eq!(Ikev2EncryptionAlgorithm::Null.salt_len(), 0);
+        assert_eq!(Ikev2EncryptionAlgorithm::Null.key_material_len(), 0);
+        assert_eq!(Ikev2EncryptionAlgorithm::Null.name(), "NULL");
+        assert_eq!(
             must_ok(Ikev2EncryptionAlgorithm::from_transform_id(20, Some(128))),
             Ikev2EncryptionAlgorithm::AesGcm16_128
         );
@@ -2171,6 +2303,29 @@ mod tests {
             .as_str(),
             "ike_sa_init_crypto_missing_integrity_transform"
         );
+        assert_eq!(
+            must_err(Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
+                Ikev2PrfAlgorithm::HmacSha2_256,
+                Ikev2DhGroup::Modp2048,
+                Ikev2EncryptionAlgorithm::Null,
+                Ikev2IntegrityAlgorithm::HmacSha2_256_128,
+            )),
+            Ikev2SaInitCryptoError::UnsupportedEncryptionTransform {
+                transform_id: ENCR_NULL,
+            }
+        );
+        assert_eq!(
+            must_err(Ikev2SaInitCryptoProfile::from_transform_ids(
+                PRF_HMAC_SHA2_256,
+                DH_MODP_2048,
+                ENCR_NULL,
+                None,
+                Some(INTEG_HMAC_SHA2_256_128),
+            )),
+            Ikev2SaInitCryptoError::UnsupportedEncryptionTransform {
+                transform_id: ENCR_NULL,
+            }
+        );
     }
 
     #[test]
@@ -2218,6 +2373,14 @@ mod tests {
         );
         assert_eq!(
             must_err(Ikev2EncryptionAlgorithm::from_transform_id(20, None)).as_str(),
+            "ike_sa_init_crypto_unsupported_encryption_key_length"
+        );
+        assert_eq!(
+            must_err(Ikev2EncryptionAlgorithm::from_transform_id(11, Some(0))).as_str(),
+            "ike_sa_init_crypto_unsupported_encryption_key_length"
+        );
+        assert_eq!(
+            must_err(Ikev2EncryptionAlgorithm::from_transform_id(11, Some(128))).as_str(),
             "ike_sa_init_crypto_unsupported_encryption_key_length"
         );
         assert_eq!(
@@ -2927,6 +3090,86 @@ mod tests {
     }
 
     #[test]
+    fn child_sa_encr_null_derives_only_independent_integrity_vectors() {
+        // Generated independently with OpenSSL 3 HMAC-SHA256 and the RFC 7296
+        // section 2.17 PRF+ equations. T1 is i2r A and T2 is r2i A because
+        // ENCR_NULL contributes zero E octets in each direction.
+        let profile = Ikev2ChildSaCryptoProfile::new_authenticated_only(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2IntegrityAlgorithm::HmacSha2_256_128,
+        );
+        let material = must_ok(derive_child_sa_key_material(
+            profile,
+            &[0x0f; 32],
+            &[0xa1; 16],
+            &[0xb2; 16],
+            None,
+        ));
+
+        assert_eq!(profile.validate_executable(), Ok(()));
+        assert_eq!(profile.encryption(), Ikev2EncryptionAlgorithm::Null);
+        assert_eq!(profile.directional_encryption_len(), 0);
+        assert_eq!(profile.directional_integrity_len(), 32);
+        assert_eq!(must_ok(profile.keymat_len()), 64);
+        assert_eq!(material.profile(), profile);
+        assert!(material.initiator_to_responder_encryption().is_empty());
+        assert!(material.responder_to_initiator_encryption().is_empty());
+        assert_eq!(
+            material.initiator_to_responder_integrity(),
+            hex_to_bytes("7ae50b9713ddfd346dbb3cfbe8b8d45a34c79925bedb4f4ae6a5ad6bc76d8ab5")
+        );
+        assert_eq!(
+            material.responder_to_initiator_integrity(),
+            hex_to_bytes("78ea306ce36f6fde3c1f71951c1fe8c6d7477a4a2adfe9b746fd3c6fd6be52da")
+        );
+        let debug = format!("{material:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("7ae50b9713ddfd34"));
+    }
+
+    #[test]
+    fn child_sa_encr_null_restores_from_exact_transform_ids() {
+        let profile = must_ok(Ikev2ChildSaCryptoProfile::from_transform_ids(
+            PRF_HMAC_SHA2_256,
+            ENCR_NULL,
+            None,
+            Some(INTEG_HMAC_SHA2_256_128),
+        ));
+
+        assert_eq!(profile.prf().transform_id(), PRF_HMAC_SHA2_256);
+        assert_eq!(profile.encryption().transform_id(), ENCR_NULL);
+        assert_eq!(profile.encryption().key_length_attribute_bits(), None);
+        assert_eq!(
+            profile.integrity().map(|value| value.transform_id()),
+            Some(INTEG_HMAC_SHA2_256_128)
+        );
+        assert_eq!(profile.directional_encryption_len(), 0);
+        assert_eq!(must_ok(profile.keymat_len()), 64);
+
+        assert_eq!(
+            must_err(Ikev2ChildSaCryptoProfile::from_transform_ids(
+                PRF_HMAC_SHA2_256,
+                ENCR_NULL,
+                None,
+                None,
+            )),
+            Ikev2SaInitCryptoError::InconsistentTransformSet
+        );
+        assert_eq!(
+            must_err(Ikev2ChildSaCryptoProfile::from_transform_ids(
+                PRF_HMAC_SHA2_256,
+                ENCR_NULL,
+                Some(128),
+                Some(INTEG_HMAC_SHA2_256_128),
+            )),
+            Ikev2SaInitCryptoError::UnsupportedEncryptionKeyLength {
+                transform_id: ENCR_NULL,
+                key_bits: Some(128),
+            }
+        );
+    }
+
+    #[test]
     fn child_sa_sha512_keymat_matches_independent_vector() {
         // Generated independently with OpenSSL 3 and RFC 7296 section 2.17.
         let profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
@@ -3015,6 +3258,68 @@ mod tests {
             Some(Ikev2IntegrityAlgorithm::HmacSha2_256_128)
         );
 
+        let encr_null = child_sa_negotiation(vec![
+            Ikev2SaTransformBuild {
+                transform_type: TRANSFORM_TYPE_ENCR,
+                transform_id: ENCR_NULL,
+                attributes: Vec::new(),
+            },
+            Ikev2SaTransformBuild {
+                transform_type: TRANSFORM_TYPE_INTEG,
+                transform_id: INTEG_HMAC_SHA2_256_128,
+                attributes: Vec::new(),
+            },
+        ]);
+        let profile = must_ok(Ikev2ChildSaCryptoProfile::from_child_sa_negotiation(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            &encr_null,
+        ));
+        assert_eq!(profile.encryption(), Ikev2EncryptionAlgorithm::Null);
+        assert_eq!(
+            profile.integrity(),
+            Some(Ikev2IntegrityAlgorithm::HmacSha2_256_128)
+        );
+        assert_eq!(profile.validate_executable(), Ok(()));
+
+        let null_without_integrity = child_sa_negotiation(vec![Ikev2SaTransformBuild {
+            transform_type: TRANSFORM_TYPE_ENCR,
+            transform_id: ENCR_NULL,
+            attributes: Vec::new(),
+        }]);
+        assert_eq!(
+            must_err(Ikev2ChildSaCryptoProfile::from_child_sa_negotiation(
+                Ikev2PrfAlgorithm::HmacSha2_256,
+                &null_without_integrity,
+            )),
+            Ikev2SaInitCryptoError::InconsistentTransformSet
+        );
+
+        let null_with_key_length = child_sa_negotiation(vec![
+            Ikev2SaTransformBuild {
+                transform_type: TRANSFORM_TYPE_ENCR,
+                transform_id: ENCR_NULL,
+                attributes: vec![Ikev2TransformAttributeBuild {
+                    attribute_type: TRANSFORM_ATTRIBUTE_KEY_LENGTH,
+                    value: Ikev2TransformAttributeBuildValue::Tv(128),
+                }],
+            },
+            Ikev2SaTransformBuild {
+                transform_type: TRANSFORM_TYPE_INTEG,
+                transform_id: INTEG_HMAC_SHA2_256_128,
+                attributes: Vec::new(),
+            },
+        ]);
+        assert_eq!(
+            must_err(Ikev2ChildSaCryptoProfile::from_child_sa_negotiation(
+                Ikev2PrfAlgorithm::HmacSha2_256,
+                &null_with_key_length,
+            )),
+            Ikev2SaInitCryptoError::UnsupportedEncryptionKeyLength {
+                transform_id: ENCR_NULL,
+                key_bits: Some(128),
+            }
+        );
+
         let gcm_with_integrity = child_sa_negotiation(vec![
             Ikev2SaTransformBuild {
                 transform_type: TRANSFORM_TYPE_ENCR,
@@ -3094,6 +3399,21 @@ mod tests {
             ))
             .as_str(),
             "ike_sa_init_crypto_inconsistent_transform_set"
+        );
+
+        let null_without_auth = Ikev2ChildSaCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2EncryptionAlgorithm::Null,
+        );
+        assert_eq!(
+            must_err(derive_child_sa_key_material(
+                null_without_auth,
+                &[0x0f; 32],
+                &[0xa1; 16],
+                &[0xb2; 16],
+                None,
+            )),
+            Ikev2SaInitCryptoError::InconsistentTransformSet
         );
     }
 

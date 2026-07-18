@@ -100,6 +100,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than a legitimate zero-TEID initial request. Exact amplification
   sizing and redacted caller-metadata reversal are available before bounded
   encoding.
+- **BREAKING — authenticated-only ESP Child SAs — `opc-proto-ikev2`,
+  `opc-ipsec-xfrm`:** typed ENCR_NULL transform 11 negotiation and restore now
+  require a separate supported integrity transform, prohibit Key Length, and
+  derive zero encryption/salt octets while retaining normal directional
+  integrity KEYMAT. ENCR_NULL remains rejected for IKE-SA protected payloads
+  and is not enabled or preferred by SDK policy. The Linux adapter maps it to
+  the kernel-required zero-key `ecb(cipher_null)` attribute plus HMAC auth,
+  rejects fabricated NULL keys and raw ESP auth without that attribute, and
+  adds a privileged bidirectional packet/tamper proof. Existing AES-CBC and
+  AES-GCM mappings are unchanged. Downstream exhaustive matches on
+  `Ikev2EncryptionAlgorithm` must add the Child-SA-only `Null` arm.
 - **Atomic candidate-only v5 Kubernetes HA artifacts — `opc-session-testkit`:**
   a separate executable and reusable composition API now preflight a trusted
   Linux output parent and Python interpreter before campaign mutation, run the

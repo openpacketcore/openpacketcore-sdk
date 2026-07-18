@@ -215,6 +215,13 @@ pub enum XfrmAction {
 /// hyphenated forms.
 pub const XFRM_ENCR_CBC_AES: &str = "cbc(aes)";
 
+/// The exact Linux kernel XFRM name for the ESP NULL encryption transform.
+///
+/// Linux requires this zero-key transform to be present for authenticated-only
+/// ESP SAs; omitting the encryption attribute causes `XFRM_MSG_NEWSA` to fail
+/// with `EINVAL`.
+pub const XFRM_ENCR_NULL: &str = "ecb(cipher_null)";
+
 /// The exact Linux kernel XFRM name for AES-GCM RFC 4106 AEAD; do not
 /// hand-write hyphenated forms.
 pub const XFRM_AEAD_RFC4106_GCM_AES: &str = "rfc4106(gcm(aes))";
@@ -247,6 +254,13 @@ impl Algorithm {
     /// Create the Linux XFRM AES-CBC encryption algorithm.
     pub fn cbc_aes() -> Self {
         Self::new(XFRM_ENCR_CBC_AES)
+    }
+
+    /// Create the Linux XFRM NULL encryption algorithm.
+    ///
+    /// This algorithm must be paired with empty [`KeyMaterial`].
+    pub fn null() -> Self {
+        Self::new(XFRM_ENCR_NULL)
     }
 }
 
@@ -1249,12 +1263,14 @@ mod tests {
     #[test]
     fn kernel_algorithm_constants_use_linux_template_names() {
         assert_eq!(XFRM_ENCR_CBC_AES, "cbc(aes)");
+        assert_eq!(XFRM_ENCR_NULL, "ecb(cipher_null)");
         assert_eq!(XFRM_AEAD_RFC4106_GCM_AES, "rfc4106(gcm(aes))");
         assert_eq!(XFRM_AUTH_HMAC_SHA256, "hmac(sha256)");
         assert_eq!(XFRM_AUTH_HMAC_SHA384, "hmac(sha384)");
         assert_eq!(XFRM_AUTH_HMAC_SHA512, "hmac(sha512)");
 
         assert_eq!(Algorithm::cbc_aes().name, XFRM_ENCR_CBC_AES);
+        assert_eq!(Algorithm::null().name, XFRM_ENCR_NULL);
         assert_eq!(
             AuthAlgorithm::hmac_sha256(128),
             AuthAlgorithm::new(XFRM_AUTH_HMAC_SHA256, 128)

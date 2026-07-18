@@ -37,7 +37,9 @@ control-plane stack.
   integrity or CBC without integrity combinations cannot be constructed.
   PRF-HMAC-SHA2-256/384/512 are supported for initial IKE-SA derivation,
   IKE-SA rekey (including distinct old/new PRFs), Child-SA KEYMAT, restore, and
-  AUTH calculations. The notify-only error builder is deliberately bounded to
+  AUTH calculations. Child-SA profiles additionally support ENCR_NULL (11)
+  with a mandatory separate SHA-2 integrity transform and exactly zero
+  encryption/salt KEYMAT octets. The notify-only error builder is deliberately bounded to
   one IKE-SA-shaped `UNSUPPORTED_CRITICAL_PAYLOAD`, `NO_PROPOSAL_CHOSEN`, or
   `INVALID_KE_PAYLOAD`. Typed convenience builders write the offending payload
   type as exactly one octet or the accepted non-zero group as exactly two
@@ -154,6 +156,51 @@ Every CBC key size may be paired with each supported SHA-2 integrity
 algorithm. `validate_executable()` is the explicit startup check, although all
 public profile constructors already enforce the same contract.
 
+## Authenticated-only ESP Child SAs
+
+ENCR_NULL is an explicit Child-SA capability, not a deployment default or a
+policy preference. It is never accepted for an IKE SA and it is not added to
+any allowlist automatically. A product that deliberately permits
+authenticated-only ESP constructs or restores the exact typed profile:
+
+```rust
+use opc_proto_ikev2::{
+    Ikev2ChildSaCryptoProfile, Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm,
+    Ikev2SaInitCryptoError,
+};
+
+fn authenticated_only_child() -> Ikev2ChildSaCryptoProfile {
+    Ikev2ChildSaCryptoProfile::new_authenticated_only(
+        Ikev2PrfAlgorithm::HmacSha2_256,
+        Ikev2IntegrityAlgorithm::HmacSha2_256_128,
+    )
+}
+
+fn restore_authenticated_only_child(
+) -> Result<Ikev2ChildSaCryptoProfile, Ikev2SaInitCryptoError> {
+    Ikev2ChildSaCryptoProfile::from_transform_ids(
+        5,        // PRF_HMAC_SHA2_256
+        11,       // ENCR_NULL
+        None,     // Key Length is prohibited for ENCR_NULL
+        Some(12), // AUTH_HMAC_SHA2_256_128
+    )
+}
+```
+
+RFC 7296 Child-SA KEYMAT contains `initiator A | responder A` for this
+profile: each directional encryption and salt slice is empty, while the
+selected integrity key is derived normally. Negotiation rejects ENCR_NULL
+without INTEG, ENCR_NULL carrying any Key Length attribute, and AEAD carrying
+a separate INTEG. Response construction copies transform 11 without adding an
+attribute. Profile and key-material debug output remains redaction-safe.
+
+The optional `opc-ipsec-xfrm` IKEv2 mapper installs this as Linux's canonical
+zero-key `ecb(cipher_null)` crypt attribute plus the selected auth attribute.
+That Linux-only adapter representation does not add protocol KEYMAT. Current
+Linux kernels reject an ESP `NEWSA` containing auth but no crypt/aead
+attribute, so consumers must use the mapper or `Algorithm::null()` rather than
+constructing a raw auth-only `SaParameters` value.
+
 ### Migration from the anonymous integrity length
 
 The old constructor could represent AES-CBC without its algorithm, and the old
@@ -185,6 +232,8 @@ fn configured_handset_profile() -> Result<Ikev2SaInitCryptoProfile, Ikev2SaInitC
 
 Downstream exhaustive matches must add these exact arms:
 
+- `Ikev2EncryptionAlgorithm::Null` (Child-SA only; reject it in IKE-SA
+  protected-payload paths);
 - `Ikev2PrfAlgorithm::HmacSha2_512`;
 - `Ikev2SaInitCryptoError::{MissingIntegrityTransform,
   UnexpectedIntegrityTransform}` and the corresponding

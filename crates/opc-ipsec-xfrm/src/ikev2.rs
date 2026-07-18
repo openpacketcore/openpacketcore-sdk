@@ -273,7 +273,10 @@ impl Error for Ikev2ChildSaXfrmError {}
 ///
 /// AES-GCM profiles map to [`Ikev2ChildSaXfrmKeys::aead`] with Linux
 /// [`crate::XFRM_AEAD_RFC4106_GCM_AES`] and a 128-bit ICV. AES-CBC profiles with supported
-/// HMAC-SHA2 integrity map to separate crypt/auth slots.
+/// HMAC-SHA2 integrity map to separate crypt/auth slots. ENCR_NULL profiles map
+/// to the auth slot plus Linux's canonical zero-key
+/// [`crate::XFRM_ENCR_NULL`] crypt slot. The IKEv2 KEYMAT remains
+/// authenticated-only: no cipher key or salt bytes are fabricated.
 ///
 /// # Errors
 ///
@@ -513,20 +516,28 @@ fn child_sa_xfrm_keys_from_direction(
         )));
     }
 
+    let Some(integrity) = profile.integrity() else {
+        return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping);
+    };
+    let auth = (
+        auth_algorithm_from_ikev2_integrity(integrity),
+        KeyMaterial::new(integrity_key.to_vec()),
+    );
+
     let crypt = match profile.encryption() {
+        Ikev2EncryptionAlgorithm::Null => {
+            if !encryption_key.is_empty() {
+                return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping);
+            }
+            Algorithm::null()
+        }
         Ikev2EncryptionAlgorithm::AesCbc128
         | Ikev2EncryptionAlgorithm::AesCbc192
         | Ikev2EncryptionAlgorithm::AesCbc256 => Algorithm::cbc_aes(),
         _ => return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping),
     };
-    let Some(integrity) = profile.integrity() else {
-        return Err(Ikev2ChildSaKeyMaterialError::UnsupportedAlgorithmMapping);
-    };
     Ok(Ikev2ChildSaXfrmKeys::new(
-        Some((
-            auth_algorithm_from_ikev2_integrity(integrity),
-            KeyMaterial::new(integrity_key.to_vec()),
-        )),
+        Some(auth),
         Some((crypt, KeyMaterial::new(encryption_key.to_vec()))),
     ))
 }
@@ -732,7 +743,9 @@ fn same_address_family(left: IpAddress, right: IpAddress) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES};
+    use crate::{
+        XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
+    };
     use opc_proto_ikev2::{
         Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation, Ikev2EncryptionAlgorithm,
         Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoErrorCode,
@@ -1358,6 +1371,63 @@ mod tests {
             outbound_crypt.1.as_bytes(),
             hex_to_bytes("8c2afd17eeff3e2a77f1c49d07cb5a9456546102f02fe52ee641dd4e3bc207ce")
         );
+    }
+
+    #[test]
+    fn derives_encr_null_child_sa_into_linux_null_cipher_and_auth_slots() {
+        let profile = Ikev2ChildSaCryptoProfile::new_authenticated_only(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2IntegrityAlgorithm::HmacSha2_256_128,
+        );
+        let keys =
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 16], None) {
+                Ok(keys) => keys,
+                Err(error) => panic!("ENCR_NULL Child SA XFRM key derivation failed: {error:?}"),
+            };
+
+        for (direction, expected) in [
+            (
+                &keys.inbound,
+                "7ae50b9713ddfd346dbb3cfbe8b8d45a34c79925bedb4f4ae6a5ad6bc76d8ab5",
+            ),
+            (
+                &keys.outbound,
+                "78ea306ce36f6fde3c1f71951c1fe8c6d7477a4a2adfe9b746fd3c6fd6be52da",
+            ),
+        ] {
+            assert!(direction.aead.is_none());
+            let crypt = match &direction.crypt {
+                Some(crypt) => crypt,
+                None => panic!("ENCR_NULL direction omitted the Linux NULL cipher"),
+            };
+            assert_eq!(crypt.0.name, XFRM_ENCR_NULL);
+            assert!(crypt.1.is_empty());
+            let auth = match &direction.auth {
+                Some(auth) => auth,
+                None => panic!("ENCR_NULL direction omitted auth keys"),
+            };
+            assert_eq!(auth.0.name, XFRM_AUTH_HMAC_SHA256);
+            assert_eq!(auth.0.truncation_len_bits, 128);
+            assert_eq!(auth.1.as_bytes(), hex_to_bytes(expected));
+        }
+
+        let mut request = request();
+        request.inbound = keys.inbound;
+        request.outbound = keys.outbound;
+        let built = match build_xfrm_requests_from_ikev2_child_sa(&request) {
+            Ok(built) => built,
+            Err(error) => panic!("ENCR_NULL XFRM request mapping failed: {error:?}"),
+        };
+        for sa in [&built.inbound_sa.parameters, &built.outbound_sa.parameters] {
+            assert!(sa.auth.is_some());
+            let crypt = match &sa.crypt {
+                Some(crypt) => crypt,
+                None => panic!("ENCR_NULL request omitted the Linux NULL cipher"),
+            };
+            assert_eq!(crypt.0.name, XFRM_ENCR_NULL);
+            assert!(crypt.1.is_empty());
+            assert!(sa.aead.is_none());
+        }
     }
 
     #[test]
