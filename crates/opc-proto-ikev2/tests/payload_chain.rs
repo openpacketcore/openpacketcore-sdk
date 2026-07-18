@@ -9,7 +9,7 @@ use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, Encode, EncodeContext, OwnedDecode, ToOwnedPdu,
     ValidationLevel,
 };
-use std::{cell::Cell, fmt};
+use std::cell::Cell;
 
 fn sa_nonce_message() -> [u8; HEADER_LEN + 16] {
     [
@@ -263,14 +263,8 @@ impl CryptoProvider for EchoProvider {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FakeCryptoError(&'static str);
-
-impl fmt::Display for FakeCryptoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
-    }
-}
 
 struct RecordingProvider<'a> {
     calls: Cell<usize>,
@@ -317,7 +311,7 @@ impl CryptoProvider for FailingProvider {
         _context: ProtectedPayloadContext<'_>,
         _protected_body: &[u8],
     ) -> Result<Bytes, Self::Error> {
-        Err(FakeCryptoError("redacted-open-failed"))
+        Err(FakeCryptoError("provider-error-secret"))
     }
 }
 
@@ -405,12 +399,21 @@ fn open_protected_payloads_projects_provider_failure_without_body_leakage() {
                 failure.first_inner_payload,
                 PayloadType::ExtensibleAuthentication
             );
-            assert_eq!(failure.provider_error, "redacted-open-failed");
+            assert_eq!(
+                failure.provider_error,
+                FakeCryptoError("provider-error-secret")
+            );
         }
         other => panic!("unexpected protected payload open error: {other:?}"),
     }
     let debug = format!("{error:?}");
     assert!(!debug.contains("protected-secret"));
+    assert!(!debug.contains("provider-error-secret"));
+    assert_eq!(error.to_string(), "IKE protected payload provider rejected");
+    let ProtectedPayloadOpenError::ProviderRejected(failure) = &error else {
+        unreachable!("provider rejection already matched")
+    };
+    assert!(!format!("{failure:?}").contains("provider-error-secret"));
 }
 
 #[test]

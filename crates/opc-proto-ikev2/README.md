@@ -259,6 +259,22 @@ already-built wire message for retransmissions—calling the production CBC
 sealer again deliberately generates a different IV. The explicit-IV sealer is
 a low-level test/vector boundary and must not be used by production callers.
 
+`open_protected_payloads` preserves the provider error by value. With the
+concrete SA_INIT-key provider its error type is
+`Ikev2ProtectedPayloadOpenError`, and
+`ProtectedPayloadOpenError::ProviderRejected(failure)` exposes
+`failure.provider_error.code()` as an
+`Ikev2ProtectedPayloadCryptoErrorCode`. This typed value is local diagnostic
+evidence only. The outer error redacts it from both `Debug` and `Display`; a
+caller that explicitly inspects a custom provider error remains responsible
+for redaction. Do not send the inner variant or code to the peer: every
+provider rejection retains the uniform outer
+`ike_protected_payload_provider_rejected` classification, and products must
+apply one peer-visible rejection/drop policy to authentication, malformed
+length, and authenticated-padding failures. The outer error's `Display` text
+is deliberately uniform as an additional defense against accidental detail
+leakage; inspect the typed field locally instead.
+
 ## Dedicated-bearer integration
 
 The dedicated-bearer API consumes and emits the cleartext payload chain inside

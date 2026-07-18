@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Typed IKEv2 protected-payload open failures — `opc-proto-ikev2`:** `SK`
+  and `SKF` provider errors now pass through `open_protected_payloads` as their
+  original type instead of being reduced to `Display` text. The concrete
+  SA_INIT-key provider exposes exact authentication, structural-length, and
+  authenticated-padding codes for local diagnostics while retaining one
+  uniform outer provider-rejection classification for peer-visible policy.
 - **Consensus cold-establishment liveness — `opc-session-net`:** one bounded
   per-peer singleflight now carries DNS/TCP/mTLS/identity/bootstrap work across
   a short Openraft caller deadline without carrying request bytes across that

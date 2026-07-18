@@ -19,7 +19,9 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::{CryptoProvider, ProtectedPayloadContext, ProtectedPayloadKind},
+    crypto::{
+        CryptoProvider, ProtectedPayloadContext, ProtectedPayloadKind, ProtectedPayloadOpenError,
+    },
     fragmentation::IKEV2_ENCRYPTED_FRAGMENT_FIXED_BODY_LEN,
     hmac_sha2::{hmac_sha2_256, hmac_sha2_384, hmac_sha2_512},
     payload::GENERIC_PAYLOAD_HEADER_LEN,
@@ -482,6 +484,17 @@ impl fmt::Display for Ikev2ProtectedPayloadCryptoError {
 }
 
 impl Error for Ikev2ProtectedPayloadCryptoError {}
+
+/// Typed error returned when the concrete SA_INIT-key provider fails while
+/// [`crate::open_protected_payloads`] is opening an `SK` or `SKF` payload.
+///
+/// The outer error retains uniform provider-rejection classification through
+/// [`ProtectedPayloadOpenError::as_str`]. Its
+/// [`crate::ProtectedPayloadOpenFailure::provider_error`] preserves the exact
+/// [`Ikev2ProtectedPayloadCryptoError`] for local diagnostics and stable code
+/// mapping.
+pub type Ikev2ProtectedPayloadOpenError =
+    ProtectedPayloadOpenError<Ikev2ProtectedPayloadCryptoError>;
 
 /// Concrete [`CryptoProvider`] for executable IKEv2 `SK` and `SKF` profiles.
 ///

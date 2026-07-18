@@ -11,7 +11,8 @@ use opc_proto_ikev2::{
     seal_ikev2_sa_init_protected_payload, seal_ikev2_sa_init_protected_payload_with_iv_counter,
     Header, HeaderFlags, Ikev2AesGcmExplicitIvCounter, Ikev2DhGroup, Ikev2EncryptionAlgorithm,
     Ikev2IkeAuthPayloadBuild, Ikev2PrfAlgorithm, Ikev2ProtectedPayloadCryptoError,
-    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile, Ikev2SaInitProtectedPayloadProvider,
+    Ikev2ProtectedPayloadCryptoErrorCode, Ikev2ProtectedPayloadDirection,
+    Ikev2ProtectedPayloadOpenError, Ikev2SaInitCryptoProfile, Ikev2SaInitProtectedPayloadProvider,
     Message, PayloadChain, PayloadType, ProtectedPayloadContext, ProtectedPayloadKind,
     ProtectedPayloadOpenError, ProtectedPayloadSealContext, EXCHANGE_TYPE_IKE_AUTH,
     EXCHANGE_TYPE_INFORMATIONAL, GENERIC_PAYLOAD_HEADER_LEN, HEADER_LEN, IKEV2_IPSEC_SPI_SIZE,
@@ -567,26 +568,17 @@ fn open_with_provider(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
     direction: Ikev2ProtectedPayloadDirection,
-) -> Result<Vec<opc_proto_ikev2::OpenedProtectedPayload>, ProtectedPayloadOpenError> {
+) -> Result<Vec<opc_proto_ikev2::OpenedProtectedPayload>, Ikev2ProtectedPayloadOpenError> {
     let message = decode_message(encoded);
     let provider = Ikev2SaInitProtectedPayloadProvider::new(profile, key_material, direction);
     open_protected_payloads(&message, encoded, DecodeContext::default(), &provider)
 }
 
-fn provider_rejection_code(error: &ProtectedPayloadOpenError) -> Option<&'static str> {
+fn provider_rejection_code(
+    error: &Ikev2ProtectedPayloadOpenError,
+) -> Option<Ikev2ProtectedPayloadCryptoErrorCode> {
     match error {
-        ProtectedPayloadOpenError::ProviderRejected(failure)
-            if failure.provider_error == "IKEv2 protected payload authentication failed" =>
-        {
-            Some("ike_protected_payload_crypto_authentication_failed")
-        }
-        ProtectedPayloadOpenError::ProviderRejected(failure)
-            if failure
-                .provider_error
-                .starts_with("invalid IKEv2 protected payload padding") =>
-        {
-            Some("ike_protected_payload_crypto_invalid_padding")
-        }
+        ProtectedPayloadOpenError::ProviderRejected(failure) => Some(failure.provider_error.code()),
         _ => None,
     }
 }
@@ -863,7 +855,7 @@ fn rejects_wrong_direction_wrong_aad_and_tampered_body_or_tag() {
     };
     assert_eq!(
         provider_rejection_code(&wrong_direction),
-        Some("ike_protected_payload_crypto_authentication_failed")
+        Some(Ikev2ProtectedPayloadCryptoErrorCode::AuthenticationFailed)
     );
 
     let decoded = decode_message(&encoded);
@@ -881,7 +873,7 @@ fn rejects_wrong_direction_wrong_aad_and_tampered_body_or_tag() {
         };
     assert_eq!(
         provider_rejection_code(&wrong_aad_error),
-        Some("ike_protected_payload_crypto_authentication_failed")
+        Some(Ikev2ProtectedPayloadCryptoErrorCode::AuthenticationFailed)
     );
 
     let mut tampered_ciphertext = encoded.clone();
@@ -897,7 +889,7 @@ fn rejects_wrong_direction_wrong_aad_and_tampered_body_or_tag() {
     };
     assert_eq!(
         provider_rejection_code(&tampered_ciphertext_error),
-        Some("ike_protected_payload_crypto_authentication_failed")
+        Some(Ikev2ProtectedPayloadCryptoErrorCode::AuthenticationFailed)
     );
 
     let mut tampered_tag = encoded.clone();
@@ -917,7 +909,7 @@ fn rejects_wrong_direction_wrong_aad_and_tampered_body_or_tag() {
     };
     assert_eq!(
         provider_rejection_code(&tampered_tag_error),
-        Some("ike_protected_payload_crypto_authentication_failed")
+        Some(Ikev2ProtectedPayloadCryptoErrorCode::AuthenticationFailed)
     );
 }
 
@@ -945,7 +937,7 @@ fn rejects_invalid_padding_after_authenticated_decryption() {
 
     assert_eq!(
         provider_rejection_code(&error),
-        Some("ike_protected_payload_crypto_invalid_padding")
+        Some(Ikev2ProtectedPayloadCryptoErrorCode::InvalidPadding)
     );
     let debug = format!("{error:?}");
     assert!(!debug.contains("cleartext-inner-auth-payload"));
@@ -969,7 +961,10 @@ fn rejects_short_body_malformed_skf_and_profile_key_mismatch_with_stable_codes()
         ProtectedPayloadOpenError::ProviderRejected(failure) => {
             assert_eq!(
                 failure.provider_error,
-                "IKEv2 protected payload body too short: minimum 24, actual 4"
+                Ikev2ProtectedPayloadCryptoError::ProtectedPayloadTooShort {
+                    min_len: 24,
+                    actual: 4,
+                }
             );
         }
         other => panic!("unexpected short-body error: {other:?}"),
