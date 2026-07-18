@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **S2b Create Session Response control endpoint — `opc-proto-gtpv2c`:**
+  accepted responses now encode, require, and project the PGW S2b GTP-C
+  F-TEID at instance 1/interface type 32 instead of treating instance-0 Sender
+  F-TEID as the response endpoint. The profile rejects a wrong interface,
+  zero TEID, or missing address and preserves first-occurrence receive
+  semantics. The public accepted-response input/summary field is renamed from
+  `sender_f_teid` to `pgw_control_f_teid`; the corresponding stable projection
+  errors now name the PGW control role.
+- **TS 29.274 singleton repetition — `opc-proto-gtpv2c`:** ProcedureAware S2b
+  receive now retains the first occurrence of each non-repeatable IE key per
+  exact top-level or Bearer-Context-instance scope, ignores later occurrences,
+  discards message-grammar-known unexpected type/instance keys before
+  interpreting their values, preserves unknown optional keys, and ignores
+  declared-list excess at its table bound. The grammar applies explicit S2b
+  applicability for exact endpoint roles; typed projections enforce endpoint
+  value semantics and correlation.
+  `decode_with_diagnostics` exposes bounded redaction-safe duplicate metadata;
+  canonical builders remain strict and reject duplicate singleton input.
 - **BREAKING — fail-closed Diameter SCTP protection contract — `opc-sctp`:**
   the deprecated `DiameterSctpSecurity::Dtls` compatibility selector no longer
   maps ordinary SCTP payloads to PPID 47. It returns the typed

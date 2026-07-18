@@ -2,10 +2,9 @@ use bytes::BytesMut;
 use opc_proto_gtpv2c::{
     decode_typed_ie_sequence, s2b, CauseValue, FullyQualifiedTeid, Message, MessageType,
     S2bMessage, TbcdDigits, TypedIe, TypedIeValue, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
-    IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID,
-    IE_TYPE_IMSI, IE_TYPE_INDICATION, IE_TYPE_MEI, IE_TYPE_PCO, IE_TYPE_RECOVERY,
-    INTERFACE_TYPE_S2B_EPDG_GTP_C, INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
-    INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+    IE_TYPE_BEARER_QOS, IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI,
+    IE_TYPE_INDICATION, IE_TYPE_MEI, IE_TYPE_RECOVERY, INTERFACE_TYPE_S2B_EPDG_GTP_C,
+    INTERFACE_TYPE_S2B_PGW_GTP_C, INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U,
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext,
@@ -105,12 +104,12 @@ const CAUSE_IE: &[u8] = &[0x02, 0x00, 0x02, 0x00, 0x10, 0x00];
 const PARTIAL_ACCEPT_CAUSE_IE: &[u8] = &[IE_TYPE_CAUSE, 0x00, 0x02, 0x00, 0x11, 0x00];
 const REJECTED_CAUSE_IE: &[u8] = &[IE_TYPE_CAUSE, 0x00, 0x02, 0x00, 0x46, 0x00];
 const EBI_IE: &[u8] = &[0x49, 0x00, 0x01, 0x00, 0x05];
-const SENDER_F_TEID_IE: &[u8] = &[
+const PGW_CONTROL_F_TEID_IE: &[u8] = &[
     IE_TYPE_F_TEID,
     0x00,
     0x09,
-    0x00,
-    0x8b,
+    0x01,
+    0xa0,
     0x55,
     0x66,
     0x77,
@@ -253,7 +252,7 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
     let fteid = find_ie(&view.ies, opc_proto_gtpv2c::IE_TYPE_F_TEID);
     match &fteid.value {
         TypedIeValue::FullyQualifiedTeid(value) => {
-            assert_eq!(value.interface_type, 0x0a);
+            assert_eq!(value.interface_type, INTERFACE_TYPE_S2B_EPDG_GTP_C);
             assert_eq!(value.teid, 0x1122_3344);
             assert_eq!(value.ipv4, Some([192, 0, 2, 10]));
             assert_eq!(
@@ -275,6 +274,17 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
                 TypedIeValue::EpsBearerId(value) => assert_eq!(value.value, 5),
                 other => panic!("unexpected EBI value: {other:?}"),
             }
+            let user_plane_fteid = find_ie(&context.members, IE_TYPE_F_TEID);
+            match &user_plane_fteid.value {
+                TypedIeValue::FullyQualifiedTeid(value) => {
+                    assert_eq!(user_plane_fteid.instance, 5);
+                    assert_eq!(value.interface_type, INTERFACE_TYPE_S2B_U_EPDG_GTP_U);
+                    assert_eq!(value.teid, 0x1122_3345);
+                    assert_eq!(value.ipv4, Some([192, 0, 2, 20]));
+                    assert_eq!(value.ipv6, None);
+                }
+                other => panic!("unexpected S2b-U ePDG F-TEID value: {other:?}"),
+            }
             let bearer_qos = find_ie(&context.members, IE_TYPE_BEARER_QOS);
             match &bearer_qos.value {
                 TypedIeValue::BearerQos(value) => {
@@ -287,23 +297,10 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
                 }
                 other => panic!("unexpected Bearer QoS value: {other:?}"),
             }
-            let charging_id = find_ie(&context.members, IE_TYPE_CHARGING_ID);
-            match &charging_id.value {
-                TypedIeValue::ChargingId(value) => assert_eq!(value.value, 0x1234_5678),
-                other => panic!("unexpected Charging ID value: {other:?}"),
-            }
         }
         other => panic!("unexpected Bearer Context value: {other:?}"),
     }
 
-    let pco = find_ie(&view.ies, IE_TYPE_PCO);
-    match &pco.value {
-        TypedIeValue::ProtocolConfigurationOptions(value) => {
-            assert_eq!(pco.instance, 2);
-            assert_eq!(value.value, [0x80, 0x21, 0x00]);
-        }
-        other => panic!("unexpected PCO value: {other:?}"),
-    }
     let indication = find_ie(&view.ies, IE_TYPE_INDICATION);
     match &indication.value {
         TypedIeValue::Indication(value) => assert_eq!(value.flags, [0x40, 0x01]),
@@ -312,7 +309,7 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
     let apco = find_ie(&view.ies, IE_TYPE_APCO);
     match &apco.value {
         TypedIeValue::AdditionalProtocolConfigurationOptions(value) => {
-            assert_eq!(apco.instance, 1);
+            assert_eq!(apco.instance, 0);
             assert_eq!(value.value, [0x80, 0x21, 0x01]);
         }
         other => panic!("unexpected APCO value: {other:?}"),
@@ -321,7 +318,7 @@ fn create_session_request_exposes_mandatory_typed_ies_and_raw_fallback() {
     match &unsupported.value {
         TypedIeValue::Raw(raw) => {
             assert_eq!(raw.ie_type, 0xfe);
-            assert_eq!(raw.value, [0xaa]);
+            assert_eq!(raw.value, [0x01, 0x00]);
         }
         other => panic!("unexpected raw fallback value: {other:?}"),
     }
@@ -771,9 +768,9 @@ fn procedure_aware_imsi_identity_does_not_require_emergency_markers() {
     }
 }
 
-/// Build a minimal Create Session Response where the Sender F-TEID IE appears at
-/// `fteid_instance`. All other mandatory S2b IEs are present at instance 0.
-fn create_session_response_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
+/// Build a minimal Create Session Response where the PGW control F-TEID IE
+/// appears at `fteid_instance`.
+fn create_session_response_with_pgw_control_fteid_instance(fteid_instance: u8) -> Vec<u8> {
     let mut header = [
         0x48,
         s2b::CREATE_SESSION_RESPONSE,
@@ -795,7 +792,7 @@ fn create_session_response_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
             0x00,
             0x09,
             fteid_instance,
-            0x8b,
+            0xa0,
             0x55,
             0x66,
             0x77,
@@ -804,7 +801,7 @@ fn create_session_response_with_fteid_instance(fteid_instance: u8) -> Vec<u8> {
             0x00,
             0x02,
             0x01,
-        ], // Sender F-TEID.
+        ], // PGW S2b control-plane F-TEID.
         BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
     ];
     let body: Vec<u8> = ies.iter().copied().flatten().copied().collect();
@@ -844,6 +841,43 @@ fn create_session_response_with_projection_ies(
     message
 }
 
+fn raw_f_teid_ie(
+    instance: u8,
+    interface_type: u8,
+    teid: u32,
+    ipv4: Option<[u8; 4]>,
+    ipv6: Option<[u8; 16]>,
+) -> Vec<u8> {
+    assert!(
+        interface_type <= 0x3f,
+        "test interface type must fit six bits"
+    );
+    let mut value = Vec::with_capacity(25);
+    let mut flags = interface_type;
+    if ipv4.is_some() {
+        flags |= 0x80;
+    }
+    if ipv6.is_some() {
+        flags |= 0x40;
+    }
+    value.push(flags);
+    value.extend_from_slice(&teid.to_be_bytes());
+    if let Some(address) = ipv4 {
+        value.extend_from_slice(&address);
+    }
+    if let Some(address) = ipv6 {
+        value.extend_from_slice(&address);
+    }
+
+    let value_len = u16::try_from(value.len()).expect("test F-TEID value fits u16");
+    let mut ie = Vec::with_capacity(value.len().saturating_add(4));
+    ie.push(IE_TYPE_F_TEID);
+    ie.extend_from_slice(&value_len.to_be_bytes());
+    ie.push(instance & 0x0f);
+    ie.extend_from_slice(&value);
+    ie
+}
+
 #[test]
 fn create_session_rejected_response_summary_allows_cause_only() {
     let response = create_session_response_with_projection_ies(
@@ -875,7 +909,7 @@ fn create_session_rejected_response_summary_allows_cause_only() {
 
 #[test]
 fn create_session_accepted_response_summary_requires_bearer_fields() {
-    let accepted = create_session_response_with_fteid_instance(0);
+    let accepted = create_session_response_with_pgw_control_fteid_instance(1);
     let summary = match s2b::decode_create_session_response_summary(&accepted, procedure_context())
     {
         Ok(summary) => summary,
@@ -886,7 +920,11 @@ fn create_session_accepted_response_summary_requires_bearer_fields() {
             assert_eq!(accepted.response_teid, 0x0102_0304);
             assert_eq!(accepted.sequence_number, 0x0000_2000);
             assert_eq!(accepted.cause, CauseValue::RequestAccepted);
-            assert_eq!(accepted.sender_f_teid.teid, 0x5566_7788);
+            assert_eq!(accepted.pgw_control_f_teid.teid, 0x5566_7788);
+            assert_eq!(
+                accepted.pgw_control_f_teid.interface_type,
+                INTERFACE_TYPE_S2B_PGW_GTP_C
+            );
             assert_eq!(accepted.bearer_ebi.value, 5);
             assert_eq!(
                 accepted.bearer_user_plane_f_teid.interface_type,
@@ -897,21 +935,21 @@ fn create_session_accepted_response_summary_requires_bearer_fields() {
         other => panic!("expected accepted summary, got {other:?}"),
     }
 
-    let missing_sender = create_session_response_with_projection_ies(
+    let missing_control_endpoint = create_session_response_with_projection_ies(
         Some(0x0102_0304),
         0x0000_2000,
         &[CAUSE_IE, BEARER_CONTEXT_IE],
     );
-    assert!(S2bMessage::decode(&missing_sender, procedure_context()).is_err());
+    assert!(S2bMessage::decode(&missing_control_endpoint, procedure_context()).is_err());
     assert_eq!(
-        s2b::decode_create_session_response_summary(&missing_sender, procedure_context()),
-        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingSenderFTeid)
+        s2b::decode_create_session_response_summary(&missing_control_endpoint, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingPgwControlFTeid)
     );
 
     let missing_bearer = create_session_response_with_projection_ies(
         Some(0x0102_0304),
         0x0000_2000,
-        &[CAUSE_IE, SENDER_F_TEID_IE],
+        &[CAUSE_IE, PGW_CONTROL_F_TEID_IE],
     );
     assert!(S2bMessage::decode(&missing_bearer, procedure_context()).is_err());
     assert_eq!(
@@ -922,7 +960,7 @@ fn create_session_accepted_response_summary_requires_bearer_fields() {
     let missing_ebi = create_session_response_with_projection_ies(
         Some(0x0102_0304),
         0x0000_2000,
-        &[CAUSE_IE, SENDER_F_TEID_IE, EMPTY_BEARER_CONTEXT_IE],
+        &[CAUSE_IE, PGW_CONTROL_F_TEID_IE, EMPTY_BEARER_CONTEXT_IE],
     );
     assert!(S2bMessage::decode(&missing_ebi, procedure_context()).is_err());
     assert_eq!(
@@ -932,13 +970,303 @@ fn create_session_accepted_response_summary_requires_bearer_fields() {
 }
 
 #[test]
+fn accepted_response_projects_ipv4_ipv6_and_dual_stack_pgw_control_endpoints() {
+    let ipv4 = [192, 0, 2, 20];
+    let ipv6 = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
+    ];
+    let fixtures = [
+        ("IPv4-only", Some(ipv4), None),
+        ("IPv6-only", None, Some(ipv6)),
+        ("dual-stack", Some(ipv4), Some(ipv6)),
+    ];
+
+    for (label, expected_ipv4, expected_ipv6) in fixtures {
+        let control = raw_f_teid_ie(
+            1,
+            INTERFACE_TYPE_S2B_PGW_GTP_C,
+            0x5566_7788,
+            expected_ipv4,
+            expected_ipv6,
+        );
+        let response = create_session_response_with_projection_ies(
+            Some(0x0102_0304),
+            0x0000_2000,
+            &[
+                CAUSE_IE,
+                control.as_slice(),
+                BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+            ],
+        );
+        let summary = s2b::decode_create_session_response_summary(&response, procedure_context())
+            .unwrap_or_else(|error| panic!("{label} fixture failed: {error:?}"));
+        let s2b::CreateSessionResponseSummary::Accepted(accepted) = summary else {
+            panic!("{label} fixture projected as rejected");
+        };
+        assert_eq!(
+            accepted.pgw_control_f_teid.interface_type, INTERFACE_TYPE_S2B_PGW_GTP_C,
+            "{label}"
+        );
+        assert_eq!(accepted.pgw_control_f_teid.teid, 0x5566_7788, "{label}");
+        assert_eq!(accepted.pgw_control_f_teid.ipv4, expected_ipv4, "{label}");
+        assert_eq!(accepted.pgw_control_f_teid.ipv6, expected_ipv6, "{label}");
+    }
+}
+
+#[test]
+fn accepted_response_rejects_invalid_pgw_control_endpoint_roles() {
+    let instance_zero = raw_f_teid_ie(
+        0,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0x1111_2222,
+        Some([192, 0, 2, 10]),
+        None,
+    );
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            instance_zero.as_slice(),
+            BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+        ],
+    );
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&response, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingPgwControlFTeid)
+    );
+
+    let wrong_interface = raw_f_teid_ie(
+        1,
+        INTERFACE_TYPE_S2B_EPDG_GTP_C,
+        0x1111_2222,
+        Some([192, 0, 2, 10]),
+        None,
+    );
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            wrong_interface.as_slice(),
+            BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+        ],
+    );
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&response, procedure_context()),
+        Err(
+            s2b::CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch
+        )
+    );
+
+    let zero_teid = raw_f_teid_ie(
+        1,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0,
+        Some([192, 0, 2, 10]),
+        None,
+    );
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            zero_teid.as_slice(),
+            BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+        ],
+    );
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&response, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseZeroPgwControlFTeid)
+    );
+
+    let no_address = raw_f_teid_ie(1, INTERFACE_TYPE_S2B_PGW_GTP_C, 0x1111_2222, None, None);
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            no_address.as_slice(),
+            BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+        ],
+    );
+    assert_eq!(
+        s2b::decode_create_session_response_summary(&response, procedure_context()),
+        Err(s2b::CreateSessionResponseSummaryError::MalformedResponse)
+    );
+}
+
+#[test]
+fn accepted_response_discards_instance_zero_and_projects_instance_one() {
+    let instance_zero = raw_f_teid_ie(
+        0,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0x1111_2222,
+        Some([192, 0, 2, 10]),
+        None,
+    );
+    let instance_one = raw_f_teid_ie(
+        1,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0x3333_4444,
+        Some([192, 0, 2, 20]),
+        None,
+    );
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            instance_zero.as_slice(),
+            instance_one.as_slice(),
+            BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+        ],
+    );
+
+    let (tail, decoded) = S2bMessage::decode_with_diagnostics(&response, procedure_context())
+        .expect("ProcedureAware response decodes");
+    assert!(tail.is_empty());
+    assert!(decoded.diagnostics().is_empty());
+    let view = decoded.message().as_view().expect("typed response view");
+    assert!(!view
+        .ies
+        .iter()
+        .any(|ie| ie.ie_type() == IE_TYPE_F_TEID && ie.instance == 0));
+    assert!(view
+        .ies
+        .iter()
+        .any(|ie| ie.ie_type() == IE_TYPE_F_TEID && ie.instance == 1));
+    let summary = decoded
+        .message()
+        .create_session_response_summary()
+        .expect("instance-1 PGW endpoint projects");
+    let s2b::CreateSessionResponseSummary::Accepted(accepted) = summary else {
+        panic!("accepted response projected as rejected");
+    };
+    assert_eq!(accepted.pgw_control_f_teid.teid, 0x3333_4444);
+
+    let malformed_instance_zero =
+        raw_f_teid_ie(0, INTERFACE_TYPE_S2B_PGW_GTP_C, 0x5555_6666, None, None);
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            malformed_instance_zero.as_slice(),
+            instance_one.as_slice(),
+            BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+        ],
+    );
+    let (_, decoded) = S2bMessage::decode_with_diagnostics(&response, procedure_context())
+        .expect("unexpected instance 0 is discarded before its malformed value is decoded");
+    let view = decoded.message().as_view().expect("typed response view");
+    assert!(!view
+        .ies
+        .iter()
+        .any(|ie| ie.ie_type() == IE_TYPE_F_TEID && ie.instance == 0));
+    assert!(view
+        .ies
+        .iter()
+        .any(|ie| ie.ie_type() == IE_TYPE_F_TEID && ie.instance == 1));
+}
+
+#[test]
+fn public_summary_helper_keeps_first_repeated_pgw_control_endpoint() {
+    let receive_context = DecodeContext {
+        duplicate_ie_policy: DuplicateIePolicy::Last,
+        validation_level: ValidationLevel::ProcedureAware,
+        ..DecodeContext::default()
+    };
+    let valid = raw_f_teid_ie(
+        1,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0x1111_2222,
+        Some([192, 0, 2, 10]),
+        None,
+    );
+    let malformed_later = raw_f_teid_ie(1, INTERFACE_TYPE_S2B_PGW_GTP_C, 0x3333_4444, None, None);
+    let response = create_session_response_with_projection_ies(
+        Some(0x0102_0304),
+        0x0000_2000,
+        &[
+            CAUSE_IE,
+            valid.as_slice(),
+            malformed_later.as_slice(),
+            BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+        ],
+    );
+    let summary = s2b::decode_create_session_response_summary(&response, receive_context)
+        .expect("malformed later duplicate is ignored before value decoding");
+    let s2b::CreateSessionResponseSummary::Accepted(accepted) = summary else {
+        panic!("accepted response projected as rejected");
+    };
+    assert_eq!(accepted.pgw_control_f_teid.teid, 0x1111_2222);
+
+    let valid_later = raw_f_teid_ie(
+        1,
+        INTERFACE_TYPE_S2B_PGW_GTP_C,
+        0x7777_8888,
+        Some([192, 0, 2, 40]),
+        None,
+    );
+    let invalid_first_cases = [
+        (
+            raw_f_teid_ie(
+                1,
+                INTERFACE_TYPE_S2B_EPDG_GTP_C,
+                0x5555_6666,
+                Some([192, 0, 2, 30]),
+                None,
+            ),
+            s2b::CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch,
+        ),
+        (
+            raw_f_teid_ie(
+                1,
+                INTERFACE_TYPE_S2B_PGW_GTP_C,
+                0,
+                Some([192, 0, 2, 30]),
+                None,
+            ),
+            s2b::CreateSessionResponseSummaryError::AcceptedResponseZeroPgwControlFTeid,
+        ),
+        (
+            raw_f_teid_ie(
+                1,
+                INTERFACE_TYPE_S2B_PGW_GTP_C,
+                0x5555_6666,
+                None,
+                None,
+            ),
+            s2b::CreateSessionResponseSummaryError::MalformedResponse,
+        ),
+    ];
+    for (invalid_first, expected_error) in invalid_first_cases {
+        let response = create_session_response_with_projection_ies(
+            Some(0x0102_0304),
+            0x0000_2000,
+            &[
+                CAUSE_IE,
+                invalid_first.as_slice(),
+                valid_later.as_slice(),
+                BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+            ],
+        );
+        assert_eq!(
+            s2b::decode_create_session_response_summary(&response, receive_context),
+            Err(expected_error)
+        );
+    }
+}
+
+#[test]
 fn create_session_partial_accept_response_summary_projects_bearer_fields() {
     let response = create_session_response_with_projection_ies(
         Some(0x0102_0304),
         0x0000_2000,
         &[
             PARTIAL_ACCEPT_CAUSE_IE,
-            SENDER_F_TEID_IE,
+            PGW_CONTROL_F_TEID_IE,
             BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
         ],
     );
@@ -953,7 +1281,7 @@ fn create_session_partial_accept_response_summary_projects_bearer_fields() {
             assert_eq!(accepted.response_teid, 0x0102_0304);
             assert_eq!(accepted.sequence_number, 0x0000_2000);
             assert_eq!(accepted.cause, CauseValue::RequestAcceptedPartially);
-            assert_eq!(accepted.sender_f_teid.teid, 0x5566_7788);
+            assert_eq!(accepted.pgw_control_f_teid.teid, 0x5566_7788);
             assert_eq!(accepted.bearer_ebi.value, 5);
             assert_eq!(
                 accepted.bearer_user_plane_f_teid.interface_type,
@@ -981,13 +1309,13 @@ fn create_session_partial_accept_response_requires_accepted_fields() {
     assert!(S2bMessage::decode(&cause_only, procedure_context()).is_err());
     assert_eq!(
         s2b::decode_create_session_response_summary(&cause_only, procedure_context()),
-        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingSenderFTeid)
+        Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingPgwControlFTeid)
     );
 
     let missing_bearer = create_session_response_with_projection_ies(
         Some(0x0102_0304),
         0x0000_2000,
-        &[PARTIAL_ACCEPT_CAUSE_IE, SENDER_F_TEID_IE],
+        &[PARTIAL_ACCEPT_CAUSE_IE, PGW_CONTROL_F_TEID_IE],
     );
     assert!(S2bMessage::decode(&missing_bearer, procedure_context()).is_err());
     assert_eq!(
@@ -1023,6 +1351,29 @@ fn create_session_response_summary_returns_stable_error_codes() {
     assert_eq!(error.as_str(), "s2b_create_session_response_missing_teid");
     assert_eq!(error.to_string(), error.as_str());
 
+    let endpoint_errors = [
+        (
+            s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingPgwControlFTeid,
+            "s2b_create_session_response_missing_pgw_control_f_teid",
+        ),
+        (
+            s2b::CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch,
+            "s2b_create_session_response_pgw_control_f_teid_interface_mismatch",
+        ),
+        (
+            s2b::CreateSessionResponseSummaryError::AcceptedResponseZeroPgwControlFTeid,
+            "s2b_create_session_response_zero_pgw_control_f_teid",
+        ),
+        (
+            s2b::CreateSessionResponseSummaryError::AcceptedResponseMalformedPgwControlFTeid,
+            "s2b_create_session_response_malformed_pgw_control_f_teid",
+        ),
+    ];
+    for (error, code) in endpoint_errors {
+        assert_eq!(error.as_str(), code);
+        assert_eq!(error.to_string(), code);
+    }
+
     let malformed_cause = [IE_TYPE_CAUSE, 0x00, 0x02, 0x00, 0x46];
     let malformed = create_session_response_with_projection_ies(
         Some(0x0102_0304),
@@ -1042,16 +1393,10 @@ fn create_session_response_summary_returns_stable_error_codes() {
 }
 
 #[test]
-fn procedure_aware_rejects_non_zero_instance_sender_fteid_for_create_session() {
-    // Sanity: instance-0 Sender F-TEID is accepted.
+fn procedure_aware_uses_request_sender_and_response_pgw_control_fteid_instances() {
+    // Create Session Request continues to require Sender F-TEID instance 0.
     let valid_request = create_session_request_with_fteid_instance(0);
     assert!(S2bMessage::decode(&valid_request, procedure_context()).is_ok());
-
-    let valid_response = create_session_response_with_fteid_instance(0);
-    assert!(S2bMessage::decode(&valid_response, procedure_context()).is_ok());
-
-    // Regression: non-zero instance Sender F-TEID must not satisfy the mandatory
-    // Sender F-TEID requirement for Create Session Request/Response.
     for instance in [1u8, 2, 15] {
         let bad_request = create_session_request_with_fteid_instance(instance);
         let decoded = S2bMessage::decode(&bad_request, procedure_context());
@@ -1062,15 +1407,16 @@ fn procedure_aware_rejects_non_zero_instance_sender_fteid_for_create_session() {
             ),
             "Create Session Request with F-TEID instance {instance} should be rejected"
         );
+    }
 
-        let bad_response = create_session_response_with_fteid_instance(instance);
-        let decoded = S2bMessage::decode(&bad_response, procedure_context());
+    // Accepted S2b responses instead require PGW control F-TEID instance 1.
+    let valid_response = create_session_response_with_pgw_control_fteid_instance(1);
+    assert!(S2bMessage::decode(&valid_response, procedure_context()).is_ok());
+    for instance in [0u8, 2, 15] {
+        let bad_response = create_session_response_with_pgw_control_fteid_instance(instance);
         assert!(
-            matches!(
-                decoded,
-                Err(error) if matches!(error.code(), DecodeErrorCode::Structural { .. })
-            ),
-            "Create Session Response with F-TEID instance {instance} should be rejected"
+            S2bMessage::decode(&bad_response, procedure_context()).is_err(),
+            "Create Session Response with control F-TEID instance {instance} should be rejected"
         );
     }
 }

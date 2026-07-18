@@ -25,7 +25,9 @@ control-plane stack.
 - `Message<'a>` and `OwnedMessage` provide the raw borrowed/owned message
   shells and implement the shared `opc-protocol` codec traits.
 - `S2bMessage<'a>` and `S2bProcedureMessage<'a>` provide typed S2b views and
-  raw fallback for unsupported message types.
+  raw fallback for unsupported message types. `decode_with_diagnostics`
+  additionally returns bounded, value-free `S2bReceiveDiagnostics` evidence
+  for ignored duplicate singleton keys.
 - `S2bCreateBearerRequest`/`Response`, `S2bUpdateBearerRequest`/`Response`,
   and `S2bDeleteBearerRequest`/`Response` project the complete S2b
   dedicated-bearer shapes claimed by this crate. Their builders enforce
@@ -60,6 +62,10 @@ control-plane stack.
   `s2b_modify_bearer_request`, `s2b_modify_bearer_response`,
   `s2b_delete_session_request`, `s2b_delete_session_response`,
   `s2b_update_bearer_request`, and `s2b_update_bearer_response`.
+- Accepted Create Session Responses use the PGW S2b control-plane F-TEID at
+  instance 1 with interface type 32. The endpoint must carry a non-zero TEID
+  and at least one IPv4 or IPv6 address. Instance-0 Sender F-TEID remains the
+  Create Session Request role and is not substituted for the response role.
 - `Gtpv2cEchoPeer` and the client-transaction helper types are
   transport-neutral state helpers; callers still own UDP, timers, persistence,
   and product policy.
@@ -88,11 +94,32 @@ let ctx = DecodeContext {
     validation_level: ValidationLevel::ProcedureAware,
     ..DecodeContext::default()
 };
-let (tail, decoded) = S2bMessage::decode(&encoded, ctx)?;
+let (tail, decoded) = S2bMessage::decode_with_diagnostics(&encoded, ctx)?;
 assert!(tail.is_empty());
-assert!(decoded.as_view().is_some());
+assert!(decoded.message().as_view().is_some());
+assert!(decoded.diagnostics().is_empty());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+`ProcedureAware` is a receiver profile. In accordance with TS 29.274 clauses
+7.7.9 and 7.7.10, it classifies each crate-known IE type/instance against one
+message grammar keyed by procedure, direction, and exact enclosing Bearer
+Context instance before decoding its value. The grammar applies explicit S2b
+applicability where the profile assigns an exact endpoint role. It discards
+unexpected known keys, preserves genuinely unknown optional keys, retains the
+first non-repeatable type/instance key in each exact scope, ignores later
+occurrences, and truncates declared lists at their procedure-table bounds.
+Typed procedure projections enforce required presence, F-TEID interface/value
+semantics, and correlation. Length, mandatory-field, and semantic validation
+of the first retained value still fail closed. Canonical builders deliberately
+use a separate sender-validation path: duplicate profile-owned or additional
+singleton keys remain construction errors and are never emitted.
+
+The current Create Session profile still treats top-level PDN Type as an
+allowed and required compatibility field. Issue #335 owns the separate
+send-profile/PAA-constructor migration that will remove that field for S2b; the
+receive-policy change here deliberately does not partially implement that API
+migration.
 
 The runnable [`dedicated_bearer` example](examples/dedicated_bearer.rs) shows
 the GTP transaction boundary for receiving a triggered request, projecting its
@@ -132,6 +159,42 @@ override priority. Exact retransmission replay always returns the byte-identical
 committed response.
 
 ## Migration notes
+
+Accepted Create Session Response callers must replace
+`S2bCreateSessionAcceptedResponse::sender_f_teid` with
+`pgw_control_f_teid` and supply `FullyQualifiedTeid` interface type
+`INTERFACE_TYPE_S2B_PGW_GTP_C` (32), a non-zero control-plane TEID, and at
+least one address. Consumers of `CreateSessionAcceptedResponseSummary` must
+likewise read `pgw_control_f_teid` instead of `sender_f_teid`. Exhaustive
+matches over `CreateSessionResponseSummaryError` must replace
+`AcceptedResponseMissingSenderFTeid` with
+`AcceptedResponseMissingPgwControlFTeid` and handle the new typed
+`AcceptedResponsePgwControlFTeidInterfaceMismatch`,
+`AcceptedResponseZeroPgwControlFTeid`, and
+`AcceptedResponseMalformedPgwControlFTeid` variants. The wire role changes
+from IE 87 instance 0 to instance 1; applications must not rewrite the
+request-side Sender F-TEID role.
+
+```rust
+use opc_proto_gtpv2c::{
+    FullyQualifiedTeid, S2bCreateSessionAcceptedResponse,
+    INTERFACE_TYPE_S2B_PGW_GTP_C,
+};
+
+# let bearer_context = opc_proto_gtpv2c::BearerContext { members: Vec::new() };
+let response = S2bCreateSessionAcceptedResponse {
+    sequence_number: 0x010203,
+    response_teid: 0x1020_3040,
+    pgw_control_f_teid: FullyQualifiedTeid {
+        interface_type: INTERFACE_TYPE_S2B_PGW_GTP_C,
+        teid: 0x5060_7080,
+        ipv4: Some([192, 0, 2, 20]),
+        ipv6: None,
+    },
+    bearer_context,
+    additional_ies: Vec::new(),
+};
+```
 
 The former loose Update Bearer shell with a single `bearer_context` has been
 replaced by the strict dedicated-bearer API. Construct

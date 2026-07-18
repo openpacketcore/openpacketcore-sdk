@@ -38,7 +38,7 @@ validation for these S2b procedure messages:
 | Procedure | Message types | Profile requirement |
 |:---|:---|:---|
 | Echo | Request (1), Response (2) | Recovery IE decode/encode, no-TEID header shape, sequence preservation, restart-counter evidence. |
-| Create Session | Request (32), Response (33) | S2b request/response required-IE validation, including the conditional request identity, response Cause classification, Sender F-TEID and bearer-context projection. |
+| Create Session | Request (32), Response (33) | S2b request/response required-IE validation, including the conditional request identity, request Sender F-TEID, response Cause classification, instance-1 PGW S2b control F-TEID, and bearer-context projection. |
 | Modify Bearer / S2b Modify Session | Request (34), Response (35) | Bearer Context request validation and Cause-bearing response validation. |
 | Delete Session | Request (36), Response (37) | Linked EPS Bearer ID request validation and Cause-bearing response validation. |
 | Update Bearer | Request (97), Response (98) | Mandatory APN-AMBR and one to fifteen request contexts; typed per-bearer TFT/QoS changes; mandatory correlated response contexts; message/bearer Cause hierarchy and partial acceptance. |
@@ -52,9 +52,10 @@ The profile owns the typed IE families required by the S2b messages above:
 - Node and liveness IEs: Recovery.
 - Subscriber/session IEs: IMSI, APN, PDN Type, PAA, Selection Mode, RAT Type,
   Serving Network, MEI, MSISDN.
-- Tunnel and bearer IEs: Sender F-TEID, Bearer Context, EPS Bearer ID, Bearer
-  QoS, Charging ID, AMBR, APN Restriction, and Bearer TFT backed by the shared
-  `opc-proto-tft` TS 24.008 codec.
+- Tunnel and bearer IEs: request Sender F-TEID, response PGW S2b control
+  F-TEID, Bearer Context, EPS Bearer ID, Bearer QoS, Charging ID, AMBR, APN
+  Restriction, and Bearer TFT backed by the shared `opc-proto-tft` TS 24.008
+  codec.
 - Response and policy containers: Cause, Indication, PCO, APCO.
 - Unknown, private, and unsupported future IEs remain raw-preserved and are not
   interpreted as product policy.
@@ -74,9 +75,11 @@ failures and must cover at least these rules:
   attach, MEI instance 0 plus an instance-0 Indication carrying the UIMSI bit.
   RAT Type, Serving Network, Sender F-TEID, APN, Selection Mode, PDN Type, PAA,
   and Bearer Context with nested EBI remain required in either case.
-- Create Session Response must include Cause, Sender F-TEID, and Bearer Context
-  for accepted responses (Cause 16/17); rejected responses may expose
-  Cause-only summaries.
+- Create Session Response must include Cause, PGW S2b control F-TEID instance
+  1/interface type 32, and Bearer Context for accepted responses (Cause 16/17).
+  The control endpoint requires a non-zero TEID and at least one address;
+  instance-0 Sender F-TEID is unexpected on this S2b response profile and is
+  discarded. Rejected responses may expose Cause-only summaries.
 - Modify Bearer requests must include Bearer Context.
 - Delete Session Request must include linked EPS Bearer ID.
 - Procedure responses must include Cause where the profile claims response
@@ -128,8 +131,29 @@ failures and must cover at least these rules:
   it. Malformed contexts are rejected rather than skipped.
 - F-TEID and PAA typed validation must reject ambiguous malformed address
   shapes instead of silently canonicalizing them.
-- Duplicate singleton IEs must be rejected according to the selected
-  `DecodeContext::duplicate_ie_policy`.
+- Structural and Strict typed IE decode honor the selected
+  `DecodeContext::duplicate_ie_policy`. ProcedureAware S2b receive follows TS
+  29.274 clause 7.7.10 instead: the first singleton key in each top-level or
+  grouped scope is retained, later occurrences are ignored, and bounded
+  `S2bReceiveDiagnostics` records only type, instance, scope/depth, first
+  offset, and a saturated duplicate count. A malformed or semantically invalid
+  first value remains an error and cannot be repaired by a later value.
+- ProcedureAware receive classifies every crate-known typed/control IE key
+  against one message grammar keyed by procedure, direction, and exact
+  enclosing Bearer Context instance before decoding its value. Unexpected
+  known type/instance combinations are discarded under clause 7.7.9, while
+  genuinely unknown optional keys remain raw-preserved. The grammar applies
+  explicit S2b applicability where the profile assigns an exact endpoint role;
+  the same entry defines clause 7.7.10 cardinality, including instance-1
+  Bearer Context lists and bounded PGW load/overload lists. Typed projections
+  enforce required presence, F-TEID interface/value semantics, and correlation.
+  If discarding a key leaves a required expected key absent, the missing-key
+  error is retained. Canonical profile builders use a separate Reject policy
+  and do not emit duplicate singleton keys.
+- The current declared Create Session compatibility profile continues to
+  allow and require top-level PDN Type. Issue #335 owns the complete S2b
+  send-profile and PAA-constructor migration; this receive-policy change does
+  not pre-empt that table delta.
 
 ### Compatibility and API guarantees
 
@@ -144,7 +168,8 @@ failures and must cover at least these rules:
   crate.
 - Unknown well-formed top-level and nested optional IEs are preserved in order
   through the typed dedicated-bearer projections/builders. Unknown duplicate
-  IE keys still obey the caller's `DuplicateIePolicy`. Standardized Bearer
+  IE keys obey the caller's `DuplicateIePolicy` for Structural/Strict decode
+  and the first-wins receiver rule for ProcedureAware S2b decode. Standardized Bearer
   Context and dedicated-EBI lists are cardinality-aware, as are request-only
   Load Control Information instance 1 (up to ten), Overload Control
   Information instance 0 (one node plus up to ten APN entries), and PGW Change
@@ -246,10 +271,11 @@ coverage.
      by this crate's S2b examples: Echo Request/Response Recovery; Create
      Session Request IMSI or emergency MEI plus UIMSI Indication, followed by
      RAT Type/Serving Network/Sender F-TEID/APN/Selection Mode/PDN Type/PAA/
-     Bearer Context with nested EBI; Create Session Response Cause/Sender
-     F-TEID/Bearer Context; Modify request Bearer Context; Delete Session
-     request linked EBI; and response Cause IEs. Dedicated Create, Update, and
-     Delete Bearer validation follows the stricter rules above.
+     Bearer Context with nested EBI; Create Session Response Cause/PGW S2b
+     control F-TEID instance 1/Bearer Context; Modify request Bearer Context;
+     Delete Session request linked EBI; and response Cause IEs. Dedicated
+     Create, Update, and Delete Bearer validation follows the stricter rules
+     above.
    - Non-S2b message types fall back to the raw `Message` shell.
 
 5. **Dedicated-bearer transaction helper**
@@ -369,13 +395,14 @@ The committed fixture corpus is split by provenance class:
   are the only GTPv2-C fixtures currently counted as conformance evidence:
   - Echo Request without TEID validates the no-TEID common-header shape and
     mandatory Recovery IE.
-  - Create Session Request without TEID validates mandatory S2b request
-    examples: IMSI, RAT Type, Serving Network, Sender F-TEID, APN, Selection
-    Mode, PDN Type, PAA, Bearer Context/EBI, nested Bearer QoS and Charging ID,
-    typed PCO, Indication, APCO, and raw fallback for an unsupported private
-    IE.
-  - Create Session Response with TEID validates response Cause, Sender F-TEID,
-    PAA, and Bearer Context examples.
+  - Create Session Request with the T flag and TEID 0 validates mandatory S2b
+    request examples: IMSI, RAT Type, Serving Network, S2b ePDG control-plane
+    F-TEID, APN, Selection Mode, PDN Type, PAA, Bearer Context/EBI, nested
+    S2b-U ePDG F-TEID and Bearer QoS, Indication, APCO, and raw fallback for a
+    correctly framed extended IE type.
+  - Create Session Response with TEID validates response Cause, PGW S2b
+    control-plane F-TEID instance 1/interface type 32, PAA, and Bearer Context
+    examples.
   - Modify Bearer and Delete Session fixtures validate those session-oriented
     views and ProcedureAware mandatory checks.
   - Create Bearer Request validates linked EBI instance 0 plus a grouped

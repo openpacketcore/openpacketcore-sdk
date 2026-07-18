@@ -17,16 +17,27 @@ use opc_protocol::{
     Encode, EncodeContext, EncodeError, EncodeErrorCode, SpecRef, ValidationLevel,
 };
 
+use crate::dedicated_bearer::{
+    MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES as MAX_APN_LOAD_CONTROL_ENTRIES,
+    MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES as MAX_PGW_OVERLOAD_CONTROL_ENTRIES,
+};
 use crate::header::Header;
 pub use crate::header::MessageType;
-use crate::ie::typed::decode_pgw_triggered_request_ie_sequence;
+use crate::ie::typed::{
+    decode_pgw_triggered_request_ie_sequence_with_evidence,
+    decode_s2b_receive_ie_sequence_with_evidence, decode_typed_ie_sequence_with_evidence,
+};
 use crate::ie::{
-    decode_typed_ie_sequence, encode_typed_ie_sequence, AccessPointName, BearerContext, Cause,
-    CauseValue, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation, PdnType,
+    encode_typed_ie_sequence, AccessPointName, BearerContext, Cause, CauseValue,
+    DuplicateIeEvidence, EpsBearerId, FullyQualifiedTeid, PdnAddressAllocation, PdnType,
     ProtocolConfigurationOptions, RatType, Recovery, SelectionMode, ServingNetwork, TbcdDigits,
-    TypedIe, TypedIeValue, IE_TYPE_APN, IE_TYPE_BEARER_CONTEXT, IE_TYPE_CAUSE, IE_TYPE_EBI,
-    IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_MEI, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE,
-    IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE, IE_TYPE_SERVING_NETWORK,
+    TypedIe, TypedIeValue, IE_TYPE_AMBR, IE_TYPE_APCO, IE_TYPE_APN, IE_TYPE_APN_RESTRICTION,
+    IE_TYPE_BEARER_CONTEXT, IE_TYPE_BEARER_QOS, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE,
+    IE_TYPE_CHARGING_ID, IE_TYPE_EBI, IE_TYPE_F_TEID, IE_TYPE_IMSI, IE_TYPE_INDICATION,
+    IE_TYPE_LOAD_CONTROL_INFORMATION, IE_TYPE_MEI, IE_TYPE_MSISDN,
+    IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PAA, IE_TYPE_PCO, IE_TYPE_PDN_TYPE,
+    IE_TYPE_PGW_CHANGE_INFO, IE_TYPE_RAT_TYPE, IE_TYPE_RECOVERY, IE_TYPE_SELECTION_MODE,
+    IE_TYPE_SERVING_NETWORK,
 };
 use crate::{Message, OwnedMessage};
 
@@ -168,11 +179,14 @@ pub struct S2bCreateSessionAcceptedResponse<'a> {
     pub sequence_number: u32,
     /// TEID carried in the response common header.
     pub response_teid: u32,
-    /// Sender F-TEID IE; encoded at instance 0.
-    pub sender_f_teid: FullyQualifiedTeid,
+    /// PGW S2b control-plane F-TEID IE; encoded at instance 1.
+    ///
+    /// The endpoint must use [`INTERFACE_TYPE_S2B_PGW_GTP_C`], carry a
+    /// non-zero TEID, and include at least one IPv4 or IPv6 address.
+    pub pgw_control_f_teid: FullyQualifiedTeid,
     /// Bearer Context IE containing the accepted bearer EBI.
     pub bearer_context: BearerContext<'a>,
-    /// Additional typed IEs to append after Cause, Sender F-TEID, and Bearer Context.
+    /// Additional typed IEs to append after Cause, PGW control F-TEID, and Bearer Context.
     pub additional_ies: Vec<TypedIe<'a>>,
 }
 
@@ -311,7 +325,10 @@ pub fn s2b_create_session_accepted_response(
 ) -> S2bProfileBuildResult<OwnedMessage> {
     let mut ies = vec![
         typed_ie(0, TypedIeValue::Cause(accepted_cause())),
-        typed_ie(0, TypedIeValue::FullyQualifiedTeid(response.sender_f_teid)),
+        typed_ie(
+            1,
+            TypedIeValue::FullyQualifiedTeid(response.pgw_control_f_teid),
+        ),
         typed_ie(0, TypedIeValue::BearerContext(response.bearer_context)),
     ];
     ies.extend(response.additional_ies);
@@ -486,7 +503,12 @@ pub(crate) fn build_s2b_profile_message<'a>(
 }
 
 fn validate_built_s2b_profile_message(message: &OwnedMessage) -> Result<(), DecodeError> {
-    let view = S2bMessage::from_message(message.as_borrowed(), profile_decode_context())?;
+    let view = S2bMessage::from_message_with_purpose(
+        message.as_borrowed(),
+        profile_decode_context(),
+        S2bDecodePurpose::CanonicalBuilder,
+    )?
+    .into_message();
     if view.as_view().is_some() {
         Ok(())
     } else {
@@ -511,8 +533,8 @@ pub struct CreateSessionAcceptedResponseSummary {
     pub sequence_number: u32,
     /// Cause value from the Cause IE.
     pub cause: CauseValue,
-    /// Top-level Sender F-TEID at instance 0.
-    pub sender_f_teid: FullyQualifiedTeid,
+    /// Top-level PGW S2b control-plane F-TEID at instance 1.
+    pub pgw_control_f_teid: FullyQualifiedTeid,
     /// Linked bearer EBI from the first Bearer Context IE.
     pub bearer_ebi: EpsBearerId,
     /// PGW S2b-U user-plane F-TEID from the accepted Bearer Context.
@@ -535,7 +557,19 @@ impl fmt::Debug for CreateSessionAcceptedResponseSummary {
             .field("response_teid_present", &true)
             .field("sequence_number", &self.sequence_number)
             .field("cause", &self.cause)
-            .field("sender_f_teid_present", &true)
+            .field("pgw_control_f_teid_present", &true)
+            .field(
+                "pgw_control_interface_type",
+                &self.pgw_control_f_teid.interface_type,
+            )
+            .field(
+                "pgw_control_ipv4_present",
+                &self.pgw_control_f_teid.ipv4.is_some(),
+            )
+            .field(
+                "pgw_control_ipv6_present",
+                &self.pgw_control_f_teid.ipv6.is_some(),
+            )
             .field("bearer_ebi", &self.bearer_ebi)
             .field(
                 "bearer_user_plane_interface_type",
@@ -573,7 +607,7 @@ impl fmt::Debug for CreateSessionAcceptedResponseSummary {
 /// Rejected Create Session Response projection.
 ///
 /// Rejected responses do not require accepted-bearer-only fields such as
-/// Sender F-TEID or Bearer Context EBI.
+/// PGW control F-TEID or Bearer Context EBI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSessionRejectedResponseSummary {
     /// TEID carried in the Create Session Response common header.
@@ -604,8 +638,14 @@ pub enum CreateSessionResponseSummaryError {
     MissingCause,
     /// Create Session Response did not carry a response-header TEID.
     MissingResponseTeid,
-    /// Accepted Create Session Response did not include Sender F-TEID instance 0.
-    AcceptedResponseMissingSenderFTeid,
+    /// Accepted response did not include the PGW S2b control F-TEID at instance 1.
+    AcceptedResponseMissingPgwControlFTeid,
+    /// Accepted response PGW control F-TEID did not use S2b PGW GTP-C type 32.
+    AcceptedResponsePgwControlFTeidInterfaceMismatch,
+    /// Accepted response PGW control F-TEID carried the reserved zero TEID.
+    AcceptedResponseZeroPgwControlFTeid,
+    /// Accepted response PGW control F-TEID carried no endpoint address.
+    AcceptedResponseMalformedPgwControlFTeid,
     /// Accepted Create Session Response did not include a Bearer Context IE.
     AcceptedResponseMissingBearerContext,
     /// Accepted Create Session Response Bearer Context did not include an EBI IE.
@@ -631,8 +671,17 @@ impl CreateSessionResponseSummaryError {
             }
             Self::MissingCause => "s2b_create_session_response_missing_cause",
             Self::MissingResponseTeid => "s2b_create_session_response_missing_teid",
-            Self::AcceptedResponseMissingSenderFTeid => {
-                "s2b_create_session_response_missing_sender_f_teid"
+            Self::AcceptedResponseMissingPgwControlFTeid => {
+                "s2b_create_session_response_missing_pgw_control_f_teid"
+            }
+            Self::AcceptedResponsePgwControlFTeidInterfaceMismatch => {
+                "s2b_create_session_response_pgw_control_f_teid_interface_mismatch"
+            }
+            Self::AcceptedResponseZeroPgwControlFTeid => {
+                "s2b_create_session_response_zero_pgw_control_f_teid"
+            }
+            Self::AcceptedResponseMalformedPgwControlFTeid => {
+                "s2b_create_session_response_malformed_pgw_control_f_teid"
             }
             Self::AcceptedResponseMissingBearerContext => {
                 "s2b_create_session_response_missing_bearer_context"
@@ -2278,6 +2327,90 @@ pub enum S2bMessage<'a> {
     Raw(Message<'a>),
 }
 
+/// Bounded, redaction-safe diagnostics from an S2b receive decode.
+///
+/// Duplicate entries describe ignored later occurrences only; the decoded
+/// projection always retains the first occurrence. Raw IE values are never
+/// retained in this diagnostic surface.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S2bReceiveDiagnostics {
+    duplicate_ies: Vec<DuplicateIeEvidence>,
+    omitted_duplicate_count: u32,
+}
+
+impl S2bReceiveDiagnostics {
+    fn new(duplicate_ies: Vec<DuplicateIeEvidence>, omitted_duplicate_count: u32) -> Self {
+        Self {
+            duplicate_ies,
+            omitted_duplicate_count,
+        }
+    }
+
+    fn empty() -> Self {
+        Self::new(Vec::new(), 0)
+    }
+
+    /// Return bounded metadata for repeated IE keys.
+    pub fn duplicate_ies(&self) -> &[DuplicateIeEvidence] {
+        &self.duplicate_ies
+    }
+
+    /// Return the saturated count of duplicate events omitted by the bound.
+    pub const fn omitted_duplicate_count(&self) -> u32 {
+        self.omitted_duplicate_count
+    }
+
+    /// Return `true` when no repeated IE was observed.
+    pub fn is_empty(&self) -> bool {
+        self.duplicate_ies.is_empty() && self.omitted_duplicate_count == 0
+    }
+}
+
+impl fmt::Debug for S2bReceiveDiagnostics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S2bReceiveDiagnostics")
+            .field("duplicate_ies", &self.duplicate_ies)
+            .field("omitted_duplicate_count", &self.omitted_duplicate_count)
+            .finish()
+    }
+}
+
+/// S2b receive result containing the typed message and separate diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S2bDecodedMessage<'a> {
+    message: S2bMessage<'a>,
+    diagnostics: S2bReceiveDiagnostics,
+}
+
+impl<'a> S2bDecodedMessage<'a> {
+    /// Borrow the decoded typed message.
+    pub const fn message(&self) -> &S2bMessage<'a> {
+        &self.message
+    }
+
+    /// Borrow the redaction-safe receive diagnostics.
+    pub const fn diagnostics(&self) -> &S2bReceiveDiagnostics {
+        &self.diagnostics
+    }
+
+    /// Consume the result and return the typed message.
+    pub fn into_message(self) -> S2bMessage<'a> {
+        self.message
+    }
+
+    /// Consume the result and return both components.
+    pub fn into_parts(self) -> (S2bMessage<'a>, S2bReceiveDiagnostics) {
+        (self.message, self.diagnostics)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum S2bDecodePurpose {
+    Receive,
+    CanonicalBuilder,
+}
+
 impl fmt::Debug for S2bMessage<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2335,40 +2468,97 @@ impl<'a> S2bMessage<'a> {
         <Self as BorrowDecode<'a>>::decode(input, ctx)
     }
 
+    /// Decode an S2b message with bounded duplicate-IE evidence.
+    ///
+    /// Under [`ValidationLevel::ProcedureAware`], this is the TS 29.274
+    /// receiver profile: the first singleton occurrence is retained and later
+    /// occurrences are ignored. Canonical builders use a separate strict
+    /// validation path and continue rejecting duplicate singleton input.
+    pub fn decode_with_diagnostics(
+        input: &'a [u8],
+        ctx: DecodeContext,
+    ) -> DecodeResult<'a, S2bDecodedMessage<'a>> {
+        let (tail, message) = Message::decode(input, ctx)?;
+        let decoded = Self::from_message_with_purpose(message, ctx, S2bDecodePurpose::Receive)?;
+        Ok((tail, decoded))
+    }
+
     /// Convert a decoded raw [`Message`] into a typed S2b view when possible.
     pub fn from_message(message: Message<'a>, ctx: DecodeContext) -> Result<Self, DecodeError> {
+        Self::from_message_with_purpose(message, ctx, S2bDecodePurpose::Receive)
+            .map(S2bDecodedMessage::into_message)
+    }
+
+    fn from_message_with_purpose(
+        message: Message<'a>,
+        ctx: DecodeContext,
+        purpose: S2bDecodePurpose,
+    ) -> Result<S2bDecodedMessage<'a>, DecodeError> {
         let message_type = message.message_type();
         let Some((procedure, direction)) = procedure_and_direction(message_type) else {
-            return Ok(Self::Raw(message));
+            return Ok(S2bDecodedMessage {
+                message: Self::Raw(message),
+                diagnostics: S2bReceiveDiagnostics::empty(),
+            });
         };
 
         let mut typed_ctx = ctx;
-        if is_procedure_aware(ctx.validation_level) {
-            // Procedure tables, not a blanket first/last policy, define which
-            // IE type/instance pairs are lists. The typed decoder preserves
-            // those known lists and raw extension lists while rejecting a
-            // second occurrence of every known singleton.
-            typed_ctx.duplicate_ie_policy = DuplicateIePolicy::Reject;
+        if is_procedure_aware(ctx.validation_level) && matches!(purpose, S2bDecodePurpose::Receive)
+        {
+            // TS 29.274 clause 7.7.10 is a receiver rule. Canonical sender
+            // validation deliberately retains Reject below.
+            typed_ctx.duplicate_ie_policy = DuplicateIePolicy::First;
         }
-        let ies = if matches!(
+        let pgw_triggered_request = matches!(
             message_type.as_u8(),
             CREATE_BEARER_REQUEST | UPDATE_BEARER_REQUEST | DELETE_BEARER_REQUEST
-        ) {
-            decode_pgw_triggered_request_ie_sequence(message.raw_ies, typed_ctx)?
+        );
+        let decoded_ies = if is_procedure_aware(ctx.validation_level)
+            && matches!(purpose, S2bDecodePurpose::Receive)
+        {
+            let filter = |ie_type, instance, depth, parent_ie| {
+                !matches!(
+                    receive_ie_disposition(
+                        procedure,
+                        direction,
+                        receive_ie_scope(depth, parent_ie),
+                        ie_type,
+                        instance,
+                    ),
+                    ReceiveIeDisposition::DiscardKnown
+                )
+            };
+            let repeatable_limit = |ie_type, instance, depth, parent_ie| {
+                receive_repeatable_limit(
+                    procedure,
+                    direction,
+                    receive_ie_scope(depth, parent_ie),
+                    ie_type,
+                    instance,
+                )
+            };
+            decode_s2b_receive_ie_sequence_with_evidence(
+                message.raw_ies,
+                typed_ctx,
+                &filter,
+                &repeatable_limit,
+            )?
+        } else if pgw_triggered_request {
+            decode_pgw_triggered_request_ie_sequence_with_evidence(message.raw_ies, typed_ctx)?
         } else {
-            decode_typed_ie_sequence(message.raw_ies, typed_ctx, 0)?
+            decode_typed_ie_sequence_with_evidence(message.raw_ies, typed_ctx, 0)?
         };
         let view = S2bProcedureMessage {
             header: message.header,
             procedure,
             direction,
-            ies,
+            ies: decoded_ies.ies,
             raw_ies: message.raw_ies,
             tail: message.tail,
         };
         validate_required_ies(&view, ctx)?;
 
-        Ok(match (procedure, direction) {
+        let message = match (procedure, direction) {
             (Procedure::Echo, MessageDirection::Request) => Self::EchoRequest(view),
             (Procedure::Echo, MessageDirection::Response) => Self::EchoResponse(view),
             (Procedure::CreateSession, MessageDirection::Request) => {
@@ -2403,6 +2593,13 @@ impl<'a> S2bMessage<'a> {
             (Procedure::DeleteBearer, MessageDirection::Response) => {
                 Self::DeleteBearerResponse(view)
             }
+        };
+        Ok(S2bDecodedMessage {
+            message,
+            diagnostics: S2bReceiveDiagnostics::new(
+                decoded_ies.duplicate_evidence,
+                decoded_ies.omitted_duplicate_count,
+            ),
         })
     }
 
@@ -2478,7 +2675,9 @@ impl<'a> S2bMessage<'a> {
 /// This helper preserves decode limits from `ctx` but performs the final
 /// Create Session Response checks through [`CreateSessionResponseSummaryError`]
 /// so callers receive stable error codes for missing Cause, missing response
-/// TEID, and accepted responses with incomplete accepted-bearer fields.
+/// TEID, and accepted responses with incomplete accepted-bearer fields. A
+/// ProcedureAware context always retains the first singleton occurrence even
+/// when its caller-provided duplicate policy is Last.
 ///
 /// # Errors
 ///
@@ -2552,9 +2751,906 @@ impl Encode for S2bMessage<'_> {
 
 fn create_session_response_projection_context(mut ctx: DecodeContext) -> DecodeContext {
     if ctx.validation_level == ValidationLevel::ProcedureAware {
+        // Keep the public projection helper's stable, field-specific errors by
+        // deferring procedure validation, but retain ProcedureAware receive
+        // semantics: an invalid first singleton must never be repaired by a
+        // later duplicate under a caller/default Last policy.
+        ctx.duplicate_ie_policy = DuplicateIePolicy::First;
         ctx.validation_level = ValidationLevel::Strict;
     }
     ctx
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveIeDisposition {
+    AllowedKnown,
+    DiscardKnown,
+    PreserveUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveIeScope {
+    TopLevel,
+    BearerContext(u8),
+}
+
+#[derive(Clone, Copy)]
+struct ReceiveIeRule {
+    procedure: Procedure,
+    direction: MessageDirection,
+    scope: ReceiveIeScope,
+    ie_types: &'static [u8],
+    instances: &'static [u8],
+    max_occurrences: usize,
+}
+
+const KNOWN_RECEIVE_IE_TYPES: &[u8] = &[
+    IE_TYPE_IMSI,
+    IE_TYPE_CAUSE,
+    IE_TYPE_RECOVERY,
+    IE_TYPE_APN,
+    IE_TYPE_AMBR,
+    IE_TYPE_EBI,
+    IE_TYPE_MEI,
+    IE_TYPE_MSISDN,
+    IE_TYPE_INDICATION,
+    IE_TYPE_PCO,
+    IE_TYPE_PAA,
+    IE_TYPE_BEARER_QOS,
+    IE_TYPE_RAT_TYPE,
+    IE_TYPE_SERVING_NETWORK,
+    IE_TYPE_BEARER_TFT,
+    IE_TYPE_F_TEID,
+    IE_TYPE_BEARER_CONTEXT,
+    IE_TYPE_CHARGING_ID,
+    IE_TYPE_PDN_TYPE,
+    IE_TYPE_APN_RESTRICTION,
+    IE_TYPE_SELECTION_MODE,
+    IE_TYPE_APCO,
+    IE_TYPE_OVERLOAD_CONTROL_INFORMATION,
+    IE_TYPE_LOAD_CONTROL_INFORMATION,
+    IE_TYPE_PGW_CHANGE_INFO,
+];
+
+const ONE: usize = 1;
+const UNBOUNDED_BY_TABLE: usize = usize::MAX;
+const MAX_DEDICATED_EBI_VALUES: usize = 15;
+
+// One message grammar drives both clause 7.7.9 disposition and clause 7.7.10
+// cardinality. It retains the full procedure-table shape while applying
+// explicit S2b applicability where the profile assigns an exact endpoint role;
+// typed projections enforce required presence, interface type, value semantics,
+// and correlation.
+//
+// Top-level rules come from TS 29.274 R18 Tables 7.1.1-1, 7.1.2-1,
+// 7.2.1-1, 7.2.2-1, 7.2.3-1, 7.2.4-1, 7.2.7-1, 7.2.8-1,
+// 7.2.9.1-1, 7.2.9.2-1, 7.2.10.1-1, 7.2.10.2-1, 7.2.15-1, and
+// 7.2.16-1. Bearer Context rules come from the matching subordinate tables.
+const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
+    ReceiveIeRule {
+        procedure: Procedure::Echo,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_RECOVERY],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::Echo,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_RECOVERY],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[
+            IE_TYPE_IMSI,
+            IE_TYPE_MEI,
+            IE_TYPE_MSISDN,
+            IE_TYPE_INDICATION,
+            IE_TYPE_RAT_TYPE,
+            IE_TYPE_SERVING_NETWORK,
+            IE_TYPE_APN,
+            IE_TYPE_AMBR,
+            IE_TYPE_SELECTION_MODE,
+            // Issue #335 owns removal of this currently declared S2b
+            // compatibility field from sender and receiver profiles.
+            IE_TYPE_PDN_TYPE,
+            IE_TYPE_PAA,
+            IE_TYPE_APN_RESTRICTION,
+            IE_TYPE_EBI,
+            IE_TYPE_PCO,
+            IE_TYPE_APCO,
+            IE_TYPE_RECOVERY,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_F_TEID],
+        instances: &[0, 1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0, 1],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0, 1, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[
+            IE_TYPE_CAUSE,
+            IE_TYPE_PAA,
+            IE_TYPE_APN_RESTRICTION,
+            IE_TYPE_EBI,
+            IE_TYPE_PCO,
+            IE_TYPE_AMBR,
+            IE_TYPE_APCO,
+            IE_TYPE_INDICATION,
+            IE_TYPE_RECOVERY,
+            IE_TYPE_CHARGING_ID,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_F_TEID],
+        // Table 7.2.2-1 marks Sender F-TEID instance 0 as not needed on S2b;
+        // the PGW control endpoint for S2b is instance 1.
+        instances: &[1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0, 1],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[0, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: MAX_APN_LOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0],
+        max_occurrences: MAX_PGW_OVERLOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_PGW_CHANGE_INFO],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[
+            IE_TYPE_IMSI,
+            IE_TYPE_MEI,
+            IE_TYPE_RAT_TYPE,
+            IE_TYPE_SERVING_NETWORK,
+            IE_TYPE_INDICATION,
+            IE_TYPE_F_TEID,
+            IE_TYPE_AMBR,
+            IE_TYPE_RECOVERY,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0, 1],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0, 1, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[
+            IE_TYPE_CAUSE,
+            IE_TYPE_MSISDN,
+            IE_TYPE_EBI,
+            IE_TYPE_APN_RESTRICTION,
+            IE_TYPE_PCO,
+            IE_TYPE_RECOVERY,
+            IE_TYPE_INDICATION,
+            IE_TYPE_CHARGING_ID,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0, 1],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[0, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: MAX_APN_LOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0],
+        max_occurrences: MAX_PGW_OVERLOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_PGW_CHANGE_INFO],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[
+            IE_TYPE_CAUSE,
+            IE_TYPE_EBI,
+            IE_TYPE_INDICATION,
+            IE_TYPE_PCO,
+            IE_TYPE_F_TEID,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0, 1, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[
+            IE_TYPE_CAUSE,
+            IE_TYPE_RECOVERY,
+            IE_TYPE_PCO,
+            IE_TYPE_INDICATION,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[0, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: MAX_APN_LOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0],
+        max_occurrences: MAX_PGW_OVERLOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_PCO, IE_TYPE_INDICATION, IE_TYPE_F_TEID],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[0, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: MAX_APN_LOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0],
+        max_occurrences: MAX_PGW_OVERLOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_PGW_CHANGE_INFO],
+        instances: &[0],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_CAUSE, IE_TYPE_RECOVERY, IE_TYPE_PCO],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0, 1, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[
+            IE_TYPE_PCO,
+            IE_TYPE_AMBR,
+            IE_TYPE_INDICATION,
+            IE_TYPE_F_TEID,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[0, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: MAX_APN_LOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0],
+        max_occurrences: MAX_PGW_OVERLOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_PGW_CHANGE_INFO],
+        instances: &[0],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[
+            IE_TYPE_CAUSE,
+            IE_TYPE_PCO,
+            IE_TYPE_RECOVERY,
+            IE_TYPE_INDICATION,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0, 1, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[
+            IE_TYPE_PCO,
+            IE_TYPE_CAUSE,
+            IE_TYPE_INDICATION,
+            IE_TYPE_F_TEID,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_EBI],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_EBI],
+        instances: &[1],
+        max_occurrences: MAX_DEDICATED_EBI_VALUES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[0, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: MAX_APN_LOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0],
+        max_occurrences: MAX_PGW_OVERLOAD_CONTROL_ENTRIES,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_PGW_CHANGE_INFO],
+        instances: &[0],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_CAUSE, IE_TYPE_EBI, IE_TYPE_RECOVERY, IE_TYPE_PCO],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_BEARER_CONTEXT],
+        instances: &[0],
+        max_occurrences: UNBOUNDED_BY_TABLE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::TopLevel,
+        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
+        instances: &[0, 1, 2],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_BEARER_TFT, IE_TYPE_BEARER_QOS],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_F_TEID],
+        instances: &[0, 1, 2, 3, 4, 5, 6, 7],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(1),
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_F_TEID],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[
+            IE_TYPE_EBI,
+            IE_TYPE_CAUSE,
+            IE_TYPE_BEARER_QOS,
+            IE_TYPE_CHARGING_ID,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_F_TEID],
+        instances: &[0, 1, 2, 3, 4, 5, 6],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(1),
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_EBI],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_F_TEID],
+        instances: &[0, 1, 2, 3, 4],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(1),
+        ie_types: &[IE_TYPE_EBI],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_F_TEID],
+        instances: &[0, 1, 2, 3],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::ModifyBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(1),
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[
+            IE_TYPE_EBI,
+            IE_TYPE_BEARER_TFT,
+            IE_TYPE_BEARER_QOS,
+            IE_TYPE_CHARGING_ID,
+            IE_TYPE_PCO,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_F_TEID],
+        instances: &[0, 1, 2, 3, 4, 5],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE, IE_TYPE_PCO],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::CreateBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_F_TEID],
+        instances: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[
+            IE_TYPE_EBI,
+            IE_TYPE_BEARER_TFT,
+            IE_TYPE_BEARER_QOS,
+            IE_TYPE_PCO,
+            IE_TYPE_APCO,
+        ],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE, IE_TYPE_PCO],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::UpdateSession,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_F_TEID],
+        instances: &[0, 1],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Request,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+    ReceiveIeRule {
+        procedure: Procedure::DeleteBearer,
+        direction: MessageDirection::Response,
+        scope: ReceiveIeScope::BearerContext(0),
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE, IE_TYPE_PCO],
+        instances: &[0],
+        max_occurrences: ONE,
+    },
+];
+
+fn receive_ie_scope(depth: usize, parent_ie: Option<(u8, u8)>) -> Option<ReceiveIeScope> {
+    match (depth, parent_ie) {
+        (0, None) => Some(ReceiveIeScope::TopLevel),
+        (1, Some((IE_TYPE_BEARER_CONTEXT, instance))) => {
+            Some(ReceiveIeScope::BearerContext(instance))
+        }
+        _ => None,
+    }
+}
+
+fn receive_ie_rule(
+    procedure: Procedure,
+    direction: MessageDirection,
+    scope: ReceiveIeScope,
+    ie_type: u8,
+    instance: u8,
+) -> Option<&'static ReceiveIeRule> {
+    RECEIVE_IE_RULES.iter().find(|rule| {
+        rule.procedure == procedure
+            && rule.direction == direction
+            && rule.scope == scope
+            && rule.ie_types.contains(&ie_type)
+            && rule.instances.contains(&instance)
+    })
+}
+
+fn receive_ie_disposition(
+    procedure: Procedure,
+    direction: MessageDirection,
+    scope: Option<ReceiveIeScope>,
+    ie_type: u8,
+    instance: u8,
+) -> ReceiveIeDisposition {
+    if scope.is_some_and(|scope| {
+        receive_ie_rule(procedure, direction, scope, ie_type, instance).is_some()
+    }) {
+        ReceiveIeDisposition::AllowedKnown
+    } else if is_known_s2b_ie_type(ie_type) {
+        ReceiveIeDisposition::DiscardKnown
+    } else {
+        ReceiveIeDisposition::PreserveUnknown
+    }
+}
+
+fn receive_repeatable_limit(
+    procedure: Procedure,
+    direction: MessageDirection,
+    scope: Option<ReceiveIeScope>,
+    ie_type: u8,
+    instance: u8,
+) -> Option<usize> {
+    let rule = receive_ie_rule(procedure, direction, scope?, ie_type, instance)?;
+    (rule.max_occurrences > ONE).then_some(rule.max_occurrences)
+}
+
+fn is_known_s2b_ie_type(ie_type: u8) -> bool {
+    KNOWN_RECEIVE_IE_TYPES.contains(&ie_type)
 }
 
 fn contains_ie(ies: &[TypedIe<'_>], ie_type: u8) -> bool {
@@ -2584,47 +3680,68 @@ fn contains_uimsi_indication(ies: &[TypedIe<'_>]) -> bool {
 }
 
 fn contains_create_session_identity(ies: &[TypedIe<'_>]) -> bool {
-    contains_ie(ies, IE_TYPE_IMSI)
+    contains_ie_instance(ies, IE_TYPE_IMSI, 0)
         || (contains_ie_instance(ies, IE_TYPE_MEI, 0) && contains_uimsi_indication(ies))
 }
 
 fn contains_bearer_context_with_ebi(ies: &[TypedIe<'_>]) -> bool {
     ies.iter().any(|ie| match &ie.value {
-        TypedIeValue::BearerContext(context) => contains_ie(&context.members, IE_TYPE_EBI),
+        TypedIeValue::BearerContext(context) if ie.instance == 0 => {
+            contains_ie_instance(&context.members, IE_TYPE_EBI, 0)
+        }
         _ => false,
     })
 }
 
 fn find_cause_value(ies: &[TypedIe<'_>]) -> Option<CauseValue> {
     ies.iter().find_map(|ie| match &ie.value {
-        TypedIeValue::Cause(cause) => Some(cause.value),
+        TypedIeValue::Cause(cause) if ie.instance == 0 => Some(cause.value),
         _ => None,
     })
 }
 
 fn find_recovery_restart_counter(ies: &[TypedIe<'_>]) -> Option<u8> {
     ies.iter().find_map(|ie| match &ie.value {
-        TypedIeValue::Recovery(recovery) => Some(recovery.restart_counter),
+        TypedIeValue::Recovery(recovery) if ie.instance == 0 => Some(recovery.restart_counter),
         _ => None,
     })
 }
 
-fn find_sender_f_teid(ies: &[TypedIe<'_>]) -> Option<FullyQualifiedTeid> {
-    ies.iter().find_map(|ie| match &ie.value {
-        TypedIeValue::FullyQualifiedTeid(f_teid)
-            if ie.ie_type() == IE_TYPE_F_TEID && ie.instance == 0 =>
-        {
-            Some(f_teid.clone())
-        }
-        _ => None,
-    })
+fn find_pgw_control_f_teid(
+    ies: &[TypedIe<'_>],
+) -> Result<FullyQualifiedTeid, CreateSessionResponseSummaryError> {
+    let f_teid = ies
+        .iter()
+        .find_map(|ie| match &ie.value {
+            TypedIeValue::FullyQualifiedTeid(f_teid)
+                if ie.ie_type() == IE_TYPE_F_TEID && ie.instance == 1 =>
+            {
+                Some(f_teid)
+            }
+            _ => None,
+        })
+        .ok_or(CreateSessionResponseSummaryError::AcceptedResponseMissingPgwControlFTeid)?;
+    if f_teid.interface_type != INTERFACE_TYPE_S2B_PGW_GTP_C {
+        return Err(
+            CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch,
+        );
+    }
+    if f_teid.teid == 0 {
+        return Err(CreateSessionResponseSummaryError::AcceptedResponseZeroPgwControlFTeid);
+    }
+    if f_teid.ipv4.is_none() && f_teid.ipv6.is_none() {
+        return Err(CreateSessionResponseSummaryError::AcceptedResponseMalformedPgwControlFTeid);
+    }
+    Ok(f_teid.clone())
 }
 
 fn find_bearer_context_ebi(
     ies: &[TypedIe<'_>],
 ) -> Result<EpsBearerId, CreateSessionResponseSummaryError> {
     let Some(context) = ies.iter().find_map(|ie| match &ie.value {
-        TypedIeValue::BearerContext(context) if ie.ie_type() == IE_TYPE_BEARER_CONTEXT => {
+        TypedIeValue::BearerContext(context)
+            if ie.ie_type() == IE_TYPE_BEARER_CONTEXT && ie.instance == 0 =>
+        {
             Some(context)
         }
         _ => None,
@@ -2636,7 +3753,9 @@ fn find_bearer_context_ebi(
         .members
         .iter()
         .find_map(|ie| match &ie.value {
-            TypedIeValue::EpsBearerId(ebi) if ie.ie_type() == IE_TYPE_EBI => Some(*ebi),
+            TypedIeValue::EpsBearerId(ebi) if ie.ie_type() == IE_TYPE_EBI && ie.instance == 0 => {
+                Some(*ebi)
+            }
             _ => None,
         })
         .ok_or(CreateSessionResponseSummaryError::AcceptedResponseMissingBearerEbi)
@@ -2672,7 +3791,9 @@ fn find_bearer_context_s2b_u_f_teid(
     ies: &[TypedIe<'_>],
 ) -> Result<FullyQualifiedTeid, CreateSessionResponseSummaryError> {
     let Some(context) = ies.iter().find_map(|ie| match &ie.value {
-        TypedIeValue::BearerContext(context) if ie.ie_type() == IE_TYPE_BEARER_CONTEXT => {
+        TypedIeValue::BearerContext(context)
+            if ie.ie_type() == IE_TYPE_BEARER_CONTEXT && ie.instance == 0 =>
+        {
             Some(context)
         }
         _ => None,
@@ -2729,8 +3850,7 @@ fn project_create_session_response(
         find_cause_value(&view.ies).ok_or(CreateSessionResponseSummaryError::MissingCause)?;
 
     if is_accepted_create_session_cause(cause) {
-        let sender_f_teid = find_sender_f_teid(&view.ies)
-            .ok_or(CreateSessionResponseSummaryError::AcceptedResponseMissingSenderFTeid)?;
+        let pgw_control_f_teid = find_pgw_control_f_teid(&view.ies)?;
         let bearer_ebi = find_bearer_context_ebi(&view.ies)?;
         let bearer_user_plane_f_teid = find_bearer_context_s2b_u_f_teid(&view.ies)?;
         let paa = find_response_paa(&view.ies)?;
@@ -2741,7 +3861,7 @@ fn project_create_session_response(
                 response_teid,
                 sequence_number,
                 cause,
-                sender_f_teid,
+                pgw_control_f_teid,
                 bearer_ebi,
                 bearer_user_plane_f_teid,
                 paa,
@@ -2761,14 +3881,6 @@ fn project_create_session_response(
 
 fn missing_ie_error(reason: &'static str) -> DecodeError {
     DecodeError::new(DecodeErrorCode::Structural { reason }, 0).with_spec_ref(spec_ref())
-}
-
-fn require_ie(ies: &[TypedIe<'_>], ie_type: u8, reason: &'static str) -> Result<(), DecodeError> {
-    if contains_ie(ies, ie_type) {
-        Ok(())
-    } else {
-        Err(missing_ie_error(reason))
-    }
 }
 
 fn require_ie_instance(
@@ -2793,15 +3905,17 @@ fn validate_required_ies(
     }
 
     match (view.procedure, view.direction) {
-        (Procedure::Echo, MessageDirection::Request) => require_ie(
+        (Procedure::Echo, MessageDirection::Request) => require_ie_instance(
             &view.ies,
             IE_TYPE_RECOVERY,
-            "Echo Request requires Recovery IE",
+            0,
+            "Echo Request requires Recovery IE at instance 0",
         ),
-        (Procedure::Echo, MessageDirection::Response) => require_ie(
+        (Procedure::Echo, MessageDirection::Response) => require_ie_instance(
             &view.ies,
             IE_TYPE_RECOVERY,
-            "Echo Response requires Recovery IE",
+            0,
+            "Echo Response requires Recovery IE at instance 0",
         ),
         (Procedure::CreateSession, MessageDirection::Request) => {
             if !view.header.teid_flag || view.header.teid != Some(0) {
@@ -2814,15 +3928,17 @@ fn validate_required_ies(
                     "Create Session Request requires IMSI IE or emergency MEI and UIMSI Indication IEs",
                 ));
             }
-            require_ie(
+            require_ie_instance(
                 &view.ies,
                 IE_TYPE_RAT_TYPE,
-                "Create Session Request requires RAT Type IE",
+                0,
+                "Create Session Request requires RAT Type IE at instance 0",
             )?;
-            require_ie(
+            require_ie_instance(
                 &view.ies,
                 IE_TYPE_SERVING_NETWORK,
-                "Create Session Request requires Serving Network IE",
+                0,
+                "Create Session Request requires Serving Network IE at instance 0",
             )?;
             require_ie_instance(
                 &view.ies,
@@ -2830,30 +3946,35 @@ fn validate_required_ies(
                 0,
                 "Create Session Request requires Sender F-TEID IE at instance 0",
             )?;
-            require_ie(
+            require_ie_instance(
                 &view.ies,
                 IE_TYPE_APN,
-                "Create Session Request requires APN IE",
+                0,
+                "Create Session Request requires APN IE at instance 0",
             )?;
-            require_ie(
+            require_ie_instance(
                 &view.ies,
                 IE_TYPE_SELECTION_MODE,
-                "Create Session Request requires Selection Mode IE",
+                0,
+                "Create Session Request requires Selection Mode IE at instance 0",
             )?;
-            require_ie(
+            require_ie_instance(
                 &view.ies,
                 IE_TYPE_PDN_TYPE,
-                "Create Session Request requires PDN Type IE",
+                0,
+                "Create Session Request requires PDN Type IE at instance 0",
             )?;
-            require_ie(
+            require_ie_instance(
                 &view.ies,
                 IE_TYPE_PAA,
-                "Create Session Request requires PAA IE",
+                0,
+                "Create Session Request requires PAA IE at instance 0",
             )?;
-            require_ie(
+            require_ie_instance(
                 &view.ies,
                 IE_TYPE_BEARER_CONTEXT,
-                "Create Session Request requires Bearer Context IE",
+                0,
+                "Create Session Request requires Bearer Context IE at instance 0",
             )?;
             if contains_bearer_context_with_ebi(&view.ies) {
                 Ok(())
@@ -2869,16 +3990,29 @@ fn validate_required_ies(
             if !is_accepted_create_session_cause(cause) {
                 return Ok(());
             }
+            find_pgw_control_f_teid(&view.ies).map_err(|error| {
+                let reason = match error {
+                    CreateSessionResponseSummaryError::AcceptedResponseMissingPgwControlFTeid => {
+                        "Create Session Response requires PGW S2b control F-TEID IE at instance 1"
+                    }
+                    CreateSessionResponseSummaryError::AcceptedResponsePgwControlFTeidInterfaceMismatch => {
+                        "Create Session Response PGW control F-TEID must use S2b PGW GTP-C interface type"
+                    }
+                    CreateSessionResponseSummaryError::AcceptedResponseZeroPgwControlFTeid => {
+                        "Create Session Response PGW control F-TEID must use a non-zero TEID"
+                    }
+                    CreateSessionResponseSummaryError::AcceptedResponseMalformedPgwControlFTeid => {
+                        "Create Session Response PGW control F-TEID requires an endpoint address"
+                    }
+                    _ => "Create Session Response PGW control F-TEID is invalid",
+                };
+                missing_ie_error(reason)
+            })?;
             require_ie_instance(
                 &view.ies,
-                IE_TYPE_F_TEID,
-                0,
-                "Create Session Response requires Sender F-TEID IE at instance 0",
-            )?;
-            require_ie(
-                &view.ies,
                 IE_TYPE_BEARER_CONTEXT,
-                "Create Session Response requires Bearer Context IE",
+                0,
+                "Create Session Response requires Bearer Context IE at instance 0",
             )?;
             if contains_bearer_context_with_ebi(&view.ies) {
                 Ok(())
@@ -2888,25 +4022,29 @@ fn validate_required_ies(
                 ))
             }
         }
-        (Procedure::ModifyBearer, MessageDirection::Request) => require_ie(
+        (Procedure::ModifyBearer, MessageDirection::Request) => require_ie_instance(
             &view.ies,
             IE_TYPE_BEARER_CONTEXT,
-            "Modify Bearer Request requires Bearer Context IE",
+            0,
+            "Modify Bearer Request requires Bearer Context IE at instance 0",
         ),
-        (Procedure::ModifyBearer, MessageDirection::Response) => require_ie(
+        (Procedure::ModifyBearer, MessageDirection::Response) => require_ie_instance(
             &view.ies,
             IE_TYPE_CAUSE,
-            "Modify Bearer Response requires Cause IE",
+            0,
+            "Modify Bearer Response requires Cause IE at instance 0",
         ),
-        (Procedure::DeleteSession, MessageDirection::Request) => require_ie(
+        (Procedure::DeleteSession, MessageDirection::Request) => require_ie_instance(
             &view.ies,
             IE_TYPE_EBI,
-            "Delete Session Request requires linked EBI IE",
+            0,
+            "Delete Session Request requires linked EBI IE at instance 0",
         ),
-        (Procedure::DeleteSession, MessageDirection::Response) => require_ie(
+        (Procedure::DeleteSession, MessageDirection::Response) => require_ie_instance(
             &view.ies,
             IE_TYPE_CAUSE,
-            "Delete Session Response requires Cause IE",
+            0,
+            "Delete Session Response requires Cause IE at instance 0",
         ),
         (Procedure::CreateBearer, _)
         | (Procedure::UpdateSession, _)
@@ -2920,6 +4058,190 @@ mod tests {
     use crate::header::{HEADER_LEN_WITHOUT_TEID, HEADER_LEN_WITH_TEID};
     use crate::ie::{PdnTypeValue, PlmnId, RatTypeValue, Recovery, SelectionModeValue};
     use opc_protocol::{DecodeContext, Encode, EncodeContext};
+
+    #[test]
+    fn receive_ie_grammar_matrix_is_complete_and_unambiguous() {
+        let procedures = [
+            Procedure::Echo,
+            Procedure::CreateSession,
+            Procedure::ModifyBearer,
+            Procedure::DeleteSession,
+            Procedure::CreateBearer,
+            Procedure::UpdateSession,
+            Procedure::DeleteBearer,
+        ];
+        let directions = [MessageDirection::Request, MessageDirection::Response];
+        let scopes = [
+            ReceiveIeScope::TopLevel,
+            ReceiveIeScope::BearerContext(0),
+            ReceiveIeScope::BearerContext(1),
+            ReceiveIeScope::BearerContext(2),
+        ];
+
+        for rule in RECEIVE_IE_RULES {
+            assert!(!rule.ie_types.is_empty());
+            assert!(!rule.instances.is_empty());
+            assert!(rule.max_occurrences >= ONE);
+            assert!(rule
+                .ie_types
+                .iter()
+                .all(|ie_type| KNOWN_RECEIVE_IE_TYPES.contains(ie_type)));
+            assert!(rule.instances.iter().all(|instance| *instance <= 15));
+        }
+
+        for ie_type in KNOWN_RECEIVE_IE_TYPES {
+            assert!(
+                RECEIVE_IE_RULES
+                    .iter()
+                    .any(|rule| rule.ie_types.contains(ie_type)),
+                "recognized IE type {ie_type} has no receive grammar rule"
+            );
+        }
+
+        for procedure in procedures {
+            for direction in directions {
+                for scope in scopes {
+                    for ie_type in KNOWN_RECEIVE_IE_TYPES {
+                        for instance in 0..=15 {
+                            let matching_rules = RECEIVE_IE_RULES
+                                .iter()
+                                .filter(|rule| {
+                                    rule.procedure == procedure
+                                        && rule.direction == direction
+                                        && rule.scope == scope
+                                        && rule.ie_types.contains(ie_type)
+                                        && rule.instances.contains(&instance)
+                                })
+                                .count();
+                            assert!(
+                                matching_rules <= 1,
+                                "duplicate grammar rule: {procedure:?}/{direction:?}/{scope:?}/{ie_type}/{instance}"
+                            );
+                            let expected = if matching_rules == 1 {
+                                ReceiveIeDisposition::AllowedKnown
+                            } else {
+                                ReceiveIeDisposition::DiscardKnown
+                            };
+                            assert_eq!(
+                                receive_ie_disposition(
+                                    procedure,
+                                    direction,
+                                    Some(scope),
+                                    *ie_type,
+                                    instance,
+                                ),
+                                expected,
+                                "matrix mismatch: {procedure:?}/{direction:?}/{scope:?}/{ie_type}/{instance}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outer_pgw_change_info_cardinality_matches_each_message_table() {
+        let expected = [
+            (Procedure::Echo, MessageDirection::Request, None),
+            (Procedure::Echo, MessageDirection::Response, None),
+            (Procedure::CreateSession, MessageDirection::Request, None),
+            (
+                Procedure::CreateSession,
+                MessageDirection::Response,
+                Some(ONE),
+            ),
+            (Procedure::ModifyBearer, MessageDirection::Request, None),
+            (
+                Procedure::ModifyBearer,
+                MessageDirection::Response,
+                Some(ONE),
+            ),
+            (Procedure::DeleteSession, MessageDirection::Request, None),
+            (Procedure::DeleteSession, MessageDirection::Response, None),
+            (
+                Procedure::CreateBearer,
+                MessageDirection::Request,
+                Some(UNBOUNDED_BY_TABLE),
+            ),
+            (Procedure::CreateBearer, MessageDirection::Response, None),
+            (
+                Procedure::UpdateSession,
+                MessageDirection::Request,
+                Some(UNBOUNDED_BY_TABLE),
+            ),
+            (Procedure::UpdateSession, MessageDirection::Response, None),
+            (
+                Procedure::DeleteBearer,
+                MessageDirection::Request,
+                Some(UNBOUNDED_BY_TABLE),
+            ),
+            (Procedure::DeleteBearer, MessageDirection::Response, None),
+        ];
+
+        for (procedure, direction, max_occurrences) in expected {
+            assert_eq!(
+                receive_ie_rule(
+                    procedure,
+                    direction,
+                    ReceiveIeScope::TopLevel,
+                    IE_TYPE_PGW_CHANGE_INFO,
+                    0,
+                )
+                .map(|rule| rule.max_occurrences),
+                max_occurrences,
+                "outer PGW Change Info mismatch for {procedure:?}/{direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn triggered_bearer_f_teid_grammar_uses_full_message_tables() {
+        for instance in 0..=5 {
+            assert_eq!(
+                receive_ie_disposition(
+                    Procedure::CreateBearer,
+                    MessageDirection::Request,
+                    Some(ReceiveIeScope::BearerContext(0)),
+                    IE_TYPE_F_TEID,
+                    instance,
+                ),
+                ReceiveIeDisposition::AllowedKnown
+            );
+        }
+        assert_eq!(
+            receive_ie_disposition(
+                Procedure::CreateBearer,
+                MessageDirection::Request,
+                Some(ReceiveIeScope::BearerContext(0)),
+                IE_TYPE_F_TEID,
+                6,
+            ),
+            ReceiveIeDisposition::DiscardKnown
+        );
+        for instance in 0..=11 {
+            assert_eq!(
+                receive_ie_disposition(
+                    Procedure::CreateBearer,
+                    MessageDirection::Response,
+                    Some(ReceiveIeScope::BearerContext(0)),
+                    IE_TYPE_F_TEID,
+                    instance,
+                ),
+                ReceiveIeDisposition::AllowedKnown
+            );
+        }
+        assert_eq!(
+            receive_ie_disposition(
+                Procedure::CreateBearer,
+                MessageDirection::Response,
+                Some(ReceiveIeScope::BearerContext(0)),
+                IE_TYPE_F_TEID,
+                12,
+            ),
+            ReceiveIeDisposition::DiscardKnown
+        );
+    }
 
     fn echo_view(
         direction: MessageDirection,
@@ -3004,7 +4326,7 @@ mod tests {
         match s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
             sequence_number: 0x0001_0203,
             response_teid: 0x0102_0304,
-            sender_f_teid: f_teid(32, 0x1111_2222, [192, 0, 2, 1]),
+            pgw_control_f_teid: f_teid(32, 0x1111_2222, [192, 0, 2, 1]),
             bearer_context: bearer_context(bearer_members),
             additional_ies,
         }) {
@@ -3765,7 +5087,7 @@ mod tests {
             ies: vec![
                 typed_ie(0, TypedIeValue::Cause(accepted_cause())),
                 typed_ie(
-                    0,
+                    1,
                     TypedIeValue::FullyQualifiedTeid(f_teid(32, 1, [192, 0, 2, 1])),
                 ),
                 typed_ie(
@@ -3800,6 +5122,56 @@ mod tests {
         assert_eq!(
             error.as_str(),
             "s2b_create_session_response_malformed_bearer_f_teid"
+        );
+    }
+
+    #[test]
+    fn accepted_create_session_summary_rejects_malformed_typed_pgw_control_f_teid() {
+        let view = S2bProcedureMessage {
+            header: Header::with_teid(CREATE_SESSION_RESPONSE, 0x0102_0304, 0x0001_0203),
+            procedure: Procedure::CreateSession,
+            direction: MessageDirection::Response,
+            ies: vec![
+                typed_ie(0, TypedIeValue::Cause(accepted_cause())),
+                typed_ie(
+                    1,
+                    TypedIeValue::FullyQualifiedTeid(FullyQualifiedTeid {
+                        interface_type: INTERFACE_TYPE_S2B_PGW_GTP_C,
+                        teid: 0x1111_2222,
+                        ipv4: None,
+                        ipv6: None,
+                    }),
+                ),
+                typed_ie(
+                    0,
+                    TypedIeValue::BearerContext(bearer_context(vec![
+                        bearer_ebi(5),
+                        typed_ie(
+                            0,
+                            TypedIeValue::FullyQualifiedTeid(f_teid(
+                                INTERFACE_TYPE_S2B_U_PGW_GTP_U,
+                                0x1122_3344,
+                                [203, 0, 113, 1],
+                            )),
+                        ),
+                    ])),
+                ),
+            ],
+            raw_ies: &[],
+            tail: &[],
+        };
+
+        let error = match project_create_session_response(&view) {
+            Ok(summary) => panic!("unexpected summary: {summary:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            CreateSessionResponseSummaryError::AcceptedResponseMalformedPgwControlFTeid
+        );
+        assert_eq!(
+            error.as_str(),
+            "s2b_create_session_response_malformed_pgw_control_f_teid"
         );
     }
 

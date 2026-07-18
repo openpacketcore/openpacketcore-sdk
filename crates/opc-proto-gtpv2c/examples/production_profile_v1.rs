@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         s2b_create_session_accepted_response(S2bCreateSessionAcceptedResponse {
             sequence_number: 0x010203,
             response_teid: 0x5566_7788,
-            sender_f_teid: sender_f_teid(0x2030_4050),
+            pgw_control_f_teid: pgw_control_f_teid(0x2030_4050),
             bearer_context: bearer_context(5),
             additional_ies: Vec::new(),
         })?,
@@ -212,6 +212,15 @@ fn sender_f_teid(teid: u32) -> FullyQualifiedTeid {
         interface_type: 11,
         teid,
         ipv4: Some([192, 0, 2, 1]),
+        ipv6: None,
+    }
+}
+
+fn pgw_control_f_teid(teid: u32) -> FullyQualifiedTeid {
+    FullyQualifiedTeid {
+        interface_type: opc_proto_gtpv2c::INTERFACE_TYPE_S2B_PGW_GTP_C,
+        teid,
+        ipv4: Some([192, 0, 2, 2]),
         ipv6: None,
     }
 }

@@ -755,12 +755,12 @@ fn assert_malformed_fixture_rejection(path: &Path, data: &[u8]) {
             |code| matches!(code, DecodeErrorCode::InvalidLength { .. }),
             "ProcedureAware Create Session Request malformed PAA rejection",
         ),
-        "profile_create_session_response_accepted_missing_sender_fteid.bin" => {
+        "profile_create_session_response_accepted_missing_pgw_control_fteid.bin" => {
             assert_s2b_profile_error(
                 path,
                 data,
                 |code| matches!(code, DecodeErrorCode::Structural { .. }),
-                "ProcedureAware accepted Create Session Response Sender F-TEID rejection",
+                "ProcedureAware accepted Create Session Response PGW control F-TEID rejection",
             );
         }
         "profile_update_bearer_response_missing_cause.bin" => assert_s2b_profile_error(
