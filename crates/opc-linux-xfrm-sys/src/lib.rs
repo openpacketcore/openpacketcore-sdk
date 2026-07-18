@@ -148,6 +148,12 @@ pub const XFRM_MSG_UPDSA: u16 = XFRM_MSG_BASE + 10;
 pub const XFRM_MSG_FLUSHSA: u16 = XFRM_MSG_BASE + 12;
 /// Flush Security Policies.
 pub const XFRM_MSG_FLUSHPOLICY: u16 = XFRM_MSG_BASE + 13;
+/// Relocate one exactly identified Security Association.
+///
+/// This is the single-state migration UAPI added after the older
+/// policy-coupled `XFRM_MSG_MIGRATE`. It is keyed by
+/// [`XfrmUserMigrateState::id`] plus [`XfrmUserMigrateState::old_mark`].
+pub const XFRM_MSG_MIGRATE_STATE: u16 = XFRM_MSG_BASE + 25;
 
 /// XFRM inbound policy direction.
 pub const XFRM_POLICY_IN: u8 = 0;
@@ -202,6 +208,18 @@ pub const XFRMA_IF_ID: u16 = 31;
 
 /// XFRM state uses Extended Sequence Numbers.
 pub const XFRM_STATE_ESN: u8 = 0x80;
+
+/// Do not inherit hardware offload when relocating an SA.
+pub const XFRM_MIGRATE_STATE_CLEAR_OFFLOAD: u32 = 1;
+/// Rewrite a host-to-host selector from the new SA endpoints.
+pub const XFRM_MIGRATE_STATE_UPDATE_H2H_SEL: u32 = 2;
+/// All currently defined `XFRM_MSG_MIGRATE_STATE` flags.
+pub const XFRM_MIGRATE_STATE_KNOWN_FLAGS: u32 =
+    XFRM_MIGRATE_STATE_CLEAR_OFFLOAD | XFRM_MIGRATE_STATE_UPDATE_H2H_SEL;
+/// Architecture-correct Linux `EINVAL` errno.
+pub const LINUX_EINVAL: i32 = libc::EINVAL;
+/// Architecture-correct Linux `ENOPROTOOPT` errno.
+pub const LINUX_ENOPROTOOPT: i32 = libc::ENOPROTOOPT;
 
 /// Netlink message header layout used by XFRM requests and responses.
 #[repr(C)]
@@ -433,6 +451,34 @@ pub struct XfrmUserPolicyId {
     pub direction: u8,
 }
 
+/// Linux `struct xfrm_user_migrate_state` used to relocate one exact SA.
+///
+/// The request preserves an SA's cryptographic and replay state while changing
+/// its outer endpoints. Optional netlink attributes carry changes such as a
+/// replacement UDP encapsulation template.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct XfrmUserMigrateState {
+    /// Current destination/family/protocol/SPI identity.
+    pub id: XfrmUserSaId,
+    /// New outer destination address.
+    pub new_destination: XfrmAddress,
+    /// New outer source address.
+    pub new_source: XfrmAddress,
+    /// Current SA lookup mark.
+    pub old_mark: XfrmMark,
+    /// Selector to install on the relocated SA.
+    pub new_selector: XfrmSelector,
+    /// Request identifier to install on the relocated SA.
+    pub new_request_id: u32,
+    /// Flags from `XFRM_MIGRATE_STATE_*`.
+    pub flags: u32,
+    /// Address family for the new outer endpoints.
+    pub new_family: u16,
+    /// Reserved field; callers must encode zero.
+    pub reserved: u16,
+}
+
 /// Linux `struct nlmsgerr` prefix used by netlink ACK/error responses.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -590,6 +636,7 @@ mod tests {
         assert_eq!(XFRM_MSG_UPDSA, 0x1A);
         assert_eq!(XFRM_MSG_FLUSHSA, 0x1C);
         assert_eq!(XFRM_MSG_FLUSHPOLICY, 0x1D);
+        assert_eq!(XFRM_MSG_MIGRATE_STATE, 0x29);
         assert_eq!(XFRM_POLICY_IN, 0);
         assert_eq!(XFRM_POLICY_OUT, 1);
         assert_eq!(XFRM_POLICY_FWD, 2);
@@ -615,6 +662,11 @@ mod tests {
         assert_eq!(XFRMA_SET_MARK, 29);
         assert_eq!(XFRMA_SET_MARK_MASK, 30);
         assert_eq!(XFRM_STATE_ESN, 0x80);
+        assert_eq!(XFRM_MIGRATE_STATE_CLEAR_OFFLOAD, 1);
+        assert_eq!(XFRM_MIGRATE_STATE_UPDATE_H2H_SEL, 2);
+        assert_eq!(XFRM_MIGRATE_STATE_KNOWN_FLAGS, 3);
+        assert_eq!(LINUX_EINVAL, libc::EINVAL);
+        assert_eq!(LINUX_ENOPROTOOPT, libc::ENOPROTOOPT);
     }
 
     #[test]
@@ -673,6 +725,16 @@ mod tests {
         assert_eq!(size_of::<XfrmUserPolicyId>(), 64);
         assert_eq!(offset_of!(XfrmUserPolicyId, index), 56);
         assert_eq!(offset_of!(XfrmUserPolicyId, direction), 60);
+        assert_eq!(size_of::<XfrmUserMigrateState>(), 132);
+        assert_eq!(align_of::<XfrmUserMigrateState>(), 4);
+        assert_eq!(offset_of!(XfrmUserMigrateState, new_destination), 24);
+        assert_eq!(offset_of!(XfrmUserMigrateState, new_source), 40);
+        assert_eq!(offset_of!(XfrmUserMigrateState, old_mark), 56);
+        assert_eq!(offset_of!(XfrmUserMigrateState, new_selector), 64);
+        assert_eq!(offset_of!(XfrmUserMigrateState, new_request_id), 120);
+        assert_eq!(offset_of!(XfrmUserMigrateState, flags), 124);
+        assert_eq!(offset_of!(XfrmUserMigrateState, new_family), 128);
+        assert_eq!(offset_of!(XfrmUserMigrateState, reserved), 130);
         assert_eq!(size_of::<NetlinkErrorMessage>(), 20);
         assert_eq!(offset_of!(NetlinkErrorMessage, message), 4);
         assert_eq!(size_of::<XfrmUserTemplate>(), 64);

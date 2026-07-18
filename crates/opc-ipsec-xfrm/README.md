@@ -12,16 +12,19 @@ management, product SA/SPD policy, or deployment defaults.
 
 ## API Shape
 
-- `XfrmBackend`: async port for SPI allocation, SA install/query/rekey/remove,
-  policy install/rekey/remove, and capability probing.
+- `XfrmBackend`: async port for SPI allocation, SA
+  install/query/rekey/relocation/removal, policy install/rekey/remove, and
+  capability probing.
 - `LinuxXfrmBackend`: safe adapter over `NETLINK_XFRM` through
   `opc-linux-xfrm-sys`.
-- `MockXfrmBackend`: deterministic in-memory backend with operation capture and
-  failure injection.
+- `MockXfrmBackend`: deterministic in-memory backend with operation capture,
+  a source-compatible separate `MockSaRelocation` log, and failure injection.
 - `UnsupportedXfrmBackend`: trait-compatible unsupported backend.
 - Model exports include `IpAddress`, `XfrmSelector`, `XfrmId`, `SaParameters`,
   `PolicyParameters`, `XfrmTemplate`, `InstallSaRequest`,
   `InstallPolicyRequest`, `QuerySaRequest`, `SaState`, `SaReplayState`,
+  `SaRelocationSelector`, `SaRelocationIdentity`, `SaRelocationEncap`,
+  `SaRelocationDirection`, `RelocateSaRequest`,
   `XfrmRequestId`, `UdpEncap`, `XfrmMark`, `DscpCodepoint`, `LifetimeConfig`,
   and `XfrmProbe`.
 - Algorithm/key exports include `Algorithm`, `AuthAlgorithm`, `AeadAlgorithm`,
@@ -76,6 +79,130 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Exact SA relocation
+
+`XfrmBackend::relocate_sa` moves one query-proven tunnel-mode ESP SA to
+authenticated control-plane-signalled outer addresses and replacement
+ESP-in-UDP ports. The Linux backend uses the current-upstream
+`XFRM_MSG_MIGRATE_STATE` UAPI, which looks up the existing state by
+destination, SPI, protocol, family, and input mark. It deliberately does not
+use the older `XFRM_MSG_MIGRATE` operation: that operation cannot identify one
+SA by SPI and mark and therefore cannot satisfy this API's exact-identity
+contract.
+
+Build the optimistic-concurrency identity from a fresh query instead of
+reconstructing it from remembered configuration:
+
+```rust,no_run
+use opc_ipsec_xfrm::{
+    IpAddress, QuerySaRequest, RelocateSaRequest, SaRelocationDirection,
+    SaRelocationEncap, UdpEncap, XfrmBackend,
+};
+
+async fn move_authenticated_sa(
+    backend: &impl XfrmBackend,
+    query: QuerySaRequest,
+) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    let current = backend.query_sa_relocation_identity(query).await?;
+    backend
+        .relocate_sa(RelocateSaRequest {
+            current,
+            new_source_address: IpAddress::Ipv4([198, 51, 100, 10]),
+            new_destination: IpAddress::Ipv4([198, 51, 100, 20]),
+            encap: SaRelocationEncap::Set(UdpEncap::esp_in_udp(4500, 62_000)),
+            direction: SaRelocationDirection::Inbound,
+        })
+        .await
+}
+```
+
+This is an authenticated control-plane primitive, not packet inference. A
+consumer may call it only after an authenticated/signalled procedure such as
+MOBIKE or an equivalent product-owned rebind decision has authorized the new
+endpoints. The SDK never learns or trusts a replacement endpoint merely
+because a packet arrived from it.
+
+The `direction` field makes the current-upstream Linux safety contract
+explicit. `Inbound` needs no temporary policy: the kernel atomically transfers
+sequence and replay state, and there is no cleartext egress fallback.
+`OutboundBlockPolicyInstalled` is an assertion by the caller that the required
+outbound block is already active. For every outgoing SA, follow this exact
+order while holding the namespace-wide XFRM writer lock:
+
+1. Install a higher-precedence block policy for the affected selector.
+2. Remove the old allow policy.
+3. Call `relocate_sa` with `OutboundBlockPolicyInstalled`.
+4. Install the replacement allow policy/template for the relocated SA.
+5. Remove the temporary block policy only after the replacement is proven.
+
+Keep the block installed when relocation returns `StateIndeterminate`; resolve
+the SA and policy state before allowing traffic. Omitting this sequence can
+allow outbound cleartext during policy/SA transition. With AES-GCM it can also
+allow a repeated `(key, IV)` pair, which destroys the algorithm's security.
+That IV risk is outbound-only because the peer controls IV generation for an
+incoming SA. This sequence follows the upstream Linux
+[`XFRM_MSG_MIGRATE_STATE` documentation](https://docs.kernel.org/networking/xfrm/xfrm_migrate_state.html).
+
+### Cancel safety
+
+`relocate_sa` is not cancellation-safe once its future has been polled. The
+blocking netlink worker can continue after the Rust future is dropped, so do
+not put relocation behind an aborting timeout and do not assume that dropping
+the future cancels the kernel operation. Supervise and poll it to completion.
+Treat task cancellation, caller disconnection, or process uncertainty as
+`StateIndeterminate` operationally. Keep the outbound block policy and the
+namespace-wide XFRM writer exclusion in place until the worker completes and
+exact GETSA queries reconcile both the old and new tuples. If the process exits,
+keep traffic fenced and perform that reconciliation during recovery before
+releasing the block. Retry only after exact readback; relocation is not blindly
+idempotent after process loss.
+
+`SaRelocationEncap::Preserve` omits the kernel attribute and exactly inherits
+either native ESP or the installed NAT-T ports. `Set` adds or replaces an
+ESP-in-UDP template; `Remove` uses the upstream type-zero sentinel to return to
+native ESP. Invalid or no-op transitions fail before mutation.
+
+The fresh identity also carries every selector field that the migration UAPI
+installs: both ports and masks, prefix lengths, protocol, interface index, and
+UID. Preflight and readback compare those fields exactly. When the destination
+identity changes, success additionally requires an exact query proving that the
+old tuple is absent; an old tuple that is still present or cannot be parsed or
+queried unambiguously returns `StateIndeterminate`. Encapsulation-only changes
+at the same destination use the single exact resulting-state readback because
+the old and target lookup identities are identical. IPv4 union padding and
+selector reserved bytes must be canonical. The narrow SDK NAT-T model has no
+original-address (`xfrm_encap_tmpl.oa`) representation, so a queried SA with a
+nonzero original address is rejected before mutation instead of silently
+zeroing it.
+
+The operation changes one SA only. It does not migrate XFRM policies or their
+templates. Consumers must coordinate any policy changes, including policies
+whose templates pin an outer address or SPI, and must serialize all XFRM
+writers in the network namespace. The preflight and post-mutation GETSA proofs
+cannot exclude a concurrent external writer. This primitive alone is not a
+claim of seamless mobility: kernel support, authenticated IKE control-plane
+handling, peer behavior, policy coordination, and traffic evidence remain
+required.
+
+Linux stores an internal `UnknownUntilUse` state until
+`XfrmBackend::sa_relocation_capability` is called. That method sends the
+upstream-documented non-mutating `XFRM_MSG_MIGRATE_STATE` missing-SA probe. Its
+non-zero SPI is paired with protocol zero, which Linux does not permit on an
+installed SA, so the probe tuple cannot collide even in a live namespace. An
+`ESRCH` response proves `Available`; `EINVAL` proves that the kernel predates
+the message; and `ENOPROTOOPT` proves that the message is known but
+`CONFIG_XFRM_MIGRATE` is disabled. Both unsupported responses report
+`Missing`. After support is established, `EINVAL` from a real relocation stays
+a real operation failure and never masquerades as old-kernel evidence.
+Successful exact relocation/readback also records `Available`, while a real
+`ENOPROTOOPT` records `Missing`. The kernel must carry the upstream
+`XFRM_MSG_MIGRATE_STATE` UAPI; version-string inference is intentionally not
+used. The mock backend provides deterministic relocation semantics, while
+unsupported backends reject the operation. The new trait methods have defaults
+and the existing `XfrmProbe` and `SaState` shapes are unchanged, so existing
+backend implementations and struct literals remain source compatible. No
+Cargo feature is required.
 
 ## Per-SA output marks
 
@@ -235,6 +362,9 @@ excludes the old key material needed for rollback.
 - `KeyMaterial` zeroizes on drop, redacts debug/display, and compares bytes
   with constant-time equality.
 - Linux mutation requires kernel XFRM support and effective `CAP_NET_ADMIN`.
+- Exact SA relocation additionally requires the upstream
+  `XFRM_MSG_MIGRATE_STATE` UAPI and product-owned authenticated endpoint and
+  policy coordination.
 - Fixed outer DSCP additionally requires bpffs, kernel BTF, `CAP_BPF` (or
   `CAP_SYS_ADMIN`), one configured tc egress attachment per SWu interface, and
   a globally reserved seven-bit skb-mark window.
@@ -262,4 +392,5 @@ cargo test -p opc-ipsec-xfrm
 cargo test -p opc-ipsec-xfrm --features ikev2
 ./scripts/build-ipsec-xfrm-ebpf.sh
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_dscp_privileged -- --ignored --nocapture'
+sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_RELOCATION_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_relocation_privileged -- --ignored --nocapture'
 ```

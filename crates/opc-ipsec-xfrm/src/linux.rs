@@ -2,29 +2,31 @@
 
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use opc_ipsec_xfrm_ebpf_common::{MarkProfile, IPPROTO_ESP};
 use opc_linux_xfrm_sys::{
-    align_to_netlink, open_netlink_socket, receive_message, send_message, NLMSG_DONE, NLMSG_ERROR,
-    NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD,
-    XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_MARK,
-    XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL,
-    XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETSA, XFRM_MSG_NEWPOLICY,
-    XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK,
-    XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_STATE_ESN,
+    align_to_netlink, open_netlink_socket, receive_message, send_message, LINUX_EINVAL,
+    LINUX_ENOPROTOOPT, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE,
+    NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID,
+    XFRMA_MARK, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK,
+    XFRMA_TMPL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETSA,
+    XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA,
+    XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT,
+    XFRM_STATE_ESN,
 };
 use zeroize::Zeroizing;
 
 use crate::dscp::{production_runtime, LinuxXfrmDscpMarkingConfig, XfrmDscpRuntime};
-use crate::model::validate_sa_output_mark;
+use crate::model::{validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query};
 use crate::{
     AllocateSpiRequest, DscpCodepoint, InstallPolicyRequest, InstallSaRequest, IpAddress,
     LifetimeConfig, LifetimeCurrent, PolicyParameters, QuerySaRequest, RekeyPolicyRequest,
-    RekeySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters, SaReplayState, SaState,
+    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
+    SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState,
     SaStatistics, SpiAllocation, UdpEncap, XfrmAction, XfrmBackend, XfrmBackendKind,
     XfrmCapability, XfrmDirection, XfrmError, XfrmId, XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId,
     XfrmSelector, XfrmTemplate, XFRM_AEAD_RFC4106_GCM_AES,
@@ -43,6 +45,7 @@ const XFRM_USER_POLICY_INFO_LEN: usize = 168;
 const XFRM_USER_POLICY_ID_LEN: usize = 64;
 const XFRM_USER_TEMPLATE_LEN: usize = 64;
 const XFRM_USER_SPI_INFO_LEN: usize = 232;
+const XFRM_USER_MIGRATE_STATE_LEN: usize = 132;
 const XFRM_ALG_NAME_LEN: usize = 64;
 const XFRM_ALGO_HEADER_LEN: usize = 68;
 const XFRM_ALGO_AUTH_HEADER_LEN: usize = 72;
@@ -59,6 +62,10 @@ const XFRM_INF: u64 = u64::MAX;
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
 const CAP_NET_ADMIN_BIT: u32 = 12;
+const RELOCATION_CAPABILITY_UNKNOWN: u8 = 0;
+const RELOCATION_CAPABILITY_AVAILABLE: u8 = 1;
+const RELOCATION_CAPABILITY_MISSING: u8 = 2;
+const SA_RELOCATION_PROBE_SPI: u32 = 0xffff_fffe;
 
 type SensitiveBuffer = Zeroizing<Vec<u8>>;
 
@@ -101,6 +108,13 @@ struct LinuxXfrmBackendInner {
     dscp_config: Option<LinuxXfrmDscpMarkingConfig>,
     dscp_runtime: Arc<dyn XfrmDscpRuntime>,
     dscp_xfrm_attributes_verified: AtomicBool,
+    sa_relocation_capability: AtomicU8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaRelocationSnapshot {
+    state: SaState,
+    identity: SaRelocationIdentity,
 }
 
 impl fmt::Debug for LinuxXfrmBackend {
@@ -136,6 +150,7 @@ impl LinuxXfrmBackend {
                 dscp_config: None,
                 dscp_runtime: production_runtime(),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
+                sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
             }),
         }
     }
@@ -165,6 +180,7 @@ impl LinuxXfrmBackend {
                 dscp_config: Some(dscp_config),
                 dscp_runtime: runtime,
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
+                sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
             }),
         })
     }
@@ -186,6 +202,7 @@ impl LinuxXfrmBackend {
                 dscp_config: None,
                 dscp_runtime: production_runtime(),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
+                sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
             }),
         }
     }
@@ -214,6 +231,7 @@ impl LinuxXfrmBackend {
                 dscp_config: Some(dscp_config),
                 dscp_runtime: Arc::new(dscp_runtime),
                 dscp_xfrm_attributes_verified: AtomicBool::new(false),
+                sa_relocation_capability: AtomicU8::new(RELOCATION_CAPABILITY_UNKNOWN),
             }),
         })
     }
@@ -235,6 +253,25 @@ impl LinuxXfrmBackend {
         // runtime readiness loss is repaired or reported before XFRM ACK.
         self.inner.dscp_runtime.ensure_ready(config)?;
         Ok(Some(profile))
+    }
+
+    fn current_sa_relocation_capability(&self) -> XfrmCapability {
+        match self.inner.sa_relocation_capability.load(Ordering::Acquire) {
+            RELOCATION_CAPABILITY_AVAILABLE => XfrmCapability::Available,
+            RELOCATION_CAPABILITY_MISSING => XfrmCapability::Missing,
+            _ => XfrmCapability::UnknownUntilUse,
+        }
+    }
+
+    fn record_sa_relocation_capability(&self, capability: XfrmCapability) {
+        let value = match capability {
+            XfrmCapability::Available => RELOCATION_CAPABILITY_AVAILABLE,
+            XfrmCapability::Missing => RELOCATION_CAPABILITY_MISSING,
+            _ => RELOCATION_CAPABILITY_UNKNOWN,
+        };
+        self.inner
+            .sa_relocation_capability
+            .store(value, Ordering::Release);
     }
 
     fn next_sequence(&self) -> u32 {
@@ -335,6 +372,103 @@ impl LinuxXfrmBackend {
         }
         Ok(())
     }
+
+    async fn query_sa_for_relocation(
+        &self,
+        id: XfrmId,
+        mark: Option<XfrmMark>,
+        operation: &'static str,
+    ) -> Result<SaRelocationSnapshot, XfrmError> {
+        let body = encode_sa_id(id.destination, id.protocol, id.spi, mark)?;
+        let response = self
+            .transact_blocking(operation, XFRM_MSG_GETSA, NLM_F_REQUEST | NLM_F_ACK, body)
+            .await?
+            .ok_or_else(|| XfrmError::io(operation, invalid_data("missing getsa response")))?;
+        parse_sa_relocation_snapshot(&response)
+    }
+
+    async fn reconcile_sa_relocation(
+        &self,
+        request: &RelocateSaRequest,
+        before: &SaRelocationSnapshot,
+        ack_error: Option<XfrmError>,
+    ) -> Result<(), XfrmError> {
+        let relocated_id = relocated_sa_id(request);
+        let relocated = self
+            .query_sa_for_relocation(relocated_id, request.current.mark, "relocate_sa_readback")
+            .await;
+        let relocated_matches = relocated
+            .as_ref()
+            .is_ok_and(|state| relocated_state_matches(request, before, state));
+
+        let Some(error) = ack_error else {
+            if !relocated_matches {
+                return Err(XfrmError::StateIndeterminate {
+                    operation: "relocate_sa_readback",
+                });
+            }
+
+            if relocated_id != request.current.id {
+                let old = self
+                    .query_sa_for_relocation(
+                        request.current.id,
+                        request.current.mark,
+                        "relocate_sa_reconcile",
+                    )
+                    .await;
+                if !matches!(old, Err(XfrmError::NotFound)) {
+                    return Err(XfrmError::StateIndeterminate {
+                        operation: "relocate_sa_reconcile",
+                    });
+                }
+            }
+
+            self.record_sa_relocation_capability(XfrmCapability::Available);
+            return Ok(());
+        };
+
+        let old_intact = if relocated_id == request.current.id {
+            if relocated_matches {
+                self.record_sa_relocation_capability(XfrmCapability::Available);
+                return Ok(());
+            }
+            relocated
+                .as_ref()
+                .is_ok_and(|state| original_state_matches(before, state))
+        } else {
+            let old = self
+                .query_sa_for_relocation(
+                    request.current.id,
+                    request.current.mark,
+                    "relocate_sa_reconcile",
+                )
+                .await;
+
+            if relocated_matches && matches!(&old, Err(XfrmError::NotFound)) {
+                self.record_sa_relocation_capability(XfrmCapability::Available);
+                return Ok(());
+            }
+
+            matches!(relocated, Err(XfrmError::NotFound))
+                && old
+                    .as_ref()
+                    .is_ok_and(|state| original_state_matches(before, state))
+        };
+
+        if !old_intact {
+            return Err(XfrmError::StateIndeterminate {
+                operation: "relocate_sa_reconcile",
+            });
+        }
+
+        if error.raw_os_error() == Some(LINUX_ENOPROTOOPT) {
+            self.record_sa_relocation_capability(XfrmCapability::Missing);
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "sa_relocation",
+            });
+        }
+        Err(error)
+    }
 }
 
 #[async_trait]
@@ -414,6 +548,25 @@ impl XfrmBackend for LinuxXfrmBackend {
         Ok(state)
     }
 
+    async fn query_sa_relocation_identity(
+        &self,
+        request: QuerySaRequest,
+    ) -> Result<SaRelocationIdentity, XfrmError> {
+        validate_sa_query(request)?;
+        let snapshot = self
+            .query_sa_for_relocation(
+                XfrmId {
+                    destination: request.destination,
+                    spi: request.spi,
+                    protocol: request.protocol,
+                },
+                request.mark,
+                "query_sa_relocation_identity",
+            )
+            .await?;
+        Ok(snapshot.identity)
+    }
+
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
         let profile = self.prepare_dscp(&request.parameters)?;
         let body = encode_sa_info_with_dscp(&request.parameters, profile)?;
@@ -438,6 +591,51 @@ impl XfrmBackend for LinuxXfrmBackend {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn relocate_sa(&self, request: RelocateSaRequest) -> Result<(), XfrmError> {
+        validate_relocate_sa_request(&request)?;
+        let before = self
+            .query_sa_for_relocation(
+                request.current.id,
+                request.current.mark,
+                "relocate_sa_preflight",
+            )
+            .await?;
+        if request.current != before.identity {
+            return Err(XfrmError::StateMismatch {
+                operation: "relocate_sa_preflight",
+            });
+        }
+
+        let relocated_id = relocated_sa_id(&request);
+        if relocated_id != request.current.id {
+            match self
+                .query_sa_for_relocation(
+                    relocated_id,
+                    request.current.mark,
+                    "relocate_sa_destination_preflight",
+                )
+                .await
+            {
+                Err(XfrmError::NotFound) => {}
+                Ok(_) => return Err(XfrmError::AlreadyExists),
+                Err(error) => return Err(error),
+            }
+        }
+
+        let body = encode_relocate_sa_request(&request)?;
+        let ack_error = self
+            .transact_blocking(
+                "relocate_sa",
+                XFRM_MSG_MIGRATE_STATE,
+                NLM_F_REQUEST | NLM_F_ACK,
+                body,
+            )
+            .await
+            .err();
+        self.reconcile_sa_relocation(&request, &before, ack_error)
+            .await
     }
 
     async fn remove_sa(&self, request: RemoveSaRequest) -> Result<(), XfrmError> {
@@ -504,6 +702,46 @@ impl XfrmBackend for LinuxXfrmBackend {
                     }
                 });
         Ok(probe)
+    }
+
+    async fn sa_relocation_capability(&self) -> Result<XfrmCapability, XfrmError> {
+        let probe = self.inner.transport.probe(self.inner.config);
+        if !probe.platform_supported {
+            return Ok(XfrmCapability::Missing);
+        }
+        if !probe.net_admin_capable {
+            return Ok(XfrmCapability::PermissionDenied);
+        }
+        let current = self.current_sa_relocation_capability();
+        if current != XfrmCapability::UnknownUntilUse {
+            return Ok(current);
+        }
+
+        let result = self
+            .transact_blocking(
+                "sa_relocation_capability_probe",
+                XFRM_MSG_MIGRATE_STATE,
+                NLM_F_REQUEST | NLM_F_ACK,
+                encode_sa_relocation_capability_probe()?,
+            )
+            .await;
+        let capability = match result {
+            Err(XfrmError::NotFound) => XfrmCapability::Available,
+            Err(error)
+                if matches!(error.raw_os_error(), Some(LINUX_EINVAL | LINUX_ENOPROTOOPT)) =>
+            {
+                XfrmCapability::Missing
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(XfrmError::io(
+                    "sa_relocation_capability_probe",
+                    invalid_data("unexpected successful missing-SA probe"),
+                ));
+            }
+        };
+        self.record_sa_relocation_capability(capability);
+        Ok(capability)
     }
 }
 
@@ -910,6 +1148,87 @@ fn encode_sa_id(
     Ok(out)
 }
 
+fn encode_relocate_sa_request(request: &RelocateSaRequest) -> Result<SensitiveBuffer, XfrmError> {
+    validate_relocate_sa_request(request)?;
+    let encap_attr_len = match request.encap {
+        SaRelocationEncap::Preserve => 0,
+        SaRelocationEncap::Set(_) | SaRelocationEncap::Remove => {
+            ROUTE_ATTRIBUTE_HEADER_LEN + XFRM_ENCAP_TEMPLATE_LEN
+        }
+    };
+    let mut out = sensitive_buffer_with_capacity(XFRM_USER_MIGRATE_STATE_LEN + encap_attr_len);
+
+    encode_address(&mut out, request.current.id.destination);
+    push_u32_be(&mut out, request.current.id.spi);
+    push_u16_ne(&mut out, address_family(request.current.id.destination));
+    push_u8(&mut out, request.current.id.protocol);
+    push_u8(&mut out, 0);
+    encode_address(&mut out, request.new_destination);
+    encode_address(&mut out, request.new_source_address);
+    out.extend_from_slice(&request.current.mark.map_or([0; XFRM_MARK_LEN], encode_mark));
+    encode_sa_relocation_selector(&mut out, &request.current.selector)?;
+    push_u32_ne(
+        &mut out,
+        request.current.request_id.map_or(0, XfrmRequestId::get),
+    );
+    push_u32_ne(&mut out, 0);
+    push_u16_ne(&mut out, address_family(request.new_destination));
+    push_u16_ne(&mut out, 0);
+    debug_assert_eq!(out.len(), XFRM_USER_MIGRATE_STATE_LEN);
+
+    match request.encap {
+        SaRelocationEncap::Preserve => {}
+        SaRelocationEncap::Set(encap) => {
+            append_attr(&mut out, XFRMA_ENCAP, encode_udp_encap(encap).as_slice())?;
+        }
+        SaRelocationEncap::Remove => {
+            append_attr(&mut out, XFRMA_ENCAP, &[0; XFRM_ENCAP_TEMPLATE_LEN])?;
+        }
+    }
+    Ok(out)
+}
+
+fn encode_sa_relocation_capability_probe() -> Result<SensitiveBuffer, XfrmError> {
+    let unspecified = IpAddress::Ipv4([0; 4]);
+    let selector = SaRelocationSelector {
+        source: unspecified,
+        destination: unspecified,
+        source_port: 0,
+        source_port_mask: 0,
+        destination_port: 0,
+        destination_port_mask: 0,
+        protocol: 0,
+        source_prefix_len: 0,
+        destination_prefix_len: 0,
+        ifindex: 0,
+        user_id: 0,
+    };
+    let mut out = sensitive_buffer_with_capacity(XFRM_USER_MIGRATE_STATE_LEN);
+
+    // The upstream feature probe requires a non-zero, non-existent SPI. An
+    // old protocol value of zero is deliberately used because Linux rejects
+    // protocol zero when installing an SA, making this lookup collision-free
+    // even in a live namespace. The new-family and selector fields remain
+    // structurally valid so a supporting kernel reaches lookup and returns
+    // ESRCH rather than rejecting the probe itself.
+    encode_address(&mut out, unspecified);
+    push_u32_be(&mut out, SA_RELOCATION_PROBE_SPI);
+    push_u16_ne(&mut out, AF_INET);
+    push_u8(&mut out, 0);
+    push_u8(&mut out, 0);
+    encode_address(&mut out, unspecified);
+    encode_address(&mut out, unspecified);
+    let old_mark_end = out.len() + XFRM_MARK_LEN;
+    out.resize(old_mark_end, 0);
+    encode_sa_relocation_selector(&mut out, &selector)?;
+    push_u32_ne(&mut out, 0);
+    push_u32_ne(&mut out, 0);
+    push_u16_ne(&mut out, AF_INET);
+    push_u16_ne(&mut out, 0);
+    debug_assert_eq!(out.len(), XFRM_USER_MIGRATE_STATE_LEN);
+    Ok(out)
+}
+
 fn encode_policy_info(parameters: &PolicyParameters) -> Result<SensitiveBuffer, XfrmError> {
     validate_policy_parameters(parameters)?;
     let mut out = sensitive_buffer_with_capacity(
@@ -986,6 +1305,7 @@ fn encode_template(out: &mut Vec<u8>, template: &XfrmTemplate) -> Result<(), Xfr
 
 fn encode_selector(out: &mut Vec<u8>, selector: &XfrmSelector) -> Result<(), XfrmError> {
     validate_selector_family(selector)?;
+    let start = out.len();
     encode_address(out, selector.destination);
     encode_address(out, selector.source);
     push_u16_be(out, selector.destination_port);
@@ -1013,7 +1333,34 @@ fn encode_selector(out: &mut Vec<u8>, selector: &XfrmSelector) -> Result<(), Xfr
     out.resize(out.len() + 3, 0);
     push_i32_ne(out, 0);
     push_u32_ne(out, 0);
-    debug_assert_eq!(out.len() % XFRM_SELECTOR_LEN, 0);
+    debug_assert_eq!(out.len() - start, XFRM_SELECTOR_LEN);
+    Ok(())
+}
+
+fn encode_sa_relocation_selector(
+    out: &mut Vec<u8>,
+    selector: &SaRelocationSelector,
+) -> Result<(), XfrmError> {
+    let start = out.len();
+    encode_address(out, selector.destination);
+    encode_address(out, selector.source);
+    push_u16_be(out, selector.destination_port);
+    push_u16_be(out, selector.destination_port_mask);
+    push_u16_be(out, selector.source_port);
+    push_u16_be(out, selector.source_port_mask);
+    push_u16_ne(out, address_family(selector.source));
+    push_u8(out, selector.destination_prefix_len);
+    push_u8(out, selector.source_prefix_len);
+    push_u8(out, selector.protocol);
+    out.resize(out.len() + 3, 0);
+    push_i32_ne(out, selector.ifindex);
+    push_u32_ne(out, selector.user_id);
+    if out.len() - start != XFRM_SELECTOR_LEN {
+        return Err(XfrmError::io(
+            "relocate_sa_encode",
+            invalid_data("invalid exact selector encoding length"),
+        ));
+    }
     Ok(())
 }
 
@@ -1291,6 +1638,100 @@ fn parse_sa_state(payload: &[u8], dscp_profile: Option<MarkProfile>) -> Result<S
         output_mark,
         egress_dscp,
     })
+}
+
+fn parse_sa_relocation_snapshot(payload: &[u8]) -> Result<SaRelocationSnapshot, XfrmError> {
+    let state = parse_sa_state(payload, None)?;
+    let identity = SaRelocationIdentity {
+        selector: decode_sa_relocation_selector(payload, 0)?,
+        id: state.id,
+        source_address: state.source_address,
+        request_id: state.request_id,
+        mode: state.mode,
+        encap: parse_udp_encap_attr(payload)?,
+        mark: parse_lookup_mark_attr(payload)?,
+        if_id: parse_if_id_attr(payload)?,
+        output_mark: state.output_mark,
+    };
+    Ok(SaRelocationSnapshot { state, identity })
+}
+
+fn parse_udp_encap_attr(payload: &[u8]) -> Result<Option<UdpEncap>, XfrmError> {
+    let Some(encap) = find_unique_attr_payload(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_ENCAP,
+        "duplicate UDP encapsulation attribute",
+    )?
+    else {
+        return Ok(None);
+    };
+    if encap.len() != XFRM_ENCAP_TEMPLATE_LEN {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("invalid UDP encapsulation attribute length"),
+        ));
+    }
+    if encap.get(6..8) != Some(&[0, 0]) {
+        return Err(XfrmError::io(
+            "query_sa_relocation_identity",
+            invalid_data("noncanonical UDP encapsulation padding"),
+        ));
+    }
+    if encap
+        .get(8..XFRM_ENCAP_TEMPLATE_LEN)
+        .is_some_and(|original_address| original_address.iter().any(|octet| *octet != 0))
+    {
+        return Err(XfrmError::UnsupportedFeature {
+            feature: "sa_relocation_encap_original_address",
+        });
+    }
+    Ok(Some(UdpEncap {
+        encap_type: read_u16_ne(encap, 0)?,
+        source_port: read_u16_be(encap, 2)?,
+        destination_port: read_u16_be(encap, 4)?,
+    }))
+}
+
+fn parse_lookup_mark_attr(payload: &[u8]) -> Result<Option<XfrmMark>, XfrmError> {
+    let Some(mark) = find_unique_attr_payload(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_MARK,
+        "duplicate lookup-mark attribute",
+    )?
+    else {
+        return Ok(None);
+    };
+    if mark.len() != XFRM_MARK_LEN {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("invalid lookup-mark attribute length"),
+        ));
+    }
+    Ok(Some(XfrmMark {
+        value: read_u32_ne(mark, 0)?,
+        mask: read_u32_ne(mark, 4)?,
+    }))
+}
+
+fn parse_if_id_attr(payload: &[u8]) -> Result<Option<u32>, XfrmError> {
+    let Some(if_id) = find_unique_attr_payload(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_IF_ID,
+        "duplicate interface-id attribute",
+    )?
+    else {
+        return Ok(None);
+    };
+    if if_id.len() != 4 {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("invalid interface-id attribute length"),
+        ));
+    }
+    Ok(Some(read_u32_ne(if_id, 0)?))
 }
 
 fn parse_output_mark_attrs(payload: &[u8]) -> Result<Option<XfrmMark>, XfrmError> {
@@ -1596,17 +2037,37 @@ fn validate_output_mark_dscp_disjoint(
     Ok(())
 }
 
-fn validate_sa_query(request: QuerySaRequest) -> Result<(), XfrmError> {
-    if request.spi == 0 {
-        return Err(XfrmError::invalid_config("spi", "spi must be nonzero"));
+fn relocated_sa_id(request: &RelocateSaRequest) -> XfrmId {
+    XfrmId {
+        destination: request.new_destination,
+        ..request.current.id
     }
-    if request.protocol == 0 {
-        return Err(XfrmError::invalid_config(
-            "protocol",
-            "protocol must be nonzero",
-        ));
-    }
-    Ok(())
+}
+
+fn original_state_matches(
+    expected: &SaRelocationSnapshot,
+    observed: &SaRelocationSnapshot,
+) -> bool {
+    observed.identity == expected.identity
+        && observed.state.replay_window == expected.state.replay_window
+        && observed.state.lifetime_config == expected.state.lifetime_config
+        && observed.state.output_mark == expected.state.output_mark
+}
+
+fn relocated_state_matches(
+    request: &RelocateSaRequest,
+    before: &SaRelocationSnapshot,
+    observed: &SaRelocationSnapshot,
+) -> bool {
+    let mut expected_identity = before.identity.clone();
+    expected_identity.id = relocated_sa_id(request);
+    expected_identity.source_address = request.new_source_address;
+    expected_identity.encap = request.encap.resulting(before.identity.encap);
+
+    observed.identity == expected_identity
+        && observed.state.replay_window == before.state.replay_window
+        && observed.state.lifetime_config == before.state.lifetime_config
+        && observed.state.output_mark == before.state.output_mark
 }
 
 fn validate_replay_state(
@@ -1827,6 +2288,58 @@ fn decode_selector(bytes: &[u8], offset: usize) -> Result<XfrmSelector, XfrmErro
     })
 }
 
+fn decode_sa_relocation_selector(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<SaRelocationSelector, XfrmError> {
+    let end = offset
+        .checked_add(XFRM_SELECTOR_LEN)
+        .ok_or_else(|| XfrmError::io("query_sa", invalid_data("selector offset overflow")))?;
+    let selector = bytes
+        .get(offset..end)
+        .ok_or_else(|| XfrmError::io("query_sa", invalid_data("short XFRM selector")))?;
+    let family = read_u16_ne(selector, 40)?;
+    if selector.get(45..48) != Some(&[0, 0, 0]) {
+        return Err(XfrmError::io(
+            "query_sa_relocation_identity",
+            invalid_data("noncanonical XFRM selector reserved bytes"),
+        ));
+    }
+    if family == AF_INET
+        && (selector[4..16].iter().any(|octet| *octet != 0)
+            || selector[20..32].iter().any(|octet| *octet != 0))
+    {
+        return Err(XfrmError::io(
+            "query_sa_relocation_identity",
+            invalid_data("noncanonical IPv4 XFRM selector address"),
+        ));
+    }
+
+    let relocation_selector = SaRelocationSelector {
+        destination: decode_address(selector, 0, family)?,
+        source: decode_address(selector, 16, family)?,
+        destination_port: read_u16_be(selector, 32)?,
+        destination_port_mask: read_u16_be(selector, 34)?,
+        source_port: read_u16_be(selector, 36)?,
+        source_port_mask: read_u16_be(selector, 38)?,
+        protocol: read_u8(selector, 44)?,
+        destination_prefix_len: read_u8(selector, 42)?,
+        source_prefix_len: read_u8(selector, 43)?,
+        ifindex: read_i32_ne(selector, 48)?,
+        user_id: read_u32_ne(selector, 52)?,
+    };
+    let prefix_limit = if family == AF_INET { 32 } else { 128 };
+    if relocation_selector.source_prefix_len > prefix_limit
+        || relocation_selector.destination_prefix_len > prefix_limit
+    {
+        return Err(XfrmError::io(
+            "query_sa_relocation_identity",
+            invalid_data("XFRM selector prefix exceeds address family"),
+        ));
+    }
+    Ok(relocation_selector)
+}
+
 fn decode_address(bytes: &[u8], offset: usize, family: u16) -> Result<IpAddress, XfrmError> {
     match family {
         AF_INET => {
@@ -1969,6 +2482,16 @@ fn read_u32_ne(bytes: &[u8], offset: usize) -> Result<u32, XfrmError> {
     Ok(u32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
+fn read_i32_ne(bytes: &[u8], offset: usize) -> Result<i32, XfrmError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("offset overflow")))?;
+    let slice = bytes
+        .get(offset..end)
+        .ok_or_else(|| XfrmError::io("netlink_receive", invalid_data("short netlink field")))?;
+    Ok(i32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
 fn read_u32_be(bytes: &[u8], offset: usize) -> Result<u32, XfrmError> {
     let end = offset
         .checked_add(4)
@@ -1997,12 +2520,13 @@ fn invalid_data(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::{
         AeadAlgorithm, Algorithm, AuthAlgorithm, InstallSaRequest, KeyMaterial,
-        XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES,
+        SaRelocationDirection, UDP_ENCAP_ESPINUDP, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES,
     };
 
     #[derive(Debug, Default, Clone)]
@@ -2051,6 +2575,72 @@ mod tests {
                 algorithms: XfrmCapability::Available,
                 egress_dscp_marking: XfrmCapability::Missing,
                 details: Some("test transport"),
+            }
+        }
+    }
+
+    type ScriptedResponse = Result<Option<SensitiveBuffer>, XfrmError>;
+
+    #[derive(Debug, Clone)]
+    struct ScriptedTransport {
+        requests: Arc<Mutex<Vec<SensitiveBuffer>>>,
+        responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(responses: Vec<Result<Option<Vec<u8>>, XfrmError>>) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                responses: Arc::new(Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|response| response.map(|body| body.map(Zeroizing::new)))
+                        .collect(),
+                )),
+            }
+        }
+
+        fn requests(&self) -> Vec<SensitiveBuffer> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl LinuxXfrmTransport for ScriptedTransport {
+        fn transact(
+            &self,
+            _operation: &'static str,
+            request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(Zeroizing::new(request.to_vec()));
+            self.responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(XfrmError::io(
+                        "test_transport",
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "missing scripted response"),
+                    ))
+                })
+        }
+
+        fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe {
+                kind: XfrmBackendKind::LinuxKernel,
+                platform_supported: true,
+                kernel_reachable: true,
+                net_admin_capable: true,
+                algorithms: XfrmCapability::Available,
+                egress_dscp_marking: XfrmCapability::Missing,
+                details: Some("scripted test transport"),
             }
         }
     }
@@ -2185,6 +2775,45 @@ mod tests {
         }
     }
 
+    fn relocation_parameters() -> SaParameters {
+        let mut parameters = sa_parameters();
+        parameters.id.destination = ipv4(192, 0, 2, 20);
+        parameters.source_address = ipv4(192, 0, 2, 10);
+        parameters.request_id = XfrmRequestId::new(0x0102_0304);
+        parameters.encap = Some(UdpEncap::esp_in_udp(4500, 4500));
+        parameters.mark = Some(XfrmMark {
+            value: 0xaabb_ccdd,
+            mask: 0xffff_0000,
+        });
+        parameters.output_mark = Some(XfrmMark {
+            value: 0x0000_1200,
+            mask: 0x0000_ff00,
+        });
+        parameters.if_id = Some(7);
+        parameters
+    }
+
+    fn relocation_request() -> RelocateSaRequest {
+        let body = encode_sa_info(&relocation_parameters()).unwrap();
+        let snapshot = parse_sa_relocation_snapshot(&body).unwrap();
+        RelocateSaRequest {
+            current: snapshot.identity,
+            new_source_address: ipv4(198, 51, 100, 10),
+            new_destination: ipv4(198, 51, 100, 20),
+            encap: SaRelocationEncap::Set(UdpEncap::esp_in_udp(4500, 62_000)),
+            direction: SaRelocationDirection::OutboundBlockPolicyInstalled,
+        }
+    }
+
+    fn relocated_parameters() -> SaParameters {
+        let mut parameters = relocation_parameters();
+        let request = relocation_request();
+        parameters.id.destination = request.new_destination;
+        parameters.source_address = request.new_source_address;
+        parameters.encap = request.encap.resulting(parameters.encap);
+        parameters
+    }
+
     fn policy_parameters() -> PolicyParameters {
         PolicyParameters {
             selector: selector(),
@@ -2245,9 +2874,709 @@ mod tests {
         None
     }
 
+    fn route_attr_payload_offset_from(
+        body: &[u8],
+        mut offset: usize,
+        attr_type: u16,
+    ) -> Option<usize> {
+        while offset + ROUTE_ATTRIBUTE_HEADER_LEN <= body.len() {
+            let len = usize::from(u16::from_ne_bytes([body[offset], body[offset + 1]]));
+            let found_type = u16::from_ne_bytes([body[offset + 2], body[offset + 3]]);
+            if len < ROUTE_ATTRIBUTE_HEADER_LEN || offset + len > body.len() {
+                return None;
+            }
+            if found_type == attr_type {
+                return offset.checked_add(ROUTE_ATTRIBUTE_HEADER_LEN);
+            }
+            offset += align_to_netlink(len)?;
+        }
+        None
+    }
+
     fn assert_sensitive_buffer(_buffer: &SensitiveBuffer) {}
 
     fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+    #[test]
+    fn relocate_sa_codec_matches_upstream_uapi_layout() {
+        let request = relocation_request();
+        let body = encode_relocate_sa_request(&request).unwrap();
+
+        assert_eq!(body.len(), 160);
+        assert_eq!(&body[0..4], &[192, 0, 2, 20]);
+        assert!(body[4..16].iter().all(|byte| *byte == 0));
+        assert_eq!(&body[16..20], &0x1234_5678_u32.to_be_bytes());
+        assert_eq!(&body[20..22], &AF_INET.to_ne_bytes());
+        assert_eq!(body[22], IPPROTO_ESP);
+        assert_eq!(body[23], 0);
+        assert_eq!(&body[24..28], &[198, 51, 100, 20]);
+        assert_eq!(&body[40..44], &[198, 51, 100, 10]);
+        assert_eq!(&body[56..60], &0xaabb_ccdd_u32.to_ne_bytes());
+        assert_eq!(&body[60..64], &0xffff_0000_u32.to_ne_bytes());
+        assert_eq!(&body[64..68], &[10, 0, 0, 2]);
+        assert_eq!(&body[80..84], &[10, 0, 0, 1]);
+        assert_eq!(&body[104..106], &AF_INET.to_ne_bytes());
+        assert_eq!(body[106], 32);
+        assert_eq!(body[107], 32);
+        assert_eq!(body[108], IPPROTO_ESP);
+        assert_eq!(&body[120..124], &0x0102_0304_u32.to_ne_bytes());
+        assert_eq!(&body[124..128], &0_u32.to_ne_bytes());
+        assert_eq!(&body[128..130], &AF_INET.to_ne_bytes());
+        assert_eq!(&body[130..132], &0_u16.to_ne_bytes());
+        assert_eq!(&body[132..134], &28_u16.to_ne_bytes());
+        assert_eq!(&body[134..136], &XFRMA_ENCAP.to_ne_bytes());
+        assert_eq!(&body[136..138], &UDP_ENCAP_ESPINUDP.to_ne_bytes());
+        assert_eq!(&body[138..140], &4500_u16.to_be_bytes());
+        assert_eq!(&body[140..142], &62_000_u16.to_be_bytes());
+        assert!(body[142..160].iter().all(|byte| *byte == 0));
+
+        let message = encode_netlink_message(
+            XFRM_MSG_MIGRATE_STATE,
+            NLM_F_REQUEST | NLM_F_ACK,
+            0x1122_3344,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(message.len(), 176);
+        assert_eq!(&message[0..4], &176_u32.to_ne_bytes());
+        assert_eq!(&message[4..6], &0x29_u16.to_ne_bytes());
+        assert_eq!(&message[6..8], &5_u16.to_ne_bytes());
+        assert_eq!(&message[8..12], &0x1122_3344_u32.to_ne_bytes());
+        assert_eq!(&message[16..], body.as_slice());
+    }
+
+    #[test]
+    fn relocation_encapsulation_actions_match_upstream_uapi_semantics() {
+        let mut request = relocation_request();
+
+        request.encap = SaRelocationEncap::Preserve;
+        let preserve_natt = encode_relocate_sa_request(&request).unwrap();
+        assert_eq!(preserve_natt.len(), XFRM_USER_MIGRATE_STATE_LEN);
+        assert!(
+            route_attr_payload_from(&preserve_natt, XFRM_USER_MIGRATE_STATE_LEN, XFRMA_ENCAP)
+                .is_none()
+        );
+
+        request.current.encap = None;
+        let preserve_native = encode_relocate_sa_request(&request).unwrap();
+        assert_eq!(preserve_native.len(), XFRM_USER_MIGRATE_STATE_LEN);
+
+        request.encap = SaRelocationEncap::Set(UdpEncap::esp_in_udp(4500, 62_000));
+        let add_natt = encode_relocate_sa_request(&request).unwrap();
+        let add_payload =
+            route_attr_payload_from(&add_natt, XFRM_USER_MIGRATE_STATE_LEN, XFRMA_ENCAP).unwrap();
+        assert_eq!(&add_payload[0..2], &UDP_ENCAP_ESPINUDP.to_ne_bytes());
+        assert_eq!(&add_payload[2..4], &4500_u16.to_be_bytes());
+        assert_eq!(&add_payload[4..6], &62_000_u16.to_be_bytes());
+
+        request.current.encap = Some(UdpEncap::esp_in_udp(4500, 4500));
+        request.encap = SaRelocationEncap::Remove;
+        let remove_natt = encode_relocate_sa_request(&request).unwrap();
+        let remove_payload =
+            route_attr_payload_from(&remove_natt, XFRM_USER_MIGRATE_STATE_LEN, XFRMA_ENCAP)
+                .unwrap();
+        assert_eq!(remove_payload, &[0; XFRM_ENCAP_TEMPLATE_LEN]);
+    }
+
+    #[test]
+    fn relocation_snapshot_exposes_exact_attributes() {
+        let parameters = relocation_parameters();
+        let snapshot = parse_sa_relocation_snapshot(&encode_sa_info(&parameters).unwrap()).unwrap();
+
+        assert_eq!(snapshot.identity.encap, parameters.encap);
+        assert_eq!(snapshot.identity.mark, parameters.mark);
+        assert_eq!(snapshot.identity.if_id, parameters.if_id);
+        assert_eq!(snapshot.identity.output_mark, parameters.output_mark);
+        assert_eq!(snapshot.identity.id, parameters.id);
+    }
+
+    #[test]
+    fn relocation_preserves_every_raw_selector_field() {
+        let mut body = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        body[32..34].copy_from_slice(&443_u16.to_be_bytes());
+        body[34..36].copy_from_slice(&0xfff0_u16.to_be_bytes());
+        body[36..38].copy_from_slice(&4500_u16.to_be_bytes());
+        body[38..40].copy_from_slice(&0xff00_u16.to_be_bytes());
+        body[48..52].copy_from_slice(&41_i32.to_ne_bytes());
+        body[52..56].copy_from_slice(&1001_u32.to_ne_bytes());
+        let snapshot = parse_sa_relocation_snapshot(&body).unwrap();
+
+        assert_eq!(snapshot.identity.selector.destination_port, 443);
+        assert_eq!(snapshot.identity.selector.destination_port_mask, 0xfff0);
+        assert_eq!(snapshot.identity.selector.source_port, 4500);
+        assert_eq!(snapshot.identity.selector.source_port_mask, 0xff00);
+        assert_eq!(snapshot.identity.selector.ifindex, 41);
+        assert_eq!(snapshot.identity.selector.user_id, 1001);
+
+        let mut request = relocation_request();
+        request.current = snapshot.identity;
+        let migrate = encode_relocate_sa_request(&request).unwrap();
+        assert_eq!(&migrate[96..98], &443_u16.to_be_bytes());
+        assert_eq!(&migrate[98..100], &0xfff0_u16.to_be_bytes());
+        assert_eq!(&migrate[100..102], &4500_u16.to_be_bytes());
+        assert_eq!(&migrate[102..104], &0xff00_u16.to_be_bytes());
+        assert_eq!(&migrate[112..116], &41_i32.to_ne_bytes());
+        assert_eq!(&migrate[116..120], &1001_u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn relocation_rejects_noncanonical_selector_and_encap_original_address() {
+        let mut noncanonical_selector = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        noncanonical_selector[4] = 1;
+        assert!(parse_sa_relocation_snapshot(&noncanonical_selector).is_err());
+
+        let mut noncanonical_reserved = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        noncanonical_reserved[45] = 1;
+        assert!(parse_sa_relocation_snapshot(&noncanonical_reserved).is_err());
+
+        let mut nonzero_original_address =
+            encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        let encap_offset = route_attr_payload_offset_from(
+            &nonzero_original_address,
+            XFRM_USER_SA_INFO_LEN,
+            XFRMA_ENCAP,
+        )
+        .unwrap();
+        nonzero_original_address[encap_offset + 8] = 1;
+        assert!(matches!(
+            parse_sa_relocation_snapshot(&nonzero_original_address),
+            Err(XfrmError::UnsupportedFeature {
+                feature: "sa_relocation_encap_original_address"
+            })
+        ));
+    }
+
+    #[test]
+    fn relocation_codec_supports_ipv6_and_cross_family_outer_migration() {
+        let mut request = relocation_request();
+        let new_source = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10];
+        let new_destination = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20];
+        request.new_source_address = IpAddress::Ipv6(new_source);
+        request.new_destination = IpAddress::Ipv6(new_destination);
+
+        let body = encode_relocate_sa_request(&request).unwrap();
+
+        assert_eq!(&body[20..22], &AF_INET.to_ne_bytes());
+        assert_eq!(&body[24..40], &new_destination);
+        assert_eq!(&body[40..56], &new_source);
+        assert_eq!(&body[128..130], &AF_INET6.to_ne_bytes());
+
+        let old_source = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10];
+        let old_destination = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 20];
+        let mut parameters = relocation_parameters();
+        parameters.source_address = IpAddress::Ipv6(old_source);
+        parameters.id.destination = IpAddress::Ipv6(old_destination);
+        let snapshot = parse_sa_relocation_snapshot(&encode_sa_info(&parameters).unwrap()).unwrap();
+        let request = RelocateSaRequest {
+            current: snapshot.identity,
+            new_source_address: ipv4(198, 51, 100, 10),
+            new_destination: ipv4(198, 51, 100, 20),
+            encap: SaRelocationEncap::Preserve,
+            direction: SaRelocationDirection::Inbound,
+        };
+        let body = encode_relocate_sa_request(&request).unwrap();
+        assert_eq!(&body[0..16], &old_destination);
+        assert_eq!(&body[20..22], &AF_INET6.to_ne_bytes());
+        assert_eq!(&body[128..130], &AF_INET.to_ne_bytes());
+    }
+
+    #[test]
+    fn relocation_validation_rejects_unsafe_shapes() {
+        let valid = relocation_request();
+
+        let mut request = valid.clone();
+        request.current.id.spi = 0;
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.current.spi",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.current.id.protocol = 51;
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.current.protocol",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.current.mode = XfrmMode::Transport;
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.current.mode",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.current.selector.source = IpAddress::Ipv6([1; 16]);
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.current.selector.family",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.current.selector.source_prefix_len = 33;
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.current.selector.source_prefix_len",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.new_source_address = IpAddress::Ipv6([1; 16]);
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.new.family",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.new_destination = ipv4(0, 0, 0, 0);
+        request.new_source_address = ipv4(0, 0, 0, 0);
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.address",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.current.mark = Some(XfrmMark { value: 7, mask: 0 });
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.current.mark",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.current.if_id = Some(0);
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.current.if_id",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.encap = SaRelocationEncap::Set(UdpEncap::esp_in_udp(4500, 0));
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.encap",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.current.encap = None;
+        request.encap = SaRelocationEncap::Remove;
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.encap",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.encap = SaRelocationEncap::Set(UdpEncap {
+            encap_type: 1,
+            source_port: 4500,
+            destination_port: 4500,
+        });
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation.encap",
+                ..
+            })
+        ));
+
+        let mut request = valid.clone();
+        request.new_source_address = request.current.source_address;
+        request.new_destination = request.current.id.destination;
+        request.encap = SaRelocationEncap::Preserve;
+        assert!(matches!(
+            validate_relocate_sa_request(&request),
+            Err(XfrmError::InvalidConfig {
+                field: "relocation",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn relocation_capability_probe_is_collision_free_and_cached() {
+        let encoded = encode_sa_relocation_capability_probe().unwrap();
+        assert_eq!(encoded.len(), XFRM_USER_MIGRATE_STATE_LEN);
+        assert_eq!(read_u32_be(&encoded, 16).unwrap(), SA_RELOCATION_PROBE_SPI);
+        assert_eq!(read_u16_ne(&encoded, 20).unwrap(), AF_INET);
+        assert_eq!(read_u8(&encoded, 22).unwrap(), 0);
+        assert_eq!(read_u16_ne(&encoded, 104).unwrap(), AF_INET);
+        assert_eq!(read_u16_ne(&encoded, 128).unwrap(), AF_INET);
+
+        let transport = ScriptedTransport::new(vec![Err(XfrmError::NotFound)]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+        assert_eq!(
+            backend.current_sa_relocation_capability(),
+            XfrmCapability::UnknownUntilUse
+        );
+
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Available
+        );
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Available
+        );
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_MIGRATE_STATE);
+        assert_eq!(netlink_body(&requests[0]), encoded.as_slice());
+    }
+
+    #[tokio::test]
+    async fn relocation_capability_probe_maps_documented_unsupported_errnos() {
+        for errno in [LINUX_EINVAL, LINUX_ENOPROTOOPT] {
+            let transport = ScriptedTransport::new(vec![Err(XfrmError::io(
+                "netlink_ack",
+                io::Error::from_raw_os_error(errno),
+            ))]);
+            let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+            assert_eq!(
+                backend.sa_relocation_capability().await.unwrap(),
+                XfrmCapability::Missing
+            );
+            assert_eq!(
+                backend.sa_relocation_capability().await.unwrap(),
+                XfrmCapability::Missing
+            );
+            assert_eq!(transport.requests().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn relocate_sa_ack_success_moved_target_and_old_absence_succeeds() {
+        let old_body = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        let new_body = encode_sa_info(&relocated_parameters()).unwrap().to_vec();
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(old_body)),
+            Err(XfrmError::NotFound),
+            Ok(None),
+            Ok(Some(new_body)),
+            Err(XfrmError::NotFound),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        backend.relocate_sa(relocation_request()).await.unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_GETSA);
+        assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_GETSA);
+        assert_eq!(netlink_message_type(&requests[2]), XFRM_MSG_MIGRATE_STATE);
+        assert_eq!(netlink_message_type(&requests[3]), XFRM_MSG_GETSA);
+        assert_eq!(netlink_message_type(&requests[4]), XFRM_MSG_GETSA);
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_sa_ack_success_with_old_tuple_present_is_indeterminate() {
+        let old_body = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        let new_body = encode_sa_info(&relocated_parameters()).unwrap().to_vec();
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(old_body.clone())),
+            Err(XfrmError::NotFound),
+            Ok(None),
+            Ok(Some(new_body)),
+            Ok(Some(old_body)),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        let error = backend.relocate_sa(relocation_request()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::StateIndeterminate {
+                operation: "relocate_sa_reconcile"
+            }
+        ));
+        assert_eq!(transport.requests().len(), 5);
+        assert_eq!(
+            backend.current_sa_relocation_capability(),
+            XfrmCapability::UnknownUntilUse
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_sa_ack_success_with_unprovable_old_absence_is_indeterminate() {
+        let old_body = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        let new_body = encode_sa_info(&relocated_parameters()).unwrap().to_vec();
+        let old_query_outcomes = [
+            Err(XfrmError::io(
+                "netlink_ack",
+                io::Error::from_raw_os_error(5),
+            )),
+            Ok(Some(vec![0; XFRM_USER_SA_INFO_LEN - 1])),
+        ];
+
+        for old_query_outcome in old_query_outcomes {
+            let transport = ScriptedTransport::new(vec![
+                Ok(Some(old_body.clone())),
+                Err(XfrmError::NotFound),
+                Ok(None),
+                Ok(Some(new_body.clone())),
+                old_query_outcome,
+            ]);
+            let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+            let error = backend.relocate_sa(relocation_request()).await.unwrap_err();
+
+            assert!(matches!(
+                error,
+                XfrmError::StateIndeterminate {
+                    operation: "relocate_sa_reconcile"
+                }
+            ));
+            assert_eq!(transport.requests().len(), 5);
+            assert_eq!(
+                backend.current_sa_relocation_capability(),
+                XfrmCapability::UnknownUntilUse
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relocate_sa_preserves_native_esp_without_emitting_encap() {
+        let mut old_parameters = relocation_parameters();
+        old_parameters.encap = None;
+        let old_body = encode_sa_info(&old_parameters).unwrap().to_vec();
+        let old_snapshot = parse_sa_relocation_snapshot(&old_body).unwrap();
+        let request = RelocateSaRequest {
+            current: old_snapshot.identity,
+            new_source_address: ipv4(198, 51, 100, 30),
+            new_destination: ipv4(198, 51, 100, 40),
+            encap: SaRelocationEncap::Preserve,
+            direction: SaRelocationDirection::Inbound,
+        };
+        let mut new_parameters = old_parameters;
+        new_parameters.id.destination = request.new_destination;
+        new_parameters.source_address = request.new_source_address;
+        let new_body = encode_sa_info(&new_parameters).unwrap().to_vec();
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(old_body)),
+            Err(XfrmError::NotFound),
+            Ok(None),
+            Ok(Some(new_body)),
+            Err(XfrmError::NotFound),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        backend.relocate_sa(request).await.unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 5);
+        let migrate = netlink_body(&requests[2]);
+        assert_eq!(migrate.len(), XFRM_USER_MIGRATE_STATE_LEN);
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_sa_ack_success_same_identity_encap_only_needs_one_readback() {
+        let old_parameters = relocation_parameters();
+        let old_body = encode_sa_info(&old_parameters).unwrap().to_vec();
+        let old_snapshot = parse_sa_relocation_snapshot(&old_body).unwrap();
+        let request = RelocateSaRequest {
+            current: old_snapshot.identity,
+            new_source_address: old_parameters.source_address,
+            new_destination: old_parameters.id.destination,
+            encap: SaRelocationEncap::Set(UdpEncap::esp_in_udp(4500, 62_000)),
+            direction: SaRelocationDirection::Inbound,
+        };
+        let mut new_parameters = old_parameters;
+        new_parameters.encap = Some(UdpEncap::esp_in_udp(4500, 62_000));
+        let new_body = encode_sa_info(&new_parameters).unwrap().to_vec();
+        let transport =
+            ScriptedTransport::new(vec![Ok(Some(old_body)), Ok(None), Ok(Some(new_body))]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        backend.relocate_sa(request).await.unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_GETSA);
+        assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_MIGRATE_STATE);
+        assert_eq!(netlink_message_type(&requests[2]), XFRM_MSG_GETSA);
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_sa_rejects_stale_current_snapshot_before_mutation() {
+        let old_body = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        let transport = ScriptedTransport::new(vec![Ok(Some(old_body))]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+        let mut request = relocation_request();
+        request.current.request_id = XfrmRequestId::new(99);
+
+        let error = backend.relocate_sa(request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::StateMismatch {
+                operation: "relocate_sa_preflight"
+            }
+        ));
+        assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn supported_kernel_relocation_einval_remains_a_real_operation_failure() {
+        let old_body = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        let transport = ScriptedTransport::new(vec![
+            Err(XfrmError::NotFound),
+            Ok(Some(old_body.clone())),
+            Err(XfrmError::NotFound),
+            Err(XfrmError::io(
+                "netlink_ack",
+                io::Error::from_raw_os_error(LINUX_EINVAL),
+            )),
+            Err(XfrmError::NotFound),
+            Ok(Some(old_body)),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Available
+        );
+
+        let error = backend.relocate_sa(relocation_request()).await.unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(LINUX_EINVAL));
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Available
+        );
+        assert_eq!(transport.requests().len(), 6);
+        assert_eq!(
+            netlink_message_type(&transport.requests()[0]),
+            XFRM_MSG_MIGRATE_STATE
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_sa_lost_ack_requires_target_match_and_old_absence() {
+        let old_body = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        let new_body = encode_sa_info(&relocated_parameters()).unwrap().to_vec();
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(old_body.clone())),
+            Err(XfrmError::NotFound),
+            Err(XfrmError::io(
+                "netlink_ack",
+                io::Error::from_raw_os_error(5),
+            )),
+            Ok(Some(new_body)),
+            Ok(Some(old_body)),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        let error = backend.relocate_sa(relocation_request()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::StateIndeterminate {
+                operation: "relocate_sa_reconcile"
+            }
+        ));
+        assert_eq!(transport.requests().len(), 5);
+        assert_eq!(
+            backend.current_sa_relocation_capability(),
+            XfrmCapability::UnknownUntilUse
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_sa_lost_ack_reconciles_when_target_matches_and_old_is_absent() {
+        let old_body = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        let new_body = encode_sa_info(&relocated_parameters()).unwrap().to_vec();
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(old_body)),
+            Err(XfrmError::NotFound),
+            Err(XfrmError::io(
+                "netlink_ack",
+                io::Error::from_raw_os_error(5),
+            )),
+            Ok(Some(new_body)),
+            Err(XfrmError::NotFound),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+
+        backend.relocate_sa(relocation_request()).await.unwrap();
+
+        assert_eq!(transport.requests().len(), 5);
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_sa_maps_kernel_missing_capability_after_intact_readback() {
+        let old_body = encode_sa_info(&relocation_parameters()).unwrap().to_vec();
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(old_body.clone())),
+            Err(XfrmError::NotFound),
+            Err(XfrmError::io(
+                "netlink_ack",
+                io::Error::from_raw_os_error(LINUX_ENOPROTOOPT),
+            )),
+            Err(XfrmError::NotFound),
+            Ok(Some(old_body)),
+        ]);
+        let backend = LinuxXfrmBackend::with_transport(transport);
+
+        let error = backend.relocate_sa(relocation_request()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            XfrmError::UnsupportedFeature {
+                feature: "sa_relocation"
+            }
+        ));
+        assert_eq!(
+            backend.sa_relocation_capability().await.unwrap(),
+            XfrmCapability::Missing
+        );
+    }
 
     #[test]
     fn netlink_response_and_transport_clones_remain_zeroizing_buffers() {
@@ -3630,6 +4959,14 @@ mod tests {
         let error = parse_netlink_response(&message, 10).unwrap_err();
 
         assert!(matches!(error, XfrmError::NotFound));
+
+        let mut body = Vec::new();
+        push_i32_ne(&mut body, -LINUX_ENOPROTOOPT);
+        let message = encode_netlink_message(NLMSG_ERROR, 0, 11, &body).unwrap();
+
+        let error = parse_netlink_response(&message, 11).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(LINUX_ENOPROTOOPT));
     }
 
     #[test]

@@ -32,6 +32,25 @@ impl IpAddress {
     pub const fn is_ipv6(self) -> bool {
         matches!(self, Self::Ipv6(_))
     }
+
+    /// True when every address octet is zero.
+    pub const fn is_unspecified(self) -> bool {
+        match self {
+            Self::Ipv4(octets) => {
+                octets[0] == 0 && octets[1] == 0 && octets[2] == 0 && octets[3] == 0
+            }
+            Self::Ipv6(octets) => {
+                let mut index = 0;
+                while index < octets.len() {
+                    if octets[index] != 0 {
+                        return false;
+                    }
+                    index += 1;
+                }
+                true
+            }
+        }
+    }
 }
 
 /// XFRM packet selector.
@@ -642,6 +661,19 @@ impl QuerySaRequest {
     }
 }
 
+pub(crate) fn validate_sa_query(request: QuerySaRequest) -> Result<(), XfrmError> {
+    if request.spi == 0 {
+        return Err(XfrmError::invalid_config("spi", "spi must be nonzero"));
+    }
+    if request.protocol == 0 {
+        return Err(XfrmError::invalid_config(
+            "protocol",
+            "protocol must be nonzero",
+        ));
+    }
+    Ok(())
+}
+
 /// Redaction-safe kernel state for a queried SA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaState {
@@ -678,6 +710,339 @@ pub struct SaState {
     /// window, so this is a decoded observation rather than durable proof of
     /// the original SA request. [`Self::output_mark`] remains exact.
     pub egress_dscp: Option<DscpCodepoint>,
+}
+
+/// Exact Linux selector snapshot used by single-SA relocation.
+///
+/// Unlike [`XfrmSelector`], this type retains every non-reserved field from
+/// the kernel's `struct xfrm_selector`. Linux installs the selector supplied
+/// to `XFRM_MSG_MIGRATE_STATE`, so dropping a port mask, interface index, or
+/// UID would silently change which packets the relocated SA selects.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SaRelocationSelector {
+    /// Source address.
+    pub source: IpAddress,
+    /// Destination address.
+    pub destination: IpAddress,
+    /// Source port in host byte order.
+    pub source_port: u16,
+    /// Exact source-port mask in host byte order.
+    pub source_port_mask: u16,
+    /// Destination port in host byte order.
+    pub destination_port: u16,
+    /// Exact destination-port mask in host byte order.
+    pub destination_port_mask: u16,
+    /// Upper-layer protocol number.
+    pub protocol: u8,
+    /// Source prefix length.
+    pub source_prefix_len: u8,
+    /// Destination prefix length.
+    pub destination_prefix_len: u8,
+    /// Exact Linux selector interface index (`ifindex`).
+    pub ifindex: i32,
+    /// Exact Linux selector UID value (`user`).
+    pub user_id: u32,
+}
+
+impl SaRelocationSelector {
+    /// Build the canonical exact form emitted for an ordinary SDK selector.
+    #[must_use]
+    pub const fn from_selector(selector: &XfrmSelector) -> Self {
+        Self {
+            source: selector.source,
+            destination: selector.destination,
+            source_port: selector.source_port,
+            source_port_mask: if selector.source_port == 0 {
+                0
+            } else {
+                u16::MAX
+            },
+            destination_port: selector.destination_port,
+            destination_port_mask: if selector.destination_port == 0 {
+                0
+            } else {
+                u16::MAX
+            },
+            protocol: selector.protocol,
+            source_prefix_len: selector.source_prefix_len,
+            destination_prefix_len: selector.destination_prefix_len,
+            ifindex: 0,
+            user_id: 0,
+        }
+    }
+
+    /// Return the existing SDK selector projection.
+    ///
+    /// Port masks, interface index, and UID remain available only on this
+    /// exact snapshot and are intentionally not discarded by relocation.
+    #[must_use]
+    pub const fn selector(&self) -> XfrmSelector {
+        XfrmSelector {
+            source: self.source,
+            destination: self.destination,
+            source_port: self.source_port,
+            destination_port: self.destination_port,
+            protocol: self.protocol,
+            source_prefix_len: self.source_prefix_len,
+            destination_prefix_len: self.destination_prefix_len,
+        }
+    }
+}
+
+/// Current, query-proven identity and stable attributes of an SA to relocate.
+///
+/// Linux's exact single-SA migration UAPI identifies the kernel object by
+/// destination, SPI, protocol, family, and lookup mark. The remaining fields
+/// are an optimistic-concurrency snapshot: the backend checks them before the
+/// mutation and preserves them in the relocated state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaRelocationIdentity {
+    /// Current exact packet selector.
+    pub selector: SaRelocationSelector,
+    /// Current destination/protocol/SPI identity.
+    pub id: XfrmId,
+    /// Current outer source address.
+    pub source_address: IpAddress,
+    /// Current request identifier.
+    pub request_id: Option<XfrmRequestId>,
+    /// Current XFRM mode.
+    pub mode: XfrmMode,
+    /// Current UDP encapsulation, when configured.
+    pub encap: Option<UdpEncap>,
+    /// Current packet lookup mark, when configured.
+    pub mark: Option<XfrmMark>,
+    /// Current XFRM interface identifier, when configured.
+    pub if_id: Option<u32>,
+    /// Current exact post-transform packet mark, when configured.
+    pub output_mark: Option<XfrmMark>,
+}
+
+/// How one relocation changes the SA's ESP-in-UDP encapsulation.
+///
+/// This models the exact `XFRM_MSG_MIGRATE_STATE` attribute semantics: an
+/// omitted `XFRMA_ENCAP` inherits the current template, a normal attribute
+/// sets one, and an attribute whose type is zero removes it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SaRelocationEncap {
+    /// Preserve the current native-ESP or ESP-in-UDP form and ports.
+    Preserve,
+    /// Add or replace the ESP-in-UDP template and NAT-T ports.
+    Set(UdpEncap),
+    /// Remove the current ESP-in-UDP template and use native ESP.
+    Remove,
+}
+
+/// Traffic direction and caller-proven safety state for one SA relocation.
+///
+/// The current-upstream Linux migration procedure requires an outbound block
+/// policy before an outgoing SA is migrated. There is deliberately no plain
+/// `Outbound` variant: selecting [`Self::OutboundBlockPolicyInstalled`] is the
+/// caller's assertion that the block is already active and will remain active
+/// until the replacement allow policy is installed. Incoming SAs do not have
+/// a cleartext egress fallback and do not require that block.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SaRelocationDirection {
+    /// Incoming SA; replay state is transferred atomically by the kernel.
+    Inbound,
+    /// Outgoing SA after the mandatory temporary block policy is installed.
+    OutboundBlockPolicyInstalled,
+}
+
+impl SaRelocationDirection {
+    /// Whether the upstream migration sequence requires a temporary block.
+    ///
+    /// A `true` result means the caller must already have completed the first
+    /// step (install the block policy) before submitting the relocation.
+    #[must_use]
+    pub const fn requires_outbound_block_policy(self) -> bool {
+        match self {
+            Self::Inbound => false,
+            Self::OutboundBlockPolicyInstalled => true,
+        }
+    }
+}
+
+impl SaRelocationEncap {
+    pub(crate) const fn resulting(self, current: Option<UdpEncap>) -> Option<UdpEncap> {
+        match self {
+            Self::Preserve => current,
+            Self::Set(encap) => Some(encap),
+            Self::Remove => None,
+        }
+    }
+}
+
+/// Request to relocate one installed tunnel-mode ESP SA's outer endpoints and
+/// optionally change its NAT-T encapsulation.
+///
+/// This request is only an authenticated control-plane primitive. Callers must
+/// derive the new endpoints from an authenticated/signalled procedure and must
+/// coordinate policy-template changes separately. Outgoing SAs require the
+/// upstream install-block/remove-old-policy/migrate/install-new-policy/
+/// remove-block sequence represented by [`SaRelocationDirection`]. Keep that
+/// block installed after an indeterminate result. Implementations never infer
+/// relocation from an inbound packet.
+///
+/// # Cancel safety
+///
+/// Once [`crate::XfrmBackend::relocate_sa`] has been polled, the operation is
+/// not cancellation-safe: blocking netlink work can continue after the Rust
+/// future is dropped. Supervise and poll it to completion; do not put it behind
+/// an aborting timeout. Cancellation, task disconnection, or process loss must
+/// be treated as an indeterminate result. Keep the outbound block policy and
+/// namespace-wide writer exclusion in place until the worker has completed and
+/// exact old/new tuple readback has reconciled the state. After process loss,
+/// reconcile before retrying because relocation is not blindly idempotent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelocateSaRequest {
+    /// Query-proven current SA identity and stable attributes.
+    pub current: SaRelocationIdentity,
+    /// New outer source address.
+    pub new_source_address: IpAddress,
+    /// New outer destination address.
+    pub new_destination: IpAddress,
+    /// Exact ESP-in-UDP preservation, set, or removal action.
+    pub encap: SaRelocationEncap,
+    /// Traffic direction and required outbound block-policy assertion.
+    pub direction: SaRelocationDirection,
+}
+
+pub(crate) fn validate_relocate_sa_request(request: &RelocateSaRequest) -> Result<(), XfrmError> {
+    match request.direction {
+        SaRelocationDirection::Inbound | SaRelocationDirection::OutboundBlockPolicyInstalled => {}
+    }
+    validate_sa_relocation_selector(&request.current.selector)?;
+    if request.current.id.spi == 0 {
+        return Err(XfrmError::invalid_config(
+            "relocation.current.spi",
+            "spi must be nonzero",
+        ));
+    }
+    if request.current.id.protocol != 50 {
+        return Err(XfrmError::invalid_config(
+            "relocation.current.protocol",
+            "SA relocation supports ESP only",
+        ));
+    }
+    if request.current.mode != XfrmMode::Tunnel {
+        return Err(XfrmError::invalid_config(
+            "relocation.current.mode",
+            "SA relocation supports tunnel mode only",
+        ));
+    }
+    validate_relocation_address_pair(
+        request.current.source_address,
+        request.current.id.destination,
+        "relocation.current.family",
+    )?;
+    validate_relocation_address_pair(
+        request.new_source_address,
+        request.new_destination,
+        "relocation.new.family",
+    )?;
+    if request.current.source_address.is_unspecified()
+        || request.current.id.destination.is_unspecified()
+        || request.new_source_address.is_unspecified()
+        || request.new_destination.is_unspecified()
+    {
+        return Err(XfrmError::invalid_config(
+            "relocation.address",
+            "outer addresses must not be unspecified",
+        ));
+    }
+    if matches!(request.current.mark, Some(XfrmMark { mask: 0, .. })) {
+        return Err(XfrmError::invalid_config(
+            "relocation.current.mark",
+            "lookup-mark mask must be nonzero; use None for an unmarked SA",
+        ));
+    }
+    if request.current.if_id == Some(0) {
+        return Err(XfrmError::invalid_config(
+            "relocation.current.if_id",
+            "interface identifier must be nonzero; use None when absent",
+        ));
+    }
+    if let Some(encap) = request.current.encap {
+        validate_relocation_encap(encap, "relocation.current.encap")?;
+    }
+    match request.encap {
+        SaRelocationEncap::Preserve => {}
+        SaRelocationEncap::Set(encap) => {
+            validate_relocation_encap(encap, "relocation.encap")?;
+        }
+        SaRelocationEncap::Remove if request.current.encap.is_none() => {
+            return Err(XfrmError::invalid_config(
+                "relocation.encap",
+                "cannot remove UDP encapsulation when none is installed",
+            ));
+        }
+        SaRelocationEncap::Remove => {}
+    }
+    let resulting_encap = request.encap.resulting(request.current.encap);
+    if request.current.source_address == request.new_source_address
+        && request.current.id.destination == request.new_destination
+        && request.current.encap == resulting_encap
+    {
+        return Err(XfrmError::invalid_config(
+            "relocation",
+            "at least one outer endpoint or encapsulation value must change",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sa_relocation_selector(selector: &SaRelocationSelector) -> Result<(), XfrmError> {
+    validate_relocation_address_pair(
+        selector.source,
+        selector.destination,
+        "relocation.current.selector.family",
+    )?;
+    let prefix_limit = if selector.source.is_ipv4() { 32 } else { 128 };
+    if selector.source_prefix_len > prefix_limit {
+        return Err(XfrmError::invalid_config(
+            "relocation.current.selector.source_prefix_len",
+            "prefix length exceeds address family",
+        ));
+    }
+    if selector.destination_prefix_len > prefix_limit {
+        return Err(XfrmError::invalid_config(
+            "relocation.current.selector.destination_prefix_len",
+            "prefix length exceeds address family",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relocation_address_pair(
+    source: IpAddress,
+    destination: IpAddress,
+    field: &'static str,
+) -> Result<(), XfrmError> {
+    if source.is_ipv4() != destination.is_ipv4() {
+        return Err(XfrmError::invalid_config(
+            field,
+            "addresses must use the same family",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relocation_encap(encap: UdpEncap, field: &'static str) -> Result<(), XfrmError> {
+    if encap.encap_type != UDP_ENCAP_ESPINUDP {
+        return Err(XfrmError::invalid_config(
+            field,
+            "encapsulation must be ESP-in-UDP",
+        ));
+    }
+    if encap.source_port == 0 || encap.destination_port == 0 {
+        return Err(XfrmError::invalid_config(
+            field,
+            "UDP encapsulation ports must be nonzero",
+        ));
+    }
+    Ok(())
 }
 
 /// Request to rekey (update) an existing Security Association.
@@ -784,6 +1149,8 @@ pub enum XfrmCapability {
     /// Capability state has not been determined.
     #[default]
     Unknown,
+    /// Capability cannot be established without attempting the operation.
+    UnknownUntilUse,
     /// The capability is available.
     Available,
     /// The capability is missing (e.g. kernel lacks an algorithm).
@@ -919,6 +1286,24 @@ mod tests {
         let sel = XfrmSelector::new(IpAddress::Ipv6([0; 16]), IpAddress::Ipv6([1; 16]), 50);
         assert_eq!(sel.source_prefix_len, 128);
         assert_eq!(sel.destination_prefix_len, 128);
+    }
+
+    #[test]
+    fn unspecified_address_detection_covers_both_families() {
+        assert!(IpAddress::Ipv4([0; 4]).is_unspecified());
+        assert!(!IpAddress::Ipv4([0, 0, 0, 1]).is_unspecified());
+        assert!(IpAddress::Ipv6([0; 16]).is_unspecified());
+        let mut ipv6 = [0; 16];
+        ipv6[15] = 1;
+        assert!(!IpAddress::Ipv6(ipv6).is_unspecified());
+    }
+
+    #[test]
+    fn relocation_direction_encodes_the_outbound_block_policy_contract() {
+        assert!(!SaRelocationDirection::Inbound.requires_outbound_block_policy());
+        assert!(
+            SaRelocationDirection::OutboundBlockPolicyInstalled.requires_outbound_block_policy()
+        );
     }
 
     #[test]
