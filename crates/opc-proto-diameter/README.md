@@ -288,6 +288,21 @@ progress for the base header and AVP layer, but it is not a production Diameter
 stack. Raw AVP bytes are not redacted; typed helper layers own their own
 redaction policies.
 
+Typed helpers distinguish diagnostic redaction from sensitive ownership.
+`avp::dictionary::Redacted<T>` hides `Debug` and `Display` only;
+`avp::dictionary::Sensitive<T>` additionally keeps its owned value in
+zeroizing storage. Each `Sensitive` clone owns independently zeroizing storage.
+STR/STA `Session-Id` and permanent `User-Name` fields use `Sensitive<String>`;
+direct struct construction accepts string literals or owned strings through
+`.into()`. `Sensitive::from_zeroizing` adopts an existing `Zeroizing` owner
+without copying, and consumers that move a value into longer-lived state can
+call `Sensitive::into_zeroizing` to retain the erasure contract.
+
+This is best-effort process-memory hygiene, not a claim that all copies are
+erasable. Previously reallocated memory, raw decoded input, encoded Diameter
+messages, transport retry caches, swap, and kernel/network buffers are outside
+the wrapper's ownership and must be governed separately.
+
 Use `CONFORMANCE.md` for the precise fixture provenance, fuzz target status,
 application dictionary status, and typed helper gaps.
 

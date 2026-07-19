@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Zeroizing retained SWm lifecycle identities — `opc-proto-diameter`:** adds
+  the reusable redaction-safe `Sensitive<T>` owner, whose current allocation
+  is zeroized on drop and independently protected across clones. Typed STR/STA
+  facts, request/answer envelopes, and correlated exchanges now retain
+  `Session-Id` and permanent `User-Name` in that owner without changing wire
+  bytes, request/answer correlation, or diagnostic output. `Redacted<T>`
+  remains the diagnostics-only wrapper for values without a memory-lifetime
+  contract. Migration: direct STR construction must provide
+  `Sensitive<String>` for `session_id` and `user_name`; string literals and
+  owned strings continue to work through `.into()`.
 - **Complete public SWm lifecycle acceptance — `opc-proto-diameter`:** adds one
   compiler-external, deterministic public-API fixture covering a successful
   DER/DEA establishment followed by RAR/RAA, AAR/AAA, and ePDG STR/STA, plus a
