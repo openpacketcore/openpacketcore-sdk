@@ -38,6 +38,7 @@ use crate::dictionary::{
     ApplicationDefinition, AvpCardinality, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey,
     CommandAvpRule, CommandDefinition, CommandKind, Dictionary, FlagRequirement,
 };
+use crate::parser_error::DiameterParserError;
 use crate::{ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage, VendorId};
 
 /// 3GPP SWm application identifier.
@@ -186,6 +187,17 @@ static SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES: [CommandAvpRule; 6] = [
     ),
 ];
 
+static TERMINAL_INFORMATION_AVP_RULES: [CommandAvpRule; 2] = [
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_IMEI, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_SOFTWARE_VERSION, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
 /// SWm Diameter-EAP-Request command definition.
 pub const COMMAND_DIAMETER_EAP_REQUEST: CommandDefinition = CommandDefinition::new(
     COMMAND_DIAMETER_EAP,
@@ -295,7 +307,8 @@ const SWM_AVPS: [AvpDefinition; 23] = [
             FlagRequirement::MustBeUnset,
         ),
         SpecRef::new("3gpp", "TS29272", "7.3.3"),
-    ),
+    )
+    .with_grouped_avp_rules(&TERMINAL_INFORMATION_AVP_RULES),
     AvpDefinition::new(
         AvpKey::vendor(AVP_IMEI, VENDOR_ID_3GPP),
         "IMEI",
@@ -1641,13 +1654,24 @@ pub fn parse_swm_diameter_eap_request(
     message: &Message<'_>,
     ctx: DecodeContext,
 ) -> Result<SwmDiameterEapRequest, DecodeError> {
+    parse_swm_diameter_eap_request_with_provenance(message, ctx)
+        .map_err(DiameterParserError::into_decode_error)
+}
+
+/// Parse a SWm Diameter-EAP-Request while retaining typed provenance for an
+/// omitted mandatory AVP.
+pub fn parse_swm_diameter_eap_request_with_provenance(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<SwmDiameterEapRequest, DiameterParserError> {
     builder_helpers::ensure_app_header(
         message,
         COMMAND_DIAMETER_EAP,
         APPLICATION_ID,
         CommandKind::Request,
         "DER",
-    )?;
+    )
+    .map_err(|error| DiameterParserError::decoded(message, error))?;
     let mut session_id = None;
     let mut auth_application_id = None;
     let mut origin_host = None;
@@ -1660,7 +1684,8 @@ pub fn parse_swm_diameter_eap_request(
     let mut emergency_services = None;
     let mut terminal_information = None;
     let mut state_avps = Vec::new();
-    builder_helpers::for_each_avp(
+    let mut terminal_missing_imei = None;
+    let parse_result = builder_helpers::for_each_avp(
         message.raw_avps,
         ctx,
         crate::DIAMETER_HEADER_LEN,
@@ -1681,12 +1706,19 @@ pub fn parse_swm_diameter_eap_request(
                     )?;
                 } else if code == AVP_TERMINAL_INFORMATION && vendor_id == VENDOR_ID_3GPP {
                     validate_3gpp_mandatory_flags(&avp.header, offset, "7.3.3")?;
-                    builder_helpers::set_once(
-                        &mut terminal_information,
-                        parse_terminal_information(avp.value, ctx, value_offset, 1)?,
-                        offset,
-                        "7.3.3",
-                    )?;
+                    match parse_terminal_information(avp.value, ctx, value_offset, 1) {
+                        Ok(terminal) => builder_helpers::set_once(
+                            &mut terminal_information,
+                            terminal,
+                            offset,
+                            "7.3.3",
+                        )?,
+                        Err(TerminalInformationParseError::MissingImei(error)) => {
+                            terminal_missing_imei = Some((error.clone(), offset));
+                            return Err(error);
+                        }
+                        Err(TerminalInformationParseError::Decode(error)) => return Err(error),
+                    }
                 } else {
                     builder_helpers::handle_unknown_avp(ctx, &avp, offset, "DER")?;
                 }
@@ -1745,61 +1777,126 @@ pub fn parse_swm_diameter_eap_request(
             }
             Ok(())
         },
-    )?;
-    let auth_application_id = builder_helpers::require_field(
+    );
+    if let Err(error) = parse_result {
+        if let Some((missing_error, parent_offset)) = terminal_missing_imei {
+            let imei = dictionary().find_avp(AvpKey::vendor(AVP_IMEI, VENDOR_ID_3GPP));
+            let parent =
+                dictionary().find_avp(AvpKey::vendor(AVP_TERMINAL_INFORMATION, VENDOR_ID_3GPP));
+            return Err(match (imei, parent) {
+                (Some(definition), Some(parent_definition)) => {
+                    DiameterParserError::missing_with_parent(
+                        message,
+                        missing_error,
+                        definition,
+                        parent_definition,
+                        parent_offset,
+                        APPLICATION_ID,
+                        COMMAND_DIAMETER_EAP,
+                    )
+                }
+                _ => DiameterParserError::decoded(message, error),
+            });
+        }
+        return Err(DiameterParserError::decoded(message, error));
+    }
+    let auth_application_id = require_swm_request_field(
         auth_application_id,
         "SWm DER requires Auth-Application-Id",
+        AvpKey::ietf(base::AVP_AUTH_APPLICATION_ID),
+        message,
         "DER",
     )?;
     if auth_application_id != APPLICATION_ID.get() {
-        return Err(DecodeError::new(
-            DecodeErrorCode::Structural {
-                reason: "SWm DER Auth-Application-Id does not match the SWm application id",
-            },
-            crate::DIAMETER_HEADER_LEN,
-        )
-        .with_spec_ref(SpecRef::new("3gpp", "TS29273", "DER")));
+        return Err(DiameterParserError::decoded(
+            message,
+            DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "SWm DER Auth-Application-Id does not match the SWm application id",
+                },
+                crate::DIAMETER_HEADER_LEN,
+            )
+            .with_spec_ref(SpecRef::new("3gpp", "TS29273", "DER")),
+        ));
     }
     let request = SwmDiameterEapRequest {
-        session_id: builder_helpers::require_field(
+        session_id: require_swm_request_field(
             session_id,
             "SWm DER requires Session-Id",
+            AvpKey::ietf(base::AVP_SESSION_ID),
+            message,
             "DER",
         )?,
         auth_application_id,
-        origin_host: builder_helpers::require_field(
+        origin_host: require_swm_request_field(
             origin_host,
             "SWm DER requires Origin-Host",
+            AvpKey::ietf(base::AVP_ORIGIN_HOST),
+            message,
             "DER",
         )?,
-        origin_realm: builder_helpers::require_field(
+        origin_realm: require_swm_request_field(
             origin_realm,
             "SWm DER requires Origin-Realm",
+            AvpKey::ietf(base::AVP_ORIGIN_REALM),
+            message,
             "DER",
         )?,
-        destination_realm: builder_helpers::require_field(
+        destination_realm: require_swm_request_field(
             destination_realm,
             "SWm DER requires Destination-Realm",
+            AvpKey::ietf(base::AVP_DESTINATION_REALM),
+            message,
             "DER",
         )?,
         destination_host,
         user_name,
-        auth_request_type: builder_helpers::require_field(
+        auth_request_type: require_swm_request_field(
             auth_request_type,
             "SWm DER requires Auth-Request-Type",
+            AvpKey::ietf(AVP_AUTH_REQUEST_TYPE),
+            message,
             "DER",
         )?,
-        eap_payload: builder_helpers::require_field(
+        eap_payload: require_swm_request_field(
             eap_payload,
             "SWm DER requires EAP-Payload",
+            AvpKey::ietf(AVP_EAP_PAYLOAD),
+            message,
             "DER",
         )?,
         emergency_services,
         terminal_information,
         state_avps,
     };
-    validate_decoded_request(&request)?;
+    validate_decoded_request(&request)
+        .map_err(|error| DiameterParserError::decoded(message, error))?;
     Ok(request)
+}
+
+fn require_swm_request_field<T>(
+    field: Option<T>,
+    reason: &'static str,
+    key: AvpKey,
+    message: &Message<'_>,
+    section: &'static str,
+) -> Result<T, DiameterParserError> {
+    field.ok_or_else(|| {
+        let error = decode_structural_error(reason, section);
+        match base::dictionary()
+            .find_avp(key)
+            .or_else(|| dictionary().find_avp(key))
+        {
+            Some(definition) => DiameterParserError::missing_for_definition(
+                message,
+                error,
+                definition,
+                APPLICATION_ID,
+                COMMAND_DIAMETER_EAP,
+            ),
+            None => DiameterParserError::decoded(message, error),
+        }
+    })
 }
 
 /// Parse a SWm DER while retaining its Diameter transaction identifiers.
@@ -1811,8 +1908,18 @@ pub fn parse_swm_diameter_eap_request_envelope(
     message: &Message<'_>,
     ctx: DecodeContext,
 ) -> Result<SwmDiameterEapRequestEnvelope, DecodeError> {
+    parse_swm_diameter_eap_request_envelope_with_provenance(message, ctx)
+        .map_err(DiameterParserError::into_decode_error)
+}
+
+/// Parse a SWm DER transaction envelope while retaining typed provenance for
+/// an omitted mandatory AVP.
+pub fn parse_swm_diameter_eap_request_envelope_with_provenance(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<SwmDiameterEapRequestEnvelope, DiameterParserError> {
     let transaction = SwmDiameterTransaction::from_message(message);
-    let request = parse_swm_diameter_eap_request(message, ctx)?;
+    let request = parse_swm_diameter_eap_request_with_provenance(message, ctx)?;
     Ok(SwmDiameterEapRequestEnvelope {
         transaction,
         request,
@@ -2368,12 +2475,23 @@ fn append_terminal_information_avp(
     )
 }
 
+enum TerminalInformationParseError {
+    Decode(DecodeError),
+    MissingImei(DecodeError),
+}
+
+impl From<DecodeError> for TerminalInformationParseError {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
 fn parse_terminal_information(
     value: &[u8],
     ctx: DecodeContext,
     base_offset: usize,
     depth: usize,
-) -> Result<SwmTerminalInformation, DecodeError> {
+) -> Result<SwmTerminalInformation, TerminalInformationParseError> {
     let mut imei = None;
     let mut software_version = None;
     builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
@@ -2416,8 +2534,14 @@ fn parse_terminal_information(
         }
         Ok(())
     })?;
+    let imei = imei.ok_or_else(|| {
+        TerminalInformationParseError::MissingImei(missing_child_error(
+            base_offset,
+            "missing IMEI child AVP",
+        ))
+    })?;
     Ok(SwmTerminalInformation {
-        imei: imei.ok_or_else(|| missing_child_error(base_offset, "missing IMEI child AVP"))?,
+        imei,
         software_version,
     })
 }

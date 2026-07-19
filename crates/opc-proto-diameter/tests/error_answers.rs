@@ -1,14 +1,17 @@
 //! RFC 6733 request-bound error-answer evidence.
 
 use bytes::{BufMut, BytesMut};
-use opc_proto_diameter::apps::swm::parse_swm_diameter_eap_request;
+use opc_proto_diameter::apps::swm::{
+    parse_swm_diameter_eap_request, parse_swm_diameter_eap_request_with_provenance,
+};
 use opc_proto_diameter::apps::{swm, APP_DICTIONARIES, VENDOR_ID_3GPP};
 use opc_proto_diameter::base::{
-    self, APPLICATION_ID_COMMON_MESSAGES, AVP_DESTINATION_HOST, AVP_DESTINATION_REALM,
-    AVP_DISCONNECT_CAUSE, AVP_FAILED_AVP, AVP_HOST_IP_ADDRESS, AVP_ORIGIN_HOST, AVP_PROXY_HOST,
+    self, APPLICATION_ID_COMMON_MESSAGES, AVP_ACCT_APPLICATION_ID, AVP_AUTH_APPLICATION_ID,
+    AVP_DESTINATION_HOST, AVP_DESTINATION_REALM, AVP_DISCONNECT_CAUSE, AVP_FAILED_AVP,
+    AVP_HOST_IP_ADDRESS, AVP_ORIGIN_HOST, AVP_ORIGIN_REALM, AVP_PRODUCT_NAME, AVP_PROXY_HOST,
     AVP_PROXY_INFO, AVP_PROXY_STATE, AVP_RESULT_CODE, AVP_ROUTE_RECORD, AVP_SESSION_ID,
-    AVP_VENDOR_SPECIFIC_APPLICATION_ID, COMMAND_CAPABILITIES_EXCHANGE, COMMAND_DEVICE_WATCHDOG,
-    COMMAND_DISCONNECT_PEER, RESULT_CODE_DIAMETER_APPLICATION_UNSUPPORTED,
+    AVP_VENDOR_ID, AVP_VENDOR_SPECIFIC_APPLICATION_ID, COMMAND_CAPABILITIES_EXCHANGE,
+    COMMAND_DEVICE_WATCHDOG, COMMAND_DISCONNECT_PEER, RESULT_CODE_DIAMETER_APPLICATION_UNSUPPORTED,
     RESULT_CODE_DIAMETER_AVP_NOT_ALLOWED, RESULT_CODE_DIAMETER_AVP_OCCURS_TOO_MANY_TIMES,
     RESULT_CODE_DIAMETER_AVP_UNSUPPORTED, RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
     RESULT_CODE_DIAMETER_INVALID_AVP_BITS, RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH,
@@ -26,9 +29,12 @@ use opc_proto_diameter::error_answer::{
     DiameterFailureMappingError, DiameterRequestClassificationError, DiameterRequestEnvelope,
     DiameterRequestFailure, DiameterRequestInspection, DiameterUnanswerableReason,
 };
+use opc_proto_diameter::parser_error::{DiameterGroupedAvpSetFailureKind, DiameterParserError};
 use opc_proto_diameter::peer::{
-    parse_device_watchdog_answer, parse_device_watchdog_request, parse_disconnect_peer_answer,
-    parse_disconnect_peer_request,
+    parse_capabilities_exchange_request, parse_capabilities_exchange_request_with_provenance,
+    parse_device_watchdog_answer, parse_device_watchdog_request,
+    parse_device_watchdog_request_with_provenance, parse_disconnect_peer_answer,
+    parse_disconnect_peer_request, parse_disconnect_peer_request_with_provenance,
 };
 use opc_proto_diameter::{
     ApplicationId, AvpCode, AvpFlags, AvpHeader, CommandCode, CommandFlags, Header, Message,
@@ -36,7 +42,7 @@ use opc_proto_diameter::{
 };
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, Encode, EncodeContext,
-    EncodeErrorCode, SpecRef, UnknownIePolicy,
+    EncodeErrorCode, SpecRef, UnknownIePolicy, ValidationLevel,
 };
 
 const UNKNOWN_COMMAND_REQUEST: &str =
@@ -186,6 +192,64 @@ static AMBIGUOUS_AVP_DICTIONARY: Dictionary = Dictionary::new(
 );
 static AMBIGUOUS_AVP_REFS: [&Dictionary; 2] = [base::dictionary(), &AMBIGUOUS_AVP_DICTIONARY];
 static AMBIGUOUS_AVP_DICTIONARIES: DictionarySet<'static> = DictionarySet::new(&AMBIGUOUS_AVP_REFS);
+
+static CONFLICTING_NESTED_VENDOR_ID_AVPS: [AvpDefinition; 1] = [AvpDefinition::new(
+    AvpKey::ietf(AVP_VENDOR_ID),
+    "Conflicting-Nested-Vendor-Id",
+    AvpDataType::OctetString,
+    AvpFlagRules::base_optional(),
+    SpecRef::new("ietf", "RFC6733", "6.11"),
+)];
+static AMBIGUOUS_NESTED_VENDOR_ID_DICTIONARY: Dictionary = Dictionary::new(
+    "diameter-error-answer-ambiguous-nested-vendor-id-test",
+    &[],
+    &[],
+    &CONFLICTING_NESTED_VENDOR_ID_AVPS,
+);
+static AMBIGUOUS_NESTED_VENDOR_ID_REFS: [&Dictionary; 2] =
+    [base::dictionary(), &AMBIGUOUS_NESTED_VENDOR_ID_DICTIONARY];
+static AMBIGUOUS_NESTED_VENDOR_ID_DICTIONARIES: DictionarySet<'static> =
+    DictionarySet::new(&AMBIGUOUS_NESTED_VENDOR_ID_REFS);
+
+static MISSING_AVP_APPLICATIONS: [ApplicationDefinition; 1] = [ApplicationDefinition::new(
+    APPLICATION_ID_COMMON_MESSAGES,
+    "Diameter Common Messages",
+    None,
+    SpecRef::new("ietf", "RFC6733", "3"),
+)];
+static MISSING_AVP_COMMANDS: [CommandDefinition; 1] = [CommandDefinition::new(
+    COMMAND_DEVICE_WATCHDOG,
+    "Device-Watchdog-Request",
+    CommandKind::Request,
+    APPLICATION_ID_COMMON_MESSAGES,
+    false,
+    SpecRef::new("ietf", "RFC6733", "5.5.1"),
+)];
+static MISSING_AVP_DICTIONARY: Dictionary = Dictionary::new(
+    "diameter-parser-provenance-no-avp-definition-test",
+    &MISSING_AVP_APPLICATIONS,
+    &MISSING_AVP_COMMANDS,
+    &[],
+);
+static MISSING_AVP_REFS: [&Dictionary; 1] = [&MISSING_AVP_DICTIONARY];
+static MISSING_AVP_DICTIONARIES: DictionarySet<'static> = DictionarySet::new(&MISSING_AVP_REFS);
+
+static SCHEMA_MISMATCH_AVPS: [AvpDefinition; 1] = [AvpDefinition::new(
+    AvpKey::ietf(AVP_ORIGIN_HOST),
+    "Conflicting-Origin-Host",
+    AvpDataType::OctetString,
+    AvpFlagRules::base_optional(),
+    SpecRef::new("ietf", "RFC6733", "6.3"),
+)];
+static SCHEMA_MISMATCH_DICTIONARY: Dictionary = Dictionary::new(
+    "diameter-parser-provenance-schema-mismatch-test",
+    &MISSING_AVP_APPLICATIONS,
+    &MISSING_AVP_COMMANDS,
+    &SCHEMA_MISMATCH_AVPS,
+);
+static SCHEMA_MISMATCH_REFS: [&Dictionary; 1] = [&SCHEMA_MISMATCH_DICTIONARY];
+static SCHEMA_MISMATCH_DICTIONARIES: DictionarySet<'static> =
+    DictionarySet::new(&SCHEMA_MISMATCH_REFS);
 
 fn fixture(source: &str) -> Vec<u8> {
     source
@@ -352,6 +416,156 @@ fn encode_request(
         .expect("test header must encode");
     encoded.put_slice(raw_avps);
     encoded.to_vec()
+}
+
+fn encoded_field(key: AvpKey, mandatory: bool, value: &[u8]) -> (AvpKey, Vec<u8>) {
+    let header = match key.vendor_id() {
+        Some(vendor_id) => AvpHeader::vendor(key.code(), vendor_id, mandatory),
+        None => AvpHeader::ietf(key.code(), mandatory),
+    };
+    (key, encode_avp(header, value))
+}
+
+fn fields_except(fields: &[(AvpKey, Vec<u8>)], missing: AvpKey) -> Vec<u8> {
+    fields
+        .iter()
+        .filter(|(key, _)| *key != missing)
+        .flat_map(|(_, wire)| wire.iter().copied())
+        .collect()
+}
+
+fn cer_request_with_vendor_application(grouped_value: &[u8]) -> Vec<u8> {
+    let fields = [
+        encode_avp(AvpHeader::ietf(AVP_ORIGIN_HOST, true), b"cer.peer.invalid"),
+        encode_avp(AvpHeader::ietf(AVP_ORIGIN_REALM, true), b"invalid"),
+        encode_avp(
+            AvpHeader::ietf(AVP_HOST_IP_ADDRESS, true),
+            &[0, 1, 192, 0, 2, 10],
+        ),
+        encode_avp(
+            AvpHeader::ietf(AVP_VENDOR_ID, true),
+            &10_415_u32.to_be_bytes(),
+        ),
+        encode_avp(AvpHeader::ietf(AVP_PRODUCT_NAME, false), b"opc-test"),
+        encode_avp(
+            AvpHeader::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID, true),
+            grouped_value,
+        ),
+    ];
+    let raw: Vec<_> = fields.into_iter().flatten().collect();
+    encode_request(
+        CommandFlags::request(false),
+        COMMAND_CAPABILITIES_EXCHANGE,
+        APPLICATION_ID_COMMON_MESSAGES,
+        &raw,
+    )
+}
+
+fn valid_swm_der_fields() -> Vec<Vec<u8>> {
+    vec![
+        encode_avp(AvpHeader::ietf(AVP_SESSION_ID, true), b"session;redacted"),
+        encode_avp(
+            AvpHeader::ietf(AVP_AUTH_APPLICATION_ID, true),
+            &swm::APPLICATION_ID.get().to_be_bytes(),
+        ),
+        encode_avp(AvpHeader::ietf(AVP_ORIGIN_HOST, true), b"epdg.invalid"),
+        encode_avp(AvpHeader::ietf(AVP_ORIGIN_REALM, true), b"visited.invalid"),
+        encode_avp(
+            AvpHeader::ietf(AVP_DESTINATION_REALM, true),
+            b"home.invalid",
+        ),
+        encode_avp(
+            AvpHeader::ietf(swm::AVP_AUTH_REQUEST_TYPE, true),
+            &swm::AUTH_REQUEST_TYPE_AUTHORIZE_AUTHENTICATE.to_be_bytes(),
+        ),
+        encode_avp(
+            AvpHeader::ietf(swm::AVP_EAP_PAYLOAD, true),
+            &[2, 7, 0, 8, 1, 2, 3, 4],
+        ),
+    ]
+}
+
+fn failed_avp_inner_wire(answer: &[u8]) -> Vec<u8> {
+    let message = decode_message(answer);
+    let failed = avps(&message)
+        .into_iter()
+        .find(|avp| avp.header.code == AVP_FAILED_AVP)
+        .expect("answer must contain Failed-AVP");
+    failed.value.to_vec()
+}
+
+fn assert_typed_missing_maps<T: core::fmt::Debug>(
+    request: &[u8],
+    expected_key: AvpKey,
+    expected_value_len: usize,
+    expected_mandatory: bool,
+    dictionaries: DictionarySet<'_>,
+    parser: impl FnOnce(&Message<'_>) -> Result<T, DiameterParserError>,
+) {
+    let message = decode_message(request);
+    let parser_error = parser(&message).expect_err("the selected mandatory AVP must be absent");
+    assert!(matches!(
+        parser_error.decode_error().code(),
+        DecodeErrorCode::Structural { .. }
+    ));
+    assert_eq!(parser_error.decode_error().offset(), DIAMETER_HEADER_LEN);
+    let provenance = parser_error
+        .missing_avp()
+        .expect("missing mandatory AVP provenance must be retained");
+    assert_eq!(provenance.key(), expected_key);
+    assert_eq!(provenance.avp_code(), expected_key.code());
+    assert_eq!(provenance.vendor_id(), expected_key.vendor_id());
+    let expected_definition = dictionaries
+        .find_avp(expected_key)
+        .expect("missing AVP must have a dictionary definition");
+    assert_eq!(provenance.definition(), expected_definition);
+    assert_eq!(provenance.data_type(), expected_definition.data_type());
+    assert_eq!(provenance.flag_rules(), expected_definition.flags());
+    assert_eq!(provenance.application_id(), message.header.application_id);
+    assert_eq!(provenance.command_code(), message.header.command_code);
+    assert_eq!(provenance.command_kind(), CommandKind::Request);
+
+    let request_envelope = envelope(request);
+    assert!(request_envelope
+        .classify(request, dictionaries)
+        .expect("test dictionaries must be unambiguous")
+        .is_none());
+    let bound = DiameterRequestFailure::from_parser_error(
+        &request_envelope,
+        request,
+        &parser_error,
+        DecodeContext::conservative(),
+        dictionaries,
+        EncodeContext::default(),
+    )
+    .expect("sealed parser provenance must map to a bound 5005 failure");
+    assert_eq!(bound.result_code(), RESULT_CODE_DIAMETER_MISSING_AVP);
+    let DiameterRequestFailure::MissingMandatoryAvp(failed) = bound.failure() else {
+        panic!("typed missing provenance must map to MissingMandatoryAvp");
+    };
+    assert_eq!(failed.leaf_code(), expected_key.code());
+    assert_eq!(failed.leaf_vendor_id(), expected_key.vendor_id());
+    assert_eq!(failed.leaf_offset(), None);
+
+    let encoded = encode_plan(
+        request,
+        &request_envelope,
+        &bound,
+        DiameterErrorAnswerGrammar::Rfc6733ErrorBitFallback,
+    );
+    let answer = decode_message(&encoded);
+    let failed_group = avps(&answer)
+        .into_iter()
+        .find(|avp| avp.header.code == AVP_FAILED_AVP)
+        .expect("5005 answer must contain Failed-AVP");
+    let (remaining, leaf) = RawAvp::decode(failed_group.value, DecodeContext::default())
+        .expect("synthesized Failed-AVP leaf must decode");
+    assert!(remaining.is_empty());
+    assert_eq!(leaf.header.key(), expected_key);
+    assert_eq!(leaf.header.flags.is_mandatory(), expected_mandatory);
+    assert!(!leaf.header.flags.is_protected());
+    assert_eq!(leaf.value.len(), expected_value_len);
+    assert!(leaf.value.iter().all(|byte| *byte == 0));
 }
 
 #[test]
@@ -2761,4 +2975,1059 @@ fn failed_avp_synthesis_rejects_over_u24_lengths_before_allocation() {
     )
     .expect_err("malformed synthesis above U24 must fail before allocation");
     assert!(matches!(malformed.code(), EncodeErrorCode::LengthOverflow));
+}
+
+#[test]
+fn actual_peer_request_parsers_map_every_required_omission_to_bound_5005() {
+    let cer_fields = vec![
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_HOST), true, b"cer.peer.invalid"),
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_REALM), true, b"invalid"),
+        encoded_field(
+            AvpKey::ietf(AVP_HOST_IP_ADDRESS),
+            true,
+            &[0, 1, 192, 0, 2, 10],
+        ),
+        encoded_field(AvpKey::ietf(AVP_VENDOR_ID), true, &10_415_u32.to_be_bytes()),
+        encoded_field(AvpKey::ietf(AVP_PRODUCT_NAME), false, b"opc-test"),
+    ];
+    for (missing, minimum_value_len, mandatory) in [
+        (AvpKey::ietf(AVP_ORIGIN_HOST), 0, true),
+        (AvpKey::ietf(AVP_ORIGIN_REALM), 0, true),
+        (AvpKey::ietf(AVP_HOST_IP_ADDRESS), 6, true),
+        (AvpKey::ietf(AVP_VENDOR_ID), 4, true),
+        (AvpKey::ietf(AVP_PRODUCT_NAME), 0, false),
+    ] {
+        let request = encode_request(
+            CommandFlags::request(false),
+            COMMAND_CAPABILITIES_EXCHANGE,
+            APPLICATION_ID_COMMON_MESSAGES,
+            &fields_except(&cer_fields, missing),
+        );
+        assert_typed_missing_maps(
+            &request,
+            missing,
+            minimum_value_len,
+            mandatory,
+            APP_DICTIONARIES,
+            |message| {
+                parse_capabilities_exchange_request_with_provenance(
+                    message,
+                    DecodeContext::conservative(),
+                )
+            },
+        );
+    }
+
+    let dwr_fields = vec![
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_HOST), true, b"dwr.peer.invalid"),
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_REALM), true, b"invalid"),
+    ];
+    for missing in [
+        AvpKey::ietf(AVP_ORIGIN_HOST),
+        AvpKey::ietf(AVP_ORIGIN_REALM),
+    ] {
+        let request = encode_request(
+            CommandFlags::request(false),
+            COMMAND_DEVICE_WATCHDOG,
+            APPLICATION_ID_COMMON_MESSAGES,
+            &fields_except(&dwr_fields, missing),
+        );
+        assert_typed_missing_maps(&request, missing, 0, true, APP_DICTIONARIES, |message| {
+            parse_device_watchdog_request_with_provenance(message, DecodeContext::conservative())
+        });
+    }
+
+    let dpr_fields = vec![
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_HOST), true, b"dpr.peer.invalid"),
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_REALM), true, b"invalid"),
+        encoded_field(
+            AvpKey::ietf(AVP_DISCONNECT_CAUSE),
+            true,
+            &0_u32.to_be_bytes(),
+        ),
+    ];
+    for (missing, minimum_value_len) in [
+        (AvpKey::ietf(AVP_ORIGIN_HOST), 0),
+        (AvpKey::ietf(AVP_ORIGIN_REALM), 0),
+        (AvpKey::ietf(AVP_DISCONNECT_CAUSE), 4),
+    ] {
+        let request = encode_request(
+            CommandFlags::request(false),
+            COMMAND_DISCONNECT_PEER,
+            APPLICATION_ID_COMMON_MESSAGES,
+            &fields_except(&dpr_fields, missing),
+        );
+        assert_typed_missing_maps(
+            &request,
+            missing,
+            minimum_value_len,
+            true,
+            APP_DICTIONARIES,
+            |message| {
+                parse_disconnect_peer_request_with_provenance(
+                    message,
+                    DecodeContext::conservative(),
+                )
+            },
+        );
+    }
+}
+
+#[test]
+fn cer_vendor_application_missing_vendor_id_maps_nested_bound_5005() {
+    let auth = encode_avp(
+        AvpHeader::ietf(AVP_AUTH_APPLICATION_ID, true),
+        &swm::APPLICATION_ID.get().to_be_bytes(),
+    );
+    let request = cer_request_with_vendor_application(&auth);
+    let message = decode_message(&request);
+    let error = parse_capabilities_exchange_request_with_provenance(
+        &message,
+        DecodeContext::conservative(),
+    )
+    .expect_err("VSAI without Vendor-Id must fail");
+    let legacy = parse_capabilities_exchange_request(&message, DecodeContext::conservative())
+        .expect_err("legacy CER parser must retain the same failure");
+    assert_eq!(&legacy, error.decode_error());
+    let provenance = error
+        .missing_avp()
+        .expect("missing nested Vendor-Id provenance must be sealed");
+    assert_eq!(provenance.key(), AvpKey::ietf(AVP_VENDOR_ID));
+    let parent = provenance.parent().expect("VSAI parent must be retained");
+    assert_eq!(
+        parent.key(),
+        AvpKey::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID)
+    );
+    assert_eq!(
+        error.decode_error().offset(),
+        parent.offset() + AVP_HEADER_LEN
+    );
+
+    let request_envelope = envelope(&request);
+    let bound = DiameterRequestFailure::from_parser_error(
+        &request_envelope,
+        &request,
+        &error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("sealed nested omission must bind");
+    assert_eq!(bound.result_code(), RESULT_CODE_DIAMETER_MISSING_AVP);
+    let answer = encode_plan(
+        &request,
+        &request_envelope,
+        &bound,
+        DiameterErrorAnswerGrammar::Application,
+    );
+    let failed_wire = failed_avp_inner_wire(&answer);
+    let (remaining, outer) = RawAvp::decode(&failed_wire, DecodeContext::default())
+        .expect("nested Failed-AVP must decode");
+    assert!(remaining.is_empty());
+    assert_eq!(
+        outer.header.key(),
+        AvpKey::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID)
+    );
+    let children: Vec<_> = outer
+        .grouped_avps(DecodeContext::default())
+        .map(|child| child.expect("nested Failed-AVP child must decode"))
+        .collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].header.key(), AvpKey::ietf(AVP_VENDOR_ID));
+    assert_eq!(children[0].header.flags.bits(), AvpFlags::MANDATORY);
+    assert_eq!(children[0].value, [0, 0, 0, 0]);
+}
+
+#[test]
+fn cer_vendor_application_missing_one_of_reports_both_child_examples() {
+    let vendor = encode_avp(
+        AvpHeader::ietf(AVP_VENDOR_ID, true),
+        &10_415_u32.to_be_bytes(),
+    );
+    let request = cer_request_with_vendor_application(&vendor);
+    let message = decode_message(&request);
+    let error = parse_capabilities_exchange_request_with_provenance(
+        &message,
+        DecodeContext::conservative(),
+    )
+    .expect_err("VSAI without an application child must fail");
+    let grouped = error
+        .grouped_avp_set_provenance()
+        .expect("one-of failure must retain grouped-set provenance");
+    assert_eq!(
+        grouped.failure_kind(),
+        DiameterGroupedAvpSetFailureKind::MissingOneOf
+    );
+    assert_eq!(
+        grouped
+            .definitions()
+            .iter()
+            .map(|definition| definition.key())
+            .collect::<Vec<_>>(),
+        [
+            AvpKey::ietf(AVP_AUTH_APPLICATION_ID),
+            AvpKey::ietf(AVP_ACCT_APPLICATION_ID),
+        ]
+    );
+    let request_envelope = envelope(&request);
+    let bounded = DiameterRequestFailure::from_parser_error(
+        &request_envelope,
+        &request,
+        &error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext {
+            max_message_len: 24,
+            ..EncodeContext::default()
+        },
+    );
+    assert!(matches!(
+        bounded,
+        Err(DiameterFailureMappingError::FailedAvpEncoding(_))
+    ));
+    let bound = DiameterRequestFailure::from_parser_error(
+        &request_envelope,
+        &request,
+        &error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("sealed one-of omission must bind");
+    assert!(matches!(
+        bound.failure(),
+        DiameterRequestFailure::MissingMandatoryAvp(_)
+    ));
+    let answer = encode_plan(
+        &request,
+        &request_envelope,
+        &bound,
+        DiameterErrorAnswerGrammar::Application,
+    );
+    let failed_wire = failed_avp_inner_wire(&answer);
+    let (remaining, outer) = RawAvp::decode(&failed_wire, DecodeContext::default())
+        .expect("one-of Failed-AVP must decode");
+    assert!(remaining.is_empty());
+    let children: Vec<_> = outer
+        .grouped_avps(DecodeContext::default())
+        .map(|child| child.expect("one-of Failed-AVP child must decode"))
+        .collect();
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| child.header.key())
+            .collect::<Vec<_>>(),
+        [
+            AvpKey::ietf(AVP_AUTH_APPLICATION_ID),
+            AvpKey::ietf(AVP_ACCT_APPLICATION_ID),
+        ]
+    );
+    assert!(children.iter().all(|child| child.value == [0, 0, 0, 0]));
+    assert!(children
+        .iter()
+        .all(|child| child.header.flags.bits() == AvpFlags::MANDATORY));
+}
+
+#[test]
+fn cer_vendor_application_conflict_reports_only_received_children_in_wire_order() {
+    let unknown = encode_avp(
+        AvpHeader::ietf(AvpCode::new(55_510), false),
+        b"not-reflected",
+    );
+    let acct = encode_avp(
+        AvpHeader::ietf(AVP_ACCT_APPLICATION_ID, true),
+        &0x1122_3344_u32.to_be_bytes(),
+    );
+    let vendor = encode_avp(
+        AvpHeader::ietf(AVP_VENDOR_ID, true),
+        &10_415_u32.to_be_bytes(),
+    );
+    let auth = encode_avp(
+        AvpHeader::ietf(AVP_AUTH_APPLICATION_ID, true),
+        &0x5566_7788_u32.to_be_bytes(),
+    );
+    let ctx = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Preserve,
+        ..DecodeContext::conservative()
+    };
+    let cases = [
+        (
+            vec![unknown.clone(), acct.clone(), vendor.clone(), auth.clone()],
+            [
+                (AVP_ACCT_APPLICATION_ID, 0x1122_3344_u32),
+                (AVP_AUTH_APPLICATION_ID, 0x5566_7788_u32),
+            ],
+        ),
+        (
+            vec![vendor, auth, unknown, acct],
+            [
+                (AVP_AUTH_APPLICATION_ID, 0x5566_7788_u32),
+                (AVP_ACCT_APPLICATION_ID, 0x1122_3344_u32),
+            ],
+        ),
+    ];
+    for (ordered_children, expected) in cases {
+        let grouped_value: Vec<_> = ordered_children.into_iter().flatten().collect();
+        let request = cer_request_with_vendor_application(&grouped_value);
+        let message = decode_message(&request);
+        let error = parse_capabilities_exchange_request_with_provenance(&message, ctx)
+            .expect_err("VSAI carrying Auth and Acct children must fail");
+        let legacy = parse_capabilities_exchange_request(&message, ctx)
+            .expect_err("legacy CER parser must retain the same conflict failure");
+        assert_eq!(&legacy, error.decode_error());
+        assert_eq!(
+            error
+                .grouped_avp_set_provenance()
+                .expect("mutual exclusion provenance must be sealed")
+                .failure_kind(),
+            DiameterGroupedAvpSetFailureKind::MutuallyExclusivePresent
+        );
+        let request_envelope = envelope(&request);
+        let bound = DiameterRequestFailure::from_parser_error(
+            &request_envelope,
+            &request,
+            &error,
+            ctx,
+            APP_DICTIONARIES,
+            EncodeContext::default(),
+        )
+        .expect("sealed mutual-exclusion failure must bind");
+        assert!(matches!(
+            bound.failure(),
+            DiameterRequestFailure::MutuallyExclusiveAvps(_)
+        ));
+        assert_eq!(
+            bound.result_code(),
+            RESULT_CODE_DIAMETER_AVP_OCCURS_TOO_MANY_TIMES
+        );
+        let answer = encode_plan(
+            &request,
+            &request_envelope,
+            &bound,
+            DiameterErrorAnswerGrammar::Application,
+        );
+        let failed_wire = failed_avp_inner_wire(&answer);
+        let (remaining, outer) = RawAvp::decode(&failed_wire, DecodeContext::default())
+            .expect("conflict Failed-AVP must decode");
+        assert!(remaining.is_empty());
+        assert_eq!(
+            outer.header.key(),
+            AvpKey::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID)
+        );
+        assert_eq!(outer.header.flags.bits(), AvpFlags::MANDATORY);
+        let children: Vec<_> = outer
+            .grouped_avps(DecodeContext::default())
+            .map(|child| child.expect("conflict Failed-AVP child must decode"))
+            .collect();
+        assert_eq!(children.len(), 2);
+        for (child, (expected_code, expected_value)) in children.iter().zip(expected) {
+            assert_eq!(child.header.key(), AvpKey::ietf(expected_code));
+            assert_eq!(child.header.flags.bits(), AvpFlags::MANDATORY);
+            assert_eq!(child.value, expected_value.to_be_bytes());
+        }
+        let diagnostics = format!("{error:?} {bound:?}");
+        assert!(!diagnostics.contains("287454020"));
+        assert!(!diagnostics.contains("1432778632"));
+        assert!(!diagnostics.contains("not-reflected"));
+    }
+}
+
+#[test]
+fn cer_vendor_application_individual_duplicate_remains_ordinary_5009() {
+    let vendor = encode_avp(
+        AvpHeader::ietf(AVP_VENDOR_ID, true),
+        &10_415_u32.to_be_bytes(),
+    );
+    for duplicate_code in [AVP_AUTH_APPLICATION_ID, AVP_ACCT_APPLICATION_ID] {
+        let application = encode_avp(
+            AvpHeader::ietf(duplicate_code, true),
+            &swm::APPLICATION_ID.get().to_be_bytes(),
+        );
+        let grouped_value: Vec<_> = [vendor.clone(), application.clone(), application]
+            .into_iter()
+            .flatten()
+            .collect();
+        let request = cer_request_with_vendor_application(&grouped_value);
+        let message = decode_message(&request);
+        let error = parse_capabilities_exchange_request_with_provenance(
+            &message,
+            DecodeContext::conservative(),
+        )
+        .expect_err("duplicate individual application child must fail");
+        assert!(error.grouped_avp_set_provenance().is_none());
+        assert!(error.missing_avp().is_none());
+        let bound = DiameterRequestFailure::from_parser_error(
+            &envelope(&request),
+            &request,
+            &error,
+            DecodeContext::conservative(),
+            APP_DICTIONARIES,
+            EncodeContext::default(),
+        )
+        .expect("grouped singleton classification must precede generic parser mapping");
+        assert!(matches!(
+            bound.failure(),
+            DiameterRequestFailure::ExcessSingleton(_)
+        ));
+    }
+}
+
+#[test]
+fn earlier_nested_vendor_application_failures_precede_cross_field_semantics() {
+    let vendor = encode_avp(
+        AvpHeader::ietf(AVP_VENDOR_ID, true),
+        &10_415_u32.to_be_bytes(),
+    );
+    let auth = encode_avp(
+        AvpHeader::ietf(AVP_AUTH_APPLICATION_ID, true),
+        &swm::APPLICATION_ID.get().to_be_bytes(),
+    );
+    let acct = encode_avp(
+        AvpHeader::ietf(AVP_ACCT_APPLICATION_ID, true),
+        &3_u32.to_be_bytes(),
+    );
+    let unknown_m = encode_avp(AvpHeader::ietf(AvpCode::new(55_511), true), b"opaque");
+    let invalid_vendor_flags = encode_avp(
+        AvpHeader::ietf(AVP_VENDOR_ID, false),
+        &10_415_u32.to_be_bytes(),
+    );
+    let cases = [
+        (
+            [unknown_m, vendor.clone(), auth.clone(), acct.clone()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            RESULT_CODE_DIAMETER_AVP_UNSUPPORTED,
+        ),
+        (
+            [invalid_vendor_flags, auth.clone(), acct.clone()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            RESULT_CODE_DIAMETER_INVALID_AVP_BITS,
+        ),
+        (
+            [
+                vec![0, 0, 0, 1, AvpFlags::MANDATORY, 0, 0, 7],
+                vendor,
+                auth,
+                acct,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+            RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH,
+        ),
+    ];
+    for (grouped_value, expected_result) in cases {
+        let request = cer_request_with_vendor_application(&grouped_value);
+        let message = decode_message(&request);
+        let error = parse_capabilities_exchange_request_with_provenance(
+            &message,
+            DecodeContext::conservative(),
+        )
+        .expect_err("earlier nested failure must stop VSAI parsing");
+        assert!(error.grouped_avp_set_provenance().is_none());
+        let bound = DiameterRequestFailure::from_parser_error(
+            &envelope(&request),
+            &request,
+            &error,
+            DecodeContext::conservative(),
+            APP_DICTIONARIES,
+            EncodeContext::default(),
+        )
+        .expect("earlier nested failure must classify before cross-field semantics");
+        assert_eq!(bound.result_code(), expected_result);
+    }
+}
+
+#[test]
+fn cer_vsai_malformed_known_child_uses_dictionary_minimum_and_fails_ambiguity() {
+    let malformed_vendor_id = [
+        0,
+        0,
+        1,
+        10,
+        AvpFlags::MANDATORY,
+        0,
+        0,
+        (AVP_HEADER_LEN - 1) as u8,
+    ];
+    let request = cer_request_with_vendor_application(&malformed_vendor_id);
+    let message = decode_message(&request);
+    let error = parse_capabilities_exchange_request_with_provenance(
+        &message,
+        DecodeContext::conservative(),
+    )
+    .expect_err("short Vendor-Id child must fail CER parsing");
+    assert!(error.missing_avp().is_none());
+    assert!(error.grouped_avp_set_provenance().is_none());
+
+    let request_envelope = envelope(&request);
+    let bound = DiameterRequestFailure::from_parser_error(
+        &request_envelope,
+        &request,
+        &error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("known malformed grouped child must map using its dictionary definition");
+    assert!(matches!(
+        bound.failure(),
+        DiameterRequestFailure::InvalidAvpLength(_)
+    ));
+    assert_eq!(bound.result_code(), RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH);
+
+    let answer = encode_plan(
+        &request,
+        &request_envelope,
+        &bound,
+        DiameterErrorAnswerGrammar::Application,
+    );
+    let failed_wire = failed_avp_inner_wire(&answer);
+    let (remaining, outer) = RawAvp::decode(&failed_wire, DecodeContext::default())
+        .expect("grouped Failed-AVP must decode");
+    assert!(remaining.is_empty());
+    assert_eq!(
+        outer.header.key(),
+        AvpKey::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID)
+    );
+    assert_eq!(outer.header.flags.bits(), AvpFlags::MANDATORY);
+    let children: Vec<_> = outer
+        .grouped_avps(DecodeContext::default())
+        .map(|child| child.expect("nested Failed-AVP child must decode"))
+        .collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].header.key(), AvpKey::ietf(AVP_VENDOR_ID));
+    assert_eq!(children[0].header.flags.bits(), AvpFlags::MANDATORY);
+    assert_eq!(children[0].value, [0, 0, 0, 0]);
+
+    assert_eq!(
+        DiameterRequestFailure::from_parser_error(
+            &request_envelope,
+            &request,
+            &error,
+            DecodeContext::conservative(),
+            AMBIGUOUS_NESTED_VENDOR_ID_DICTIONARIES,
+            EncodeContext::default(),
+        ),
+        Err(DiameterFailureMappingError::AvpDefinitionAmbiguous)
+    );
+}
+
+#[test]
+fn actual_swm_der_parser_maps_every_required_omission_to_bound_5005() {
+    let fields = vec![
+        encoded_field(AvpKey::ietf(AVP_SESSION_ID), true, b"session;redacted"),
+        encoded_field(
+            AvpKey::ietf(AVP_AUTH_APPLICATION_ID),
+            true,
+            &swm::APPLICATION_ID.get().to_be_bytes(),
+        ),
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_HOST), true, b"epdg.invalid"),
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_REALM), true, b"visited.invalid"),
+        encoded_field(AvpKey::ietf(AVP_DESTINATION_REALM), true, b"home.invalid"),
+        encoded_field(
+            AvpKey::ietf(swm::AVP_AUTH_REQUEST_TYPE),
+            true,
+            &swm::AUTH_REQUEST_TYPE_AUTHORIZE_AUTHENTICATE.to_be_bytes(),
+        ),
+        encoded_field(
+            AvpKey::ietf(swm::AVP_EAP_PAYLOAD),
+            true,
+            &[2, 7, 0, 8, 1, 2, 3, 4],
+        ),
+    ];
+    for (missing, minimum_value_len) in [
+        (AvpKey::ietf(AVP_SESSION_ID), 0),
+        (AvpKey::ietf(AVP_AUTH_APPLICATION_ID), 4),
+        (AvpKey::ietf(AVP_ORIGIN_HOST), 0),
+        (AvpKey::ietf(AVP_ORIGIN_REALM), 0),
+        (AvpKey::ietf(AVP_DESTINATION_REALM), 0),
+        (AvpKey::ietf(swm::AVP_AUTH_REQUEST_TYPE), 4),
+        (AvpKey::ietf(swm::AVP_EAP_PAYLOAD), 0),
+    ] {
+        let request = encode_request(
+            CommandFlags::request(true),
+            swm::COMMAND_DIAMETER_EAP,
+            swm::APPLICATION_ID,
+            &fields_except(&fields, missing),
+        );
+        assert_typed_missing_maps(
+            &request,
+            missing,
+            minimum_value_len,
+            true,
+            APP_DICTIONARIES,
+            |message| {
+                parse_swm_diameter_eap_request_with_provenance(
+                    message,
+                    DecodeContext::conservative(),
+                )
+            },
+        );
+    }
+}
+
+#[test]
+fn swm_terminal_information_missing_imei_maps_nested_bound_5005() {
+    let software = encode_avp(
+        AvpHeader::vendor(swm::AVP_SOFTWARE_VERSION, VENDOR_ID_3GPP, true),
+        b"99",
+    );
+    let terminal = encode_avp(
+        AvpHeader::vendor(swm::AVP_TERMINAL_INFORMATION, VENDOR_ID_3GPP, true),
+        &software,
+    );
+    let mut fields = valid_swm_der_fields();
+    fields.push(terminal);
+    let raw: Vec<_> = fields.into_iter().flatten().collect();
+    let request = encode_request(
+        CommandFlags::request(true),
+        swm::COMMAND_DIAMETER_EAP,
+        swm::APPLICATION_ID,
+        &raw,
+    );
+    let message = decode_message(&request);
+    let error =
+        parse_swm_diameter_eap_request_with_provenance(&message, DecodeContext::conservative())
+            .expect_err("Terminal-Information without IMEI must fail");
+    let legacy = parse_swm_diameter_eap_request(&message, DecodeContext::conservative())
+        .expect_err("legacy SWm parser must retain the same nested failure");
+    assert_eq!(&legacy, error.decode_error());
+    let provenance = error
+        .missing_avp()
+        .expect("missing IMEI provenance must be sealed");
+    assert_eq!(
+        provenance.key(),
+        AvpKey::vendor(swm::AVP_IMEI, VENDOR_ID_3GPP)
+    );
+    let parent = provenance
+        .parent()
+        .expect("Terminal-Information parent must be retained");
+    assert_eq!(
+        parent.key(),
+        AvpKey::vendor(swm::AVP_TERMINAL_INFORMATION, VENDOR_ID_3GPP)
+    );
+    let request_envelope = envelope(&request);
+    let bound = DiameterRequestFailure::from_parser_error(
+        &request_envelope,
+        &request,
+        &error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("sealed missing IMEI must bind");
+    assert_eq!(bound.result_code(), RESULT_CODE_DIAMETER_MISSING_AVP);
+    let answer = encode_plan(
+        &request,
+        &request_envelope,
+        &bound,
+        DiameterErrorAnswerGrammar::Application,
+    );
+    let failed_wire = failed_avp_inner_wire(&answer);
+    let (remaining, outer) = RawAvp::decode(&failed_wire, DecodeContext::default())
+        .expect("Terminal-Information Failed-AVP must decode");
+    assert!(remaining.is_empty());
+    assert_eq!(outer.header.key(), parent.key());
+    assert_eq!(
+        outer.header.flags.bits(),
+        AvpFlags::VENDOR | AvpFlags::MANDATORY
+    );
+    let children: Vec<_> = outer
+        .grouped_avps(DecodeContext::default())
+        .map(|child| child.expect("Terminal-Information Failed-AVP child must decode"))
+        .collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].header.key(), provenance.key());
+    assert_eq!(
+        children[0].header.flags.bits(),
+        AvpFlags::VENDOR | AvpFlags::MANDATORY
+    );
+    assert!(children[0].value.is_empty());
+
+    let mut different = request.clone();
+    let software_position = different
+        .windows(2)
+        .position(|window| window == b"99")
+        .expect("synthetic software version must be present");
+    different[software_position] = b'8';
+    assert_eq!(
+        DiameterRequestFailure::from_parser_error(
+            &envelope(&different),
+            &different,
+            &error,
+            DecodeContext::conservative(),
+            APP_DICTIONARIES,
+            EncodeContext::default(),
+        ),
+        Err(DiameterFailureMappingError::ParserRequestMismatch)
+    );
+}
+
+#[test]
+fn empty_request_provenance_preserves_existing_required_field_order() {
+    let cases = [
+        (
+            COMMAND_CAPABILITIES_EXCHANGE,
+            APPLICATION_ID_COMMON_MESSAGES,
+            false,
+            AvpKey::ietf(AVP_HOST_IP_ADDRESS),
+        ),
+        (
+            COMMAND_DEVICE_WATCHDOG,
+            APPLICATION_ID_COMMON_MESSAGES,
+            false,
+            AvpKey::ietf(AVP_ORIGIN_HOST),
+        ),
+        (
+            COMMAND_DISCONNECT_PEER,
+            APPLICATION_ID_COMMON_MESSAGES,
+            false,
+            AvpKey::ietf(AVP_DISCONNECT_CAUSE),
+        ),
+        (
+            swm::COMMAND_DIAMETER_EAP,
+            swm::APPLICATION_ID,
+            true,
+            AvpKey::ietf(AVP_AUTH_APPLICATION_ID),
+        ),
+    ];
+    for (command, application, proxiable, expected) in cases {
+        let request = encode_request(CommandFlags::request(proxiable), command, application, &[]);
+        let message = decode_message(&request);
+        let error = if command == COMMAND_CAPABILITIES_EXCHANGE {
+            parse_capabilities_exchange_request_with_provenance(
+                &message,
+                DecodeContext::conservative(),
+            )
+            .expect_err("empty CER must fail")
+        } else if command == COMMAND_DEVICE_WATCHDOG {
+            parse_device_watchdog_request_with_provenance(&message, DecodeContext::conservative())
+                .expect_err("empty DWR must fail")
+        } else if command == COMMAND_DISCONNECT_PEER {
+            parse_disconnect_peer_request_with_provenance(&message, DecodeContext::conservative())
+                .expect_err("empty DPR must fail")
+        } else {
+            parse_swm_diameter_eap_request_with_provenance(&message, DecodeContext::conservative())
+                .expect_err("empty DER must fail")
+        };
+        assert_eq!(
+            error
+                .missing_avp()
+                .expect("empty request must retain missing provenance")
+                .key(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn parser_provenance_is_request_bound_and_dictionary_resolution_fails_closed() {
+    let request = encode_request(
+        CommandFlags::request(false),
+        COMMAND_DEVICE_WATCHDOG,
+        APPLICATION_ID_COMMON_MESSAGES,
+        &[],
+    );
+    let message = decode_message(&request);
+    let parser_error =
+        parse_device_watchdog_request_with_provenance(&message, DecodeContext::conservative())
+            .expect_err("empty DWR must miss Origin-Host");
+    let legacy = parse_device_watchdog_request(&message, DecodeContext::conservative())
+        .expect_err("legacy empty DWR parse must fail");
+    assert_eq!(&legacy, parser_error.decode_error());
+
+    let mut different_request = request.clone();
+    different_request[12] ^= 0x01;
+    let different_envelope = envelope(&different_request);
+    assert_eq!(
+        DiameterRequestFailure::from_parser_error(
+            &different_envelope,
+            &different_request,
+            &parser_error,
+            DecodeContext::conservative(),
+            APP_DICTIONARIES,
+            EncodeContext::default(),
+        ),
+        Err(DiameterFailureMappingError::ParserRequestMismatch)
+    );
+
+    let request_envelope = envelope(&request);
+    assert_eq!(
+        DiameterRequestFailure::from_parser_error(
+            &request_envelope,
+            &request,
+            &parser_error,
+            DecodeContext::conservative(),
+            MISSING_AVP_DICTIONARIES,
+            EncodeContext::default(),
+        ),
+        Err(DiameterFailureMappingError::MissingAvpDefinitionMissing)
+    );
+    assert_eq!(
+        DiameterRequestFailure::from_parser_error(
+            &request_envelope,
+            &request,
+            &parser_error,
+            DecodeContext::conservative(),
+            AMBIGUOUS_AVP_DICTIONARIES,
+            EncodeContext::default(),
+        ),
+        Err(DiameterFailureMappingError::AvpDefinitionAmbiguous)
+    );
+    assert_eq!(
+        DiameterRequestFailure::from_parser_error(
+            &request_envelope,
+            &request,
+            &parser_error,
+            DecodeContext::conservative(),
+            SCHEMA_MISMATCH_DICTIONARIES,
+            EncodeContext::default(),
+        ),
+        Err(DiameterFailureMappingError::MissingAvpDefinitionMismatch)
+    );
+
+    assert_eq!(
+        DiameterRequestFailure::from_decode_error(
+            &request_envelope,
+            &request,
+            parser_error.decode_error(),
+            DecodeContext::conservative(),
+            APP_DICTIONARIES,
+            EncodeContext::default(),
+        ),
+        Err(DiameterFailureMappingError::OffsetAmbiguous)
+    );
+}
+
+#[test]
+fn nonmissing_typed_errors_delegate_and_earlier_request_failures_win() {
+    let invalid_cause = encode_avp(
+        AvpHeader::ietf(AVP_DISCONNECT_CAUSE, true),
+        &99_u32.to_be_bytes(),
+    );
+    let mut dpr_avps = encode_avp(AvpHeader::ietf(AVP_ORIGIN_HOST, true), b"peer.invalid");
+    dpr_avps.extend_from_slice(&encode_avp(
+        AvpHeader::ietf(AVP_ORIGIN_REALM, true),
+        b"invalid",
+    ));
+    dpr_avps.extend_from_slice(&invalid_cause);
+    let dpr = encode_request(
+        CommandFlags::request(false),
+        COMMAND_DISCONNECT_PEER,
+        APPLICATION_ID_COMMON_MESSAGES,
+        &dpr_avps,
+    );
+    let dpr_message = decode_message(&dpr);
+    let dpr_error =
+        parse_disconnect_peer_request_with_provenance(&dpr_message, DecodeContext::conservative())
+            .expect_err("invalid Disconnect-Cause must fail");
+    assert!(dpr_error.missing_avp().is_none());
+    let dpr_bound = DiameterRequestFailure::from_parser_error(
+        &envelope(&dpr),
+        &dpr,
+        &dpr_error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("ordinary parser error must delegate to generic mapping");
+    assert_eq!(
+        dpr_bound.result_code(),
+        RESULT_CODE_DIAMETER_INVALID_AVP_VALUE
+    );
+
+    let invalid_p_bit = encode_request(
+        CommandFlags::request(true),
+        COMMAND_DEVICE_WATCHDOG,
+        APPLICATION_ID_COMMON_MESSAGES,
+        &[],
+    );
+    let p_message = decode_message(&invalid_p_bit);
+    let p_error =
+        parse_device_watchdog_request_with_provenance(&p_message, DecodeContext::conservative())
+            .expect_err("DWR P-bit mismatch must fail before missing fields");
+    let p_bound = DiameterRequestFailure::from_parser_error(
+        &envelope(&invalid_p_bit),
+        &invalid_p_bit,
+        &p_error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("header classification must win");
+    assert_eq!(p_bound.result_code(), RESULT_CODE_DIAMETER_INVALID_HDR_BITS);
+
+    let unknown_code = AvpCode::new(55_001);
+    let unknown = encode_avp(AvpHeader::ietf(unknown_code, true), b"opaque");
+    let unknown_request = encode_request(
+        CommandFlags::request(false),
+        COMMAND_DEVICE_WATCHDOG,
+        APPLICATION_ID_COMMON_MESSAGES,
+        &unknown,
+    );
+    let unknown_message = decode_message(&unknown_request);
+    let unknown_error = parse_device_watchdog_request_with_provenance(
+        &unknown_message,
+        DecodeContext::conservative(),
+    )
+    .expect_err("unknown M-bit AVP must fail");
+    let unknown_bound = DiameterRequestFailure::from_parser_error(
+        &envelope(&unknown_request),
+        &unknown_request,
+        &unknown_error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("unknown mandatory classification must win");
+    let DiameterRequestFailure::UnsupportedMandatoryAvp(failed) = unknown_bound.failure() else {
+        panic!("unknown mandatory AVP must map to 5001");
+    };
+    assert_eq!(failed.leaf_code(), unknown_code);
+
+    let forbidden = encode_avp(
+        AvpHeader::ietf(AVP_RESULT_CODE, true),
+        &2_001_u32.to_be_bytes(),
+    );
+    let forbidden_request = encode_request(
+        CommandFlags::request(true),
+        swm::COMMAND_DIAMETER_EAP,
+        swm::APPLICATION_ID,
+        &forbidden,
+    );
+    let forbidden_message = decode_message(&forbidden_request);
+    let forbidden_error = parse_swm_diameter_eap_request_with_provenance(
+        &forbidden_message,
+        DecodeContext::conservative(),
+    )
+    .expect_err("forbidden Result-Code must fail before missing fields");
+    let forbidden_bound = DiameterRequestFailure::from_parser_error(
+        &envelope(&forbidden_request),
+        &forbidden_request,
+        &forbidden_error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("forbidden classification must win");
+    assert_eq!(
+        forbidden_bound.result_code(),
+        RESULT_CODE_DIAMETER_AVP_NOT_ALLOWED
+    );
+
+    let session = encode_avp(AvpHeader::ietf(AVP_SESSION_ID, true), b"first");
+    let mut duplicate_sessions = session.clone();
+    duplicate_sessions.extend_from_slice(&session);
+    let duplicate_request = encode_request(
+        CommandFlags::request(true),
+        swm::COMMAND_DIAMETER_EAP,
+        swm::APPLICATION_ID,
+        &duplicate_sessions,
+    );
+    let duplicate_message = decode_message(&duplicate_request);
+    let duplicate_error = parse_swm_diameter_eap_request_with_provenance(
+        &duplicate_message,
+        DecodeContext::conservative(),
+    )
+    .expect_err("duplicate singleton must fail before later missing fields");
+    let duplicate_bound = DiameterRequestFailure::from_parser_error(
+        &envelope(&duplicate_request),
+        &duplicate_request,
+        &duplicate_error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("excess singleton classification must win");
+    assert_eq!(
+        duplicate_bound.result_code(),
+        RESULT_CODE_DIAMETER_AVP_OCCURS_TOO_MANY_TIMES
+    );
+
+    let malformed_avp = [0, 0, 1, 8, AvpFlags::MANDATORY, 0, 0, 12];
+    let malformed_request = encode_request(
+        CommandFlags::request(false),
+        COMMAND_DEVICE_WATCHDOG,
+        APPLICATION_ID_COMMON_MESSAGES,
+        &malformed_avp,
+    );
+    let (_, malformed_message) = Message::decode(
+        &malformed_request,
+        DecodeContext {
+            validation_level: ValidationLevel::HeaderOnly,
+            ..DecodeContext::conservative()
+        },
+    )
+    .expect("header-only decode must preserve malformed AVP bytes");
+    let malformed_error = parse_device_watchdog_request_with_provenance(
+        &malformed_message,
+        DecodeContext::conservative(),
+    )
+    .expect_err("malformed AVP framing must fail");
+    let malformed_bound = DiameterRequestFailure::from_parser_error(
+        &envelope(&malformed_request),
+        &malformed_request,
+        &malformed_error,
+        DecodeContext::conservative(),
+        APP_DICTIONARIES,
+        EncodeContext::default(),
+    )
+    .expect("inspection framing failure must win");
+    assert_eq!(
+        malformed_bound.result_code(),
+        RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH
+    );
+}
+
+#[test]
+fn parser_error_diagnostics_never_expose_request_values() {
+    let fields = [
+        encoded_field(
+            AvpKey::ietf(AVP_AUTH_APPLICATION_ID),
+            true,
+            &swm::APPLICATION_ID.get().to_be_bytes(),
+        ),
+        encoded_field(AvpKey::ietf(AVP_SESSION_ID), true, b"SESSION-ID-DO-NOT-LOG"),
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_HOST), true, b"IDENTITY-DO-NOT-LOG"),
+        encoded_field(AvpKey::ietf(AVP_ORIGIN_REALM), true, b"realm.invalid"),
+        encoded_field(
+            AvpKey::ietf(AVP_DESTINATION_REALM),
+            true,
+            b"destination.invalid",
+        ),
+        encoded_field(
+            AvpKey::ietf(swm::AVP_AUTH_REQUEST_TYPE),
+            true,
+            &swm::AUTH_REQUEST_TYPE_AUTHORIZE_AUTHENTICATE.to_be_bytes(),
+        ),
+    ];
+    let raw: Vec<u8> = fields
+        .iter()
+        .flat_map(|(_, wire)| wire.iter().copied())
+        .collect();
+    let request = encode_request(
+        CommandFlags::request(true),
+        swm::COMMAND_DIAMETER_EAP,
+        swm::APPLICATION_ID,
+        &raw,
+    );
+    let message = decode_message(&request);
+    let error =
+        parse_swm_diameter_eap_request_with_provenance(&message, DecodeContext::conservative())
+            .expect_err("request intentionally omits EAP-Payload");
+    let diagnostics = format!("{error:?} {error}");
+    for sensitive in [
+        "SESSION-ID-DO-NOT-LOG",
+        "IDENTITY-DO-NOT-LOG",
+        "realm.invalid",
+        "destination.invalid",
+    ] {
+        assert!(!diagnostics.contains(sensitive));
+    }
+    assert!(diagnostics.contains("<redacted>"));
+    assert!(!diagnostics.contains("[2, 7"));
 }

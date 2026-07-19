@@ -20,18 +20,21 @@ use opc_protocol::{
 };
 
 use crate::base::{
-    self, APPLICATION_ID_RELAY, AVP_ACCT_APPLICATION_ID, AVP_AUTH_APPLICATION_ID,
-    AVP_DISCONNECT_CAUSE, AVP_ERROR_MESSAGE, AVP_FAILED_AVP, AVP_FIRMWARE_REVISION,
-    AVP_HOST_IP_ADDRESS, AVP_INBAND_SECURITY_ID, AVP_ORIGIN_HOST, AVP_ORIGIN_REALM,
-    AVP_ORIGIN_STATE_ID, AVP_PRODUCT_NAME, AVP_RESULT_CODE, AVP_SUPPORTED_VENDOR_ID, AVP_VENDOR_ID,
-    AVP_VENDOR_SPECIFIC_APPLICATION_ID, COMMAND_CAPABILITIES_EXCHANGE, COMMAND_DEVICE_WATCHDOG,
-    COMMAND_DISCONNECT_PEER, RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION,
-    RESULT_CODE_DIAMETER_SUCCESS,
+    self, APPLICATION_ID_COMMON_MESSAGES, APPLICATION_ID_RELAY, AVP_ACCT_APPLICATION_ID,
+    AVP_AUTH_APPLICATION_ID, AVP_DISCONNECT_CAUSE, AVP_ERROR_MESSAGE, AVP_FAILED_AVP,
+    AVP_FIRMWARE_REVISION, AVP_HOST_IP_ADDRESS, AVP_INBAND_SECURITY_ID, AVP_ORIGIN_HOST,
+    AVP_ORIGIN_REALM, AVP_ORIGIN_STATE_ID, AVP_PRODUCT_NAME, AVP_RESULT_CODE,
+    AVP_SUPPORTED_VENDOR_ID, AVP_VENDOR_ID, AVP_VENDOR_SPECIFIC_APPLICATION_ID,
+    COMMAND_CAPABILITIES_EXCHANGE, COMMAND_DEVICE_WATCHDOG, COMMAND_DISCONNECT_PEER,
+    RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION, RESULT_CODE_DIAMETER_SUCCESS,
 };
 use crate::dictionary::{CommandKind, Dictionary, DictionarySet};
+use crate::parser_error::{
+    DiameterGroupedAvpSetFailureKind, DiameterGroupedAvpSetProvenance, DiameterParserError,
+};
 use crate::{
-    ApplicationId, AvpCode, AvpHeader, CommandCode, CommandFlags, FlagRequirement, Header, Message,
-    OwnedMessage, RawAvp, VendorId, DIAMETER_HEADER_LEN, MAX_U24,
+    ApplicationId, AvpCode, AvpDefinition, AvpHeader, AvpKey, CommandCode, CommandFlags,
+    FlagRequirement, Header, Message, OwnedMessage, RawAvp, VendorId, DIAMETER_HEADER_LEN, MAX_U24,
 };
 
 static PEER_DICTIONARY_REFS: [&Dictionary; 1] = [base::dictionary()];
@@ -1661,13 +1664,27 @@ pub fn parse_capabilities_exchange_request(
     message: &Message<'_>,
     ctx: DecodeContext,
 ) -> Result<PeerCapabilities, DecodeError> {
+    parse_capabilities_exchange_request_with_provenance(message, ctx)
+        .map_err(DiameterParserError::into_decode_error)
+}
+
+/// Parse a Capabilities-Exchange-Request while retaining typed provenance for
+/// an omitted mandatory AVP or invalid grouped `Vendor-Specific-Application-Id`
+/// child set.
+pub fn parse_capabilities_exchange_request_with_provenance(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<PeerCapabilities, DiameterParserError> {
     let section = PeerProcedure::CapabilitiesExchange.spec_section(CommandKind::Request);
     ensure_peer_header(
         message,
         PeerProcedure::CapabilitiesExchange,
         CommandKind::Request,
-    )?;
-    collect_procedure_avps(message.raw_avps, ctx, section)?.into_capabilities(section)
+    )
+    .map_err(|error| DiameterParserError::decoded(message, error))?;
+    collect_procedure_avps_with_provenance(message.raw_avps, ctx, section)
+        .map_err(|error| error.into_parser_error(message, PeerProcedure::CapabilitiesExchange))?
+        .into_request_capabilities(message, section)
 }
 
 /// Build a Capabilities-Exchange-Answer message.
@@ -1830,11 +1847,23 @@ pub fn parse_device_watchdog_request(
     message: &Message<'_>,
     ctx: DecodeContext,
 ) -> Result<DeviceWatchdogRequest, DecodeError> {
+    parse_device_watchdog_request_with_provenance(message, ctx)
+        .map_err(DiameterParserError::into_decode_error)
+}
+
+/// Parse a Device-Watchdog-Request while retaining typed provenance for an
+/// omitted mandatory AVP.
+pub fn parse_device_watchdog_request_with_provenance(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<DeviceWatchdogRequest, DiameterParserError> {
     let section = PeerProcedure::DeviceWatchdog.spec_section(CommandKind::Request);
-    ensure_peer_header(message, PeerProcedure::DeviceWatchdog, CommandKind::Request)?;
-    let avps = collect_procedure_avps(message.raw_avps, ctx, section)?;
+    ensure_peer_header(message, PeerProcedure::DeviceWatchdog, CommandKind::Request)
+        .map_err(|error| DiameterParserError::decoded(message, error))?;
+    let avps = collect_procedure_avps_with_provenance(message.raw_avps, ctx, section)
+        .map_err(|error| error.into_parser_error(message, PeerProcedure::DeviceWatchdog))?;
     Ok(DeviceWatchdogRequest {
-        identity: avps.identity(section)?,
+        identity: avps.request_identity(message, PeerProcedure::DeviceWatchdog, section)?,
         origin_state_id: avps.origin_state_id(),
     })
 }
@@ -1929,16 +1958,31 @@ pub fn parse_disconnect_peer_request(
     message: &Message<'_>,
     ctx: DecodeContext,
 ) -> Result<DisconnectPeerRequest, DecodeError> {
+    parse_disconnect_peer_request_with_provenance(message, ctx)
+        .map_err(DiameterParserError::into_decode_error)
+}
+
+/// Parse a Disconnect-Peer-Request while retaining typed provenance for an
+/// omitted mandatory AVP.
+pub fn parse_disconnect_peer_request_with_provenance(
+    message: &Message<'_>,
+    ctx: DecodeContext,
+) -> Result<DisconnectPeerRequest, DiameterParserError> {
     let section = PeerProcedure::DisconnectPeer.spec_section(CommandKind::Request);
-    ensure_peer_header(message, PeerProcedure::DisconnectPeer, CommandKind::Request)?;
-    let avps = collect_procedure_avps(message.raw_avps, ctx, section)?;
-    let disconnect_cause = require_field(
+    ensure_peer_header(message, PeerProcedure::DisconnectPeer, CommandKind::Request)
+        .map_err(|error| DiameterParserError::decoded(message, error))?;
+    let avps = collect_procedure_avps_with_provenance(message.raw_avps, ctx, section)
+        .map_err(|error| error.into_parser_error(message, PeerProcedure::DisconnectPeer))?;
+    let disconnect_cause = require_request_field(
         avps.disconnect_cause.clone(),
         "diameter DPR requires Disconnect-Cause",
+        AVP_DISCONNECT_CAUSE,
+        message,
+        PeerProcedure::DisconnectPeer,
         section,
     )?;
     Ok(DisconnectPeerRequest {
-        identity: avps.identity(section)?,
+        identity: avps.request_identity(message, PeerProcedure::DisconnectPeer, section)?,
         disconnect_cause,
         origin_state_id: avps.origin_state_id(),
     })
@@ -2031,6 +2075,89 @@ struct ProcedureAvps {
     inband_security_ids: Vec<u32>,
 }
 
+enum ProcedureAvpParseError {
+    Decode(Box<DecodeError>),
+    MissingNested {
+        error: Box<DecodeError>,
+        definition: &'static AvpDefinition,
+        parent_definition: &'static AvpDefinition,
+        parent_offset: usize,
+    },
+    GroupedSet {
+        error: Box<DecodeError>,
+        definitions: Vec<&'static AvpDefinition>,
+        parent_definition: &'static AvpDefinition,
+        parent_offset: usize,
+        failure_kind: DiameterGroupedAvpSetFailureKind,
+    },
+}
+
+impl ProcedureAvpParseError {
+    fn decode_error(&self) -> &DecodeError {
+        match self {
+            Self::Decode(error)
+            | Self::MissingNested { error, .. }
+            | Self::GroupedSet { error, .. } => error.as_ref(),
+        }
+    }
+
+    fn into_decode_error(self) -> DecodeError {
+        match self {
+            Self::Decode(error)
+            | Self::MissingNested { error, .. }
+            | Self::GroupedSet { error, .. } => *error,
+        }
+    }
+
+    fn into_parser_error(
+        self,
+        message: &Message<'_>,
+        procedure: PeerProcedure,
+    ) -> DiameterParserError {
+        match self {
+            Self::Decode(error) => DiameterParserError::decoded(message, *error),
+            Self::MissingNested {
+                error,
+                definition,
+                parent_definition,
+                parent_offset,
+            } => DiameterParserError::missing_with_parent(
+                message,
+                *error,
+                definition,
+                parent_definition,
+                parent_offset,
+                APPLICATION_ID_COMMON_MESSAGES,
+                procedure.command_code(),
+            ),
+            Self::GroupedSet {
+                error,
+                definitions,
+                parent_definition,
+                parent_offset,
+                failure_kind,
+            } => DiameterParserError::grouped_avp_set(
+                message,
+                *error,
+                DiameterGroupedAvpSetProvenance::for_request(
+                    &definitions,
+                    parent_definition,
+                    parent_offset,
+                    APPLICATION_ID_COMMON_MESSAGES,
+                    procedure.command_code(),
+                    failure_kind,
+                ),
+            ),
+        }
+    }
+}
+
+impl From<DecodeError> for ProcedureAvpParseError {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(Box::new(error))
+    }
+}
+
 impl ProcedureAvps {
     fn identity(&self, section: &'static str) -> Result<PeerIdentity, DecodeError> {
         Ok(PeerIdentity {
@@ -2043,6 +2170,34 @@ impl ProcedureAvps {
             origin_realm: require_field_ref(
                 &self.origin_realm,
                 "diameter peer procedure requires Origin-Realm",
+                section,
+            )?
+            .clone(),
+        })
+    }
+
+    fn request_identity(
+        &self,
+        message: &Message<'_>,
+        procedure: PeerProcedure,
+        section: &'static str,
+    ) -> Result<PeerIdentity, DiameterParserError> {
+        Ok(PeerIdentity {
+            origin_host: require_request_field_ref(
+                &self.origin_host,
+                "diameter peer procedure requires Origin-Host",
+                AVP_ORIGIN_HOST,
+                message,
+                procedure,
+                section,
+            )?
+            .clone(),
+            origin_realm: require_request_field_ref(
+                &self.origin_realm,
+                "diameter peer procedure requires Origin-Realm",
+                AVP_ORIGIN_REALM,
+                message,
+                procedure,
                 section,
             )?
             .clone(),
@@ -2090,6 +2245,67 @@ impl ProcedureAvps {
             product_name: require_field(
                 self.product_name,
                 "diameter capabilities exchange requires Product-Name",
+                section,
+            )?,
+            origin_state_id: self.origin_state_id.map(|field| field.value),
+            firmware_revision: self.firmware_revision.map(|field| field.value),
+            supported_vendor_ids: self.supported_vendor_ids,
+            auth_application_ids: self.auth_application_ids,
+            acct_application_ids: self.acct_application_ids,
+            vendor_specific_applications: self.vendor_specific_applications,
+            inband_security_ids: self.inband_security_ids,
+        })
+    }
+
+    fn into_request_capabilities(
+        self,
+        message: &Message<'_>,
+        section: &'static str,
+    ) -> Result<PeerCapabilities, DiameterParserError> {
+        let procedure = PeerProcedure::CapabilitiesExchange;
+        if self.host_ip_addresses.is_empty() {
+            return Err(missing_request_field_error(
+                message,
+                procedure,
+                AVP_HOST_IP_ADDRESS,
+                "diameter capabilities exchange requires Host-IP-Address",
+                section,
+            ));
+        }
+        Ok(PeerCapabilities {
+            identity: PeerIdentity {
+                origin_host: require_request_field(
+                    self.origin_host,
+                    "diameter capabilities exchange requires Origin-Host",
+                    AVP_ORIGIN_HOST,
+                    message,
+                    procedure,
+                    section,
+                )?,
+                origin_realm: require_request_field(
+                    self.origin_realm,
+                    "diameter capabilities exchange requires Origin-Realm",
+                    AVP_ORIGIN_REALM,
+                    message,
+                    procedure,
+                    section,
+                )?,
+            },
+            host_ip_addresses: self.host_ip_addresses,
+            vendor_id: require_request_field(
+                self.vendor_id,
+                "diameter capabilities exchange requires Vendor-Id",
+                AVP_VENDOR_ID,
+                message,
+                procedure,
+                section,
+            )?,
+            product_name: require_request_field(
+                self.product_name,
+                "diameter capabilities exchange requires Product-Name",
+                AVP_PRODUCT_NAME,
+                message,
+                procedure,
                 section,
             )?,
             origin_state_id: self.origin_state_id.map(|field| field.value),
@@ -2362,8 +2578,18 @@ fn collect_procedure_avps(
     ctx: DecodeContext,
     section: &'static str,
 ) -> Result<ProcedureAvps, DecodeError> {
+    collect_procedure_avps_with_provenance(raw_avps, ctx, section)
+        .map_err(ProcedureAvpParseError::into_decode_error)
+}
+
+fn collect_procedure_avps_with_provenance(
+    raw_avps: &[u8],
+    ctx: DecodeContext,
+    section: &'static str,
+) -> Result<ProcedureAvps, ProcedureAvpParseError> {
     let mut parsed = ProcedureAvps::default();
-    for_each_avp(raw_avps, ctx, DIAMETER_HEADER_LEN, 0, |offset, avp| {
+    let mut nested_error = None;
+    let result = for_each_avp(raw_avps, ctx, DIAMETER_HEADER_LEN, 0, |offset, avp| {
         let value_offset = offset_add(offset, avp.header.header_len(), section)?;
         validate_peer_avp_flags(&avp.header, offset)?;
         if avp.header.vendor_id.is_some() {
@@ -2441,28 +2667,36 @@ fn collect_procedure_avps(
                 .push(parse_u32_value(avp.value, value_offset, "6.10")?);
             Ok(())
         } else if code == AVP_VENDOR_SPECIFIC_APPLICATION_ID {
-            parsed
-                .vendor_specific_applications
-                .push(parse_vendor_specific_application(
-                    &avp,
-                    ctx,
-                    value_offset,
-                    section,
-                )?);
-            Ok(())
+            match parse_vendor_specific_application(&avp, ctx, offset, value_offset, section) {
+                Ok(application) => {
+                    parsed.vendor_specific_applications.push(application);
+                    Ok(())
+                }
+                Err(error) => {
+                    let decode_error = error.decode_error().clone();
+                    nested_error = Some(error);
+                    Err(decode_error)
+                }
+            }
         } else {
             handle_unknown_avp(ctx, &avp, offset, section)
         }
-    })?;
-    Ok(parsed)
+    });
+    match result {
+        Ok(()) => Ok(parsed),
+        Err(error) => {
+            Err(nested_error.unwrap_or_else(|| ProcedureAvpParseError::Decode(Box::new(error))))
+        }
+    }
 }
 
 fn parse_vendor_specific_application(
     avp: &RawAvp<'_>,
     ctx: DecodeContext,
+    parent_offset: usize,
     value_offset: usize,
     section: &'static str,
-) -> Result<VendorSpecificApplication, DecodeError> {
+) -> Result<VendorSpecificApplication, ProcedureAvpParseError> {
     let child_depth = 1;
     let mut vendor_id: Option<FieldValue<VendorId>> = None;
     let mut auth_application_id = None;
@@ -2496,17 +2730,44 @@ fn parse_vendor_specific_application(
             }
         },
     )?;
-    let vendor_id = require_field_at(
-        vendor_id,
-        "diameter Vendor-Specific-Application-Id requires Vendor-Id",
-        value_offset,
-        section,
-    )?;
-    if auth_application_id.is_some() == acct_application_id.is_some() {
-        return Err(decode_structural_error(
-            "diameter Vendor-Specific-Application-Id requires exactly one Auth-Application-Id or Acct-Application-Id",
+    let vendor_id = match vendor_id {
+        Some(field) => field.value,
+        None => {
+            let error = decode_structural_error(
+                "diameter Vendor-Specific-Application-Id requires Vendor-Id",
+                value_offset,
+                section,
+            );
+            let vendor_definition = base::dictionary().find_avp(AvpKey::ietf(AVP_VENDOR_ID));
+            let parent_definition =
+                base::dictionary().find_avp(AvpKey::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID));
+            return Err(match (vendor_definition, parent_definition) {
+                (Some(definition), Some(parent_definition)) => {
+                    ProcedureAvpParseError::MissingNested {
+                        error: Box::new(error),
+                        definition,
+                        parent_definition,
+                        parent_offset,
+                    }
+                }
+                _ => ProcedureAvpParseError::Decode(Box::new(error)),
+            });
+        }
+    };
+    if auth_application_id.is_none() && acct_application_id.is_none() {
+        return Err(vendor_specific_application_set_error(
             value_offset,
+            parent_offset,
             section,
+            DiameterGroupedAvpSetFailureKind::MissingOneOf,
+        ));
+    }
+    if auth_application_id.is_some() && acct_application_id.is_some() {
+        return Err(vendor_specific_application_set_error(
+            value_offset,
+            parent_offset,
+            section,
+            DiameterGroupedAvpSetFailureKind::MutuallyExclusivePresent,
         ));
     }
     Ok(VendorSpecificApplication {
@@ -2514,6 +2775,32 @@ fn parse_vendor_specific_application(
         auth_application_id: auth_application_id.map(|field| field.value),
         acct_application_id: acct_application_id.map(|field| field.value),
     })
+}
+
+fn vendor_specific_application_set_error(
+    value_offset: usize,
+    parent_offset: usize,
+    section: &'static str,
+    failure_kind: DiameterGroupedAvpSetFailureKind,
+) -> ProcedureAvpParseError {
+    let error = decode_structural_error(
+        "diameter Vendor-Specific-Application-Id requires exactly one Auth-Application-Id or Acct-Application-Id",
+        value_offset,
+        section,
+    );
+    let auth = base::dictionary().find_avp(AvpKey::ietf(AVP_AUTH_APPLICATION_ID));
+    let acct = base::dictionary().find_avp(AvpKey::ietf(AVP_ACCT_APPLICATION_ID));
+    let parent = base::dictionary().find_avp(AvpKey::ietf(AVP_VENDOR_SPECIFIC_APPLICATION_ID));
+    match (auth, acct, parent) {
+        (Some(auth), Some(acct), Some(parent_definition)) => ProcedureAvpParseError::GroupedSet {
+            error: Box::new(error),
+            definitions: vec![auth, acct],
+            parent_definition,
+            parent_offset,
+            failure_kind,
+        },
+        _ => ProcedureAvpParseError::Decode(Box::new(error)),
+    }
 }
 
 fn for_each_avp<F>(
@@ -2732,6 +3019,59 @@ fn require_field_ref<'a, T>(
             DIAMETER_HEADER_LEN,
             section,
         )),
+    }
+}
+
+fn require_request_field<T>(
+    field: Option<FieldValue<T>>,
+    reason: &'static str,
+    avp_code: AvpCode,
+    message: &Message<'_>,
+    procedure: PeerProcedure,
+    section: &'static str,
+) -> Result<T, DiameterParserError> {
+    match field {
+        Some(field) => Ok(field.value),
+        None => Err(missing_request_field_error(
+            message, procedure, avp_code, reason, section,
+        )),
+    }
+}
+
+fn require_request_field_ref<'a, T>(
+    field: &'a Option<FieldValue<T>>,
+    reason: &'static str,
+    avp_code: AvpCode,
+    message: &Message<'_>,
+    procedure: PeerProcedure,
+    section: &'static str,
+) -> Result<&'a T, DiameterParserError> {
+    match field {
+        Some(field) => Ok(&field.value),
+        None => Err(missing_request_field_error(
+            message, procedure, avp_code, reason, section,
+        )),
+    }
+}
+
+fn missing_request_field_error(
+    message: &Message<'_>,
+    procedure: PeerProcedure,
+    avp_code: AvpCode,
+    reason: &'static str,
+    section: &'static str,
+) -> DiameterParserError {
+    let error = decode_structural_error(reason, DIAMETER_HEADER_LEN, section);
+    let key = AvpKey::ietf(avp_code);
+    match base::dictionary().find_avp(key) {
+        Some(definition) => DiameterParserError::missing_for_definition(
+            message,
+            error,
+            definition,
+            APPLICATION_ID_COMMON_MESSAGES,
+            procedure.command_code(),
+        ),
+        None => DiameterParserError::decoded(message, error),
     }
 }
 

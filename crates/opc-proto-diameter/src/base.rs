@@ -154,6 +154,18 @@ const PROXY_INFO_AVP_RULES: [CommandAvpRule; 2] = [
     CommandAvpRule::new(AvpKey::ietf(AVP_PROXY_STATE), AvpCardinality::ZeroOrOne),
 ];
 
+const VENDOR_SPECIFIC_APPLICATION_ID_AVP_RULES: [CommandAvpRule; 3] = [
+    CommandAvpRule::new(AvpKey::ietf(AVP_VENDOR_ID), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_AUTH_APPLICATION_ID),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_ACCT_APPLICATION_ID),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
 const BASE_COMMANDS: [CommandDefinition; 6] = [
     CommandDefinition::new(
         COMMAND_CAPABILITIES_EXCHANGE,
@@ -249,7 +261,8 @@ const BASE_AVPS: [AvpDefinition; 27] = [
         AvpDataType::Grouped,
         AvpFlagRules::base_mandatory(),
         SpecRef::new("ietf", "RFC6733", "6.11"),
-    ),
+    )
+    .with_grouped_avp_rules(&VENDOR_SPECIFIC_APPLICATION_ID_AVP_RULES),
     AvpDefinition::new(
         AvpKey::ietf(AVP_SESSION_ID),
         "Session-Id",

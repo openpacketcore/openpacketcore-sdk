@@ -90,6 +90,33 @@ This document defines the conformance status of the `opc-proto-diameter` crate.
   Header/P/dictionary failures and AVP offsets have deterministic first-failure
   precedence across classification, decoder mapping, application binding, and
   answer construction.
+- `DiameterParserError` retains the original `DecodeError` plus a private
+  fingerprint of the exact declared Diameter message boundary (following
+  transport-buffer bytes are deliberately outside the binding). Its optional
+  sealed `DiameterMissingAvpProvenance`
+  exposes only the request role plus numeric application, command, vendor-aware
+  AVP key, data type, and flag-rule schema metadata. Provenance-aware CER, DWR,
+  DPR, and SWm DER parsers cover every required top-level field, CER's nested
+  Vendor-Id and Auth/Acct one-of grammar, and SWm DER's optional-present
+  Terminal-Information mandatory IMEI child while their legacy entry points
+  delegate and retain the original return type.
+  `DiameterRequestFailure::from_parser_error`
+  reclassifies the exact request first, verifies the declared-message-boundary
+  parser fingerprint and
+  command/application identity, resolves exactly one vendor-aware dictionary
+  definition, requires it to equal the sealed SDK definition, derives its fixed
+  or variable minimum shape, and invokes the checked absence binder before
+  returning bound 5005. Received grouped parents are bound by exact key,
+  offset, wire length, and digest. RFC 6733 §6.11 missing-one-of evidence emits
+  both minimum Auth/Acct child examples inside that parent; simultaneous Auth
+  and Acct maps to 5009 and copies only those exact received children in wire
+  order. Ordinary duplicate Auth or Acct remains ordinary singleton 5009.
+  Non-missing parser failures delegate to generic offset mapping.
+  Missing/conflicting/ambiguous schema, cross-message reuse, command mismatch,
+  and unsealed reason-string-only errors never become peer errors.
+  The additive `DiameterRequestFailure::MutuallyExclusiveAvps` variant requires
+  a new arm in downstream exhaustive matches; it retains the existing 5009
+  result and stable diagnostic family.
 - `DiameterFailedAvp` copies one complete offender, derives a zero-filled
   missing shape from dictionary type/flag/vendor metadata, safely synthesizes
   short or overlong AVP headers, rejects values beyond Diameter's U24 limit
@@ -124,7 +151,11 @@ This document defines the conformance status of the `opc-proto-diameter` crate.
   DWR/DPR/SWm requests, explicit/absent/repeatable cardinality, triple
   singleton first-excess selection, one/two forbidden Result-Code occurrences,
   grouped-child 5008/5009 precedence, unknown M-bit first-failure selection,
-  the actual SWm DER forbidden Result-Code parser path, application/AVP ambiguity,
+  the actual SWm DER forbidden Result-Code parser path, every required
+  CER/DWR/DPR/SWm DER omission, nested VSAI/Terminal-Information omissions,
+  VSAI one-of and mutual-exclusion behavior, dictionary-derived Address/Unsigned32/
+  Enumerated and variable minimum shapes, sealed synthetic vendor provenance,
+  parser request/command/application mismatch, application/AVP ambiguity,
   fixed-width base/vendor and grouped/unknown malformed shapes, Proxy-Info
   depth/count limits, pre-allocation U24 bounds, exact correlation, unrelated,
   non-Grouped, mislocated, embedded-OctetString, root/path-presence,
@@ -158,6 +189,8 @@ Peer helpers include:
   awareness.
 - Result-code family classification and E-bit derivation per RFC 6733 §7.2.
 - Optional answer diagnostics (`Error-Message`, raw `Failed-AVP` values).
+- Provenance-aware CER, DWR, and DPR request parsers; their legacy forms return
+  byte-for-byte equivalent `DecodeError` values.
 - Unknown AVP handling in typed peer/application parsers: mandatory unknown
   AVPs are rejected; `Reject` also rejects non-mandatory unknown AVPs. `Drop`
   and `Preserve` both accept non-mandatory unknown AVPs, but typed projections
@@ -197,6 +230,15 @@ authorization additionally requires the correlated evidence described below.
 These checks are mechanical message-shape validation only; AAA challenge
 selection, subscriber authorization, local emergency policy, realm routing,
 transport state, and EAP-AKA policy remain downstream product work.
+
+The SWm DER parser and transaction-envelope parser have additive provenance-
+aware entry points. Missing Session-Id, Auth-Application-Id, Origin-Host,
+Origin-Realm, Destination-Realm, Auth-Request-Type, or EAP-Payload can therefore
+be mapped to checked request-bound 5005 without downstream command-grammar
+duplication or human-readable reason matching.
+When optional Terminal-Information is received, its mandatory IMEI child is
+also covered: 5005 contains a vendor-correct minimum IMEI nested inside the
+exact received Terminal-Information header, without reflecting Software-Version.
 
 The typed DER surface models TS 29.273 `Emergency-Services` as its actual 3GPP
 vendor-specific `Unsigned32` AVP (code 1538), with the V bit set and M/P bits
@@ -321,10 +363,14 @@ preallocate from a wire-declared length. Three layers guard them:
 - **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
   fuzz corpus entry, byte-truncations of each entry, and hostile constant
   inputs through raw, owned, dictionary-command, and AVP decode entry points
-  under `catch_unwind`. Seeds include repeated SWm State and the explicit
-  projected two-APN profile. The SWm set also covers the DER-only emergency
-  indication, 3GPP experimental result 5001, the Terminal-Information retry,
-  and final EAP-Success/MSK/Mobile-Node-Identifier material.
+  under `catch_unwind`. Empty DWR, DPR, and SWm DER seeds exercise sealed
+  mandatory-field provenance (the existing header-only CER seed covers CER).
+  Dedicated CER seeds cover VSAI missing Vendor-Id, missing Auth/Acct one-of,
+  and simultaneous Auth/Acct; a SWm seed covers Terminal-Information missing
+  IMEI. Seeds also include repeated SWm State and the explicit projected two-APN
+  profile. The SWm set covers the DER-only emergency indication, 3GPP
+  experimental result 5001, the Terminal-Information retry, and final
+  EAP-Success/MSK/Mobile-Node-Identifier material.
   Runs in ordinary `cargo test`; no nightly toolchain or libFuzzer required.
 - **Corpus generator helper guard** — `fuzz/generate_corpus.py self-test`
   exercises the `avp()` helper's acceptance of valid flags and rejection of

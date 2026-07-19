@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Request-bound Diameter missing-AVP provenance — `opc-proto-diameter`:**
+  additive provenance-aware CER, DWR, DPR, and SWm DER parsers now retain the
+  original `DecodeError` plus sealed exact-Diameter-message and numeric command/
+  application/vendor-aware AVP identity. The checked parser-error mapper
+  verifies the exact SDK AVP schema, derives the dictionary's minimum
+  `Failed-AVP`, proves root or received-parent-relative absence, and binds
+  result code 5005 without consumer-owned grammar or reason-string matching.
+  RFC 6733 `Vendor-Specific-Application-Id` missing-one-of failures report both
+  Auth/Acct child examples; mutually exclusive received children bind 5009
+  with only those exact children in wire order. SWm `Terminal-Information`
+  missing IMEI is covered by the same received-parent proof.
+  `DiameterRequestFailure` gains `MutuallyExclusiveAvps`; downstream exhaustive
+  matches on this newly introduced, unreleased enum must add an arm. Its result
+  and stable diagnostic code remain in the existing 5009 family.
+  Legacy parser signatures and non-missing decode-error mapping are unchanged;
+  cross-request reuse, mismatched or untrusted provenance, and missing,
+  conflicting, or ambiguous dictionary definitions fail closed.
 - **BREAKING — fail-closed eBPF GTP-U downlink endpoint binding —
   `opc-gtpu-dataplane`:** every tc downlink PDR now carries a canonical binding
   to its outer peer, concrete local destination, address family, ingress
