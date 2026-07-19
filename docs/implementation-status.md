@@ -172,6 +172,76 @@ policy/dataplane behavior.
 
 ---
 
+## Current durable multi-SA re-pin foundation — 2026-07-18
+
+`opc-ipsec-lb` now implements the SDK portion of
+[issue #365](https://github.com/openpacketcore/openpacketcore-sdk/issues/365).
+`SessionRePinPlan` binds one privacy-preserving session ID and one operation ID
+to a canonical bounded IKE/default-ESP/dedicated-ESP order and each complete
+`RePinRequest` fingerprint. `SessionRePinCoordinator` composes the existing
+single-SA ownership-fence, audit, and idempotent steering boundary with a
+monotonic durable journal. A completed-fence prefix and any current post-commit
+fence are recorded before whole-session success can escape. Restart reloads the
+complete exact requests only for the caller's retained operation-plus-plan
+identity and uses
+authoritative grant recovery; it never mints a
+replacement transition, rolls ownership back, or falls through to birth/upsert.
+Every later operation must also name the exact terminal predecessor plan
+fingerprint, so a delayed retry of an older completed operation cannot replace
+the newest durable restart/status authority. Successor admission rejects reuse
+of either the predecessor operation ID or any predecessor per-SA transition ID
+and leaves that predecessor intact. Resume and status take a redaction-safe
+`SessionRePinIdentity` containing both operation ID and whole-plan fingerprint,
+so stale callers cannot observe or drive the successor.
+
+Before advancing another SA and before terminal success, the coordinator first
+idempotently repairs steering across the entire completed prefix. It then starts
+a separate global mutation-free sweep of every owner, fence, transition ID,
+complete request fingerprint, retry proof, and target shard owner. Monotonic
+non-ABA fences make a successful second sweep the prefix linearization point.
+A supported direct per-SA transition that displaces an earlier entry while a
+later repair waits therefore fails closed before a later mutation. Raw
+`SteeringBackend` mutation outside `RePinCoordinator` is explicitly outside the
+contract because it can drift without advancing an ownership fence.
+
+Successful `start` or `resume` proves one whole-prefix convergence point during
+that invocation. It is not an ownership or steering lease and does not
+guarantee that the validated state remains current when the future returns or
+afterward: a later supported transition may advance a fence after validation.
+Consumers must serialize subsequent transitions and use current fenced
+authority at each action boundary. `status()` exposes durable journal progress
+without rerunning convergence validation; it is not live ownership or steering
+authority.
+
+The production journal adapter uses the existing session-store lease/CAS
+authority, bounded v1 payload envelope, tenant/NF/session key scope, and
+`AuthoritativeSession` record profile. Competing plans cannot replace active
+progress, while identical helpers converge idempotently. With the normal
+`EncryptingSessionBackend` over the quorum store, exact request metadata is
+sealed before persistence and follows the existing HKMS/KMS rotation path; no
+second encryption or consensus implementation was added. Startup and every
+read/write validate the complete lease/CAS authority capability set and fixed
+checkpoint budget, so a downgraded backend cannot replay terminal success.
+Tests cover failures
+before ownership, immediately after commit, during steering, and at all three
+audit positions for every SA position; restart from prepared, committed,
+completed-prefix, and terminal stages; exact-helper races; foreign-plan
+rejection; successor identity reuse; stale resume/status identities; completed
+prefix owner/fence/transition/fingerprint and steering conflicts; direct
+single-SA displacement; deterministic earlier/later repair interleavings on
+both mock and session-store journals; codec corruption; encrypted raw storage;
+and redaction.
+
+This is an SDK recovery foundation, not a product continuity attestation. The
+consumer remains responsible for enumerating the complete live SA set,
+privacy-safe session-ID derivation, operation/transition-ID generation, key
+custody, retry and operator-quarantine policy, and dataplane qualification.
+Issue #333 remains the authority for adapter-issued counter apply/read-back
+evidence: the session saga retains current numeric resume fields exactly but
+does not claim they were applied.
+
+---
+
 ## Current authenticated ingress-redirect foundation — 2026-07-18
 
 `opc-ipsec-lb` now implements the SDK portion of
