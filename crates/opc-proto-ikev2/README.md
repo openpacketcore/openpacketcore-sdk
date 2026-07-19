@@ -8,10 +8,11 @@ Transport-neutral IKEv2 mechanisms for OpenPacketCore untrusted-access work.
 to expose as SDK primitives today: header decode/encode, unencrypted payload
 walking, protected-payload boundaries, selected SA_INIT and IKE_AUTH helpers,
 NAT detection, NAT-T datagram classification, and product-neutral Child SA
-negotiation intent. It also provides strict opened-payload primitives for the
-TS 24.302 multiple-bearer profile: typed QoS/TFT/AMBR notifications, new
-non-rekey dedicated-bearer Child SA establishment, bearer modification, and
-bearer deletion.
+negotiation intent. It includes a strict responder boundary for opened IKE-SA
+rekey `CREATE_CHILD_SA` requests and exact successful responses. It also
+provides strict opened-payload primitives for the TS 24.302 multiple-bearer
+profile: typed QoS/TFT/AMBR notifications, new non-rekey dedicated-bearer
+Child SA establishment, bearer modification, and bearer deletion.
 
 It does not implement an IKE SA state machine, EAP-AKA, retransmission policy,
 cookie policy, Child SA lifecycle, XFRM/IPsec programming, bearer admission or
@@ -53,6 +54,11 @@ control-plane stack.
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
   helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
   selector/proposal helpers.
+- `ike_sa_rekey` strictly decodes authenticated/opened `SA, Ni, KEi`
+  `CREATE_CHILD_SA` requests, selects an existing executable IKE-SA profile,
+  and builds an immutable exact `SA, Nr, KEr` response chain. It rejects
+  Child-SA protocol/SPI shapes, `REKEY_SA`, traffic selectors, `DH=NONE`, and
+  KE/group mismatches without owning SPI allocation or IKE-SA lifecycle state.
 - `device_identity` validates and builds TS 24.302 DEVICE_IDENTITY requests and
   responses using the redaction-safe exact-15-digit `Imei15` and `Imeisv`
   types. TBCD decoding preserves the received fifteenth IMEI digit (including
@@ -299,6 +305,42 @@ signature-hash, redirect, and unknown non-critical/private-use notifications do 
 participate in algorithm selection. The product still owns responder SPI and
 nonce allocation, anti-amplification policy, transaction caching, and the IKE
 SA state machine.
+
+## IKE-SA rekey responder boundary
+
+`decode_ike_sa_rekey_request` accepts an already-authenticated and opened RFC
+7296 IKE-SA rekey request. The outer header must identify a non-response
+`CREATE_CHILD_SA` protected by `SK` on an established IKE SA. The inner chain
+must contain exactly one SA payload, one Nonce, and one KE payload. Every
+proposal uses Protocol ID IKE, a consecutive Proposal Number, and a non-zero
+eight-octet new initiator SPI. The default decoder preserves Vendor IDs,
+unrecognized Notify payloads, and unknown non-critical payloads as
+redaction-safe borrowed views. The explicit-context decoder honors `Drop` for
+the latter two classes and preserves them under both `Preserve` and `Reject`:
+RFC 7296 requires these extensions to be ignored, so a generic reject policy
+cannot reject this request. Unknown critical payloads always fail closed.
+`REKEY_SA`, TSi/TSr, `DH=NONE`, other semantically invalid known payloads, and
+a KE group absent from the proposals also fail closed with stable structural
+codes.
+
+Pass the decoded request to `negotiate_ike_sa_rekey` with the same
+`Ikev2SaInitNegotiationPolicy` used for initial IKE-SA selection. The result
+contains the selected transforms, the selected proposal's new initiator SPI,
+and an `Ikev2SaInitCryptoProfile` that can be passed directly to
+`derive_ike_sa_rekey_key_material` without re-decoding generated wire bytes.
+That KDF accepts only the selected group's fixed-width shared secret: 256
+octets for DH14 and 32, 48, or 66 octets for DH19, DH20, or DH21. A mismatch
+returns the pre-existing stable `ike_sa_init_crypto_invalid_key_length` error
+with only a redaction-safe input label and actual length; callers can obtain the
+required width from `Ikev2DhGroup::shared_secret_len()`.
+
+`build_ike_sa_rekey_response` requires a selected negotiation, a caller-owned
+non-zero new responder SPI, Nr, and a KEr whose group and fixed public-value
+length match the selected profile. It emits immutable generic-payload bytes in
+exactly `SA, Nr, KEr` order. The caller remains responsible for generating DH
+and nonce material, allocating collision-resistant SPIs, sealing and caching
+the complete `SK` response, handling simultaneous rekeys, installing the new
+SA, and deleting the old SA.
 
 ## Protected IKE_AUTH integration
 

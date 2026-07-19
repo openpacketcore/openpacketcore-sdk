@@ -68,6 +68,10 @@ const MODP_2048_PUBLIC_VALUE_LEN: usize = 256;
 const ECP_256_PUBLIC_VALUE_LEN: usize = 64;
 const ECP_384_PUBLIC_VALUE_LEN: usize = 96;
 const ECP_521_PUBLIC_VALUE_LEN: usize = 132;
+const MODP_2048_SHARED_SECRET_LEN: usize = 256;
+const ECP_256_SHARED_SECRET_LEN: usize = 32;
+const ECP_384_SHARED_SECRET_LEN: usize = 48;
+const ECP_521_SHARED_SECRET_LEN: usize = 66;
 const MODP_GENERATOR_TWO: u64 = 2;
 const MODP_PRIVATE_REJECTION_LIMIT: usize = 64;
 
@@ -142,6 +146,19 @@ impl Ikev2DhGroup {
             Self::Ecp256 => ECP_256_PUBLIC_VALUE_LEN,
             Self::Ecp384 => ECP_384_PUBLIC_VALUE_LEN,
             Self::Ecp521 => ECP_521_PUBLIC_VALUE_LEN,
+        }
+    }
+
+    /// Fixed-width shared-secret length in octets for this group.
+    ///
+    /// MODP agreement is padded to the modulus width. ECP agreement uses the
+    /// fixed-width x-coordinate representation defined for the group.
+    pub const fn shared_secret_len(self) -> usize {
+        match self {
+            Self::Modp2048 => MODP_2048_SHARED_SECRET_LEN,
+            Self::Ecp256 => ECP_256_SHARED_SECRET_LEN,
+            Self::Ecp384 => ECP_384_SHARED_SECRET_LEN,
+            Self::Ecp521 => ECP_521_SHARED_SECRET_LEN,
         }
     }
 }
@@ -1516,7 +1533,11 @@ pub fn derive_ike_sa_init_key_material(
 /// RFC 7296 section 2.18 deliberately uses two possibly different PRFs. The
 /// old IKE SA's negotiated PRF derives the new `SKEYSEED` from `SK_d (old)`,
 /// while the new IKE SA's negotiated PRF expands that `SKEYSEED` into the new
-/// seven-key stream. `new_dh_shared_secret` is mandatory for an IKE-SA rekey.
+/// seven-key stream. `new_dh_shared_secret` is mandatory for an IKE-SA rekey
+/// and must already use the selected group's fixed-width representation: 256
+/// octets for MODP-2048 or 32, 48, and 66 octets for ECP-256, ECP-384, and
+/// ECP-521 respectively. MODP leading-zero padding and the ECP fixed-width
+/// x-coordinate representation must be retained.
 ///
 /// RFC 8784 PPK post-processing is not repeated during rekey. Quantum
 /// resistance, when present, is inherited through the old SA's already-mixed
@@ -1526,7 +1547,9 @@ pub fn derive_ike_sa_init_key_material(
 ///
 /// Returns [`Ikev2SaInitCryptoError`] when the new profile is not executable,
 /// `old_sk_d` does not match the old PRF's preferred key length, a nonce or
-/// the mandatory new DH secret is invalid, or PRF+ limits are exceeded.
+/// the mandatory new DH secret has the wrong fixed width, or PRF+ limits are
+/// exceeded. Shared-secret failures reuse the redaction-safe
+/// [`Ikev2SaInitCryptoError::InvalidKeyLength`] contract.
 #[allow(clippy::too_many_arguments)]
 pub fn derive_ike_sa_rekey_key_material(
     old_prf: Ikev2PrfAlgorithm,
@@ -1542,7 +1565,7 @@ pub fn derive_ike_sa_rekey_key_material(
     validate_exact_key_len("old SK_d", old_sk_d, old_prf.output_len())?;
     validate_nonce("initiator", initiator_nonce)?;
     validate_nonce("responder", responder_nonce)?;
-    validate_secret_input("new DH shared secret", new_dh_shared_secret)?;
+    validate_dh_shared_secret_len(new_profile.dh_group(), new_dh_shared_secret)?;
 
     let rekey_seed_len = new_dh_shared_secret
         .len()
@@ -1760,6 +1783,22 @@ fn validate_exact_key_len(
 fn validate_secret_input(name: &'static str, secret: &[u8]) -> Result<(), Ikev2SaInitCryptoError> {
     if secret.is_empty() {
         return Err(Ikev2SaInitCryptoError::InvalidKeyLength { name, len: 0 });
+    }
+    Ok(())
+}
+
+fn validate_dh_shared_secret_len(
+    group: Ikev2DhGroup,
+    secret: &[u8],
+) -> Result<(), Ikev2SaInitCryptoError> {
+    let expected_len = group.shared_secret_len();
+    if secret.len() != expected_len {
+        return Err(Ikev2SaInitCryptoError::InvalidKeyLength {
+            // Keep the pre-existing empty-input diagnostic stable while using
+            // the same established public variant for every invalid width.
+            name: "new DH shared secret",
+            len: secret.len(),
+        });
     }
     Ok(())
 }
@@ -2884,9 +2923,11 @@ mod tests {
                 &nonce,
                 &nonce,
                 &[],
-            ))
-            .as_str(),
-            "ike_sa_init_crypto_invalid_key_length"
+            )),
+            Ikev2SaInitCryptoError::InvalidKeyLength {
+                name: "new DH shared secret",
+                len: 0,
+            }
         );
     }
 
