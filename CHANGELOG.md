@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Typed SWm Abort-Session boundary — `opc-proto-diameter`:** adds TS 29.273
+  ASR/ASA command definitions, typed redaction-safe request/answer models,
+  bounded parsers, request-bound deterministic builders, and exact transaction,
+  P-bit, ordinary-answer Session-Id, permanent-identity, Proxy-Info, and
+  overload-control correlation. Outbound envelopes require an opaque
+  authenticated connection-generation token and optionally constrain a direct
+  host or routed realm using ASCII case-insensitive DiameterIdentity matching;
+  Destination AVPs are never peer-authentication evidence. Generic E-bit errors
+  skip only logical-Origin policy and remain connection-bound. The request
+  parser retains Diameter's T bit while every ASA clears it. Same-Hop T/non-T
+  duplicates rebuild byte-identical committed responses; failover atomically
+  replaces the connection binding and Hop-by-Hop Identifier while preserving
+  End-to-End duplicate identity and response AVPs. Required ASR omissions retain
+  sealed provenance for checked 5005 construction, including the
+  procedure-mandated User-Name. Command metadata is the single additional-AVP
+  occurrence authority for typed and conservative dictionary decoding: ASR
+  permits repeated `Class` and `Reply-Message` while keeping `State` singleton;
+  ASA permits repeated `Failed-AVP` and dictionary-level `Redirect-Host` while
+  keeping `Class`, `State`, redirect usage, and cache time singleton. Canonical
+  RFC 6733 redirect definitions validate flags, widths, and bounded DiameterURI
+  grammar, but typed ASA rejects redirect context until result 3006 semantics
+  are modeled. ASR explicitly rejects answer-only error and redirect fields,
+  and an undeclared extension wildcard remains singleton.
+  At the ePDG, a successfully built and committed maintained-state ASA derives
+  an administrative STR fact set from the inbound ASR envelope;
+  `NO_STATE_MAINTAINED` and unsuccessful ASAs produce explicit no-STR
+  dispositions. The AAA-side correlated exchange does not claim ownership of
+  this ePDG-originated transition. Independent wire fixtures, hostile-input cases, corpus seeds,
+  and fuzz dispatch cover the modeled boundary. Session lookup, exactly-once
+  teardown, duplicate-cache lifetime, exact encoded-byte replay, fresh STR
+  transaction allocation, transport, retry, and compensation remain product
+  responsibilities.
 - **Typed SWm Session-Termination boundary — `opc-proto-diameter`:** adds
   TS 29.273 STR/STA command definitions, typed redaction-safe request/answer
   models, bounded parsers, and request-bound builders. Envelopes preserve both

@@ -37,6 +37,10 @@ pub const AVP_AUTH_APPLICATION_ID: AvpCode = AvpCode::new(258);
 pub const AVP_ACCT_APPLICATION_ID: AvpCode = AvpCode::new(259);
 /// Vendor-Specific-Application-Id AVP code.
 pub const AVP_VENDOR_SPECIFIC_APPLICATION_ID: AvpCode = AvpCode::new(260);
+/// Redirect-Host-Usage AVP code.
+pub const AVP_REDIRECT_HOST_USAGE: AvpCode = AvpCode::new(261);
+/// Redirect-Max-Cache-Time AVP code.
+pub const AVP_REDIRECT_MAX_CACHE_TIME: AvpCode = AvpCode::new(262);
 /// Session-Id AVP code.
 pub const AVP_SESSION_ID: AvpCode = AvpCode::new(263);
 /// Origin-Host AVP code.
@@ -53,6 +57,8 @@ pub const AVP_RESULT_CODE: AvpCode = AvpCode::new(268);
 pub const AVP_PRODUCT_NAME: AvpCode = AvpCode::new(269);
 /// Disconnect-Cause AVP code.
 pub const AVP_DISCONNECT_CAUSE: AvpCode = AvpCode::new(273);
+/// Auth-Session-State AVP code.
+pub const AVP_AUTH_SESSION_STATE: AvpCode = AvpCode::new(277);
 /// Origin-State-Id AVP code.
 pub const AVP_ORIGIN_STATE_ID: AvpCode = AvpCode::new(278);
 /// Failed-AVP AVP code.
@@ -67,6 +73,8 @@ pub const AVP_ROUTE_RECORD: AvpCode = AvpCode::new(282);
 pub const AVP_DESTINATION_REALM: AvpCode = AvpCode::new(283);
 /// Proxy-Info AVP code.
 pub const AVP_PROXY_INFO: AvpCode = AvpCode::new(284);
+/// Redirect-Host AVP code.
+pub const AVP_REDIRECT_HOST: AvpCode = AvpCode::new(292);
 /// Destination-Host AVP code.
 pub const AVP_DESTINATION_HOST: AvpCode = AvpCode::new(293);
 /// Error-Reporting-Host AVP code.
@@ -227,7 +235,7 @@ const BASE_COMMANDS: [CommandDefinition; 6] = [
     ),
 ];
 
-const BASE_AVPS: [AvpDefinition; 29] = [
+const BASE_AVPS: [AvpDefinition; 33] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_USER_NAME),
         "User-Name",
@@ -278,6 +286,20 @@ const BASE_AVPS: [AvpDefinition; 29] = [
         SpecRef::new("ietf", "RFC6733", "6.11"),
     )
     .with_grouped_avp_rules(&VENDOR_SPECIFIC_APPLICATION_ID_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_REDIRECT_HOST_USAGE),
+        "Redirect-Host-Usage",
+        AvpDataType::Enumerated,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "6.13"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_REDIRECT_MAX_CACHE_TIME),
+        "Redirect-Max-Cache-Time",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "6.14"),
+    ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_SESSION_ID),
         "Session-Id",
@@ -335,6 +357,13 @@ const BASE_AVPS: [AvpDefinition; 29] = [
         SpecRef::new("ietf", "RFC6733", "5.4.3"),
     ),
     AvpDefinition::new(
+        AvpKey::ietf(AVP_AUTH_SESSION_STATE),
+        "Auth-Session-State",
+        AvpDataType::Enumerated,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.11"),
+    ),
+    AvpDefinition::new(
         AvpKey::ietf(AVP_ORIGIN_STATE_ID),
         "Origin-State-Id",
         AvpDataType::Unsigned32,
@@ -384,6 +413,13 @@ const BASE_AVPS: [AvpDefinition; 29] = [
         SpecRef::new("ietf", "RFC6733", "6.7.2"),
     )
     .with_grouped_avp_rules(&PROXY_INFO_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_REDIRECT_HOST),
+        "Redirect-Host",
+        AvpDataType::DiameterUri,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "6.12"),
+    ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_DESTINATION_HOST),
         "Destination-Host",
@@ -548,6 +584,30 @@ mod tests {
         assert_eq!(definition.name(), "Class");
         assert_eq!(definition.data_type(), AvpDataType::OctetString);
         assert_eq!(definition.flags(), AvpFlagRules::base_mandatory());
+    }
+
+    #[test]
+    fn base_dictionary_contains_normative_redirect_definitions() {
+        for (code, name, data_type) in [
+            (AVP_REDIRECT_HOST, "Redirect-Host", AvpDataType::DiameterUri),
+            (
+                AVP_REDIRECT_HOST_USAGE,
+                "Redirect-Host-Usage",
+                AvpDataType::Enumerated,
+            ),
+            (
+                AVP_REDIRECT_MAX_CACHE_TIME,
+                "Redirect-Max-Cache-Time",
+                AvpDataType::Unsigned32,
+            ),
+        ] {
+            let definition = dictionary()
+                .find_avp(AvpKey::ietf(code))
+                .unwrap_or_else(|| panic!("{name} missing from base dictionary"));
+            assert_eq!(definition.name(), name);
+            assert_eq!(definition.data_type(), data_type);
+            assert_eq!(definition.flags(), AvpFlagRules::base_mandatory());
+        }
     }
 
     #[test]

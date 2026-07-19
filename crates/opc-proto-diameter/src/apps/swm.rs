@@ -2,13 +2,16 @@
 //!
 //! This module covers the ePDG-restricted SWm DER/DEA exchange that carries
 //! EAP payloads between the ePDG and an AAA/DRA peer, the request-bound
-//! Session-Termination STR/STA lifecycle exchange, plus a bounded
+//! Session-Termination STR/STA and Abort-Session ASR/ASA lifecycle exchanges,
+//! including the deterministic successful-ASA transition to an administrative
+//! STR when Diameter session state is maintained, plus a bounded
 //! subscription-profile extension surface for APN-Configuration, its default
 //! Context-Identifier, Service-Selection, and the TS 29.273 emergency attach
 //! sequence. The top-level default pointer is accepted under the DEA
 //! extension-AVP wildcard; it is not part of the baseline SWm DEA command ABNF.
 //! This module does not implement transport state, realm routing, local
-//! emergency-access policy, or IKEv2 policy. A live Diameter client must still
+//! emergency-access policy, duplicate-request cache lifetime, or IKEv2 policy.
+//! A live Diameter client must still
 //! consume a pending request keyed by peer connection and Hop-by-Hop Identifier
 //! before passing the parsed transaction envelopes to emergency evidence; the
 //! codec enforces identifier equality but cannot prove transport liveness.
@@ -62,6 +65,8 @@ pub const AVP_EAP_MASTER_SESSION_KEY: AvpCode = AvpCode::new(464);
 pub const AVP_AUTH_REQUEST_TYPE: AvpCode = AvpCode::new(274);
 /// State AVP code.
 pub const AVP_STATE: AvpCode = AvpCode::new(24);
+/// Reply-Message AVP code (RFC 4005 section 4.9).
+pub const AVP_REPLY_MESSAGE: AvpCode = AvpCode::new(18);
 /// Service-Selection AVP code (RFC 5778 §6.2).
 pub const AVP_SERVICE_SELECTION: AvpCode = AvpCode::new(493);
 /// Mobile-Node-Identifier AVP code (RFC 5779 §5.6).
@@ -268,7 +273,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 35] = [
+const SWM_AVPS: [AvpDefinition; 36] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -305,10 +310,19 @@ const SWM_AVPS: [AvpDefinition; 35] = [
         SpecRef::new("ietf", "RFC6733", "6.38"),
     ),
     AvpDefinition::new(
+        AvpKey::ietf(AVP_REPLY_MESSAGE),
+        "Reply-Message",
+        AvpDataType::Utf8String,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC4005", "4.9"),
+    ),
+    AvpDefinition::new(
         AvpKey::ietf(AVP_DRMP),
         "DRMP",
         AvpDataType::Enumerated,
-        AvpFlagRules::base_must_not_set_m(),
+        // TS 29.273 7.2.3.1 note 2 requires receivers to ignore a known
+        // DRMP M-bit mismatch. Typed builders still always emit M clear.
+        AvpFlagRules::base_optional(),
         SpecRef::new("ietf", "RFC7944", "9.1"),
     ),
     AvpDefinition::new(
@@ -373,8 +387,10 @@ const SWM_AVPS: [AvpDefinition; 35] = [
         AvpKey::ietf(AVP_LOAD),
         "Load",
         AvpDataType::Grouped,
-        AvpFlagRules::base_must_not_set_m(),
-        SpecRef::new("3gpp", "TS29273", "7.2.3.1"),
+        // TS 29.273 7.2.3.1 note 2 requires receivers to ignore a known
+        // Load M-bit mismatch. Lifecycle encoding canonicalizes it to clear.
+        AvpFlagRules::base_optional(),
+        SpecRef::new("3gpp", "TS29273", "7.2.3.1/2"),
     )
     .with_grouped_avp_rules(&LOAD_AVP_RULES),
     AvpDefinition::new(
@@ -536,21 +552,25 @@ const SWM_AVPS: [AvpDefinition; 35] = [
     ),
 ];
 
-const SWM_COMMANDS: [CommandDefinition; 4] = [
+const SWM_COMMANDS: [CommandDefinition; 6] = [
     COMMAND_DIAMETER_EAP_REQUEST,
     COMMAND_DIAMETER_EAP_ANSWER,
+    COMMAND_ABORT_SESSION_REQUEST,
+    COMMAND_ABORT_SESSION_ANSWER,
     COMMAND_SESSION_TERMINATION_REQUEST,
     COMMAND_SESSION_TERMINATION_ANSWER,
 ];
 
-const SWM_PROJECTED_PROFILE_COMMANDS: [CommandDefinition; 4] = [
+const SWM_PROJECTED_PROFILE_COMMANDS: [CommandDefinition; 6] = [
     COMMAND_DIAMETER_EAP_REQUEST,
     COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE,
+    COMMAND_ABORT_SESSION_REQUEST,
+    COMMAND_ABORT_SESSION_ANSWER,
     COMMAND_SESSION_TERMINATION_REQUEST,
     COMMAND_SESSION_TERMINATION_ANSWER,
 ];
 
-/// Static SWm dictionary covering DER/DEA and the typed STR/STA lifecycle slice.
+/// Static SWm dictionary covering DER/DEA and typed ASR/ASA plus STR/STA lifecycle slices.
 pub static DICTIONARY: Dictionary = Dictionary::new(
     "diameter-3gpp-swm-subset",
     &[APPLICATION],

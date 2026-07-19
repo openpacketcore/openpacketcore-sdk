@@ -49,7 +49,7 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   truncation and resource-limit failures are explicitly unanswerable.
 - `parser_error` provides sealed, redaction-safe `DiameterParserError` and
   `DiameterMissingAvpProvenance`, grouped-parent, and grouped-set metadata. Additive
-  `*_with_provenance` request parsers cover CER, DWR, DPR, and SWm DER/STR (plus
+  `*_with_provenance` request parsers cover CER, DWR, DPR, and SWm DER/STR/ASR (plus
   their SWm transaction-envelope forms); legacy parser signatures delegate to
   them and still return the original `DecodeError`. Missing provenance exposes
   only numeric application/command/role metadata and the exact SDK-owned AVP
@@ -66,20 +66,22 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   advertised Host-IP-Address for an SCTP-multihomed peer; singleton fields and
   the watchdog/disconnect profiles retain conservative duplicate rejection.
 - The `app-rf` feature adds typed Rf accounting helpers.
-- The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA and
-  Session-Termination STR/STA helpers. STR/STA envelopes bind both Diameter
-  identifiers, the P bit, a present exact `Session-Id`, and ordered Proxy-Info.
-  Outbound envelopes additionally require an authenticated connection-generation
-  token and may apply an explicit direct-host or routed-realm Origin policy;
-  RFC 6733 generic E-bit answers, including the permitted permanent-failure
-  fallback, may omit Session-Id and skip logical-Origin policy, but still
-  require the exact connection, transaction, P, and Proxy-Info chain. The
-  initial outbound STR clears T, and the envelope exposes a one-way
+- The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA,
+  Session-Termination STR/STA, and Abort-Session ASR/ASA helpers. Lifecycle
+  envelopes bind both Diameter identifiers, the P bit, a present exact
+  `Session-Id`, and ordered Proxy-Info. Outbound envelopes additionally require
+  an authenticated connection-generation token and may apply an explicit
+  direct-host, routed-realm, or connection-only Origin policy. RFC 6733 generic
+  E-bit answers, including the permitted permanent-failure fallback, may omit
+  Session-Id and skip logical-Origin policy, but still require the exact
+  connection, transaction, P, and Proxy-Info chain. The
+  initial outbound STR or ASR clears T, and each envelope exposes a one-way
   `mark_for_failover_retransmission` transition for queued, unacknowledged
   state resent after link failover or recovery; the transition atomically
   installs the replacement connection binding and its caller-reserved
   Hop-by-Hop Identifier while retaining End-to-End duplicate identity.
-  SWm STR `User-Name` is required by the TS 29.273 procedure table and retains
+  SWm STR and ASR `User-Name` are required by the TS 29.273 procedure tables and
+  retain
   sealed missing-AVP provenance despite the reused command CCF showing it as
   optional. The
   request-bound STA builder emits only fully modeled success, base
@@ -88,9 +90,15 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   transaction, optional-present `Session-Id`, and Proxy-Info correlation.
   Received non-redirect base result
   codes remain receive-only projections; redirect 3006 is rejected until its
-  required redirect AVPs have a typed surface. Missing required STR fields retain sealed 5005
-  provenance for the generic RFC 6733 error-answer mapper. Lifecycle ownership,
-  retries, teardown ordering, and compensation remain consumer policy.
+  required redirect semantics have a typed surface. Command occurrence metadata
+  declares repeated ASA `Redirect-Host` and `Failed-AVP` fields, so conservative
+  dictionary decoding recognizes their standard cardinality. The typed surface
+  retains repeated `Failed-AVP` but rejects redirect AVPs and result 3006.
+  `Redirect-Host-Usage` and `Redirect-Max-Cache-Time` remain singleton, and an
+  undeclared wildcard extension never gains repeatability implicitly. Missing
+  required STR and ASR fields retain sealed 5005 provenance for the generic RFC
+  6733 error-answer mapper. Lifecycle ownership, duplicate-request cache
+  lifetime, retries, teardown ordering, and compensation remain consumer policy.
   The DER/DEA surface includes
   exact, fail-closed resolution of an opt-in top-level default
   `Context-Identifier` extension to one of its repeated APN configurations and
@@ -259,7 +267,7 @@ function signatures and their `DecodeError` values remain source-compatible.
 | `base` | yes | RFC 6733 common application and raw base metadata. |
 | `peer` | no | CER/CEA, DWR/DWA, DPR/DPA helpers and peer-session projections. |
 | `app-rf` | no | Rf accounting dictionary plus typed ACR/ACA helpers. |
-| `app-swm` | no | SWm dictionary plus typed Diameter-EAP DER/DEA and Session-Termination STR/STA helpers. |
+| `app-swm` | no | SWm dictionary plus typed Diameter-EAP DER/DEA, Session-Termination STR/STA, and Abort-Session ASR/ASA helpers. |
 | `app-gx` | no | Gx dictionary slot only. |
 | `app-s6a` | no | S6a/S6d dictionary slot only. |
 | `app-s6b` | no | S6b dictionary slot only. |
@@ -397,6 +405,100 @@ Identifier produces a byte-identical STA. A failover duplicate with a newly
 reserved Hop-by-Hop Identifier produces the same flags and AVPs with that new
 identifier, as RFC 6733 permits. Cache lifetime, duplicate lookup, and
 committed-response ownership remain transport policy.
+
+### SWm Abort-Session
+
+An ePDG receiving an ASR parses the request envelope before touching session
+state, applies its product-owned abort exactly once, and builds the ASA against
+that same envelope:
+
+```rust
+use opc_proto_diameter::Message;
+use opc_proto_diameter::apps::swm::{
+    build_swm_abort_session_answer, parse_swm_abort_session_request_envelope,
+    SwmAbortSessionAnswer, SwmAbortSessionResult,
+};
+use opc_protocol::{DecodeContext, EncodeContext};
+
+# fn answer(message: &Message<'_>) -> Result<(), Box<dyn std::error::Error>> {
+let request = parse_swm_abort_session_request_envelope(
+    message,
+    DecodeContext::conservative(),
+)?;
+# // Perform the product-owned, exactly-once session abort here.
+let answer = SwmAbortSessionAnswer::for_request(
+    &request,
+    SwmAbortSessionResult::Success,
+    "epdg.example",
+    "example",
+);
+let asa_message = build_swm_abort_session_answer(
+    &request,
+    &answer,
+    EncodeContext::default(),
+)?;
+# // Commit the exact ASA bytes before acting on the follow-on disposition.
+let follow_on = request.post_abort_session_termination(
+    &answer,
+    EncodeContext::default(),
+)?;
+# let _ = asa_message;
+# let _ = follow_on;
+# Ok(())
+# }
+```
+
+The envelope retains the request T bit for duplicate classification, but ASA
+construction always clears T and preserves the request identifiers, P bit,
+Session-Id, and ordered Proxy-Info chain; the caller supplies the local ASA
+Origin explicitly rather than inferring authenticated identity from Destination
+AVPs. A duplicate retaining the same Hop-by-Hop Identifier produces a
+byte-identical ASA. A failover duplicate with a newly reserved Hop-by-Hop
+Identifier produces the same flags and AVPs with that new identifier, as RFC
+6733 permits. The product must key and bound its duplicate-request cache, commit
+the encoded ASA bytes before publishing success, and replay those exact cached
+bytes without repeating teardown side effects.
+
+For outbound ASR, construct the request with a transport-owned
+`SwmDiameterConnectionToken` and `SwmExpectedAnswerPeer`, then parse the ASA with
+`parse_swm_abort_session_answer_envelope_from_connection(message, received_on,
+context)`. Tokens must be process-unique and renewed on reconnect. An outbound
+envelope starts with T clear;
+`mark_for_failover_retransmission(replacement_hop_by_hop_identifier, new_peer)`
+is only for a queued, unacknowledged ASR resend after link failover or equivalent
+recovery, not an ordinary timer retry.
+
+Ordinary E-clear ASAs require Session-Id and correlate it exactly. A received
+generic E-bit answer may omit Session-Id under RFC 6733's error-answer grammar,
+including the permitted permanent-failure fallback; when present it must still
+match. Generic errors skip only logical-Origin policy; connection generation,
+transaction, P, Proxy-Info, and overload-control correlation remain mandatory.
+Such an error never enters the successful post-abort STR path.
+
+The RFC 4005-derived metadata recognizes repeated ASA `Redirect-Host` and
+`Failed-AVP` occurrences. Base definitions require the RFC 6733 M bit, validate
+fixed widths, and apply a bounded DiameterURI grammar. The typed ASA boundary
+retains repeated `Failed-AVP` but rejects all redirect AVPs and result 3006 until
+redirect semantics are fully modeled; it does not originate, route, or rebuild
+redirect context. `Redirect-Host-Usage` and `Redirect-Max-Cache-Time` are
+singleton. ASR explicitly forbids these answer-only fields. RFC 4005 ASR also
+declares singleton `State` and repeated `Reply-Message`; ASA keeps `State` and
+wildcard `Class` singleton. An undeclared extension wildcard remains singleton.
+
+The typed ASR profile requires `User-Name`. TS 29.273 V19.2.0's command ABNF
+prints it as optional, but the procedure table marks Permanent User Identity
+mandatory and the abort matching procedure requires the same Session-Id and
+User-Name. This stricter mechanical boundary prevents ambiguous session aborts.
+An omitted `Auth-Session-State` is treated as `STATE_MAINTAINED`, as required by
+RFC 6733. At the ePDG, after successfully building and committing the ASA, call
+`request.post_abort_session_termination(&answer, context)`: maintained state
+yields typed STR facts with `ADMINISTRATIVE` termination cause, while
+`NO_STATE_MAINTAINED` and an unsuccessful ASA yield explicit no-STR
+dispositions. This method lives on the inbound request envelope because TS
+29.273 requires the ePDG, not the AAA originator correlating an ASA, to send the
+follow-on STR. The SDK cannot prove response commitment; the consumer allocates
+a fresh STR transaction and peer binding, drives teardown/STR ordering, and owns
+STR retry and compensation state.
 
 Known additional STR/STA AVPs are not merely framed: dictionary fixed widths,
 Address, UTF-8, DiameterIdentity, and grouped framing are validated on both

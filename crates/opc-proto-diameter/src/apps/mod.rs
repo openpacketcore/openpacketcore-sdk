@@ -522,8 +522,8 @@ pub(crate) mod builder_helpers {
     /// generic wire contract.
     ///
     /// Grouped values still require the caller's command-specific child schema;
-    /// this helper validates their bounded framing only. DiameterURI and filter
-    /// rules fail closed until a complete grammar parser is available.
+    /// this helper validates their bounded framing only. Filter rules fail
+    /// closed until a complete grammar parser is available.
     pub(crate) fn validate_known_avp_value(
         value: &[u8],
         data_type: AvpDataType,
@@ -556,14 +556,130 @@ pub(crate) mod builder_helpers {
                 }
                 Ok(())
             }
-            AvpDataType::DiameterUri | AvpDataType::IpFilterRule | AvpDataType::QosFilterRule => {
-                Err(decode_structural_error(
-                    "dictionary-known AVP requires a typed value grammar",
-                    offset,
-                    section,
-                ))
+            AvpDataType::DiameterUri => validate_diameter_uri_value(value, offset, section),
+            AvpDataType::IpFilterRule | AvpDataType::QosFilterRule => Err(decode_structural_error(
+                "dictionary-known AVP requires a typed value grammar",
+                offset,
+                section,
+            )),
+        }
+    }
+
+    fn validate_diameter_uri_value(
+        value: &[u8],
+        offset: usize,
+        section: &'static str,
+    ) -> Result<(), DecodeError> {
+        const INVALID: &str = "DiameterURI AVP value violates RFC 6733 grammar";
+
+        if !value.is_ascii() {
+            return Err(decode_structural_error(INVALID, offset, section));
+        }
+        let uri =
+            str::from_utf8(value).map_err(|_| decode_structural_error(INVALID, offset, section))?;
+        let authority_and_parameters = if uri
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("aaa://"))
+        {
+            &uri[6..]
+        } else if uri
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("aaas://"))
+        {
+            &uri[7..]
+        } else {
+            return Err(decode_structural_error(INVALID, offset, section));
+        };
+
+        let (authority, parameters) = match authority_and_parameters.split_once(';') {
+            Some((authority, parameters)) => (authority, Some(parameters)),
+            None => (authority_and_parameters, None),
+        };
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        };
+        if !valid_diameter_uri_fqdn(host) || port.is_some_and(|port| !valid_diameter_uri_port(port))
+        {
+            return Err(decode_structural_error(INVALID, offset, section));
+        }
+
+        let mut transport = None;
+        let mut protocol = None;
+        if let Some(parameters) = parameters {
+            if parameters.is_empty() {
+                return Err(decode_structural_error(INVALID, offset, section));
+            }
+            for parameter in parameters.split(';') {
+                let Some((name, value)) = parameter.split_once('=') else {
+                    return Err(decode_structural_error(INVALID, offset, section));
+                };
+                if name.eq_ignore_ascii_case("transport") {
+                    if transport.is_some() || protocol.is_some() {
+                        return Err(decode_structural_error(INVALID, offset, section));
+                    }
+                    if !(value.eq_ignore_ascii_case("tcp")
+                        || value.eq_ignore_ascii_case("sctp")
+                        || value.eq_ignore_ascii_case("udp"))
+                    {
+                        return Err(decode_structural_error(INVALID, offset, section));
+                    }
+                    transport = Some(value);
+                } else if name.eq_ignore_ascii_case("protocol") {
+                    if protocol.is_some()
+                        || !(value.eq_ignore_ascii_case("diameter")
+                            || value.eq_ignore_ascii_case("radius")
+                            || value.eq_ignore_ascii_case("tacacs+"))
+                    {
+                        return Err(decode_structural_error(INVALID, offset, section));
+                    }
+                    protocol = Some(value);
+                } else {
+                    return Err(decode_structural_error(INVALID, offset, section));
+                }
             }
         }
+
+        if transport.is_some_and(|value| value.eq_ignore_ascii_case("udp"))
+            && protocol
+                .map(|value| value.eq_ignore_ascii_case("diameter"))
+                .unwrap_or(true)
+        {
+            return Err(decode_structural_error(INVALID, offset, section));
+        }
+        Ok(())
+    }
+
+    fn valid_diameter_uri_fqdn(host: &str) -> bool {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        !host.is_empty()
+            && host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+    }
+
+    fn valid_diameter_uri_port(port: &str) -> bool {
+        if port.is_empty() || port.len() > 5 || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        let mut value = 0_u32;
+        for digit in port.bytes() {
+            value = value * 10 + u32::from(digit - b'0');
+        }
+        value != 0 && value <= u32::from(u16::MAX)
     }
 
     fn validate_exact_value_len(
@@ -713,6 +829,62 @@ pub(crate) mod builder_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diameter_uri_validator_accepts_only_bounded_rfc_6733_grammar() {
+        let valid = [
+            "aaa://host.example.com;transport=tcp",
+            "aaa://host.example.com:6666;protocol=diameter",
+            "AAA://host.example.com:6666;Transport=SCTP;Protocol=Diameter",
+            "aaa://host.example.com:1813;transport=udp;protocol=radius",
+            "aaas://host.example.com.;transport=sctp",
+        ];
+        for value in valid {
+            builder_helpers::validate_known_avp_value(
+                value.as_bytes(),
+                crate::dictionary::AvpDataType::DiameterUri,
+                opc_protocol::DecodeContext::conservative(),
+                37,
+                "6.12",
+            )
+            .unwrap_or_else(|error| panic!("valid DiameterURI was rejected: {error}"));
+        }
+
+        let invalid = [
+            "",
+            "http://host.example.com",
+            "aaa://",
+            "aaa://-host.example.com",
+            "aaa://host..example.com",
+            "aaa://host.example.com:0",
+            "aaa://host.example.com:65536",
+            "aaa://host.example.com;transport=udp",
+            "aaa://host.example.com;transport=udp;protocol=diameter",
+            "aaa://host.example.com;protocol=radius;transport=udp",
+            "aaa://host.example.com;transport=tcp;transport=sctp",
+            "aaa://host.example.com;protocol=diameter;protocol=radius",
+            "aaa://host.example.com/path",
+            "aaa://host.example.com?query",
+            "aaa://host.example.com#fragment",
+            "aaa://höst.example.com",
+        ];
+        for value in invalid {
+            let error = match builder_helpers::validate_known_avp_value(
+                value.as_bytes(),
+                crate::dictionary::AvpDataType::DiameterUri,
+                opc_protocol::DecodeContext::conservative(),
+                37,
+                "6.12",
+            ) {
+                Ok(()) => panic!("malformed DiameterURI must fail closed"),
+                Err(error) => error,
+            };
+            assert_eq!(error.offset(), 37);
+            if !value.is_empty() {
+                assert!(!error.to_string().contains(value));
+            }
+        }
+    }
 
     #[test]
     #[cfg(feature = "app-gx")]
