@@ -32,15 +32,16 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use opc_gtpu_ebpf_common::{
-    DownlinkPdr, MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr, UplinkFar,
-    UplinkFarKey, DOWNLINK_PDR_VALUE_LEN, MARKED_BEARER_OWNER_VALUE_LEN,
+    DownlinkEndpointBinding, DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner,
+    MarkedBearerOwnerPhase, MarkedDownlinkPdr, UplinkFar, UplinkFarKey,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, MARKED_BEARER_OWNER_VALUE_LEN,
     MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
     UPLINK_MARK_KEY_LEN,
 };
 
 use crate::{
     CreateGtpDeviceRequest, GtpDevice, GtpPdpContext, GtpVersion, GtpuBackendKind, GtpuCapability,
-    GtpuDataplaneBackend, GtpuError, GtpuProbe, RemovePdpContextRequest,
+    GtpuDataplaneBackend, GtpuDownlinkEndpoint, GtpuError, GtpuProbe, RemovePdpContextRequest,
 };
 
 /// Default bpffs directory under which per-interface map pins are created.
@@ -68,6 +69,18 @@ pub struct EbpfGtpuDatapathCounters {
     /// Downlink G-PDUs dropped because the inner destination did not match
     /// the PDR's UE address.
     pub downlink_destination_mismatches: u64,
+    /// Downlink G-PDUs dropped because binding state was missing or corrupt.
+    pub downlink_binding_invalid: u64,
+    /// Downlink G-PDUs dropped for an outer address-family mismatch.
+    pub downlink_binding_family_mismatches: u64,
+    /// Downlink G-PDUs dropped for an unauthorized outer peer.
+    pub downlink_binding_peer_mismatches: u64,
+    /// Downlink G-PDUs dropped for an unauthorized local outer destination.
+    pub downlink_binding_local_mismatches: u64,
+    /// Downlink G-PDUs dropped on the wrong ingress attachment.
+    pub downlink_binding_ingress_mismatches: u64,
+    /// Downlink G-PDUs dropped by the explicit UDP source-port policy.
+    pub downlink_binding_source_port_mismatches: u64,
 }
 
 /// Identity-bound diagnostic snapshot for one live eBPF GTP-U datapath.
@@ -86,6 +99,8 @@ pub struct EbpfGtpuDatapathSnapshot {
     pub downlink_program_id: u32,
     /// Kernel map ID of the exact pinned per-CPU counter map.
     pub counters_map_id: u32,
+    /// Kernel map ID of the exact pinned binding-drop counter map.
+    pub downlink_binding_counters_map_id: u32,
     /// Per-path counters aggregated across all possible CPUs.
     pub counters: EbpfGtpuDatapathCounters,
 }
@@ -268,6 +283,22 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Remove a marked downlink PDR entry; returns whether it existed.
     fn marked_pdr_remove(&self, ifindex: u32, key: [u8; 4]) -> Result<bool, GtpuError>;
 
+    /// Read the canonical downlink outer-endpoint binding for a local TEID.
+    fn downlink_binding_get(
+        &self,
+        ifindex: u32,
+        key: [u8; 4],
+    ) -> Result<Option<[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>, GtpuError>;
+    /// Atomically insert or replace one complete downlink endpoint binding.
+    fn downlink_binding_insert(
+        &self,
+        ifindex: u32,
+        key: [u8; 4],
+        value: [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
+    ) -> Result<(), GtpuError>;
+    /// Remove a downlink endpoint binding; returns whether it existed.
+    fn downlink_binding_remove(&self, ifindex: u32, key: [u8; 4]) -> Result<bool, GtpuError>;
+
     /// Read a marked-bearer owner journal by `(PAA, mark)` selector.
     fn marked_owner_get(
         &self,
@@ -308,6 +339,10 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// reference every exact pinned per-bearer mark map.
     fn bearer_mark_datapath_usable(&self, ifindex: u32) -> bool;
 
+    /// Return whether the exact live downlink program and both endpoint-
+    /// binding maps are present for the managed attachment.
+    fn downlink_endpoint_binding_datapath_usable(&self, ifindex: u32) -> bool;
+
     /// Return whether PDP cleanup can safely mutate the held maps.
     ///
     /// Every named pin must still identify its exact held map, and each tc
@@ -321,6 +356,16 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 struct ManagedDevice {
     name: String,
     local_ip: Ipv4Addr,
+}
+
+#[derive(Clone, Copy)]
+struct MarkedPdpState {
+    far_key: [u8; UPLINK_MARK_KEY_LEN],
+    far_value: [u8; UPLINK_FAR_VALUE_LEN],
+    pdr_key: [u8; 4],
+    pdr_value: [u8; MARKED_DOWNLINK_PDR_VALUE_LEN],
+    binding_value: [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
+    dscp_value: Option<[u8; UPLINK_DSCP_VALUE_LEN]>,
 }
 
 struct EbpfGtpuDataplaneBackendInner {
@@ -469,23 +514,30 @@ impl EbpfGtpuDataplaneBackend {
     fn install_marked_pdp_context(
         &self,
         ifindex: u32,
-        far_key: [u8; UPLINK_MARK_KEY_LEN],
-        far_value: [u8; UPLINK_FAR_VALUE_LEN],
-        pdr_key: [u8; 4],
-        pdr_value: [u8; MARKED_DOWNLINK_PDR_VALUE_LEN],
-        dscp_value: Option<[u8; UPLINK_DSCP_VALUE_LEN]>,
+        state: MarkedPdpState,
     ) -> Result<(), GtpuError> {
+        let MarkedPdpState {
+            far_key,
+            far_value,
+            pdr_key,
+            pdr_value,
+            binding_value,
+            dscp_value,
+        } = state;
         let owner_dscp = dscp_value.map(|value| value[0]);
+        let downlink_binding = DownlinkEndpointBinding::decode(&binding_value);
         let pending_owner = MarkedBearerOwner::new(
             pdr_key,
             UplinkFar::decode(&far_value),
             owner_dscp,
+            downlink_binding,
             MarkedBearerOwnerPhase::Pending,
         );
         let active_owner = MarkedBearerOwner::new(
             pdr_key,
             UplinkFar::decode(&far_value),
             owner_dscp,
+            downlink_binding,
             MarkedBearerOwnerPhase::Active,
         );
         let selector_value = UplinkFarKey::decode(&far_key);
@@ -495,6 +547,8 @@ impl EbpfGtpuDataplaneBackend {
             || decoded_pdr.encode() != pdr_value
             || decoded_pdr.ue_ip != selector_value.ue_ip
             || decoded_pdr.bearer_mark != selector_value.bearer_mark
+            || downlink_binding.encode() != binding_value
+            || downlink_binding.ingress_ifindex() != ifindex
         {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_install_pdp_context",
@@ -554,13 +608,18 @@ impl EbpfGtpuDataplaneBackend {
 
         let existing_far = self.inner.runtime.marked_far_get(ifindex, far_key)?;
         let existing_pdr = self.inner.runtime.marked_pdr_get(ifindex, pdr_key)?;
+        let existing_binding = self.inner.runtime.downlink_binding_get(ifindex, pdr_key)?;
         let existing_dscp = self.inner.runtime.marked_dscp_get(ifindex, far_key)?;
         match existing_owner {
             None => {
                 // This schema has never shipped without the owner journal.
                 // Unowned forwarding state is corruption, not a recoverable
                 // partial install, and must not be claimed by a new request.
-                if existing_far.is_some() || existing_pdr.is_some() || existing_dscp.is_some() {
+                if existing_far.is_some()
+                    || existing_pdr.is_some()
+                    || existing_binding.is_some()
+                    || existing_dscp.is_some()
+                {
                     return Err(GtpuError::StateIndeterminate {
                         operation: "ebpf_install_pdp_context",
                     });
@@ -574,28 +633,101 @@ impl EbpfGtpuDataplaneBackend {
                 if existing_owner.local_teid != pdr_key {
                     return Err(GtpuError::AlreadyExists);
                 }
-                if existing_owner.uplink_far != pending_owner.uplink_far {
-                    return Err(GtpuError::AlreadyExists);
-                }
                 if existing_owner.phase == MarkedBearerOwnerPhase::Active {
                     let old_dscp = existing_owner.egress_dscp().map(|value| [value]);
-                    let complete = existing_far == Some(far_value)
+                    let old_far = existing_owner.uplink_far.encode();
+                    let old_binding = existing_owner.downlink_binding.encode();
+                    let complete = existing_far == Some(old_far)
                         && existing_pdr == Some(pdr_value)
+                        && existing_binding == Some(old_binding)
                         && existing_dscp == old_dscp;
                     if !complete {
                         return Err(GtpuError::StateIndeterminate {
                             operation: "ebpf_install_pdp_context",
                         });
                     }
-                    if existing_owner.egress_dscp() == owner_dscp {
+                    if existing_owner == active_owner {
                         return Ok(());
                     }
-                    // Phase-gate a DSCP-only update before changing its map.
-                    self.inner.runtime.marked_owner_insert(
-                        ifindex,
-                        far_key,
-                        pending_owner.encode(),
-                    )?;
+
+                    // Keep the old Active journal authoritative while new
+                    // resources are staged. The one binding-map replacement
+                    // is the downlink authorization cutover; publishing the
+                    // new Active owner last makes the complete new graph
+                    // usable. A reported failure restores every changed
+                    // resource before returning, so the old peer remains the
+                    // sole authorized identity.
+                    let mut dscp_changed = false;
+                    let mut far_changed = false;
+                    let mut binding_changed = false;
+                    let replace = (|| {
+                        if existing_dscp != dscp_value {
+                            match dscp_value {
+                                Some(value) => self
+                                    .inner
+                                    .runtime
+                                    .marked_dscp_insert(ifindex, far_key, value)?,
+                                None => {
+                                    self.inner.runtime.marked_dscp_remove(ifindex, far_key)?;
+                                }
+                            }
+                            dscp_changed = true;
+                        }
+                        if old_far != far_value {
+                            self.inner
+                                .runtime
+                                .marked_far_insert(ifindex, far_key, far_value)?;
+                            far_changed = true;
+                        }
+                        if old_binding != binding_value {
+                            self.inner.runtime.downlink_binding_insert(
+                                ifindex,
+                                pdr_key,
+                                binding_value,
+                            )?;
+                            binding_changed = true;
+                        }
+                        self.inner.runtime.marked_owner_insert(
+                            ifindex,
+                            far_key,
+                            active_owner.encode(),
+                        )
+                    })();
+                    if let Err(source) = replace {
+                        let binding_restored = !binding_changed
+                            || self
+                                .inner
+                                .runtime
+                                .downlink_binding_insert(ifindex, pdr_key, old_binding)
+                                .is_ok();
+                        let far_restored = !far_changed
+                            || self
+                                .inner
+                                .runtime
+                                .marked_far_insert(ifindex, far_key, old_far)
+                                .is_ok();
+                        let dscp_restored = !dscp_changed
+                            || match old_dscp {
+                                Some(value) => self
+                                    .inner
+                                    .runtime
+                                    .marked_dscp_insert(ifindex, far_key, value)
+                                    .is_ok(),
+                                None => self
+                                    .inner
+                                    .runtime
+                                    .marked_dscp_remove(ifindex, far_key)
+                                    .is_ok(),
+                            };
+                        return if binding_restored && far_restored && dscp_restored {
+                            Err(source)
+                        } else {
+                            Err(GtpuError::StateIndeterminate {
+                                operation: "ebpf_install_pdp_context",
+                            })
+                        };
+                    }
+                    return Ok(());
                 } else if existing_owner != pending_owner {
                     // Only the exact request that published Pending may
                     // resume it after a crash.
@@ -609,6 +741,7 @@ impl EbpfGtpuDataplaneBackend {
             // state, publish the PDR last, then atomically commit Active.
             if existing_far.is_some_and(|value| value != far_value)
                 || existing_pdr.is_some_and(|value| value != pdr_value)
+                || existing_binding.is_some_and(|value| value != binding_value)
             {
                 return Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_install_pdp_context",
@@ -631,6 +764,11 @@ impl EbpfGtpuDataplaneBackend {
                 self.inner
                     .runtime
                     .marked_far_insert(ifindex, far_key, far_value)?;
+            }
+            if existing_binding.is_none() {
+                self.inner
+                    .runtime
+                    .downlink_binding_insert(ifindex, pdr_key, binding_value)?;
             }
             if existing_pdr.is_none() {
                 self.inner
@@ -680,10 +818,17 @@ impl EbpfGtpuDataplaneBackend {
         }
         let far = self.inner.runtime.marked_far_get(ifindex, selector)?;
         let dscp = self.inner.runtime.marked_dscp_get(ifindex, selector)?;
+        let binding = self
+            .inner
+            .runtime
+            .downlink_binding_get(ifindex, owner.local_teid)?;
+        let expected_binding = owner.downlink_binding.encode();
         if far.is_some_and(|value| value != owner.uplink_far.encode())
             || dscp.is_some_and(|value| value[0] > 63)
+            || binding.is_some_and(|value| value != expected_binding)
             || owner.phase == MarkedBearerOwnerPhase::Active
-                && dscp.map(|value| value[0]) != owner.egress_dscp()
+                && (dscp.map(|value| value[0]) != owner.egress_dscp()
+                    || binding != Some(expected_binding))
         {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_remove_pdp_context",
@@ -694,6 +839,7 @@ impl EbpfGtpuDataplaneBackend {
                 owner.local_teid,
                 owner.uplink_far,
                 owner.egress_dscp(),
+                owner.downlink_binding,
                 MarkedBearerOwnerPhase::Removing,
             );
             self.inner
@@ -709,6 +855,11 @@ impl EbpfGtpuDataplaneBackend {
                 .inner
                 .runtime
                 .marked_dscp_remove(ifindex, selector)
+                .is_err()
+            || self
+                .inner
+                .runtime
+                .downlink_binding_remove(ifindex, owner.local_teid)
                 .is_err()
             || self
                 .inner
@@ -859,6 +1010,33 @@ impl EbpfGtpuDataplaneBackend {
                 "MS address must differ from the S2b-U local address",
             ));
         }
+        let downlink_endpoint = GtpuDownlinkEndpoint::new(
+            request.peer_address,
+            IpAddr::V4(local_ip),
+            request.link_ifindex,
+            request.downlink_source_port_policy,
+        )
+        .ok_or_else(|| {
+            GtpuError::invalid_config(
+                "pdp.downlink_endpoint",
+                "peer, local endpoint, and ingress attachment must form one canonical identity",
+            )
+        })?;
+        let binding_value = encode_downlink_endpoint(&downlink_endpoint)?;
+
+        if !self
+            .inner
+            .runtime
+            .downlink_endpoint_binding_datapath_usable(request.link_ifindex)
+        {
+            return Err(GtpuError::io(
+                "ebpf_downlink_endpoint_datapath",
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "live downlink endpoint-binding datapath identity is unavailable",
+                ),
+            ));
+        }
 
         let far_value = UplinkFar {
             peer_ip: peer_address.octets(),
@@ -911,11 +1089,14 @@ impl EbpfGtpuDataplaneBackend {
             .encode();
             return self.install_marked_pdp_context(
                 request.link_ifindex,
-                far_key,
-                far_value,
-                pdr_key,
-                pdr_value,
-                dscp_value,
+                MarkedPdpState {
+                    far_key,
+                    far_value,
+                    pdr_key,
+                    pdr_value,
+                    binding_value,
+                    dscp_value,
+                },
             );
         }
 
@@ -943,32 +1124,104 @@ impl EbpfGtpuDataplaneBackend {
 
         let existing_far = self.inner.runtime.far_get(request.link_ifindex, far_key)?;
         let existing_pdr = self.inner.runtime.pdr_get(request.link_ifindex, pdr_key)?;
+        let existing_binding = self
+            .inner
+            .runtime
+            .downlink_binding_get(request.link_ifindex, pdr_key)?;
         let existing_dscp = self.inner.runtime.dscp_get(request.link_ifindex, far_key)?;
-        match (existing_far, existing_pdr, existing_dscp) {
+        match (existing_far, existing_pdr, existing_binding, existing_dscp) {
             // Exact re-install of the same session state is idempotent.
-            (Some(far), Some(pdr), dscp)
-                if far == far_value && pdr == pdr_value && dscp == dscp_value =>
+            (Some(far), Some(pdr), Some(binding), dscp)
+                if far == far_value
+                    && pdr == pdr_value
+                    && binding == binding_value
+                    && dscp == dscp_value =>
             {
                 Ok(())
             }
-            // DSCP is an independently keyed one-byte subresource. When the
-            // session's FAR/PDR identity is unchanged, reconcile only that
-            // map entry with one atomic BPF hash operation.
-            (Some(far), Some(pdr), _existing_dscp) if far == far_value && pdr == pdr_value => {
-                match dscp_value {
-                    Some(dscp) => {
+            // One exact UE/TEID identity may relocate its peer or change its
+            // bounded source-port policy. Stage uplink/DSCP state first and
+            // replace the single complete binding last. No interval can
+            // authorize both peers. A reported pre-commit failure restores
+            // the exact previous resources before returning.
+            (Some(old_far), Some(pdr), Some(old_binding), old_dscp) if pdr == pdr_value => {
+                let decoded_old = DownlinkEndpointBinding::decode(&old_binding);
+                let old_far_decoded = UplinkFar::decode(&old_far);
+                if !decoded_old.is_valid()
+                    || decoded_old.ingress_ifindex() != request.link_ifindex
+                    || decoded_old.peer_address()
+                        != GtpuEndpointAddress::Ipv4(old_far_decoded.peer_ip)
+                    || decoded_old.local_address()
+                        != GtpuEndpointAddress::Ipv4(old_far_decoded.local_ip)
+                {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_install_pdp_context",
+                    });
+                }
+                let mut dscp_changed = false;
+                let mut far_changed = false;
+                let replace = (|| {
+                    if old_dscp != dscp_value {
+                        match dscp_value {
+                            Some(value) => self.inner.runtime.dscp_insert(
+                                request.link_ifindex,
+                                far_key,
+                                value,
+                            )?,
+                            None => {
+                                self.inner
+                                    .runtime
+                                    .dscp_remove(request.link_ifindex, far_key)?;
+                            }
+                        }
+                        dscp_changed = true;
+                    }
+                    if old_far != far_value {
                         self.inner
                             .runtime
-                            .dscp_insert(request.link_ifindex, far_key, dscp)
+                            .far_insert(request.link_ifindex, far_key, far_value)?;
+                        far_changed = true;
                     }
-                    None => self
-                        .inner
-                        .runtime
-                        .dscp_remove(request.link_ifindex, far_key)
-                        .map(|_| ()),
+                    if old_binding != binding_value {
+                        self.inner.runtime.downlink_binding_insert(
+                            request.link_ifindex,
+                            pdr_key,
+                            binding_value,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                if let Err(source) = replace {
+                    let far_restored = !far_changed
+                        || self
+                            .inner
+                            .runtime
+                            .far_insert(request.link_ifindex, far_key, old_far)
+                            .is_ok();
+                    let dscp_restored = !dscp_changed
+                        || match old_dscp {
+                            Some(value) => self
+                                .inner
+                                .runtime
+                                .dscp_insert(request.link_ifindex, far_key, value)
+                                .is_ok(),
+                            None => self
+                                .inner
+                                .runtime
+                                .dscp_remove(request.link_ifindex, far_key)
+                                .is_ok(),
+                        };
+                    return if far_restored && dscp_restored {
+                        Err(source)
+                    } else {
+                        Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_install_pdp_context",
+                        })
+                    };
                 }
+                Ok(())
             }
-            (None, None, existing_dscp) => {
+            (None, None, None, existing_dscp) => {
                 // DSCP is published before FAR/PDR so a packet can never see
                 // new routing without its requested marking. A process crash
                 // in that first step can therefore leave a DSCP-only orphan.
@@ -1002,11 +1255,11 @@ impl EbpfGtpuDataplaneBackend {
                         error,
                     );
                 }
-                if let Err(error) =
-                    self.inner
-                        .runtime
-                        .pdr_insert(request.link_ifindex, pdr_key, pdr_value)
-                {
+                if let Err(error) = self.inner.runtime.downlink_binding_insert(
+                    request.link_ifindex,
+                    pdr_key,
+                    binding_value,
+                ) {
                     let far_rolled_back = self
                         .inner
                         .runtime
@@ -1026,8 +1279,50 @@ impl EbpfGtpuDataplaneBackend {
                         })
                     };
                 }
+                if let Err(error) =
+                    self.inner
+                        .runtime
+                        .pdr_insert(request.link_ifindex, pdr_key, pdr_value)
+                {
+                    let binding_rolled_back = self
+                        .inner
+                        .runtime
+                        .downlink_binding_remove(request.link_ifindex, pdr_key)
+                        .is_ok();
+                    let far_rolled_back = self
+                        .inner
+                        .runtime
+                        .far_remove(request.link_ifindex, far_key)
+                        .is_ok();
+                    let dscp_rolled_back = dscp_value.is_none()
+                        || self
+                            .inner
+                            .runtime
+                            .dscp_remove(request.link_ifindex, far_key)
+                            .is_ok();
+                    return if binding_rolled_back && far_rolled_back && dscp_rolled_back {
+                        Err(error)
+                    } else {
+                        Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_install_pdp_context",
+                        })
+                    };
+                }
                 Ok(())
             }
+            // Exact FAR/PDR state without its binding, or a binding without a
+            // PDR, is partial/corrupt state rather than exact presence.
+            (Some(_), Some(pdr), None, _) if pdr == pdr_value => {
+                Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_install_pdp_context",
+                })
+            }
+            (None, Some(pdr), _, _) if pdr == pdr_value => Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_install_pdp_context",
+            }),
+            (_, None, Some(_), _) => Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_install_pdp_context",
+            }),
             // A different session already claims this UE PAA or TEID.
             _ => Err(GtpuError::AlreadyExists),
         }
@@ -1103,9 +1398,25 @@ impl EbpfGtpuDataplaneBackend {
                 };
             }
         };
+        let binding_result = self
+            .inner
+            .runtime
+            .downlink_binding_remove(request.link_ifindex, pdr_key);
+        let binding_existed = match binding_result {
+            Ok(existed) => existed,
+            Err(error) => {
+                return if far_existed || dscp_existed {
+                    Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_remove_pdp_context",
+                    })
+                } else {
+                    Err(error)
+                };
+            }
+        };
         let pdr_result = self.inner.runtime.pdr_remove(request.link_ifindex, pdr_key);
         if let Err(error) = pdr_result {
-            return if far_existed || dscp_existed {
+            return if far_existed || dscp_existed || binding_existed {
                 Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_remove_pdp_context",
                 })
@@ -1118,7 +1429,12 @@ impl EbpfGtpuDataplaneBackend {
 
     fn probe_sync(&self) -> GtpuProbe {
         let env = self.inner.runtime.probe_environment();
-        let (has_attached_device, dscp_datapath_usable, bearer_mark_datapath_usable) = self
+        let (
+            has_attached_device,
+            dscp_datapath_usable,
+            bearer_mark_datapath_usable,
+            endpoint_binding_datapath_usable,
+        ) = self
             .devices()
             .map(|devices| {
                 (
@@ -1131,9 +1447,15 @@ impl EbpfGtpuDataplaneBackend {
                         && devices.keys().all(|ifindex| {
                             self.inner.runtime.bearer_mark_datapath_usable(*ifindex)
                         }),
+                    !devices.is_empty()
+                        && devices.keys().all(|ifindex| {
+                            self.inner
+                                .runtime
+                                .downlink_endpoint_binding_datapath_usable(*ifindex)
+                        }),
                 )
             })
-            .unwrap_or((false, false, false));
+            .unwrap_or((false, false, false, false));
         let mutation_ready = env.platform_supported
             && env.bpffs_present
             && env.btf_present
@@ -1190,6 +1512,20 @@ impl EbpfGtpuDataplaneBackend {
             } else if !has_attached_device {
                 GtpuCapability::Unknown
             } else if bearer_mark_datapath_usable {
+                GtpuCapability::Available
+            } else {
+                GtpuCapability::Missing
+            },
+            downlink_endpoint_binding: if !env.platform_supported
+                || !env.bpffs_present
+                || !env.btf_present
+            {
+                GtpuCapability::Missing
+            } else if !env.net_admin_capable || !env.bpf_capable {
+                GtpuCapability::PermissionDenied
+            } else if !has_attached_device {
+                GtpuCapability::Unknown
+            } else if endpoint_binding_datapath_usable {
                 GtpuCapability::Available
             } else {
                 GtpuCapability::Missing
@@ -1284,6 +1620,28 @@ fn require_ipv4(address: IpAddr, field: &'static str) -> Result<Ipv4Addr, GtpuEr
     }
 }
 
+fn encode_downlink_endpoint(
+    endpoint: &GtpuDownlinkEndpoint,
+) -> Result<[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN], GtpuError> {
+    let address = |address| match address {
+        IpAddr::V4(address) => GtpuEndpointAddress::Ipv4(address.octets()),
+        IpAddr::V6(address) => GtpuEndpointAddress::Ipv6(address.octets()),
+    };
+    DownlinkEndpointBinding::new(
+        address(endpoint.peer_address()),
+        address(endpoint.local_address()),
+        endpoint.ingress_ifindex(),
+        endpoint.source_port_policy(),
+    )
+    .map(DownlinkEndpointBinding::encode)
+    .ok_or_else(|| {
+        GtpuError::invalid_config(
+            "pdp.downlink_endpoint",
+            "downlink endpoint identity must be canonical",
+        )
+    })
+}
+
 fn poisoned_lock() -> io::Error {
     io::Error::other("gtpu ebpf backend mutex poisoned")
 }
@@ -1293,7 +1651,7 @@ mod aya_runtime {
     //! aya-based kernel runtime: loads the committed CO-RE object, attaches
     //! tc clsact filters, and performs pinned BPF map operations.
 
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io;
     use std::mem::ManuallyDrop;
@@ -1315,15 +1673,20 @@ mod aya_runtime {
     use opc_linux_gtpu_sys as sys;
 
     use opc_gtpu_ebpf_common::{
-        MarkedBearerOwner, MarkedBearerOwnerPhase, MarkedDownlinkPdr, UplinkFarKey,
+        default_bearer_graph_is_valid, DownlinkEndpointBinding, DownlinkPdr, MarkedBearerOwner,
+        MarkedBearerOwnerPhase, MarkedDownlinkPdr, UplinkFar, UplinkFarKey,
+        COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+        COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
+        COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
         COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
-        COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS,
-        MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP,
-        MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MARKED_BEARER_OWNER_VALUE_LEN,
-        MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
-        UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-        UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-        UPLINK_MARK_KEY_LEN,
+        COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN,
+        DOWNLINK_PDR_VALUE_LEN, MAP_CONFIG, MAP_COUNTERS, MAP_DOWNLINK_BINDING_COUNTERS,
+        MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR,
+        MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
+        MAP_UPLINK_MARK_FAR, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
+        PROG_DOWNLINK, PROG_UPLINK, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+        UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
+        UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
     };
 
     use super::{
@@ -1338,7 +1701,7 @@ mod aya_runtime {
         "/bpf/opc-gtpu-datapath.bpf.o"
     ));
     /// Frozen pre-bearer-mark object used only to prove exact live v1 filter
-    /// ownership during the bounded v1-to-v2 pin-schema migration.
+    /// ownership during the bounded empty-v1-to-endpoint-v3 pin migration.
     const LEGACY_V1_DATAPATH_OBJECT: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/bpf/opc-gtpu-datapath-v1.bpf.o"
@@ -1408,8 +1771,10 @@ mod aya_runtime {
         uplink_mark_dscp: u32,
         downlink_pdr: u32,
         downlink_mark_pdr: u32,
+        downlink_binding: u32,
         marked_owner: u32,
         counters: u32,
+        downlink_binding_counters: u32,
         config: u32,
     }
 
@@ -1425,6 +1790,8 @@ mod aya_runtime {
         DscpV1,
         /// Every additive per-bearer map was committed.
         BearerV2,
+        /// Every PDR has canonical outer-endpoint provenance state.
+        EndpointV3,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1508,8 +1875,10 @@ mod aya_runtime {
                 MAP_UPLINK_MARK_DSCP,
                 MAP_DOWNLINK_PDR,
                 MAP_DOWNLINK_MARK_PDR,
+                MAP_DOWNLINK_ENDPOINT_BINDING,
                 MAP_MARKED_BEARER_OWNER,
                 MAP_COUNTERS,
+                MAP_DOWNLINK_BINDING_COUNTERS,
                 MAP_CONFIG,
             ] {
                 match fs::remove_file(pin_dir.join(map_name)) {
@@ -1569,8 +1938,10 @@ mod aya_runtime {
                     MAP_UPLINK_MARK_DSCP,
                     MAP_DOWNLINK_PDR,
                     MAP_DOWNLINK_MARK_PDR,
+                    MAP_DOWNLINK_ENDPOINT_BINDING,
                     MAP_MARKED_BEARER_OWNER,
                     MAP_COUNTERS,
+                    MAP_DOWNLINK_BINDING_COUNTERS,
                     MAP_CONFIG,
                 ] {
                     if pin_dir
@@ -1600,6 +1971,9 @@ mod aya_runtime {
                 Ok(value) if value == UPLINK_DSCP_SCHEMA_MARKER_VALUE => BearerSchemaState::DscpV1,
                 Ok(value) if value == UPLINK_BEARER_SCHEMA_MARKER_VALUE => {
                     BearerSchemaState::BearerV2
+                }
+                Ok(value) if value == UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE => {
+                    BearerSchemaState::EndpointV3
                 }
                 Ok(_) => {
                     return Err(GtpuError::io(
@@ -1640,6 +2014,18 @@ mod aya_runtime {
                     MAP_COUNTERS,
                     MAP_CONFIG,
                 ],
+                BearerSchemaState::EndpointV3 => &[
+                    MAP_UPLINK_DSCP,
+                    MAP_UPLINK_MARK_FAR,
+                    MAP_UPLINK_MARK_DSCP,
+                    MAP_DOWNLINK_PDR,
+                    MAP_DOWNLINK_MARK_PDR,
+                    MAP_DOWNLINK_ENDPOINT_BINDING,
+                    MAP_MARKED_BEARER_OWNER,
+                    MAP_COUNTERS,
+                    MAP_DOWNLINK_BINDING_COUNTERS,
+                    MAP_CONFIG,
+                ],
             };
             for required_pin in required_pins {
                 if !pin_dir
@@ -1653,6 +2039,12 @@ mod aya_runtime {
                     ));
                 }
             }
+            if state == BearerSchemaState::BearerV2 {
+                return Err(GtpuError::io(
+                    "ebpf_endpoint_schema",
+                    invalid_data("endpoint-unbound GTP-U schema requires drained reprovisioning"),
+                ));
+            }
             Ok(state)
         }
 
@@ -1664,7 +2056,7 @@ mod aya_runtime {
                 .map_err(|error| map_error("ebpf_bearer_schema", error))?;
             far.insert(
                 UPLINK_DSCP_SCHEMA_MARKER_KEY,
-                UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+                UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE,
                 0,
             )
             .map_err(|error| map_error("ebpf_bearer_schema", error))
@@ -1675,6 +2067,7 @@ mod aya_runtime {
         fn marked_owner_index(
             ebpf: &Ebpf,
             local_ip: [u8; 4],
+            ifindex: u32,
         ) -> Result<HashMap<[u8; 4], [u8; UPLINK_MARK_KEY_LEN]>, GtpuError> {
             let missing =
                 || GtpuError::io("ebpf_marked_owner_rebuild", invalid_data("map missing"));
@@ -1706,6 +2099,16 @@ mod aya_runtime {
                 ebpf.map(MAP_DOWNLINK_PDR).ok_or_else(missing)?,
             )
             .map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+            let downlink_binding =
+                BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>::try_from(
+                    ebpf.map(MAP_DOWNLINK_ENDPOINT_BINDING)
+                        .ok_or_else(missing)?,
+                )
+                .map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+            let legacy_far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(
+                ebpf.map(MAP_UPLINK_FAR).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
 
             let mut by_teid = HashMap::new();
             for entry in owners.iter() {
@@ -1725,6 +2128,7 @@ mod aya_runtime {
                     || selector_value.bearer_mark == [0; 4]
                     || !owner.is_valid()
                     || owner.uplink_far.local_ip != local_ip
+                    || owner.downlink_binding.ingress_ifindex() != ifindex
                     || by_teid.insert(owner.local_teid, selector).is_some()
                 {
                     return Err(invalid());
@@ -1751,8 +2155,16 @@ mod aya_runtime {
                         return Err(map_error("ebpf_marked_owner_rebuild", error));
                     }
                 };
+                let binding = match downlink_binding.get(&owner.local_teid, 0) {
+                    Ok(value) => Some(value),
+                    Err(MapError::KeyNotFound) => None,
+                    Err(error) => {
+                        return Err(map_error("ebpf_marked_owner_rebuild", error));
+                    }
+                };
                 let expected_far = owner.uplink_far.encode();
                 let expected_dscp = owner.egress_dscp().map(|value| [value]);
+                let expected_binding = owner.downlink_binding.encode();
                 let expected_pdr = MarkedDownlinkPdr {
                     ue_ip: selector_value.ue_ip,
                     bearer_mark: selector_value.bearer_mark,
@@ -1760,9 +2172,12 @@ mod aya_runtime {
                 .encode();
                 let resources_match = far.is_none_or(|value| value == expected_far)
                     && dscp.is_none_or(|value| value[0] <= 63)
-                    && pdr.is_none_or(|value| value == expected_pdr);
-                let complete =
-                    far == Some(expected_far) && dscp == expected_dscp && pdr == Some(expected_pdr);
+                    && pdr.is_none_or(|value| value == expected_pdr)
+                    && binding.is_none_or(|value| value == expected_binding);
+                let complete = far == Some(expected_far)
+                    && dscp == expected_dscp
+                    && pdr == Some(expected_pdr)
+                    && binding == Some(expected_binding);
                 if !resources_match || (owner.phase == MarkedBearerOwnerPhase::Active && !complete)
                 {
                     return Err(invalid());
@@ -1810,6 +2225,45 @@ mod aya_runtime {
                     }
                 };
                 if owner.local_teid != teid {
+                    return Err(invalid());
+                }
+            }
+
+            let mut default_teids = HashSet::new();
+            let mut default_ues = HashSet::new();
+            for entry in legacy_pdr.iter() {
+                let (teid, encoded) =
+                    entry.map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+                let pdr = DownlinkPdr::decode(&encoded);
+                let far = legacy_far
+                    .get(&pdr.ue_ip, 0)
+                    .map(|value| UplinkFar::decode(&value))
+                    .map_err(|_| invalid())?;
+                let binding = downlink_binding
+                    .get(&teid, 0)
+                    .map(|value| DownlinkEndpointBinding::decode(&value))
+                    .map_err(|_| invalid())?;
+                if !default_bearer_graph_is_valid(teid, pdr, far, binding, local_ip, ifindex)
+                    || !default_teids.insert(teid)
+                    || !default_ues.insert(pdr.ue_ip)
+                {
+                    return Err(invalid());
+                }
+            }
+            for entry in legacy_far.iter() {
+                let (ue_ip, _) =
+                    entry.map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+                if ue_ip != UPLINK_DSCP_SCHEMA_MARKER_KEY && !default_ues.contains(&ue_ip) {
+                    return Err(invalid());
+                }
+            }
+            for entry in downlink_binding.iter() {
+                let (teid, encoded) =
+                    entry.map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+                let binding = DownlinkEndpointBinding::decode(&encoded);
+                let has_default = default_teids.contains(&teid);
+                let has_marked = by_teid.contains_key(&teid);
+                if !binding.is_valid() || has_default == has_marked {
                     return Err(invalid());
                 }
             }
@@ -1895,8 +2349,10 @@ mod aya_runtime {
                     &[
                         MAP_DOWNLINK_PDR,
                         MAP_DOWNLINK_MARK_PDR,
+                        MAP_DOWNLINK_ENDPOINT_BINDING,
                         MAP_MARKED_BEARER_OWNER,
                         MAP_COUNTERS,
+                        MAP_DOWNLINK_BINDING_COUNTERS,
                     ],
                 )?,
                 pins: Self::pinned_map_identity(pin_dir)?,
@@ -1916,8 +2372,10 @@ mod aya_runtime {
                 uplink_mark_dscp: id(MAP_UPLINK_MARK_DSCP)?,
                 downlink_pdr: id(MAP_DOWNLINK_PDR)?,
                 downlink_mark_pdr: id(MAP_DOWNLINK_MARK_PDR)?,
+                downlink_binding: id(MAP_DOWNLINK_ENDPOINT_BINDING)?,
                 marked_owner: id(MAP_MARKED_BEARER_OWNER)?,
                 counters: id(MAP_COUNTERS)?,
+                downlink_binding_counters: id(MAP_DOWNLINK_BINDING_COUNTERS)?,
                 config: id(MAP_CONFIG)?,
             })
         }
@@ -1956,6 +2414,12 @@ mod aya_runtime {
                     ebpf.map(MAP_DOWNLINK_MARK_PDR).ok_or_else(missing)?,
                 )
                 .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let downlink_binding =
+                BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>::try_from(
+                    ebpf.map(MAP_DOWNLINK_ENDPOINT_BINDING)
+                        .ok_or_else(missing)?,
+                )
+                .map_err(|error| map_error("ebpf_map_identity", error))?;
             let marked_owner = BpfHashMap::<
                 _,
                 [u8; UPLINK_MARK_KEY_LEN],
@@ -1967,6 +2431,11 @@ mod aya_runtime {
             let counters =
                 PerCpuArray::<_, u64>::try_from(ebpf.map(MAP_COUNTERS).ok_or_else(missing)?)
                     .map_err(|error| map_error("ebpf_map_identity", error))?;
+            let downlink_binding_counters = PerCpuArray::<_, u64>::try_from(
+                ebpf.map(MAP_DOWNLINK_BINDING_COUNTERS)
+                    .ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_map_identity", error))?;
             let config = Array::<_, [u8; 4]>::try_from(ebpf.map(MAP_CONFIG).ok_or_else(missing)?)
                 .map_err(|error| map_error("ebpf_map_identity", error))?;
             Ok(PinnedMapIdentity {
@@ -1976,8 +2445,10 @@ mod aya_runtime {
                 uplink_mark_dscp: info_id(uplink_mark_dscp.map())?,
                 downlink_pdr: info_id(downlink_pdr.map())?,
                 downlink_mark_pdr: info_id(downlink_mark_pdr.map())?,
+                downlink_binding: info_id(downlink_binding.map())?,
                 marked_owner: info_id(marked_owner.map())?,
                 counters: info_id(counters.map())?,
+                downlink_binding_counters: info_id(downlink_binding_counters.map())?,
                 config: info_id(config.map())?,
             })
         }
@@ -2901,7 +3372,7 @@ mod aya_runtime {
                     // address is an ownership conflict.
                     return Err(GtpuError::AlreadyExists);
                 }
-                let marked_owner_by_teid = Self::marked_owner_index(&ebpf, local_ip)?;
+                let marked_owner_by_teid = Self::marked_owner_index(&ebpf, local_ip, ifindex)?;
                 let attached = self.attach_programs(
                     &mut ebpf,
                     interface,
@@ -2910,10 +3381,10 @@ mod aya_runtime {
                     tc_priority,
                     schema_state,
                 )?;
-                if schema_state != BearerSchemaState::BearerV2 {
+                if schema_state != BearerSchemaState::EndpointV3 {
                     if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
                         if attached.replaced_existing {
-                            // Both exact v2 hooks remain live. Retaining them
+                            // Both exact current hooks remain live. Retaining them
                             // with the prior marker is a retryable,
                             // fail-closed migration state; removing them
                             // would create an outage for the displaced v1
@@ -3037,7 +3508,7 @@ mod aya_runtime {
                     Err(error) => Err(error),
                 };
             }
-            let marked_owner_by_teid = Self::marked_owner_index(&ebpf, local_ip)?;
+            let marked_owner_by_teid = Self::marked_owner_index(&ebpf, local_ip, ifindex)?;
             let attached = self.attach_programs(
                 &mut ebpf,
                 interface,
@@ -3046,7 +3517,7 @@ mod aya_runtime {
                 tc_priority,
                 schema_state,
             )?;
-            if schema_state != BearerSchemaState::BearerV2 {
+            if schema_state != BearerSchemaState::EndpointV3 {
                 if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
                     if attached.replaced_existing {
                         return Err(state_indeterminate("ebpf_schema_marker_commit"));
@@ -3466,6 +3937,75 @@ mod aya_runtime {
             })
         }
 
+        fn downlink_binding_get(
+            &self,
+            ifindex: u32,
+            key: [u8; 4],
+        ) -> Result<Option<[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>, GtpuError> {
+            self.with_device(ifindex, "ebpf_downlink_binding_get", |device| {
+                let map = device
+                    .ebpf
+                    .map(MAP_DOWNLINK_ENDPOINT_BINDING)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_downlink_binding_map", invalid_data("map missing"))
+                    })?;
+                let hash =
+                    BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>::try_from(
+                        map,
+                    )
+                    .map_err(|error| map_error("ebpf_downlink_binding_map", error))?;
+                match hash.get(&key, 0) {
+                    Ok(value) => Ok(Some(value)),
+                    Err(MapError::KeyNotFound) => Ok(None),
+                    Err(error) => Err(map_error("ebpf_downlink_binding_get", error)),
+                }
+            })
+        }
+
+        fn downlink_binding_insert(
+            &self,
+            ifindex: u32,
+            key: [u8; 4],
+            value: [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            self.with_device(ifindex, "ebpf_downlink_binding_insert", |device| {
+                let binding = DownlinkEndpointBinding::decode(&value);
+                if !binding.is_valid() || binding.ingress_ifindex() != ifindex {
+                    return Err(state_indeterminate("ebpf_downlink_binding_insert"));
+                }
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_DOWNLINK_ENDPOINT_BINDING)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_downlink_binding_map", invalid_data("map missing"))
+                    })?;
+                let mut hash =
+                    BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>::try_from(
+                        map,
+                    )
+                    .map_err(|error| map_error("ebpf_downlink_binding_map", error))?;
+                hash.insert(key, value, 0)
+                    .map_err(|error| map_error("ebpf_downlink_binding_insert", error))
+            })
+        }
+
+        fn downlink_binding_remove(&self, ifindex: u32, key: [u8; 4]) -> Result<bool, GtpuError> {
+            self.with_device(ifindex, "ebpf_downlink_binding_remove", |device| {
+                let map = device
+                    .ebpf
+                    .map_mut(MAP_DOWNLINK_ENDPOINT_BINDING)
+                    .ok_or_else(|| {
+                        GtpuError::io("ebpf_downlink_binding_map", invalid_data("map missing"))
+                    })?;
+                let mut hash =
+                    BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>::try_from(
+                        map,
+                    )
+                    .map_err(|error| map_error("ebpf_downlink_binding_map", error))?;
+                map_delete_result("ebpf_downlink_binding_remove", hash.remove(&key))
+            })
+        }
+
         fn marked_owner_get(
             &self,
             ifindex: u32,
@@ -3498,7 +4038,11 @@ mod aya_runtime {
             self.with_device(ifindex, "ebpf_marked_owner_insert", |device| {
                 let key = UplinkFarKey::decode(&selector);
                 let owner = MarkedBearerOwner::decode(&value);
-                if key.ue_ip == [0; 4] || key.bearer_mark == [0; 4] || !owner.is_valid() {
+                if key.ue_ip == [0; 4]
+                    || key.bearer_mark == [0; 4]
+                    || !owner.is_valid()
+                    || owner.downlink_binding.ingress_ifindex() != ifindex
+                {
                     return Err(state_indeterminate("ebpf_marked_owner_insert"));
                 }
                 if device
@@ -3615,10 +4159,30 @@ mod aya_runtime {
                     .map_err(|error| map_error("ebpf_datapath_counters", error))?;
                 Ok(values.iter().copied().fold(0_u64, u64::saturating_add))
             };
+            let binding_map = device
+                .ebpf
+                .map(MAP_DOWNLINK_BINDING_COUNTERS)
+                .ok_or_else(indeterminate)?;
+            let binding_counters = PerCpuArray::<_, u64>::try_from(binding_map).map_err(|_| {
+                GtpuError::io(
+                    "ebpf_datapath_binding_counters",
+                    invalid_data("binding counter map has an unexpected shape"),
+                )
+            })?;
+            let aggregate_binding = |index: u32| -> Result<u64, GtpuError> {
+                let values = binding_counters
+                    .get(&index, 0)
+                    .map_err(|error| map_error("ebpf_datapath_binding_counters", error))?;
+                Ok(values.iter().copied().fold(0_u64, u64::saturating_add))
+            };
             let snapshot = EbpfGtpuDatapathSnapshot {
                 uplink_program_id: device.datapath_identity.uplink.program_id,
                 downlink_program_id: device.datapath_identity.downlink.program_id,
                 counters_map_id: device.datapath_identity.pins.counters,
+                downlink_binding_counters_map_id: device
+                    .datapath_identity
+                    .pins
+                    .downlink_binding_counters,
                 counters: EbpfGtpuDatapathCounters {
                     uplink_encapsulated: aggregate(COUNTER_UL_ENCAP)?,
                     uplink_far_misses: aggregate(COUNTER_UL_FAR_MISS)?,
@@ -3626,6 +4190,22 @@ mod aya_runtime {
                     downlink_unknown_teid: aggregate(COUNTER_DL_UNKNOWN_TEID)?,
                     downlink_malformed: aggregate(COUNTER_DL_MALFORMED)?,
                     downlink_destination_mismatches: aggregate(COUNTER_DL_DST_MISMATCH)?,
+                    downlink_binding_invalid: aggregate_binding(COUNTER_DL_BINDING_INVALID)?,
+                    downlink_binding_family_mismatches: aggregate_binding(
+                        COUNTER_DL_BINDING_FAMILY_MISMATCH,
+                    )?,
+                    downlink_binding_peer_mismatches: aggregate_binding(
+                        COUNTER_DL_BINDING_PEER_MISMATCH,
+                    )?,
+                    downlink_binding_local_mismatches: aggregate_binding(
+                        COUNTER_DL_BINDING_LOCAL_MISMATCH,
+                    )?,
+                    downlink_binding_ingress_mismatches: aggregate_binding(
+                        COUNTER_DL_BINDING_INGRESS_MISMATCH,
+                    )?,
+                    downlink_binding_source_port_mismatches: aggregate_binding(
+                        COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
+                    )?,
                 },
             };
             // Repeat the complete proof after the reads so any hook or pin
@@ -3659,6 +4239,15 @@ mod aya_runtime {
         }
 
         fn bearer_mark_datapath_usable(&self, ifindex: u32) -> bool {
+            let Ok(devices) = self.devices.lock() else {
+                return false;
+            };
+            devices
+                .get(&ifindex)
+                .is_some_and(|device| Self::loaded_datapath_is_current(ifindex, device))
+        }
+
+        fn downlink_endpoint_binding_datapath_usable(&self, ifindex: u32) -> bool {
             let Ok(devices) = self.devices.lock() else {
                 return false;
             };
@@ -3963,9 +4552,11 @@ mod aya_runtime {
                 uplink_mark_dscp: 4,
                 downlink_pdr: 5,
                 downlink_mark_pdr: 6,
-                marked_owner: 7,
-                counters: 8,
-                config: 9,
+                downlink_binding: 7,
+                marked_owner: 8,
+                counters: 9,
+                downlink_binding_counters: 10,
+                config: 11,
             };
             let swapped = PinnedMapIdentity {
                 uplink_far: expected.uplink_dscp,
@@ -4026,6 +4617,8 @@ mod tests {
     use std::net::Ipv6Addr;
     use std::sync::{Barrier, Mutex};
 
+    use opc_gtpu_ebpf_common::default_bearer_graph_is_valid;
+
     use crate::model::{GtpBearerMark, Teid};
     use crate::GtpAddressFamily;
 
@@ -4051,6 +4644,7 @@ mod tests {
         marked_dscp: HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; UPLINK_DSCP_VALUE_LEN]>,
         pdr: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_PDR_VALUE_LEN]>,
         marked_pdr: HashMap<(u32, [u8; 4]), [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]>,
+        downlink_binding: HashMap<(u32, [u8; 4]), [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>,
         marked_owner:
             HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; MARKED_BEARER_OWNER_VALUE_LEN]>,
         marked_owner_by_teid: HashMap<(u32, [u8; 4]), [u8; UPLINK_MARK_KEY_LEN]>,
@@ -4060,6 +4654,8 @@ mod tests {
         marked_dscp_map_ready: HashSet<u32>,
         marked_pdr_map_ready: HashSet<u32>,
         marked_owner_map_ready: HashSet<u32>,
+        downlink_binding_map_ready: HashSet<u32>,
+        downlink_binding_counters_map_ready: HashSet<u32>,
         uplink_filter_ready: HashSet<u32>,
         downlink_filter_ready: HashSet<u32>,
         uplink_filter_foreign: HashSet<u32>,
@@ -4078,6 +4674,7 @@ mod tests {
         V1Uncommitted,
         DscpV1,
         BearerV2,
+        EndpointV3,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4153,12 +4750,21 @@ mod tests {
                         ))
                     }
                 }
-                Some(FakeSchema::BearerV2) => {
+                Some(FakeSchema::BearerV2) => Err(GtpuError::io(
+                    "ebpf_endpoint_schema",
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "endpoint-unbound GTP-U schema requires drained reprovisioning",
+                    ),
+                )),
+                Some(FakeSchema::EndpointV3) => {
                     if state.dscp_map_ready.contains(&ifindex)
                         && state.marked_far_map_ready.contains(&ifindex)
                         && state.marked_dscp_map_ready.contains(&ifindex)
                         && state.marked_pdr_map_ready.contains(&ifindex)
                         && state.marked_owner_map_ready.contains(&ifindex)
+                        && state.downlink_binding_map_ready.contains(&ifindex)
+                        && state.downlink_binding_counters_map_ready.contains(&ifindex)
                     {
                         Ok(())
                     } else {
@@ -4213,11 +4819,19 @@ mod tests {
                 let far = state.marked_far.get(&(ifindex, selector)).copied();
                 let dscp = state.marked_dscp.get(&(ifindex, selector)).copied();
                 let pdr = state.marked_pdr.get(&(ifindex, owner.local_teid)).copied();
+                let binding = state
+                    .downlink_binding
+                    .get(&(ifindex, owner.local_teid))
+                    .copied();
+                let expected_binding = owner.downlink_binding.encode();
                 let resources_match = far.is_none_or(|value| value == expected_far)
                     && dscp.is_none_or(|value| value[0] <= 63)
-                    && pdr.is_none_or(|value| value == expected_pdr);
-                let complete =
-                    far == Some(expected_far) && dscp == expected_dscp && pdr == Some(expected_pdr);
+                    && pdr.is_none_or(|value| value == expected_pdr)
+                    && binding.is_none_or(|value| value == expected_binding);
+                let complete = far == Some(expected_far)
+                    && dscp == expected_dscp
+                    && pdr == Some(expected_pdr)
+                    && binding == Some(expected_binding);
                 if !resources_match || (owner.phase == MarkedBearerOwnerPhase::Active && !complete)
                 {
                     return Err(invalid());
@@ -4247,6 +4861,55 @@ mod tests {
                     return Err(invalid());
                 };
                 if MarkedBearerOwner::decode(encoded_owner).local_teid != *teid {
+                    return Err(invalid());
+                }
+            }
+
+            // Default-bearer state has no owner journal. Its PDR and binding
+            // must therefore both be complete and agree with the exact FAR
+            // before either hook may be attached.
+            let mut default_teids = HashSet::new();
+            let mut default_ues = HashSet::new();
+            for ((index, teid), encoded) in &state.pdr {
+                if *index != ifindex {
+                    continue;
+                }
+                let pdr = DownlinkPdr::decode(encoded);
+                let far = state
+                    .far
+                    .get(&(*index, pdr.ue_ip))
+                    .copied()
+                    .ok_or_else(invalid)?;
+                let far = UplinkFar::decode(&far);
+                let binding = state
+                    .downlink_binding
+                    .get(&(*index, *teid))
+                    .copied()
+                    .ok_or_else(invalid)?;
+                let binding = DownlinkEndpointBinding::decode(&binding);
+                if !default_bearer_graph_is_valid(*teid, pdr, far, binding, local_ip, ifindex)
+                    || !default_teids.insert(*teid)
+                    || !default_ues.insert(pdr.ue_ip)
+                {
+                    return Err(invalid());
+                }
+            }
+            for (index, ue_ip) in state.far.keys() {
+                if *index == ifindex
+                    && *ue_ip != opc_gtpu_ebpf_common::UPLINK_DSCP_SCHEMA_MARKER_KEY
+                    && !default_ues.contains(ue_ip)
+                {
+                    return Err(invalid());
+                }
+            }
+            for ((index, teid), encoded) in &state.downlink_binding {
+                if *index != ifindex {
+                    continue;
+                }
+                let binding = DownlinkEndpointBinding::decode(encoded);
+                let has_default = state.pdr.contains_key(&(*index, *teid));
+                let has_marked = rebuilt.contains_key(teid);
+                if !binding.is_valid() || has_default == has_marked {
                     return Err(invalid());
                 }
             }
@@ -4296,11 +4959,13 @@ mod tests {
             state.marked_dscp_map_ready.insert(ifindex);
             state.marked_pdr_map_ready.insert(ifindex);
             state.marked_owner_map_ready.insert(ifindex);
+            state.downlink_binding_map_ready.insert(ifindex);
+            state.downlink_binding_counters_map_ready.insert(ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
             state
                 .schema
-                .insert(pin_dir.to_path_buf(), FakeSchema::BearerV2);
+                .insert(pin_dir.to_path_buf(), FakeSchema::EndpointV3);
             Ok(())
         }
 
@@ -4337,11 +5002,13 @@ mod tests {
             state.marked_dscp_map_ready.insert(ifindex);
             state.marked_pdr_map_ready.insert(ifindex);
             state.marked_owner_map_ready.insert(ifindex);
+            state.downlink_binding_map_ready.insert(ifindex);
+            state.downlink_binding_counters_map_ready.insert(ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
             state
                 .schema
-                .insert(pin_dir.to_path_buf(), FakeSchema::BearerV2);
+                .insert(pin_dir.to_path_buf(), FakeSchema::EndpointV3);
             Ok(local_ip)
         }
 
@@ -4360,6 +5027,8 @@ mod tests {
             state.marked_dscp_map_ready.remove(&ifindex);
             state.marked_pdr_map_ready.remove(&ifindex);
             state.marked_owner_map_ready.remove(&ifindex);
+            state.downlink_binding_map_ready.remove(&ifindex);
+            state.downlink_binding_counters_map_ready.remove(&ifindex);
             state.uplink_filter_ready.remove(&ifindex);
             state.downlink_filter_ready.remove(&ifindex);
             state.uplink_filter_foreign.remove(&ifindex);
@@ -4373,6 +5042,9 @@ mod tests {
             state.marked_dscp.retain(|(index, _), _| *index != ifindex);
             state.pdr.retain(|(index, _), _| *index != ifindex);
             state.marked_pdr.retain(|(index, _), _| *index != ifindex);
+            state
+                .downlink_binding
+                .retain(|(index, _), _| *index != ifindex);
             state.marked_owner.retain(|(index, _), _| *index != ifindex);
             state
                 .marked_owner_by_teid
@@ -4632,6 +5304,59 @@ mod tests {
             Ok(state.marked_pdr.remove(&(ifindex, key)).is_some())
         }
 
+        fn downlink_binding_get(
+            &self,
+            ifindex: u32,
+            key: [u8; 4],
+        ) -> Result<Option<[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>, GtpuError> {
+            let state = self.state();
+            if !state.downlink_binding_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_downlink_binding_map",
+                    io::Error::new(io::ErrorKind::NotFound, "downlink binding map unavailable"),
+                ));
+            }
+            Ok(state.downlink_binding.get(&(ifindex, key)).copied())
+        }
+
+        fn downlink_binding_insert(
+            &self,
+            ifindex: u32,
+            key: [u8; 4],
+            value: [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
+        ) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            if !state.downlink_binding_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_downlink_binding_map",
+                    io::Error::new(io::ErrorKind::NotFound, "downlink binding map unavailable"),
+                ));
+            }
+            state.operations.push("downlink_binding_insert");
+            Self::fail_if_requested(&mut state, "downlink_binding_insert")?;
+            let binding = DownlinkEndpointBinding::decode(&value);
+            if !binding.is_valid() || binding.ingress_ifindex() != ifindex {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_downlink_binding_insert",
+                });
+            }
+            state.downlink_binding.insert((ifindex, key), value);
+            Ok(())
+        }
+
+        fn downlink_binding_remove(&self, ifindex: u32, key: [u8; 4]) -> Result<bool, GtpuError> {
+            let mut state = self.state();
+            if !state.downlink_binding_map_ready.contains(&ifindex) {
+                return Err(GtpuError::io(
+                    "ebpf_downlink_binding_map",
+                    io::Error::new(io::ErrorKind::NotFound, "downlink binding map unavailable"),
+                ));
+            }
+            state.operations.push("downlink_binding_remove");
+            Self::fail_if_requested(&mut state, "downlink_binding_remove")?;
+            Ok(state.downlink_binding.remove(&(ifindex, key)).is_some())
+        }
+
         fn marked_owner_get(
             &self,
             ifindex: u32,
@@ -4669,7 +5394,11 @@ mod tests {
             };
             state.operations.push(operation);
             Self::fail_if_requested(&mut state, operation)?;
-            if key.ue_ip == [0; 4] || key.bearer_mark == [0; 4] || !owner.is_valid() {
+            if key.ue_ip == [0; 4]
+                || key.bearer_mark == [0; 4]
+                || !owner.is_valid()
+                || owner.downlink_binding.ingress_ifindex() != ifindex
+            {
                 return Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_marked_owner_insert",
                 });
@@ -4752,6 +5481,8 @@ mod tests {
                 && state.marked_dscp_map_ready.contains(&ifindex)
                 && state.marked_pdr_map_ready.contains(&ifindex)
                 && state.marked_owner_map_ready.contains(&ifindex)
+                && state.downlink_binding_map_ready.contains(&ifindex)
+                && state.downlink_binding_counters_map_ready.contains(&ifindex)
                 && state.uplink_filter_ready.contains(&ifindex)
                 && state.downlink_filter_ready.contains(&ifindex)
                 && !state.pin_identity_invalid.contains(&ifindex)
@@ -4784,8 +5515,20 @@ mod tests {
                 && state.marked_dscp_map_ready.contains(&ifindex)
                 && state.marked_pdr_map_ready.contains(&ifindex)
                 && state.marked_owner_map_ready.contains(&ifindex)
+                && state.downlink_binding_map_ready.contains(&ifindex)
+                && state.downlink_binding_counters_map_ready.contains(&ifindex)
                 && state.uplink_filter_ready.contains(&ifindex)
                 && state.downlink_filter_ready.contains(&ifindex)
+        }
+
+        fn downlink_endpoint_binding_datapath_usable(&self, ifindex: u32) -> bool {
+            let state = self.state();
+            state.attached.contains_key(&ifindex)
+                && state.downlink_binding_map_ready.contains(&ifindex)
+                && state.downlink_binding_counters_map_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && !state.pin_identity_invalid.contains(&ifindex)
+                && !state.downlink_filter_foreign.contains(&ifindex)
         }
 
         fn pdp_cleanup_datapath_usable(&self, ifindex: u32) -> bool {
@@ -4796,6 +5539,7 @@ mod tests {
                 && state.marked_dscp_map_ready.contains(&ifindex)
                 && state.marked_pdr_map_ready.contains(&ifindex)
                 && state.marked_owner_map_ready.contains(&ifindex)
+                && state.downlink_binding_map_ready.contains(&ifindex)
                 && !state.pin_identity_invalid.contains(&ifindex)
                 && !state.uplink_filter_foreign.contains(&ifindex)
                 && !state.downlink_filter_foreign.contains(&ifindex)
@@ -4819,6 +5563,7 @@ mod tests {
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: S2BU_IFINDEX,
+            downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,
@@ -4876,6 +5621,7 @@ mod tests {
             uplink_program_id: 101,
             downlink_program_id: 102,
             counters_map_id: 201,
+            downlink_binding_counters_map_id: 202,
             counters: EbpfGtpuDatapathCounters {
                 uplink_encapsulated: 11,
                 uplink_far_misses: 12,
@@ -4883,6 +5629,12 @@ mod tests {
                 downlink_unknown_teid: 14,
                 downlink_malformed: 15,
                 downlink_destination_mismatches: 16,
+                downlink_binding_invalid: 17,
+                downlink_binding_family_mismatches: 18,
+                downlink_binding_peer_mismatches: 19,
+                downlink_binding_local_mismatches: 20,
+                downlink_binding_ingress_mismatches: 21,
+                downlink_binding_source_port_mismatches: 22,
             },
         };
         runtime.state().datapath_snapshot = expected;
@@ -4977,6 +5729,26 @@ mod tests {
             .get(&(S2BU_IFINDEX, 0x1000_0001_u32.to_be_bytes()))
             .expect("downlink PDR keyed by local TEID");
         assert_eq!(DownlinkPdr::decode(pdr).ue_ip, [10, 45, 0, 2]);
+        let binding = DownlinkEndpointBinding::decode(
+            state
+                .downlink_binding
+                .get(&(S2BU_IFINDEX, 0x1000_0001_u32.to_be_bytes()))
+                .expect("downlink binding keyed by local TEID"),
+        );
+        assert!(binding.is_valid());
+        assert_eq!(
+            binding.peer_address(),
+            GtpuEndpointAddress::Ipv4([192, 0, 2, 10])
+        );
+        assert_eq!(
+            binding.local_address(),
+            GtpuEndpointAddress::Ipv4([192, 0, 2, 1])
+        );
+        assert_eq!(binding.ingress_ifindex(), S2BU_IFINDEX);
+        assert_eq!(
+            binding.source_port_policy(),
+            crate::GtpuSourcePortPolicy::Any
+        );
     }
 
     #[tokio::test]
@@ -5000,6 +5772,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_persists_each_explicit_source_port_policy() {
+        for policy in [
+            crate::GtpuSourcePortPolicy::Any,
+            crate::GtpuSourcePortPolicy::Exact(21_152),
+            crate::GtpuSourcePortPolicy::inclusive_range(20_000, 21_000).unwrap(),
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let mut requested = context();
+            requested.downlink_source_port_policy = policy;
+            backend.install_pdp_context(requested).await.unwrap();
+
+            let binding = DownlinkEndpointBinding::decode(
+                runtime
+                    .state()
+                    .downlink_binding
+                    .get(&(S2BU_IFINDEX, 0x1000_0001_u32.to_be_bytes()))
+                    .expect("source-port policy binding"),
+            );
+            assert_eq!(binding.source_port_policy(), policy);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_default_relocation_retains_only_the_old_authorized_peer() {
+        for failure in ["dscp_insert", "far_insert", "downlink_binding_insert"] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let original = context();
+            backend.install_pdp_context(original.clone()).await.unwrap();
+
+            let mut relocated = original.clone();
+            relocated.peer_teid = teid(0x3000_0003);
+            relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
+            relocated.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(21_152);
+            relocated.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+            runtime.fail_in_order([failure]);
+
+            assert!(matches!(
+                backend
+                    .install_pdp_context(relocated)
+                    .await
+                    .unwrap_err(),
+                GtpuError::Io { operation, .. } if operation == failure
+            ));
+            let state = runtime.state();
+            let far = UplinkFar::decode(
+                state
+                    .far
+                    .get(&(S2BU_IFINDEX, [10, 45, 0, 2]))
+                    .expect("old FAR restored"),
+            );
+            let binding = DownlinkEndpointBinding::decode(
+                state
+                    .downlink_binding
+                    .get(&(S2BU_IFINDEX, 0x1000_0001_u32.to_be_bytes()))
+                    .expect("old binding retained"),
+            );
+            assert_eq!(far.peer_ip, [192, 0, 2, 10], "{failure}");
+            assert_eq!(far.o_teid, 0x2000_0001_u32.to_be_bytes(), "{failure}");
+            assert_eq!(
+                binding.peer_address(),
+                GtpuEndpointAddress::Ipv4([192, 0, 2, 10]),
+                "{failure}"
+            );
+            assert_eq!(
+                binding.source_port_policy(),
+                crate::GtpuSourcePortPolicy::Any,
+                "{failure}"
+            );
+            assert!(state.dscp.is_empty(), "{failure}");
+            assert_eq!(state.pdr.len(), 1, "{failure}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_marked_relocation_retains_only_the_old_active_peer() {
+        for failure in [
+            "marked_dscp_insert",
+            "marked_far_insert",
+            "downlink_binding_insert",
+            "marked_owner_insert_active",
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let mut original = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+            original.egress_dscp = Some(crate::DscpCodepoint::new(10).unwrap());
+            backend.install_pdp_context(original.clone()).await.unwrap();
+
+            let mut relocated = original.clone();
+            relocated.peer_teid = teid(0x3000_0003);
+            relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
+            relocated.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(21_152);
+            relocated.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+            runtime.fail_in_order([failure]);
+
+            assert!(matches!(
+                backend
+                    .install_pdp_context(relocated)
+                    .await
+                    .unwrap_err(),
+                GtpuError::Io { operation, .. } if operation == failure
+            ));
+            let selector = UplinkFarKey {
+                ue_ip: [10, 45, 0, 2],
+                bearer_mark: 0x1001_u32.to_be_bytes(),
+            }
+            .encode();
+            let state = runtime.state();
+            let owner = MarkedBearerOwner::decode(
+                state
+                    .marked_owner
+                    .get(&(S2BU_IFINDEX, selector))
+                    .expect("old active owner retained"),
+            );
+            assert_eq!(owner.phase, MarkedBearerOwnerPhase::Active, "{failure}");
+            assert_eq!(owner.uplink_far.peer_ip, [192, 0, 2, 10], "{failure}");
+            assert_eq!(owner.egress_dscp(), Some(10), "{failure}");
+            assert_eq!(
+                owner.downlink_binding.peer_address(),
+                GtpuEndpointAddress::Ipv4([192, 0, 2, 10]),
+                "{failure}"
+            );
+            assert_eq!(
+                state
+                    .downlink_binding
+                    .get(&(S2BU_IFINDEX, original.local_teid.get().to_be_bytes())),
+                Some(&owner.downlink_binding.encode()),
+                "{failure}"
+            );
+            assert_eq!(
+                state.marked_far.get(&(S2BU_IFINDEX, selector)),
+                Some(&owner.uplink_far.encode()),
+                "{failure}"
+            );
+            assert_eq!(
+                state.marked_dscp.get(&(S2BU_IFINDEX, selector)),
+                Some(&[10]),
+                "{failure}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn install_stages_dscp_before_routing_and_records_exact_codepoint() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
@@ -5012,7 +5928,12 @@ mod tests {
         let state = runtime.state();
         assert_eq!(
             state.operations,
-            vec!["dscp_insert", "far_insert", "pdr_insert"]
+            vec![
+                "dscp_insert",
+                "far_insert",
+                "downlink_binding_insert",
+                "pdr_insert"
+            ]
         );
         assert_eq!(state.dscp.get(&(S2BU_IFINDEX, [10, 45, 0, 2])), Some(&[46]));
     }
@@ -5039,7 +5960,12 @@ mod tests {
         let state = runtime.state();
         assert_eq!(
             state.operations,
-            vec!["dscp_insert", "far_insert", "pdr_insert"]
+            vec![
+                "dscp_insert",
+                "far_insert",
+                "downlink_binding_insert",
+                "pdr_insert"
+            ]
         );
         assert_eq!(state.dscp.get(&(S2BU_IFINDEX, [10, 45, 0, 2])), Some(&[46]));
         assert_eq!(state.far.len(), 1);
@@ -5047,7 +5973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_sided_far_or_pdr_state_remains_an_ambiguous_conflict() {
+    async fn one_sided_far_or_pdr_state_is_indeterminate() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
         backend.install_pdp_context(context()).await.unwrap();
@@ -5055,7 +5981,9 @@ mod tests {
         runtime.state().pdr.clear();
         assert!(matches!(
             backend.install_pdp_context(context()).await.unwrap_err(),
-            GtpuError::AlreadyExists
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_install_pdp_context"
+            }
         ));
 
         {
@@ -5071,7 +5999,9 @@ mod tests {
         }
         assert!(matches!(
             backend.install_pdp_context(context()).await.unwrap_err(),
-            GtpuError::AlreadyExists
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_install_pdp_context"
+            }
         ));
     }
 
@@ -5121,7 +6051,9 @@ mod tests {
             vec![
                 "dscp_insert",
                 "far_insert",
+                "downlink_binding_insert",
                 "pdr_insert",
+                "downlink_binding_remove",
                 "far_remove",
                 "dscp_remove"
             ]
@@ -5148,21 +6080,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_conflicting_state_reports_already_exists() {
-        let (backend, _runtime) = backend_with_fake();
+    async fn install_relocates_exact_identity_and_rejects_a_conflicting_selector() {
+        let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
         backend.install_pdp_context(context()).await.unwrap();
 
-        // Same UE PAA, different peer TEID.
-        let mut conflicting_teid = context();
-        conflicting_teid.peer_teid = teid(0x3000_0003);
-        assert!(matches!(
-            backend
-                .install_pdp_context(conflicting_teid)
-                .await
-                .unwrap_err(),
-            GtpuError::AlreadyExists
-        ));
+        // The same UE/local-TEID identity may relocate to a new peer. The
+        // binding-map replacement is the downlink authorization cutover.
+        let mut relocated = context();
+        relocated.peer_teid = teid(0x3000_0003);
+        relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
+        backend.install_pdp_context(relocated).await.unwrap();
+        {
+            let state = runtime.state();
+            let far = UplinkFar::decode(
+                state
+                    .far
+                    .get(&(S2BU_IFINDEX, [10, 45, 0, 2]))
+                    .expect("relocated FAR"),
+            );
+            let binding = DownlinkEndpointBinding::decode(
+                state
+                    .downlink_binding
+                    .get(&(S2BU_IFINDEX, 0x1000_0001_u32.to_be_bytes()))
+                    .expect("relocated binding"),
+            );
+            assert_eq!(far.peer_ip, [192, 0, 2, 20]);
+            assert_eq!(far.o_teid, 0x3000_0003_u32.to_be_bytes());
+            assert_eq!(
+                binding.peer_address(),
+                GtpuEndpointAddress::Ipv4([192, 0, 2, 20])
+            );
+        }
 
         // Same local TEID, different UE PAA.
         let mut conflicting_paa = context();
@@ -5186,6 +6135,13 @@ mod tests {
         assert!(matches!(
             backend.install_pdp_context(ipv6).await.unwrap_err(),
             GtpuError::InvalidConfig { field, .. } if field == "pdp.ms_address"
+        ));
+
+        let mut ipv6_peer = context();
+        ipv6_peer.peer_address = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(matches!(
+            backend.install_pdp_context(ipv6_peer).await.unwrap_err(),
+            GtpuError::InvalidConfig { field, .. } if field == "pdp.peer_address"
         ));
 
         let mut loops = context();
@@ -5221,7 +6177,12 @@ mod tests {
             assert!(state.dscp.is_empty());
             assert_eq!(
                 state.operations,
-                vec!["far_remove", "dscp_remove", "pdr_remove"]
+                vec![
+                    "far_remove",
+                    "dscp_remove",
+                    "downlink_binding_remove",
+                    "pdr_remove"
+                ]
             );
         }
         // Removing an absent context is idempotent success.
@@ -5229,7 +6190,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_dscp_remove_retains_pdr_journal_for_restart_retry() {
+    async fn failed_default_removal_is_rejected_as_partial_on_restart() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
         let mut marked = context();
@@ -5252,35 +6213,26 @@ mod tests {
             assert!(state.far.is_empty(), "FAR must be disabled first");
             assert_eq!(state.dscp.len(), 1, "failed DSCP delete remains retryable");
             assert_eq!(state.pdr.len(), 1, "PDR retains the UE-key journal");
+            assert_eq!(
+                state.downlink_binding.len(),
+                1,
+                "binding remains paired with the PDR"
+            );
             state.attached.clear();
         }
 
         let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
-        restarted.resolve_device("s2bu").await.unwrap();
-        restarted
-            .remove_pdp_context(remove_request())
-            .await
-            .unwrap();
-
-        let state = runtime.state();
-        assert!(state.far.is_empty());
-        assert!(state.dscp.is_empty());
-        assert!(state.pdr.is_empty());
-        assert_eq!(
-            state.operations,
-            vec![
-                "far_remove",
-                "dscp_remove",
-                "adopt",
-                "far_remove",
-                "dscp_remove",
-                "pdr_remove"
-            ]
-        );
+        assert!(matches!(
+            restarted.resolve_device("s2bu").await.unwrap_err(),
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_marked_owner_rebuild"
+            }
+        ));
+        assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
     }
 
     #[tokio::test]
-    async fn concurrent_conflicting_installs_never_publish_mixed_subresources() {
+    async fn concurrent_relocations_never_publish_mixed_subresources() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
 
@@ -5288,6 +6240,7 @@ mod tests {
         first.egress_dscp = Some(crate::DscpCodepoint::new(10).unwrap());
         let mut second = context();
         second.peer_teid = teid(0x3000_0003);
+        second.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
         second.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
         let barrier = Arc::new(Barrier::new(3));
         let first_task = {
@@ -5309,14 +6262,8 @@ mod tests {
         barrier.wait();
         let first_result = first_task.await.unwrap();
         let second_result = second_task.await.unwrap();
-        assert_eq!(
-            usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
-            1
-        );
-        assert!(matches!(
-            first_result.as_ref().err().or(second_result.as_ref().err()),
-            Some(GtpuError::AlreadyExists)
-        ));
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
 
         let state = runtime.state();
         let far = UplinkFar::decode(
@@ -5329,9 +6276,21 @@ mod tests {
             .dscp
             .get(&(S2BU_IFINDEX, [10, 45, 0, 2]))
             .expect("winning DSCP")[0];
+        let binding = DownlinkEndpointBinding::decode(
+            state
+                .downlink_binding
+                .get(&(S2BU_IFINDEX, 0x1000_0001_u32.to_be_bytes()))
+                .expect("winning binding"),
+        );
         assert!(
-            (far.o_teid == 0x2000_0001_u32.to_be_bytes() && dscp == 10)
-                || (far.o_teid == 0x3000_0003_u32.to_be_bytes() && dscp == 46)
+            (far.o_teid == 0x2000_0001_u32.to_be_bytes()
+                && far.peer_ip == [192, 0, 2, 10]
+                && dscp == 10
+                && binding.peer_address() == GtpuEndpointAddress::Ipv4([192, 0, 2, 10]))
+                || (far.o_teid == 0x3000_0003_u32.to_be_bytes()
+                    && far.peer_ip == [192, 0, 2, 20]
+                    && dscp == 46
+                    && binding.peer_address() == GtpuEndpointAddress::Ipv4([192, 0, 2, 20]))
         );
         assert_eq!(state.pdr.len(), 1);
     }
@@ -5416,7 +6375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_v0_pin_adoption_commits_full_bearer_schema() {
+    async fn legacy_v0_pin_adoption_commits_endpoint_bound_schema() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
         {
@@ -5437,16 +6396,44 @@ mod tests {
         restarted.resolve_device("s2bu").await.unwrap();
         let probe = restarted.probe().await.unwrap();
         assert_eq!(probe.egress_dscp_marking, GtpuCapability::Available);
+        assert_eq!(probe.downlink_endpoint_binding, GtpuCapability::Available);
         assert_eq!(probe.per_bearer_marking, GtpuCapability::Available);
         let marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
         restarted.install_pdp_context(marked).await.unwrap();
         let state = runtime.state();
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
-        assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::BearerV2));
+        assert_eq!(state.schema.get(&pin_dir), Some(&FakeSchema::EndpointV3));
     }
 
     #[tokio::test]
-    async fn uncommitted_v1_and_committed_v1_adopt_to_bearer_v2() {
+    async fn endpoint_unbound_v2_schema_requires_drained_reprovisioning() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        {
+            let mut state = runtime.state();
+            state.attached.clear();
+            state.schema.insert(
+                PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu"),
+                FakeSchema::BearerV2,
+            );
+            state.operations.clear();
+        }
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert!(matches!(
+            restarted.resolve_device("s2bu").await.unwrap_err(),
+            GtpuError::Io {
+                operation: "ebpf_endpoint_schema",
+                ..
+            }
+        ));
+        let state = runtime.state();
+        assert_eq!(state.operations, vec!["adopt"]);
+        assert!(!state.attached.contains_key(&S2BU_IFINDEX));
+    }
+
+    #[tokio::test]
+    async fn uncommitted_v1_and_committed_v1_adopt_to_endpoint_v3() {
         for v1_marker_committed in [false, true] {
             let (backend, runtime) = backend_with_fake();
             backend.create_device(create_request()).await.unwrap();
@@ -5481,8 +6468,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_v2_fails_closed_when_each_marked_map_is_missing() {
-        for missing in ["far", "dscp", "pdr", "owner"] {
+    async fn committed_v3_fails_closed_when_each_bearer_map_is_missing() {
+        for missing in ["far", "dscp", "pdr", "owner", "binding", "binding-counters"] {
             let (backend, runtime) = backend_with_fake();
             backend.create_device(create_request()).await.unwrap();
             {
@@ -5492,7 +6479,9 @@ mod tests {
                     "far" => state.marked_far_map_ready.clear(),
                     "dscp" => state.marked_dscp_map_ready.clear(),
                     "pdr" => state.marked_pdr_map_ready.clear(),
-                    _ => state.marked_owner_map_ready.clear(),
+                    "owner" => state.marked_owner_map_ready.clear(),
+                    "binding" => state.downlink_binding_map_ready.clear(),
+                    _ => state.downlink_binding_counters_map_ready.clear(),
                 }
             }
             let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
@@ -5504,6 +6493,100 @@ mod tests {
                 }
             ));
             assert!(!runtime.state().attached.contains_key(&S2BU_IFINDEX));
+        }
+    }
+
+    #[tokio::test]
+    async fn adoption_rejects_corrupt_default_bearer_identity_before_attachment() {
+        for case in [
+            "zero-local-teid",
+            "zero-peer-teid",
+            "unspecified-ue",
+            "ue-is-managed-local-ip",
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            backend.install_pdp_context(context()).await.unwrap();
+            {
+                let mut state = runtime.state();
+                state.attached.clear();
+                state.uplink_filter_ready.clear();
+                state.downlink_filter_ready.clear();
+                state.operations.clear();
+
+                let local_teid = 0x1000_0001_u32.to_be_bytes();
+                let ue_ip = [10, 45, 0, 2];
+                match case {
+                    "zero-local-teid" => {
+                        let pdr = state
+                            .pdr
+                            .remove(&(S2BU_IFINDEX, local_teid))
+                            .expect("installed default PDR");
+                        let binding = state
+                            .downlink_binding
+                            .remove(&(S2BU_IFINDEX, local_teid))
+                            .expect("installed default binding");
+                        state.pdr.insert((S2BU_IFINDEX, [0; 4]), pdr);
+                        state
+                            .downlink_binding
+                            .insert((S2BU_IFINDEX, [0; 4]), binding);
+                    }
+                    "zero-peer-teid" => {
+                        let far = state
+                            .far
+                            .get_mut(&(S2BU_IFINDEX, ue_ip))
+                            .expect("installed default FAR");
+                        let mut decoded = UplinkFar::decode(far);
+                        decoded.o_teid = [0; 4];
+                        *far = decoded.encode();
+                    }
+                    "unspecified-ue" => {
+                        state
+                            .pdr
+                            .get_mut(&(S2BU_IFINDEX, local_teid))
+                            .expect("installed default PDR")
+                            .copy_from_slice(&[0; 4]);
+                        let far = state
+                            .far
+                            .remove(&(S2BU_IFINDEX, ue_ip))
+                            .expect("installed default FAR");
+                        state.far.insert((S2BU_IFINDEX, [0; 4]), far);
+                    }
+                    "ue-is-managed-local-ip" => {
+                        let managed_local_ip = [192, 0, 2, 1];
+                        state
+                            .pdr
+                            .get_mut(&(S2BU_IFINDEX, local_teid))
+                            .expect("installed default PDR")
+                            .copy_from_slice(&managed_local_ip);
+                        let far = state
+                            .far
+                            .remove(&(S2BU_IFINDEX, ue_ip))
+                            .expect("installed default FAR");
+                        state.far.insert((S2BU_IFINDEX, managed_local_ip), far);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            assert!(
+                matches!(
+                    restarted.resolve_device("s2bu").await.unwrap_err(),
+                    GtpuError::StateIndeterminate {
+                        operation: "ebpf_marked_owner_rebuild"
+                    }
+                ),
+                "{case}"
+            );
+            let state = runtime.state();
+            assert_eq!(state.operations, vec!["adopt"], "{case}");
+            assert!(!state.attached.contains_key(&S2BU_IFINDEX), "{case}");
+            assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX), "{case}");
+            assert!(
+                !state.downlink_filter_ready.contains(&S2BU_IFINDEX),
+                "{case}"
+            );
         }
     }
 
@@ -5533,6 +6616,13 @@ mod tests {
                         o_teid: 0x2000_0002_u32.to_be_bytes(),
                     },
                     None,
+                    DownlinkEndpointBinding::new(
+                        GtpuEndpointAddress::Ipv4([192, 0, 2, 10]),
+                        GtpuEndpointAddress::Ipv4(local_ip),
+                        S2BU_IFINDEX,
+                        crate::GtpuSourcePortPolicy::Any,
+                    )
+                    .unwrap(),
                     phase,
                 )
             };
@@ -5544,7 +6634,7 @@ mod tests {
                     "invalid-format" => {
                         let mut encoded =
                             make_owner([192, 0, 2, 1], MarkedBearerOwnerPhase::Pending).encode();
-                        encoded[17] = 2;
+                        encoded[17] = 1;
                         state.marked_owner.insert((S2BU_IFINDEX, selector), encoded);
                     }
                     "duplicate-teid" => {
@@ -5611,7 +6701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adopted_v2_required_map_loss_is_not_silently_recreated_on_restart() {
+    async fn adopted_v3_required_map_loss_is_not_silently_recreated_on_restart() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
         {
@@ -5622,7 +6712,7 @@ mod tests {
                 state
                     .schema
                     .get(&PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu")),
-                Some(&FakeSchema::BearerV2)
+                Some(&FakeSchema::EndpointV3)
             );
         }
 
@@ -5698,16 +6788,22 @@ mod tests {
                 backend.probe().await.unwrap().per_bearer_marking,
                 GtpuCapability::Missing
             );
-            assert!(matches!(
-                backend
-                    .install_pdp_context(marked_context(0x1001, 0x1000_0002, 0x2000_0002,))
-                    .await
-                    .unwrap_err(),
-                GtpuError::Io {
-                    operation: "ebpf_bearer_mark_datapath",
-                    ..
-                }
-            ));
+            let error = backend
+                .install_pdp_context(marked_context(0x1001, 0x1000_0002, 0x2000_0002))
+                .await
+                .unwrap_err();
+            let expected_operation = if missing_hook == "downlink" {
+                "ebpf_downlink_endpoint_datapath"
+            } else {
+                "ebpf_bearer_mark_datapath"
+            };
+            assert!(
+                matches!(
+                    error,
+                    GtpuError::Io { operation, .. } if operation == expected_operation
+                ),
+                "{missing_hook}"
+            );
             let state = runtime.state();
             assert!(state.marked_far.is_empty());
             assert!(state.marked_pdr.is_empty());
@@ -5980,7 +7076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dscp_update_cut_restarts_with_pending_old_value_and_converges() {
+    async fn failed_marked_update_retains_old_active_identity_and_retry_converges() {
         let (backend, runtime) = backend_with_fake();
         backend.create_device(create_request()).await.unwrap();
         let mut marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
@@ -5999,8 +7095,9 @@ mod tests {
                 .install_pdp_context(marked.clone())
                 .await
                 .unwrap_err(),
-            GtpuError::StateIndeterminate {
-                operation: "ebpf_install_pdp_context"
+            GtpuError::Io {
+                operation: "marked_dscp_insert",
+                ..
             }
         ));
         {
@@ -6008,8 +7105,8 @@ mod tests {
             let owner = MarkedBearerOwner::decode(
                 state.marked_owner.get(&(S2BU_IFINDEX, selector)).unwrap(),
             );
-            assert_eq!(owner.phase, MarkedBearerOwnerPhase::Pending);
-            assert_eq!(owner.egress_dscp(), Some(46));
+            assert_eq!(owner.phase, MarkedBearerOwnerPhase::Active);
+            assert_eq!(owner.egress_dscp(), Some(10));
             assert_eq!(
                 state.marked_dscp.get(&(S2BU_IFINDEX, selector)),
                 Some(&[10])
@@ -6192,7 +7289,7 @@ mod tests {
                 .get(&(S2BU_IFINDEX, selector))
                 .copied()
                 .expect("Removing owner remains after the injected final cut");
-            assert_eq!(&encoded[16..], &[0xff, 1, 3, 0]);
+            assert_eq!(&encoded[16..20], &[0xff, 2, 3, 0]);
             assert_eq!(
                 MarkedBearerOwner::decode(&encoded).phase,
                 MarkedBearerOwnerPhase::Removing

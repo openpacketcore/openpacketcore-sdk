@@ -10,7 +10,15 @@ GTP-U encapsulation/classification helpers.
 ## API Shape
 
 - Constants for GTP-U, IPv4, UDP, map names, program names, and counter slots.
-- `UplinkFar` and `DownlinkPdr` encode/decode fixed BPF map value layouts.
+- `UplinkFar`, `DownlinkPdr`, `DownlinkEndpointBinding`, and
+  `MarkedBearerOwner` encode/decode fixed BPF map value layouts.
+- `GtpuEndpointAddress` and `GtpuSourcePortPolicy` model canonical IPv4/IPv6
+  endpoint identity plus explicit `Any`, exact, or inclusive-range UDP source
+  authorization. `validate_ipv4_downlink_binding_wire` and the owner wire
+  helpers provide allocation-free verifier-facing checks over map-owned bytes.
+- `DownlinkBindingMismatch` defines the fixed invalid/family/peer/local/
+  ingress/source-port counter cardinality; map names and indexes are shared by
+  userspace and the tc object.
 - `build_uplink_encap` builds the exact 36-byte outer IPv4/UDP/GTPv1-U header
   sequence for uplink encapsulation.
 - `classify_gtpu` classifies a mandatory GTP-U header as `NotGtpV1`,
@@ -32,7 +40,8 @@ Rust docs.
 
 ```rust
 use opc_gtpu_ebpf_common::{
-    build_uplink_encap, DownlinkPdr, UplinkFar, GTPU_ENCAP_LEN,
+    build_uplink_encap, DownlinkEndpointBinding, DownlinkPdr,
+    GtpuEndpointAddress, GtpuSourcePortPolicy, UplinkFar, GTPU_ENCAP_LEN,
 };
 
 let far = UplinkFar {
@@ -45,6 +54,15 @@ assert_eq!(UplinkFar::decode(&bytes), far);
 
 let pdr = DownlinkPdr { ue_ip: [10, 23, 0, 2] };
 assert_eq!(DownlinkPdr::decode(&pdr.encode()), pdr);
+
+let binding = DownlinkEndpointBinding::new(
+    GtpuEndpointAddress::Ipv4([192, 0, 2, 10]),
+    GtpuEndpointAddress::Ipv4([192, 0, 2, 20]),
+    7,
+    GtpuSourcePortPolicy::Exact(2152),
+)
+.unwrap();
+assert_eq!(DownlinkEndpointBinding::decode(&binding.encode()), binding);
 
 let encap = build_uplink_encap(&far, 64).unwrap();
 assert_eq!(encap.len(), GTPU_ENCAP_LEN);
@@ -61,6 +79,11 @@ assert_eq!(encap.len(), GTPU_ENCAP_LEN);
 - `#![no_std]`, `#![forbid(unsafe_code)]`, and dependency-free.
 - Contains no map access, loader code, tc hooks, kernel syscalls, or product
   policy.
+- The 44-byte endpoint-binding layout is canonical and versioned. IPv4 values
+  zero their unused twelve-byte tails; families must match; addresses and the
+  ingress ifindex must be non-zero; exact/range policy encodings are bounded.
+  Decode retains invalid-format evidence rather than normalizing corrupt map
+  bytes into an authorized value.
 - The shared envelope model validates declarations and checksum bytes but does
   not inspect kernel checksum metadata or access packet memory. A live skb
   caller must exclude pending offload before supplying `NoPendingOffload`; the

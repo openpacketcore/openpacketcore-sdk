@@ -43,12 +43,18 @@ use aya_ebpf::{
 };
 use opc_gtpu_ebpf_common::{
     build_uplink_encap_with_dscp, classify_gtpu, classify_udp_checksum,
-    internet_checksum_sum_is_valid, uplink_non_encapsulation_drops, DownlinkPdr, GtpuClass,
-    GtpuEnvelopeBounds, Ipv4EnvelopeBounds, MarkedBearerOwner, MarkedDownlinkPdr,
-    UdpChecksumDisposition, UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey,
-    COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID,
-    COUNTER_SLOTS, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
-    ETH_P_IPV4, GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN, GTPU_UDP_PORT,
+    internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
+    marked_owner_wire_authorizes_uplink, uplink_non_encapsulation_drops,
+    validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr, GtpuClass,
+    GtpuEnvelopeBounds, Ipv4EnvelopeBounds, MarkedDownlinkPdr, UdpChecksumDisposition,
+    UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey,
+    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
+    COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
+    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
+    COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, DOWNLINK_BINDING_COUNTER_SLOTS,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
+    GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN, GTPU_UDP_PORT,
     MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY,
     UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
 };
@@ -81,6 +87,11 @@ static GTPU_DOWNLINK_PDR: HashMap<[u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]> =
 static GTPU_DLM_PDR: HashMap<[u8; 4], [u8; MARKED_DOWNLINK_PDR_VALUE_LEN]> =
     HashMap::pinned(65536, 0);
 
+/// Downlink outer endpoint/ingress identity: local TEID -> binding.
+#[map]
+static GTPU_DL_BIND: HashMap<[u8; 4], [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]> =
+    HashMap::pinned(65536, 0);
+
 /// Marked-bearer owner journal and forwarding commit gate.
 #[map]
 static GTPU_M_OWNER: HashMap<[u8; UPLINK_MARK_KEY_LEN], [u8; MARKED_BEARER_OWNER_VALUE_LEN]> =
@@ -89,6 +100,10 @@ static GTPU_M_OWNER: HashMap<[u8; UPLINK_MARK_KEY_LEN], [u8; MARKED_BEARER_OWNER
 /// Per-CPU datapath counters, indexed by the COUNTER_* constants.
 #[map]
 static GTPU_COUNTERS: PerCpuArray<u64> = PerCpuArray::pinned(COUNTER_SLOTS, 0);
+
+/// Fixed-cardinality provenance mismatch counters.
+#[map]
+static GTPU_DL_DROP: PerCpuArray<u64> = PerCpuArray::pinned(DOWNLINK_BINDING_COUNTER_SLOTS, 0);
 
 /// Single-slot device configuration: slot 0 holds the local S2b-U IPv4
 /// (network order), used as the outer source when a FAR carries 0.0.0.0 and
@@ -107,6 +122,28 @@ fn count(index: u32) {
     }
 }
 
+#[inline(always)]
+fn count_binding_drop(index: u32) {
+    if let Some(counter) = GTPU_DL_DROP.get_ptr_mut(index) {
+        // SAFETY: per-CPU slot; no concurrent access on the same CPU.
+        unsafe { *counter += 1 };
+    }
+}
+
+#[inline(always)]
+fn binding_drop(reason: DownlinkBindingMismatch) -> i32 {
+    let index = match reason {
+        DownlinkBindingMismatch::Invalid => COUNTER_DL_BINDING_INVALID,
+        DownlinkBindingMismatch::AddressFamily => COUNTER_DL_BINDING_FAMILY_MISMATCH,
+        DownlinkBindingMismatch::PeerAddress => COUNTER_DL_BINDING_PEER_MISMATCH,
+        DownlinkBindingMismatch::LocalAddress => COUNTER_DL_BINDING_LOCAL_MISMATCH,
+        DownlinkBindingMismatch::IngressAttachment => COUNTER_DL_BINDING_INGRESS_MISMATCH,
+        DownlinkBindingMismatch::SourcePort => COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
+    };
+    count_binding_drop(index);
+    TC_ACT_SHOT as i32
+}
+
 /// Read the complete Linux packet mark presented to the tc hook.
 ///
 /// Aya exposes a safe mark setter but no getter for `TcContext`. Keep the
@@ -118,6 +155,15 @@ fn packet_mark(ctx: &TcContext) -> u32 {
     // context for the lifetime of this classifier invocation. This helper
     // performs one aligned, read-only access to its fixed-width `mark` field.
     unsafe { (*ctx.skb.skb).mark }
+}
+
+/// Read the exact interface on which this tc classifier is executing.
+#[inline(always)]
+fn packet_ifindex(ctx: &TcContext) -> u32 {
+    // SAFETY: the kernel supplies a verifier-checked, non-null `__sk_buff`
+    // context for the lifetime of this classifier invocation. `ifindex` is a
+    // fixed-width read-only field at this boundary.
+    unsafe { (*ctx.skb.skb).ifindex }
 }
 
 #[classifier]
@@ -158,25 +204,6 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
         bearer_mark: mark.to_be_bytes(),
     }
     .encode();
-    let owner = if mark == 0 {
-        // Keep the hot-path value fully initialized across later helpers;
-        // mark zero never consults or authorizes against this sentinel.
-        MarkedBearerOwner::decode(&[0; MARKED_BEARER_OWNER_VALUE_LEN])
-    } else {
-        let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(&marked_key) else {
-            count(COUNTER_UL_FAR_MISS);
-            return Ok(TC_ACT_SHOT as i32);
-        };
-        // SAFETY: the map value outlives this program invocation. A volatile
-        // value copy materializes the complete journal before later map
-        // helpers invalidate verifier knowledge of the returned pointer.
-        let encoded_owner = unsafe { core::ptr::read_volatile(owner_ptr) };
-        let owner = MarkedBearerOwner::decode(&encoded_owner);
-        if !owner.is_valid() {
-            return Ok(TC_ACT_SHOT as i32);
-        }
-        owner
-    };
     let far_ptr = if mark == 0 {
         GTPU_UPLINK_FAR.get_ptr(&inner_src)
     } else {
@@ -219,8 +246,16 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
     } else {
         0xff
     };
-    if mark != 0 && !owner.authorizes_uplink(&far, dscp_wire) {
-        return Ok(TC_ACT_SHOT as i32);
+    if mark != 0 {
+        let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(&marked_key) else {
+            count(COUNTER_UL_FAR_MISS);
+            return Ok(TC_ACT_SHOT as i32);
+        };
+        // SAFETY: the hash value remains map-owned for this invocation and is
+        // read only by the allocation-free wire validator.
+        if !marked_owner_wire_authorizes_uplink(unsafe { &*owner_ptr }, &far, dscp_wire) {
+            return Ok(TC_ACT_SHOT as i32);
+        }
     }
     let dscp = if dscp_wire == 0xff {
         None
@@ -816,9 +851,25 @@ fn try_downlink(ctx: &mut TcContext) -> Result<i32, ()> {
         return Ok(malformed_downlink());
     }
 
+    authorize_and_decap_downlink(ctx, teid, l4_offset, payload_offset)
+}
+
+/// Authorize the complete downlink forwarding identity and perform decap.
+///
+/// Keep this phase in a verifier-visible BPF subprogram. The envelope and
+/// software-checksum phase uses a bounded 256-byte `bpf_loop` callback stack;
+/// separating the map-graph authorization phase ensures the callback and the
+/// endpoint/owner checks do not share one oversized caller frame.
+#[inline(never)]
+fn authorize_and_decap_downlink(
+    ctx: &mut TcContext,
+    teid: [u8; 4],
+    l4_offset: usize,
+    payload_offset: usize,
+) -> Result<i32, ()> {
     let legacy_pdr = GTPU_DOWNLINK_PDR.get_ptr(&teid);
     let marked_pdr = GTPU_DLM_PDR.get_ptr(&teid);
-    let (pdr, output_mark) = match (legacy_pdr, marked_pdr) {
+    let (pdr, output_mark, owner_selector) = match (legacy_pdr, marked_pdr) {
         (None, None) => {
             count(COUNTER_DL_UNKNOWN_TEID);
             return Ok(TC_ACT_SHOT as i32);
@@ -840,6 +891,7 @@ fn try_downlink(ctx: &mut TcContext) -> Result<i32, ()> {
                     bearer_mark: [0; 4],
                 },
                 0,
+                None,
             )
         }
         (None, Some(pdr_ptr)) => {
@@ -856,20 +908,46 @@ fn try_downlink(ctx: &mut TcContext) -> Result<i32, ()> {
                 bearer_mark: pdr.bearer_mark,
             }
             .encode();
-            let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(&selector) else {
-                count(COUNTER_DL_MALFORMED);
-                return Ok(TC_ACT_SHOT as i32);
-            };
-            // SAFETY: the map value outlives this program invocation and is
-            // only read here.
-            let owner = MarkedBearerOwner::decode(unsafe { &*owner_ptr });
-            if !owner.authorizes_downlink(teid) {
-                count(COUNTER_DL_MALFORMED);
-                return Ok(TC_ACT_SHOT as i32);
-            }
-            (pdr, u32::from_be_bytes(pdr.bearer_mark))
+            (pdr, u32::from_be_bytes(pdr.bearer_mark), Some(selector))
         }
     };
+
+    let Some(binding_ptr) = GTPU_DL_BIND.get_ptr(&teid) else {
+        count_binding_drop(COUNTER_DL_BINDING_INVALID);
+        return Ok(TC_ACT_SHOT as i32);
+    };
+    // SAFETY: the hash value remains map-owned for this invocation and is
+    // read only by the allocation-free wire validators below.
+    let binding = unsafe { &*binding_ptr };
+    let Ok(outer_peer) = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 12) else {
+        return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+    };
+    let Ok(outer_local) = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 16) else {
+        return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+    };
+    let Ok(source_port) = ctx.load::<u16>(l4_offset) else {
+        return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+    };
+    if let Err(reason) = validate_ipv4_downlink_binding_wire(
+        binding,
+        outer_peer,
+        outer_local,
+        packet_ifindex(ctx),
+        u16::from_be(source_port),
+    ) {
+        return Ok(binding_drop(reason));
+    }
+    if let Some(selector) = owner_selector {
+        let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(&selector) else {
+            return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+        };
+        // SAFETY: both map values remain map-owned and read-only for this
+        // exact comparison. Publishing Active last means an old owner cannot
+        // authorize a newly replaced binding during peer relocation.
+        if !marked_owner_wire_authorizes_downlink(unsafe { &*owner_ptr }, teid, binding) {
+            return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+        }
+    }
 
     let Ok(inner_version_ihl) = ctx.load::<u8>(payload_offset) else {
         count(COUNTER_DL_MALFORMED);

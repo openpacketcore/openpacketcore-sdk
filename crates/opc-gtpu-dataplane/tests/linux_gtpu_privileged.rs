@@ -30,6 +30,7 @@ async fn create_install_remove_destroy_gtpu_device_in_current_netns(
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
         peer_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         link_ifindex: device.ifindex,
+        downlink_source_port_policy: opc_gtpu_dataplane::GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,

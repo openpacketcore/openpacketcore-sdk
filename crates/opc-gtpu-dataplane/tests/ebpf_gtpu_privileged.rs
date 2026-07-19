@@ -60,18 +60,23 @@ use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
-    GtpuCapability, GtpuDataplaneBackend, GtpuError, RemovePdpContextRequest, Teid,
+    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuSourcePortPolicy, RemovePdpContextRequest,
+    Teid,
 };
 use opc_gtpu_ebpf_common::{
-    internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkPdr, MarkedBearerOwner,
-    MarkedBearerOwnerPhase, UplinkFar, UplinkFarKey, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
-    COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS,
-    DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG,
-    MAP_COUNTERS, MAP_DOWNLINK_MARK_PDR, MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER,
-    MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR,
-    MARKED_BEARER_OWNER_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN,
-    UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
+    internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkEndpointBinding,
+    DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner, MarkedBearerOwnerPhase, UplinkFar,
+    UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
+    COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
+    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP,
+    COUNTER_UL_FAR_MISS, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
+    GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_COUNTERS,
+    MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
+    MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
+    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MARKED_BEARER_OWNER_VALUE_LEN, PROG_DOWNLINK,
+    PROG_UPLINK, UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE,
+    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -89,7 +94,9 @@ sockopt_impl!(
 );
 
 const EPDG_S2BU_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+const EPDG_S2BU_ALT_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 const PGW_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+const PGW_ALT_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 11);
 const EPDG_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const UE_SWU_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 const AUTH_GTP_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
@@ -234,6 +241,7 @@ impl TestNet {
         run("ip", &["link", "set", "ue1", "netns", &ue_ns]);
 
         run("ip", &["addr", "add", "192.0.2.1/24", "dev", "s2bu"]);
+        run("ip", &["addr", "add", "192.0.2.2/32", "dev", "s2bu"]);
         run("ip", &["link", "set", "s2bu", "up"]);
         run("ip", &["addr", "add", "10.45.0.1/24", "dev", "ue0"]);
         run("ip", &["addr", "add", "198.18.0.1/24", "dev", "ue0"]);
@@ -287,6 +295,18 @@ impl TestNet {
             ],
         );
         run("ip", &["-n", &pgw_ns, "link", "set", "s2bup", "up"]);
+        run(
+            "ip",
+            &[
+                "-n",
+                &pgw_ns,
+                "addr",
+                "add",
+                "192.0.2.11/32",
+                "dev",
+                "s2bup",
+            ],
+        );
         // A veth peer can otherwise present locally generated UDP at tc
         // ingress as CHECKSUM_PARTIAL, whose on-frame checksum bytes are not
         // yet verifiable. Emit completed wire-equivalent checksums so this
@@ -487,6 +507,7 @@ fn session_context(link_ifindex: u32) -> GtpPdpContext {
         ms_address: IpAddr::V4(UE_PAA),
         peer_address: IpAddr::V4(PGW_IP),
         link_ifindex,
+        downlink_source_port_policy: GtpuSourcePortPolicy::Exact(GTPU_PORT),
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
@@ -1418,6 +1439,21 @@ async fn exercise_outer_envelope_validation(
     // only the positive kernel query bypasses byte verification. Structural
     // boundaries remain mandatory and are still rejected before PDR lookup.
     configure_checksum_metadata_path(net);
+    // This checksum-evidence path is injected by the authenticated helper
+    // namespace rather than the PGW namespace. Bind the PDR to that exact
+    // source for this phase; provenance remains mandatory even when the
+    // kernel supplies CHECKSUM_UNNECESSARY evidence.
+    let authenticated_binding = DownlinkEndpointBinding::new(
+        GtpuEndpointAddress::Ipv4(AUTH_GTP_IP.octets()),
+        GtpuEndpointAddress::Ipv4(EPDG_S2BU_IP.octets()),
+        device.ifindex,
+        GtpuSourcePortPolicy::Exact(GTPU_PORT),
+    )
+    .expect("canonical authenticated-source binding")
+    .encode();
+    let pin_dir = net.pin_root.join("s2bu");
+    let pgw_binding = replace_pinned_binding(&pin_dir, LOCAL_TEID, Some(authenticated_binding))
+        .expect("installed PGW binding");
     let verified_payload = b"kernel-verified";
     let mut verified_frame = build_frame(verified_payload, &[], true, 0);
     verified_frame[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&AUTH_GTP_IP.octets());
@@ -1472,6 +1508,7 @@ async fn exercise_outer_envelope_validation(
         verified_after.downlink_unknown_teid, verified_before.downlink_unknown_teid,
         "kernel-verified malformed structure must not reach PDR lookup",
     );
+    replace_pinned_binding(&pin_dir, LOCAL_TEID, Some(pgw_binding));
 
     let invalid_base = build_frame(b"invalid-envelope", &[], true, 0);
     let ip = ETH_HDR_LEN;
@@ -1900,6 +1937,47 @@ fn pinned_counter(pin_dir: &std::path::Path, index: u32) -> u64 {
         .sum()
 }
 
+fn pinned_binding_counter(pin_dir: &std::path::Path, index: u32) -> u64 {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_DOWNLINK_BINDING_COUNTERS))
+            .expect("open pinned binding counters"),
+    )
+    .expect("identify pinned binding counters map");
+    let counters = PerCpuArray::<_, u64>::try_from(map).expect("typed pinned binding counters");
+    counters
+        .get(&index, 0)
+        .expect("read per-CPU binding counter")
+        .iter()
+        .copied()
+        .sum()
+}
+
+fn replace_pinned_binding(
+    pin_dir: &std::path::Path,
+    local_teid: u32,
+    replacement: Option<[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>,
+) -> Option<[u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_DOWNLINK_ENDPOINT_BINDING))
+            .expect("open pinned downlink binding"),
+    )
+    .expect("identify pinned downlink binding map");
+    let mut bindings =
+        BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN]>::try_from(map)
+            .expect("typed pinned downlink binding map");
+    let key = local_teid.to_be_bytes();
+    let previous = bindings.get(&key, 0).ok();
+    match replacement {
+        Some(value) => bindings
+            .insert(key, value, 0)
+            .expect("replace pinned downlink binding"),
+        None => bindings
+            .remove(&key)
+            .expect("remove pinned downlink binding"),
+    }
+    previous
+}
+
 fn set_marked_owner_phase(pin_dir: &std::path::Path, mark: u32, phase: MarkedBearerOwnerPhase) {
     let selector = UplinkFarKey {
         ue_ip: UE_PAA.octets(),
@@ -1929,6 +2007,7 @@ fn set_marked_owner_phase(pin_dir: &std::path::Path, mark: u32, phase: MarkedBea
         current.local_teid,
         current.uplink_far,
         current.egress_dscp(),
+        current.downlink_binding,
         phase,
     );
     owners
@@ -2033,6 +2112,11 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         GtpuCapability::Available,
         "both exact hooks and all marked maps must be live"
     );
+    assert_eq!(
+        backend.probe().await?.downlink_endpoint_binding,
+        GtpuCapability::Available,
+        "the exact binding map, counter map, and downlink hook must be live"
+    );
     assert!(
         tc_filters("egress").contains("opc_gtpu_uplink"),
         "uplink program must be attached at tc egress"
@@ -2064,6 +2148,8 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             &[
                 MAP_DOWNLINK_PDR,
                 MAP_DOWNLINK_MARK_PDR,
+                MAP_DOWNLINK_ENDPOINT_BINDING,
+                MAP_DOWNLINK_BINDING_COUNTERS,
                 MAP_MARKED_BEARER_OWNER,
                 MAP_COUNTERS,
             ],
@@ -2079,6 +2165,10 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     assert_eq!(
         initial_snapshot.counters_map_id,
         MapInfo::from_pin(marked_pin_dir.join(MAP_COUNTERS))?.id()
+    );
+    assert_eq!(
+        initial_snapshot.downlink_binding_counters_map_id,
+        MapInfo::from_pin(marked_pin_dir.join(MAP_DOWNLINK_BINDING_COUNTERS))?.id()
     );
     for (reported, index) in [
         (
@@ -2110,6 +2200,42 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             reported,
             pinned_counter(&marked_pin_dir, index),
             "the public snapshot must aggregate every per-CPU value from the exact pinned map",
+        );
+    }
+    for (reported, index) in [
+        (
+            initial_snapshot.counters.downlink_binding_invalid,
+            COUNTER_DL_BINDING_INVALID,
+        ),
+        (
+            initial_snapshot.counters.downlink_binding_family_mismatches,
+            COUNTER_DL_BINDING_FAMILY_MISMATCH,
+        ),
+        (
+            initial_snapshot.counters.downlink_binding_peer_mismatches,
+            COUNTER_DL_BINDING_PEER_MISMATCH,
+        ),
+        (
+            initial_snapshot.counters.downlink_binding_local_mismatches,
+            COUNTER_DL_BINDING_LOCAL_MISMATCH,
+        ),
+        (
+            initial_snapshot
+                .counters
+                .downlink_binding_ingress_mismatches,
+            COUNTER_DL_BINDING_INGRESS_MISMATCH,
+        ),
+        (
+            initial_snapshot
+                .counters
+                .downlink_binding_source_port_mismatches,
+            COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
+        ),
+    ] {
+        assert_eq!(
+            reported,
+            pinned_binding_counter(&marked_pin_dir, index),
+            "the public snapshot must aggregate the exact fixed binding counter map",
         );
     }
 
@@ -2167,6 +2293,12 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     // Sockets living in the peer namespaces.
     let pgw_socket = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW GTP-U socket")
+    });
+    let pgw_wrong_peer_socket = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_ALT_IP, GTPU_PORT)).expect("bind alternate-peer GTP-U socket")
+    });
+    let pgw_wrong_source_port_socket = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT + 1)).expect("bind alternate-port GTP-U socket")
     });
     let pgw_plaintext_socket = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((REMOTE_HOST, 53)).expect("bind PGW plaintext-leak detector")
@@ -2442,6 +2574,115 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     assert_eq!(&buffer[..len], b"opc-downlink");
     assert_eq!(from, SocketAddr::from((REMOTE_HOST, 53)));
 
+    // Every provenance dimension is independently fail-closed and reported
+    // through one fixed-cardinality aggregate. No diagnostic includes the
+    // rejected endpoint, port, TEID, or UE address.
+    let binding_counters_before = backend.datapath_snapshot(&device).await?.counters;
+    drain_datagrams(&ue_socket);
+    for _ in 0..3 {
+        pgw_wrong_peer_socket.send_to(&gpdu_downlink, (EPDG_S2BU_IP, GTPU_PORT))?;
+    }
+    expect_no_datagram(&ue_socket);
+
+    drain_datagrams(&ue_socket);
+    for _ in 0..3 {
+        pgw_socket.send_to(&gpdu_downlink, (EPDG_S2BU_ALT_IP, GTPU_PORT))?;
+    }
+    expect_no_datagram(&ue_socket);
+
+    drain_datagrams(&ue_socket);
+    for _ in 0..3 {
+        pgw_wrong_source_port_socket.send_to(&gpdu_downlink, (EPDG_S2BU_IP, GTPU_PORT))?;
+    }
+    expect_no_datagram(&ue_socket);
+
+    let canonical_binding = replace_pinned_binding(&marked_pin_dir, LOCAL_TEID, None)
+        .expect("installed default binding");
+    drain_datagrams(&ue_socket);
+    for _ in 0..3 {
+        pgw_socket.send_to(&gpdu_downlink, (EPDG_S2BU_IP, GTPU_PORT))?;
+    }
+    expect_no_datagram(&ue_socket);
+    replace_pinned_binding(&marked_pin_dir, LOCAL_TEID, Some(canonical_binding));
+
+    let ipv6_binding = DownlinkEndpointBinding::new(
+        GtpuEndpointAddress::Ipv6([1; 16]),
+        GtpuEndpointAddress::Ipv6([2; 16]),
+        device.ifindex,
+        GtpuSourcePortPolicy::Exact(GTPU_PORT),
+    )
+    .expect("canonical IPv6 binding")
+    .encode();
+    replace_pinned_binding(&marked_pin_dir, LOCAL_TEID, Some(ipv6_binding));
+    drain_datagrams(&ue_socket);
+    for _ in 0..3 {
+        pgw_socket.send_to(&gpdu_downlink, (EPDG_S2BU_IP, GTPU_PORT))?;
+    }
+    expect_no_datagram(&ue_socket);
+    replace_pinned_binding(&marked_pin_dir, LOCAL_TEID, Some(canonical_binding));
+
+    let wrong_ingress_binding = DownlinkEndpointBinding::new(
+        GtpuEndpointAddress::Ipv4(PGW_IP.octets()),
+        GtpuEndpointAddress::Ipv4(EPDG_S2BU_IP.octets()),
+        device.ifindex + 1,
+        GtpuSourcePortPolicy::Exact(GTPU_PORT),
+    )
+    .expect("canonical alternate-ingress binding")
+    .encode();
+    replace_pinned_binding(&marked_pin_dir, LOCAL_TEID, Some(wrong_ingress_binding));
+    drain_datagrams(&ue_socket);
+    for _ in 0..3 {
+        pgw_socket.send_to(&gpdu_downlink, (EPDG_S2BU_IP, GTPU_PORT))?;
+    }
+    expect_no_datagram(&ue_socket);
+    replace_pinned_binding(&marked_pin_dir, LOCAL_TEID, Some(canonical_binding));
+
+    let binding_counters_after = backend.datapath_snapshot(&device).await?.counters;
+    for (before, after, reason) in [
+        (
+            binding_counters_before.downlink_binding_invalid,
+            binding_counters_after.downlink_binding_invalid,
+            "invalid",
+        ),
+        (
+            binding_counters_before.downlink_binding_family_mismatches,
+            binding_counters_after.downlink_binding_family_mismatches,
+            "family",
+        ),
+        (
+            binding_counters_before.downlink_binding_peer_mismatches,
+            binding_counters_after.downlink_binding_peer_mismatches,
+            "peer",
+        ),
+        (
+            binding_counters_before.downlink_binding_local_mismatches,
+            binding_counters_after.downlink_binding_local_mismatches,
+            "local",
+        ),
+        (
+            binding_counters_before.downlink_binding_ingress_mismatches,
+            binding_counters_after.downlink_binding_ingress_mismatches,
+            "ingress",
+        ),
+        (
+            binding_counters_before.downlink_binding_source_port_mismatches,
+            binding_counters_after.downlink_binding_source_port_mismatches,
+            "source-port",
+        ),
+    ] {
+        assert!(after > before, "{reason} binding counter must advance");
+    }
+
+    let (len, _) = send_until_received(
+        || {
+            let _ = pgw_socket.send_to(&gpdu_downlink, (EPDG_S2BU_IP, GTPU_PORT));
+        },
+        &ue_socket,
+        &mut buffer,
+    )
+    .expect("restoring the exact binding must resume downlink");
+    assert_eq!(&buffer[..len], b"opc-downlink");
+
     for (expected_mark, local_teid, payload) in [
         (MARK_A, LOCAL_TEID_A, b"opc-downlink-mark-a".as_slice()),
         (MARK_B, LOCAL_TEID_B, b"opc-downlink-mark-b".as_slice()),
@@ -2586,7 +2827,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         "pinned maps must be removed with the device"
     );
 
-    // --- Frozen-v1 live migration and rejected-config preservation. ---
+    // --- Populated endpoint-unbound v1 rejection and config preservation. ---
     // Build the exact prior-generation state: five retained pins, committed
     // v1 marker, populated default session, and both old tc programs live.
     let v1_pin_dir = net.pin_root.join("s2bu");
@@ -2601,7 +2842,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     assert_eq!(tc_program_id("ingress"), v1_downlink_id);
 
     // A create request with a different retained local address must fail
-    // before any config, marker, map-ID, or hook mutation. Loading the v2
+    // before any config, marker, map-ID, or hook mutation. Loading the v3
     // object may create its additive empty pins, which is safe and expected.
     let rejected_migration =
         EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
@@ -2656,79 +2897,39 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     .expect("frozen v1 downlink must survive rejected migration");
     assert_eq!(&buffer[..len], b"opc-v1-downlink");
 
-    // A valid restart adopts the retained pins, replaces each exact v1 tc
-    // slot atomically, commits the v2 marker, and preserves all five map
-    // object IDs and the populated default session.
-    let migrated = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
-        bpffs_pin_root: net.pin_root.clone(),
-        ..EbpfGtpuDataplaneBackendConfig::default()
-    });
-    let migrated_device = migrated.resolve_device("s2bu").await?;
+    // A populated endpoint-unbound v1 graph cannot be inferred as `Any` and
+    // upgraded silently. Adoption must reject it before replacing either
+    // live v1 hook or advancing the schema marker. Draining/reprovisioning is
+    // the explicit operator-safe migration for these old pins.
+    let rejected_endpoint_migration =
+        EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+            bpffs_pin_root: net.pin_root.clone(),
+            ..EbpfGtpuDataplaneBackendConfig::default()
+        });
+    assert!(matches!(
+        rejected_endpoint_migration.resolve_device("s2bu").await,
+        Err(GtpuError::StateIndeterminate {
+            operation: "ebpf_marked_owner_rebuild"
+        })
+    ));
+    drop(rejected_endpoint_migration);
     assert_eq!(frozen_v1_map_ids(&v1_pin_dir), retained_map_ids);
     assert_eq!(
         pinned_schema_marker(&v1_pin_dir),
-        UPLINK_BEARER_SCHEMA_MARKER_VALUE
+        UPLINK_DSCP_SCHEMA_MARKER_VALUE,
+        "failed adoption must not claim endpoint-bound schema"
     );
-    assert_ne!(tc_program_id("egress"), v1_uplink_id);
-    assert_ne!(tc_program_id("ingress"), v1_downlink_id);
-    assert_eq!(
-        migrated.probe().await?.per_bearer_marking,
-        GtpuCapability::Available
-    );
-
-    drain_datagrams(&pgw_socket);
-    let (len, from) = send_until_received(
-        || {
-            let _ = ue_socket.send_to(b"opc-v2-after-migrate", (REMOTE_HOST, 53));
-        },
-        &pgw_socket,
-        &mut buffer,
-    )
-    .expect("retained default session must forward after v2 migration");
-    assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
-    assert_eq!(
-        u32::from_be_bytes(buffer[4..8].try_into().expect("retained TEID bytes")),
-        PEER_TEID
-    );
-    assert!(buffer[..len].ends_with(b"opc-v2-after-migrate"));
-
-    net.require_forward_mark(0);
-    let migrated_default_downlink =
-        build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5000, b"opc-v2-default-downlink");
-    let migrated_default_gpdu = build_gpdu(LOCAL_TEID, None, &migrated_default_downlink);
-    let (len, _) = send_until_received(
-        || {
-            let _ = pgw_socket.send_to(&migrated_default_gpdu, (EPDG_S2BU_IP, GTPU_PORT));
-        },
-        &ue_socket,
-        &mut buffer,
-    )
-    .expect("retained default PDR must decap through the new v2 hook");
-    assert_eq!(&buffer[..len], b"opc-v2-default-downlink");
-    net.allow_all_forward_marks();
-
-    let migrated_bearer =
-        dedicated_session_context(migrated_device.ifindex, MARK_A, LOCAL_TEID_A, PEER_TEID_A);
-    migrated
-        .install_pdp_context(migrated_bearer.clone())
-        .await?;
-    drain_datagrams(&pgw_socket);
-    let (len, _) = send_until_received(
-        || {
-            let _ = ue_mark_a_socket.send_to(b"opc-v2-marked", (REMOTE_HOST, 53));
-        },
-        &pgw_socket,
-        &mut buffer,
-    )
-    .expect("new marked bearer must forward after v1 migration");
-    assert_eq!(
-        u32::from_be_bytes(buffer[4..8].try_into().expect("marked TEID bytes")),
-        PEER_TEID_A
-    );
-    assert!(buffer[..len].ends_with(b"opc-v2-marked"));
-    migrated.remove_device(&migrated_device).await?;
-    drop(migrated);
-    assert!(!v1_pin_dir.exists());
+    assert_eq!(tc_program_id("egress"), v1_uplink_id);
+    assert_eq!(tc_program_id("ingress"), v1_downlink_id);
+    for direction in ["egress", "ingress"] {
+        run(
+            "tc",
+            &[
+                "filter", "del", "dev", "s2bu", direction, "handle", "0x1", "pref", "50", "bpf",
+            ],
+        );
+    }
+    fs::remove_dir_all(&v1_pin_dir).expect("drain endpoint-unbound v1 pins");
 
     // --- Static pin-path replacement safety. ---
     // Swap two exact named pin paths while this test is the only writer. The
@@ -2804,8 +3005,13 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             ],
         );
     }
+    let replacement_probe = replacement_owner.probe().await?;
     assert_eq!(
-        replacement_owner.probe().await?.egress_dscp_marking,
+        replacement_probe.egress_dscp_marking,
+        GtpuCapability::Missing
+    );
+    assert_eq!(
+        replacement_probe.downlink_endpoint_binding,
         GtpuCapability::Missing
     );
     assert!(matches!(
@@ -2813,7 +3019,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             .install_pdp_context(marked_session_context(replacement_device.ifindex))
             .await,
         Err(opc_gtpu_dataplane::GtpuError::Io {
-            operation: "ebpf_dscp_datapath",
+            operation: "ebpf_downlink_endpoint_datapath",
             ..
         })
     ));

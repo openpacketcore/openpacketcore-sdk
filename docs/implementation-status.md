@@ -184,6 +184,40 @@ qualification remain product and deployment responsibilities.
 
 ---
 
+## Current eBPF GTP-U endpoint-binding foundation — 2026-07-18
+
+`opc-gtpu-dataplane` now binds every eBPF downlink PDR to a canonical outer
+peer/local pair, address family, exact ingress attachment, and explicit bounded
+UDP source-port policy. The shared no-std schema covers IPv4/IPv6 semantics and
+fixed redaction-safe encodings; the current tc adapter is explicitly IPv4-only.
+Ingress retains its full prior envelope and checksum validation, then requires
+the binding before inspecting or delivering the inner packet. Missing,
+non-canonical, wrong-family, wrong-peer, wrong-local, wrong-interface, and
+wrong-port state fails closed through six fixed aggregate reason counters.
+
+The host reconciler includes endpoint identity in fresh publication, exact
+default and marked peer relocation, rollback, marked owner phases, removal,
+restart adoption, live-map/program snapshots, and readiness probing. One atomic
+binding replacement is the default-bearer authorization cutover; marked
+bearers require the live binding and `Active` owner journal to agree exactly.
+Persisted graph validation rejects partial, stale, duplicate, or unowned state
+before accepting either tc hook. Endpoint-unbound populated state is never
+upgraded by assumption: committed v2 pins require drain/reprovision, and older
+populated graphs fail closed rather than acquiring an implicit `Any` policy.
+
+Unit evidence covers canonical IPv4/IPv6 models, corrupt encodings, every
+source-port policy, redaction, graph adoption, failure injection at relocation
+cutovers, and rollback authorization. The ignored privileged proof loads the
+committed object in a fresh network namespace and exercises correct forwarding,
+all six live mismatch classes, restored forwarding, exact program/map identity,
+restart adoption, and endpoint-unbound legacy rejection. This is implemented
+SDK behavior, not a product traffic-readiness attestation. Consumers must gate
+on `GtpuProbe::downlink_endpoint_binding`; peer discovery, site port policy,
+routing, XFRM, CNI attachment, operational drain, and deployment qualification
+remain downstream responsibilities.
+
+---
+
 ## Historical EPC/untrusted-access hardening snapshot — T-8c57ecee (2026-06-28)
 
 This snapshot records the final EPC/untrusted-access SDK readiness pass after
