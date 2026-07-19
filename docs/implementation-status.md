@@ -184,6 +184,51 @@ qualification remain product and deployment responsibilities.
 
 ---
 
+## Current conflict-safe GTP-U reconciliation foundation — 2026-07-18
+
+`opc-gtpu-dataplane` now exposes an additive backend-neutral PDP-context
+reconciliation contract. Typed selectors cover the local TEID and uplink
+`(UE PAA, optional bearer mark)` axes; typed readback returns complete context
+identity. Classified install distinguishes new, exact-present, conflict, and
+indeterminate outcomes after inspecting both axes. Conflict diagnostics retain
+only axis occupancy and mismatch field names. Exact stale removal is a separate
+capability and operation; no API claims atomic replacement or hides the bounded
+forwarding gap between an owned stale removal and desired install. Existing
+third-party backends inherit typed unsupported defaults and can construct
+redaction-safe conflicts through the public validated API.
+
+The eBPF implementation reconstructs only complete default or marked
+FAR/PDR/endpoint-binding/DSCP/active-owner graphs while holding its reconciler
+lease and exact program/map identities. A host-only default UE-to-TEID index is
+transactionally maintained and rebuilt from validated v3 pins, without a
+datapath map or schema revision. Restart adoption, both selector-collision
+shapes, exact default/marked retry and removal, transitional owners, one-sided
+graphs, map/index corruption, identity loss, cancellation retry, and a second
+reconciler all fail closed or converge through authoritative readback.
+
+The Linux implementation performs response-required `GETPDP` queries twice for
+each selector, binds the outer generic-netlink family identity, strictly decodes
+the independently typed MS/PAA and peer attributes, and handles the kernel's
+historical family-ID command quirk. `GTPA_FAMILY` applies only to the MS/PAA;
+the peer follows the GTP socket and may use the other IP family. Family omission
+is inferred only from one unambiguous MS/PAA attribute, while the independently
+required peer attribute remains part of the complete identity. Unsupported
+family behavior is not absence. NEWPDP success, EEXIST, and ACK-uncertain errors
+are followed by full classification. Mainline `DELPDP` is unconditional and
+there is no cross-process writer lease, so exact removal is explicitly
+unavailable. The stateful mock provides parity and
+corrupt/transitional/changing evidence injection through a separate typed log
+that preserves the externally exhaustive legacy operation enum.
+
+Unit and external-API tests cover the complete contract and hostile netlink
+responses. Ignored fresh-network-namespace tests exercise actual Linux GETPDP
+exact retry and eBPF pinned-state adoption where the host exposes the required
+kernel, BPF, bpffs, and capability support. This is reusable SDK reconciliation
+behavior, not ownership policy, drain orchestration, route/XFRM sequencing, or
+deployment qualification.
+
+---
+
 ## Current eBPF GTP-U endpoint-binding foundation — 2026-07-18
 
 `opc-gtpu-dataplane` now binds every eBPF downlink PDR to a canonical outer

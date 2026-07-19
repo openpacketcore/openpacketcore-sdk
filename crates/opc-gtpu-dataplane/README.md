@@ -12,8 +12,11 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
 
 ## API Shape
 
-- `GtpuDataplaneBackend`: async port for `create_device`, `resolve_device`,
-  `remove_device`, `install_pdp_context`, `remove_pdp_context`, and `probe`.
+- `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
+  readback, classified installation, authority-safe exact removal, and probes.
+  The reconciliation methods are additive defaults, so existing third-party
+  implementations remain source-compatible and report typed unsupported
+  results until they opt in.
 - `LinuxGtpuDataplaneBackend`: safe adapter over the Linux `gtp` netdevice and
   GTP generic-netlink family.
 - `EbpfGtpuDataplaneBackend`: tc `clsact` eBPF datapath adapter for
@@ -29,6 +32,10 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
   `GtpPdpContext`, `GtpBearerMark`, `RemovePdpContextRequest`, `Teid`,
   `GtpuProbe`, `GtpuBackendKind`, `GtpuCapability`,
   `GtpuDownlinkEndpoint`, `GtpuSourcePortPolicy`, `GtpuSourcePortRange`,
+  `PdpContextSelector`, `PdpContextReadback`, `PdpContextInstallOutcome`,
+  `PdpContextRemovalOutcome`, `PdpContextConflict`,
+  `PdpContextMismatchField`, `PdpContextIndeterminateReason`, and
+  `PdpContextReconciliationCapabilities`,
   `EbpfGtpuDatapathSnapshot`, `EbpfGtpuDatapathCounters`, `DscpCodepoint`,
   `GtpRole`, `GtpVersion`, `GtpAddressFamily`, and `GTPU_PORT`.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
@@ -85,6 +92,96 @@ interface and `bind_address` is the local outer IPv4 address. It pins maps under
 `/sys/fs/bpf/opc-gtpu/<interface>/` by default, installs both uplink FAR and
 downlink PDR state from one `GtpPdpContext`, and supports restore through
 `resolve_device`. It only supports IPv4 session state today.
+
+### Conflict-safe PDP reconciliation
+
+Use `read_pdp_context` to inspect either the local/downlink TEID axis or the
+uplink `(UE PAA, optional bearer mark)` axis. `PdpContextLocalTeidSelector`
+requires the address family explicitly so a backend cannot call an IPv4-only
+lookup and report an IPv6 context absent. Both selector constructors reject
+ifindex zero. `Present` returns the complete typed context needed for equality;
+its `Debug` output redacts TEIDs, addresses, marks, and source-port policy.
+
+`install_pdp_context_classified` inspects both desired selector axes under one
+backend operation boundary. Its outcomes distinguish a new exact install,
+exact state already present, valid conflicting state, and indeterminate
+evidence. Conflict diagnostics expose only occupied axes and names of differing
+fields, never values. This strict method does not perform the legacy eBPF peer
+relocation behavior. A caller that owns a stale eBPF context can first invoke
+`remove_pdp_context_exact(stale)` and, only after `Removed`, install the desired
+context. Those are two separate operations and therefore have a bounded
+forwarding gap; the SDK does not claim atomic replacement.
+
+```rust,no_run
+use opc_gtpu_dataplane::{
+    GtpPdpContext, GtpuDataplaneBackend, PdpContextInstallOutcome,
+    PdpContextRemovalOutcome,
+};
+
+async fn converge(
+    backend: &dyn GtpuDataplaneBackend,
+    desired: GtpPdpContext,
+    owned_stale: Option<GtpPdpContext>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(stale) = owned_stale {
+        match backend.remove_pdp_context_exact(stale).await? {
+            PdpContextRemovalOutcome::Removed | PdpContextRemovalOutcome::AlreadyAbsent => {}
+            _ => {
+                return Err("stale PDP context was not proven removable".into());
+            }
+        }
+    }
+    match backend.install_pdp_context_classified(desired).await? {
+        PdpContextInstallOutcome::Installed
+        | PdpContextInstallOutcome::ExactAlreadyPresent => Ok(()),
+        _ => {
+            Err("desired PDP context did not converge".into())
+        }
+    }
+}
+```
+
+The eBPF adapter treats its held reconciler lease, exact tc program identity,
+and exact named-map identities as mutation authority. It reconstructs default
+and marked contexts only from a complete FAR/PDR/endpoint-binding/DSCP/active
+owner graph. A host-only default `(ifindex, UE PAA) -> local TEID` reverse index
+is rebuilt from validated pinned v3 state on adoption and maintained inside the
+same serialized publication/removal boundary. It is not a new datapath map and
+does not change the pinned schema. Partial graphs, transitional marked owners,
+index disagreement, changed observations, a second writer, or lost program/map
+identity return indeterminate without deleting state. Exact removal uses the
+same authority and confirms both selector axes absent afterward.
+
+The Linux `gtp` adapter uses response-required generic-netlink `GETPDP` queries
+for both axes and requires two identical bounded observations. It validates the
+outer generic-family message type, the kernel's historical family-ID-in-command
+reply quirk (or a future canonical `GETPDP` command), every known attribute,
+MS/PAA-family consistency, selector correlation, and the complete returned
+identity. `GTPA_FAMILY` describes only the inner MS/PAA lookup key; the outer
+peer family follows the GTP device's UDP socket and may differ. Current kernels
+may omit `GTPA_FAMILY`; one unambiguous MS/PAA attribute still determines its
+family independently of the required peer attribute. Linux currently stores an
+IPv6 MS/PAA as a canonical `/64` prefix. A kernel that cannot perform the
+requested family lookup fails closed rather than reporting absence. Mainline
+Linux exposes unconditional `DELPDP` but no compare-delete primitive or
+cross-process writer lease, so `remove_pdp_context_exact` is intentionally
+unsupported there.
+
+Readback/classified-install/exact-removal capabilities are reported separately
+through `pdp_context_reconciliation_capabilities`; they are not inferred from
+packet-processing fields in `GtpuProbe`. The mock implements the full stateful
+contract for default and marked contexts, exposes `MockPdpContextFault` for
+corrupt, transitional, and changing-readback tests, and records the additive
+calls separately through `pdp_context_reconciliation_operations`. The original
+externally exhaustive `MockOperation` variants remain unchanged.
+
+Calls execute blocking kernel/map work behind an async boundary. Dropping an
+in-flight future is not proof that its blocking operation stopped. A caller
+must retry through classified readback; deterministic pre-mutation validation,
+capability, and permission errors remain errors, while ACK-uncertain or partial
+mutation failures are re-read and returned as exact, conflict, or indeterminate
+state. Product policy decides which stale context it owns, coordinates drain,
+and sequences route/XFRM/session changes.
 
 ### Downlink outer-envelope validation
 

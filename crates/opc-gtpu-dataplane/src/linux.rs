@@ -15,17 +15,21 @@ use opc_linux_gtpu_sys::{
     GtpuUdpBind, GtpuUdpSocket, AF_INET, AF_INET6, CTRL_ATTR_FAMILY_ID, CTRL_ATTR_FAMILY_NAME,
     CTRL_CMD_GETFAMILY, CTRL_VERSION, GENL_ID_CTRL, GTPA_FAMILY, GTPA_I_TEI, GTPA_LINK,
     GTPA_MS_ADDR6, GTPA_MS_ADDRESS, GTPA_O_TEI, GTPA_PEER_ADDR6, GTPA_PEER_ADDRESS, GTPA_VERSION,
-    GTP_CMD_DELPDP, GTP_CMD_NEWPDP, GTP_GENL_NAME, GTP_GENL_VERSION, GTP_ROLE_GGSN, GTP_ROLE_SGSN,
-    GTP_V1, IFF_UP, IFLA_GTP_FD1, IFLA_GTP_LOCAL, IFLA_GTP_LOCAL6, IFLA_GTP_PDP_HASHSIZE,
-    IFLA_GTP_ROLE, IFLA_IFNAME, IFLA_INFO_DATA, IFLA_INFO_KIND, IFLA_LINKINFO, NLMSG_DONE,
-    NLMSG_ERROR, NLMSG_NOOP, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, RTM_DELLINK,
-    RTM_NEWLINK,
+    GTP_CMD_DELPDP, GTP_CMD_GETPDP, GTP_CMD_NEWPDP, GTP_GENL_NAME, GTP_GENL_VERSION, GTP_ROLE_GGSN,
+    GTP_ROLE_SGSN, GTP_V1, IFF_UP, IFLA_GTP_FD1, IFLA_GTP_LOCAL, IFLA_GTP_LOCAL6,
+    IFLA_GTP_PDP_HASHSIZE, IFLA_GTP_ROLE, IFLA_IFNAME, IFLA_INFO_DATA, IFLA_INFO_KIND,
+    IFLA_LINKINFO, NLMSG_DONE, NLMSG_ERROR, NLMSG_NOOP, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL,
+    NLM_F_REQUEST, RTM_DELLINK, RTM_NEWLINK,
 };
 
+use crate::backend::error_proves_no_requested_mutation;
+use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::{
     CreateGtpDeviceRequest, GtpAddressFamily, GtpDevice, GtpPdpContext, GtpRole, GtpVersion,
     GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuProbe,
-    RemovePdpContextRequest, GTPU_PORT,
+    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
+    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
+    PdpContextSelector, PdpContextUplinkSelector, RemovePdpContextRequest, Teid, GTPU_PORT,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -72,6 +76,8 @@ pub struct LinuxGtpuDataplaneBackend {
 struct LinuxGtpuDataplaneBackendInner {
     transport: Arc<dyn LinuxGtpuTransport>,
     next_sequence: AtomicU32,
+    /// Serializes PDP read/compare/mutate transactions across backend clones.
+    pdp_operation_lock: Mutex<()>,
     device_sockets: Mutex<HashMap<u32, GtpuSocketHandle>>,
     config: LinuxGtpuDataplaneBackendConfig,
 }
@@ -104,6 +110,7 @@ impl LinuxGtpuDataplaneBackend {
             inner: Arc::new(LinuxGtpuDataplaneBackendInner {
                 transport: Arc::new(NetlinkGtpuTransport),
                 next_sequence: AtomicU32::new(1),
+                pdp_operation_lock: Mutex::new(()),
                 device_sockets: Mutex::new(HashMap::new()),
                 config,
             }),
@@ -119,6 +126,7 @@ impl LinuxGtpuDataplaneBackend {
             inner: Arc::new(LinuxGtpuDataplaneBackendInner {
                 transport: Arc::new(transport),
                 next_sequence: AtomicU32::new(1),
+                pdp_operation_lock: Mutex::new(()),
                 device_sockets: Mutex::new(HashMap::new()),
                 config: LinuxGtpuDataplaneBackendConfig {
                     receive_attempts: 1,
@@ -136,6 +144,13 @@ impl LinuxGtpuDataplaneBackend {
         } else {
             sequence
         }
+    }
+
+    fn pdp_operation_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, GtpuError> {
+        self.inner
+            .pdp_operation_lock
+            .lock()
+            .map_err(|_| GtpuError::io("pdp_context_reconciliation", poisoned_lock()))
     }
 
     fn route_transact(
@@ -298,10 +313,19 @@ impl LinuxGtpuDataplaneBackend {
     }
 
     fn install_pdp_context_sync(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
+        let _operation = self.pdp_operation_guard()?;
         validate_pdp_context(&request)?;
         let family_id = self
             .resolve_gtp_family_id()
             .map_err(map_family_lookup_error)?;
+        self.install_pdp_context_with_family_locked(family_id, request)
+    }
+
+    fn install_pdp_context_with_family_locked(
+        &self,
+        family_id: u16,
+        request: GtpPdpContext,
+    ) -> Result<(), GtpuError> {
         let body = encode_install_pdp_context(&request)?;
         let _ = self.generic_transact(
             "install_pdp_context",
@@ -313,6 +337,7 @@ impl LinuxGtpuDataplaneBackend {
     }
 
     fn remove_pdp_context_sync(&self, request: RemovePdpContextRequest) -> Result<(), GtpuError> {
+        let _operation = self.pdp_operation_guard()?;
         validate_remove_pdp_context_request(&request)?;
         let family_id = self
             .resolve_gtp_family_id()
@@ -325,6 +350,162 @@ impl LinuxGtpuDataplaneBackend {
             body,
         )?;
         Ok(())
+    }
+
+    fn get_pdp_context_once_locked(
+        &self,
+        family_id: u16,
+        selector: &PdpContextSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        validate_pdp_context_selector(selector)?;
+        let body = encode_get_pdp_context(selector)?;
+        let response =
+            match self.generic_transact("read_pdp_context", family_id, NLM_F_REQUEST, body) {
+                Ok(Some(response)) => response,
+                Ok(None) => {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "linux_pdp_context_readback",
+                    });
+                }
+                Err(GtpuError::NotFound) => return Ok(PdpContextReadback::Absent),
+                Err(error) => return Err(error),
+            };
+        parse_pdp_context_response(&response, selector, family_id).map(PdpContextReadback::Present)
+    }
+
+    fn get_pdp_context_stable_locked(
+        &self,
+        family_id: u16,
+        selector: &PdpContextSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        let first = self.get_pdp_context_once_locked(family_id, selector)?;
+        let second = self.get_pdp_context_once_locked(family_id, selector)?;
+        if first == second {
+            Ok(first)
+        } else {
+            Err(GtpuError::StateIndeterminate {
+                operation: "linux_pdp_context_state_changed",
+            })
+        }
+    }
+
+    fn read_pdp_context_sync(
+        &self,
+        selector: PdpContextSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        validate_pdp_context_selector(&selector)?;
+        let _operation = self.pdp_operation_guard()?;
+        let family_id = self
+            .resolve_gtp_family_id()
+            .map_err(map_family_lookup_error)?;
+        self.get_pdp_context_stable_locked(family_id, &selector)
+    }
+
+    fn inspect_desired_axes_stable_locked(
+        &self,
+        family_id: u16,
+        desired: &GtpPdpContext,
+    ) -> Result<(PdpContextReadback, PdpContextReadback), GtpuError> {
+        let local = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(desired).ok_or_else(|| {
+                GtpuError::invalid_config("pdp.link_ifindex", "ifindex must be nonzero")
+            })?,
+        );
+        let uplink = PdpContextSelector::Uplink(
+            PdpContextUplinkSelector::from_context(desired).ok_or_else(|| {
+                GtpuError::invalid_config("pdp.ms_address", "MS address must not be unspecified")
+            })?,
+        );
+        let first_local = self.get_pdp_context_once_locked(family_id, &local)?;
+        let first_uplink = self.get_pdp_context_once_locked(family_id, &uplink)?;
+        let second_local = self.get_pdp_context_once_locked(family_id, &local)?;
+        let second_uplink = self.get_pdp_context_once_locked(family_id, &uplink)?;
+        if first_local == second_local && first_uplink == second_uplink {
+            Ok((first_local, first_uplink))
+        } else {
+            Err(GtpuError::StateIndeterminate {
+                operation: "linux_pdp_context_state_changed",
+            })
+        }
+    }
+
+    fn install_pdp_context_classified_sync(
+        &self,
+        request: GtpPdpContext,
+    ) -> Result<PdpContextInstallOutcome, GtpuError> {
+        validate_pdp_context(&request)?;
+        let _operation = self.pdp_operation_guard()?;
+        let family_id = self
+            .resolve_gtp_family_id()
+            .map_err(map_family_lookup_error)?;
+        let (local, uplink) = match self.inspect_desired_axes_stable_locked(family_id, &request) {
+            Ok(observed) => observed,
+            Err(GtpuError::StateIndeterminate { .. }) => {
+                return Ok(PdpContextInstallOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::StateChanged,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        match classify_dual_selector_state(&local, &uplink, &request) {
+            DualSelectorState::Exact => Ok(PdpContextInstallOutcome::ExactAlreadyPresent),
+            DualSelectorState::Conflict(conflict) => {
+                Ok(PdpContextInstallOutcome::Conflict(conflict))
+            }
+            DualSelectorState::Indeterminate => Ok(PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::IncompleteState,
+            )),
+            DualSelectorState::BothAbsent => {
+                let install =
+                    self.install_pdp_context_with_family_locked(family_id, request.clone());
+                match install {
+                    Ok(()) => {}
+                    Err(error) if error_proves_no_requested_mutation(&error) => return Err(error),
+                    Err(_error) => {
+                        // A non-definitive netlink failure can mean ACK loss
+                        // after a committed mutation. Re-read both axes before
+                        // classifying it; never treat the error itself as
+                        // proof that the context is absent.
+                        return match self.inspect_desired_axes_stable_locked(family_id, &request) {
+                            Ok((local, uplink)) => {
+                                match classify_dual_selector_state(&local, &uplink, &request) {
+                                    DualSelectorState::Exact => {
+                                        Ok(PdpContextInstallOutcome::ExactAlreadyPresent)
+                                    }
+                                    DualSelectorState::Conflict(conflict) => {
+                                        Ok(PdpContextInstallOutcome::Conflict(conflict))
+                                    }
+                                    _ => Ok(PdpContextInstallOutcome::Indeterminate(
+                                        PdpContextIndeterminateReason::MutationUnconfirmed,
+                                    )),
+                                }
+                            }
+                            Err(_) => Ok(PdpContextInstallOutcome::Indeterminate(
+                                PdpContextIndeterminateReason::MutationUnconfirmed,
+                            )),
+                        };
+                    }
+                }
+                match self.inspect_desired_axes_stable_locked(family_id, &request) {
+                    Ok((local, uplink)) => {
+                        match classify_dual_selector_state(&local, &uplink, &request) {
+                            DualSelectorState::Exact => Ok(PdpContextInstallOutcome::Installed),
+                            DualSelectorState::Conflict(conflict) => {
+                                Ok(PdpContextInstallOutcome::Conflict(conflict))
+                            }
+                            DualSelectorState::BothAbsent | DualSelectorState::Indeterminate => {
+                                Ok(PdpContextInstallOutcome::Indeterminate(
+                                    PdpContextIndeterminateReason::MutationUnconfirmed,
+                                ))
+                            }
+                        }
+                    }
+                    Err(_) => Ok(PdpContextInstallOutcome::Indeterminate(
+                        PdpContextIndeterminateReason::MutationUnconfirmed,
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -365,6 +546,63 @@ impl GtpuDataplaneBackend for LinuxGtpuDataplaneBackend {
             backend.remove_pdp_context_sync(request)
         })
         .await
+    }
+
+    async fn read_pdp_context(
+        &self,
+        selector: PdpContextSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        self.run_blocking("read_pdp_context", move |backend| {
+            backend.read_pdp_context_sync(selector)
+        })
+        .await
+    }
+
+    async fn install_pdp_context_classified(
+        &self,
+        request: GtpPdpContext,
+    ) -> Result<PdpContextInstallOutcome, GtpuError> {
+        self.run_blocking("install_pdp_context_classified", move |backend| {
+            backend.install_pdp_context_classified_sync(request)
+        })
+        .await
+    }
+
+    async fn remove_pdp_context_exact(
+        &self,
+        _expected: GtpPdpContext,
+    ) -> Result<PdpContextRemovalOutcome, GtpuError> {
+        // The kernel API exposes GET followed by unconditional DELPDP, but no
+        // compare-delete primitive. This backend also has no cross-process
+        // reconciler lease, so deleting after a read could remove foreign
+        // replacement state.
+        Err(GtpuError::UnsupportedFeature {
+            feature: "pdp_context_exact_removal",
+        })
+    }
+
+    fn pdp_context_reconciliation_capabilities(&self) -> PdpContextReconciliationCapabilities {
+        let probe = self.inner.transport.probe(self.inner.config);
+        let readback = if !probe.platform_supported || !probe.gtp_module_present {
+            GtpuCapability::Missing
+        } else if !probe.net_admin_capable {
+            GtpuCapability::PermissionDenied
+        } else if probe.kernel_reachable {
+            GtpuCapability::Available
+        } else {
+            GtpuCapability::Unknown
+        };
+        PdpContextReconciliationCapabilities {
+            readback,
+            classified_install: if probe.mutation_ready {
+                GtpuCapability::Available
+            } else if matches!(readback, GtpuCapability::PermissionDenied) {
+                GtpuCapability::PermissionDenied
+            } else {
+                GtpuCapability::Missing
+            },
+            exact_removal: GtpuCapability::Missing,
+        }
     }
 
     async fn probe(&self) -> Result<GtpuProbe, GtpuError> {
@@ -458,7 +696,14 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
         for _ in 0..config.receive_attempts {
             match receive_message(&socket, &mut buffer) {
                 Ok(0) => {}
-                Ok(len) => return parse_netlink_response(&buffer[..len], expected_sequence),
+                Ok(len) => {
+                    let expected_payload_type = read_u16_ne(request, 4)?;
+                    return parse_netlink_response(
+                        &buffer[..len],
+                        expected_sequence,
+                        expected_payload_type,
+                    );
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -662,6 +907,31 @@ fn validate_remove_pdp_context_request(request: &RemovePdpContextRequest) -> Res
     Ok(())
 }
 
+fn validate_pdp_context_selector(selector: &PdpContextSelector) -> Result<(), GtpuError> {
+    match selector {
+        PdpContextSelector::LocalTeid(selector) => {
+            validate_ifindex(selector.link_ifindex(), "pdp.selector.link_ifindex")?;
+            validate_gtp_version(selector.gtp_version())?;
+        }
+        PdpContextSelector::Uplink(selector) => {
+            validate_ifindex(selector.link_ifindex(), "pdp.selector.link_ifindex")?;
+            validate_gtp_version(selector.gtp_version())?;
+            if selector.identity().bearer_mark().is_some() {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "per_bearer_marking",
+                });
+            }
+            if is_unspecified(selector.identity().ms_address()) {
+                return Err(GtpuError::invalid_config(
+                    "pdp.selector.ms_address",
+                    "MS address must not be unspecified",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_interface_name(name: &str, field: &'static str) -> Result<(), GtpuError> {
     if name.is_empty() {
         return Err(GtpuError::invalid_config(field, "name must be nonempty"));
@@ -824,12 +1094,242 @@ fn encode_remove_pdp_context(request: &RemovePdpContextRequest) -> Result<Vec<u8
     Ok(out)
 }
 
+fn encode_get_pdp_context(selector: &PdpContextSelector) -> Result<Vec<u8>, GtpuError> {
+    validate_pdp_context_selector(selector)?;
+    let mut out = encode_gtp_genl_header(GTP_CMD_GETPDP);
+    match selector {
+        PdpContextSelector::LocalTeid(selector) => {
+            append_attr_u32_ne(&mut out, GTPA_LINK, selector.link_ifindex())?;
+            append_attr_u32_ne(
+                &mut out,
+                GTPA_VERSION,
+                encode_version(selector.gtp_version()),
+            )?;
+            append_attr_u8(
+                &mut out,
+                GTPA_FAMILY,
+                encode_address_family(selector.address_family()),
+            )?;
+            append_attr_u32_ne(&mut out, GTPA_I_TEI, selector.local_teid().get())?;
+        }
+        PdpContextSelector::Uplink(selector) => {
+            append_attr_u32_ne(&mut out, GTPA_LINK, selector.link_ifindex())?;
+            append_attr_u32_ne(
+                &mut out,
+                GTPA_VERSION,
+                encode_version(selector.gtp_version()),
+            )?;
+            append_attr_u8(
+                &mut out,
+                GTPA_FAMILY,
+                encode_ip_family(selector.identity().ms_address()),
+            )?;
+            append_ip_attr(
+                &mut out,
+                selector.identity().ms_address(),
+                GTPA_MS_ADDRESS,
+                GTPA_MS_ADDR6,
+            )?;
+        }
+    }
+    Ok(out)
+}
+
 fn encode_gtp_genl_header(command: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(GENERIC_NETLINK_HEADER_LEN + 64);
     push_u8(&mut out, command);
     push_u8(&mut out, GTP_GENL_VERSION);
     push_u16_ne(&mut out, 0);
     out
+}
+
+#[derive(Default)]
+struct PdpResponseAttributes<'a> {
+    link: Option<&'a [u8]>,
+    version: Option<&'a [u8]>,
+    family: Option<&'a [u8]>,
+    ms_ipv4: Option<&'a [u8]>,
+    ms_ipv6: Option<&'a [u8]>,
+    peer_ipv4: Option<&'a [u8]>,
+    peer_ipv6: Option<&'a [u8]>,
+    local_teid: Option<&'a [u8]>,
+    peer_teid: Option<&'a [u8]>,
+}
+
+fn parse_pdp_context_response(
+    body: &[u8],
+    selector: &PdpContextSelector,
+    expected_family_id: u16,
+) -> Result<GtpPdpContext, GtpuError> {
+    let invalid = |reason| GtpuError::io("linux_pdp_context_decode", invalid_data(reason));
+    if body.len() < GENERIC_NETLINK_HEADER_LEN {
+        return Err(invalid("short generic netlink header"));
+    }
+    // Linux v6.8 through current master passes the outer generic-family ID as
+    // the response command for GETPDP. Accept that correlated low byte as well
+    // as GETPDP so a future kernel fix remains compatible; reject every other
+    // command. The outer nlmsg type is independently bound by
+    // `parse_netlink_response`.
+    if !matches!(body[0], GTP_CMD_GETPDP) && body[0] != expected_family_id as u8
+        || body[1] != GTP_GENL_VERSION
+        || body[2..GENERIC_NETLINK_HEADER_LEN] != [0, 0]
+    {
+        return Err(invalid("invalid generic netlink header"));
+    }
+    let mut attributes = PdpResponseAttributes::default();
+    let mut offset = GENERIC_NETLINK_HEADER_LEN;
+    while offset < body.len() {
+        if body.len() - offset < ROUTE_ATTRIBUTE_HEADER_LEN {
+            return Err(invalid("trailing generic netlink bytes"));
+        }
+        let length = usize::from(read_u16_ne(body, offset)?);
+        let attribute_type = read_u16_ne(body, offset + 2)? & 0x3fff;
+        if length < ROUTE_ATTRIBUTE_HEADER_LEN {
+            return Err(invalid("invalid PDP attribute length"));
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| invalid("PDP attribute length overflow"))?;
+        let aligned =
+            align_to_netlink(length).ok_or_else(|| invalid("PDP attribute alignment overflow"))?;
+        let aligned_end = offset
+            .checked_add(aligned)
+            .ok_or_else(|| invalid("PDP attribute alignment overflow"))?;
+        if end > body.len() || aligned_end > body.len() {
+            return Err(invalid("truncated PDP attribute"));
+        }
+        if body[end..aligned_end].iter().any(|byte| *byte != 0) {
+            return Err(invalid("nonzero PDP attribute padding"));
+        }
+        let payload = &body[offset + ROUTE_ATTRIBUTE_HEADER_LEN..end];
+        let slot = match attribute_type {
+            GTPA_LINK => Some(&mut attributes.link),
+            GTPA_VERSION => Some(&mut attributes.version),
+            GTPA_FAMILY => Some(&mut attributes.family),
+            GTPA_MS_ADDRESS => Some(&mut attributes.ms_ipv4),
+            GTPA_MS_ADDR6 => Some(&mut attributes.ms_ipv6),
+            GTPA_PEER_ADDRESS => Some(&mut attributes.peer_ipv4),
+            GTPA_PEER_ADDR6 => Some(&mut attributes.peer_ipv6),
+            GTPA_I_TEI => Some(&mut attributes.local_teid),
+            GTPA_O_TEI => Some(&mut attributes.peer_teid),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            if slot.replace(payload).is_some() {
+                return Err(invalid("duplicate PDP attribute"));
+            }
+        }
+        offset = aligned_end;
+    }
+
+    let link_ifindex = decode_pdp_u32(attributes.link, "missing or invalid link attribute")?;
+    validate_ifindex(link_ifindex, "pdp.readback.link_ifindex")?;
+    let version = decode_pdp_u32(attributes.version, "missing or invalid version attribute")?;
+    if version != GTP_V1 {
+        return Err(invalid("unsupported PDP GTP version"));
+    }
+    let local_teid = Teid::new(decode_pdp_u32(
+        attributes.local_teid,
+        "missing or invalid local TEID attribute",
+    )?)
+    .ok_or_else(|| invalid("zero local TEID attribute"))?;
+    let peer_teid = Teid::new(decode_pdp_u32(
+        attributes.peer_teid,
+        "missing or invalid peer TEID attribute",
+    )?)
+    .ok_or_else(|| invalid("zero peer TEID attribute"))?;
+
+    // GTPA_FAMILY selects the MS/PAA lookup table. The outer peer address is
+    // independently selected by the GTP device's UDP socket family, so valid
+    // contexts may combine an IPv4 PAA with an IPv6 peer or vice versa.
+    let ms_address = decode_pdp_address(
+        attributes.ms_ipv4,
+        attributes.ms_ipv6,
+        "missing or ambiguous MS address attributes",
+        "invalid IPv4 MS address attribute",
+        "invalid IPv6 MS address attribute",
+    )?;
+    let peer_address = decode_pdp_address(
+        attributes.peer_ipv4,
+        attributes.peer_ipv6,
+        "missing or ambiguous peer address attributes",
+        "invalid IPv4 peer address attribute",
+        "invalid IPv6 peer address attribute",
+    )?;
+    let ms_family = GtpAddressFamily::from_ip(ms_address);
+    if is_unspecified(ms_address) || is_unspecified(peer_address) {
+        return Err(invalid("unspecified PDP address attribute"));
+    }
+    if let Some(family) = attributes.family {
+        if family.len() != 1 || family[0] != encode_address_family(ms_family) {
+            return Err(invalid("PDP family/MS-address mismatch"));
+        }
+    }
+
+    let context = GtpPdpContext {
+        local_teid,
+        peer_teid,
+        ms_address,
+        peer_address,
+        link_ifindex,
+        downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
+        gtp_version: GtpVersion::V1,
+        bearer_mark: None,
+        egress_dscp: None,
+    };
+    let selector_matches = match selector {
+        PdpContextSelector::LocalTeid(selector) => {
+            selector.link_ifindex() == context.link_ifindex
+                && selector.gtp_version() == context.gtp_version
+                && selector.address_family() == ms_family
+                && selector.local_teid() == context.local_teid
+        }
+        PdpContextSelector::Uplink(selector) => {
+            selector.link_ifindex() == context.link_ifindex
+                && selector.gtp_version() == context.gtp_version
+                && selector.identity().bearer_mark().is_none()
+                && selector.identity().ms_address() == context.ms_address
+        }
+    };
+    if !selector_matches {
+        return Err(invalid("PDP response selector mismatch"));
+    }
+    Ok(context)
+}
+
+fn decode_pdp_address(
+    ipv4: Option<&[u8]>,
+    ipv6: Option<&[u8]>,
+    missing_or_ambiguous: &'static str,
+    invalid_ipv4: &'static str,
+    invalid_ipv6: &'static str,
+) -> Result<IpAddr, GtpuError> {
+    let invalid = |reason| GtpuError::io("linux_pdp_context_decode", invalid_data(reason));
+    match (ipv4, ipv6) {
+        (Some(address), None) => {
+            let address: [u8; 4] = address.try_into().map_err(|_| invalid(invalid_ipv4))?;
+            Ok(IpAddr::V4(address.into()))
+        }
+        (None, Some(address)) => {
+            let address: [u8; 16] = address.try_into().map_err(|_| invalid(invalid_ipv6))?;
+            Ok(IpAddr::V6(address.into()))
+        }
+        (None, None) | (Some(_), Some(_)) => Err(invalid(missing_or_ambiguous)),
+    }
+}
+
+fn decode_pdp_u32(payload: Option<&[u8]>, reason: &'static str) -> Result<u32, GtpuError> {
+    let payload =
+        payload.ok_or_else(|| GtpuError::io("linux_pdp_context_decode", invalid_data(reason)))?;
+    if payload.len() != 4 {
+        return Err(GtpuError::io(
+            "linux_pdp_context_decode",
+            invalid_data(reason),
+        ));
+    }
+    Ok(u32::from_ne_bytes([
+        payload[0], payload[1], payload[2], payload[3],
+    ]))
 }
 
 fn append_local_address_attr(out: &mut Vec<u8>, address: IpAddr) -> Result<(), GtpuError> {
@@ -926,6 +1426,7 @@ fn finish_attr(out: &mut Vec<u8>, start: usize) -> Result<(), GtpuError> {
 fn parse_netlink_response(
     response: &[u8],
     expected_sequence: u32,
+    expected_payload_type: u16,
 ) -> Result<Option<Vec<u8>>, GtpuError> {
     let mut offset = 0;
     let mut payload = None;
@@ -963,6 +1464,12 @@ fn parse_netlink_response(
             NLMSG_DONE => return Ok(payload),
             NLMSG_NOOP => {}
             _ => {
+                if message_type != expected_payload_type {
+                    return Err(GtpuError::io(
+                        "netlink_receive",
+                        invalid_data("unexpected netlink payload family"),
+                    ));
+                }
                 if payload.is_none() {
                     payload = Some(body.to_vec());
                 }
@@ -1275,6 +1782,18 @@ mod tests {
         }
     }
 
+    fn mixed_family_pdp_contexts() -> [GtpPdpContext; 2] {
+        let mut ipv6_ms_ipv4_peer = pdp_context();
+        // Linux currently represents an IPv6 MS/PAA as the canonical /64
+        // prefix (the lower 64 bits must be zero in ipv6_pdp_fill).
+        ipv6_ms_ipv4_peer.ms_address = "2001:db8:23:1::".parse().unwrap();
+
+        let mut ipv4_ms_ipv6_peer = pdp_context();
+        ipv4_ms_ipv6_peer.peer_address = "2001:db8:ffff::10".parse().unwrap();
+
+        [ipv6_ms_ipv4_peer, ipv4_ms_ipv6_peer]
+    }
+
     fn ack(sequence: u32) -> Vec<u8> {
         let mut body = Vec::new();
         push_i32_ne(&mut body, 0);
@@ -1291,6 +1810,52 @@ mod tests {
         let mut body = encode_gtp_genl_header(CTRL_CMD_GETFAMILY);
         append_attr_u16_ne(&mut body, CTRL_ATTR_FAMILY_ID, family_id).unwrap();
         encode_netlink_message(GENL_ID_CTRL, 0, sequence, &body).unwrap()
+    }
+
+    fn pdp_response(context: &GtpPdpContext, include_family: bool) -> Vec<u8> {
+        let mut body = encode_gtp_genl_header(GTP_CMD_GETPDP);
+        append_attr_u32_ne(&mut body, GTPA_LINK, context.link_ifindex).unwrap();
+        append_attr_u32_ne(&mut body, GTPA_VERSION, encode_version(context.gtp_version)).unwrap();
+        if include_family {
+            append_attr_u8(&mut body, GTPA_FAMILY, encode_ip_family(context.ms_address)).unwrap();
+        }
+        append_ip_attr(
+            &mut body,
+            context.ms_address,
+            GTPA_MS_ADDRESS,
+            GTPA_MS_ADDR6,
+        )
+        .unwrap();
+        append_ip_attr(
+            &mut body,
+            context.peer_address,
+            GTPA_PEER_ADDRESS,
+            GTPA_PEER_ADDR6,
+        )
+        .unwrap();
+        append_attr_u32_ne(&mut body, GTPA_I_TEI, context.local_teid.get()).unwrap();
+        append_attr_u32_ne(&mut body, GTPA_O_TEI, context.peer_teid.get()).unwrap();
+        body
+    }
+
+    fn push_family_lookup(transport: &CapturingTransport) {
+        transport.push_response(Ok(Some(netlink_body(&family_response(1, 31)).to_vec())));
+    }
+
+    fn push_present(transport: &CapturingTransport, context: &GtpPdpContext) {
+        transport.push_response(Ok(Some(pdp_response(context, false))));
+    }
+
+    fn push_present_with_family(
+        transport: &CapturingTransport,
+        context: &GtpPdpContext,
+        include_family: bool,
+    ) {
+        transport.push_response(Ok(Some(pdp_response(context, include_family))));
+    }
+
+    fn push_absent(transport: &CapturingTransport) {
+        transport.push_response(Err(GtpuError::NotFound));
     }
 
     fn netlink_body(message: &[u8]) -> &[u8] {
@@ -1316,6 +1881,27 @@ mod tests {
             offset += align_to_netlink(len)?;
         }
         None
+    }
+
+    fn replace_attr_payload(body: &mut [u8], attr_type: u16, replacement: &[u8]) -> bool {
+        let mut offset = GENERIC_NETLINK_HEADER_LEN;
+        while offset + ROUTE_ATTRIBUTE_HEADER_LEN <= body.len() {
+            let len = usize::from(u16::from_ne_bytes([body[offset], body[offset + 1]]));
+            let found_type = u16::from_ne_bytes([body[offset + 2], body[offset + 3]]) & 0x3fff;
+            if len < ROUTE_ATTRIBUTE_HEADER_LEN || offset + len > body.len() {
+                return false;
+            }
+            if found_type == attr_type && replacement.len() == len - ROUTE_ATTRIBUTE_HEADER_LEN {
+                body[offset + ROUTE_ATTRIBUTE_HEADER_LEN..offset + len]
+                    .copy_from_slice(replacement);
+                return true;
+            }
+            let Some(aligned) = align_to_netlink(len) else {
+                return false;
+            };
+            offset += aligned;
+        }
+        false
     }
 
     fn attr_u32(body: &[u8], attr_type: u16) -> u32 {
@@ -1466,14 +2052,15 @@ mod tests {
     #[test]
     fn encodes_ipv6_pdp_context_attrs() {
         let mut context = pdp_context();
-        context.ms_address = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let ms_address: Ipv6Addr = "2001:db8:23:1::".parse().unwrap();
+        context.ms_address = IpAddr::V6(ms_address);
         context.peer_address = IpAddr::V6(Ipv6Addr::LOCALHOST);
         let body = encode_install_pdp_context(&context).unwrap();
         let attrs = &body[GENERIC_NETLINK_HEADER_LEN..];
         assert_eq!(attr_u8(attrs, GTPA_FAMILY), AF_INET6);
         assert_eq!(
             attr_payload(attrs, GTPA_MS_ADDR6),
-            Some(&Ipv6Addr::LOCALHOST.octets()[..])
+            Some(&ms_address.octets()[..])
         );
         assert_eq!(
             attr_payload(attrs, GTPA_PEER_ADDR6),
@@ -1512,29 +2099,34 @@ mod tests {
 
     #[test]
     fn parses_ack_and_errno_mapping() {
-        assert_eq!(parse_netlink_response(&ack(7), 7).unwrap(), None);
+        assert_eq!(parse_netlink_response(&ack(7), 7, 31).unwrap(), None);
 
-        let err = parse_netlink_response(&netlink_error(8, 17), 8).unwrap_err();
+        let err = parse_netlink_response(&netlink_error(8, 17), 8, 31).unwrap_err();
         assert!(matches!(err, GtpuError::AlreadyExists));
 
-        let err = parse_netlink_response(&netlink_error(9, 95), 9).unwrap_err();
+        let err = parse_netlink_response(&netlink_error(9, 95), 9, 31).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(95));
 
-        let err = parse_netlink_response(&netlink_error(10, ENOENT), 10).unwrap_err();
+        let err = parse_netlink_response(&netlink_error(10, ENOENT), 10, 31).unwrap_err();
         assert!(matches!(err, GtpuError::NotFound));
     }
 
     #[test]
     fn rejects_malformed_netlink_responses() {
-        let err = parse_netlink_response(&[0_u8; NETLINK_HEADER_LEN - 1], 1).unwrap_err();
+        let err = parse_netlink_response(&[0_u8; NETLINK_HEADER_LEN - 1], 1, 31).unwrap_err();
         assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
 
         let mut invalid_len = ack(1);
         invalid_len[0..4].copy_from_slice(&(NETLINK_HEADER_LEN as u32 - 1).to_ne_bytes());
-        let err = parse_netlink_response(&invalid_len, 1).unwrap_err();
+        let err = parse_netlink_response(&invalid_len, 1, 31).unwrap_err();
         assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
 
-        let err = parse_netlink_response(&ack(2), 1).unwrap_err();
+        let err = parse_netlink_response(&ack(2), 1, 31).unwrap_err();
+        assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
+
+        let wrong_family =
+            encode_netlink_message(30, 0, 1, &encode_gtp_genl_header(GTP_CMD_GETPDP)).unwrap();
+        let err = parse_netlink_response(&wrong_family, 1, 31).unwrap_err();
         assert_eq!(err.io_kind(), Some(io::ErrorKind::InvalidData));
     }
 
@@ -1545,16 +2137,137 @@ mod tests {
         let mut response = encode_netlink_message(GENL_ID_CTRL, 0, 9, &payload_body).unwrap();
         response.extend_from_slice(&ack(9));
 
-        let payload = parse_netlink_response(&response, 9).unwrap().unwrap();
+        let payload = parse_netlink_response(&response, 9, GENL_ID_CTRL)
+            .unwrap()
+            .unwrap();
         assert_eq!(parse_generic_family_id(&payload).unwrap(), 31);
     }
 
     #[test]
     fn parses_generic_family_response() {
-        let response = parse_netlink_response(&family_response(3, 29), 3)
+        let response = parse_netlink_response(&family_response(3, 29), 3, GENL_ID_CTRL)
             .unwrap()
             .unwrap();
         assert_eq!(parse_generic_family_id(&response).unwrap(), 29);
+    }
+
+    #[test]
+    fn parses_strict_pdp_readback_with_kernel_family_omission() {
+        let ipv4 = pdp_context();
+        let local = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(&ipv4).unwrap(),
+        );
+        assert_eq!(
+            parse_pdp_context_response(&pdp_response(&ipv4, false), &local, 31).unwrap(),
+            ipv4
+        );
+
+        let mut ipv6 = pdp_context();
+        ipv6.ms_address = "2001:db8:23:1::".parse().unwrap();
+        ipv6.peer_address = "2001:db8::2".parse().unwrap();
+        let uplink =
+            PdpContextSelector::Uplink(PdpContextUplinkSelector::from_context(&ipv6).unwrap());
+        assert_eq!(
+            parse_pdp_context_response(&pdp_response(&ipv6, false), &uplink, 31).unwrap(),
+            ipv6
+        );
+    }
+
+    #[test]
+    fn parses_mixed_inner_outer_families_by_both_selectors_with_optional_family() {
+        for context in mixed_family_pdp_contexts() {
+            let selectors = [
+                PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+                ),
+                PdpContextSelector::Uplink(
+                    PdpContextUplinkSelector::from_context(&context).unwrap(),
+                ),
+            ];
+            for include_family in [false, true] {
+                for selector in &selectors {
+                    assert_eq!(
+                        parse_pdp_context_response(
+                            &pdp_response(&context, include_family),
+                            selector,
+                            31,
+                        )
+                        .unwrap(),
+                        context
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pdp_readback_decoder_rejects_ambiguous_or_malformed_identity() {
+        let context = pdp_context();
+        let selector = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+        );
+
+        let mut duplicate = pdp_response(&context, true);
+        append_attr_u32_ne(&mut duplicate, GTPA_LINK, context.link_ifindex).unwrap();
+        assert!(parse_pdp_context_response(&duplicate, &selector, 31).is_err());
+
+        let mut mixed = pdp_response(&context, true);
+        append_attr(&mut mixed, GTPA_MS_ADDR6, &Ipv6Addr::LOCALHOST.octets()).unwrap();
+        append_attr(&mut mixed, GTPA_PEER_ADDR6, &Ipv6Addr::LOCALHOST.octets()).unwrap();
+        assert!(parse_pdp_context_response(&mixed, &selector, 31).is_err());
+
+        let mut zero_teid = pdp_response(&context, true);
+        assert!(replace_attr_payload(
+            &mut zero_teid,
+            GTPA_I_TEI,
+            &0_u32.to_ne_bytes()
+        ));
+        assert!(parse_pdp_context_response(&zero_teid, &selector, 31).is_err());
+
+        let mut wrong_family = pdp_response(&context, true);
+        assert!(replace_attr_payload(
+            &mut wrong_family,
+            GTPA_FAMILY,
+            &[AF_INET6]
+        ));
+        assert!(parse_pdp_context_response(&wrong_family, &selector, 31).is_err());
+
+        let mut nonzero_padding = pdp_response(&context, true);
+        append_attr(&mut nonzero_padding, 0x3ffe, &[1]).unwrap();
+        let last = nonzero_padding.len() - 1;
+        nonzero_padding[last] = 1;
+        assert!(parse_pdp_context_response(&nonzero_padding, &selector, 31).is_err());
+
+        let mut truncated = pdp_response(&context, true);
+        truncated.pop();
+        assert!(parse_pdp_context_response(&truncated, &selector, 31).is_err());
+
+        let mut selector_mismatch = context.clone();
+        selector_mismatch.local_teid = teid(9);
+        assert!(parse_pdp_context_response(
+            &pdp_response(&context, true),
+            &PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&selector_mismatch).unwrap(),
+            ),
+            31,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pdp_readback_decoder_allows_well_formed_extension_and_kernel_command_quirk() {
+        let context = pdp_context();
+        let selector =
+            PdpContextSelector::Uplink(PdpContextUplinkSelector::from_context(&context).unwrap());
+        let mut body = pdp_response(&context, false);
+        body[0] = 31;
+        append_attr(&mut body, 0x3ffe, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            parse_pdp_context_response(&body, &selector, 31).unwrap(),
+            context
+        );
+        body[0] = GTP_CMD_NEWPDP;
+        assert!(parse_pdp_context_response(&body, &selector, 31).is_err());
     }
 
     #[test]
@@ -1667,6 +2380,356 @@ mod tests {
         assert_eq!(requests[1].operation, "install_pdp_context");
         let body = netlink_body(&requests[1].request);
         assert_eq!(body[0], GTP_CMD_NEWPDP);
+    }
+
+    #[tokio::test]
+    async fn linux_backend_reads_exact_state_by_both_selectors() {
+        let transport = CapturingTransport::new();
+        let context = pdp_context();
+        push_family_lookup(&transport);
+        push_present(&transport, &context);
+        push_present(&transport, &context);
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(context.clone())
+        );
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests[1..] {
+            assert_eq!(request.operation, "read_pdp_context");
+            assert_eq!(read_u16_ne(&request.request, 6).unwrap(), NLM_F_REQUEST);
+            assert_eq!(netlink_body(&request.request)[0], GTP_CMD_GETPDP);
+        }
+
+        let second_transport = CapturingTransport::new();
+        push_family_lookup(&second_transport);
+        push_present(&second_transport, &context);
+        push_present(&second_transport, &context);
+        let second = LinuxGtpuDataplaneBackend::with_transport(second_transport);
+        assert_eq!(
+            second
+                .read_pdp_context(PdpContextSelector::Uplink(
+                    PdpContextUplinkSelector::from_context(&context).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(context)
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_backend_reconciles_mixed_inner_outer_families() {
+        for context in mixed_family_pdp_contexts() {
+            for include_family in [false, true] {
+                let selectors = [
+                    PdpContextSelector::LocalTeid(
+                        PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+                    ),
+                    PdpContextSelector::Uplink(
+                        PdpContextUplinkSelector::from_context(&context).unwrap(),
+                    ),
+                ];
+                for selector in selectors {
+                    let transport = CapturingTransport::new();
+                    push_family_lookup(&transport);
+                    push_present_with_family(&transport, &context, include_family);
+                    push_present_with_family(&transport, &context, include_family);
+                    let backend = LinuxGtpuDataplaneBackend::with_transport(transport);
+                    assert_eq!(
+                        backend.read_pdp_context(selector).await.unwrap(),
+                        PdpContextReadback::Present(context.clone())
+                    );
+                }
+
+                let transport = CapturingTransport::new();
+                push_family_lookup(&transport);
+                for _ in 0..4 {
+                    push_present_with_family(&transport, &context, include_family);
+                }
+                let backend = LinuxGtpuDataplaneBackend::with_transport(transport);
+                assert_eq!(
+                    backend
+                        .install_pdp_context_classified(context.clone())
+                        .await
+                        .unwrap(),
+                    PdpContextInstallOutcome::ExactAlreadyPresent
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_readback_distinguishes_absence_from_missing_or_changing_evidence() {
+        let context = pdp_context();
+
+        let absent_transport = CapturingTransport::new();
+        push_family_lookup(&absent_transport);
+        push_absent(&absent_transport);
+        push_absent(&absent_transport);
+        let absent_backend = LinuxGtpuDataplaneBackend::with_transport(absent_transport);
+        assert_eq!(
+            absent_backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Absent
+        );
+
+        let no_response_transport = CapturingTransport::new();
+        push_family_lookup(&no_response_transport);
+        no_response_transport.push_response(Ok(None));
+        let no_response = LinuxGtpuDataplaneBackend::with_transport(no_response_transport);
+        assert!(matches!(
+            no_response
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            GtpuError::StateIndeterminate {
+                operation: "linux_pdp_context_readback"
+            }
+        ));
+
+        let changed_transport = CapturingTransport::new();
+        let mut changed = context.clone();
+        changed.peer_teid = teid(9);
+        push_family_lookup(&changed_transport);
+        push_present(&changed_transport, &context);
+        push_present(&changed_transport, &changed);
+        let changed_backend = LinuxGtpuDataplaneBackend::with_transport(changed_transport);
+        assert!(matches!(
+            changed_backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            GtpuError::StateIndeterminate {
+                operation: "linux_pdp_context_state_changed"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn linux_classified_install_proves_exact_and_both_collision_shapes() {
+        let exact_transport = CapturingTransport::new();
+        let installed = pdp_context();
+        push_family_lookup(&exact_transport);
+        for _ in 0..4 {
+            push_present(&exact_transport, &installed);
+        }
+        let exact_backend = LinuxGtpuDataplaneBackend::with_transport(exact_transport.clone());
+        assert_eq!(
+            exact_backend
+                .install_pdp_context_classified(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::ExactAlreadyPresent
+        );
+        assert!(exact_transport
+            .requests()
+            .iter()
+            .all(|request| request.operation != "install_pdp_context"));
+
+        let uplink_conflict_transport = CapturingTransport::new();
+        let mut same_uplink = installed.clone();
+        same_uplink.local_teid = teid(9);
+        same_uplink.peer_teid = teid(10);
+        push_family_lookup(&uplink_conflict_transport);
+        push_absent(&uplink_conflict_transport);
+        push_present(&uplink_conflict_transport, &installed);
+        push_absent(&uplink_conflict_transport);
+        push_present(&uplink_conflict_transport, &installed);
+        let uplink_backend =
+            LinuxGtpuDataplaneBackend::with_transport(uplink_conflict_transport.clone());
+        assert!(matches!(
+            uplink_backend
+                .install_pdp_context_classified(same_uplink)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Conflict(conflict)
+                if conflict.occupied() == crate::PdpContextSelectorOccupancy::Uplink
+        ));
+        assert!(uplink_conflict_transport
+            .requests()
+            .iter()
+            .all(|request| request.operation != "install_pdp_context"));
+
+        let local_conflict_transport = CapturingTransport::new();
+        let mut same_local = installed.clone();
+        same_local.ms_address = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 3));
+        push_family_lookup(&local_conflict_transport);
+        push_present(&local_conflict_transport, &installed);
+        push_absent(&local_conflict_transport);
+        push_present(&local_conflict_transport, &installed);
+        push_absent(&local_conflict_transport);
+        let local_backend =
+            LinuxGtpuDataplaneBackend::with_transport(local_conflict_transport.clone());
+        assert!(matches!(
+            local_backend
+                .install_pdp_context_classified(same_local)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Conflict(conflict)
+                if conflict.occupied() == crate::PdpContextSelectorOccupancy::LocalTeid
+        ));
+        assert!(local_conflict_transport
+            .requests()
+            .iter()
+            .all(|request| request.operation != "install_pdp_context"));
+    }
+
+    #[tokio::test]
+    async fn linux_classified_install_requires_exact_postread_and_reconciles_eexist() {
+        let installed = pdp_context();
+        let fresh_transport = CapturingTransport::new();
+        push_family_lookup(&fresh_transport);
+        for _ in 0..4 {
+            push_absent(&fresh_transport);
+        }
+        fresh_transport.push_response(Ok(None));
+        for _ in 0..4 {
+            push_present(&fresh_transport, &installed);
+        }
+        let fresh = LinuxGtpuDataplaneBackend::with_transport(fresh_transport);
+        assert_eq!(
+            fresh
+                .install_pdp_context_classified(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+
+        let raced_transport = CapturingTransport::new();
+        push_family_lookup(&raced_transport);
+        for _ in 0..4 {
+            push_absent(&raced_transport);
+        }
+        raced_transport.push_response(Err(GtpuError::AlreadyExists));
+        for _ in 0..4 {
+            push_present(&raced_transport, &installed);
+        }
+        let raced = LinuxGtpuDataplaneBackend::with_transport(raced_transport);
+        assert_eq!(
+            raced
+                .install_pdp_context_classified(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::ExactAlreadyPresent
+        );
+
+        let post_conflict_transport = CapturingTransport::new();
+        push_family_lookup(&post_conflict_transport);
+        for _ in 0..4 {
+            push_absent(&post_conflict_transport);
+        }
+        post_conflict_transport.push_response(Ok(None));
+        let mut conflicting = installed.clone();
+        conflicting.peer_teid = teid(9);
+        conflicting.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        for _ in 0..4 {
+            push_present(&post_conflict_transport, &conflicting);
+        }
+        let post_conflict = LinuxGtpuDataplaneBackend::with_transport(post_conflict_transport);
+        assert!(matches!(
+            post_conflict
+                .install_pdp_context_classified(installed)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Conflict(conflict)
+                if conflict.occupied() == crate::PdpContextSelectorOccupancy::Both
+        ));
+    }
+
+    #[tokio::test]
+    async fn linux_classified_install_preserves_definitive_errors_and_reconciles_ack_loss() {
+        let desired = pdp_context();
+        let denied_transport = CapturingTransport::new();
+        push_family_lookup(&denied_transport);
+        for _ in 0..4 {
+            push_absent(&denied_transport);
+        }
+        denied_transport.push_response(Err(GtpuError::io(
+            "netlink_ack",
+            io::Error::new(io::ErrorKind::PermissionDenied, "redacted"),
+        )));
+        let denied = LinuxGtpuDataplaneBackend::with_transport(denied_transport);
+        assert!(matches!(
+            denied
+                .install_pdp_context_classified(desired.clone())
+                .await
+                .unwrap_err(),
+            GtpuError::Io {
+                kind: io::ErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+
+        let timeout_transport = CapturingTransport::new();
+        push_family_lookup(&timeout_transport);
+        for _ in 0..4 {
+            push_absent(&timeout_transport);
+        }
+        timeout_transport.push_response(Err(GtpuError::io(
+            "netlink_ack",
+            io::Error::new(io::ErrorKind::TimedOut, "redacted"),
+        )));
+        for _ in 0..4 {
+            push_present(&timeout_transport, &desired);
+        }
+        let timed_out = LinuxGtpuDataplaneBackend::with_transport(timeout_transport);
+        assert_eq!(
+            timed_out
+                .install_pdp_context_classified(desired)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::ExactAlreadyPresent
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_exact_removal_is_explicitly_unavailable_without_compare_delete() {
+        let transport = CapturingTransport::new();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+        assert!(matches!(
+            backend
+                .remove_pdp_context_exact(pdp_context())
+                .await
+                .unwrap_err(),
+            GtpuError::UnsupportedFeature {
+                feature: "pdp_context_exact_removal"
+            }
+        ));
+        assert!(transport.requests().is_empty());
+        assert_eq!(
+            backend.pdp_context_reconciliation_capabilities(),
+            PdpContextReconciliationCapabilities {
+                readback: GtpuCapability::Available,
+                classified_install: GtpuCapability::Available,
+                exact_removal: GtpuCapability::Missing,
+            }
+        );
+
+        let mut unavailable_transport = CapturingTransport::new();
+        unavailable_transport.probe.mutation_ready = false;
+        let unavailable = LinuxGtpuDataplaneBackend::with_transport(unavailable_transport);
+        assert_eq!(
+            unavailable
+                .pdp_context_reconciliation_capabilities()
+                .classified_install,
+            GtpuCapability::Missing
+        );
     }
 
     #[tokio::test]

@@ -9,8 +9,23 @@ use async_trait::async_trait;
 use crate::backend::GtpuDataplaneBackend;
 use crate::error::GtpuError;
 use crate::model::{
-    CreateGtpDeviceRequest, GtpDevice, GtpPdpContext, GtpuProbe, RemovePdpContextRequest,
+    classify_dual_selector_state, CreateGtpDeviceRequest, DualSelectorState, GtpAddressFamily,
+    GtpDevice, GtpPdpContext, GtpuCapability, GtpuProbe, PdpContextIndeterminateReason,
+    PdpContextInstallOutcome, PdpContextReadback, PdpContextReconciliationCapabilities,
+    PdpContextRemovalOutcome, PdpContextSelector, RemovePdpContextRequest,
 };
+
+/// Redaction-safe reconciliation fault injected into the deterministic mock.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockPdpContextFault {
+    /// Simulate a partial or corrupt multi-map/context graph.
+    CorruptState,
+    /// Simulate a publication/removal transaction in a non-active phase.
+    TransitionalState,
+    /// Simulate state changing during a bounded double-read.
+    ChangingReadback,
+}
 
 /// One recorded call against the mock backend.
 #[derive(Clone, PartialEq, Eq)]
@@ -71,19 +86,91 @@ impl fmt::Debug for MockOperation {
     }
 }
 
+/// One PDP-context reconciliation call recorded by the mock backend.
+///
+/// Reconciliation calls use a separate log so the additive backend contract
+/// does not add variants to the established, externally exhaustive
+/// [`MockOperation`] enum.
+#[derive(Clone, PartialEq, Eq)]
+pub enum MockPdpContextReconciliationOperation {
+    /// Typed PDP-context readback.
+    Read {
+        /// Redacted selector snapshot.
+        selector: PdpContextSelector,
+    },
+    /// Strict classified PDP-context installation.
+    InstallClassified {
+        /// Redacted desired-context snapshot.
+        request: GtpPdpContext,
+    },
+    /// Exact PDP-context removal.
+    RemoveExact {
+        /// Redacted expected-context snapshot.
+        expected: GtpPdpContext,
+    },
+}
+
+impl fmt::Debug for MockPdpContextReconciliationOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { selector } => f.debug_struct("Read").field("selector", selector).finish(),
+            Self::InstallClassified { request } => f
+                .debug_struct("InstallClassified")
+                .field("request", request)
+                .finish(),
+            Self::RemoveExact { expected } => f
+                .debug_struct("RemoveExact")
+                .field("expected", expected)
+                .finish(),
+        }
+    }
+}
+
 /// Deterministic in-memory GTP-U dataplane backend.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MockGtpuDataplaneBackend {
     state: Arc<Mutex<MockState>>,
+}
+
+impl fmt::Debug for MockGtpuDataplaneBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockGtpuDataplaneBackend")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
 struct MockState {
     operations: Vec<MockOperation>,
+    pdp_context_reconciliation_operations: Vec<MockPdpContextReconciliationOperation>,
     probe_result: GtpuProbe,
     failure: Option<GtpuError>,
     next_ifindex: u32,
     devices: BTreeMap<String, GtpDevice>,
+    pdp_by_local: BTreeMap<MockLocalSelector, GtpPdpContext>,
+    pdp_by_uplink: BTreeMap<MockUplinkSelector, GtpPdpContext>,
+    pdp_fault: Option<MockPdpContextFault>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MockLocalSelector {
+    link_ifindex: u32,
+    version: u8,
+    family: u8,
+    local_teid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MockUplinkSelector {
+    link_ifindex: u32,
+    version: u8,
+    ms_address: std::net::IpAddr,
+    bearer_mark: Option<u32>,
+}
+
+enum MockSelectorKey {
+    Local(MockLocalSelector),
+    Uplink(MockUplinkSelector),
 }
 
 impl MockGtpuDataplaneBackend {
@@ -99,10 +186,14 @@ impl MockGtpuDataplaneBackend {
         Self {
             state: Arc::new(Mutex::new(MockState {
                 operations: Vec::new(),
+                pdp_context_reconciliation_operations: Vec::new(),
                 probe_result,
                 failure: None,
                 next_ifindex: 1,
                 devices: BTreeMap::new(),
+                pdp_by_local: BTreeMap::new(),
+                pdp_by_uplink: BTreeMap::new(),
+                pdp_fault: None,
             })),
         }
     }
@@ -144,6 +235,18 @@ impl MockGtpuDataplaneBackend {
         state.operations.clone()
     }
 
+    /// Return all recorded PDP-context reconciliation calls, in order.
+    #[must_use]
+    pub fn pdp_context_reconciliation_operations(
+        &self,
+    ) -> Vec<MockPdpContextReconciliationOperation> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pdp_context_reconciliation_operations.clone()
+    }
+
     /// Clear the recorded operation log.
     pub fn clear_operations(&self) {
         let mut state = self
@@ -151,6 +254,16 @@ impl MockGtpuDataplaneBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.operations.clear();
+        state.pdp_context_reconciliation_operations.clear();
+    }
+
+    /// Inject or clear a redaction-safe PDP reconciliation fault.
+    pub fn set_pdp_context_fault(&self, fault: Option<MockPdpContextFault>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pdp_fault = fault;
     }
 
     fn check_failure(state: &MockState) -> Result<(), GtpuError> {
@@ -158,6 +271,150 @@ impl MockGtpuDataplaneBackend {
             return Err(error.clone());
         }
         Ok(())
+    }
+
+    fn validate_context(context: &GtpPdpContext) -> Result<(), GtpuError> {
+        if context.link_ifindex == 0 {
+            return Err(GtpuError::invalid_config(
+                "pdp.link_ifindex",
+                "ifindex must be nonzero",
+            ));
+        }
+        if context.ms_address.is_unspecified() {
+            return Err(GtpuError::invalid_config(
+                "pdp.ms_address",
+                "MS address must not be unspecified",
+            ));
+        }
+        if context.peer_address.is_unspecified() {
+            return Err(GtpuError::invalid_config(
+                "pdp.peer_address",
+                "peer address must not be unspecified",
+            ));
+        }
+        Ok(())
+    }
+
+    fn version_key(version: crate::GtpVersion) -> u8 {
+        match version {
+            crate::GtpVersion::V1 => 1,
+        }
+    }
+
+    fn family_key(family: GtpAddressFamily) -> u8 {
+        match family {
+            GtpAddressFamily::Ipv4 => 4,
+            GtpAddressFamily::Ipv6 => 6,
+        }
+    }
+
+    fn local_key(context: &GtpPdpContext) -> MockLocalSelector {
+        MockLocalSelector {
+            link_ifindex: context.link_ifindex,
+            version: Self::version_key(context.gtp_version),
+            family: Self::family_key(GtpAddressFamily::from_ip(context.ms_address)),
+            local_teid: context.local_teid.get(),
+        }
+    }
+
+    fn uplink_key(context: &GtpPdpContext) -> MockUplinkSelector {
+        MockUplinkSelector {
+            link_ifindex: context.link_ifindex,
+            version: Self::version_key(context.gtp_version),
+            ms_address: context.ms_address,
+            bearer_mark: context.bearer_mark.map(crate::GtpBearerMark::get),
+        }
+    }
+
+    fn selector_key(selector: &PdpContextSelector) -> Result<MockSelectorKey, GtpuError> {
+        match selector {
+            PdpContextSelector::LocalTeid(selector) => {
+                if selector.link_ifindex() == 0 {
+                    return Err(GtpuError::invalid_config(
+                        "pdp.selector.link_ifindex",
+                        "ifindex must be nonzero",
+                    ));
+                }
+                Ok(MockSelectorKey::Local(MockLocalSelector {
+                    link_ifindex: selector.link_ifindex(),
+                    version: Self::version_key(selector.gtp_version()),
+                    family: Self::family_key(selector.address_family()),
+                    local_teid: selector.local_teid().get(),
+                }))
+            }
+            PdpContextSelector::Uplink(selector) => {
+                if selector.link_ifindex() == 0 {
+                    return Err(GtpuError::invalid_config(
+                        "pdp.selector.link_ifindex",
+                        "ifindex must be nonzero",
+                    ));
+                }
+                Ok(MockSelectorKey::Uplink(MockUplinkSelector {
+                    link_ifindex: selector.link_ifindex(),
+                    version: Self::version_key(selector.gtp_version()),
+                    ms_address: selector.identity().ms_address(),
+                    bearer_mark: selector
+                        .identity()
+                        .bearer_mark()
+                        .map(crate::GtpBearerMark::get),
+                }))
+            }
+        }
+    }
+
+    fn read_locked(
+        state: &MockState,
+        selector: &PdpContextSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        if state.pdp_fault.is_some() {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "mock_pdp_context_readback",
+            });
+        }
+        match Self::selector_key(selector)? {
+            MockSelectorKey::Local(key) => Ok(state
+                .pdp_by_local
+                .get(&key)
+                .cloned()
+                .map_or(PdpContextReadback::Absent, PdpContextReadback::Present)),
+            MockSelectorKey::Uplink(key) => Ok(state
+                .pdp_by_uplink
+                .get(&key)
+                .cloned()
+                .map_or(PdpContextReadback::Absent, PdpContextReadback::Present)),
+        }
+    }
+
+    fn desired_readback_locked(
+        state: &MockState,
+        desired: &GtpPdpContext,
+    ) -> (PdpContextReadback, PdpContextReadback) {
+        (
+            state
+                .pdp_by_local
+                .get(&Self::local_key(desired))
+                .cloned()
+                .map_or(PdpContextReadback::Absent, PdpContextReadback::Present),
+            state
+                .pdp_by_uplink
+                .get(&Self::uplink_key(desired))
+                .cloned()
+                .map_or(PdpContextReadback::Absent, PdpContextReadback::Present),
+        )
+    }
+
+    fn insert_context_locked(state: &mut MockState, context: GtpPdpContext) {
+        state
+            .pdp_by_local
+            .insert(Self::local_key(&context), context.clone());
+        state
+            .pdp_by_uplink
+            .insert(Self::uplink_key(&context), context);
+    }
+
+    fn remove_context_locked(state: &mut MockState, context: &GtpPdpContext) {
+        state.pdp_by_local.remove(&Self::local_key(context));
+        state.pdp_by_uplink.remove(&Self::uplink_key(context));
     }
 }
 
@@ -221,13 +478,19 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
+        if state.devices.get(&device.name) != Some(device) {
+            return Err(GtpuError::NotFound);
+        }
+        state.devices.remove(&device.name);
+        state
+            .pdp_by_local
+            .retain(|selector, _| selector.link_ifindex != device.ifindex);
+        state
+            .pdp_by_uplink
+            .retain(|selector, _| selector.link_ifindex != device.ifindex);
         state.operations.push(MockOperation::RemoveDevice {
             device: device.clone(),
         });
-        state
-            .devices
-            .remove(&device.name)
-            .ok_or(GtpuError::NotFound)?;
         Ok(())
     }
 
@@ -253,6 +516,25 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
                 "ifindex must be nonzero",
             ));
         }
+        Self::validate_context(&request)?;
+        if state.pdp_fault.is_some() {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "mock_pdp_context_install",
+            });
+        }
+        let (local, uplink) = Self::desired_readback_locked(&state, &request);
+        match classify_dual_selector_state(&local, &uplink, &request) {
+            DualSelectorState::BothAbsent => {
+                Self::insert_context_locked(&mut state, request.clone());
+            }
+            DualSelectorState::Exact => {}
+            DualSelectorState::Conflict(_) => return Err(GtpuError::AlreadyExists),
+            DualSelectorState::Indeterminate => {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "mock_pdp_context_install",
+                });
+            }
+        }
         state
             .operations
             .push(MockOperation::InstallPdpContext { request });
@@ -271,10 +553,152 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
                 "ifindex must be nonzero",
             ));
         }
+        if state.pdp_fault.is_some() {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "mock_pdp_context_remove",
+            });
+        }
+        let key = MockLocalSelector {
+            link_ifindex: request.link_ifindex,
+            version: Self::version_key(request.gtp_version),
+            family: Self::family_key(request.address_family),
+            local_teid: request.local_teid.get(),
+        };
+        if let Some(context) = state.pdp_by_local.get(&key).cloned() {
+            Self::remove_context_locked(&mut state, &context);
+        }
         state
             .operations
             .push(MockOperation::RemovePdpContext { request });
         Ok(())
+    }
+
+    async fn read_pdp_context(
+        &self,
+        selector: PdpContextSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        let result = Self::read_locked(&state, &selector);
+        state
+            .pdp_context_reconciliation_operations
+            .push(MockPdpContextReconciliationOperation::Read { selector });
+        result
+    }
+
+    async fn install_pdp_context_classified(
+        &self,
+        request: GtpPdpContext,
+    ) -> Result<PdpContextInstallOutcome, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        Self::validate_context(&request)?;
+        state.pdp_context_reconciliation_operations.push(
+            MockPdpContextReconciliationOperation::InstallClassified {
+                request: request.clone(),
+            },
+        );
+        if let Some(fault) = state.pdp_fault {
+            let reason = match fault {
+                MockPdpContextFault::ChangingReadback => {
+                    PdpContextIndeterminateReason::StateChanged
+                }
+                MockPdpContextFault::CorruptState | MockPdpContextFault::TransitionalState => {
+                    PdpContextIndeterminateReason::IncompleteState
+                }
+            };
+            return Ok(PdpContextInstallOutcome::Indeterminate(reason));
+        }
+        let (local, uplink) = Self::desired_readback_locked(&state, &request);
+        match classify_dual_selector_state(&local, &uplink, &request) {
+            DualSelectorState::BothAbsent => {
+                Self::insert_context_locked(&mut state, request.clone());
+                let (local, uplink) = Self::desired_readback_locked(&state, &request);
+                if matches!(
+                    classify_dual_selector_state(&local, &uplink, &request),
+                    DualSelectorState::Exact
+                ) {
+                    Ok(PdpContextInstallOutcome::Installed)
+                } else {
+                    Ok(PdpContextInstallOutcome::Indeterminate(
+                        PdpContextIndeterminateReason::MutationUnconfirmed,
+                    ))
+                }
+            }
+            DualSelectorState::Exact => Ok(PdpContextInstallOutcome::ExactAlreadyPresent),
+            DualSelectorState::Conflict(conflict) => {
+                Ok(PdpContextInstallOutcome::Conflict(conflict))
+            }
+            DualSelectorState::Indeterminate => Ok(PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::IncompleteState,
+            )),
+        }
+    }
+
+    async fn remove_pdp_context_exact(
+        &self,
+        expected: GtpPdpContext,
+    ) -> Result<PdpContextRemovalOutcome, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        Self::validate_context(&expected)?;
+        state.pdp_context_reconciliation_operations.push(
+            MockPdpContextReconciliationOperation::RemoveExact {
+                expected: expected.clone(),
+            },
+        );
+        if let Some(fault) = state.pdp_fault {
+            let reason = match fault {
+                MockPdpContextFault::ChangingReadback => {
+                    PdpContextIndeterminateReason::StateChanged
+                }
+                MockPdpContextFault::CorruptState | MockPdpContextFault::TransitionalState => {
+                    PdpContextIndeterminateReason::IncompleteState
+                }
+            };
+            return Ok(PdpContextRemovalOutcome::Indeterminate(reason));
+        }
+        let (local, uplink) = Self::desired_readback_locked(&state, &expected);
+        match classify_dual_selector_state(&local, &uplink, &expected) {
+            DualSelectorState::BothAbsent => Ok(PdpContextRemovalOutcome::AlreadyAbsent),
+            DualSelectorState::Exact => {
+                Self::remove_context_locked(&mut state, &expected);
+                let (local, uplink) = Self::desired_readback_locked(&state, &expected);
+                if matches!(
+                    classify_dual_selector_state(&local, &uplink, &expected),
+                    DualSelectorState::BothAbsent
+                ) {
+                    Ok(PdpContextRemovalOutcome::Removed)
+                } else {
+                    Ok(PdpContextRemovalOutcome::Indeterminate(
+                        PdpContextIndeterminateReason::MutationUnconfirmed,
+                    ))
+                }
+            }
+            DualSelectorState::Conflict(conflict) => {
+                Ok(PdpContextRemovalOutcome::Conflict(conflict))
+            }
+            DualSelectorState::Indeterminate => Ok(PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::IncompleteState,
+            )),
+        }
+    }
+
+    fn pdp_context_reconciliation_capabilities(&self) -> PdpContextReconciliationCapabilities {
+        PdpContextReconciliationCapabilities {
+            readback: GtpuCapability::Available,
+            classified_install: GtpuCapability::Available,
+            exact_removal: GtpuCapability::Available,
+        }
     }
 
     async fn probe(&self) -> Result<GtpuProbe, GtpuError> {
@@ -433,5 +857,231 @@ mod tests {
         let debug = format!("{op:?}");
         assert!(!debug.contains("10.23.0.2"));
         assert!(!debug.contains("192.0.2.10"));
+    }
+
+    #[tokio::test]
+    async fn mock_reconciliation_calls_use_the_separate_redacted_log() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let desired = context();
+        let selector = PdpContextSelector::LocalTeid(
+            crate::PdpContextLocalTeidSelector::from_context(&desired).unwrap(),
+        );
+
+        assert_eq!(
+            backend
+                .install_pdp_context_classified(desired.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+        assert_eq!(
+            backend.read_pdp_context(selector.clone()).await.unwrap(),
+            PdpContextReadback::Present(desired.clone())
+        );
+        assert_eq!(
+            backend
+                .remove_pdp_context_exact(desired.clone())
+                .await
+                .unwrap(),
+            PdpContextRemovalOutcome::Removed
+        );
+
+        assert!(backend.operations().is_empty());
+        assert_eq!(
+            backend.pdp_context_reconciliation_operations(),
+            vec![
+                MockPdpContextReconciliationOperation::InstallClassified {
+                    request: desired.clone(),
+                },
+                MockPdpContextReconciliationOperation::Read { selector },
+                MockPdpContextReconciliationOperation::RemoveExact { expected: desired },
+            ]
+        );
+        let debug = format!("{:?}", backend.pdp_context_reconciliation_operations());
+        assert!(!debug.contains("10.23.0.2"));
+        assert!(!debug.contains("192.0.2.10"));
+
+        backend.clear_operations();
+        assert!(backend.pdp_context_reconciliation_operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_reconciliation_round_trip_covers_default_and_marked_contexts() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let mut default = context();
+        default.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+        let mut marked = context();
+        marked.local_teid = teid(3);
+        marked.peer_teid = teid(4);
+        marked.bearer_mark = crate::GtpBearerMark::new(0x1001);
+        marked.egress_dscp = Some(crate::DscpCodepoint::new(34).unwrap());
+
+        for desired in [&default, &marked] {
+            assert_eq!(
+                backend
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Installed
+            );
+            assert_eq!(
+                backend
+                    .clone()
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::ExactAlreadyPresent
+            );
+            assert_eq!(
+                backend
+                    .read_pdp_context(PdpContextSelector::LocalTeid(
+                        crate::PdpContextLocalTeidSelector::from_context(desired).unwrap(),
+                    ))
+                    .await
+                    .unwrap(),
+                PdpContextReadback::Present(desired.clone())
+            );
+            assert_eq!(
+                backend
+                    .read_pdp_context(PdpContextSelector::Uplink(
+                        crate::PdpContextUplinkSelector::from_context(desired).unwrap(),
+                    ))
+                    .await
+                    .unwrap(),
+                PdpContextReadback::Present(desired.clone())
+            );
+        }
+
+        assert_eq!(
+            backend.pdp_context_reconciliation_capabilities(),
+            PdpContextReconciliationCapabilities {
+                readback: GtpuCapability::Available,
+                classified_install: GtpuCapability::Available,
+                exact_removal: GtpuCapability::Available,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_classifies_both_selector_collision_shapes_without_mutation() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let installed = context();
+        assert_eq!(
+            backend
+                .install_pdp_context_classified(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+
+        let mut same_uplink = installed.clone();
+        same_uplink.local_teid = teid(11);
+        same_uplink.peer_teid = teid(12);
+        let outcome = backend
+            .install_pdp_context_classified(same_uplink.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PdpContextInstallOutcome::Conflict(conflict)
+                if conflict.occupied() == crate::PdpContextSelectorOccupancy::Uplink
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::LocalTeid)
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::PeerTeid)
+        ));
+
+        let mut same_local = installed.clone();
+        same_local.ms_address = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 3));
+        same_local.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        let outcome = backend
+            .install_pdp_context_classified(same_local.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PdpContextInstallOutcome::Conflict(conflict)
+                if conflict.occupied() == crate::PdpContextSelectorOccupancy::LocalTeid
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::MsAddress)
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::PeerAddress)
+        ));
+
+        assert!(matches!(
+            backend.remove_pdp_context_exact(same_uplink).await.unwrap(),
+            PdpContextRemovalOutcome::Conflict(_)
+        ));
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    crate::PdpContextLocalTeidSelector::from_context(&installed).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(installed)
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_exact_removal_is_idempotent_and_never_deletes_conflicting_state() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let installed = context();
+        backend
+            .install_pdp_context_classified(installed.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend
+                .remove_pdp_context_exact(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend.remove_pdp_context_exact(installed).await.unwrap(),
+            PdpContextRemovalOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_reconciliation_faults_fail_closed_with_stable_classification() {
+        let backend = MockGtpuDataplaneBackend::new();
+        for (fault, expected) in [
+            (
+                MockPdpContextFault::CorruptState,
+                PdpContextIndeterminateReason::IncompleteState,
+            ),
+            (
+                MockPdpContextFault::TransitionalState,
+                PdpContextIndeterminateReason::IncompleteState,
+            ),
+            (
+                MockPdpContextFault::ChangingReadback,
+                PdpContextIndeterminateReason::StateChanged,
+            ),
+        ] {
+            backend.set_pdp_context_fault(Some(fault));
+            assert_eq!(
+                backend
+                    .install_pdp_context_classified(context())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Indeterminate(expected)
+            );
+            assert_eq!(
+                backend.remove_pdp_context_exact(context()).await.unwrap(),
+                PdpContextRemovalOutcome::Indeterminate(expected)
+            );
+            assert!(matches!(
+                backend
+                    .read_pdp_context(PdpContextSelector::LocalTeid(
+                        crate::PdpContextLocalTeidSelector::from_context(&context()).unwrap(),
+                    ))
+                    .await
+                    .unwrap_err(),
+                GtpuError::StateIndeterminate {
+                    operation: "mock_pdp_context_readback"
+                }
+            ));
+        }
+        backend.set_pdp_context_fault(None);
     }
 }
