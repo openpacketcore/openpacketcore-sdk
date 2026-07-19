@@ -1,0 +1,29 @@
+[package]
+name = "opc-crypto-provider"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Fail-closed capability reporting and policy admission boundary for cryptographic modules"
+readme = "README.md"
+documentation = "https://docs.rs/opc-crypto-provider"
+keywords = ["5g", "cnf", "cryptography", "telecom", "packet-core"]
+categories = ["cryptography", "network-programming"]
+publish = false
+
+[features]
+testkit = []
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+opc-crypto-provider = { path = ".", version = "0.2.0", features = ["testkit"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

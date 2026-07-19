@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Validated-provider capability seam — `opc-crypto-provider`:** a new
+  standalone crate defining the capability-reporting and key-custody boundary
+  requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the
+  security-critical operation families (TLS, IKE PRF, IKE integrity, IKE
+  encryption, IKE signature, IKE Diffie-Hellman, approved entropy,
+  zeroization, sealed key storage) and `CapabilitySet` is fail-closed: an
+  unreported or unknown capability never reads as available and the default
+  set is empty. `ProviderIdentity` binds a bounded, printable-ASCII module
+  name and version to every report; `ValidationState` defaults to
+  non-validated and records only a module's self-declared validation claim —
+  the SDK does not verify, certify, or imply external certification of any
+  module or deployment. `SelfTestOutcome`, `SelfTestEvidence`, and
+  `ModuleReadiness` withdraw a capability when its self-test fails, when the
+  self-test cannot run, or when readiness is lost, and the withdrawal is
+  visible in the bounded, redaction-safe `CapabilityReport` evidence, which
+  can carry no key material by construction. `ProviderPolicy::admit` fails
+  closed with typed missing-capability and validation errors and is the only
+  constructor of `PolicyAdmission`, so no operation can be admitted past a
+  rejected policy and no implicit software fallback exists. The async
+  `CryptoModule` trait exposes identity, capabilities, self-test, and
+  readiness so later slices can bind runtime health gates, IKEv2, TLS, and
+  `opc-key` custody to one approved module; this slice implements no
+  cryptographic algorithm and modifies no existing crate. A configurable
+  `FakeCryptoModule` behind the `testkit` feature lets tests satisfy an
+  advertised capability set and then drop a capability, fail the self-test,
+  or lose readiness to prove the fail-closed behavior end to end.
+
 ### Fixed
 - **Complete public SWm lifecycle acceptance — `opc-proto-diameter`:** adds one
   compiler-external, deterministic public-API fixture covering a successful
