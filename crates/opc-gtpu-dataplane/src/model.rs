@@ -319,6 +319,497 @@ impl fmt::Debug for GtpPdpContext {
     }
 }
 
+/// Uplink selector identity for one PDP context.
+///
+/// The identity is the UE/MS packet-data address plus the optional complete
+/// bearer mark. It is deliberately separate from the downlink local TEID:
+/// reconciliation must inspect both kernel selector axes before classifying a
+/// collision as idempotent or conflicting.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct PdpContextUplinkIdentity {
+    ms_address: IpAddr,
+    bearer_mark: Option<GtpBearerMark>,
+}
+
+impl PdpContextUplinkIdentity {
+    /// Construct a canonical uplink identity.
+    ///
+    /// Unspecified UE/MS addresses do not identify installable PDP state and
+    /// return `None`.
+    #[must_use]
+    pub const fn new(ms_address: IpAddr, bearer_mark: Option<GtpBearerMark>) -> Option<Self> {
+        if ms_address.is_unspecified() {
+            return None;
+        }
+        Some(Self {
+            ms_address,
+            bearer_mark,
+        })
+    }
+
+    /// Build the uplink identity projected by a complete PDP context.
+    #[must_use]
+    pub const fn from_context(context: &GtpPdpContext) -> Option<Self> {
+        Self::new(context.ms_address, context.bearer_mark)
+    }
+
+    /// Return the UE/MS packet-data address.
+    #[must_use]
+    pub const fn ms_address(&self) -> IpAddr {
+        self.ms_address
+    }
+
+    /// Return the optional complete bearer mark.
+    #[must_use]
+    pub const fn bearer_mark(&self) -> Option<GtpBearerMark> {
+        self.bearer_mark
+    }
+}
+
+impl fmt::Debug for PdpContextUplinkIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PdpContextUplinkIdentity")
+            .field("ms_address", &"<redacted>")
+            .field("bearer_mark", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Lookup by the downlink selector of one PDP context.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct PdpContextLocalTeidSelector {
+    link_ifindex: NonZeroU32,
+    gtp_version: GtpVersion,
+    address_family: GtpAddressFamily,
+    local_teid: Teid,
+}
+
+impl PdpContextLocalTeidSelector {
+    /// Construct a local-TEID selector.
+    ///
+    /// The address family is explicit so a backend cannot report an IPv6 PDP
+    /// context absent after performing only an IPv4 kernel lookup.
+    #[must_use]
+    pub const fn new(
+        link_ifindex: u32,
+        gtp_version: GtpVersion,
+        address_family: GtpAddressFamily,
+        local_teid: Teid,
+    ) -> Option<Self> {
+        match NonZeroU32::new(link_ifindex) {
+            Some(link_ifindex) => Some(Self {
+                link_ifindex,
+                gtp_version,
+                address_family,
+                local_teid,
+            }),
+            None => None,
+        }
+    }
+
+    /// Build the selector projected by a complete PDP context.
+    #[must_use]
+    pub fn from_context(context: &GtpPdpContext) -> Option<Self> {
+        Self::new(
+            context.link_ifindex,
+            context.gtp_version,
+            GtpAddressFamily::from_ip(context.ms_address),
+            context.local_teid,
+        )
+    }
+
+    /// Return the Linux GTP link ifindex.
+    #[must_use]
+    pub const fn link_ifindex(&self) -> u32 {
+        self.link_ifindex.get()
+    }
+
+    /// Return the GTP version.
+    #[must_use]
+    pub const fn gtp_version(&self) -> GtpVersion {
+        self.gtp_version
+    }
+
+    /// Return the expected UE/MS address family.
+    #[must_use]
+    pub const fn address_family(&self) -> GtpAddressFamily {
+        self.address_family
+    }
+
+    /// Return the local/downlink TEID.
+    #[must_use]
+    pub const fn local_teid(&self) -> Teid {
+        self.local_teid
+    }
+}
+
+impl fmt::Debug for PdpContextLocalTeidSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PdpContextLocalTeidSelector")
+            .field("link_ifindex", &"<redacted>")
+            .field("gtp_version", &self.gtp_version)
+            .field("address_family", &self.address_family)
+            .field("local_teid", &self.local_teid)
+            .finish()
+    }
+}
+
+/// Lookup by the uplink selector of one PDP context.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct PdpContextUplinkSelector {
+    link_ifindex: NonZeroU32,
+    gtp_version: GtpVersion,
+    identity: PdpContextUplinkIdentity,
+}
+
+impl PdpContextUplinkSelector {
+    /// Construct an uplink selector.
+    #[must_use]
+    pub const fn new(
+        link_ifindex: u32,
+        gtp_version: GtpVersion,
+        identity: PdpContextUplinkIdentity,
+    ) -> Option<Self> {
+        match NonZeroU32::new(link_ifindex) {
+            Some(link_ifindex) => Some(Self {
+                link_ifindex,
+                gtp_version,
+                identity,
+            }),
+            None => None,
+        }
+    }
+
+    /// Build the selector projected by a complete PDP context.
+    #[must_use]
+    pub fn from_context(context: &GtpPdpContext) -> Option<Self> {
+        PdpContextUplinkIdentity::from_context(context)
+            .and_then(|identity| Self::new(context.link_ifindex, context.gtp_version, identity))
+    }
+
+    /// Return the Linux GTP link ifindex.
+    #[must_use]
+    pub const fn link_ifindex(&self) -> u32 {
+        self.link_ifindex.get()
+    }
+
+    /// Return the GTP version.
+    #[must_use]
+    pub const fn gtp_version(&self) -> GtpVersion {
+        self.gtp_version
+    }
+
+    /// Return the typed uplink identity.
+    #[must_use]
+    pub const fn identity(&self) -> &PdpContextUplinkIdentity {
+        &self.identity
+    }
+}
+
+impl fmt::Debug for PdpContextUplinkSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PdpContextUplinkSelector")
+            .field("link_ifindex", &"<redacted>")
+            .field("gtp_version", &self.gtp_version)
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
+/// Backend-neutral selector for PDP-context readback.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum PdpContextSelector {
+    /// Lookup by the incoming/downlink local TEID.
+    LocalTeid(PdpContextLocalTeidSelector),
+    /// Lookup by UE/MS address plus optional bearer mark.
+    Uplink(PdpContextUplinkSelector),
+}
+
+impl fmt::Debug for PdpContextSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalTeid(selector) => f.debug_tuple("LocalTeid").field(selector).finish(),
+            Self::Uplink(selector) => f.debug_tuple("Uplink").field(selector).finish(),
+        }
+    }
+}
+
+/// Result of a backend-neutral PDP-context lookup.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PdpContextReadback {
+    /// No context occupies the requested selector.
+    Absent,
+    /// One complete, validated context occupies the selector.
+    Present(GtpPdpContext),
+}
+
+/// PDP-context field whose value differs from a desired context.
+///
+/// Values are never included. This enum is non-exhaustive so future context
+/// fields can be reported without exposing routing/session identifiers or
+/// forcing downstream exhaustive matches.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub enum PdpContextMismatchField {
+    /// Incoming/downlink local TEID.
+    LocalTeid,
+    /// Outgoing/uplink peer TEID.
+    PeerTeid,
+    /// UE/MS packet-data address.
+    MsAddress,
+    /// GTP-U peer address.
+    PeerAddress,
+    /// Linux GTP link ifindex.
+    LinkIfindex,
+    /// GTP version.
+    GtpVersion,
+    /// Optional complete bearer mark.
+    BearerMark,
+    /// Optional fixed outer DSCP.
+    EgressDscp,
+    /// Inbound GTP-U source-port policy.
+    DownlinkSourcePortPolicy,
+}
+
+/// Selector axes occupied by valid state that conflicts with a request.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PdpContextSelectorOccupancy {
+    /// Only the requested local-TEID selector is occupied.
+    LocalTeid,
+    /// Only the requested uplink selector is occupied.
+    Uplink,
+    /// Both requested selector axes are occupied.
+    Both,
+}
+
+/// Redaction-safe evidence for a PDP-context conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdpContextConflict {
+    occupied: PdpContextSelectorOccupancy,
+    mismatches: Vec<PdpContextMismatchField>,
+}
+
+impl PdpContextConflict {
+    pub(crate) fn new(
+        occupied: PdpContextSelectorOccupancy,
+        mut mismatches: Vec<PdpContextMismatchField>,
+    ) -> Self {
+        mismatches.sort_unstable();
+        mismatches.dedup();
+        Self {
+            occupied,
+            mismatches,
+        }
+    }
+
+    /// Construct conflict evidence by comparing one occupied context with the
+    /// desired context.
+    ///
+    /// Returns `None` when the contexts are identical, preventing an adapter
+    /// from manufacturing a conflict without at least one typed mismatch.
+    /// Neither context value is retained in the returned diagnostic.
+    #[must_use]
+    pub fn between(
+        occupied: PdpContextSelectorOccupancy,
+        existing: &GtpPdpContext,
+        desired: &GtpPdpContext,
+    ) -> Option<Self> {
+        Self::from_mismatch_fields(occupied, pdp_context_mismatches(existing, desired))
+    }
+
+    /// Construct conflict evidence from a nonempty set of mismatch field
+    /// names.
+    ///
+    /// Values cannot be supplied through this boundary. Fields are sorted and
+    /// deduplicated; an empty iterator returns `None`.
+    #[must_use]
+    pub fn from_mismatch_fields(
+        occupied: PdpContextSelectorOccupancy,
+        mismatches: impl IntoIterator<Item = PdpContextMismatchField>,
+    ) -> Option<Self> {
+        let mut mismatches = mismatches.into_iter().collect::<Vec<_>>();
+        mismatches.sort_unstable();
+        mismatches.dedup();
+        (!mismatches.is_empty()).then_some(Self {
+            occupied,
+            mismatches,
+        })
+    }
+
+    /// Return which requested selector axes are occupied.
+    #[must_use]
+    pub const fn occupied(&self) -> PdpContextSelectorOccupancy {
+        self.occupied
+    }
+
+    /// Return only the names of differing fields, in deterministic order.
+    #[must_use]
+    pub fn mismatches(&self) -> &[PdpContextMismatchField] {
+        &self.mismatches
+    }
+}
+
+/// Stable reason why PDP reconciliation could not prove a final state.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PdpContextIndeterminateReason {
+    /// State was partial, malformed, transitional, or internally inconsistent.
+    IncompleteState,
+    /// State changed during the bounded observation window.
+    StateChanged,
+    /// Program, map, lease, or other mutation authority could not be proven.
+    AuthorityUnavailable,
+    /// A mutation was attempted but its final state could not be confirmed.
+    MutationUnconfirmed,
+}
+
+/// Classified result of strict PDP-context installation.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PdpContextInstallOutcome {
+    /// The requested context was newly installed and exactly read back.
+    Installed,
+    /// Both selector axes already identified the exact complete context.
+    ExactAlreadyPresent,
+    /// Valid existing state differs from the request.
+    Conflict(PdpContextConflict),
+    /// Equality or the final mutation state could not be proven.
+    Indeterminate(PdpContextIndeterminateReason),
+}
+
+/// Classified result of exact PDP-context removal.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PdpContextRemovalOutcome {
+    /// The exact expected context was removed and both selectors are absent.
+    Removed,
+    /// Both expected selector axes were already absent.
+    AlreadyAbsent,
+    /// Valid existing state differs from the expected context and was untouched.
+    Conflict(PdpContextConflict),
+    /// Exact ownership or the final mutation state could not be proven.
+    Indeterminate(PdpContextIndeterminateReason),
+}
+
+/// Capabilities of the explicit PDP-context reconciliation contract.
+///
+/// These capabilities are separate from packet-processing features in
+/// [`GtpuProbe`]. A backend may support readback but intentionally lack exact
+/// removal, as the mainline Linux GTP API does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdpContextReconciliationCapabilities {
+    /// Typed readback by local TEID and uplink identity.
+    pub readback: GtpuCapability,
+    /// Dual-selector classified installation.
+    pub classified_install: GtpuCapability,
+    /// Authority-safe exact removal.
+    pub exact_removal: GtpuCapability,
+}
+
+impl PdpContextReconciliationCapabilities {
+    /// Capabilities for an implementation that has not opted into the
+    /// additive reconciliation API.
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            readback: GtpuCapability::Missing,
+            classified_install: GtpuCapability::Missing,
+            exact_removal: GtpuCapability::Missing,
+        }
+    }
+}
+
+pub(crate) fn pdp_context_mismatches(
+    existing: &GtpPdpContext,
+    desired: &GtpPdpContext,
+) -> Vec<PdpContextMismatchField> {
+    let mut fields = Vec::with_capacity(9);
+    if existing.local_teid != desired.local_teid {
+        fields.push(PdpContextMismatchField::LocalTeid);
+    }
+    if existing.peer_teid != desired.peer_teid {
+        fields.push(PdpContextMismatchField::PeerTeid);
+    }
+    if existing.ms_address != desired.ms_address {
+        fields.push(PdpContextMismatchField::MsAddress);
+    }
+    if existing.peer_address != desired.peer_address {
+        fields.push(PdpContextMismatchField::PeerAddress);
+    }
+    if existing.link_ifindex != desired.link_ifindex {
+        fields.push(PdpContextMismatchField::LinkIfindex);
+    }
+    if existing.gtp_version != desired.gtp_version {
+        fields.push(PdpContextMismatchField::GtpVersion);
+    }
+    if existing.bearer_mark != desired.bearer_mark {
+        fields.push(PdpContextMismatchField::BearerMark);
+    }
+    if existing.egress_dscp != desired.egress_dscp {
+        fields.push(PdpContextMismatchField::EgressDscp);
+    }
+    if existing.downlink_source_port_policy != desired.downlink_source_port_policy {
+        fields.push(PdpContextMismatchField::DownlinkSourcePortPolicy);
+    }
+    fields
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DualSelectorState {
+    BothAbsent,
+    Exact,
+    Conflict(PdpContextConflict),
+    Indeterminate,
+}
+
+pub(crate) fn classify_dual_selector_state(
+    local: &PdpContextReadback,
+    uplink: &PdpContextReadback,
+    desired: &GtpPdpContext,
+) -> DualSelectorState {
+    match (local, uplink) {
+        (PdpContextReadback::Absent, PdpContextReadback::Absent) => DualSelectorState::BothAbsent,
+        (PdpContextReadback::Present(local), PdpContextReadback::Present(uplink))
+            if local == desired && uplink == desired =>
+        {
+            DualSelectorState::Exact
+        }
+        (PdpContextReadback::Present(existing), PdpContextReadback::Absent)
+            if existing == desired =>
+        {
+            DualSelectorState::Indeterminate
+        }
+        (PdpContextReadback::Absent, PdpContextReadback::Present(existing))
+            if existing == desired =>
+        {
+            DualSelectorState::Indeterminate
+        }
+        (PdpContextReadback::Present(existing), PdpContextReadback::Absent) => {
+            DualSelectorState::Conflict(PdpContextConflict::new(
+                PdpContextSelectorOccupancy::LocalTeid,
+                pdp_context_mismatches(existing, desired),
+            ))
+        }
+        (PdpContextReadback::Absent, PdpContextReadback::Present(existing)) => {
+            DualSelectorState::Conflict(PdpContextConflict::new(
+                PdpContextSelectorOccupancy::Uplink,
+                pdp_context_mismatches(existing, desired),
+            ))
+        }
+        (PdpContextReadback::Present(local), PdpContextReadback::Present(uplink)) => {
+            let mut mismatches = pdp_context_mismatches(local, desired);
+            mismatches.extend(pdp_context_mismatches(uplink, desired));
+            DualSelectorState::Conflict(PdpContextConflict::new(
+                PdpContextSelectorOccupancy::Both,
+                mismatches,
+            ))
+        }
+    }
+}
+
 /// Request to remove a GTP-U PDP context.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RemovePdpContextRequest {
@@ -463,6 +954,20 @@ mod tests {
     use super::*;
     use std::net::Ipv6Addr;
 
+    fn reconciliation_context() -> GtpPdpContext {
+        GtpPdpContext {
+            local_teid: Teid::new(0x1234_5678).unwrap(),
+            peer_teid: Teid::new(0x8765_4321).unwrap(),
+            ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
+            peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            link_ifindex: 7,
+            downlink_source_port_policy: GtpuSourcePortPolicy::Exact(21_152),
+            gtp_version: GtpVersion::V1,
+            bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
+            egress_dscp: Some(DscpCodepoint::new(46).unwrap()),
+        }
+    }
+
     #[test]
     fn teid_rejects_zero_and_redacts_debug_display() {
         assert_eq!(Teid::new(0), None);
@@ -515,6 +1020,129 @@ mod tests {
         assert!(!debug.contains("::1"));
         assert!(!debug.contains("3456789a"));
         assert!(!debug.contains("21152"));
+    }
+
+    #[test]
+    fn reconciliation_selectors_are_typed_and_redaction_safe() {
+        let context = reconciliation_context();
+        let local = PdpContextLocalTeidSelector::from_context(&context).unwrap();
+        assert_eq!(local.link_ifindex(), context.link_ifindex);
+        assert_eq!(local.gtp_version(), context.gtp_version);
+        assert_eq!(local.address_family(), GtpAddressFamily::Ipv4);
+        assert_eq!(local.local_teid(), context.local_teid);
+
+        let uplink = PdpContextUplinkSelector::from_context(&context).unwrap();
+        assert_eq!(uplink.link_ifindex(), context.link_ifindex);
+        assert_eq!(uplink.gtp_version(), context.gtp_version);
+        assert_eq!(uplink.identity().ms_address(), context.ms_address);
+        assert_eq!(uplink.identity().bearer_mark(), context.bearer_mark);
+
+        let debug = format!(
+            "{:?} {:?}",
+            PdpContextSelector::LocalTeid(local),
+            PdpContextSelector::Uplink(uplink)
+        );
+        for sensitive in ["12345678", "10.23.0.2", "3456789a", "21152"] {
+            assert!(!debug.contains(sensitive));
+        }
+
+        assert!(PdpContextLocalTeidSelector::new(
+            0,
+            GtpVersion::V1,
+            GtpAddressFamily::Ipv4,
+            context.local_teid,
+        )
+        .is_none());
+        let identity = PdpContextUplinkIdentity::from_context(&context).unwrap();
+        assert!(PdpContextUplinkSelector::new(0, GtpVersion::V1, identity).is_none());
+        let mut invalid = context;
+        invalid.link_ifindex = 0;
+        assert!(PdpContextLocalTeidSelector::from_context(&invalid).is_none());
+        assert!(PdpContextUplinkSelector::from_context(&invalid).is_none());
+    }
+
+    #[test]
+    fn mismatch_evidence_contains_only_deterministic_field_names() {
+        let desired = reconciliation_context();
+        let mut existing = desired.clone();
+        existing.local_teid = Teid::new(1).unwrap();
+        existing.peer_teid = Teid::new(2).unwrap();
+        existing.ms_address = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 3));
+        existing.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        existing.link_ifindex = 8;
+        existing.bearer_mark = None;
+        existing.egress_dscp = None;
+        existing.downlink_source_port_policy = GtpuSourcePortPolicy::Any;
+
+        let conflict = PdpContextConflict::new(
+            PdpContextSelectorOccupancy::Both,
+            pdp_context_mismatches(&existing, &desired),
+        );
+        assert_eq!(conflict.occupied(), PdpContextSelectorOccupancy::Both);
+        assert_eq!(
+            conflict.mismatches(),
+            &[
+                PdpContextMismatchField::LocalTeid,
+                PdpContextMismatchField::PeerTeid,
+                PdpContextMismatchField::MsAddress,
+                PdpContextMismatchField::PeerAddress,
+                PdpContextMismatchField::LinkIfindex,
+                PdpContextMismatchField::BearerMark,
+                PdpContextMismatchField::EgressDscp,
+                PdpContextMismatchField::DownlinkSourcePortPolicy,
+            ]
+        );
+        let debug = format!("{conflict:?}");
+        for sensitive in [
+            "12345678",
+            "87654321",
+            "10.23.0.2",
+            "192.0.2.10",
+            "3456789a",
+            "21152",
+        ] {
+            assert!(!debug.contains(sensitive));
+        }
+
+        assert!(
+            PdpContextConflict::between(PdpContextSelectorOccupancy::Both, &desired, &desired,)
+                .is_none()
+        );
+        assert!(
+            PdpContextConflict::from_mismatch_fields(PdpContextSelectorOccupancy::Both, [],)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dual_selector_classification_requires_both_axes_for_exactness() {
+        let desired = reconciliation_context();
+        let absent = PdpContextReadback::Absent;
+        let exact = PdpContextReadback::Present(desired.clone());
+
+        assert_eq!(
+            classify_dual_selector_state(&absent, &absent, &desired),
+            DualSelectorState::BothAbsent
+        );
+        assert_eq!(
+            classify_dual_selector_state(&exact, &exact, &desired),
+            DualSelectorState::Exact
+        );
+        assert_eq!(
+            classify_dual_selector_state(&exact, &absent, &desired),
+            DualSelectorState::Indeterminate
+        );
+
+        let mut conflict = desired.clone();
+        conflict.peer_teid = Teid::new(3).unwrap();
+        let classified =
+            classify_dual_selector_state(&PdpContextReadback::Present(conflict), &absent, &desired);
+        assert!(matches!(
+            classified,
+            DualSelectorState::Conflict(conflict)
+                if conflict.occupied() == PdpContextSelectorOccupancy::LocalTeid
+                    && conflict.mismatches() == [PdpContextMismatchField::PeerTeid]
+        ));
     }
 
     #[test]

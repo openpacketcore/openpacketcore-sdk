@@ -25,6 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Legacy parser signatures and non-missing decode-error mapping are unchanged;
   cross-request reuse, mismatched or untrusted provenance, and missing,
   conflicting, or ambiguous dictionary definitions fail closed.
+- **Conflict-safe PDP-context reconciliation — `opc-gtpu-dataplane`:** the
+  additive backend trait now supports redaction-safe readback by local TEID or
+  uplink identity, dual-selector classified install, validated mismatch-only
+  conflict evidence, separate reconciliation capabilities, and authority-safe
+  exact removal. Existing third-party backends retain source compatibility
+  through typed unsupported defaults. The eBPF adapter reconstructs complete
+  default/marked v3 graphs under its reconciler lease and exact program/map
+  identities, including a rebuilt host-only default UE-to-TEID index, without
+  changing the datapath schema. The Linux adapter performs strict stable
+  generic-netlink GETPDP readback and classified NEWPDP reconciliation,
+  including independently typed inner MS/PAA and outer peer families; exact
+  removal remains unavailable because mainline Linux has neither compare-delete
+  nor a cross-process writer lease. The mock provides stateful parity and
+  redaction-safe corrupt/transitional/changing fault injection through a
+  separate reconciliation log that preserves its established operation enum.
 - **BREAKING — fail-closed eBPF GTP-U downlink endpoint binding —
   `opc-gtpu-dataplane`:** every tc downlink PDR now carries a canonical binding
   to its outer peer, concrete local destination, address family, ingress

@@ -60,8 +60,10 @@ use nix::{setsockopt_impl, sockopt_impl};
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
-    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuSourcePortPolicy, RemovePdpContextRequest,
-    Teid,
+    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuSourcePortPolicy,
+    PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
+    PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
+    PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkEndpointBinding,
@@ -2789,6 +2791,112 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     restored
         .install_pdp_context(marked_session_context(adopted.ifindex))
         .await?;
+
+    let adopted_default = marked_session_context(adopted.ifindex);
+    let adopted_marked =
+        dedicated_session_context(adopted.ifindex, MARK_A, LOCAL_TEID_A, PEER_TEID_A);
+    for expected in [&adopted_default, &adopted_marked] {
+        assert_eq!(
+            restored
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(expected)
+                        .ok_or("local selector requires nonzero ifindex")?,
+                ))
+                .await?,
+            PdpContextReadback::Present(expected.clone())
+        );
+        assert_eq!(
+            restored
+                .read_pdp_context(PdpContextSelector::Uplink(
+                    PdpContextUplinkSelector::from_context(expected)
+                        .ok_or("uplink selector requires canonical context")?,
+                ))
+                .await?,
+            PdpContextReadback::Present(expected.clone())
+        );
+        assert_eq!(
+            restored
+                .install_pdp_context_classified(expected.clone())
+                .await?,
+            PdpContextInstallOutcome::ExactAlreadyPresent
+        );
+    }
+
+    for expected in [&adopted_default, &adopted_marked] {
+        let mut uplink_collision = expected.clone();
+        uplink_collision.local_teid =
+            Teid::new(expected.local_teid.get() + 0x100).ok_or("conflict TEID must be nonzero")?;
+        uplink_collision.peer_teid =
+            Teid::new(expected.peer_teid.get() + 0x100).ok_or("conflict TEID must be nonzero")?;
+        assert!(matches!(
+            restored
+                .install_pdp_context_classified(uplink_collision)
+                .await?,
+            PdpContextInstallOutcome::Conflict(conflict)
+                if conflict.occupied() == PdpContextSelectorOccupancy::Uplink
+        ));
+
+        let mut local_collision = expected.clone();
+        local_collision.ms_address = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 99));
+        local_collision.peer_address = IpAddr::V4(PGW_ALT_IP);
+        assert!(matches!(
+            restored
+                .install_pdp_context_classified(local_collision)
+                .await?,
+            PdpContextInstallOutcome::Conflict(conflict)
+                if conflict.occupied() == PdpContextSelectorOccupancy::LocalTeid
+        ));
+    }
+
+    let saved_binding = replace_pinned_binding(&marked_pin_dir, LOCAL_TEID, None)
+        .ok_or("default binding must exist before corruption proof")?;
+    assert!(matches!(
+        restored
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&adopted_default)
+                    .ok_or("local selector requires nonzero ifindex")?,
+            ))
+            .await,
+        Err(GtpuError::StateIndeterminate { .. })
+    ));
+    assert_eq!(
+        restored
+            .install_pdp_context_classified(adopted_default.clone())
+            .await?,
+        PdpContextInstallOutcome::Indeterminate(PdpContextIndeterminateReason::IncompleteState)
+    );
+    let _ = replace_pinned_binding(&marked_pin_dir, LOCAL_TEID, Some(saved_binding));
+
+    set_marked_owner_phase(&marked_pin_dir, MARK_A, MarkedBearerOwnerPhase::Pending);
+    assert!(matches!(
+        restored
+            .read_pdp_context(PdpContextSelector::Uplink(
+                PdpContextUplinkSelector::from_context(&adopted_marked)
+                    .ok_or("uplink selector requires canonical context")?,
+            ))
+            .await,
+        Err(GtpuError::StateIndeterminate { .. })
+    ));
+    assert_eq!(
+        restored
+            .install_pdp_context_classified(adopted_marked.clone())
+            .await?,
+        PdpContextInstallOutcome::Indeterminate(PdpContextIndeterminateReason::IncompleteState)
+    );
+    set_marked_owner_phase(&marked_pin_dir, MARK_A, MarkedBearerOwnerPhase::Active);
+
+    for expected in [&adopted_default, &adopted_marked] {
+        assert_eq!(
+            restored.remove_pdp_context_exact(expected.clone()).await?,
+            PdpContextRemovalOutcome::Removed
+        );
+        assert_eq!(
+            restored
+                .install_pdp_context_classified(expected.clone())
+                .await?,
+            PdpContextInstallOutcome::Installed
+        );
+    }
     let (_, from) = send_until_received(
         || {
             let _ = ue_socket.send_to(b"opc-uplink-2", (REMOTE_HOST, 53));

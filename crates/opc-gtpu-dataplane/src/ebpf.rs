@@ -39,9 +39,15 @@ use opc_gtpu_ebpf_common::{
     UPLINK_MARK_KEY_LEN,
 };
 
+use crate::backend::error_proves_no_requested_mutation;
+use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::{
-    CreateGtpDeviceRequest, GtpDevice, GtpPdpContext, GtpVersion, GtpuBackendKind, GtpuCapability,
-    GtpuDataplaneBackend, GtpuDownlinkEndpoint, GtpuError, GtpuProbe, RemovePdpContextRequest,
+    CreateGtpDeviceRequest, GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
+    GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkEndpoint, GtpuError,
+    GtpuProbe, PdpContextIndeterminateReason, PdpContextInstallOutcome,
+    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextReconciliationCapabilities,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpContextUplinkSelector,
+    RemovePdpContextRequest, Teid,
 };
 
 /// Default bpffs directory under which per-interface map pins are created.
@@ -325,6 +331,27 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         local_teid: [u8; 4],
     ) -> Result<Option<[u8; UPLINK_MARK_KEY_LEN]>, GtpuError>;
 
+    /// Resolve the default-bearer local TEID reserved by one UE address.
+    fn default_teid_for_ue(
+        &self,
+        ifindex: u32,
+        ue_ip: [u8; 4],
+    ) -> Result<Option<[u8; 4]>, GtpuError>;
+    /// Reserve one exact default-bearer `(UE, local TEID)` identity.
+    fn default_selector_insert(
+        &self,
+        ifindex: u32,
+        ue_ip: [u8; 4],
+        local_teid: [u8; 4],
+    ) -> Result<(), GtpuError>;
+    /// Release one exact default-bearer `(UE, local TEID)` identity.
+    fn default_selector_remove(
+        &self,
+        ifindex: u32,
+        ue_ip: [u8; 4],
+        local_teid: [u8; 4],
+    ) -> Result<bool, GtpuError>;
+
     /// Read counters only after proving the live hooks and exact named pins.
     fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError>;
 
@@ -342,6 +369,10 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Return whether the exact live downlink program and both endpoint-
     /// binding maps are present for the managed attachment.
     fn downlink_endpoint_binding_datapath_usable(&self, ifindex: u32) -> bool;
+
+    /// Return whether readback can trust the exact programs, every named map,
+    /// and the held reconciler lease for this managed device.
+    fn pdp_readback_datapath_usable(&self, ifindex: u32) -> bool;
 
     /// Return whether PDP cleanup can safely mutate the held maps.
     ///
@@ -508,6 +539,25 @@ impl EbpfGtpuDataplaneBackend {
             Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_install_pdp_context",
             })
+        }
+    }
+
+    fn rollback_default_selector(
+        &self,
+        ifindex: u32,
+        ue_ip: [u8; 4],
+        local_teid: [u8; 4],
+        source: GtpuError,
+    ) -> Result<(), GtpuError> {
+        match self
+            .inner
+            .runtime
+            .default_selector_remove(ifindex, ue_ip, local_teid)
+        {
+            Ok(true) => Err(source),
+            Ok(false) | Err(_) => Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_install_pdp_context",
+            }),
         }
     }
 
@@ -980,8 +1030,605 @@ impl EbpfGtpuDataplaneBackend {
         self.inner.runtime.datapath_snapshot(device.ifindex)
     }
 
+    fn validate_reconciliation_context_locked(
+        &self,
+        context: &GtpPdpContext,
+    ) -> Result<Ipv4Addr, GtpuError> {
+        validate_gtp_version(context.gtp_version)?;
+        let ms_address = require_ipv4(context.ms_address, "pdp.ms_address")?;
+        let peer_address = require_ipv4(context.peer_address, "pdp.peer_address")?;
+        if ms_address.is_unspecified() {
+            return Err(GtpuError::invalid_config(
+                "pdp.ms_address",
+                "MS address must not be unspecified",
+            ));
+        }
+        if peer_address.is_unspecified() {
+            return Err(GtpuError::invalid_config(
+                "pdp.peer_address",
+                "peer address must not be unspecified",
+            ));
+        }
+        let local_ip = self
+            .devices()?
+            .get(&context.link_ifindex)
+            .map(|device| device.local_ip)
+            .ok_or(GtpuError::NotFound)?;
+        if ms_address == local_ip {
+            return Err(GtpuError::invalid_config(
+                "pdp.ms_address",
+                "MS address must differ from the S2b-U local address",
+            ));
+        }
+        GtpuDownlinkEndpoint::new(
+            context.peer_address,
+            IpAddr::V4(local_ip),
+            context.link_ifindex,
+            context.downlink_source_port_policy,
+        )
+        .ok_or_else(|| {
+            GtpuError::invalid_config(
+                "pdp.downlink_endpoint",
+                "peer, local endpoint, and ingress attachment must form one canonical identity",
+            )
+        })?;
+        Ok(local_ip)
+    }
+
+    fn managed_local_ip_locked(&self, ifindex: u32) -> Result<Ipv4Addr, GtpuError> {
+        self.devices()?
+            .get(&ifindex)
+            .map(|device| device.local_ip)
+            .ok_or(GtpuError::NotFound)
+    }
+
+    fn read_default_context_locked(
+        &self,
+        ifindex: u32,
+        local_teid: [u8; 4],
+        expected_ue: Option<[u8; 4]>,
+    ) -> Result<GtpPdpContext, GtpuError> {
+        let indeterminate = || GtpuError::StateIndeterminate {
+            operation: "ebpf_pdp_context_readback",
+        };
+        let local_ip = self.managed_local_ip_locked(ifindex)?.octets();
+        let encoded_pdr = self
+            .inner
+            .runtime
+            .pdr_get(ifindex, local_teid)?
+            .ok_or_else(indeterminate)?;
+        let pdr = DownlinkPdr::decode(&encoded_pdr);
+        if pdr.encode() != encoded_pdr
+            || expected_ue.is_some_and(|expected| expected != pdr.ue_ip)
+            || self.inner.runtime.default_teid_for_ue(ifindex, pdr.ue_ip)? != Some(local_teid)
+            || self
+                .inner
+                .runtime
+                .marked_owner_for_teid(ifindex, local_teid)?
+                .is_some()
+            || self
+                .inner
+                .runtime
+                .marked_pdr_get(ifindex, local_teid)?
+                .is_some()
+        {
+            return Err(indeterminate());
+        }
+        let encoded_far = self
+            .inner
+            .runtime
+            .far_get(ifindex, pdr.ue_ip)?
+            .ok_or_else(indeterminate)?;
+        let far = UplinkFar::decode(&encoded_far);
+        let encoded_binding = self
+            .inner
+            .runtime
+            .downlink_binding_get(ifindex, local_teid)?
+            .ok_or_else(indeterminate)?;
+        let binding = DownlinkEndpointBinding::decode(&encoded_binding);
+        if !opc_gtpu_ebpf_common::default_bearer_graph_is_valid(
+            local_teid, pdr, far, binding, local_ip, ifindex,
+        ) {
+            return Err(indeterminate());
+        }
+        let egress_dscp = match self.inner.runtime.dscp_get(ifindex, pdr.ue_ip)? {
+            Some([value]) => crate::DscpCodepoint::new(value)
+                .map_err(|_| indeterminate())
+                .map(Some)?,
+            None => None,
+        };
+        let local_teid = Teid::new(u32::from_be_bytes(local_teid)).ok_or_else(indeterminate)?;
+        let peer_teid = Teid::new(u32::from_be_bytes(far.o_teid)).ok_or_else(indeterminate)?;
+        Ok(GtpPdpContext {
+            local_teid,
+            peer_teid,
+            ms_address: IpAddr::V4(Ipv4Addr::from(pdr.ue_ip)),
+            peer_address: IpAddr::V4(Ipv4Addr::from(far.peer_ip)),
+            link_ifindex: ifindex,
+            downlink_source_port_policy: binding.source_port_policy(),
+            gtp_version: GtpVersion::V1,
+            bearer_mark: None,
+            egress_dscp,
+        })
+    }
+
+    fn read_marked_context_locked(
+        &self,
+        ifindex: u32,
+        selector: [u8; UPLINK_MARK_KEY_LEN],
+        expected_local_teid: Option<[u8; 4]>,
+    ) -> Result<GtpPdpContext, GtpuError> {
+        let indeterminate = || GtpuError::StateIndeterminate {
+            operation: "ebpf_pdp_context_readback",
+        };
+        let local_ip = self.managed_local_ip_locked(ifindex)?.octets();
+        let key = UplinkFarKey::decode(&selector);
+        let encoded_owner = self
+            .inner
+            .runtime
+            .marked_owner_get(ifindex, selector)?
+            .ok_or_else(indeterminate)?;
+        let owner = MarkedBearerOwner::decode(&encoded_owner);
+        if key.ue_ip == [0; 4]
+            || key.ue_ip == local_ip
+            || key.bearer_mark == [0; 4]
+            || !owner.is_valid()
+            || owner.phase != MarkedBearerOwnerPhase::Active
+            || owner.uplink_far.local_ip != local_ip
+            || owner.downlink_binding.ingress_ifindex() != ifindex
+            || expected_local_teid.is_some_and(|expected| expected != owner.local_teid)
+            || self
+                .inner
+                .runtime
+                .marked_owner_for_teid(ifindex, owner.local_teid)?
+                != Some(selector)
+            || self
+                .inner
+                .runtime
+                .pdr_get(ifindex, owner.local_teid)?
+                .is_some()
+        {
+            return Err(indeterminate());
+        }
+        let expected_pdr = MarkedDownlinkPdr {
+            ue_ip: key.ue_ip,
+            bearer_mark: key.bearer_mark,
+        }
+        .encode();
+        let expected_far = owner.uplink_far.encode();
+        let expected_dscp = owner.egress_dscp().map(|value| [value]);
+        let expected_binding = owner.downlink_binding.encode();
+        if self
+            .inner
+            .runtime
+            .marked_pdr_get(ifindex, owner.local_teid)?
+            != Some(expected_pdr)
+            || self.inner.runtime.marked_far_get(ifindex, selector)? != Some(expected_far)
+            || self.inner.runtime.marked_dscp_get(ifindex, selector)? != expected_dscp
+            || self
+                .inner
+                .runtime
+                .downlink_binding_get(ifindex, owner.local_teid)?
+                != Some(expected_binding)
+        {
+            return Err(indeterminate());
+        }
+        let local_teid =
+            Teid::new(u32::from_be_bytes(owner.local_teid)).ok_or_else(indeterminate)?;
+        let peer_teid =
+            Teid::new(u32::from_be_bytes(owner.uplink_far.o_teid)).ok_or_else(indeterminate)?;
+        let bearer_mark =
+            GtpBearerMark::new(u32::from_be_bytes(key.bearer_mark)).ok_or_else(indeterminate)?;
+        let egress_dscp = match owner.egress_dscp() {
+            Some(value) => Some(crate::DscpCodepoint::new(value).map_err(|_| indeterminate())?),
+            None => None,
+        };
+        Ok(GtpPdpContext {
+            local_teid,
+            peer_teid,
+            ms_address: IpAddr::V4(Ipv4Addr::from(key.ue_ip)),
+            peer_address: IpAddr::V4(Ipv4Addr::from(owner.uplink_far.peer_ip)),
+            link_ifindex: ifindex,
+            downlink_source_port_policy: owner.downlink_binding.source_port_policy(),
+            gtp_version: GtpVersion::V1,
+            bearer_mark: Some(bearer_mark),
+            egress_dscp,
+        })
+    }
+
+    fn inspect_local_selector_locked(
+        &self,
+        selector: &PdpContextLocalTeidSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        validate_gtp_version(selector.gtp_version())?;
+        if selector.link_ifindex() == 0 {
+            return Err(GtpuError::invalid_config(
+                "pdp.selector.link_ifindex",
+                "ifindex must be nonzero",
+            ));
+        }
+        if selector.address_family() != GtpAddressFamily::Ipv4 {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "ebpf_ipv6_pdp_readback",
+            });
+        }
+        self.managed_local_ip_locked(selector.link_ifindex())?;
+        let local_teid = selector.local_teid().get().to_be_bytes();
+        let default_pdr = self
+            .inner
+            .runtime
+            .pdr_get(selector.link_ifindex(), local_teid)?;
+        let marked_pdr = self
+            .inner
+            .runtime
+            .marked_pdr_get(selector.link_ifindex(), local_teid)?;
+        let owner_selector = self
+            .inner
+            .runtime
+            .marked_owner_for_teid(selector.link_ifindex(), local_teid)?;
+        let binding = self
+            .inner
+            .runtime
+            .downlink_binding_get(selector.link_ifindex(), local_teid)?;
+        match (default_pdr, marked_pdr, owner_selector, binding) {
+            (None, None, None, None) => Ok(PdpContextReadback::Absent),
+            (Some(_), None, None, Some(_)) => self
+                .read_default_context_locked(selector.link_ifindex(), local_teid, None)
+                .map(PdpContextReadback::Present),
+            (None, Some(_), Some(owner_selector), Some(_)) => self
+                .read_marked_context_locked(
+                    selector.link_ifindex(),
+                    owner_selector,
+                    Some(local_teid),
+                )
+                .map(PdpContextReadback::Present),
+            _ => Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pdp_context_readback",
+            }),
+        }
+    }
+
+    fn inspect_uplink_selector_locked(
+        &self,
+        selector: &PdpContextUplinkSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        validate_gtp_version(selector.gtp_version())?;
+        if selector.link_ifindex() == 0 {
+            return Err(GtpuError::invalid_config(
+                "pdp.selector.link_ifindex",
+                "ifindex must be nonzero",
+            ));
+        }
+        self.managed_local_ip_locked(selector.link_ifindex())?;
+        let ms_address = require_ipv4(selector.identity().ms_address(), "pdp.selector.ms_address")?;
+        if ms_address.is_unspecified() {
+            return Err(GtpuError::invalid_config(
+                "pdp.selector.ms_address",
+                "MS address must not be unspecified",
+            ));
+        }
+        let ue_ip = ms_address.octets();
+        if let Some(mark) = selector.identity().bearer_mark() {
+            let marked_selector = UplinkFarKey {
+                ue_ip,
+                bearer_mark: mark.get().to_be_bytes(),
+            }
+            .encode();
+            let owner = self
+                .inner
+                .runtime
+                .marked_owner_get(selector.link_ifindex(), marked_selector)?;
+            let far = self
+                .inner
+                .runtime
+                .marked_far_get(selector.link_ifindex(), marked_selector)?;
+            let dscp = self
+                .inner
+                .runtime
+                .marked_dscp_get(selector.link_ifindex(), marked_selector)?;
+            return match (owner, far, dscp) {
+                (None, None, None) => Ok(PdpContextReadback::Absent),
+                (Some(_), _, _) => self
+                    .read_marked_context_locked(selector.link_ifindex(), marked_selector, None)
+                    .map(PdpContextReadback::Present),
+                _ => Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_pdp_context_readback",
+                }),
+            };
+        }
+        let local_teid = self
+            .inner
+            .runtime
+            .default_teid_for_ue(selector.link_ifindex(), ue_ip)?;
+        let far = self.inner.runtime.far_get(selector.link_ifindex(), ue_ip)?;
+        let dscp = self
+            .inner
+            .runtime
+            .dscp_get(selector.link_ifindex(), ue_ip)?;
+        match (local_teid, far, dscp) {
+            (None, None, None) => Ok(PdpContextReadback::Absent),
+            (Some(local_teid), Some(_), _) => self
+                .read_default_context_locked(selector.link_ifindex(), local_teid, Some(ue_ip))
+                .map(PdpContextReadback::Present),
+            _ => Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pdp_context_readback",
+            }),
+        }
+    }
+
+    fn inspect_selector_locked(
+        &self,
+        selector: &PdpContextSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        match selector {
+            PdpContextSelector::LocalTeid(selector) => self.inspect_local_selector_locked(selector),
+            PdpContextSelector::Uplink(selector) => self.inspect_uplink_selector_locked(selector),
+        }
+    }
+
+    fn inspect_selector_stable_locked(
+        &self,
+        selector: &PdpContextSelector,
+    ) -> Result<Option<PdpContextReadback>, GtpuError> {
+        let first = self.inspect_selector_locked(selector)?;
+        let second = self.inspect_selector_locked(selector)?;
+        Ok((first == second).then_some(first))
+    }
+
+    fn read_pdp_context_sync(
+        &self,
+        selector: PdpContextSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        let _operation = self.operation_guard()?;
+        let ifindex = match &selector {
+            PdpContextSelector::LocalTeid(selector) => selector.link_ifindex(),
+            PdpContextSelector::Uplink(selector) => selector.link_ifindex(),
+        };
+        if !self.inner.runtime.pdp_readback_datapath_usable(ifindex) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pdp_context_readback",
+            });
+        }
+        let readback = self.inspect_selector_stable_locked(&selector)?.ok_or(
+            GtpuError::StateIndeterminate {
+                operation: "ebpf_pdp_context_readback",
+            },
+        )?;
+        if !self.inner.runtime.pdp_readback_datapath_usable(ifindex) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_pdp_context_readback",
+            });
+        }
+        Ok(readback)
+    }
+
+    fn inspect_desired_axes_stable_locked(
+        &self,
+        desired: &GtpPdpContext,
+    ) -> Result<Option<(PdpContextReadback, PdpContextReadback)>, GtpuError> {
+        let local = PdpContextLocalTeidSelector::from_context(desired).ok_or_else(|| {
+            GtpuError::invalid_config("pdp.link_ifindex", "ifindex must be nonzero")
+        })?;
+        let uplink = PdpContextUplinkSelector::from_context(desired).ok_or_else(|| {
+            GtpuError::invalid_config("pdp.ms_address", "MS address must not be unspecified")
+        })?;
+        let first = (
+            self.inspect_local_selector_locked(&local)?,
+            self.inspect_uplink_selector_locked(&uplink)?,
+        );
+        let second = (
+            self.inspect_local_selector_locked(&local)?,
+            self.inspect_uplink_selector_locked(&uplink)?,
+        );
+        Ok((first == second).then_some(first))
+    }
+
+    fn install_pdp_context_classified_sync(
+        &self,
+        request: GtpPdpContext,
+    ) -> Result<PdpContextInstallOutcome, GtpuError> {
+        let _operation = self.operation_guard()?;
+        self.validate_reconciliation_context_locked(&request)?;
+        if !self
+            .inner
+            .runtime
+            .pdp_readback_datapath_usable(request.link_ifindex)
+        {
+            return Ok(PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable,
+            ));
+        }
+        let (local, uplink) = match self.inspect_desired_axes_stable_locked(&request) {
+            Ok(Some(observed)) => observed,
+            Ok(None) => {
+                return Ok(PdpContextInstallOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::StateChanged,
+                ));
+            }
+            Err(GtpuError::StateIndeterminate { .. }) => {
+                return Ok(PdpContextInstallOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::IncompleteState,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if !self
+            .inner
+            .runtime
+            .pdp_readback_datapath_usable(request.link_ifindex)
+        {
+            return Ok(PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable,
+            ));
+        }
+        match classify_dual_selector_state(&local, &uplink, &request) {
+            DualSelectorState::Exact => Ok(PdpContextInstallOutcome::ExactAlreadyPresent),
+            DualSelectorState::Conflict(conflict) => {
+                Ok(PdpContextInstallOutcome::Conflict(conflict))
+            }
+            DualSelectorState::Indeterminate => Ok(PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::IncompleteState,
+            )),
+            DualSelectorState::BothAbsent => {
+                let mutation_uncertain = match self.install_pdp_context_locked(request.clone()) {
+                    Ok(()) => false,
+                    Err(error) if error_proves_no_requested_mutation(&error) => return Err(error),
+                    Err(_error) => true,
+                };
+                if !self
+                    .inner
+                    .runtime
+                    .pdp_readback_datapath_usable(request.link_ifindex)
+                {
+                    return Ok(PdpContextInstallOutcome::Indeterminate(
+                        PdpContextIndeterminateReason::AuthorityUnavailable,
+                    ));
+                }
+                let (local, uplink) = match self.inspect_desired_axes_stable_locked(&request) {
+                    Ok(Some(observed)) => observed,
+                    Err(_) => {
+                        return Ok(PdpContextInstallOutcome::Indeterminate(
+                            PdpContextIndeterminateReason::MutationUnconfirmed,
+                        ));
+                    }
+                    Ok(None) => {
+                        return Ok(PdpContextInstallOutcome::Indeterminate(
+                            PdpContextIndeterminateReason::MutationUnconfirmed,
+                        ));
+                    }
+                };
+                if !self
+                    .inner
+                    .runtime
+                    .pdp_readback_datapath_usable(request.link_ifindex)
+                {
+                    return Ok(PdpContextInstallOutcome::Indeterminate(
+                        PdpContextIndeterminateReason::AuthorityUnavailable,
+                    ));
+                }
+                match classify_dual_selector_state(&local, &uplink, &request) {
+                    DualSelectorState::Exact if mutation_uncertain => {
+                        Ok(PdpContextInstallOutcome::ExactAlreadyPresent)
+                    }
+                    DualSelectorState::Exact => Ok(PdpContextInstallOutcome::Installed),
+                    DualSelectorState::Conflict(conflict) => {
+                        Ok(PdpContextInstallOutcome::Conflict(conflict))
+                    }
+                    DualSelectorState::BothAbsent | DualSelectorState::Indeterminate => {
+                        Ok(PdpContextInstallOutcome::Indeterminate(
+                            PdpContextIndeterminateReason::MutationUnconfirmed,
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    fn remove_pdp_context_exact_sync(
+        &self,
+        expected: GtpPdpContext,
+    ) -> Result<PdpContextRemovalOutcome, GtpuError> {
+        let _operation = self.operation_guard()?;
+        self.validate_reconciliation_context_locked(&expected)?;
+        if !self
+            .inner
+            .runtime
+            .pdp_readback_datapath_usable(expected.link_ifindex)
+        {
+            return Ok(PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable,
+            ));
+        }
+        let (local, uplink) = match self.inspect_desired_axes_stable_locked(&expected) {
+            Ok(Some(observed)) => observed,
+            Ok(None) => {
+                return Ok(PdpContextRemovalOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::StateChanged,
+                ));
+            }
+            Err(GtpuError::StateIndeterminate { .. }) => {
+                return Ok(PdpContextRemovalOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::IncompleteState,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if !self
+            .inner
+            .runtime
+            .pdp_readback_datapath_usable(expected.link_ifindex)
+        {
+            return Ok(PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable,
+            ));
+        }
+        match classify_dual_selector_state(&local, &uplink, &expected) {
+            DualSelectorState::BothAbsent => Ok(PdpContextRemovalOutcome::AlreadyAbsent),
+            DualSelectorState::Conflict(conflict) => {
+                Ok(PdpContextRemovalOutcome::Conflict(conflict))
+            }
+            DualSelectorState::Indeterminate => Ok(PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::IncompleteState,
+            )),
+            DualSelectorState::Exact => {
+                let remove = RemovePdpContextRequest::from_context(&expected);
+                match self.remove_pdp_context_locked(remove) {
+                    Ok(()) => {}
+                    Err(error) if error_proves_no_requested_mutation(&error) => return Err(error),
+                    Err(_error) => {}
+                }
+                if !self
+                    .inner
+                    .runtime
+                    .pdp_readback_datapath_usable(expected.link_ifindex)
+                {
+                    return Ok(PdpContextRemovalOutcome::Indeterminate(
+                        PdpContextIndeterminateReason::AuthorityUnavailable,
+                    ));
+                }
+                let (local, uplink) = match self.inspect_desired_axes_stable_locked(&expected) {
+                    Ok(Some(observed)) => observed,
+                    Err(_) => {
+                        return Ok(PdpContextRemovalOutcome::Indeterminate(
+                            PdpContextIndeterminateReason::MutationUnconfirmed,
+                        ));
+                    }
+                    Ok(None) => {
+                        return Ok(PdpContextRemovalOutcome::Indeterminate(
+                            PdpContextIndeterminateReason::MutationUnconfirmed,
+                        ));
+                    }
+                };
+                if !self
+                    .inner
+                    .runtime
+                    .pdp_readback_datapath_usable(expected.link_ifindex)
+                {
+                    return Ok(PdpContextRemovalOutcome::Indeterminate(
+                        PdpContextIndeterminateReason::AuthorityUnavailable,
+                    ));
+                }
+                match classify_dual_selector_state(&local, &uplink, &expected) {
+                    DualSelectorState::BothAbsent => Ok(PdpContextRemovalOutcome::Removed),
+                    DualSelectorState::Conflict(conflict) => {
+                        Ok(PdpContextRemovalOutcome::Conflict(conflict))
+                    }
+                    DualSelectorState::Exact | DualSelectorState::Indeterminate => {
+                        Ok(PdpContextRemovalOutcome::Indeterminate(
+                            PdpContextIndeterminateReason::MutationUnconfirmed,
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
     fn install_pdp_context_sync(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
         let _operation = self.operation_guard()?;
+        self.install_pdp_context_locked(request)
+    }
+
+    fn install_pdp_context_locked(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
         validate_gtp_version(request.gtp_version)?;
         let ms_address = require_ipv4(request.ms_address, "pdp.ms_address")?;
         let peer_address = require_ipv4(request.peer_address, "pdp.peer_address")?;
@@ -1129,6 +1776,25 @@ impl EbpfGtpuDataplaneBackend {
             .runtime
             .downlink_binding_get(request.link_ifindex, pdr_key)?;
         let existing_dscp = self.inner.runtime.dscp_get(request.link_ifindex, far_key)?;
+        let indexed_teid = self
+            .inner
+            .runtime
+            .default_teid_for_ue(request.link_ifindex, far_key)?;
+        if indexed_teid.is_some_and(|existing| existing != pdr_key) {
+            return Err(GtpuError::AlreadyExists);
+        }
+        if indexed_teid.is_none() {
+            let pdr_claims_requested_ue = existing_pdr
+                .as_ref()
+                .is_some_and(|encoded| DownlinkPdr::decode(encoded).ue_ip == far_key);
+            if pdr_claims_requested_ue
+                || existing_pdr.is_none() && (existing_far.is_some() || existing_binding.is_some())
+            {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_install_pdp_context",
+                });
+            }
+        }
         match (existing_far, existing_pdr, existing_binding, existing_dscp) {
             // Exact re-install of the same session state is idempotent.
             (Some(far), Some(pdr), Some(binding), dscp)
@@ -1229,31 +1895,59 @@ impl EbpfGtpuDataplaneBackend {
                 // session and is safe to reconcile before retrying the exact
                 // install. Any one-sided FAR/PDR state remains ambiguous and
                 // is rejected by the catch-all arm below.
-                match (existing_dscp, dscp_value) {
-                    (Some(existing), Some(requested)) if existing == requested => {}
-                    (_, Some(requested)) => {
-                        self.inner
-                            .runtime
-                            .dscp_insert(request.link_ifindex, far_key, requested)?
+                self.inner.runtime.default_selector_insert(
+                    request.link_ifindex,
+                    far_key,
+                    pdr_key,
+                )?;
+                let dscp_prepare = (|| {
+                    match (existing_dscp, dscp_value) {
+                        (Some(existing), Some(requested)) if existing == requested => {}
+                        (_, Some(requested)) => self.inner.runtime.dscp_insert(
+                            request.link_ifindex,
+                            far_key,
+                            requested,
+                        )?,
+                        (Some(_), None) => {
+                            self.inner
+                                .runtime
+                                .dscp_remove(request.link_ifindex, far_key)?;
+                        }
+                        (None, None) => {}
                     }
-                    (Some(_), None) => {
-                        self.inner
-                            .runtime
-                            .dscp_remove(request.link_ifindex, far_key)?;
-                    }
-                    (None, None) => {}
+                    Ok(())
+                })();
+                if let Err(error) = dscp_prepare {
+                    return self.rollback_default_selector(
+                        request.link_ifindex,
+                        far_key,
+                        pdr_key,
+                        error,
+                    );
                 }
                 if let Err(error) =
                     self.inner
                         .runtime
                         .far_insert(request.link_ifindex, far_key, far_value)
                 {
-                    return self.rollback_dscp_insert(
+                    let rollback = self.rollback_dscp_insert(
                         request.link_ifindex,
                         far_key,
                         dscp_value.is_some(),
                         error,
                     );
+                    return match rollback {
+                        Err(error @ GtpuError::StateIndeterminate { .. }) => Err(error),
+                        Err(source) => self.rollback_default_selector(
+                            request.link_ifindex,
+                            far_key,
+                            pdr_key,
+                            source,
+                        ),
+                        Ok(()) => Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_install_pdp_context",
+                        }),
+                    };
                 }
                 if let Err(error) = self.inner.runtime.downlink_binding_insert(
                     request.link_ifindex,
@@ -1272,7 +1966,12 @@ impl EbpfGtpuDataplaneBackend {
                             .dscp_remove(request.link_ifindex, far_key)
                             .is_ok();
                     return if far_rolled_back && dscp_rolled_back {
-                        Err(error)
+                        self.rollback_default_selector(
+                            request.link_ifindex,
+                            far_key,
+                            pdr_key,
+                            error,
+                        )
                     } else {
                         Err(GtpuError::StateIndeterminate {
                             operation: "ebpf_install_pdp_context",
@@ -1301,7 +2000,12 @@ impl EbpfGtpuDataplaneBackend {
                             .dscp_remove(request.link_ifindex, far_key)
                             .is_ok();
                     return if binding_rolled_back && far_rolled_back && dscp_rolled_back {
-                        Err(error)
+                        self.rollback_default_selector(
+                            request.link_ifindex,
+                            far_key,
+                            pdr_key,
+                            error,
+                        )
                     } else {
                         Err(GtpuError::StateIndeterminate {
                             operation: "ebpf_install_pdp_context",
@@ -1330,6 +2034,10 @@ impl EbpfGtpuDataplaneBackend {
 
     fn remove_pdp_context_sync(&self, request: RemovePdpContextRequest) -> Result<(), GtpuError> {
         let _operation = self.operation_guard()?;
+        self.remove_pdp_context_locked(request)
+    }
+
+    fn remove_pdp_context_locked(&self, request: RemovePdpContextRequest) -> Result<(), GtpuError> {
         validate_gtp_version(request.gtp_version)?;
         if !self.devices()?.contains_key(&request.link_ifindex) {
             return Err(GtpuError::NotFound);
@@ -1384,6 +2092,16 @@ impl EbpfGtpuDataplaneBackend {
             return Ok(());
         };
         let ue_ip = DownlinkPdr::decode(&legacy_pdr).ue_ip;
+        if self
+            .inner
+            .runtime
+            .default_teid_for_ue(request.link_ifindex, ue_ip)?
+            != Some(pdr_key)
+        {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_remove_pdp_context",
+            });
+        }
         let far_existed = self.inner.runtime.far_remove(request.link_ifindex, ue_ip)?;
         let dscp_result = self.inner.runtime.dscp_remove(request.link_ifindex, ue_ip);
         let dscp_existed = match dscp_result {
@@ -1424,7 +2142,16 @@ impl EbpfGtpuDataplaneBackend {
                 Err(error)
             };
         }
-        Ok(())
+        match self
+            .inner
+            .runtime
+            .default_selector_remove(request.link_ifindex, ue_ip, pdr_key)
+        {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_remove_pdp_context",
+            }),
+        }
     }
 
     fn probe_sync(&self) -> GtpuProbe {
@@ -1574,6 +2301,62 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         .await
     }
 
+    async fn read_pdp_context(
+        &self,
+        selector: PdpContextSelector,
+    ) -> Result<PdpContextReadback, GtpuError> {
+        self.run_blocking("ebpf_pdp_context_readback", move |backend| {
+            backend.read_pdp_context_sync(selector)
+        })
+        .await
+    }
+
+    async fn install_pdp_context_classified(
+        &self,
+        request: GtpPdpContext,
+    ) -> Result<PdpContextInstallOutcome, GtpuError> {
+        self.run_blocking("ebpf_pdp_context_classified_install", move |backend| {
+            backend.install_pdp_context_classified_sync(request)
+        })
+        .await
+    }
+
+    async fn remove_pdp_context_exact(
+        &self,
+        expected: GtpPdpContext,
+    ) -> Result<PdpContextRemovalOutcome, GtpuError> {
+        self.run_blocking("ebpf_pdp_context_exact_removal", move |backend| {
+            backend.remove_pdp_context_exact_sync(expected)
+        })
+        .await
+    }
+
+    fn pdp_context_reconciliation_capabilities(&self) -> PdpContextReconciliationCapabilities {
+        let environment = self.inner.runtime.probe_environment();
+        let capability = if !environment.platform_supported
+            || !environment.bpffs_present
+            || !environment.btf_present
+        {
+            GtpuCapability::Missing
+        } else if !environment.net_admin_capable || !environment.bpf_capable {
+            GtpuCapability::PermissionDenied
+        } else if self.devices().is_ok_and(|devices| {
+            !devices.is_empty()
+                && devices
+                    .keys()
+                    .all(|ifindex| self.inner.runtime.pdp_readback_datapath_usable(*ifindex))
+        }) {
+            GtpuCapability::Available
+        } else {
+            GtpuCapability::Unknown
+        };
+        PdpContextReconciliationCapabilities {
+            readback: capability,
+            classified_install: capability,
+            exact_removal: capability,
+        }
+    }
+
     async fn probe(&self) -> Result<GtpuProbe, GtpuError> {
         self.run_blocking("ebpf_probe", move |backend| Ok(backend.probe_sync()))
             .await
@@ -1720,6 +2503,7 @@ mod aya_runtime {
     struct LoadedDevice {
         ebpf: Ebpf,
         marked_owner_by_teid: HashMap<[u8; 4], [u8; UPLINK_MARK_KEY_LEN]>,
+        default_teid_by_ue: HashMap<[u8; 4], [u8; 4]>,
         // Aya's netlink tc link drops by priority/handle rather than by
         // program ID. Keep the links kernel-owned and detach them only after
         // proving that both live slots still contain our exact program IDs.
@@ -1740,10 +2524,16 @@ mod aya_runtime {
             formatter
                 .debug_struct("LoadedDevice")
                 .field("marked_owner_count", &self.marked_owner_by_teid.len())
+                .field("default_owner_count", &self.default_teid_by_ue.len())
                 .field("tc_priority", &self.tc_priority)
                 .field("datapath_identity", &self.datapath_identity)
                 .finish_non_exhaustive()
         }
+    }
+
+    struct PdpHostIndexes {
+        marked_owner_by_teid: HashMap<[u8; 4], [u8; UPLINK_MARK_KEY_LEN]>,
+        default_teid_by_ue: HashMap<[u8; 4], [u8; 4]>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2064,11 +2854,11 @@ mod aya_runtime {
 
         /// Validate the durable marked-bearer journal and build its bounded
         /// local-TEID uniqueness index before either tc hook can be changed.
-        fn marked_owner_index(
+        fn pdp_host_indexes(
             ebpf: &Ebpf,
             local_ip: [u8; 4],
             ifindex: u32,
-        ) -> Result<HashMap<[u8; 4], [u8; UPLINK_MARK_KEY_LEN]>, GtpuError> {
+        ) -> Result<PdpHostIndexes, GtpuError> {
             let missing =
                 || GtpuError::io("ebpf_marked_owner_rebuild", invalid_data("map missing"));
             let invalid = || state_indeterminate("ebpf_marked_owner_rebuild");
@@ -2107,6 +2897,10 @@ mod aya_runtime {
                 .map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
             let legacy_far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(
                 ebpf.map(MAP_UPLINK_FAR).ok_or_else(missing)?,
+            )
+            .map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+            let legacy_dscp = BpfHashMap::<_, [u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]>::try_from(
+                ebpf.map(MAP_UPLINK_DSCP).ok_or_else(missing)?,
             )
             .map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
 
@@ -2230,7 +3024,7 @@ mod aya_runtime {
             }
 
             let mut default_teids = HashSet::new();
-            let mut default_ues = HashSet::new();
+            let mut default_teid_by_ue = HashMap::new();
             for entry in legacy_pdr.iter() {
                 let (teid, encoded) =
                     entry.map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
@@ -2245,15 +3039,35 @@ mod aya_runtime {
                     .map_err(|_| invalid())?;
                 if !default_bearer_graph_is_valid(teid, pdr, far, binding, local_ip, ifindex)
                     || !default_teids.insert(teid)
-                    || !default_ues.insert(pdr.ue_ip)
+                    || default_teid_by_ue.insert(pdr.ue_ip, teid).is_some()
                 {
                     return Err(invalid());
+                }
+                match legacy_dscp.get(&pdr.ue_ip, 0) {
+                    Ok(value) if value[0] <= 63 => {}
+                    Ok(_) => return Err(invalid()),
+                    Err(MapError::KeyNotFound) => {}
+                    Err(error) => {
+                        return Err(map_error("ebpf_marked_owner_rebuild", error));
+                    }
                 }
             }
             for entry in legacy_far.iter() {
                 let (ue_ip, _) =
                     entry.map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
-                if ue_ip != UPLINK_DSCP_SCHEMA_MARKER_KEY && !default_ues.contains(&ue_ip) {
+                if ue_ip != UPLINK_DSCP_SCHEMA_MARKER_KEY
+                    && !default_teid_by_ue.contains_key(&ue_ip)
+                {
+                    return Err(invalid());
+                }
+            }
+            for entry in legacy_dscp.iter() {
+                let (_, value) =
+                    entry.map_err(|error| map_error("ebpf_marked_owner_rebuild", error))?;
+                // A valid DSCP-only orphan has no forwarding reachability and
+                // remains recoverable by the legacy exact retry path. The
+                // strict readback contract classifies it as indeterminate.
+                if value[0] > 63 {
                     return Err(invalid());
                 }
             }
@@ -2267,7 +3081,10 @@ mod aya_runtime {
                     return Err(invalid());
                 }
             }
-            Ok(by_teid)
+            Ok(PdpHostIndexes {
+                marked_owner_by_teid: by_teid,
+                default_teid_by_ue,
+            })
         }
 
         fn program_identity(
@@ -3372,7 +4189,7 @@ mod aya_runtime {
                     // address is an ownership conflict.
                     return Err(GtpuError::AlreadyExists);
                 }
-                let marked_owner_by_teid = Self::marked_owner_index(&ebpf, local_ip, ifindex)?;
+                let indexes = Self::pdp_host_indexes(&ebpf, local_ip, ifindex)?;
                 let attached = self.attach_programs(
                     &mut ebpf,
                     interface,
@@ -3405,9 +4222,9 @@ mod aya_runtime {
                         ));
                     }
                 }
-                Ok((attached, marked_owner_by_teid))
+                Ok((attached, indexes))
             })();
-            let (attached, marked_owner_by_teid) = match provisioned {
+            let (attached, indexes) = match provisioned {
                 Ok(provisioned) => provisioned,
                 Err(error) => {
                     let error = Self::finish_fresh_attach_failure(
@@ -3456,7 +4273,8 @@ mod aya_runtime {
                 ifindex,
                 LoadedDevice {
                     ebpf,
-                    marked_owner_by_teid,
+                    marked_owner_by_teid: indexes.marked_owner_by_teid,
+                    default_teid_by_ue: indexes.default_teid_by_ue,
                     links: attached.links,
                     pin_dir: canonical_pin_dir,
                     tc_priority,
@@ -3508,7 +4326,7 @@ mod aya_runtime {
                     Err(error) => Err(error),
                 };
             }
-            let marked_owner_by_teid = Self::marked_owner_index(&ebpf, local_ip, ifindex)?;
+            let indexes = Self::pdp_host_indexes(&ebpf, local_ip, ifindex)?;
             let attached = self.attach_programs(
                 &mut ebpf,
                 interface,
@@ -3560,7 +4378,8 @@ mod aya_runtime {
                 ifindex,
                 LoadedDevice {
                     ebpf,
-                    marked_owner_by_teid,
+                    marked_owner_by_teid: indexes.marked_owner_by_teid,
+                    default_teid_by_ue: indexes.default_teid_by_ue,
                     links: attached.links,
                     pin_dir: canonical_pin_dir,
                     tc_priority,
@@ -3597,6 +4416,7 @@ mod aya_runtime {
             let LoadedDevice {
                 ebpf,
                 marked_owner_by_teid: _,
+                default_teid_by_ue: _,
                 links,
                 pin_dir,
                 tc_priority,
@@ -4133,6 +4953,65 @@ mod aya_runtime {
             })
         }
 
+        fn default_teid_for_ue(
+            &self,
+            ifindex: u32,
+            ue_ip: [u8; 4],
+        ) -> Result<Option<[u8; 4]>, GtpuError> {
+            self.with_device(ifindex, "ebpf_default_teid_for_ue", |device| {
+                Ok(device.default_teid_by_ue.get(&ue_ip).copied())
+            })
+        }
+
+        fn default_selector_insert(
+            &self,
+            ifindex: u32,
+            ue_ip: [u8; 4],
+            local_teid: [u8; 4],
+        ) -> Result<(), GtpuError> {
+            self.with_device(ifindex, "ebpf_default_selector_insert", |device| {
+                if ue_ip == [0; 4] || local_teid == [0; 4] {
+                    return Err(state_indeterminate("ebpf_default_selector_insert"));
+                }
+                if device
+                    .default_teid_by_ue
+                    .get(&ue_ip)
+                    .is_some_and(|existing| *existing != local_teid)
+                    || device
+                        .default_teid_by_ue
+                        .iter()
+                        .any(|(existing_ue, existing_teid)| {
+                            *existing_teid == local_teid && *existing_ue != ue_ip
+                        })
+                    || device.marked_owner_by_teid.contains_key(&local_teid)
+                {
+                    return Err(GtpuError::AlreadyExists);
+                }
+                device.default_teid_by_ue.insert(ue_ip, local_teid);
+                Ok(())
+            })
+        }
+
+        fn default_selector_remove(
+            &self,
+            ifindex: u32,
+            ue_ip: [u8; 4],
+            local_teid: [u8; 4],
+        ) -> Result<bool, GtpuError> {
+            self.with_device(
+                ifindex,
+                "ebpf_default_selector_remove",
+                |device| match device.default_teid_by_ue.get(&ue_ip) {
+                    None => Ok(false),
+                    Some(existing) if *existing == local_teid => {
+                        device.default_teid_by_ue.remove(&ue_ip);
+                        Ok(true)
+                    }
+                    Some(_) => Err(state_indeterminate("ebpf_default_selector_remove")),
+                },
+            )
+        }
+
         fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError> {
             let devices = self
                 .devices
@@ -4248,6 +5127,15 @@ mod aya_runtime {
         }
 
         fn downlink_endpoint_binding_datapath_usable(&self, ifindex: u32) -> bool {
+            let Ok(devices) = self.devices.lock() else {
+                return false;
+            };
+            devices
+                .get(&ifindex)
+                .is_some_and(|device| Self::loaded_datapath_is_current(ifindex, device))
+        }
+
+        fn pdp_readback_datapath_usable(&self, ifindex: u32) -> bool {
             let Ok(devices) = self.devices.lock() else {
                 return false;
             };
@@ -4648,6 +5536,7 @@ mod tests {
         marked_owner:
             HashMap<(u32, [u8; UPLINK_MARK_KEY_LEN]), [u8; MARKED_BEARER_OWNER_VALUE_LEN]>,
         marked_owner_by_teid: HashMap<(u32, [u8; 4]), [u8; UPLINK_MARK_KEY_LEN]>,
+        default_teid_by_ue: HashMap<(u32, [u8; 4]), [u8; 4]>,
         datapath_snapshot: EbpfGtpuDatapathSnapshot,
         dscp_map_ready: HashSet<u32>,
         marked_far_map_ready: HashSet<u32>,
@@ -4869,7 +5758,7 @@ mod tests {
             // must therefore both be complete and agree with the exact FAR
             // before either hook may be attached.
             let mut default_teids = HashSet::new();
-            let mut default_ues = HashSet::new();
+            let mut default_teid_by_ue = HashMap::new();
             for ((index, teid), encoded) in &state.pdr {
                 if *index != ifindex {
                     continue;
@@ -4889,7 +5778,14 @@ mod tests {
                 let binding = DownlinkEndpointBinding::decode(&binding);
                 if !default_bearer_graph_is_valid(*teid, pdr, far, binding, local_ip, ifindex)
                     || !default_teids.insert(*teid)
-                    || !default_ues.insert(pdr.ue_ip)
+                    || default_teid_by_ue.insert(pdr.ue_ip, *teid).is_some()
+                {
+                    return Err(invalid());
+                }
+                if state
+                    .dscp
+                    .get(&(*index, pdr.ue_ip))
+                    .is_some_and(|value| value[0] > 63)
                 {
                     return Err(invalid());
                 }
@@ -4897,8 +5793,13 @@ mod tests {
             for (index, ue_ip) in state.far.keys() {
                 if *index == ifindex
                     && *ue_ip != opc_gtpu_ebpf_common::UPLINK_DSCP_SCHEMA_MARKER_KEY
-                    && !default_ues.contains(ue_ip)
+                    && !default_teid_by_ue.contains_key(ue_ip)
                 {
+                    return Err(invalid());
+                }
+            }
+            for ((index, _), value) in &state.dscp {
+                if *index == ifindex && value[0] > 63 {
                     return Err(invalid());
                 }
             }
@@ -4920,6 +5821,14 @@ mod tests {
                 rebuilt
                     .into_iter()
                     .map(|(teid, selector)| ((ifindex, teid), selector)),
+            );
+            state
+                .default_teid_by_ue
+                .retain(|(index, _), _| *index != ifindex);
+            state.default_teid_by_ue.extend(
+                default_teid_by_ue
+                    .into_iter()
+                    .map(|(ue_ip, teid)| ((ifindex, ue_ip), teid)),
             );
             Ok(())
         }
@@ -5048,6 +5957,9 @@ mod tests {
             state.marked_owner.retain(|(index, _), _| *index != ifindex);
             state
                 .marked_owner_by_teid
+                .retain(|(index, _), _| *index != ifindex);
+            state
+                .default_teid_by_ue
                 .retain(|(index, _), _| *index != ifindex);
             Ok(())
         }
@@ -5473,6 +6385,70 @@ mod tests {
                 .copied())
         }
 
+        fn default_teid_for_ue(
+            &self,
+            ifindex: u32,
+            ue_ip: [u8; 4],
+        ) -> Result<Option<[u8; 4]>, GtpuError> {
+            Ok(self
+                .state()
+                .default_teid_by_ue
+                .get(&(ifindex, ue_ip))
+                .copied())
+        }
+
+        fn default_selector_insert(
+            &self,
+            ifindex: u32,
+            ue_ip: [u8; 4],
+            local_teid: [u8; 4],
+        ) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            Self::fail_if_requested(&mut state, "default_selector_insert")?;
+            if ue_ip == [0; 4]
+                || local_teid == [0; 4]
+                || state
+                    .default_teid_by_ue
+                    .get(&(ifindex, ue_ip))
+                    .is_some_and(|existing| *existing != local_teid)
+                || state
+                    .default_teid_by_ue
+                    .iter()
+                    .any(|((index, existing_ue), existing_teid)| {
+                        *index == ifindex && *existing_teid == local_teid && *existing_ue != ue_ip
+                    })
+                || state
+                    .marked_owner_by_teid
+                    .contains_key(&(ifindex, local_teid))
+            {
+                return Err(GtpuError::AlreadyExists);
+            }
+            state
+                .default_teid_by_ue
+                .insert((ifindex, ue_ip), local_teid);
+            Ok(())
+        }
+
+        fn default_selector_remove(
+            &self,
+            ifindex: u32,
+            ue_ip: [u8; 4],
+            local_teid: [u8; 4],
+        ) -> Result<bool, GtpuError> {
+            let mut state = self.state();
+            Self::fail_if_requested(&mut state, "default_selector_remove")?;
+            match state.default_teid_by_ue.get(&(ifindex, ue_ip)) {
+                None => Ok(false),
+                Some(existing) if *existing == local_teid => {
+                    state.default_teid_by_ue.remove(&(ifindex, ue_ip));
+                    Ok(true)
+                }
+                Some(_) => Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_default_selector_remove",
+                }),
+            }
+        }
+
         fn datapath_snapshot(&self, ifindex: u32) -> Result<EbpfGtpuDatapathSnapshot, GtpuError> {
             let mut state = self.state();
             let exact = state.attached.contains_key(&ifindex)
@@ -5528,6 +6504,23 @@ mod tests {
                 && state.downlink_binding_counters_map_ready.contains(&ifindex)
                 && state.downlink_filter_ready.contains(&ifindex)
                 && !state.pin_identity_invalid.contains(&ifindex)
+                && !state.downlink_filter_foreign.contains(&ifindex)
+        }
+
+        fn pdp_readback_datapath_usable(&self, ifindex: u32) -> bool {
+            let state = self.state();
+            state.attached.contains_key(&ifindex)
+                && state.dscp_map_ready.contains(&ifindex)
+                && state.marked_far_map_ready.contains(&ifindex)
+                && state.marked_dscp_map_ready.contains(&ifindex)
+                && state.marked_pdr_map_ready.contains(&ifindex)
+                && state.marked_owner_map_ready.contains(&ifindex)
+                && state.downlink_binding_map_ready.contains(&ifindex)
+                && state.downlink_binding_counters_map_ready.contains(&ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && !state.pin_identity_invalid.contains(&ifindex)
+                && !state.uplink_filter_foreign.contains(&ifindex)
                 && !state.downlink_filter_foreign.contains(&ifindex)
         }
 
@@ -7649,6 +8642,276 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_readback_survives_restart_for_default_and_marked_contexts() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let mut default = context();
+        default.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+        let mut marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+        marked.egress_dscp = Some(crate::DscpCodepoint::new(34).unwrap());
+
+        for desired in [&default, &marked] {
+            assert_eq!(
+                backend
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Installed
+            );
+        }
+        {
+            let mut state = runtime.state();
+            state.attached.clear();
+            state.default_teid_by_ue.clear();
+            state.marked_owner_by_teid.clear();
+        }
+
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime);
+        restarted.resolve_device("s2bu").await.unwrap();
+        for desired in [&default, &marked] {
+            assert_eq!(
+                restarted
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::ExactAlreadyPresent
+            );
+            assert_eq!(
+                restarted
+                    .read_pdp_context(PdpContextSelector::LocalTeid(
+                        PdpContextLocalTeidSelector::from_context(desired).unwrap(),
+                    ))
+                    .await
+                    .unwrap(),
+                PdpContextReadback::Present(desired.clone())
+            );
+            assert_eq!(
+                restarted
+                    .read_pdp_context(PdpContextSelector::Uplink(
+                        PdpContextUplinkSelector::from_context(desired).unwrap(),
+                    ))
+                    .await
+                    .unwrap(),
+                PdpContextReadback::Present(desired.clone())
+            );
+        }
+        assert_eq!(
+            restarted.pdp_context_reconciliation_capabilities(),
+            PdpContextReconciliationCapabilities {
+                readback: GtpuCapability::Available,
+                classified_install: GtpuCapability::Available,
+                exact_removal: GtpuCapability::Available,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_reconciliation_classifies_both_collision_axes_without_relocation() {
+        let (backend, _runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let installed = context();
+        assert_eq!(
+            backend
+                .install_pdp_context_classified(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+
+        let mut same_uplink = installed.clone();
+        same_uplink.local_teid = teid(0x1000_0002);
+        same_uplink.peer_teid = teid(0x2000_0002);
+        assert!(matches!(
+            backend
+                .install_pdp_context_classified(same_uplink.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Conflict(conflict)
+                if conflict.occupied() == crate::PdpContextSelectorOccupancy::Uplink
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::LocalTeid)
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::PeerTeid)
+        ));
+
+        let mut same_local = installed.clone();
+        same_local.ms_address = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 3));
+        same_local.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        same_local.bearer_mark = GtpBearerMark::new(0x1001);
+        same_local.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+        assert!(matches!(
+            backend
+                .install_pdp_context_classified(same_local)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Conflict(conflict)
+                if conflict.occupied() == crate::PdpContextSelectorOccupancy::LocalTeid
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::MsAddress)
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::PeerAddress)
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::BearerMark)
+                    && conflict.mismatches().contains(&crate::PdpContextMismatchField::EgressDscp)
+        ));
+
+        assert!(matches!(
+            backend.remove_pdp_context_exact(same_uplink).await.unwrap(),
+            PdpContextRemovalOutcome::Conflict(_)
+        ));
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&installed).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(installed.clone())
+        );
+        assert_eq!(
+            backend
+                .remove_pdp_context_exact(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend.remove_pdp_context_exact(installed).await.unwrap(),
+            PdpContextRemovalOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_fails_closed_for_each_partial_default_graph_shape() {
+        for cut in ["far", "pdr", "binding", "reverse_index", "dscp"] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let mut desired = context();
+            desired.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+            backend
+                .install_pdp_context_classified(desired.clone())
+                .await
+                .unwrap();
+            {
+                let mut state = runtime.state();
+                match cut {
+                    "far" => {
+                        state.far.remove(&(S2BU_IFINDEX, [10, 45, 0, 2]));
+                    }
+                    "pdr" => {
+                        state
+                            .pdr
+                            .remove(&(S2BU_IFINDEX, desired.local_teid.get().to_be_bytes()));
+                    }
+                    "binding" => {
+                        state
+                            .downlink_binding
+                            .remove(&(S2BU_IFINDEX, desired.local_teid.get().to_be_bytes()));
+                    }
+                    "reverse_index" => {
+                        state
+                            .default_teid_by_ue
+                            .remove(&(S2BU_IFINDEX, [10, 45, 0, 2]));
+                    }
+                    _ => {
+                        state.dscp.insert((S2BU_IFINDEX, [10, 45, 0, 2]), [64]);
+                    }
+                }
+            }
+            assert!(matches!(
+                backend
+                    .read_pdp_context(PdpContextSelector::LocalTeid(
+                        PdpContextLocalTeidSelector::from_context(&desired).unwrap(),
+                    ))
+                    .await
+                    .unwrap_err(),
+                GtpuError::StateIndeterminate { .. }
+            ));
+            assert_eq!(
+                backend
+                    .install_pdp_context_classified(desired)
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::IncompleteState
+                ),
+                "cut={cut}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_rejects_transitional_owner_and_lost_authority() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let marked = marked_context(0x1001, 0x1000_0002, 0x2000_0002);
+        backend
+            .install_pdp_context_classified(marked.clone())
+            .await
+            .unwrap();
+        let selector = UplinkFarKey {
+            ue_ip: [10, 45, 0, 2],
+            bearer_mark: 0x1001_u32.to_be_bytes(),
+        }
+        .encode();
+        {
+            let mut state = runtime.state();
+            let encoded = state
+                .marked_owner
+                .get(&(S2BU_IFINDEX, selector))
+                .copied()
+                .unwrap();
+            let mut owner = MarkedBearerOwner::decode(&encoded);
+            owner.phase = MarkedBearerOwnerPhase::Pending;
+            state
+                .marked_owner
+                .insert((S2BU_IFINDEX, selector), owner.encode());
+        }
+        assert_eq!(
+            backend
+                .install_pdp_context_classified(marked.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Indeterminate(PdpContextIndeterminateReason::IncompleteState)
+        );
+
+        runtime.state().pin_identity_invalid.insert(S2BU_IFINDEX);
+        assert_eq!(
+            backend.remove_pdp_context_exact(marked).await.unwrap(),
+            PdpContextRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_classified_install_converges_by_authoritative_retry() {
+        let (backend, _runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let desired = context();
+        let task = tokio::spawn({
+            let backend = backend.clone();
+            let desired = desired.clone();
+            async move { backend.install_pdp_context_classified(desired).await }
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(matches!(
+            backend
+                .install_pdp_context_classified(desired.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed | PdpContextInstallOutcome::ExactAlreadyPresent
+        ));
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&desired).unwrap(),
+                ))
+                .await
+                .unwrap(),
+            PdpContextReadback::Present(desired)
+        );
     }
 
     #[tokio::test]

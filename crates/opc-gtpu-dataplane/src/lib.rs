@@ -9,6 +9,14 @@
 //! management, or deployment policy; GTP-U packet handling itself lives in
 //! the committed eBPF datapath object and `opc-gtpu-ebpf-common`.
 //!
+//! The additive reconciliation contract provides typed lookup by local TEID or
+//! uplink identity, dual-selector classified install, and capability-gated
+//! exact removal. Existing backend implementations inherit fail-closed
+//! unsupported defaults. The eBPF adapter proves complete pinned-map state and
+//! held mutation authority; the Linux adapter provides strict double-read
+//! `GETPDP` inspection but intentionally cannot claim exact removal because the
+//! kernel API has no compare-delete primitive.
+//!
 //! Raw Linux netlink and socket syscalls stay in [`opc_linux_gtpu_sys`]; this
 //! crate is safe Rust and never performs `unsafe` operations.
 
@@ -29,11 +37,18 @@ pub use ebpf::{
 };
 pub use error::GtpuError;
 pub use linux::{LinuxGtpuDataplaneBackend, LinuxGtpuDataplaneBackendConfig};
-pub use mock::{MockGtpuDataplaneBackend, MockOperation};
+pub use mock::{
+    MockGtpuDataplaneBackend, MockOperation, MockPdpContextFault,
+    MockPdpContextReconciliationOperation,
+};
 pub use model::{
     CreateGtpDeviceRequest, GtpAddressFamily, GtpBearerMark, GtpDevice, GtpPdpContext, GtpRole,
     GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDownlinkEndpoint, GtpuProbe,
-    GtpuSourcePortPolicy, GtpuSourcePortRange, RemovePdpContextRequest, Teid, GTPU_PORT,
+    GtpuSourcePortPolicy, GtpuSourcePortRange, PdpContextConflict, PdpContextIndeterminateReason,
+    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextMismatchField,
+    PdpContextReadback, PdpContextReconciliationCapabilities, PdpContextRemovalOutcome,
+    PdpContextSelector, PdpContextSelectorOccupancy, PdpContextUplinkIdentity,
+    PdpContextUplinkSelector, RemovePdpContextRequest, Teid, GTPU_PORT,
 };
 pub use opc_types::DscpCodepoint;
 pub use unsupported::UnsupportedGtpuDataplaneBackend;
