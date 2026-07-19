@@ -16,14 +16,16 @@ pub(crate) fn validate_route_request(request: &RouteRequest) -> Result<(), Route
 /// IPv4 omits `0`. IPv6 assigns the effective default metric `1024` when the
 /// attribute is omitted or zero.
 pub(crate) fn canonical_route_priority(request: &RouteRequest) -> Option<u32> {
-    match request.destination.address {
-        std::net::IpAddr::V4(_) => request.priority.filter(|priority| *priority != 0),
-        std::net::IpAddr::V6(_) => Some(
-            request
-                .priority
-                .filter(|priority| *priority != 0)
-                .unwrap_or(1024),
-        ),
+    canonical_route_priority_for_address(request.destination.address, request.priority)
+}
+
+pub(crate) fn canonical_route_priority_for_address(
+    address: IpAddr,
+    priority: Option<u32>,
+) -> Option<u32> {
+    match address {
+        IpAddr::V4(_) => priority.filter(|priority| *priority != 0),
+        IpAddr::V6(_) => Some(priority.filter(|priority| *priority != 0).unwrap_or(1024)),
     }
 }
 

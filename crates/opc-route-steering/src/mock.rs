@@ -11,6 +11,13 @@ use crate::backend::{
     route_readback_to_convergence, rule_readback_after_owned_rollback, rule_readback_failure_class,
     rule_readback_to_convergence, RouteSteeringBackend,
 };
+use crate::collection::{
+    reconcile_incomplete, reconcile_rollback_incomplete, rule_is_ipv4,
+    OwnedRouteRuleReconcileOutcome, OwnedRouteRuleReconcilePhase, OwnedRouteRuleScope,
+    OwnedRouteRuleSet, OwnedRouteRuleSnapshot, MAX_OWNED_ROUTE_COLLECTION_ENTRIES,
+    MAX_OWNED_RULE_COLLECTION_ENTRIES, MAX_TRANSIENT_OWNED_ROUTE_COLLECTION_ENTRIES,
+    MAX_TRANSIENT_OWNED_RULE_COLLECTION_ENTRIES,
+};
 use crate::error::{RouteSteeringError, RouteSteeringFailureClass};
 use crate::model::{
     RouteConflict, RouteConvergenceOutcome, RouteMismatch, RouteReadback, RouteRequest,
@@ -48,6 +55,8 @@ pub enum MockObservation {
     ReadRoute(RouteRequest),
     /// Rule readback.
     ReadRule(RuleRequest),
+    /// Complete owned route/rule scope snapshot.
+    SnapshotOwnedRouteRules(OwnedRouteRuleScope),
 }
 
 /// Operation boundary where the mock should inject its next targeted failure.
@@ -66,6 +75,10 @@ pub enum MockFailurePoint {
     ReadRoute,
     /// Rule readback.
     ReadRule,
+    /// Complete owned route/rule scope snapshot.
+    SnapshotOwnedRouteRules,
+    /// Post-install complete owned route/rule verification.
+    VerifyOwnedRouteRules,
     /// Capability probe.
     Probe,
 }
@@ -87,7 +100,7 @@ struct MockState {
     targeted_failures: BTreeMap<MockFailurePoint, RouteSteeringError>,
 }
 
-const MAX_MOCK_CANDIDATES_PER_KEY: usize = 4096;
+const MAX_MOCK_CANDIDATES_PER_KEY: usize = MAX_TRANSIENT_OWNED_RULE_COLLECTION_ENTRIES;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MockRouteResident {
@@ -108,6 +121,12 @@ struct RouteKernelKey(crate::model::IpPrefix);
 struct RuleKernelKey {
     ipv4: bool,
     priority: u32,
+}
+
+struct MockOwnedCollectionState {
+    snapshot: OwnedRouteRuleSnapshot,
+    colliding_route_destinations: BTreeSet<crate::model::IpPrefix>,
+    colliding_rule_key: bool,
 }
 
 impl RouteKernelKey {
@@ -303,10 +322,13 @@ impl MockRouteSteeringBackend {
             owned,
         };
         let candidates = state.routes.entry(key).or_default();
-        if candidates
-            .iter()
-            .any(|candidate| candidate.request == request)
-        {
+        if candidates.contains(&MockRouteResident {
+            request: request.clone(),
+            owned: true,
+        }) || candidates.contains(&MockRouteResident {
+            request: request.clone(),
+            owned: false,
+        }) {
             return Err(RouteSteeringError::AlreadyExists);
         }
         insert_bounded(candidates, resident)?;
@@ -414,10 +436,13 @@ impl MockRouteSteeringBackend {
             owned,
         };
         let candidates = state.rules.entry(key).or_default();
-        if candidates
-            .iter()
-            .any(|candidate| candidate.request == request)
-        {
+        if candidates.contains(&MockRuleResident {
+            request: request.clone(),
+            owned: true,
+        }) || candidates.contains(&MockRuleResident {
+            request: request.clone(),
+            owned: false,
+        }) {
             return Err(RouteSteeringError::AlreadyExists);
         }
         insert_bounded(candidates, resident)?;
@@ -706,6 +731,538 @@ impl MockRouteSteeringBackend {
             Err(error) => Err(error),
         }
     }
+
+    fn snapshot_owned_locked(
+        state: &mut MockState,
+        scope: OwnedRouteRuleScope,
+    ) -> Result<MockOwnedCollectionState, RouteSteeringError> {
+        Self::snapshot_owned_with_limit_locked(state, scope, false)
+    }
+
+    fn snapshot_owned_transient_locked(
+        state: &mut MockState,
+        scope: OwnedRouteRuleScope,
+    ) -> Result<MockOwnedCollectionState, RouteSteeringError> {
+        Self::snapshot_owned_with_limit_locked(state, scope, true)
+    }
+
+    fn snapshot_owned_with_limit_locked(
+        state: &mut MockState,
+        scope: OwnedRouteRuleScope,
+        transient: bool,
+    ) -> Result<MockOwnedCollectionState, RouteSteeringError> {
+        Self::check_failure(state, MockFailurePoint::SnapshotOwnedRouteRules)?;
+        state
+            .observations
+            .push(MockObservation::SnapshotOwnedRouteRules(scope));
+
+        let mut routes = Vec::new();
+        let mut rules = Vec::new();
+        let mut colliding_route_destinations = BTreeSet::new();
+        let mut colliding_rule_key = false;
+        for candidates in state.routes.values() {
+            for candidate in candidates {
+                if candidate.owned && scope.contains_route(&candidate.request) {
+                    routes.push(candidate.request.clone());
+                } else {
+                    colliding_route_destinations.insert(candidate.request.destination);
+                }
+            }
+        }
+        for candidates in state.rules.values() {
+            for candidate in candidates {
+                if candidate.owned && scope.contains_rule(&candidate.request) {
+                    rules.push(candidate.request.clone());
+                } else if rule_is_ipv4(&candidate.request)
+                    == matches!(
+                        scope.family(),
+                        crate::collection::RouteSteeringIpFamily::Ipv4
+                    )
+                    && candidate.request.priority == scope.rule_priority()
+                {
+                    colliding_rule_key = true;
+                }
+            }
+        }
+        let (max_routes, max_rules) = if transient {
+            (
+                MAX_TRANSIENT_OWNED_ROUTE_COLLECTION_ENTRIES,
+                MAX_TRANSIENT_OWNED_RULE_COLLECTION_ENTRIES,
+            )
+        } else {
+            (
+                MAX_OWNED_ROUTE_COLLECTION_ENTRIES,
+                MAX_OWNED_RULE_COLLECTION_ENTRIES,
+            )
+        };
+        if routes.len() > max_routes || rules.len() > max_rules {
+            return Err(RouteSteeringError::indeterminate(
+                crate::model::ReadbackIndeterminateReason::LimitExceeded,
+            ));
+        }
+        let snapshot = if transient {
+            OwnedRouteRuleSnapshot::new_transient(scope, routes, rules)
+        } else {
+            OwnedRouteRuleSnapshot::new(scope, routes, rules)
+        }
+        .map_err(|_| {
+            RouteSteeringError::indeterminate(
+                crate::model::ReadbackIndeterminateReason::UnrepresentableObject,
+            )
+        })?;
+        Ok(MockOwnedCollectionState {
+            snapshot,
+            colliding_route_destinations,
+            colliding_rule_key,
+        })
+    }
+
+    fn ensure_collection_collision_free(
+        state: &MockOwnedCollectionState,
+        desired: &OwnedRouteRuleSet,
+    ) -> Result<(), RouteSteeringError> {
+        if state
+            .snapshot
+            .routes()
+            .iter()
+            .chain(desired.routes())
+            .any(|route| {
+                state
+                    .colliding_route_destinations
+                    .contains(&route.destination)
+            })
+        {
+            return Err(RouteSteeringError::AlreadyExists);
+        }
+        if state.colliding_rule_key
+            && (!state.snapshot.rules().is_empty() || !desired.rules().is_empty())
+        {
+            return Err(RouteSteeringError::AlreadyExists);
+        }
+        Ok(())
+    }
+
+    fn remove_owned_route_exact_locked(
+        state: &mut MockState,
+        request: &RouteRequest,
+    ) -> Result<(), RouteSteeringError> {
+        Self::check_failure(state, MockFailurePoint::RemoveRoute)?;
+        let key = RouteKernelKey::from_request(request);
+        let remove_key = if let Some(candidates) = state.routes.get_mut(&key) {
+            if !candidates.remove(&MockRouteResident {
+                request: request.clone(),
+                owned: true,
+            }) {
+                return Err(RouteSteeringError::NotFound);
+            }
+            candidates.is_empty()
+        } else {
+            return Err(RouteSteeringError::NotFound);
+        };
+        if remove_key {
+            state.routes.remove(&key);
+        }
+        state
+            .operations
+            .push(MockOperation::RemoveRoute(request.clone()));
+        Ok(())
+    }
+
+    fn remove_owned_rule_exact_locked(
+        state: &mut MockState,
+        request: &RuleRequest,
+    ) -> Result<(), RouteSteeringError> {
+        Self::check_failure(state, MockFailurePoint::RemoveRule)?;
+        let key = RuleKernelKey::from_request(request);
+        let remove_key = if let Some(candidates) = state.rules.get_mut(&key) {
+            if !candidates.remove(&MockRuleResident {
+                request: request.clone(),
+                owned: true,
+            }) {
+                return Err(RouteSteeringError::NotFound);
+            }
+            candidates.is_empty()
+        } else {
+            return Err(RouteSteeringError::NotFound);
+        };
+        if remove_key {
+            state.rules.remove(&key);
+        }
+        state
+            .operations
+            .push(MockOperation::RemoveRule(request.clone()));
+        Ok(())
+    }
+
+    fn rollback_owned_collection_installs(
+        state: &mut MockState,
+        before: &MockOwnedCollectionState,
+        desired: &OwnedRouteRuleSet,
+        routes: &[RouteRequest],
+        rules: &[RuleRequest],
+    ) -> Result<(), RouteSteeringFailureClass> {
+        for rule in rules.iter().rev() {
+            if let Err(rollback) = Self::remove_owned_rule_exact_locked(state, rule) {
+                let _ = Self::snapshot_owned_transient_locked(state, desired.scope());
+                return Err(rollback.class());
+            }
+        }
+        for route in routes.iter().rev() {
+            if let Err(rollback) = Self::remove_owned_route_exact_locked(state, route) {
+                let _ = Self::snapshot_owned_transient_locked(state, desired.scope());
+                return Err(rollback.class());
+            }
+        }
+        let rollback_state = Self::snapshot_owned_transient_locked(state, desired.scope())
+            .map_err(|rollback| rollback.class())?;
+        if rollback_state.snapshot != before.snapshot
+            || Self::ensure_collection_collision_free(&rollback_state, desired).is_err()
+        {
+            return Err(RouteSteeringFailureClass::ReadbackIndeterminate);
+        }
+        Ok(())
+    }
+
+    fn reconcile_owned_locked(
+        state: &mut MockState,
+        desired: OwnedRouteRuleSet,
+    ) -> Result<OwnedRouteRuleReconcileOutcome, RouteSteeringError> {
+        // Recover a bounded old∪new residual left by interruption after the
+        // prior install phase. Public and final snapshots keep the lower cap.
+        let before = Self::snapshot_owned_transient_locked(state, desired.scope())?;
+        Self::ensure_collection_collision_free(&before, &desired)?;
+        let before_routes = before
+            .snapshot
+            .routes()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let before_rules = before
+            .snapshot
+            .rules()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let desired_routes = desired.routes().iter().cloned().collect::<BTreeSet<_>>();
+        let desired_rules = desired.rules().iter().cloned().collect::<BTreeSet<_>>();
+        let missing_routes = desired_routes
+            .difference(&before_routes)
+            .cloned()
+            .collect::<Vec<_>>();
+        let missing_rules = desired_rules
+            .difference(&before_rules)
+            .cloned()
+            .collect::<Vec<_>>();
+        let orphan_rules = before_rules
+            .difference(&desired_rules)
+            .cloned()
+            .collect::<Vec<_>>();
+        let orphan_routes = before_routes
+            .difference(&desired_routes)
+            .cloned()
+            .collect::<Vec<_>>();
+        let retained_routes = before_routes.intersection(&desired_routes).count();
+        let retained_rules = before_rules.intersection(&desired_rules).count();
+
+        let transient_routes = before_routes
+            .len()
+            .checked_add(missing_routes.len())
+            .ok_or_else(|| {
+                RouteSteeringError::indeterminate(
+                    crate::model::ReadbackIndeterminateReason::LimitExceeded,
+                )
+            })?;
+        let transient_rules = before_rules
+            .len()
+            .checked_add(missing_rules.len())
+            .ok_or_else(|| {
+                RouteSteeringError::indeterminate(
+                    crate::model::ReadbackIndeterminateReason::LimitExceeded,
+                )
+            })?;
+        if transient_routes > MAX_TRANSIENT_OWNED_ROUTE_COLLECTION_ENTRIES
+            || transient_rules > MAX_TRANSIENT_OWNED_RULE_COLLECTION_ENTRIES
+        {
+            return Err(RouteSteeringError::indeterminate(
+                crate::model::ReadbackIndeterminateReason::LimitExceeded,
+            ));
+        }
+
+        // Validate the full install-before-delete union, not only its two
+        // independently valid halves, before any mock mutation is recorded.
+        // This mirrors Linux rejection of cross-set sibling overlap.
+        OwnedRouteRuleSnapshot::new_transient(
+            desired.scope(),
+            before_routes
+                .iter()
+                .cloned()
+                .chain(missing_routes.iter().cloned())
+                .collect(),
+            before_rules
+                .iter()
+                .cloned()
+                .chain(missing_rules.iter().cloned())
+                .collect(),
+        )
+        .map(|_| ())?;
+
+        let mut installed_routes = Vec::with_capacity(missing_routes.len());
+        let mut installed_rules = Vec::with_capacity(missing_rules.len());
+        for route in missing_routes {
+            if let Err(primary) = Self::install_route_locked(state, route.clone(), true) {
+                if let Err(rollback) = Self::rollback_owned_collection_installs(
+                    state,
+                    &before,
+                    &desired,
+                    &installed_routes,
+                    &installed_rules,
+                ) {
+                    return Err(reconcile_rollback_incomplete(
+                        OwnedRouteRuleReconcilePhase::InstallRoutes,
+                        installed_routes.len(),
+                        installed_rules.len(),
+                        0,
+                        0,
+                        &primary,
+                        rollback,
+                    ));
+                }
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::InstallRoutes,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    0,
+                    0,
+                    &primary,
+                ));
+            }
+            installed_routes.push(route);
+        }
+        for rule in missing_rules {
+            if let Err(primary) = Self::install_rule_locked(state, rule.clone(), true) {
+                if let Err(rollback) = Self::rollback_owned_collection_installs(
+                    state,
+                    &before,
+                    &desired,
+                    &installed_routes,
+                    &installed_rules,
+                ) {
+                    return Err(reconcile_rollback_incomplete(
+                        OwnedRouteRuleReconcilePhase::InstallRules,
+                        installed_routes.len(),
+                        installed_rules.len(),
+                        0,
+                        0,
+                        &primary,
+                        rollback,
+                    ));
+                }
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::InstallRules,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    0,
+                    0,
+                    &primary,
+                ));
+            }
+            installed_rules.push(rule);
+        }
+
+        let installed_state =
+            match Self::check_failure(state, MockFailurePoint::VerifyOwnedRouteRules)
+                .and_then(|()| Self::snapshot_owned_transient_locked(state, desired.scope()))
+            {
+                Ok(snapshot) => snapshot,
+                Err(primary) => {
+                    if let Err(rollback) = Self::rollback_owned_collection_installs(
+                        state,
+                        &before,
+                        &desired,
+                        &installed_routes,
+                        &installed_rules,
+                    ) {
+                        return Err(reconcile_rollback_incomplete(
+                            OwnedRouteRuleReconcilePhase::VerifyDesired,
+                            installed_routes.len(),
+                            installed_rules.len(),
+                            0,
+                            0,
+                            &primary,
+                            rollback,
+                        ));
+                    }
+                    return Err(reconcile_incomplete(
+                        OwnedRouteRuleReconcilePhase::VerifyDesired,
+                        installed_routes.len(),
+                        installed_rules.len(),
+                        0,
+                        0,
+                        &primary,
+                    ));
+                }
+            };
+        let desired_present = desired.routes().iter().all(|route| {
+            installed_state
+                .snapshot
+                .routes()
+                .binary_search(route)
+                .is_ok()
+        }) && desired
+            .rules()
+            .iter()
+            .all(|rule| installed_state.snapshot.rules().binary_search(rule).is_ok());
+        if let Err(primary) = Self::ensure_collection_collision_free(&installed_state, &desired)
+            .and_then(|()| {
+                if desired_present {
+                    Ok(())
+                } else {
+                    Err(RouteSteeringError::indeterminate(
+                        crate::model::ReadbackIndeterminateReason::ConcurrentModification,
+                    ))
+                }
+            })
+        {
+            if let Err(rollback) = Self::rollback_owned_collection_installs(
+                state,
+                &before,
+                &desired,
+                &installed_routes,
+                &installed_rules,
+            ) {
+                return Err(reconcile_rollback_incomplete(
+                    OwnedRouteRuleReconcilePhase::VerifyDesired,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    0,
+                    0,
+                    &primary,
+                    rollback,
+                ));
+            }
+            return Err(reconcile_incomplete(
+                OwnedRouteRuleReconcilePhase::VerifyDesired,
+                installed_routes.len(),
+                installed_rules.len(),
+                0,
+                0,
+                &primary,
+            ));
+        }
+
+        let mut removed_rules = 0_usize;
+        let mut removed_routes = 0_usize;
+        for rule in &orphan_rules {
+            if let Err(primary) = Self::remove_owned_rule_exact_locked(state, rule) {
+                let _ = Self::snapshot_owned_transient_locked(state, desired.scope());
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::RemoveRules,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    removed_routes,
+                    removed_rules,
+                    &primary,
+                ));
+            }
+            removed_rules = removed_rules.saturating_add(1);
+        }
+        if !orphan_rules.is_empty() {
+            let rules_removed_state = Self::snapshot_owned_transient_locked(state, desired.scope())
+                .map_err(|primary| {
+                    reconcile_incomplete(
+                        OwnedRouteRuleReconcilePhase::RemoveRules,
+                        installed_routes.len(),
+                        installed_rules.len(),
+                        removed_routes,
+                        removed_rules,
+                        &primary,
+                    )
+                })?;
+            let rules_removed_exact = rules_removed_state.snapshot.routes()
+                == installed_state.snapshot.routes()
+                && rules_removed_state.snapshot.rules() == desired.rules();
+            if let Err(primary) =
+                Self::ensure_collection_collision_free(&rules_removed_state, &desired).and_then(
+                    |()| {
+                        if rules_removed_exact {
+                            Ok(())
+                        } else {
+                            Err(RouteSteeringError::indeterminate(
+                                crate::model::ReadbackIndeterminateReason::ConcurrentModification,
+                            ))
+                        }
+                    },
+                )
+            {
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::RemoveRules,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    removed_routes,
+                    removed_rules,
+                    &primary,
+                ));
+            }
+        }
+        for route in &orphan_routes {
+            if let Err(primary) = Self::remove_owned_route_exact_locked(state, route) {
+                let _ = Self::snapshot_owned_transient_locked(state, desired.scope());
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::RemoveRoutes,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    removed_routes,
+                    removed_rules,
+                    &primary,
+                ));
+            }
+            removed_routes = removed_routes.saturating_add(1);
+        }
+
+        let final_state =
+            Self::snapshot_owned_locked(state, desired.scope()).map_err(|primary| {
+                reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::VerifyFinal,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    removed_routes,
+                    removed_rules,
+                    &primary,
+                )
+            })?;
+        Self::ensure_collection_collision_free(&final_state, &desired).map_err(|primary| {
+            reconcile_incomplete(
+                OwnedRouteRuleReconcilePhase::VerifyFinal,
+                installed_routes.len(),
+                installed_rules.len(),
+                removed_routes,
+                removed_rules,
+                &primary,
+            )
+        })?;
+        if !final_state.snapshot.matches_desired(&desired) {
+            let primary = RouteSteeringError::indeterminate(
+                crate::model::ReadbackIndeterminateReason::ConcurrentModification,
+            );
+            return Err(reconcile_incomplete(
+                OwnedRouteRuleReconcilePhase::VerifyFinal,
+                installed_routes.len(),
+                installed_rules.len(),
+                removed_routes,
+                removed_rules,
+                &primary,
+            ));
+        }
+        Ok(OwnedRouteRuleReconcileOutcome {
+            snapshot: final_state.snapshot,
+            retained_routes,
+            installed_routes: installed_routes.len(),
+            removed_routes,
+            retained_rules,
+            installed_rules: installed_rules.len(),
+            removed_rules,
+        })
+    }
 }
 
 fn insert_bounded<T: Ord>(set: &mut BTreeSet<T>, value: T) -> Result<(), RouteSteeringError> {
@@ -915,6 +1472,28 @@ impl RouteSteeringBackend for MockRouteSteeringBackend {
         }
     }
 
+    async fn snapshot_owned_route_rules(
+        &self,
+        scope: OwnedRouteRuleScope,
+    ) -> Result<OwnedRouteRuleSnapshot, RouteSteeringError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::snapshot_owned_locked(&mut state, scope).map(|state| state.snapshot)
+    }
+
+    async fn reconcile_owned_route_rules(
+        &self,
+        desired: OwnedRouteRuleSet,
+    ) -> Result<OwnedRouteRuleReconcileOutcome, RouteSteeringError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::reconcile_owned_locked(&mut state, desired)
+    }
+
     async fn probe(&self) -> Result<RouteSteeringProbe, RouteSteeringError> {
         let mut state = self
             .state
@@ -1011,6 +1590,36 @@ mod tests {
             }),
             table: 100,
             priority: 1000,
+        }
+    }
+
+    fn owned_scope() -> OwnedRouteRuleScope {
+        OwnedRouteRuleScope::new(
+            crate::collection::RouteSteeringIpFamily::Ipv4,
+            100,
+            42,
+            Some(10),
+            100,
+        )
+        .unwrap()
+    }
+
+    fn sibling_route(host: u8) -> RouteRequest {
+        RouteRequest {
+            destination: prefix([192, 0, 2, host], 32),
+            oif_ifindex: 42,
+            table: 100,
+            priority: Some(10),
+        }
+    }
+
+    fn sibling_rule(host: u8) -> RuleRequest {
+        RuleRequest {
+            source: Some(prefix([192, 0, 2, host], 32)),
+            destination: None,
+            fwmark: None,
+            table: 100,
+            priority: 100,
         }
     }
 
@@ -1552,5 +2161,321 @@ mod tests {
                 rollback: RouteSteeringFailureClass::Io,
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn owned_collection_converges_retries_and_removes_same_priority_siblings_exactly() {
+        let backend = MockRouteSteeringBackend::new();
+        let desired = OwnedRouteRuleSet::new(
+            owned_scope(),
+            vec![sibling_route(10), sibling_route(11)],
+            vec![sibling_rule(10), sibling_rule(11)],
+        )
+        .unwrap();
+        let installed = backend
+            .reconcile_owned_route_rules(desired.clone())
+            .await
+            .unwrap();
+        assert_eq!(installed.installed_routes, 2);
+        assert_eq!(installed.installed_rules, 2);
+        assert_eq!(installed.retained_routes, 0);
+        assert_eq!(installed.retained_rules, 0);
+
+        let retried = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(retried.installed_routes, 0);
+        assert_eq!(retried.installed_rules, 0);
+        assert_eq!(retried.retained_routes, 2);
+        assert_eq!(retried.retained_rules, 2);
+
+        let only_second = OwnedRouteRuleSet::new(
+            owned_scope(),
+            vec![sibling_route(11)],
+            vec![sibling_rule(11)],
+        )
+        .unwrap();
+        let removed = backend
+            .reconcile_owned_route_rules(only_second.clone())
+            .await
+            .unwrap();
+        assert_eq!(removed.removed_routes, 1);
+        assert_eq!(removed.removed_rules, 1);
+        assert_eq!(removed.retained_routes, 1);
+        assert_eq!(removed.retained_rules, 1);
+        assert!(removed.snapshot.matches_desired(&only_second));
+        assert_eq!(removed.snapshot.rules(), &[sibling_rule(11)]);
+        assert_eq!(removed.snapshot.routes(), &[sibling_route(11)]);
+        assert!(backend
+            .operations()
+            .contains(&MockOperation::RemoveRule(sibling_rule(10))));
+        assert!(!backend
+            .operations()
+            .contains(&MockOperation::RemoveRule(sibling_rule(11))));
+    }
+
+    #[tokio::test]
+    async fn owned_collection_foreign_same_priority_candidate_blocks_all_deletion() {
+        let backend = MockRouteSteeringBackend::new();
+        backend.seed_rule(sibling_rule(10)).unwrap();
+        backend.seed_foreign_rule(sibling_rule(11)).unwrap();
+        let desired =
+            OwnedRouteRuleSet::new(owned_scope(), Vec::new(), vec![sibling_rule(10)]).unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired).await,
+            Err(RouteSteeringError::AlreadyExists)
+        ));
+        assert!(backend.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owned_collection_cross_set_overlap_fails_before_mutation_and_on_retry() {
+        let backend = MockRouteSteeringBackend::new();
+        backend.seed_rule(sibling_rule(10)).unwrap();
+        let desired_rule = RuleRequest {
+            source: Some(prefix([192, 0, 2, 0], 24)),
+            destination: None,
+            fwmark: None,
+            table: 100,
+            priority: 100,
+        };
+        let desired =
+            OwnedRouteRuleSet::new(owned_scope(), Vec::new(), vec![desired_rule]).unwrap();
+
+        for desired in [desired.clone(), desired] {
+            assert!(matches!(
+                backend.reconcile_owned_route_rules(desired).await,
+                Err(RouteSteeringError::InvalidConfig {
+                    field: "owned.rules",
+                    ..
+                })
+            ));
+        }
+        assert!(backend.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owned_collection_verification_failure_rolls_back_only_attempt_rule() {
+        let backend = MockRouteSteeringBackend::new();
+        backend.seed_rule(sibling_rule(10)).unwrap();
+        backend.set_failure_at(
+            MockFailurePoint::VerifyOwnedRouteRules,
+            RouteSteeringError::indeterminate(
+                crate::model::ReadbackIndeterminateReason::IncompleteReply,
+            ),
+        );
+        let desired = OwnedRouteRuleSet::new(
+            owned_scope(),
+            Vec::new(),
+            vec![sibling_rule(10), sibling_rule(11)],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired).await,
+            Err(RouteSteeringError::ReconcileIncomplete {
+                phase: OwnedRouteRuleReconcilePhase::VerifyDesired,
+                installed_rules: 1,
+                ..
+            })
+        ));
+        let snapshot = backend
+            .snapshot_owned_route_rules(owned_scope())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.rules(), &[sibling_rule(10)]);
+        assert_eq!(
+            backend.operations(),
+            vec![
+                MockOperation::InstallRule(sibling_rule(11)),
+                MockOperation::RemoveRule(sibling_rule(11)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_collection_rollback_failure_keeps_typed_phase_and_counts() {
+        let backend = MockRouteSteeringBackend::new();
+        backend.seed_rule(sibling_rule(10)).unwrap();
+        backend.set_failure_at(
+            MockFailurePoint::VerifyOwnedRouteRules,
+            RouteSteeringError::indeterminate(
+                crate::model::ReadbackIndeterminateReason::IncompleteReply,
+            ),
+        );
+        backend.set_failure_at(
+            MockFailurePoint::RemoveRule,
+            RouteSteeringError::io(
+                "remove_rule",
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "redacted"),
+            ),
+        );
+        let desired = OwnedRouteRuleSet::new(
+            owned_scope(),
+            Vec::new(),
+            vec![sibling_rule(10), sibling_rule(11)],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired).await,
+            Err(RouteSteeringError::ReconcileIncomplete {
+                phase: OwnedRouteRuleReconcilePhase::VerifyDesired,
+                installed_routes: 0,
+                installed_rules: 1,
+                removed_routes: 0,
+                removed_rules: 0,
+                failure: RouteSteeringFailureClass::ReadbackIndeterminate,
+                rollback_failure: Some(RouteSteeringFailureClass::Io),
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn owned_collection_garbage_collects_preseeded_restart_orphans() {
+        let backend = MockRouteSteeringBackend::new();
+        backend.seed_route(sibling_route(10)).unwrap();
+        backend.seed_rule(sibling_rule(10)).unwrap();
+        assert!(backend.operations().is_empty());
+        let desired = OwnedRouteRuleSet::new(
+            owned_scope(),
+            vec![sibling_route(11)],
+            vec![sibling_rule(11)],
+        )
+        .unwrap();
+
+        let outcome = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(outcome.installed_routes, 1);
+        assert_eq!(outcome.installed_rules, 1);
+        assert_eq!(outcome.removed_routes, 1);
+        assert_eq!(outcome.removed_rules, 1);
+        assert_eq!(outcome.snapshot.routes(), &[sibling_route(11)]);
+        assert_eq!(outcome.snapshot.rules(), &[sibling_rule(11)]);
+        let operations = backend.operations();
+        assert_eq!(
+            operations,
+            vec![
+                MockOperation::InstallRoute(sibling_route(11)),
+                MockOperation::InstallRule(sibling_rule(11)),
+                MockOperation::RemoveRule(sibling_rule(10)),
+                MockOperation::RemoveRoute(sibling_route(10)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_collection_replaces_near_bound_disjoint_sets_through_transient_union() {
+        const SET_SIZE: usize = 25_001;
+
+        let scope = OwnedRouteRuleScope::new(
+            crate::collection::RouteSteeringIpFamily::Ipv4,
+            2000,
+            42,
+            Some(10),
+            900,
+        )
+        .unwrap();
+        let base = u32::from(Ipv4Addr::new(198, 18, 0, 0));
+        let rule_at = |offset: usize| RuleRequest {
+            source: Some(IpPrefix::new(
+                IpAddr::V4(Ipv4Addr::from(base + u32::try_from(offset).unwrap())),
+                32,
+            )),
+            destination: None,
+            fwmark: None,
+            table: 2000,
+            priority: 900,
+        };
+        let backend = MockRouteSteeringBackend::new();
+        for offset in 0..SET_SIZE {
+            backend.seed_rule(rule_at(offset)).unwrap();
+        }
+        let desired_rules = (SET_SIZE..(SET_SIZE * 2)).map(rule_at).collect::<Vec<_>>();
+        let desired = OwnedRouteRuleSet::new(scope, Vec::new(), desired_rules.clone()).unwrap();
+
+        let outcome = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(outcome.installed_rules, SET_SIZE);
+        assert_eq!(outcome.removed_rules, SET_SIZE);
+        assert_eq!(outcome.snapshot.rules(), desired_rules);
+        assert_eq!(outcome.snapshot.rules().len(), SET_SIZE);
+    }
+
+    #[tokio::test]
+    async fn owned_collection_restart_recovers_preseeded_transient_union_above_final_bound() {
+        const SET_SIZE: usize = 25_001;
+
+        let scope = OwnedRouteRuleScope::new(
+            crate::collection::RouteSteeringIpFamily::Ipv4,
+            2000,
+            42,
+            Some(10),
+            900,
+        )
+        .unwrap();
+        let base = u32::from(Ipv4Addr::new(198, 18, 0, 0));
+        let rule_at = |offset: usize| RuleRequest {
+            source: Some(IpPrefix::new(
+                IpAddr::V4(Ipv4Addr::from(base + u32::try_from(offset).unwrap())),
+                32,
+            )),
+            destination: None,
+            fwmark: None,
+            table: 2000,
+            priority: 900,
+        };
+        let backend = MockRouteSteeringBackend::new();
+        for offset in 0..(SET_SIZE * 2) {
+            backend.seed_rule(rule_at(offset)).unwrap();
+        }
+        let desired_rules = (SET_SIZE..(SET_SIZE * 2)).map(rule_at).collect::<Vec<_>>();
+        let desired = OwnedRouteRuleSet::new(scope, Vec::new(), desired_rules.clone()).unwrap();
+
+        let outcome = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(outcome.retained_rules, SET_SIZE);
+        assert_eq!(outcome.installed_rules, 0);
+        assert_eq!(outcome.removed_rules, SET_SIZE);
+        assert_eq!(outcome.snapshot.rules(), desired_rules);
+    }
+
+    #[tokio::test]
+    async fn owned_collection_accepts_and_reconciles_fifty_thousand_pairs_without_per_key_reads() {
+        let scope = OwnedRouteRuleScope::new(
+            crate::collection::RouteSteeringIpFamily::Ipv4,
+            2000,
+            42,
+            Some(10),
+            900,
+        )
+        .unwrap();
+        let base = u32::from(Ipv4Addr::new(198, 18, 0, 0));
+        let mut routes = Vec::with_capacity(crate::collection::MAX_OWNED_RULE_COLLECTION_ENTRIES);
+        let mut rules = Vec::with_capacity(crate::collection::MAX_OWNED_RULE_COLLECTION_ENTRIES);
+        for offset in 0..crate::collection::MAX_OWNED_RULE_COLLECTION_ENTRIES {
+            let address = IpAddr::V4(Ipv4Addr::from(base + u32::try_from(offset).unwrap()));
+            let prefix = IpPrefix::new(address, 32);
+            routes.push(RouteRequest {
+                destination: prefix,
+                oif_ifindex: 42,
+                table: 2000,
+                priority: Some(10),
+            });
+            rules.push(RuleRequest {
+                source: Some(prefix),
+                destination: None,
+                fwmark: None,
+                table: 2000,
+                priority: 900,
+            });
+        }
+        let desired = OwnedRouteRuleSet::new(scope, routes, rules).unwrap();
+        let backend = MockRouteSteeringBackend::new();
+        let outcome = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(outcome.installed_routes, 50_000);
+        assert_eq!(outcome.installed_rules, 50_000);
+        assert_eq!(outcome.snapshot.routes().len(), 50_000);
+        assert_eq!(outcome.snapshot.rules().len(), 50_000);
+        assert!(!backend.observations().iter().any(|observation| matches!(
+            observation,
+            MockObservation::ReadRoute(_) | MockObservation::ReadRule(_)
+        )));
     }
 }

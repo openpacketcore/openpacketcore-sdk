@@ -5,8 +5,9 @@ use std::process::Command;
 
 use opc_route_steering::{
     FirewallMark, IpPrefix, LinuxRouteSteeringBackend, LinuxRuleProtocolCapability,
-    RouteConvergenceOutcome, RouteReadback, RouteRequest, RouteRuleRollback, RouteSteeringBackend,
-    RuleConvergenceOutcome, RuleReadback, RuleRequest,
+    OwnedRouteRuleScope, OwnedRouteRuleSet, RouteConvergenceOutcome, RouteReadback, RouteRequest,
+    RouteRuleRollback, RouteSteeringBackend, RouteSteeringIpFamily, RuleConvergenceOutcome,
+    RuleReadback, RuleRequest,
 };
 
 const OWNED_PROTOCOL: &str = "242";
@@ -184,6 +185,52 @@ async fn live_privileged_pair_converges_retries_and_removes_exact_state() {
         backend.read_route(&ipv6_route).await.unwrap(),
         RouteReadback::Absent
     );
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN in an isolated network namespace"]
+async fn live_owned_collection_same_priority_siblings_retry_and_remove_exactly() {
+    let backend = LinuxRouteSteeringBackend::new();
+    let scope = OwnedRouteRuleScope::new(RouteSteeringIpFamily::Ipv4, 1000, 1, None, 900).unwrap();
+    let first = RuleRequest {
+        source: Some(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 32)),
+        destination: None,
+        fwmark: None,
+        table: 1000,
+        priority: 900,
+    };
+    let second = RuleRequest {
+        source: Some(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)), 32)),
+        destination: None,
+        fwmark: None,
+        table: 1000,
+        priority: 900,
+    };
+    let both =
+        OwnedRouteRuleSet::new(scope, Vec::new(), vec![first.clone(), second.clone()]).unwrap();
+
+    let installed = backend
+        .reconcile_owned_route_rules(both.clone())
+        .await
+        .unwrap();
+    assert_eq!(installed.installed_rules, 2);
+    assert_eq!(installed.snapshot.rules(), &[first.clone(), second.clone()]);
+
+    let retried = backend.reconcile_owned_route_rules(both).await.unwrap();
+    assert_eq!(retried.retained_rules, 2);
+    assert_eq!(retried.installed_rules, 0);
+
+    let only_second = OwnedRouteRuleSet::new(scope, Vec::new(), vec![second.clone()]).unwrap();
+    let reduced = backend
+        .reconcile_owned_route_rules(only_second)
+        .await
+        .unwrap();
+    assert_eq!(reduced.removed_rules, 1);
+    assert_eq!(reduced.snapshot.rules(), &[second]);
+
+    let empty = OwnedRouteRuleSet::new(scope, Vec::new(), Vec::new()).unwrap();
+    let cleaned = backend.reconcile_owned_route_rules(empty).await.unwrap();
+    assert!(cleaned.snapshot.rules().is_empty());
 }
 
 #[tokio::test]

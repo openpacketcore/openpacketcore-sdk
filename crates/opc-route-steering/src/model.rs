@@ -382,6 +382,16 @@ pub struct RouteSteeringCapabilities {
     pub conflict_safe_rule_convergence: bool,
     /// Cancellation-safe paired route/rule convergence is implemented.
     pub paired_convergence: bool,
+    /// Bounded exclusive-scope owned route/rule snapshot and authoritative
+    /// reconciliation are implemented and may be attempted fail closed.
+    ///
+    /// For the Linux backend this is an attempt capability, not proof that the
+    /// running kernel retained the rule ownership marker. Inspect
+    /// `LinuxRouteSteeringBackend::rule_protocol_capability` when marker
+    /// attestation is required; `Unknown` and `ExpectedByKernelVersion` permit
+    /// a self-verifying bootstrap attempt, while only `Confirmed` is positive
+    /// readback evidence.
+    pub owned_route_rule_collection: bool,
 }
 
 impl RouteSteeringCapabilities {
@@ -393,6 +403,7 @@ impl RouteSteeringCapabilities {
             conflict_safe_route_convergence: false,
             conflict_safe_rule_convergence: false,
             paired_convergence: false,
+            owned_route_rule_collection: false,
         }
     }
 
@@ -404,6 +415,7 @@ impl RouteSteeringCapabilities {
             conflict_safe_route_convergence: true,
             conflict_safe_rule_convergence: true,
             paired_convergence: true,
+            owned_route_rule_collection: true,
         }
     }
 }

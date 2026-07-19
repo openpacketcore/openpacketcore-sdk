@@ -32,6 +32,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod collection;
 pub mod error;
 pub mod linux;
 pub mod mock;
@@ -40,10 +41,15 @@ pub mod unsupported;
 mod validation;
 
 pub use backend::RouteSteeringBackend;
+pub use collection::{
+    OwnedRouteRuleReconcileOutcome, OwnedRouteRuleReconcilePhase, OwnedRouteRuleScope,
+    OwnedRouteRuleSet, OwnedRouteRuleSnapshot, RouteSteeringIpFamily,
+    MAX_OWNED_ROUTE_COLLECTION_ENTRIES, MAX_OWNED_RULE_COLLECTION_ENTRIES,
+};
 pub use error::{RouteSteeringError, RouteSteeringFailureClass};
 pub use linux::{
-    LinuxRouteReadbackLimits, LinuxRouteSteeringBackend, LinuxRouteSteeringBackendConfig,
-    LinuxRuleProtocolCapability, LINUX_ROUTE_STEERING_PROTOCOL,
+    LinuxOwnedRouteRuleCollectionLimits, LinuxRouteReadbackLimits, LinuxRouteSteeringBackend,
+    LinuxRouteSteeringBackendConfig, LinuxRuleProtocolCapability, LINUX_ROUTE_STEERING_PROTOCOL,
 };
 pub use mock::{MockFailurePoint, MockObservation, MockOperation, MockRouteSteeringBackend};
 pub use model::{
