@@ -264,6 +264,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reservation rather than authentication, so the declared scope requires one
   exclusive orchestrated writer. Existing singleton convergence and
   static/untagged legacy APIs retain their behavior.
+- **Typed IKE-SA rekey exchange boundary — `opc-proto-ikev2`:** a strict
+  responder-side opened-`SK` decoder now classifies only RFC 7296
+  `CREATE_CHILD_SA` requests shaped as `SA, Ni, KEi`, with IKE Protocol ID,
+  consecutive proposals, non-zero eight-octet new initiator SPIs, mandatory
+  non-`NONE` DH, and exact selected KE/group correlation. Vendor IDs,
+  unrecognized error/status Notify payloads, and unknown non-critical payloads
+  follow RFC 7296 mandatory-ignore behavior: `Drop` discards the latter two
+  classes, while `Preserve` and generic `Reject` retain them. Unknown critical
+  payloads still fail closed. Child-SA `REKEY_SA`, ESP/AH, TSi/TSr, other
+  semantically invalid known payloads, malformed/zero SPIs, and
+  missing/duplicate SA, Nonce, or KE fail closed with stable redaction-safe
+  errors. Selection reuses the executable SA_INIT policy and exposes the chosen
+  profile and initiator SPI directly to the existing rekey KDF. That KDF now
+  requires the selected group's fixed-width shared secret (DH14 256 octets;
+  DH19/20/21 32/48/66 octets) and reports a mismatch through the pre-existing
+  redaction-safe invalid-key-length error contract. The response builder
+  requires a caller-allocated non-zero responder SPI plus exact Nr/KEr and
+  emits immutable `SA, Nr, KEr` bytes.
+  Specification-authored AEAD and AES-CBC/HMAC vectors independently audit
+  decode and byte-exact response encoding. IKE-SA state, SPI/DH/nonce
+  allocation, simultaneous-rekey policy, `SK` protection, retransmission
+  caching, installation, and deletion remain caller-owned.
 - **Conflict-safe route/rule convergence — `opc-route-steering`,
   `opc-linux-route-sys`:** backend-neutral typed readback and convergence now
   distinguish newly installed, exact resident, conflicting, and indeterminate
