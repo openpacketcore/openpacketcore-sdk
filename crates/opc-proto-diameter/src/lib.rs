@@ -13,6 +13,14 @@
 //! `error_answer` adds the bounded RFC 6733 request envelope and negative-
 //! answer boundary without exposing sensitive AVP contents or retaining an
 //! unbounded request suffix.
+//! `parser_error` adds sealed, request-bound missing-AVP and grouped-set
+//! provenance for the typed CER, DWR, DPR, and SWm DER parsers. Legacy parser
+//! signatures continue to return [`DecodeError`]; additive
+//! `*_with_provenance` entry points retain the command/application identity and
+//! exact SDK-owned vendor-aware AVP schema required by
+//! `DiameterRequestFailure::from_parser_error` to safely bind actual missing-
+//! field failures to 5005. CER `Vendor-Specific-Application-Id` mutual-
+//! exclusion failures retain exact received Auth/Acct children for typed 5009.
 //!
 //! The crate is experimental and not yet an ADR 0015 conformance claim; see
 //! `CONFORMANCE.md` before treating any fixture or dictionary entry as release
@@ -40,6 +48,8 @@ pub mod base;
 pub mod dictionary;
 #[cfg(feature = "base")]
 pub mod error_answer;
+#[cfg(feature = "base")]
+pub mod parser_error;
 #[cfg(feature = "peer")]
 pub mod peer;
 

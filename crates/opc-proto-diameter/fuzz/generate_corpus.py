@@ -194,6 +194,52 @@ def main() -> None:
         header(0x80, 257, 0, 0x11111111, 0x22222222, cer_avps),
         "cer_request",
     )
+    # RFC 6733 §6.11 nested parser provenance: received VSAI without Vendor-Id,
+    # and received VSAI without either Auth/Acct application child.
+    write_corpus(
+        msg_dir,
+        header(
+            0x80,
+            257,
+            0,
+            0x11111112,
+            0x22222223,
+            cer_avps + avp(260, 0x40, avp(258, 0x40, u32(16777264), None), None),
+        ),
+        "cer_vsai_missing_vendor_id",
+    )
+    write_corpus(
+        msg_dir,
+        header(
+            0x80,
+            257,
+            0,
+            0x11111113,
+            0x22222224,
+            cer_avps + avp(260, 0x40, avp(266, 0x40, u32(10415), None), None),
+        ),
+        "cer_vsai_missing_application_id",
+    )
+    write_corpus(
+        msg_dir,
+        header(
+            0x80,
+            257,
+            0,
+            0x11111114,
+            0x22222225,
+            cer_avps
+            + avp(
+                260,
+                0x40,
+                avp(266, 0x40, u32(10415), None)
+                + avp(258, 0x40, u32(16777264), None)
+                + avp(259, 0x40, u32(3), None),
+                None,
+            ),
+        ),
+        "cer_vsai_auth_acct_conflict",
+    )
 
     # 3. Capabilities-Exchange-Answer (CEA). Command code 257, R bit cleared.
     #    RFC 6733 section 5.3.2.
@@ -220,6 +266,11 @@ def main() -> None:
         header(0x80, 280, 0, 0x33333333, 0x44444444, dwr_avps),
         "dwr_request",
     )
+    write_corpus(
+        msg_dir,
+        header(0x80, 280, 0, 0x33333334, 0x44444445, b""),
+        "dwr_missing_origin_host",
+    )
 
     # 5. Disconnect-Peer-Request (DPR). Command code 282. RFC 6733 section 5.4.1.
     dpr_avps = b""
@@ -231,6 +282,11 @@ def main() -> None:
         msg_dir,
         header(0x80, 282, 0, 0x55555555, 0x66666666, dpr_avps),
         "dpr_request",
+    )
+    write_corpus(
+        msg_dir,
+        header(0x80, 282, 0, 0x55555556, 0x66666667, b""),
+        "dpr_missing_disconnect_cause",
     )
 
     # Request-bound error-answer seeds. These exercise inspection of an
@@ -305,6 +361,29 @@ def main() -> None:
         msg_dir,
         header(0xC0, 268, 16777264, 0x99999999, 0xAAAAAAAA, der_avps),
         "swm_der",
+    )
+    write_corpus(
+        msg_dir,
+        header(0xC0, 268, 16777264, 0x99999998, 0xAAAAAAA9, b""),
+        "swm_der_missing_auth_application_id",
+    )
+    write_corpus(
+        msg_dir,
+        header(
+            0xC0,
+            268,
+            16777264,
+            0x99999997,
+            0xAAAAAAA8,
+            der_avps
+            + avp(
+                1401,
+                0xC0,
+                avp(1403, 0xC0, b"99", vendor=10415),
+                vendor=10415,
+            ),
+        ),
+        "swm_der_terminal_information_missing_imei",
     )
 
     # 8. SWm DER with two State AVPs. State is repeatable in the command

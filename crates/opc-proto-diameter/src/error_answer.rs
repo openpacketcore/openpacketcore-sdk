@@ -29,6 +29,7 @@ use crate::base::{
     RESULT_CODE_DIAMETER_INVALID_HDR_BITS, RESULT_CODE_DIAMETER_MISSING_AVP,
     RESULT_CODE_DIAMETER_UNSUPPORTED_VERSION,
 };
+use crate::parser_error::{DiameterGroupedAvpSetFailureKind, DiameterParserError};
 use crate::{
     ApplicationId, AvpCardinality, AvpCode, AvpDataType, AvpDefinition, AvpFlags, AvpHeader,
     AvpKey, CommandCode, CommandDefinition, CommandFlags, CommandKind, CommandLookupError,
@@ -56,6 +57,24 @@ enum FailedAvpAncestorProvenance {
     },
     Missing {
         key: AvpKey,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FailedAvpReceivedChildProvenance {
+    key: AvpKey,
+    offset: usize,
+    wire_len: usize,
+    wire_digest: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum FailedAvpSiblingSetProvenance {
+    Missing {
+        keys: Box<[AvpKey]>,
+    },
+    Received {
+        children: Box<[FailedAvpReceivedChildProvenance]>,
     },
 }
 
@@ -187,6 +206,7 @@ pub struct DiameterFailedAvp {
     source_wire_len: Option<usize>,
     malformed_header: Option<Bytes>,
     ancestors: Vec<FailedAvpAncestorProvenance>,
+    sibling_set: Option<FailedAvpSiblingSetProvenance>,
 }
 
 impl DiameterFailedAvp {
@@ -212,6 +232,7 @@ impl DiameterFailedAvp {
             source_wire_len,
             malformed_header: None,
             ancestors: Vec::new(),
+            sibling_set: None,
         })
     }
 
@@ -242,6 +263,7 @@ impl DiameterFailedAvp {
             source_wire_len: None,
             malformed_header: None,
             ancestors: Vec::new(),
+            sibling_set: None,
         })
     }
 
@@ -255,6 +277,135 @@ impl DiameterFailedAvp {
     ) -> Result<Self, EncodeError> {
         let header = header_for_definition(definition);
         Self::missing(header, minimum_value_len(definition.data_type()), ctx)
+    }
+
+    fn missing_sibling_set_within_group(
+        definitions: &[&AvpDefinition],
+        group: &RawAvp<'_>,
+        group_offset: usize,
+        ctx: EncodeContext,
+    ) -> Result<Self, EncodeError> {
+        if definitions.len() < 2 || definitions.len() > MAX_FAILED_AVP_HIERARCHY_DEPTH {
+            return Err(structural_encode_error(
+                "diameter Failed-AVP sibling set has invalid cardinality",
+                "7.5",
+            ));
+        }
+        let mut keys = Vec::with_capacity(definitions.len());
+        let mut children = BytesMut::new();
+        for definition in definitions {
+            let key = definition.key();
+            if keys.contains(&key) {
+                return Err(structural_encode_error(
+                    "diameter Failed-AVP sibling set contains duplicate definitions",
+                    "7.5",
+                ));
+            }
+            let child = Self::missing_for_definition(definition, ctx)?;
+            children.extend_from_slice(child.wire());
+            keys.push(key);
+        }
+        let source_wire =
+            encode_raw_avp(group.header.clone(), group.value, group.padding, true, ctx)?;
+        let wire = encode_raw_avp(group.header.clone(), &children, &[], false, ctx)?;
+        let first = definitions
+            .first()
+            .ok_or_else(|| structural_encode_error("empty Failed-AVP sibling set", "7.5"))?;
+        Ok(Self {
+            leaf_code: first.key().code(),
+            leaf_vendor_id: first.key().vendor_id(),
+            leaf_offset: None,
+            ordering_offset: Some(group_offset),
+            reported_len: None,
+            hierarchy_depth: 1,
+            wire,
+            source_wire_digest: None,
+            source_wire_len: None,
+            malformed_header: None,
+            ancestors: vec![FailedAvpAncestorProvenance::Received {
+                key: group.header.key(),
+                offset: group_offset,
+                wire_len: source_wire.len(),
+                wire_digest: digest_request(&source_wire),
+            }],
+            sibling_set: Some(FailedAvpSiblingSetProvenance::Missing {
+                keys: keys.into_boxed_slice(),
+            }),
+        })
+    }
+
+    fn copied_sibling_set_within_group(
+        selected: &[(RawAvp<'_>, usize)],
+        group: &RawAvp<'_>,
+        group_offset: usize,
+        ctx: EncodeContext,
+    ) -> Result<Self, EncodeError> {
+        if selected.len() < 2 || selected.len() > MAX_FAILED_AVP_HIERARCHY_DEPTH {
+            return Err(structural_encode_error(
+                "diameter Failed-AVP sibling set has invalid cardinality",
+                "7.5",
+            ));
+        }
+        let first_reported_len = selected
+            .first()
+            .map(|(child, _)| child.header.length)
+            .ok_or_else(|| {
+                structural_encode_error("empty Failed-AVP received sibling set", "7.5")
+            })?;
+        let mut children_wire = BytesMut::new();
+        let mut children = Vec::with_capacity(selected.len());
+        let mut previous_offset = None;
+        for (child, offset) in selected {
+            if previous_offset.is_some_and(|previous| previous >= *offset)
+                || children
+                    .iter()
+                    .any(|provenance: &FailedAvpReceivedChildProvenance| {
+                        provenance.key == child.header.key()
+                    })
+            {
+                return Err(structural_encode_error(
+                    "diameter Failed-AVP received sibling set is not unique wire order",
+                    "7.5",
+                ));
+            }
+            let child_wire =
+                encode_raw_avp(child.header.clone(), child.value, child.padding, true, ctx)?;
+            children_wire.extend_from_slice(&child_wire);
+            children.push(FailedAvpReceivedChildProvenance {
+                key: child.header.key(),
+                offset: *offset,
+                wire_len: child_wire.len(),
+                wire_digest: digest_request(&child_wire),
+            });
+            previous_offset = Some(*offset);
+        }
+        let source_wire =
+            encode_raw_avp(group.header.clone(), group.value, group.padding, true, ctx)?;
+        let wire = encode_raw_avp(group.header.clone(), &children_wire, &[], false, ctx)?;
+        let first = children.first().ok_or_else(|| {
+            structural_encode_error("empty Failed-AVP received sibling set", "7.5")
+        })?;
+        Ok(Self {
+            leaf_code: first.key.code(),
+            leaf_vendor_id: first.key.vendor_id(),
+            leaf_offset: Some(first.offset),
+            ordering_offset: Some(group_offset),
+            reported_len: Some(first_reported_len),
+            hierarchy_depth: 1,
+            wire,
+            source_wire_digest: None,
+            source_wire_len: None,
+            malformed_header: None,
+            ancestors: vec![FailedAvpAncestorProvenance::Received {
+                key: group.header.key(),
+                offset: group_offset,
+                wire_len: source_wire.len(),
+                wire_digest: digest_request(&source_wire),
+            }],
+            sibling_set: Some(FailedAvpSiblingSetProvenance::Received {
+                children: children.into_boxed_slice(),
+            }),
+        })
     }
 
     /// Synthesize an RFC 6733 invalid-length context from an incomplete or
@@ -313,6 +464,7 @@ impl DiameterFailedAvp {
             source_wire_len: None,
             malformed_header: Some(Bytes::copy_from_slice(retained_header)),
             ancestors: Vec::new(),
+            sibling_set: None,
         })
     }
 
@@ -381,6 +533,7 @@ impl DiameterFailedAvp {
             source_wire_len: self.source_wire_len,
             malformed_header: self.malformed_header,
             ancestors,
+            sibling_set: self.sibling_set,
         })
     }
 
@@ -433,6 +586,7 @@ impl DiameterFailedAvp {
             source_wire_len: self.source_wire_len,
             malformed_header: self.malformed_header,
             ancestors,
+            sibling_set: self.sibling_set,
         })
     }
 
@@ -449,6 +603,7 @@ impl DiameterFailedAvp {
             wire: value.wire,
             malformed_header: None,
             ancestors: Vec::new(),
+            sibling_set: None,
         }
     }
 
@@ -456,19 +611,23 @@ impl DiameterFailedAvp {
         &self.wire
     }
 
-    /// Leaf AVP code represented by this failure context.
+    /// First evidence-child AVP code represented by this failure context.
+    ///
+    /// Ordinary evidence has one leaf. A missing sibling set reports its first
+    /// normative example; a received sibling set reports its first wire-order
+    /// child.
     #[must_use]
     pub const fn leaf_code(&self) -> AvpCode {
         self.leaf_code
     }
 
-    /// Leaf Vendor-Id represented by this failure context.
+    /// Vendor-Id of the first evidence child represented by this context.
     #[must_use]
     pub const fn leaf_vendor_id(&self) -> Option<VendorId> {
         self.leaf_vendor_id
     }
 
-    /// Request offset of the selected leaf failure, when it was received.
+    /// Request offset of the first selected evidence child, when received.
     ///
     /// Synthesized missing AVPs return `None`; they have no honest absolute
     /// location in the request.
@@ -483,7 +642,7 @@ impl DiameterFailedAvp {
         self.reported_len
     }
 
-    /// Number of grouped ancestors retained around the leaf.
+    /// Number of grouped ancestors retained around one or more evidence children.
     #[must_use]
     pub const fn hierarchy_depth(&self) -> usize {
         self.hierarchy_depth
@@ -546,6 +705,8 @@ pub enum DiameterRequestFailure {
     ForbiddenAvp(DiameterFailedAvp),
     /// First AVP occurrence beyond a singleton cardinality (5009).
     ExcessSingleton(DiameterFailedAvp),
+    /// Mutually exclusive grouped children were present together (5009).
+    MutuallyExclusiveAvps(DiameterFailedAvp),
     /// Unsupported Diameter version (5011).
     UnsupportedVersion,
     /// A reserved Diameter header bit was set (5013).
@@ -567,7 +728,9 @@ impl DiameterRequestFailure {
             Self::InvalidAvpValue(_) => RESULT_CODE_DIAMETER_INVALID_AVP_VALUE,
             Self::MissingMandatoryAvp(_) => RESULT_CODE_DIAMETER_MISSING_AVP,
             Self::ForbiddenAvp(_) => RESULT_CODE_DIAMETER_AVP_NOT_ALLOWED,
-            Self::ExcessSingleton(_) => RESULT_CODE_DIAMETER_AVP_OCCURS_TOO_MANY_TIMES,
+            Self::ExcessSingleton(_) | Self::MutuallyExclusiveAvps(_) => {
+                RESULT_CODE_DIAMETER_AVP_OCCURS_TOO_MANY_TIMES
+            }
             Self::UnsupportedVersion => RESULT_CODE_DIAMETER_UNSUPPORTED_VERSION,
             Self::InvalidBitInHeader => RESULT_CODE_DIAMETER_INVALID_BIT_IN_HEADER,
             Self::InvalidAvpLength(_) => RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH,
@@ -586,7 +749,9 @@ impl DiameterRequestFailure {
             Self::InvalidAvpValue(_) => "diameter_invalid_avp_value",
             Self::MissingMandatoryAvp(_) => "diameter_missing_avp",
             Self::ForbiddenAvp(_) => "diameter_avp_not_allowed",
-            Self::ExcessSingleton(_) => "diameter_avp_occurs_too_many_times",
+            Self::ExcessSingleton(_) | Self::MutuallyExclusiveAvps(_) => {
+                "diameter_avp_occurs_too_many_times"
+            }
             Self::UnsupportedVersion => "diameter_unsupported_version",
             Self::InvalidBitInHeader => "diameter_invalid_bit_in_header",
             Self::InvalidAvpLength(_) => "diameter_invalid_avp_length",
@@ -610,6 +775,7 @@ impl DiameterRequestFailure {
             | Self::MissingMandatoryAvp(value)
             | Self::ForbiddenAvp(value)
             | Self::ExcessSingleton(value)
+            | Self::MutuallyExclusiveAvps(value)
             | Self::InvalidAvpLength(value) => Some(value),
             Self::UnknownCommand
             | Self::UnsupportedApplication
@@ -743,6 +909,167 @@ impl DiameterRequestFailure {
         };
         Ok(envelope.bind_failure(failure))
     }
+
+    /// Map an SDK typed-parser failure to an exact request-bound error answer.
+    ///
+    /// Missing mandatory AVPs are accepted only from sealed SDK parser
+    /// provenance tied to the byte-identical declared Diameter message boundary
+    /// (not bytes following that boundary in the supplied input). The parser's application,
+    /// command, request role, and exact vendor-aware AVP schema must match the
+    /// inspected envelope and exactly one supplied dictionary definition. The
+    /// resulting `Failed-AVP` minimum value and Vendor-Id are derived from that
+    /// definition, then the ordinary checked application binder proves the AVP
+    /// is absent.
+    /// Earlier header, application, command, P-bit, framing, flag, forbidden,
+    /// excess, or unsupported-AVP failures always win.
+    ///
+    /// Typed parser errors without missing-AVP provenance delegate to
+    /// [`Self::from_decode_error`] and retain all of its offset and local-policy
+    /// checks.
+    pub fn from_parser_error(
+        envelope: &DiameterRequestEnvelope,
+        request: &[u8],
+        error: &DiameterParserError,
+        decode_ctx: DecodeContext,
+        dictionaries: DictionarySet<'_>,
+        encode_ctx: EncodeContext,
+    ) -> Result<DiameterBoundRequestFailure, DiameterFailureMappingError> {
+        envelope.verify_request(request)?;
+        if !error.matches_request(request) {
+            return Err(DiameterFailureMappingError::ParserRequestMismatch);
+        }
+        if error.missing_avp().is_none() && error.grouped_avp_set_provenance().is_none() {
+            return Self::from_decode_error(
+                envelope,
+                request,
+                error.decode_error(),
+                decode_ctx,
+                dictionaries,
+                encode_ctx,
+            );
+        };
+        if let Some(failure) = envelope
+            .classify(request, dictionaries)
+            .map_err(DiameterFailureMappingError::from_classification)?
+        {
+            return Ok(failure);
+        }
+        if !matches!(
+            error.decode_error().code(),
+            DecodeErrorCode::Structural { .. }
+        ) {
+            return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+        }
+        if let Some(missing) = error.missing_avp() {
+            verify_parser_command(
+                envelope,
+                missing.application_id(),
+                missing.command_code(),
+                missing.command_kind(),
+                dictionaries,
+            )?;
+            let definition =
+                resolve_parser_definition(dictionaries, missing.key(), missing.definition())?;
+            let failed = if let Some(parent) = missing.parent() {
+                let located = locate_exact_top_level_avp(request, parent.offset(), parent.key())?;
+                let parent_definition =
+                    resolve_parser_definition(dictionaries, parent.key(), parent.definition())?;
+                if parent_definition.data_type() != AvpDataType::Grouped
+                    || error.decode_error().offset()
+                        != parent
+                            .offset()
+                            .checked_add(located.avp.header.header_len())
+                            .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?
+                {
+                    return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+                }
+                DiameterFailedAvp::missing_for_definition(definition, encode_ctx)
+                    .and_then(|failed| {
+                        failed.within_group(&located.avp, located.offset, encode_ctx)
+                    })
+                    .map_err(DiameterFailureMappingError::FailedAvpEncoding)?
+            } else {
+                if error.decode_error().offset() != DIAMETER_HEADER_LEN {
+                    return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+                }
+                DiameterFailedAvp::missing_for_definition(definition, encode_ctx)
+                    .map_err(DiameterFailureMappingError::FailedAvpEncoding)?
+            };
+            return envelope
+                .bind_application_failure(request, Self::MissingMandatoryAvp(failed), dictionaries)
+                .map_err(DiameterFailureMappingError::from_classification);
+        }
+
+        let grouped = error
+            .grouped_avp_set_provenance()
+            .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?;
+        verify_parser_command(
+            envelope,
+            grouped.application_id(),
+            grouped.command_code(),
+            grouped.command_kind(),
+            dictionaries,
+        )?;
+        if grouped.definitions().len() < 2
+            || grouped.definitions().len() > MAX_FAILED_AVP_HIERARCHY_DEPTH
+        {
+            return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+        }
+        let parent = grouped.parent();
+        let located = locate_exact_top_level_avp(request, parent.offset(), parent.key())?;
+        let parent_definition =
+            resolve_parser_definition(dictionaries, parent.key(), parent.definition())?;
+        if parent_definition.data_type() != AvpDataType::Grouped
+            || error.decode_error().offset()
+                != parent
+                    .offset()
+                    .checked_add(located.avp.header.header_len())
+                    .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?
+        {
+            return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+        }
+        let mut definitions = Vec::with_capacity(grouped.definitions().len());
+        for definition in grouped.definitions() {
+            let resolved = resolve_parser_definition(dictionaries, definition.key(), definition)?;
+            if definitions
+                .iter()
+                .any(|existing: &&AvpDefinition| existing.key() == resolved.key())
+                || parent_definition
+                    .find_grouped_avp_rule(resolved.key())
+                    .is_none_or(|rule| rule.cardinality().is_forbidden())
+            {
+                return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+            }
+            definitions.push(resolved);
+        }
+        let failure = match grouped.failure_kind() {
+            DiameterGroupedAvpSetFailureKind::MissingOneOf => {
+                let failed = DiameterFailedAvp::missing_sibling_set_within_group(
+                    &definitions,
+                    &located.avp,
+                    located.offset,
+                    encode_ctx,
+                )
+                .map_err(DiameterFailureMappingError::FailedAvpEncoding)?;
+                Self::MissingMandatoryAvp(failed)
+            }
+            DiameterGroupedAvpSetFailureKind::MutuallyExclusivePresent => {
+                let selected =
+                    select_direct_grouped_children(&located.avp, located.offset, &definitions)?;
+                let failed = DiameterFailedAvp::copied_sibling_set_within_group(
+                    &selected,
+                    &located.avp,
+                    located.offset,
+                    encode_ctx,
+                )
+                .map_err(DiameterFailureMappingError::FailedAvpEncoding)?;
+                Self::MutuallyExclusiveAvps(failed)
+            }
+        };
+        envelope
+            .bind_application_failure(request, failure, dictionaries)
+            .map_err(DiameterFailureMappingError::from_classification)
+    }
 }
 
 /// A typed failure cryptographically bound to one inspected request envelope.
@@ -798,6 +1125,12 @@ impl fmt::Debug for DiameterBoundRequestFailure {
 pub enum DiameterFailureMappingError {
     /// The supplied request is not byte-identical to the inspected request.
     RequestMismatch,
+    /// The typed parser failure was produced from a different request.
+    ParserRequestMismatch,
+    /// The parser's application, command, or role does not match the request.
+    ParserCommandMismatch,
+    /// Missing-field provenance is inconsistent with an SDK parser result.
+    ParserProvenanceMismatch,
     /// No trusted command grammar exists for the request.
     CommandMissing,
     /// More than one non-identical application definition matches the request.
@@ -806,6 +1139,10 @@ pub enum DiameterFailureMappingError {
     CommandAmbiguous,
     /// More than one AVP definition matches the received vendor-aware key.
     AvpDefinitionAmbiguous,
+    /// No dictionary definition matches the parser's missing AVP schema key.
+    MissingAvpDefinitionMissing,
+    /// The resolved AVP definition differs from the parser's sealed SDK schema.
+    MissingAvpDefinitionMismatch,
     /// The decoder rejected an optional unknown AVP only because of local policy.
     LocalUnknownOptionalRejected,
     /// The command grammar explicitly permits the duplicated AVP to repeat.
@@ -830,10 +1167,19 @@ impl DiameterFailureMappingError {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::RequestMismatch => "diameter_error_mapping_request_mismatch",
+            Self::ParserRequestMismatch => "diameter_error_mapping_parser_request_mismatch",
+            Self::ParserCommandMismatch => "diameter_error_mapping_parser_command_mismatch",
+            Self::ParserProvenanceMismatch => "diameter_error_mapping_parser_provenance_mismatch",
             Self::CommandMissing => "diameter_error_mapping_command_missing",
             Self::ApplicationAmbiguous => "diameter_error_mapping_application_ambiguous",
             Self::CommandAmbiguous => "diameter_error_mapping_command_ambiguous",
             Self::AvpDefinitionAmbiguous => "diameter_error_mapping_avp_definition_ambiguous",
+            Self::MissingAvpDefinitionMissing => {
+                "diameter_error_mapping_missing_avp_definition_missing"
+            }
+            Self::MissingAvpDefinitionMismatch => {
+                "diameter_error_mapping_missing_avp_definition_mismatch"
+            }
             Self::LocalUnknownOptionalRejected => {
                 "diameter_error_mapping_local_unknown_optional_rejected"
             }
@@ -1158,9 +1504,8 @@ impl DiameterRequestEnvelope {
                 continue;
             }
             let key = located.avp.header.key();
-            if unique_avp_definition_for_classification(dictionaries, key)?.is_none()
-                && located.avp.header.flags.is_mandatory()
-            {
+            let definition = unique_avp_definition_for_classification(dictionaries, key)?;
+            if definition.is_none() && located.avp.header.flags.is_mandatory() {
                 let candidate = DiameterRequestFailure::UnsupportedMandatoryAvp(
                     DiameterFailedAvp::copied(
                         &located.avp,
@@ -1200,6 +1545,23 @@ impl DiameterRequestEnvelope {
                     }
                 }
                 Some(AvpCardinality::ZeroOrMore) | None => {}
+            }
+            if let Some(definition) = definition.filter(|definition| {
+                definition.data_type() == AvpDataType::Grouped
+                    && !definition.grouped_avp_rules().is_empty()
+                    && command
+                        .find_avp_rule(key)
+                        .is_some_and(|rule| !rule.cardinality().is_forbidden())
+            }) {
+                if let Some(candidate) = classify_direct_grouped_failure(
+                    &located.avp,
+                    located.offset,
+                    definition,
+                    dictionaries,
+                    envelope_encode_context(self),
+                )? {
+                    selected = Some(select_earlier_avp_failure(selected, candidate));
+                }
             }
         }
         Ok(selected.map(|failure| self.bind_failure(failure)))
@@ -2199,6 +2561,102 @@ fn top_level_avps(request: &[u8]) -> Result<TopLevelAvpIterator<'_>, DiameterFai
     })
 }
 
+fn verify_parser_command(
+    envelope: &DiameterRequestEnvelope,
+    application_id: ApplicationId,
+    command_code: CommandCode,
+    command_kind: CommandKind,
+    dictionaries: DictionarySet<'_>,
+) -> Result<(), DiameterFailureMappingError> {
+    if command_kind != CommandKind::Request
+        || application_id != envelope.application_id
+        || command_code != envelope.command_code
+    {
+        return Err(DiameterFailureMappingError::ParserCommandMismatch);
+    }
+    dictionaries
+        .resolve_command(application_id, command_code, command_kind)
+        .map(|_| ())
+        .map_err(|lookup| match lookup {
+            CommandLookupError::Missing => DiameterFailureMappingError::CommandMissing,
+            CommandLookupError::Ambiguous => DiameterFailureMappingError::CommandAmbiguous,
+        })
+}
+
+fn resolve_parser_definition<'a>(
+    dictionaries: DictionarySet<'a>,
+    key: AvpKey,
+    expected: &AvpDefinition,
+) -> Result<&'a AvpDefinition, DiameterFailureMappingError> {
+    let definition = unique_avp_definition(dictionaries, key)?
+        .ok_or(DiameterFailureMappingError::MissingAvpDefinitionMissing)?;
+    if definition != expected {
+        return Err(DiameterFailureMappingError::MissingAvpDefinitionMismatch);
+    }
+    Ok(definition)
+}
+
+fn locate_exact_top_level_avp<'a>(
+    request: &'a [u8],
+    expected_offset: usize,
+    expected_key: AvpKey,
+) -> Result<LocatedAvp<'a>, DiameterFailureMappingError> {
+    for located in top_level_avps(request)? {
+        let located = located?;
+        if located.offset > expected_offset {
+            break;
+        }
+        if located.offset == expected_offset {
+            return if located.avp.header.key() == expected_key {
+                Ok(located)
+            } else {
+                Err(DiameterFailureMappingError::ParserProvenanceMismatch)
+            };
+        }
+    }
+    Err(DiameterFailureMappingError::ParserProvenanceMismatch)
+}
+
+fn select_direct_grouped_children<'a>(
+    parent: &RawAvp<'a>,
+    parent_offset: usize,
+    definitions: &[&AvpDefinition],
+) -> Result<Vec<(RawAvp<'a>, usize)>, DiameterFailureMappingError> {
+    let mut counts = vec![0usize; definitions.len()];
+    let mut selected = Vec::with_capacity(definitions.len());
+    let mut remaining = parent.value;
+    let mut offset = parent_offset
+        .checked_add(parent.header.header_len())
+        .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?;
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        let (next, child) = RawAvp::decode(remaining, mapping_decode_context())
+            .map_err(|_| DiameterFailureMappingError::RequestAvpFramingInvalid)?;
+        if let Some((index, _)) = definitions
+            .iter()
+            .enumerate()
+            .find(|(_, definition)| definition.key() == child.header.key())
+        {
+            counts[index] = counts[index]
+                .checked_add(1)
+                .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?;
+            selected.push((child, offset));
+        }
+        let consumed = before
+            .checked_sub(next.len())
+            .filter(|consumed| *consumed != 0)
+            .ok_or(DiameterFailureMappingError::RequestAvpFramingInvalid)?;
+        offset = offset
+            .checked_add(consumed)
+            .ok_or(DiameterFailureMappingError::ParserProvenanceMismatch)?;
+        remaining = next;
+    }
+    if counts.iter().any(|count| *count != 1) || selected.len() != definitions.len() {
+        return Err(DiameterFailureMappingError::ParserProvenanceMismatch);
+    }
+    Ok(selected)
+}
+
 fn top_level_avps_before(
     request: &[u8],
     stop_offset: usize,
@@ -2370,6 +2828,89 @@ fn normalize_inspected_failure(
     (cardinality == Some(AvpCardinality::ZeroOrOne)).then_some(failure)
 }
 
+fn classify_direct_grouped_failure(
+    group: &RawAvp<'_>,
+    group_offset: usize,
+    definition: &AvpDefinition,
+    dictionaries: DictionarySet<'_>,
+    encode_ctx: EncodeContext,
+) -> Result<Option<DiameterRequestFailure>, DiameterRequestClassificationError> {
+    let mut remaining = group.value;
+    let mut offset = group_offset
+        .checked_add(group.header.header_len())
+        .ok_or(DiameterRequestClassificationError::RequestAvpFramingInvalid)?;
+    let mut seen_singletons = Vec::new();
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        let (next, child) = match RawAvp::decode(remaining, mapping_decode_context()) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                let malformed = DiameterFailedAvp::malformed(remaining, offset, 0, encode_ctx)
+                    .map_err(DiameterRequestClassificationError::FailedAvpEncoding)?;
+                let malformed_key = avp_key(malformed.leaf_code, malformed.leaf_vendor_id);
+                let failed =
+                    match unique_avp_definition_for_classification(dictionaries, malformed_key)? {
+                        Some(definition) if definition.data_type() != AvpDataType::Grouped => {
+                            DiameterFailedAvp::malformed_for_definition(
+                                remaining, offset, definition, encode_ctx,
+                            )
+                        }
+                        Some(_) | None => Ok(malformed),
+                    }
+                    .and_then(|failed| failed.within_group(group, group_offset, encode_ctx))
+                    .map_err(DiameterRequestClassificationError::FailedAvpEncoding)?;
+                return Ok(Some(DiameterRequestFailure::InvalidAvpLength(failed)));
+            }
+        };
+        let failed = || {
+            DiameterFailedAvp::copied(&child, offset, encode_ctx)
+                .and_then(|failed| failed.within_group(group, group_offset, encode_ctx))
+                .map_err(DiameterRequestClassificationError::FailedAvpEncoding)
+        };
+        if invalid_dictionary_flags(&child.header, dictionaries).map_err(|error| match error {
+            DiameterFailureMappingError::AvpDefinitionAmbiguous => {
+                DiameterRequestClassificationError::AvpDefinitionAmbiguous
+            }
+            _ => DiameterRequestClassificationError::RequestAvpFramingInvalid,
+        })? {
+            return Ok(Some(DiameterRequestFailure::InvalidAvpBits(failed()?)));
+        }
+        if vendor_id_zero(&child.header) || child.padding.iter().any(|byte| *byte != 0) {
+            return Ok(Some(DiameterRequestFailure::InvalidAvpValue(failed()?)));
+        }
+        let key = child.header.key();
+        if unique_avp_definition_for_classification(dictionaries, key)?.is_none()
+            && child.header.flags.is_mandatory()
+        {
+            return Ok(Some(DiameterRequestFailure::UnsupportedMandatoryAvp(
+                failed()?,
+            )));
+        }
+        match definition
+            .find_grouped_avp_rule(key)
+            .map(|rule| rule.cardinality())
+        {
+            Some(AvpCardinality::Forbidden) => {
+                return Ok(Some(DiameterRequestFailure::ForbiddenAvp(failed()?)));
+            }
+            Some(AvpCardinality::ZeroOrOne) if seen_singletons.contains(&key) => {
+                return Ok(Some(DiameterRequestFailure::ExcessSingleton(failed()?)));
+            }
+            Some(AvpCardinality::ZeroOrOne) => seen_singletons.push(key),
+            Some(AvpCardinality::ZeroOrMore) | None => {}
+        }
+        let consumed = before
+            .checked_sub(next.len())
+            .filter(|consumed| *consumed != 0)
+            .ok_or(DiameterRequestClassificationError::RequestAvpFramingInvalid)?;
+        offset = offset
+            .checked_add(consumed)
+            .ok_or(DiameterRequestClassificationError::RequestAvpFramingInvalid)?;
+        remaining = next;
+    }
+    Ok(None)
+}
+
 fn select_earlier_avp_failure(
     selected: Option<DiameterRequestFailure>,
     candidate: DiameterRequestFailure,
@@ -2420,6 +2961,12 @@ fn validate_application_failure(
         .ok_or(DiameterRequestClassificationError::FailureProvenanceMismatch)?;
     match failure {
         DiameterRequestFailure::MissingMandatoryAvp(_) => {
+            if matches!(
+                failed.sibling_set,
+                Some(FailedAvpSiblingSetProvenance::Missing { .. })
+            ) {
+                return validate_missing_sibling_set(request, failed, dictionaries, max_depth);
+            }
             if failed.leaf_offset.is_some() {
                 return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
             }
@@ -2455,6 +3002,9 @@ fn validate_application_failure(
             } else {
                 Err(DiameterRequestClassificationError::FailureProvenanceMismatch)
             }
+        }
+        DiameterRequestFailure::MutuallyExclusiveAvps(_) => {
+            validate_received_sibling_set(request, failed, dictionaries, max_depth)
         }
         DiameterRequestFailure::UnsupportedMandatoryAvp(_) => {
             validate_received_failed_avp(request, failed, dictionaries, max_depth)?;
@@ -2572,6 +3122,9 @@ fn validate_missing_failed_avp(
     dictionaries: DictionarySet<'_>,
     max_depth: usize,
 ) -> Result<(), DiameterRequestClassificationError> {
+    if failed.sibling_set.is_some() {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    }
     validate_failed_avp_hierarchy(request, failed, dictionaries, max_depth)?;
     let leaf = failed_leaf_avp(failed)?;
     if leaf.header.key() != definition.key()
@@ -2594,12 +3147,226 @@ fn validate_missing_failed_avp(
     Ok(())
 }
 
+fn validate_missing_sibling_set(
+    request: &[u8],
+    failed: &DiameterFailedAvp,
+    dictionaries: DictionarySet<'_>,
+    max_depth: usize,
+) -> Result<(), DiameterRequestClassificationError> {
+    let Some(FailedAvpSiblingSetProvenance::Missing { keys }) = &failed.sibling_set else {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    };
+    if keys.len() < 2
+        || keys.len() > MAX_FAILED_AVP_HIERARCHY_DEPTH
+        || failed.hierarchy_depth != 1
+        || failed.hierarchy_depth > max_depth
+        || failed.ancestors.len() != 1
+        || failed.leaf_offset.is_some()
+        || failed.source_wire_len.is_some()
+        || failed.source_wire_digest.is_some()
+        || failed.malformed_header.is_some()
+        || failed.reported_len.is_some()
+        || failed.ordering_offset != failed.ancestors[0].received_range().map(|range| range.0)
+        || avp_key(failed.leaf_code, failed.leaf_vendor_id) != keys[0]
+    {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    }
+    let FailedAvpAncestorProvenance::Received {
+        key: parent_key,
+        offset: parent_offset,
+        wire_len: parent_wire_len,
+        wire_digest: parent_digest,
+    } = failed.ancestors[0]
+    else {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    };
+    validate_exact_top_level_avp(
+        request,
+        parent_offset,
+        parent_wire_len,
+        parent_digest,
+        parent_key,
+    )?;
+    let received = received_avp(
+        request,
+        parent_offset,
+        parent_wire_len,
+        parent_digest,
+        parent_key,
+    )?;
+    let parent_definition = unique_grouped_definition(dictionaries, parent_key)?;
+    let (remaining, encoded_parent) = RawAvp::decode(failed.wire(), mapping_decode_context())
+        .map_err(|_| DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+    if !remaining.is_empty()
+        || encoded_parent.header.key() != parent_key
+        || encoded_parent.header.flags != received.header.flags
+        || encoded_parent.header.vendor_id != received.header.vendor_id
+    {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    }
+    let mut encoded_children = encoded_parent.grouped_avps(mapping_decode_context());
+    for (index, expected_key) in keys.iter().copied().enumerate() {
+        if keys[..index].contains(&expected_key) {
+            return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+        }
+        let child = encoded_children
+            .next()
+            .ok_or(DiameterRequestClassificationError::FailureProvenanceMismatch)?
+            .map_err(|_| DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+        let definition = unique_avp_definition(dictionaries, expected_key)
+            .map_err(|error| match error {
+                DiameterFailureMappingError::AvpDefinitionAmbiguous => {
+                    DiameterRequestClassificationError::AvpDefinitionAmbiguous
+                }
+                _ => DiameterRequestClassificationError::FailureProvenanceMismatch,
+            })?
+            .ok_or(DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+        let expected_header = header_for_definition(definition);
+        if child.header.key() != expected_key
+            || child.header.flags != expected_header.flags
+            || child.header.vendor_id != expected_header.vendor_id
+            || child.value.len() != minimum_value_len(definition.data_type())
+            || child.value.iter().any(|byte| *byte != 0)
+        {
+            return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+        }
+        validate_missing_schema_child(parent_definition, expected_key)?;
+        validate_direct_child_absent(&received, expected_key)?;
+    }
+    if encoded_children.next().is_some() {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    }
+    Ok(())
+}
+
+fn validate_received_sibling_set(
+    request: &[u8],
+    failed: &DiameterFailedAvp,
+    dictionaries: DictionarySet<'_>,
+    max_depth: usize,
+) -> Result<(), DiameterRequestClassificationError> {
+    let Some(FailedAvpSiblingSetProvenance::Received { children }) = &failed.sibling_set else {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    };
+    if children.len() < 2
+        || children.len() > MAX_FAILED_AVP_HIERARCHY_DEPTH
+        || failed.hierarchy_depth != 1
+        || failed.hierarchy_depth > max_depth
+        || failed.ancestors.len() != 1
+        || failed.source_wire_len.is_some()
+        || failed.source_wire_digest.is_some()
+        || failed.malformed_header.is_some()
+        || failed.leaf_offset != Some(children[0].offset)
+        || avp_key(failed.leaf_code, failed.leaf_vendor_id) != children[0].key
+        || failed.ordering_offset != failed.ancestors[0].received_range().map(|range| range.0)
+    {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    }
+    let FailedAvpAncestorProvenance::Received {
+        key: parent_key,
+        offset: parent_offset,
+        wire_len: parent_wire_len,
+        wire_digest: parent_digest,
+    } = failed.ancestors[0]
+    else {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    };
+    validate_exact_top_level_avp(
+        request,
+        parent_offset,
+        parent_wire_len,
+        parent_digest,
+        parent_key,
+    )?;
+    let received = received_avp(
+        request,
+        parent_offset,
+        parent_wire_len,
+        parent_digest,
+        parent_key,
+    )?;
+    let parent_definition = unique_grouped_definition(dictionaries, parent_key)?;
+    let (remaining, encoded_parent) = RawAvp::decode(failed.wire(), mapping_decode_context())
+        .map_err(|_| DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+    if !remaining.is_empty()
+        || encoded_parent.header.key() != parent_key
+        || encoded_parent.header.flags != received.header.flags
+        || encoded_parent.header.vendor_id != received.header.vendor_id
+    {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    }
+    let mut encoded_children = encoded_parent.value;
+    for (index, provenance) in children.iter().enumerate() {
+        if children[..index]
+            .iter()
+            .any(|earlier| earlier.key == provenance.key || earlier.offset >= provenance.offset)
+        {
+            return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+        }
+        if encoded_children.is_empty() {
+            return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+        }
+        let before = encoded_children.len();
+        let (next, child) = RawAvp::decode(encoded_children, mapping_decode_context())
+            .map_err(|_| DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+        let consumed = before
+            .checked_sub(next.len())
+            .filter(|consumed| *consumed != 0)
+            .ok_or(DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+        let encoded_wire = encoded_children
+            .get(..consumed)
+            .ok_or(DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+        let end = provenance
+            .offset
+            .checked_add(provenance.wire_len)
+            .ok_or(DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+        let source = request
+            .get(provenance.offset..end)
+            .ok_or(DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+        if child.header.key() != provenance.key
+            || source.len() != provenance.wire_len
+            || digest_request(source) != provenance.wire_digest
+            || encoded_wire != source
+            || (index == 0 && failed.reported_len != Some(child.header.length))
+        {
+            return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+        }
+        validate_direct_received_child(
+            &received,
+            parent_offset,
+            provenance.offset,
+            provenance.wire_len,
+            provenance.key,
+        )?;
+        let definition = unique_avp_definition(dictionaries, provenance.key)
+            .map_err(|error| match error {
+                DiameterFailureMappingError::AvpDefinitionAmbiguous => {
+                    DiameterRequestClassificationError::AvpDefinitionAmbiguous
+                }
+                _ => DiameterRequestClassificationError::FailureProvenanceMismatch,
+            })?
+            .ok_or(DiameterRequestClassificationError::FailureProvenanceMismatch)?;
+        if definition.key() != provenance.key {
+            return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+        }
+        validate_missing_schema_child(parent_definition, provenance.key)?;
+        encoded_children = next;
+    }
+    if !encoded_children.is_empty() {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    }
+    Ok(())
+}
+
 fn validate_failed_avp_hierarchy(
     request: &[u8],
     failed: &DiameterFailedAvp,
     dictionaries: DictionarySet<'_>,
     max_depth: usize,
 ) -> Result<(), DiameterRequestClassificationError> {
+    if failed.sibling_set.is_some() {
+        return Err(DiameterRequestClassificationError::FailureProvenanceMismatch);
+    }
     if failed.hierarchy_depth != failed.ancestors.len()
         || failed.hierarchy_depth > max_depth
         || failed.hierarchy_depth > MAX_FAILED_AVP_HIERARCHY_DEPTH
@@ -3135,5 +3902,195 @@ const fn minimum_value_len(data_type: AvpDataType) -> usize {
         | AvpDataType::DiameterUri
         | AvpDataType::IpFilterRule
         | AvpDataType::QosFilterRule => 0,
+    }
+}
+
+#[cfg(test)]
+mod parser_provenance_tests {
+    use super::*;
+    use crate::base::{
+        self, APPLICATION_ID_COMMON_MESSAGES, AVP_ORIGIN_HOST, COMMAND_DEVICE_WATCHDOG,
+    };
+    use crate::dictionary::{AvpFlagRules, Dictionary};
+    use crate::parser_error::DiameterParserError;
+    use crate::Message;
+
+    const SYNTHETIC_VENDOR_ID: VendorId = VendorId::new(42_424);
+    const SYNTHETIC_VENDOR_CODE: AvpCode = AvpCode::new(9_901);
+    const SYNTHETIC_VENDOR_DEFINITION: AvpDefinition = AvpDefinition::new(
+        AvpKey::vendor(SYNTHETIC_VENDOR_CODE, SYNTHETIC_VENDOR_ID),
+        "Synthetic-Vendor-Required",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("ietf", "RFC6733", "7.5"),
+    );
+    static SYNTHETIC_AVPS: [AvpDefinition; 1] = [SYNTHETIC_VENDOR_DEFINITION];
+    static SYNTHETIC_DICTIONARY: Dictionary = Dictionary::new(
+        "diameter-parser-provenance-vendor-test",
+        &[],
+        &[],
+        &SYNTHETIC_AVPS,
+    );
+    static SYNTHETIC_DICTIONARY_REFS: [&Dictionary; 2] =
+        [base::dictionary(), &SYNTHETIC_DICTIONARY];
+    static SYNTHETIC_DICTIONARIES: DictionarySet<'static> =
+        DictionarySet::new(&SYNTHETIC_DICTIONARY_REFS);
+
+    fn empty_dwr() -> ([u8; DIAMETER_HEADER_LEN], Message<'static>) {
+        let request = [
+            1, 0, 0, 20, 0x80, 0, 1, 24, 0, 0, 0, 0, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+        ];
+        let message = Message {
+            header: Header::new(
+                CommandFlags::request(false),
+                COMMAND_DEVICE_WATCHDOG,
+                APPLICATION_ID_COMMON_MESSAGES,
+                0x1020_3040,
+                0x5060_7080,
+            ),
+            raw_avps: &[],
+            tail: &[],
+        };
+        (request, message)
+    }
+
+    fn request_envelope(request: &[u8]) -> DiameterRequestEnvelope {
+        match inspect_diameter_request(request, DecodeContext::conservative()) {
+            DiameterRequestInspection::Request(envelope) => *envelope,
+            DiameterRequestInspection::Unanswerable(reason) => {
+                panic!("empty DWR unexpectedly unanswerable: {}", reason.as_str())
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_vendor_provenance_uses_dictionary_header_and_minimum_shape() {
+        let (request, message) = empty_dwr();
+        let error = DiameterParserError::missing_for_definition(
+            &message,
+            DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "synthetic missing vendor field",
+                },
+                DIAMETER_HEADER_LEN,
+            ),
+            &SYNTHETIC_AVPS[0],
+            APPLICATION_ID_COMMON_MESSAGES,
+            COMMAND_DEVICE_WATCHDOG,
+        );
+        let bound = match DiameterRequestFailure::from_parser_error(
+            &request_envelope(&request),
+            &request,
+            &error,
+            DecodeContext::conservative(),
+            SYNTHETIC_DICTIONARIES,
+            EncodeContext::default(),
+        ) {
+            Ok(bound) => bound,
+            Err(mapping) => panic!("synthetic vendor provenance did not map: {mapping}"),
+        };
+        let DiameterRequestFailure::MissingMandatoryAvp(failed) = bound.failure() else {
+            panic!("synthetic vendor provenance did not select 5005");
+        };
+        let leaf = match failed_leaf_avp(failed) {
+            Ok(leaf) => leaf,
+            Err(mapping) => panic!("synthetic vendor Failed-AVP did not decode: {mapping}"),
+        };
+        assert_eq!(leaf.header.code, SYNTHETIC_VENDOR_CODE);
+        assert_eq!(leaf.header.vendor_id, Some(SYNTHETIC_VENDOR_ID));
+        assert!(leaf.header.flags.is_vendor_specific());
+        assert!(leaf.header.flags.is_mandatory());
+        assert_eq!(leaf.value, [0_u8; 4]);
+    }
+
+    #[test]
+    fn forged_internal_command_application_and_category_provenance_is_rejected() {
+        let (request, message) = empty_dwr();
+        let envelope = request_envelope(&request);
+        for (application_id, command_code) in [
+            (ApplicationId::new(99), COMMAND_DEVICE_WATCHDOG),
+            (
+                APPLICATION_ID_COMMON_MESSAGES,
+                crate::base::COMMAND_DISCONNECT_PEER,
+            ),
+        ] {
+            let error = DiameterParserError::missing_for_definition(
+                &message,
+                DecodeError::new(
+                    DecodeErrorCode::Structural {
+                        reason: "synthetic mismatched parser grammar",
+                    },
+                    DIAMETER_HEADER_LEN,
+                ),
+                base::dictionary()
+                    .find_avp(AvpKey::ietf(AVP_ORIGIN_HOST))
+                    .unwrap_or(&SYNTHETIC_AVPS[0]),
+                application_id,
+                command_code,
+            );
+            assert_eq!(
+                DiameterRequestFailure::from_parser_error(
+                    &envelope,
+                    &request,
+                    &error,
+                    DecodeContext::conservative(),
+                    SYNTHETIC_DICTIONARIES,
+                    EncodeContext::default(),
+                ),
+                Err(DiameterFailureMappingError::ParserCommandMismatch)
+            );
+        }
+
+        let wrong_category = DiameterParserError::missing_for_definition(
+            &message,
+            DecodeError::new(
+                DecodeErrorCode::InvalidEnumValue {
+                    field: "synthetic",
+                    value: 7,
+                },
+                DIAMETER_HEADER_LEN,
+            ),
+            base::dictionary()
+                .find_avp(AvpKey::ietf(AVP_ORIGIN_HOST))
+                .unwrap_or(&SYNTHETIC_AVPS[0]),
+            APPLICATION_ID_COMMON_MESSAGES,
+            COMMAND_DEVICE_WATCHDOG,
+        );
+        assert_eq!(
+            DiameterRequestFailure::from_parser_error(
+                &envelope,
+                &request,
+                &wrong_category,
+                DecodeContext::conservative(),
+                SYNTHETIC_DICTIONARIES,
+                EncodeContext::default(),
+            ),
+            Err(DiameterFailureMappingError::ParserProvenanceMismatch)
+        );
+
+        let untrusted = DiameterParserError::decoded(
+            &message,
+            DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "synthetic reason-string-only missing field",
+                },
+                DIAMETER_HEADER_LEN,
+            ),
+        );
+        assert_eq!(
+            DiameterRequestFailure::from_parser_error(
+                &envelope,
+                &request,
+                &untrusted,
+                DecodeContext::conservative(),
+                SYNTHETIC_DICTIONARIES,
+                EncodeContext::default(),
+            ),
+            Err(DiameterFailureMappingError::OffsetAmbiguous)
+        );
     }
 }

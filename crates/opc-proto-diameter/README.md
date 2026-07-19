@@ -47,6 +47,15 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   received parent.
   Proxy-Info descent and child count honor `max_depth` and `max_ies`;
   truncation and resource-limit failures are explicitly unanswerable.
+- `parser_error` provides sealed, redaction-safe `DiameterParserError` and
+  `DiameterMissingAvpProvenance`, grouped-parent, and grouped-set metadata. Additive
+  `*_with_provenance` request parsers cover CER, DWR, DPR, and SWm DER (plus
+  the SWm transaction-envelope form); legacy parser signatures delegate to
+  them and still return the original `DecodeError`. Missing provenance exposes
+  only numeric application/command/role metadata and the exact SDK-owned AVP
+  definition needed to inspect its vendor-aware key, data type, and flag rules.
+  The binding covers the declared Diameter message boundary, not unrelated
+  bytes following it in a stream or datagram receive buffer.
 - `dictionary` exposes `Dictionary`, `DictionarySet`, `ApplicationDefinition`,
   `CommandDefinition`, `CommandAvpRule`, `AvpCardinality`, `AvpDefinition`,
   `AvpDataType`, `AvpFlagRules`, and related metadata types.
@@ -156,6 +165,67 @@ parent's declared grouped-child rule and preceding siblings; top-level command
 rules are never reused for nested leaves. These fail-closed distinctions
 prevent local parser or dictionary incompleteness from being reported as peer
 fault.
+
+For an actual typed request-parser failure, use the provenance-aware entry
+point and the dedicated mapper rather than matching a `DecodeError` reason:
+
+```rust
+use opc_proto_diameter::error_answer::DiameterRequestFailure;
+use opc_proto_diameter::peer::parse_device_watchdog_request_with_provenance;
+use opc_protocol::{DecodeContext, EncodeContext};
+
+# use opc_proto_diameter::{DictionarySet, Message};
+# use opc_proto_diameter::error_answer::DiameterRequestEnvelope;
+# fn example(
+#     message: &Message<'_>,
+#     request: &[u8],
+#     envelope: &DiameterRequestEnvelope,
+#     dictionaries: DictionarySet<'_>,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+if let Err(parser_error) = parse_device_watchdog_request_with_provenance(
+    message,
+    DecodeContext::conservative(),
+) {
+    let bound = DiameterRequestFailure::from_parser_error(
+        envelope,
+        request,
+        &parser_error,
+        DecodeContext::conservative(),
+        dictionaries,
+        EncodeContext::default(),
+    )?;
+    assert_eq!(bound.result_code(), 5005);
+}
+# Ok(())
+# }
+```
+
+The mapper first reclassifies the exact inspected Diameter message, so a prior header,
+application, command, P-bit, framing, dictionary-bit, unknown-M, forbidden, or
+excess failure wins. It then verifies the sealed declared-message-boundary
+parser fingerprint and
+command/application identity, resolves exactly one vendor-aware AVP definition,
+requires it to equal the sealed SDK definition, derives its minimum
+`Failed-AVP` shape, and proves the field is absent through the existing checked
+application binder. A typed parser error without missing provenance delegates
+to the generic decode-error mapper unchanged. Missing, conflicting, or
+ambiguous definitions, cross-request reuse, command mismatch, and local-policy
+rejections fail closed as typed mapping errors.
+
+Nested command grammar uses exact received-parent provenance. A CER
+`Vendor-Specific-Application-Id` without Vendor-Id produces a nested minimum
+Vendor-Id. When neither Auth-Application-Id nor Acct-Application-Id is present,
+RFC 6733 §6.11's 5005 `Failed-AVP` contains minimum examples of both children;
+when both are present, 5009 contains only those exact received children in wire
+order. An optional-present SWm `Terminal-Information` without mandatory IMEI
+similarly produces a nested vendor-correct minimum IMEI and never reflects its
+Software-Version sibling.
+
+Migration note: `DiameterRequestFailure` now includes
+`MutuallyExclusiveAvps(DiameterFailedAvp)`. Exhaustive downstream matches must
+add an arm; `result_code()` and `as_str()` intentionally classify it with the
+existing 5009 `diameter_avp_occurs_too_many_times` family. Legacy parser
+function signatures and their `DecodeError` values remain source-compatible.
 
 ## Features
 
