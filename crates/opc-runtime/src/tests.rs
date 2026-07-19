@@ -5,6 +5,11 @@ use opc_alarm::{
     AffectedObject, AlarmDetails, AlarmType, ProbableCause, RedactedText, Severity,
     SharedAlarmManager,
 };
+use opc_crypto_provider::testkit::FakeCryptoModule;
+use opc_crypto_provider::{
+    probe_capability_report, CapabilitySet, CryptoCapability, PolicyError, ProviderIdentity,
+    ProviderPolicy,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1228,4 +1233,378 @@ async fn test_budget_limit_max_tasks_enforced() {
     assert!(!err.contains("/"), "Errors must not contain paths");
 
     handle.shutdown().await;
+}
+
+// =============================================================================
+// SecurityInit startup hook (issue #334, slice 2)
+// =============================================================================
+
+fn crypto_fixture_module(capabilities: CapabilitySet) -> Arc<FakeCryptoModule> {
+    let identity = match ProviderIdentity::from_parts("runtime fixture", "0.0.1") {
+        Ok(identity) => identity,
+        Err(error) => panic!("valid identity labels: {error}"),
+    };
+    Arc::new(FakeCryptoModule::new(identity).with_advertised_capabilities(capabilities))
+}
+
+/// Startup phases whose `SecurityInit` hook probes `module` and admits it
+/// against `policy`, mapping a typed policy rejection into
+/// `BootstrapError::SecurityInit` — the consumer-side wiring this slice
+/// enables.
+fn crypto_admission_phases(module: Arc<FakeCryptoModule>, policy: ProviderPolicy) -> StartupPhases {
+    StartupPhases {
+        init_security: Some(Box::new(move |_profile: &RuntimeProfile| {
+            let module = module.clone();
+            Box::pin(async move {
+                let report = probe_capability_report(module.as_ref()).await;
+                policy
+                    .admit(&report)
+                    .map(|_admission| ())
+                    .map_err(|err| BootstrapError::SecurityInit(Box::new(err)))
+            })
+        })),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn startup_phases_init_security_defaults_to_noop() {
+    let phases = StartupPhases::default();
+    assert!(phases.init_security.is_none());
+    assert!(phases
+        .init_security(&RuntimeProfile::default())
+        .await
+        .is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failing_security_init_hook_fails_build_before_any_listener_exists() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "security-init-failure-test".to_string(),
+        ..Default::default()
+    };
+    let observed_phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let phases_for_observer = observed_phases.clone();
+    let listener_constructed = Arc::new(AtomicBool::new(false));
+    let listener_flag = listener_constructed.clone();
+
+    let phases = StartupPhases {
+        init_security: Some(Box::new(|_profile: &RuntimeProfile| {
+            Box::pin(async {
+                Err(BootstrapError::SecurityInit(Box::new(
+                    std::io::Error::other("required crypto capability unavailable"),
+                )))
+            })
+        })),
+        ..Default::default()
+    };
+
+    let result = Builder::new(profile)
+        .with_phases(phases)
+        .with_phase_observer(move |phase| {
+            phases_for_observer.lock().unwrap().push(phase);
+        })
+        .try_with_init(move |_supervisor, _shutdown| {
+            let listener_flag = listener_flag.clone();
+            Box::pin(async move {
+                // A product binds its listeners here (see the crate docs);
+                // recording the flag stands in for listener construction.
+                listener_flag.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .build()
+        .await;
+
+    match result {
+        Err(RuntimeError::Bootstrap(err)) => assert!(
+            matches!(
+                err.downcast_ref::<BootstrapError>(),
+                Some(BootstrapError::SecurityInit(_))
+            ),
+            "expected SecurityInit bootstrap error, got {err:?}"
+        ),
+        other => panic!("expected bootstrap error from failed security init, got {other:?}"),
+    }
+    assert!(
+        !listener_constructed.load(Ordering::SeqCst),
+        "no listener may ever be constructed after a SecurityInit failure"
+    );
+    let observed = observed_phases.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        vec![
+            RuntimePhase::ProcessInit,
+            RuntimePhase::TelemetryInit,
+            RuntimePhase::SecurityInit,
+        ],
+        "failure must abort before ConfigBootstrap/ResourcePreflight/ServiceBind/PeerWarmup"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn security_init_hook_success_runs_in_phase_order_and_allows_ready() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "security-init-success-test".to_string(),
+        ..Default::default()
+    };
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events_for_observer = events.clone();
+    let events_for_hook = events.clone();
+
+    let phases = StartupPhases {
+        init_security: Some(Box::new(move |_profile: &RuntimeProfile| {
+            let events_for_hook = events_for_hook.clone();
+            Box::pin(async move {
+                events_for_hook
+                    .lock()
+                    .unwrap()
+                    .push("init_security".to_string());
+                Ok(())
+            })
+        })),
+        ..Default::default()
+    };
+
+    let handle = Builder::new(profile)
+        .with_phases(phases)
+        .with_phase_observer(move |phase| {
+            events_for_observer.lock().unwrap().push(phase.to_string());
+        })
+        .try_with_init(|supervisor, shutdown| {
+            Box::pin(async move {
+                let task_shutdown = shutdown.clone();
+                supervisor
+                    .spawn(
+                        TaskName::new("security-init-success-listener"),
+                        TaskKind::Listener,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        move || {
+                            let task_shutdown = task_shutdown.clone();
+                            Box::pin(async move {
+                                task_shutdown.shutdown_acknowledged().await;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await?;
+                Ok(())
+            })
+        })
+        .build()
+        .await
+        .unwrap();
+
+    wait_for_runtime_phase(&handle, RuntimePhase::Ready).await;
+    assert_eq!(handle.readiness().await, Readiness::Ready);
+    handle.shutdown().await;
+
+    let recorded = events.lock().unwrap().clone();
+    let position = |name: &str| {
+        recorded
+            .iter()
+            .position(|event| event == name)
+            .unwrap_or_else(|| panic!("event {name:?} not recorded: {recorded:?}"))
+    };
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| *event == "init_security")
+            .count(),
+        1,
+        "security hook must run exactly once: {recorded:?}"
+    );
+    assert!(
+        position("SecurityInit") < position("init_security"),
+        "hook must run inside the SecurityInit phase: {recorded:?}"
+    );
+    assert!(
+        position("init_security") < position("ConfigBootstrap"),
+        "hook must finish before ConfigBootstrap: {recorded:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn absent_security_init_hook_keeps_existing_startup_sequence() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "security-init-absent-test".to_string(),
+        ..Default::default()
+    };
+    let observed_phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let phases_for_observer = observed_phases.clone();
+
+    // Default StartupPhases: no security hook configured. Startup must behave
+    // exactly as it did before the hook existed.
+    let handle = Builder::new(profile)
+        .with_phase_observer(move |phase| {
+            phases_for_observer.lock().unwrap().push(phase);
+        })
+        .try_with_init(|supervisor, shutdown| {
+            Box::pin(async move {
+                let task_shutdown = shutdown.clone();
+                supervisor
+                    .spawn(
+                        TaskName::new("security-init-absent-listener"),
+                        TaskKind::Listener,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        move || {
+                            let task_shutdown = task_shutdown.clone();
+                            Box::pin(async move {
+                                task_shutdown.shutdown_acknowledged().await;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await?;
+                Ok(())
+            })
+        })
+        .build()
+        .await
+        .unwrap();
+
+    wait_for_runtime_phase(&handle, RuntimePhase::Ready).await;
+    assert_eq!(handle.readiness().await, Readiness::Ready);
+    handle.shutdown().await;
+
+    let observed = observed_phases.lock().unwrap().clone();
+    assert!(
+        observed.len() >= 8,
+        "expected the full startup sequence: {observed:?}"
+    );
+    assert_eq!(
+        &observed[..8],
+        &[
+            RuntimePhase::ProcessInit,
+            RuntimePhase::TelemetryInit,
+            RuntimePhase::SecurityInit,
+            RuntimePhase::ConfigBootstrap,
+            RuntimePhase::ResourcePreflight,
+            RuntimePhase::ServiceBind,
+            RuntimePhase::PeerWarmup,
+            RuntimePhase::Ready,
+        ],
+        "absent hook must preserve the pre-hook startup sequence"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_required_crypto_capability_fails_startup_before_service_bind() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "crypto-admission-reject-test".to_string(),
+        ..Default::default()
+    };
+    let module = crypto_fixture_module(CapabilitySet::empty());
+    let policy = ProviderPolicy::new().require(CryptoCapability::Tls);
+    let observed_phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let phases_for_observer = observed_phases.clone();
+    let listener_constructed = Arc::new(AtomicBool::new(false));
+    let listener_flag = listener_constructed.clone();
+
+    let result = Builder::new(profile)
+        .with_phases(crypto_admission_phases(module, policy))
+        .with_phase_observer(move |phase| {
+            phases_for_observer.lock().unwrap().push(phase);
+        })
+        .try_with_init(move |_supervisor, _shutdown| {
+            let listener_flag = listener_flag.clone();
+            Box::pin(async move {
+                listener_flag.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .build()
+        .await;
+
+    match result {
+        Err(RuntimeError::Bootstrap(err)) => match err.downcast_ref::<BootstrapError>() {
+            Some(BootstrapError::SecurityInit(source)) => {
+                match source.downcast_ref::<PolicyError>() {
+                    Some(PolicyError::CapabilityUnavailable { missing }) => assert_eq!(
+                        *missing,
+                        CapabilitySet::from_slice(&[CryptoCapability::Tls]),
+                        "expected exactly the unadvertised capability to be reported missing"
+                    ),
+                    other => {
+                        panic!("expected a typed CapabilityUnavailable rejection, got {other:?}")
+                    }
+                }
+            }
+            other => panic!("expected SecurityInit bootstrap error, got {other:?}"),
+        },
+        other => panic!("expected bootstrap error from rejected admission, got {other:?}"),
+    }
+    assert!(
+        !listener_constructed.load(Ordering::SeqCst),
+        "no listener may be constructed when crypto admission is rejected"
+    );
+    let observed = observed_phases.lock().unwrap().clone();
+    assert!(
+        !observed.contains(&RuntimePhase::ConfigBootstrap)
+            && !observed.contains(&RuntimePhase::ServiceBind)
+            && !observed.contains(&RuntimePhase::Ready),
+        "rejected admission must abort before ConfigBootstrap/ServiceBind: {observed:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn advertised_crypto_capability_admits_and_startup_completes() {
+    let profile = RuntimeProfile {
+        mode: RuntimeMode::Conformance,
+        nf_kind: "crypto-admission-accept-test".to_string(),
+        ..Default::default()
+    };
+    let module = crypto_fixture_module(CapabilitySet::empty().with(CryptoCapability::Tls));
+    let policy = ProviderPolicy::new().require(CryptoCapability::Tls);
+
+    let handle = Builder::new(profile)
+        .with_phases(crypto_admission_phases(module.clone(), policy))
+        .try_with_init(|supervisor, shutdown| {
+            Box::pin(async move {
+                let task_shutdown = shutdown.clone();
+                supervisor
+                    .spawn(
+                        TaskName::new("crypto-admission-accept-listener"),
+                        TaskKind::Listener,
+                        Criticality::Fatal,
+                        RestartPolicy::no_restart(),
+                        move || {
+                            let task_shutdown = task_shutdown.clone();
+                            Box::pin(async move {
+                                task_shutdown.shutdown_acknowledged().await;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await?;
+                Ok(())
+            })
+        })
+        .build()
+        .await
+        .unwrap();
+
+    wait_for_runtime_phase(&handle, RuntimePhase::Ready).await;
+    assert_eq!(handle.readiness().await, Readiness::Ready);
+    handle.shutdown().await;
+
+    // Observability companion: the admitted module's bounded report attaches
+    // to the crypto provider gate. The gate reports; the SecurityInit hook
+    // above is what enforced.
+    let report = probe_capability_report(module.as_ref()).await;
+    let gates = HealthGateSet::new().with_gate(
+        HealthGate::new(known_gates::CRYPTO_PROVIDER, GateImpact::BlocksReadiness)
+            .with_status(GateStatus::Passing)
+            .with_details(serde_json::to_value(&report).unwrap()),
+    );
+    assert_eq!(gates.readiness(), Readiness::Ready);
+    let json = serde_json::to_string(&gates).unwrap();
+    assert!(json.contains("\"crypto_provider\":"));
+    assert!(json.contains("\"effective\":[\"tls\"]"));
 }

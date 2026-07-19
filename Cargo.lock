@@ -3130,6 +3130,7 @@ dependencies = [
  "nix",
  "num_cpus",
  "opc-alarm",
+ "opc-crypto-provider",
  "opc-observability",
  "opc-redaction",
  "opc-sbi",

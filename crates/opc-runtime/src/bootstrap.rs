@@ -74,6 +74,16 @@ pub enum BootstrapError {
     #[error("security material unavailable: {0}")]
     SecurityUnavailable(String),
 
+    /// The security bootstrap callback run during the `SecurityInit` phase
+    /// rejected startup — for example a policy-required cryptographic
+    /// capability is not effective on the selected module; wraps the
+    /// underlying error. Fatal in every runtime mode: it aborts
+    /// `Builder::build` before `ServiceBind`, so the runtime binds no service
+    /// listener. Anything bound by an earlier phase callback, such as a
+    /// telemetry exporter, is not torn down.
+    #[error("security init error: {0}")]
+    SecurityInit(#[source] Box<dyn std::error::Error + Send + Sync>),
+
     /// A drain hook required by the profile (e.g. `"NrfDrainHook"` for
     /// AMF/SMF/UPF) was not registered before `Builder::build`. Fatal in
     /// fail-closed modes; logged as a warning otherwise.
