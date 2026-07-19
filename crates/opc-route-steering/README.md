@@ -4,23 +4,30 @@
 
 `opc-route-steering` is the safe Rust control surface for Linux route and rule
 steering used by OpenPacketCore dataplane adapters. It models destination
-routes, source/destination/firewall-mark rules, backend capability probes, mock
-behavior, Linux rtnetlink mutation, and redaction-safe errors.
+routes, source/destination/firewall-mark rules, backend capability probes,
+conflict-safe resident-state convergence, mock behavior, Linux rtnetlink
+mutation/readback, and redaction-safe errors.
 
 The crate does not choose route tables, rule priorities, CNI coexistence
 policy, namespace placement, or product traffic-readiness policy.
 
 ## API Shape
 
-- `RouteSteeringBackend`: async port for `install_route`, `remove_route`,
-  `install_rule`, `remove_rule`, and `probe`.
+- `RouteSteeringBackend`: async port for legacy exclusive mutation, typed
+  `read_route`/`read_rule`, single-object convergence, explicit
+  `remove_converged_route`/`remove_converged_rule`, cancellation-safe paired
+  route/rule convergence, typed `capabilities`, and runtime `probe`.
 - `LinuxRouteSteeringBackend`: safe adapter over rtnetlink through
   `opc-linux-route-sys`.
-- `MockRouteSteeringBackend`: deterministic in-memory backend with operation
-  capture and failure injection.
+- `MockRouteSteeringBackend`: deterministic in-memory backend with Linux-style
+  bounded multimap collisions, legacy mutation/probe operation capture,
+  separate typed read observations, owned/foreign fixture seeding, and
+  targeted failure injection.
 - `UnsupportedRouteSteeringBackend`: trait-compatible unsupported backend.
-- Model exports: `IpPrefix`, `FirewallMark`, `RouteRequest`, `RuleRequest`,
-  `RouteSteeringProbe`, and `RouteSteeringBackendKind`.
+- Model exports include `RouteReadback`, `RuleReadback`, typed conflict and
+  mismatch evidence, per-object convergence outcomes, and
+  `RouteRuleConvergenceOutcome`. `RouteSteeringCapabilities` prevents callers
+  from treating legacy mutation support as conflict-safe convergence support.
 - `RouteSteeringError` exposes stable labels and raw OS errno access without
   leaking kernel messages into formatted output.
 
@@ -30,8 +37,8 @@ policy, namespace placement, or product traffic-readiness policy.
 use std::net::{IpAddr, Ipv4Addr};
 
 use opc_route_steering::{
-    IpPrefix, MockRouteSteeringBackend, RouteRequest, RouteSteeringBackend,
-    RuleRequest,
+    IpPrefix, MockRouteSteeringBackend, RouteConvergenceOutcome, RouteRequest,
+    RouteSteeringBackend, RouteRuleRollback, RuleConvergenceOutcome, RuleRequest,
 };
 
 #[tokio::main]
@@ -52,13 +59,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         priority: 1000,
     };
 
-    backend.install_route(route.clone()).await?;
-    backend.install_rule(rule.clone()).await?;
-    backend.remove_rule(rule).await?;
-    backend.remove_route(route).await?;
+    let outcome = backend
+        .converge_route_and_rule(route.clone(), rule.clone())
+        .await?;
+    assert_eq!(outcome.route, RouteConvergenceOutcome::Installed);
+    assert_eq!(outcome.rule, RuleConvergenceOutcome::Installed);
+    assert_eq!(outcome.rollback, RouteRuleRollback::NotNeeded);
+
+    // A retry proves exact resident equality rather than trusting EEXIST.
+    let retry = backend
+        .converge_route_and_rule(route.clone(), rule.clone())
+        .await?;
+    assert_eq!(retry.route, RouteConvergenceOutcome::ExactAlreadyPresent);
+    assert_eq!(retry.rule, RuleConvergenceOutcome::ExactAlreadyPresent);
+
+    backend.remove_converged_rule(rule).await?;
+    backend.remove_converged_route(route).await?;
     Ok(())
 }
 ```
+
+## Convergence Contract
+
+- A route's logical collision key is its effective destination network prefix:
+  route convergence, readback, and mock resident state clear IPv4/IPv6 host
+  bits before comparison, matching the Linux FIB. Equality also compares the
+  output interface, table, optional metric, fixed unicast kernel semantics, and
+  namespace ownership protocol emitted by this crate. IPv4 `None`/zero metrics
+  canonicalize to an absent attribute; IPv6 `None`/zero canonicalize to the
+  kernel's effective metric `1024`. This does not canonicalize rule selectors.
+  Legacy Linux route install/remove still emits the caller-supplied destination
+  bytes, and legacy mock mutation operations record the exact caller request.
+- A rule's logical collision key is its address family and priority. Equality
+  compares source, destination, firewall mark and mask, table, priority, and
+  the fixed table-lookup semantics and namespace ownership protocol emitted by
+  this crate. Convergence-owned Linux route `rtm_protocol` and rule
+  `FRA_PROTOCOL` use `LINUX_ROUTE_STEERING_PROTOCOL` (`242`). Missing, legacy,
+  or other protocol values are foreign conflicts, never exact resident state.
+- A rule containing only a firewall mark uses Linux's IPv4 rule family (the
+  same default used by `ip rule`). Source- or destination-qualified rules
+  derive their family from that prefix. Legacy mutation and readback preserve
+  IPv4/IPv6 `/0` family selectors and a zero firewall-mark value. Conflict-safe
+  convergence and exact owned removal reject `/0` and mark zero with a typed
+  `InvalidConfig`; Linux treats those values as delete wildcards. Mark masks
+  remain nonzero for both APIs.
+- Bounded readback returns `ExactPresent` only for one fully representable
+  object. A modeled difference returns `Conflict`; malformed, incomplete,
+  oversized, unsupported, or unmodeled colliding state returns
+  `Indeterminate`. `AlreadyExists` alone is never idempotent success.
+- Convergence reads before mutation and verifies again after a successful
+  exclusive create. A collision introduced across that race is never reported
+  as installed; the object owned by the call is removed and the typed outcome
+  records conflict/indeterminate-after-rollback.
+- `remove_converged_route`/`remove_converged_rule` require exactly one owned
+  exact candidate immediately before deletion and verify the broad key is
+  absent afterward. Multiplicity, foreign protocol state, semantic route cache
+  expiry/error, or unfamiliar attributes fail closed without issuing a normal
+  delete. The original `remove_route`/`remove_rule` retain their legacy
+  best-effort semantics and are not ownership-safe APIs.
+- Paired convergence handles the route first. If the rule cannot converge, it
+  removes only objects installed by the same call and only after the exact
+  ownership check succeeds. Post-install races can report owned rule, route,
+  or combined rollback; ambiguous rollback returns a typed failure.
+- Every Linux read, mutation, and convergence operation acquires one
+  clone-shared lock inside its blocking worker. A pair holds the lock once
+  through post-install verification and rollback. If its async waiter is
+  cancelled, the worker retains the lock and completes; the caller must retry
+  to obtain the resulting typed state.
+- Linux rule convergence first checks non-mutating `FRA_PROTOCOL` capability
+  evidence. Plain upstream kernels older than 4.17 fail before desired-state
+  mutation. An older vendor/custom version remains `Unknown` because it may
+  contain a backport. Every allowed create is still verified by readback. If a
+  kernel ACKs but silently discards the marker, the exact rule created by that
+  serialized attempt is deleted immediately, absence is verified, and
+  `LinuxRuleProtocolCapability::UnsupportedByReadback` is cached. No global or
+  collision-prone probe rule is installed. A validated IPv4 tagged create
+  rejected with an unsupported-attribute kernel error is cached separately as
+  `UnsupportedByKernelRejection` only before positive tagged readback; no
+  cleanup is needed because creation failed. `Confirmed` evidence is monotonic:
+  a later generic create failure remains its original operational error and does
+  not disable subsequent attempts. IPv6-family rejection is likewise preserved
+  as an operational/family error rather than treated as global marker evidence.
+- Existing third-party trait implementations compile unchanged. Their default
+  readback, convergence, exact owned removal, and paired convergence are
+  fail-closed `Unsupported`/`Indeterminate` until explicitly implemented.
+
+The ownership protocol is a namespace-local reservation, not global
+authentication. Safety against a writer deliberately reusing value `242`
+requires one orchestrated authority per network namespace. Clones of one
+backend are serialized; separate backend instances, direct `ip`/netlink
+writers, table/priority allocation, and replacement of intentionally stale
+foreign objects require external coordination. Within that boundary, the API
+does not automatically replace conflicts and never treats `EEXIST` as proof of
+ownership.
+
+## Legacy Compatibility And Migration
+
+The original `install_route` continues to emit Linux `RTPROT_STATIC` (`4`), and
+the original `install_rule` remains untagged. Their existing `/0`, mark-zero,
+and best-effort removal behavior is preserved. These methods are intentionally
+separate from the new convergence authority: an object created by a legacy SDK
+release or direct `ip` command is reported as a foreign conflict even when all
+modeled request fields match. The SDK never silently adopts or deletes it.
+
+Before switching a namespace to convergence, the operator/product must remove
+known legacy-owned state under its existing writer serialization, then call
+`converge_*`. If provenance is not independently known, leave the object in
+place and resolve the typed conflict operationally. `remove_converged_*` must
+not be used as an adoption mechanism.
+
+Routing policy is also explicit: BGP/export filters that match Linux
+`protocol static` continue to see legacy installs, while convergence-owned
+routes use protocol `242`. Deployments that intend to redistribute those routes
+must add an explicit policy for `242`; the SDK does not alter BGP policy or
+pretend protocol `242` is `static`.
 
 ## Relationships
 
@@ -71,18 +185,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Unpublished workspace crate (`publish = false`).
 - Safe Rust only (`#![forbid(unsafe_code)]`).
 - Linux mutation requires rtnetlink access and effective `CAP_NET_ADMIN`.
-- Validation rejects invalid prefixes, ifindexes, and table values before
-  encoding netlink messages.
+- Validation rejects invalid prefixes, zero rule mark masks, ifindexes, and
+  table values for every API. Exact convergence/removal additionally rejects
+  optional `/0` rule selectors and a zero rule mark value before encoding a
+  netlink mutation; legacy mutation/readback retain those request shapes.
+- Linux readback uses bounded `RTM_GETROUTE`/`RTM_GETRULE` multipart dumps.
+  `LinuxRouteSteeringBackendConfig` bounds receive attempts and each datagram;
+  `LinuxRouteReadbackLimits` bounds aggregate bytes, datagrams, and decoded
+  messages.
+- `RTA_CACHEINFO` volatile counters are ignored only when signed expiry and
+  error fields are zero; either semantic field being nonzero is indeterminate.
+  Kernels reporting unsupported address/protocol families or unsupported
+  operations map to a typed unsupported result.
 
 ## Roadmap
 
 - Keep table/priority allocation in product or orchestration layers.
 - Add new rule selectors only when the model and Linux encoder can reject
   unsupported combinations clearly.
-- Add privileged integration coverage before relying on new kernel behavior.
+- Keep privileged kernel-version qualification in the consuming release's
+  evidence; unsupported or unfamiliar reply shapes remain fail closed.
 
 ## Verification
 
 ```sh
 cargo test -p opc-route-steering
+
+# Linux: exercise real IPv4/IPv6 route/rule mutation in an isolated namespace.
+unshare -Urn sh -c 'ip link set lo up; cargo test -p opc-route-steering \
+  --test live_readback_probe -- --ignored'
 ```

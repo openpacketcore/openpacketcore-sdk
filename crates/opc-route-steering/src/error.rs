@@ -4,6 +4,28 @@ use std::io;
 
 use thiserror::Error;
 
+use crate::model::ReadbackIndeterminateReason;
+
+/// Stable, payload-free class for an operation failure.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteSteeringFailureClass {
+    /// The backend is unsupported on this platform.
+    UnsupportedPlatform,
+    /// Kernel or transport I/O failed.
+    Io,
+    /// A colliding kernel object exists.
+    AlreadyExists,
+    /// The requested object was absent.
+    NotFound,
+    /// A caller-provided request or backend bound was invalid.
+    InvalidConfig,
+    /// A bounded resident-state readback was not conclusive.
+    ReadbackIndeterminate,
+    /// A paired operation failed and its owned rollback also failed.
+    RollbackFailed,
+}
+
 /// Error type for safe route-steering backend operations.
 #[non_exhaustive]
 #[derive(Debug, Clone, Error)]
@@ -35,6 +57,20 @@ pub enum RouteSteeringError {
         /// Static payload-free reason.
         reason: &'static str,
     },
+    /// A bounded readback could not complete safely.
+    #[error("route steering readback is indeterminate: {reason:?}")]
+    ReadbackIndeterminate {
+        /// Stable payload-free reason.
+        reason: ReadbackIndeterminateReason,
+    },
+    /// A paired operation failed and removal of state owned by that attempt failed.
+    #[error("route steering paired operation and owned rollback both failed")]
+    RollbackFailed {
+        /// Failure class for the primary route/rule operation.
+        primary: RouteSteeringFailureClass,
+        /// Failure class for the owned rollback operation.
+        rollback: RouteSteeringFailureClass,
+    },
 }
 
 impl RouteSteeringError {
@@ -49,6 +85,24 @@ impl RouteSteeringError {
             operation,
             kind: source.kind(),
             raw_os_error: source.raw_os_error(),
+        }
+    }
+
+    pub(crate) const fn indeterminate(reason: ReadbackIndeterminateReason) -> Self {
+        Self::ReadbackIndeterminate { reason }
+    }
+
+    /// Return a stable payload-free failure class.
+    #[must_use]
+    pub const fn class(&self) -> RouteSteeringFailureClass {
+        match self {
+            Self::UnsupportedPlatform => RouteSteeringFailureClass::UnsupportedPlatform,
+            Self::Io { .. } => RouteSteeringFailureClass::Io,
+            Self::AlreadyExists => RouteSteeringFailureClass::AlreadyExists,
+            Self::NotFound => RouteSteeringFailureClass::NotFound,
+            Self::InvalidConfig { .. } => RouteSteeringFailureClass::InvalidConfig,
+            Self::ReadbackIndeterminate { .. } => RouteSteeringFailureClass::ReadbackIndeterminate,
+            Self::RollbackFailed { .. } => RouteSteeringFailureClass::RollbackFailed,
         }
     }
 

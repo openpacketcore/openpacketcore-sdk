@@ -60,7 +60,8 @@ pub fn send_message(socket: &NetlinkSocket, payload: &[u8]) -> io::Result<usize>
 /// `recv` is called with `flags=0`. To avoid silent truncation, this wrapper
 /// passes `MSG_TRUNC` and returns an [`io::Error`] of kind
 /// [`io::ErrorKind::InvalidData`] if the real datagram length exceeds
-/// `buffer.len()`.
+/// `buffer.len()`. It also verifies the source `sockaddr_nl` identifies the
+/// kernel (port and multicast group zero) before exposing any bytes.
 pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<usize> {
     platform::receive_message(&socket.inner, buffer)
 }
@@ -71,8 +72,18 @@ pub const NLM_F_REQUEST: u16 = 0x0001;
 pub const NLM_F_MULTI: u16 = 0x0002;
 /// Netlink acknowledge request flag.
 pub const NLM_F_ACK: u16 = 0x0004;
+/// Netlink dump was interrupted and its result is inconsistent.
+pub const NLM_F_DUMP_INTR: u16 = 0x0010;
+/// Netlink dump was filtered as requested.
+pub const NLM_F_DUMP_FILTERED: u16 = 0x0020;
 /// Netlink replacement flag for create/update operations.
 pub const NLM_F_REPLACE: u16 = 0x0100;
+/// Netlink root-selection flag used by dump requests.
+pub const NLM_F_ROOT: u16 = 0x0100;
+/// Netlink match-selection flag used by dump requests.
+pub const NLM_F_MATCH: u16 = 0x0200;
+/// Netlink dump request (`NLM_F_ROOT | NLM_F_MATCH`).
+pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 /// Netlink exclusive-create flag.
 pub const NLM_F_EXCL: u16 = 0x0200;
 /// Netlink create flag.
@@ -82,6 +93,8 @@ pub const NLM_F_CREATE: u16 = 0x0400;
 pub const NLMSG_ERROR: u16 = 0x2;
 /// Netlink multipart completion control message.
 pub const NLMSG_DONE: u16 = 0x3;
+/// Netlink receive overrun control message.
+pub const NLMSG_OVERRUN: u16 = 0x4;
 /// Netlink no-op control message.
 pub const NLMSG_NOOP: u16 = 0x1;
 
@@ -89,10 +102,14 @@ pub const NLMSG_NOOP: u16 = 0x1;
 pub const RTM_NEWROUTE: u16 = 24;
 /// Delete a route.
 pub const RTM_DELROUTE: u16 = 25;
+/// Read routes.
+pub const RTM_GETROUTE: u16 = 26;
 /// Add a rule.
 pub const RTM_NEWRULE: u16 = 32;
 /// Delete a rule.
 pub const RTM_DELRULE: u16 = 33;
+/// Read rules.
+pub const RTM_GETRULE: u16 = 34;
 
 /// Linux address family unspecified.
 pub const AF_UNSPEC: u8 = 0;
@@ -103,6 +120,8 @@ pub const AF_INET6: u8 = 10;
 
 /// Unspecified route table marker used when table is carried as an attribute.
 pub const RT_TABLE_UNSPEC: u8 = 0;
+/// Compatibility marker used by kernel dumps when the full table is an attribute.
+pub const RT_TABLE_COMPAT: u8 = 252;
 /// Main Linux route table.
 pub const RT_TABLE_MAIN: u32 = 254;
 /// Static route protocol.
@@ -118,8 +137,14 @@ pub const RTA_DST: u16 = 1;
 pub const RTA_OIF: u16 = 4;
 /// Route attribute: metric/priority.
 pub const RTA_PRIORITY: u16 = 6;
+/// Route attribute: non-identity kernel cache metadata.
+pub const RTA_CACHEINFO: u16 = 12;
 /// Route attribute: route table as u32.
 pub const RTA_TABLE: u16 = 15;
+/// Route attribute: IPv6 router preference.
+pub const RTA_PREF: u16 = 20;
+/// Neutral/default IPv6 router preference (`medium`).
+pub const ICMPV6_ROUTER_PREF_MEDIUM: u8 = 0;
 
 /// Rule action: lookup table.
 pub const FR_ACT_TO_TBL: u8 = 1;
@@ -131,10 +156,18 @@ pub const FRA_SRC: u16 = 2;
 pub const FRA_PRIORITY: u16 = 6;
 /// Rule attribute: firewall mark value.
 pub const FRA_FWMARK: u16 = 10;
+/// Rule attribute: suppress routes with an interface group.
+pub const FRA_SUPPRESS_IFGROUP: u16 = 13;
+/// Rule attribute: suppress routes with a prefix length.
+pub const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
 /// Rule attribute: table as u32.
 pub const FRA_TABLE: u16 = 15;
 /// Rule attribute: firewall mark mask.
 pub const FRA_FWMASK: u16 = 16;
+/// Rule alignment-padding attribute.
+pub const FRA_PAD: u16 = 18;
+/// Rule originator protocol attribute.
+pub const FRA_PROTOCOL: u16 = 21;
 
 /// Netlink message header layout.
 #[repr(C)]
@@ -239,11 +272,16 @@ mod tests {
         assert_eq!(NETLINK_ROUTE, 0);
         assert_eq!(NLM_F_REQUEST, 0x0001);
         assert_eq!(NLM_F_ACK, 0x0004);
+        assert_eq!(NLM_F_DUMP_INTR, 0x0010);
+        assert_eq!(NLM_F_DUMP, 0x0300);
+        assert_eq!(NLMSG_OVERRUN, 0x4);
         assert_eq!(NLM_F_CREATE, 0x0400);
         assert_eq!(RTM_NEWROUTE, 24);
         assert_eq!(RTM_DELROUTE, 25);
+        assert_eq!(RTM_GETROUTE, 26);
         assert_eq!(RTM_NEWRULE, 32);
         assert_eq!(RTM_DELRULE, 33);
+        assert_eq!(RTM_GETRULE, 34);
         assert_eq!(AF_INET, 2);
         assert_eq!(AF_INET6, 10);
         assert_eq!(RT_TABLE_MAIN, 254);
@@ -258,8 +296,12 @@ mod tests {
         assert_eq!(FRA_SRC, 2);
         assert_eq!(FRA_PRIORITY, 6);
         assert_eq!(FRA_FWMARK, 10);
+        assert_eq!(FRA_SUPPRESS_IFGROUP, 13);
+        assert_eq!(FRA_SUPPRESS_PREFIXLEN, 14);
         assert_eq!(FRA_TABLE, 15);
         assert_eq!(FRA_FWMASK, 16);
+        assert_eq!(FRA_PAD, 18);
+        assert_eq!(FRA_PROTOCOL, 21);
     }
 
     #[test]

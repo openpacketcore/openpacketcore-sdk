@@ -85,6 +85,63 @@ closed as SDK foundation gaps).
 
 ---
 
+## Current conflict-safe route-steering foundation — 2026-07-18
+
+`opc-route-steering` and `opc-linux-route-sys` implement the SDK portion of
+[issue #371](https://github.com/openpacketcore/openpacketcore-sdk/issues/371).
+Backend-neutral route/rule readback and convergence now distinguish installed,
+exact resident, conflicting, and indeterminate state. Linux uses bounded,
+strict multipart route/rule dumps and compares every request field plus the
+fixed kernel semantics emitted by the adapter; malformed, truncated,
+oversized, unsupported, or unrepresented colliding state fails closed. The
+parser handles Linux's extended-table dump marker and bounded non-identity
+IPv6 route metadata, while nonzero cache expiry/error fails closed. Route
+metrics follow kernel family semantics (`None`/zero is absent for IPv4 and
+effective `1024` for IPv6), and route destinations use the effective network
+address after clearing IPv4/IPv6 host bits. Rule selectors are not
+canonicalized. Conflict-safe Linux routes and rules carry the reserved nonzero
+`LINUX_ROUTE_STEERING_PROTOCOL`; missing, legacy, or other values are foreign
+conflicts. The original mutation API remains wire-compatible (`RTPROT_STATIC`
+routes with exact caller destination bytes and untagged rules) and accepts
+IPv4/IPv6 `/0` selectors and mark zero. Only convergence and explicit
+`remove_converged_*` reject those
+wildcard-unsafe rule shapes. Typed capability flags distinguish the legacy and
+conflict-safe contracts. The bounded multimap mock covers multiple candidates,
+exact-plus-conflict, foreign ownership, and the same metric normalization while
+keeping legacy `MockOperation` exhaustive matches source-compatible. External
+backends can construct typed conflicts through public nonzero-count
+constructors. Isolated-namespace tests exercise IPv4/IPv6 default metrics,
+multiple route/rule candidates, exact-plus-conflict, external protocol and
+zero-mark preservation, exact retry/removal, pair rollback, clone
+serialization, and cancellation against the running kernel.
+
+Paired convergence owns only objects installed by that same attempt. Exact
+removal requires one uniquely owned candidate before delete and absence after;
+ambiguity refuses deletion. Plain upstream pre-4.17 kernels fail before rule
+convergence mutation; older vendor/custom versions remain unknown because they
+may backport `FRA_PROTOCOL`. Every allowed create is read back, and an ACKed
+rule whose marker was silently discarded is removed through the serialized
+attempt-owned rollback path before the capability is cached unsupported. This
+uses no global probe rule. Validated IPv4 creates rejected with an
+unsupported-attribute kernel error become separate cached typed evidence only
+before positive tagged readback and cannot leak state. Confirmed capability is
+monotonic: later generic IPv4 errors and non-IPv4 family/operation failures keep
+their original typed result, do not poison capability state, and do not block a
+subsequent attempt. One clone-shared lock is acquired inside the
+blocking worker and held through an entire pair and rollback even when the
+async waiter is cancelled. This prevents sibling clones from interleaving, but
+the protocol value is a namespace-local reservation rather than
+authentication. Separate backend instances and external writers must be
+coordinated under one authority. This is an implemented SDK safety contract,
+not a production route-policy or kernel qualification claim. Products still
+own table/priority allocation, network namespaces, CNI coexistence, external
+ownership records for intentional stale-state replacement, privileged
+kernel-version evidence, BGP policy for convergence route protocol `242`, and
+traffic-readiness policy. Pre-upgrade static state is never silently adopted;
+known-provenance legacy cleanup is an operator/product migration step.
+
+---
+
 ## Current dedicated-bearer shared protocol foundation — 2026-07-15
 
 `opc-proto-tft` now owns the canonical product-neutral TS 24.008 V18.8.0 TFT

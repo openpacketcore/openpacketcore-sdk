@@ -1,10 +1,30 @@
 //! Safe Linux route/rule steering backend model for OpenPacketCore.
 //!
 //! This crate provides a backend trait for route and rule lifecycle operations,
-//! a deterministic mock backend for tests, an unsupported-platform backend, a
-//! Linux rtnetlink adapter, and redaction-safe error types. It deliberately
-//! does not choose route tables, rule priorities, network namespaces, or product
-//! steering policy.
+//! conflict-safe typed readback and convergence, a deterministic mock backend
+//! for tests, an unsupported-platform backend, a Linux rtnetlink adapter, and
+//! redaction-safe error types. It deliberately does not choose route tables,
+//! rule priorities, network namespaces, or product steering policy.
+//!
+//! [`RouteSteeringBackend::converge_route`] and
+//! [`RouteSteeringBackend::converge_rule`] distinguish a newly installed object
+//! from an exact resident object, a kernel-key conflict, and indeterminate
+//! readback. Route convergence compares the effective destination network with
+//! host bits cleared, matching Linux FIB representation without changing rule
+//! selector semantics. [`RouteSteeringBackend::converge_route_and_rule`]
+//! additionally rolls back only a route installed by that same call. The
+//! original mutation methods remain available, but their `AlreadyExists` error
+//! is not proof of resident equality.
+//!
+//! The Linux adapter tags only convergence-owned objects with
+//! [`LINUX_ROUTE_STEERING_PROTOCOL`]; the original install/remove methods keep
+//! their legacy static/untagged wire behavior. Exact cleanup therefore uses
+//! [`RouteSteeringBackend::remove_converged_route`] and
+//! [`RouteSteeringBackend::remove_converged_rule`], never a legacy delete.
+//! Every read/mutation is serialized across clones that share one backend
+//! instance. The protocol value is a namespace-local ownership reservation,
+//! not authentication: separate backend instances and external netlink writers
+//! still require one orchestration-level authority.
 //!
 //! Raw Linux rtnetlink syscalls stay in [`opc_linux_route_sys`]; this crate is
 //! safe Rust and never performs `unsafe` operations.
@@ -17,13 +37,20 @@ pub mod linux;
 pub mod mock;
 pub mod model;
 pub mod unsupported;
+mod validation;
 
 pub use backend::RouteSteeringBackend;
-pub use error::RouteSteeringError;
-pub use linux::{LinuxRouteSteeringBackend, LinuxRouteSteeringBackendConfig};
-pub use mock::{MockOperation, MockRouteSteeringBackend};
+pub use error::{RouteSteeringError, RouteSteeringFailureClass};
+pub use linux::{
+    LinuxRouteReadbackLimits, LinuxRouteSteeringBackend, LinuxRouteSteeringBackendConfig,
+    LinuxRuleProtocolCapability, LINUX_ROUTE_STEERING_PROTOCOL,
+};
+pub use mock::{MockFailurePoint, MockObservation, MockOperation, MockRouteSteeringBackend};
 pub use model::{
-    FirewallMark, IpPrefix, RouteRequest, RouteSteeringBackendKind, RouteSteeringProbe, RuleRequest,
+    FirewallMark, IpPrefix, ReadbackIndeterminateReason, RouteConflict, RouteConvergenceOutcome,
+    RouteMismatch, RouteReadback, RouteRequest, RouteRuleConvergenceOutcome, RouteRuleRollback,
+    RouteSteeringBackendKind, RouteSteeringCapabilities, RouteSteeringProbe, RuleConflict,
+    RuleConvergenceOutcome, RuleMismatch, RuleReadback, RuleRequest,
 };
 pub use unsupported::UnsupportedRouteSteeringBackend;
 
