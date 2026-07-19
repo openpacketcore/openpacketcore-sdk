@@ -358,6 +358,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Added
+- **Initiator-side IKE-SA rekey exchange boundary — `opc-proto-ikev2`:** the
+  typed IKE-SA rekey boundary now covers the initiating side of the RFC 7296
+  `CREATE_CHILD_SA` exchange. A request builder emits the exact immutable
+  `SA, Ni, KEi` cleartext chain from one product-selected executable profile,
+  a caller-allocated non-zero eight-octet new initiator SPI, and exact
+  Ni/KEi, offering a single proposal numbered one with IKE Protocol ID and
+  the profile's exact transform set; a zero SPI or a KEi group/length that
+  does not match the offered profile fails closed before anything is sent. A
+  strict opened-`SK` response decoder validates the `CREATE_CHILD_SA`
+  response header, including the caller-supplied established IKE-SA SPI
+  pair, and accepts exactly one SA, Nonce, and KE payload whose single
+  proposal echoes the offered profile with a non-zero eight-octet new
+  responder SPI and whose KEr uses the negotiated group's exact public-value
+  length. Vendor IDs, unrecognized status-range Notify payloads (`>= 16384`),
+  and unknown non-critical payloads follow the same RFC 7296 mandatory-ignore
+  preservation policy as the responder boundary, but any error-range Notify
+  (`< 16384`) in a response fails the exchange per RFC 7296 §3.10.1 with a
+  typed peer-error carrying only the Notify Message Type and Protocol ID,
+  regardless of the unknown-IE policy — a responder declining the rekey with
+  only `TEMPORARY_FAILURE` or `NO_PROPOSAL_CHOSEN` therefore yields that
+  typed peer-error (feeding the §2.25 retry rules) instead of a
+  missing-payload failure. Child-SA `REKEY_SA`, ESP/AH, TSi/TSr, other known
+  payloads, missing/duplicate required payloads, unknown critical payloads
+  (classified distinctly from other chain failures), proposal
+  count/number/SPI/transform mismatches, and KE group/length mismatches fail
+  closed with stable redaction-safe typed errors before any key derivation.
+  Decoded responses expose the selected profile, responder SPI, nonce, DH
+  group, and responder public value directly to the existing DH agreement
+  and rekey KDF APIs. Specification-authored AEAD and AES-CBC/HMAC vectors
+  audit byte-exact request encoding, initiator/responder boundary interop,
+  and response decoding. Message-ID allocation and correlation,
+  simultaneous-rekey collision policy, `SK` protection, retransmission,
+  cutover, rollback, Child-SA inheritance, and old-SA deletion remain
+  caller-owned.
 - **Authoritative owned route/rule collection reconciliation —
   `opc-route-steering`:** additive `OwnedRouteRuleScope`,
   `OwnedRouteRuleSet`, and `OwnedRouteRuleSnapshot` APIs let Linux and mock

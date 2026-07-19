@@ -17,8 +17,8 @@
 //! verification, transcript-bound signature AUTH (RFC 7296 method 1 and
 //! RFC 7427 method 14) against caller-trusted keys, typed 3GPP DEVICE_IDENTITY
 //! notifications, product-neutral Child SA negotiation intent including
-//! authenticated-only ESP ENCR_NULL profiles and KEYMAT, a strict responder
-//! boundary for opened IKE-SA rekey `CREATE_CHILD_SA` exchanges, and strict
+//! authenticated-only ESP ENCR_NULL profiles and KEYMAT, strict responder and
+//! initiator boundaries for opened IKE-SA rekey `CREATE_CHILD_SA` exchanges, and strict
 //! opened-payload helpers for 3GPP TS 24.302 dedicated-bearer establishment,
 //! modification, and deletion. It does not implement an IKE SA state machine,
 //! EAP-AKA, retransmission policy, cookie policy, Child SA installation, XFRM
@@ -162,10 +162,13 @@ pub use ike_auth_signature::{
     RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
 };
 pub use ike_sa_rekey::{
-    build_ike_sa_rekey_response, decode_ike_sa_rekey_request,
-    decode_ike_sa_rekey_request_with_context, negotiate_ike_sa_rekey, Ikev2IkeSaRekeyBuildError,
+    build_ike_sa_rekey_request, build_ike_sa_rekey_response, decode_ike_sa_rekey_request,
+    decode_ike_sa_rekey_request_with_context, decode_ike_sa_rekey_response,
+    decode_ike_sa_rekey_response_with_context, negotiate_ike_sa_rekey, Ikev2IkeSaRekeyBuildError,
     Ikev2IkeSaRekeyNegotiation, Ikev2IkeSaRekeyPayloadRole, Ikev2IkeSaRekeyRequest,
-    Ikev2IkeSaRekeyRequestError, Ikev2IkeSaRekeyResponseBuild, Ikev2IkeSaRekeyResponsePayloads,
+    Ikev2IkeSaRekeyRequestBuild, Ikev2IkeSaRekeyRequestBuildError, Ikev2IkeSaRekeyRequestError,
+    Ikev2IkeSaRekeyRequestPayloads, Ikev2IkeSaRekeyResponse, Ikev2IkeSaRekeyResponseBuild,
+    Ikev2IkeSaRekeyResponseError, Ikev2IkeSaRekeyResponsePayloads, Ikev2IkeSaRekeySentRequest,
     IKEV2_REKEY_IKE_SPI_LEN,
 };
 pub use message::{Message, OwnedMessage};
