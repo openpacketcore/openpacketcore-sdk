@@ -4,6 +4,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
 
+pub use opc_gtpu_ebpf_common::{GtpuSourcePortPolicy, GtpuSourcePortRange};
 use opc_types::DscpCodepoint;
 
 /// Default GTP-U UDP port.
@@ -184,6 +185,84 @@ impl fmt::Debug for CreateGtpDeviceRequest {
     }
 }
 
+/// Exact backend-neutral identity of one authorized downlink GTP-U endpoint.
+///
+/// The current eBPF adapter constructs this value from the PDP peer address,
+/// the device's concrete local bind address, the managed ingress ifindex, and
+/// the request's explicit source-port policy. The same semantic model covers
+/// IPv4 and IPv6; an adapter that cannot execute a family rejects it before
+/// publishing dataplane state.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GtpuDownlinkEndpoint {
+    peer_address: IpAddr,
+    local_address: IpAddr,
+    ingress_ifindex: u32,
+    source_port_policy: GtpuSourcePortPolicy,
+}
+
+impl GtpuDownlinkEndpoint {
+    /// Construct a canonical endpoint identity.
+    ///
+    /// Mixed address families, unspecified addresses, and ifindex zero return
+    /// `None` rather than creating an identity an adapter cannot bind safely.
+    #[must_use]
+    pub fn new(
+        peer_address: IpAddr,
+        local_address: IpAddr,
+        ingress_ifindex: u32,
+        source_port_policy: GtpuSourcePortPolicy,
+    ) -> Option<Self> {
+        if peer_address.is_unspecified()
+            || local_address.is_unspecified()
+            || ingress_ifindex == 0
+            || GtpAddressFamily::from_ip(peer_address) != GtpAddressFamily::from_ip(local_address)
+        {
+            return None;
+        }
+        Some(Self {
+            peer_address,
+            local_address,
+            ingress_ifindex,
+            source_port_policy,
+        })
+    }
+
+    /// Return the authorized outer peer address.
+    #[must_use]
+    pub const fn peer_address(&self) -> IpAddr {
+        self.peer_address
+    }
+
+    /// Return the authorized local outer destination.
+    #[must_use]
+    pub const fn local_address(&self) -> IpAddr {
+        self.local_address
+    }
+
+    /// Return the exact ingress attachment ifindex.
+    #[must_use]
+    pub const fn ingress_ifindex(&self) -> u32 {
+        self.ingress_ifindex
+    }
+
+    /// Return the explicit UDP source-port policy.
+    #[must_use]
+    pub const fn source_port_policy(&self) -> GtpuSourcePortPolicy {
+        self.source_port_policy
+    }
+}
+
+impl fmt::Debug for GtpuDownlinkEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuDownlinkEndpoint")
+            .field("peer_address", &"<redacted>")
+            .field("local_address", &"<redacted>")
+            .field("ingress_ifindex", &"<redacted>")
+            .field("source_port_policy", &"<redacted>")
+            .finish()
+    }
+}
+
 /// GTP-U PDP context programmed into the Linux `gtp` kernel module.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct GtpPdpContext {
@@ -197,6 +276,13 @@ pub struct GtpPdpContext {
     pub peer_address: IpAddr,
     /// GTP netdevice ifindex.
     pub link_ifindex: u32,
+    /// Explicit UDP source-port authorization for inbound GTP-U G-PDUs.
+    ///
+    /// Use [`GtpuSourcePortPolicy::Any`] for peers that select dynamic source
+    /// ports as described by TS 29.281 section 4.4.2. The eBPF adapter never
+    /// infers this policy from missing state: every published downlink PDR is
+    /// paired with this exact bounded policy.
+    pub downlink_source_port_policy: GtpuSourcePortPolicy,
     /// GTP version.
     pub gtp_version: GtpVersion,
     /// Optional non-zero packet mark selecting this bearer.
@@ -225,6 +311,7 @@ impl fmt::Debug for GtpPdpContext {
             .field("ms_address", &"<redacted>")
             .field("peer_address", &"<redacted>")
             .field("link_ifindex", &self.link_ifindex)
+            .field("downlink_source_port_policy", &"<redacted>")
             .field("gtp_version", &self.gtp_version)
             .field("bearer_mark", &self.bearer_mark)
             .field("egress_dscp", &self.egress_dscp)
@@ -326,6 +413,9 @@ pub struct GtpuProbe {
     /// Ability to select uplink TEIDs and downlink XFRM policies by a
     /// per-bearer Linux packet mark while multiple bearers share one UE PAA.
     pub per_bearer_marking: GtpuCapability,
+    /// Ability to bind every downlink PDR to an exact outer peer/local pair,
+    /// ingress attachment, address family, and explicit source-port policy.
+    pub downlink_endpoint_binding: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,
 }
@@ -344,6 +434,7 @@ impl GtpuProbe {
             mutation_ready: false,
             egress_dscp_marking: GtpuCapability::Missing,
             per_bearer_marking: GtpuCapability::Missing,
+            downlink_endpoint_binding: GtpuCapability::Missing,
             details: Some("dry-run/mock backend"),
         }
     }
@@ -361,6 +452,7 @@ impl GtpuProbe {
             mutation_ready: false,
             egress_dscp_marking: GtpuCapability::Missing,
             per_bearer_marking: GtpuCapability::Missing,
+            downlink_endpoint_binding: GtpuCapability::Missing,
             details: Some("GTP-U dataplane operations are not supported on this platform"),
         }
     }
@@ -411,6 +503,7 @@ mod tests {
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             link_ifindex: 7,
+            downlink_source_port_policy: GtpuSourcePortPolicy::Exact(21_152),
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
             egress_dscp: None,
@@ -421,6 +514,50 @@ mod tests {
         assert!(!debug.contains("10.23.0.2"));
         assert!(!debug.contains("::1"));
         assert!(!debug.contains("3456789a"));
+        assert!(!debug.contains("21152"));
+    }
+
+    #[test]
+    fn downlink_endpoint_supports_both_families_and_redacts_identity() {
+        let ipv4 = GtpuDownlinkEndpoint::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            7,
+            GtpuSourcePortPolicy::Exact(21_152),
+        )
+        .unwrap();
+        assert_eq!(ipv4.ingress_ifindex(), 7);
+        assert_eq!(
+            ipv4.source_port_policy(),
+            GtpuSourcePortPolicy::Exact(21_152)
+        );
+
+        let ipv6 = GtpuDownlinkEndpoint::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            7,
+            GtpuSourcePortPolicy::Any,
+        );
+        assert!(ipv6.is_none(), "unspecified local addresses fail closed");
+        assert!(GtpuDownlinkEndpoint::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            9,
+            GtpuSourcePortPolicy::Any,
+        )
+        .is_some());
+        assert!(GtpuDownlinkEndpoint::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            7,
+            GtpuSourcePortPolicy::Any,
+        )
+        .is_none());
+
+        let debug = format!("{ipv4:?}");
+        for secret in ["192.0.2.10", "192.0.2.1", "21152"] {
+            assert!(!debug.contains(secret));
+        }
     }
 
     #[test]
@@ -431,6 +568,7 @@ mod tests {
             ms_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 9,
+            downlink_source_port_policy: GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,

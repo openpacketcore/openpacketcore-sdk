@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **BREAKING — fail-closed eBPF GTP-U downlink endpoint binding —
+  `opc-gtpu-dataplane`:** every tc downlink PDR now carries a canonical binding
+  to its outer peer, concrete local destination, address family, ingress
+  ifindex, and explicit bounded UDP source-port policy. Missing, corrupt, or
+  mismatched state drops before inner delivery and advances one of six fixed
+  redaction-safe aggregate counters. Fresh install, exact peer relocation,
+  rollback, marked-owner journaling, removal, restart adoption, snapshot
+  identity, and probe readiness all include the binding and counter maps.
+  Populated endpoint-unbound graphs are never interpreted as permissive state:
+  committed v2 pins require drain/reprovision, and older populated graphs fail
+  closed. `GtpPdpContext` literals must add
+  `downlink_source_port_policy: GtpuSourcePortPolicy::{Any, Exact, ...}`;
+  consumers must gate eBPF traffic readiness on
+  `GtpuProbe::downlink_endpoint_binding == Available`. The backend-neutral
+  `GtpuDownlinkEndpoint` API models canonical IPv4/IPv6 identity while the
+  current tc adapter remains explicitly IPv4-only. The Linux `gtp` backend
+  preserves prior behavior for explicit `Any`, rejects narrower policies, and
+  reports the exact-binding capability as missing.
 - **BREAKING — typed conditional S2b session context — `opc-proto-gtpv2c`:**
   Create Session now uses `S2bCreateSessionIdentity` for subscriber versus
   UICC-less emergency identity and a new `S2bCreateSessionContext` for

@@ -89,7 +89,8 @@ jobs:
       # nonzero NONE/UNNECESSARY handling, and zero/nonzero PARTIAL rejection
       # (including exact checksum-byte restoration) before PDR lookup;
       # exact attached-program/pinned-map identity and per-CPU counter sums,
-      # byte-compatible unmarked traffic, v1 live-filter/schema adoption,
+      # byte-compatible unmarked traffic, drained legacy schema adoption and
+      # populated endpoint-unbound fail-closed migration,
       # unknown-mark/TEID drops, echo passthrough, restore/adoption, and
       # ownership-safe teardown (no opc_gtpu filters or pins left behind;
       # already-visible foreign filters are preserved).
@@ -140,7 +141,7 @@ jobs:
           readelf -sW "${frozen}" | awk '$4 == "OBJECT" && $8 ~ /^GTPU_/ {print $8}' | sort > frozen.maps
           diff -u <(printf '%s\n' opc_gtpu_downlink opc_gtpu_uplink) frozen.programs
           diff -u <(printf '%s\n' GTPU_CONFIG GTPU_COUNTERS GTPU_DOWNLINK_PDR GTPU_UPLINK_DSCP GTPU_UPLINK_FAR) frozen.maps
-          for marked in GTPU_ULM_FAR GTPU_ULM_DSCP GTPU_DLM_PDR GTPU_M_OWNER; do
+          for marked in GTPU_ULM_FAR GTPU_ULM_DSCP GTPU_DLM_PDR GTPU_M_OWNER GTPU_DL_BIND GTPU_DL_DROP; do
             if grep -qx "${marked}" frozen.maps; then
               echo "frozen v1 authority unexpectedly contains ${marked}" >&2
               exit 1
@@ -160,16 +161,18 @@ jobs:
           ./scripts/build-gtpu-ebpf.sh
           rebuilt="crates/opc-gtpu-dataplane-ebpf/target/bpfel-unknown-none/release/opc-gtpu-datapath"
           inventory() {
-            # The private bpf_loop callback must retain local linkage for the
-            # verifier. Rust therefore gives it a v0-mangled symbol whose
-            # crate-disambiguator prefix can differ across build hosts. Keep
-            # checking that the callback exists, while normalizing only that
-            # non-ABI prefix before comparing the complete inventory.
+            # Private verifier-bounded subprograms retain local linkage. Rust
+            # therefore gives them v0-mangled symbols whose crate-disambiguator
+            # prefixes can differ across source roots. Keep checking that each
+            # subprogram exists while normalizing only that non-ABI prefix.
             readelf -sW "$1" | awk '
               $4 == "FUNC" || $4 == "OBJECT" {
                 name = $8
                 if (name ~ /checksum_loop_chunk$/) {
                   name = "checksum_loop_chunk"
+                }
+                if (name ~ /authorize_and_decap_downlink$/) {
+                  name = "authorize_and_decap_downlink"
                 }
                 print $4, name
               }
@@ -179,6 +182,6 @@ jobs:
           inventory "${rebuilt}" > rebuilt.inventory
           cat rebuilt.inventory
           diff -u committed.inventory rebuilt.inventory
-          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
+          for symbol in opc_gtpu_uplink opc_gtpu_downlink checksum_loop_chunk authorize_and_decap_downlink GTPU_UPLINK_FAR GTPU_ULM_FAR GTPU_UPLINK_DSCP GTPU_ULM_DSCP GTPU_DOWNLINK_PDR GTPU_DLM_PDR GTPU_DL_BIND GTPU_DL_DROP GTPU_M_OWNER GTPU_COUNTERS GTPU_CONFIG; do
             grep -q " ${symbol}$" committed.inventory
           done

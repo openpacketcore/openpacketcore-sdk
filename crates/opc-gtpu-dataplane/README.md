@@ -28,6 +28,7 @@ route steering, XFRM policy, deployment defaults, or traffic-readiness policy.
 - Model exports include `CreateGtpDeviceRequest`, `GtpDevice`,
   `GtpPdpContext`, `GtpBearerMark`, `RemovePdpContextRequest`, `Teid`,
   `GtpuProbe`, `GtpuBackendKind`, `GtpuCapability`,
+  `GtpuDownlinkEndpoint`, `GtpuSourcePortPolicy`, `GtpuSourcePortRange`,
   `EbpfGtpuDatapathSnapshot`, `EbpfGtpuDatapathCounters`, `DscpCodepoint`,
   `GtpRole`, `GtpVersion`, `GtpAddressFamily`, and `GTPU_PORT`.
 - `GtpuError` is intentionally redaction-safe; TEIDs and addresses are not
@@ -40,7 +41,8 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, GtpPdpContext, GtpVersion, GtpuDataplaneBackend,
-    MockGtpuDataplaneBackend, RemovePdpContextRequest, Teid,
+    GtpuSourcePortPolicy, MockGtpuDataplaneBackend, RemovePdpContextRequest,
+    Teid,
 };
 
 #[tokio::main]
@@ -56,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
         peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         link_ifindex: device.ifindex,
+        downlink_source_port_policy: GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
@@ -138,6 +141,54 @@ zero cases decapsulate only after the exact checksum bytes are restored. A
 boundary mismatch with trusted metadata proves metadata never bypasses
 structural validation.
 
+### Downlink endpoint provenance
+
+Every eBPF downlink PDR is paired with one canonical endpoint binding keyed by
+the same local TEID. The binding records the outer peer address, concrete local
+destination, address family, exact ingress interface index, and an explicit
+bounded UDP source-port policy. `GtpuSourcePortPolicy::Any` is the deliberate
+dynamic-source-port policy described by TS 29.281 section 4.4.2;
+`Exact(port)` or `inclusive_range(first, last)` provides a narrower site or
+peer contract. Missing state is never interpreted as `Any`.
+
+`GtpPdpContext::downlink_source_port_policy` is therefore required for every
+install. The eBPF adapter derives the rest of the public
+`GtpuDownlinkEndpoint` from the request's peer, the managed device's concrete
+local address, and the attachment ifindex. The semantic API accepts canonical
+IPv4 or IPv6 endpoint pairs so adapters can share one contract; the current tc
+object remains IPv4-only and rejects IPv6 before publishing any state.
+
+After the complete outer IPv4/UDP/GTP-U envelope has passed its existing
+structural and checksum checks, the tc ingress program selects exactly one
+default or marked PDR and requires its endpoint binding. It then compares the
+packet's outer source, outer destination, current tc attachment, family, and
+source port before examining or delivering the inner packet. A missing,
+non-canonical, wrong-family, wrong-peer, wrong-local, wrong-interface, or
+wrong-port record drops fail closed. The six fixed aggregate reason counters
+are `invalid`, `family`, `peer`, `local`, `ingress`, and `source_port`; they do
+not contain addresses, ports, TEIDs, interface names, or payload values.
+
+Fresh default installs publish the binding before making the PDR reachable.
+An exact peer/local/policy relocation stages the new uplink resources and uses
+one binding-map replacement as the downlink authorization cutover; a reported
+failure restores the old binding and forwarding resources. Marked bearers also
+embed the exact binding in their owner journal. Their `Active` owner and live
+binding must agree byte-for-byte, so a replacement interval authorizes neither
+the old nor the new endpoint, never both. Removal phase-gates marked state and
+removes binding reachability before deleting the PDR and journal. Restart
+adoption validates the complete FAR/PDR/binding/owner graph before either tc
+hook is accepted.
+
+Consumers must require
+`GtpuProbe::downlink_endpoint_binding == GtpuCapability::Available` before
+declaring an eBPF S2b-U attachment traffic-ready. `Unknown` means a capable
+environment has not attached a device yet; `Missing` means the exact live
+downlink program, binding map, bounded counter map, or attachment identity is
+not usable. The Linux `gtp` adapter preserves its existing behavior only for
+the explicit `Any` policy, rejects narrower policies with
+`UnsupportedFeature`, and reports this capability as `Missing` because its
+kernel interface cannot prove the same per-PDR endpoint binding.
+
 ### Per-bearer packet marks
 
 The eBPF backend can install a default bearer and multiple dedicated bearers
@@ -182,8 +233,8 @@ For redaction-safe live diagnostics, call
 required exclusive-writer contract, a successful call re-opens every named
 bpffs pin, verifies the full map-ID sets referenced by the held uplink and
 downlink programs, verifies both exact program IDs are still in their tc slots,
-reads the held `GTPU_COUNTERS` map directly, aggregates every per-CPU value,
-then repeats the identity proof. The returned
+reads the held `GTPU_COUNTERS` and fixed `GTPU_DL_DROP` maps directly,
+aggregates every per-CPU value, then repeats the identity proof. The returned
 `EbpfGtpuDatapathSnapshot` contains only kernel-local program/map IDs and
 aggregate counters; it contains no addresses, TEIDs, packet marks, or payloads.
 This avoids `bpftool map dump name GTPU_COUNTERS`, which can select an unrelated
@@ -193,19 +244,20 @@ if a hook or pin mismatch is visible at either identity check. An external-root
 replace-and-restore between checks is outside the exclusive-writer contract and
 cannot be distinguished by this diagnostic.
 
-The existing counter schema remains unchanged and aggregates default and
-dedicated bearers. Use counter deltas to prove that the attached uplink/downlink
-programs ran; use the peer's observed GTP-U TEID for per-bearer correlation.
+Both bounded counter schemas aggregate default and dedicated bearers. Use
+counter deltas to prove that the attached uplink/downlink programs ran; use the
+peer's observed GTP-U TEID for per-bearer correlation.
 An all-zero identity-bound snapshot during a claimed GTP-U round trip means the
 traffic did not traverse these exact programs, not that a marked lookup chose
 the default entry.
 
 Existing `GtpPdpContext` literals must add `bearer_mark: None` to retain the
-default path, or construct a non-zero `GtpBearerMark` for a dedicated bearer.
-Code that constructs `GtpuProbe` literals must also initialize the new
-`per_bearer_marking` field. Consumers must gate `bearer_mark: Some(_)` on
+default path, or construct a non-zero `GtpBearerMark` for a dedicated bearer;
+they must also choose an explicit `downlink_source_port_policy`. Code that
+constructs `GtpuProbe` literals must initialize `per_bearer_marking` and
+`downlink_endpoint_binding`. Consumers must gate `bearer_mark: Some(_)` on
 `GtpuProbe::per_bearer_marking == GtpuCapability::Available`; it becomes
-available only after both exact live tc programs and every exact v2 map pin
+available only after both exact live tc programs and every exact v3 map pin
 have been verified. The mainline Linux `gtp`, mock, and unsupported backends
 report `Missing` and reject marked requests. This API requires no Cargo feature
 and introduces no dependency.
@@ -218,28 +270,29 @@ marked DSCP map keyed by `(UE PAA, mark)`. Setting
 generated outer uplink IPv4 header and includes it in the header checksum.
 `None` preserves the exact legacy encapsulation bytes.
 
-Default-bearer reconciliation retains the existing map protocol: installation
-publishes DSCP before FAR/PDR reachability and rolls it back after a reported
-later failure, while removal retains the PDR as its lookup-key journal until
-FAR and DSCP have been cleared. An exact retry can reconcile a DSCP-only
-publication orphan. One-sided default FAR or PDR state remains an ambiguous
-conflict and fails closed.
+Default-bearer reconciliation publishes DSCP and FAR before the endpoint
+binding and publishes the PDR last. Removal retains the PDR as its lookup-key
+journal until FAR, DSCP, and binding state have been cleared. An exact retry
+can reconcile a pre-reachability publication orphan. One-sided FAR/PDR state,
+or reachable PDR state without its exact binding, remains an ambiguous conflict
+and fails closed.
 
 Marked bearers use a stronger, additive owner journal keyed by `(UE PAA,
-mark)`. Its value binds the local TEID, complete uplink FAR, optional DSCP, and
-one of three phases. Installation publishes `Pending` before any forwarding
-resource, reconciles only an exact matching request, then publishes `Active`
-last. Both classifiers require an exact active owner and matching FAR/DSCP/PDR
-state, so a crash or map error at any earlier point leaves the bearer
-non-forwarding and safely retryable. A DSCP update is phase-gated by the same
-protocol. Removal publishes `Removing` first, deletes FAR, DSCP, and PDR, then
+mark)`. Its value binds the local TEID, complete uplink FAR, exact downlink
+endpoint binding, optional DSCP, and one of three phases. Installation
+publishes `Pending` before any forwarding resource, reconciles only an exact
+matching request, then publishes `Active` last. Both classifiers require an
+exact active owner and matching FAR/DSCP/PDR/binding state, so a crash or map
+error at any earlier point leaves the bearer non-forwarding and safely
+retryable. A DSCP or endpoint update is phase-gated by the same protocol.
+Removal publishes `Removing` first, deletes FAR, DSCP, binding, and PDR, then
 deletes the owner last; an interrupted removal cannot resume forwarding and an
 exact removal retry finishes it. Linux/Aya reports deletion of an absent hash
 entry as syscall `ENOENT`; the runtime classifies that result as idempotent
 absence, including when an optional DSCP entry was never installed. An install
-that encounters a valid persisted `Removing` owner also finishes that committed
-deletion, but never resurrects the bearer or reports `AlreadyExists` in the
-same call. It returns
+that encounters a valid persisted `Removing` owner also finishes that
+committed deletion, but never resurrects the bearer or reports `AlreadyExists`
+in the same call. It returns
 `GtpuError::RetryRequired { operation: "ebpf_install_after_removal" }`; the
 caller must submit a fresh install after that result. This remains true when
 the fresh request changes the endpoint, DSCP, local TEID, or selector. On
@@ -255,45 +308,54 @@ be positively absent; an absent hook does not prevent cleanup because removal
 only reduces reachability. A foreign hook, unreadable slot, or replaced pin
 returns `StateIndeterminate` before any cross-map query or mutation.
 
-`GtpuProbe::egress_dscp_marking` and `GtpuProbe::per_bearer_marking` report
-`Unknown` while a capable environment awaits its first device attach. DSCP
-becomes `Available` only when the exact uplink path is live; per-bearer marking
-requires both exact uplink and downlink programs and all exact default and
-marked map pins. Runtime program or map identity loss reports `Missing` and
-blocks new marked state publication, while identity-safe cleanup remains
-available under the rule above.
+`GtpuProbe::egress_dscp_marking`, `GtpuProbe::per_bearer_marking`, and
+`GtpuProbe::downlink_endpoint_binding` report `Unknown` while a capable
+environment awaits its first device attach. DSCP becomes `Available` only when
+the exact uplink path is live; per-bearer marking requires both exact programs
+and all exact v3 map pins; endpoint binding additionally verifies the exact
+downlink attachment plus its binding and fixed counter maps. Runtime program or
+map identity loss reports `Missing` and blocks new state publication, while
+identity-safe cleanup remains available under the rule above.
 
 ### Pinned-map and live-program migration
 
-The v2 schema is additive. The legacy `GTPU_UPLINK_FAR`,
-`GTPU_UPLINK_DSCP`, and `GTPU_DOWNLINK_PDR` names, key/value sizes, and default
-bearer encodings are unchanged; marked FAR, DSCP, PDR, and owner-journal state
-lives in four new maps: `GTPU_ULM_FAR`, `GTPU_ULM_DSCP`, `GTPU_DLM_PDR`, and
-`GTPU_M_OWNER`. With `bearer_mark: None` and `egress_dscp: None`, uplink GTP-U
-bytes remain byte-for-byte compatible. The owner lookup is skipped on the
-mark-zero uplink path. The only intentional default-path behavior change is
-the downlink mark-zero metadata normalization described above.
+The endpoint-bound v3 schema keeps the legacy default FAR, DSCP, and PDR
+names/layouts and the v2 marked FAR/DSCP/PDR names. It adds
+`GTPU_DL_BIND` for the canonical per-TEID endpoint identity and
+`GTPU_DL_DROP` for six fixed mismatch counters. The marked owner journal now
+embeds that complete binding, so its map value is intentionally incompatible
+with endpoint-unbound v2 pins. With an explicit `Any` source-port policy,
+`bearer_mark: None`, and `egress_dscp: None`, uplink wire bytes remain
+byte-for-byte compatible; downlink authorization is deliberately stricter.
 
-A durable v2 value at the reserved impossible-PAA key in the legacy FAR map is
-the schema commit. It is written atomically only after all named map identities
-are verified and both v2 tc programs have been attached and read back by exact
-program ID. A committed v2 marker with a missing required pin, an unknown
-marker, or a foreign tc occupant fails closed before Aya can recreate empty
-state. A positively absent current hook may be repaired. The older v1 loader
-does not recognize the v2 marker, which prevents an accidental downgrade.
+The durable `OPC-PEER-v3` value at the reserved impossible-PAA key in the
+legacy FAR map is the schema commit. It is written only after every named map
+identity is verified, the complete map graph is canonical, and both current tc
+programs have been attached and read back by exact program ID. A committed v3
+marker with a missing required pin, an unknown marker, or a foreign tc occupant
+fails closed before Aya can recreate empty state. A positively absent current
+hook may be repaired.
 
-Live v1 adoption is authorized only by the frozen
+There is no implicit endpoint migration for populated older state. A committed
+v2 pin set is rejected with the redaction-safe `ebpf_endpoint_schema` error and
+requires an explicit traffic drain followed by pin removal and reprovisioning.
+An uncommitted, legacy-v0, or DSCP-v1 graph can advance only when it is empty;
+any retained PDR/FAR without an exact binding is indeterminate and fails before
+either hook changes. The SDK never invents `Any`, derives a peer from an
+untrusted packet, or labels endpoint-unbound forwarding state production-ready.
+
+Empty v0/v1 hook replacement is authorized only by the frozen
 `bpf/opc-gtpu-datapath-v1.bpf.o` fixture. It is the DSCP-generation artifact
 from commit `4fd43cf1465a46b6afa35348b2463fa9c497fce4`, with SHA-256
 `f31ccc2914f2fd61ae8f1e892e9ac0342f9e81350a4a065d5d8dcfcc9f7a943f`.
-The loader binds that object to the exact retained v1 map IDs and compares the
+The loader binds that object to the exact retained old map IDs and compares the
 live program name, type, tag, and complete map-ID set before replacement. The
-fixture is migration authority only; it is never selected as the running v2
+fixture is migration authority only; it is never selected as the running v3
 datapath. CI verifies its hash and old-only program/map inventory.
 
 Classic-tc replacement uses Aya's atomic `attach_to_link` netlink path, not a
 detach-then-attach window. Both hook occupants are proven before either is
-touched. If the second replacement is uncertain, the first exact v2 hook is
+touched. If the second replacement is uncertain, the first exact v3 hook is
 retained and the exact old/current second hook is left for an idempotent retry;
 the migration returns `StateIndeterminate` instead of creating an empty live
 slot. The same retained, retryable rule applies if schema or runtime-state

@@ -555,6 +555,7 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             mutation_ready,
             egress_dscp_marking: GtpuCapability::Missing,
             per_bearer_marking: GtpuCapability::Missing,
+            downlink_endpoint_binding: GtpuCapability::Missing,
             details,
         }
     }
@@ -631,6 +632,11 @@ fn validate_pdp_context(context: &GtpPdpContext) -> Result<(), GtpuError> {
     if context.egress_dscp.is_some() {
         return Err(GtpuError::UnsupportedFeature {
             feature: "fixed_outer_dscp",
+        });
+    }
+    if context.downlink_source_port_policy != crate::GtpuSourcePortPolicy::Any {
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_source_port_policy",
         });
     }
     validate_ifindex(context.link_ifindex, "pdp.link_ifindex")?;
@@ -1179,6 +1185,7 @@ mod tests {
                     mutation_ready: true,
                     egress_dscp_marking: GtpuCapability::Missing,
                     per_bearer_marking: GtpuCapability::Missing,
+                    downlink_endpoint_binding: GtpuCapability::Missing,
                     details: Some("test transport"),
                 },
                 socket_fd: 9,
@@ -1261,6 +1268,7 @@ mod tests {
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 42,
+            downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,
@@ -1429,6 +1437,30 @@ mod tests {
             encode_install_pdp_context(&baseline).unwrap(),
             baseline_bytes
         );
+    }
+
+    #[test]
+    fn kernel_backend_rejects_bounded_source_port_policy_without_sending_it() {
+        for policy in [
+            crate::GtpuSourcePortPolicy::Exact(21_152),
+            crate::GtpuSourcePortPolicy::inclusive_range(20_000, 21_000).unwrap(),
+        ] {
+            let baseline = pdp_context();
+            let baseline_bytes = encode_install_pdp_context(&baseline).unwrap();
+            let mut bounded = baseline.clone();
+            bounded.downlink_source_port_policy = policy;
+
+            assert!(matches!(
+                validate_pdp_context(&bounded).unwrap_err(),
+                GtpuError::UnsupportedFeature {
+                    feature: "downlink_source_port_policy"
+                }
+            ));
+            assert_eq!(
+                encode_install_pdp_context(&baseline).unwrap(),
+                baseline_bytes
+            );
+        }
     }
 
     #[test]
