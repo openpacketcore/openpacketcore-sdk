@@ -10,9 +10,10 @@ use opc_proto_diameter::apps::swm::{
     self, SwmAdditionalAvp, SwmDiameterConnectionToken, SwmDiameterTransaction,
     SwmExpectedAnswerPeer, SwmRoutingMessagePriority, SwmSessionTerminationAnswer,
     SwmSessionTerminationAnswerEnvelope, SwmSessionTerminationCorrelationError,
-    SwmSessionTerminationRequestEnvelope, SwmSessionTerminationResult, SwmTerminationCause,
+    SwmSessionTerminationRequest, SwmSessionTerminationRequestEnvelope,
+    SwmSessionTerminationResult, SwmTerminationCause,
 };
-use opc_proto_diameter::avp::dictionary::Redacted;
+use opc_proto_diameter::avp::dictionary::Sensitive;
 use opc_proto_diameter::base;
 use opc_proto_diameter::error_answer::{
     inspect_diameter_request, DiameterRequestFailure, DiameterRequestInspection,
@@ -25,6 +26,7 @@ use opc_protocol::{
     UnknownIePolicy,
 };
 use std::num::NonZeroU64;
+use zeroize::ZeroizeOnDrop;
 
 const HOP_BY_HOP: u32 = 0x3510_0001;
 const FAILOVER_HOP_BY_HOP: u32 = 0x3510_1001;
@@ -2189,7 +2191,7 @@ fn answer_builder_rejects_session_mismatch_and_duplicate_extension() {
         "aaa.private.invalid",
         "private.invalid",
     );
-    answer.session_id = Some(Redacted::from("session;private;wrong"));
+    answer.session_id = Some(Sensitive::from("session;private;wrong"));
     assert!(
         swm::build_swm_session_termination_answer(&request, &answer, EncodeContext::default())
             .is_err()
@@ -2201,7 +2203,7 @@ fn answer_builder_rejects_session_mismatch_and_duplicate_extension() {
             .is_err()
     );
 
-    answer.session_id = Some(Redacted::from(SESSION_ID));
+    answer.session_id = Some(Sensitive::from(SESSION_ID));
     let extension = SwmAdditionalAvp::new(
         AvpHeader::ietf(AvpCode::new(9_778), false),
         b"opaque".to_vec(),
@@ -2368,4 +2370,35 @@ fn proxy_info_values_are_copied_in_order_without_exposure() {
             b"private-proxy-state-two".to_vec()
         ]
     );
+}
+
+#[test]
+fn retained_subscriber_values_and_envelopes_are_zeroize_on_drop() {
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+    assert_zeroize_on_drop::<Sensitive<String>>();
+    assert_zeroize_on_drop::<SwmSessionTerminationRequest>();
+    assert_zeroize_on_drop::<SwmSessionTerminationAnswer>();
+    assert_zeroize_on_drop::<SwmSessionTerminationRequestEnvelope>();
+    assert_zeroize_on_drop::<SwmSessionTerminationAnswerEnvelope>();
+    assert_zeroize_on_drop::<swm::SwmCorrelatedSessionTerminationExchange>();
+
+    let source = parsed_request_envelope(&str_wire());
+    let clone = source.clone();
+    assert_eq!(source.request().session_id, clone.request().session_id);
+    assert_eq!(source.request().user_name, clone.request().user_name);
+
+    let diagnostics = format!("source={source:?};clone={clone:?}");
+    assert!(!diagnostics.contains(SESSION_ID));
+    assert!(!diagnostics.contains(USER_NAME));
+
+    let source_wire = encode(
+        &swm::build_swm_session_termination_request(&source, EncodeContext::default())
+            .expect("source request must remain encodable"),
+    );
+    let clone_wire = encode(
+        &swm::build_swm_session_termination_request(&clone, EncodeContext::default())
+            .expect("cloned request must remain encodable"),
+    );
+    assert_eq!(source_wire, clone_wire);
 }

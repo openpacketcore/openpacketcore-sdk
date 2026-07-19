@@ -686,11 +686,28 @@ the broader experimental Diameter conformance status. Session lookup,
 authorization, transport pending state, retry/cache lifetime, teardown and
 compensation ordering, and product side effects remain downstream.
 
-### 7. Redaction
+### 7. Redaction and retained sensitive ownership
 
-Sensitive typed fields are wrapped in `Redacted<T>` or redaction-safe identity
-newtypes. Their `Debug` and `Display` output never exposes the underlying
-value; equality, cloning, and hashing still support business logic.
+Typed fields use `Redacted<T>`, `Sensitive<T>`, or redaction-safe identity
+newtypes. All three diagnostic surfaces hide the underlying value.
+`Redacted<T>` is diagnostics-only; it does not promise memory erasure.
+`Sensitive<T>` owns a `zeroize::Zeroizing<T>`, implements
+`ZeroizeOnDrop`, and gives each clone independently zeroizing storage while
+preserving equality and hashing for correlation. Its `into_zeroizing` method
+lets a consumer transfer ownership without returning to an ordinary value.
+
+The typed STR/STA `Session-Id` and permanent `User-Name` fields use
+`Sensitive<String>`. The STR and STA facts, their request/answer envelopes,
+and the correlated exchange expose an explicit `ZeroizeOnDrop` contract for
+those retained owners. Parsing moves newly allocated strings directly into
+`Sensitive`; answer construction and request-envelope cloning clone only into
+another `Sensitive` owner. The canonical wire fixtures and correlation rules
+are unchanged.
+
+Zeroization covers the wrapper's current owned allocation on a best-effort
+basis. It cannot erase allocator copies left by earlier reallocation, raw
+input, already encoded messages, transport caches, swap, or kernel/network
+buffers. Those are separate product and transport lifecycle concerns.
 
 Covered redacted fields:
 - `RfAccountingRequest` / `RfAccountingAnswer`: `Session-Id`, `Origin-Host`,
@@ -704,10 +721,11 @@ Covered redacted fields:
   `ApnConfiguration::service_selection`). `SwmDiameterEapAnswer` debug output
   shows only the count of `apn_configurations`, never their contents. Context
   identifiers are numeric selectors and are not treated as subscriber data.
-- `SwmSessionTerminationRequest` / `SwmSessionTerminationAnswer`: Session-Id,
-  origin/destination identities, User-Name, Route-Record, retained Proxy-Info,
-  and all additional AVP values. Diagnostics expose only enum values, counts,
-  numeric AVP keys, and value lengths.
+- `SwmSessionTerminationRequest` / `SwmSessionTerminationAnswer`: Session-Id
+  and User-Name are both redacted and zeroizing; origin/destination identities,
+  Route-Record, retained Proxy-Info, and all additional AVP values are
+  redacted. Diagnostics expose only enum values, counts, numeric AVP keys, and
+  value lengths.
 - `SwmAbortSessionRequest` / `SwmAbortSessionAnswer`: Session-Id,
   origin/destination identities, permanent User-Name, Route-Record, retained
   Proxy-Info, Error-Message/Error-Reporting-Host, and all additional AVP values.

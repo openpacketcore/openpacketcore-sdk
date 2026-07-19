@@ -7,7 +7,7 @@
 
 use bytes::BytesMut;
 use opc_proto_diameter::apps::swm::{self, AuthRequestType};
-use opc_proto_diameter::avp::dictionary::Redacted;
+use opc_proto_diameter::avp::dictionary::{Redacted, Sensitive};
 use opc_proto_diameter::base;
 use opc_proto_diameter::{CommandCode, Message, OwnedMessage};
 use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
@@ -460,13 +460,13 @@ fn complete_swm_lifecycle_uses_only_public_sdk_boundaries() {
 
     let terminated_update = terminate_session(
         swm::SwmSessionTerminationRequest {
-            session_id: Redacted::from(SESSION_UPDATE.to_owned()),
+            session_id: Sensitive::from(SESSION_UPDATE.to_owned()),
             origin_host: Redacted::from(EPDG_HOST.to_owned()),
             origin_realm: Redacted::from(EPDG_REALM.to_owned()),
             destination_realm: Redacted::from(AAA_REALM.to_owned()),
             destination_host: Some(Redacted::from(AAA_HOST.to_owned())),
             termination_cause: swm::SwmTerminationCause::Logout,
-            user_name: Redacted::from(USER_UPDATE.to_owned()),
+            user_name: Sensitive::from(USER_UPDATE.to_owned()),
             drmp: None,
             route_records: Vec::new(),
             additional_avps: Vec::new(),

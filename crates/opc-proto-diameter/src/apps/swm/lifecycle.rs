@@ -12,6 +12,7 @@ use opc_protocol::{
 use std::{collections::HashSet, error::Error, fmt, num::NonZeroU64};
 
 use super::{builder_helpers, Redacted, APPLICATION_ID};
+use crate::avp::dictionary::Sensitive;
 use crate::base;
 use crate::dictionary::{
     AvpCardinality, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey, CommandAvpRule,
@@ -831,10 +832,13 @@ impl fmt::Debug for SwmExpectedAnswerPeer {
 }
 
 /// Typed ePDG-originated SWm Session-Termination-Request facts.
+///
+/// The retained Session-Id and permanent User-Name own zeroizing storage.
+/// Cloning these facts creates independent zeroize-on-drop owners.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmSessionTerminationRequest {
-    /// Session-Id; diagnostic formatting is redacted.
-    pub session_id: Redacted<String>,
+    /// Session-Id; zeroized on drop and redacted in diagnostics.
+    pub session_id: Sensitive<String>,
     /// Origin-Host; diagnostic formatting is redacted.
     pub origin_host: Redacted<String>,
     /// Origin-Realm; diagnostic formatting is redacted.
@@ -845,8 +849,8 @@ pub struct SwmSessionTerminationRequest {
     pub destination_host: Option<Redacted<String>>,
     /// Required Termination-Cause.
     pub termination_cause: SwmTerminationCause,
-    /// Required permanent User-Name; diagnostic formatting is redacted.
-    pub user_name: Redacted<String>,
+    /// Required permanent User-Name; zeroized on drop and redacted in diagnostics.
+    pub user_name: Sensitive<String>,
     /// Optional RFC 7944 routing priority.
     pub drmp: Option<SwmRoutingMessagePriority>,
     /// Ordered Route-Record values; diagnostic formatting is redacted.
@@ -873,13 +877,18 @@ impl fmt::Debug for SwmSessionTerminationRequest {
     }
 }
 
+impl zeroize::ZeroizeOnDrop for SwmSessionTerminationRequest {}
+
 /// Typed SWm Session-Termination-Answer facts.
+///
+/// A retained Session-Id owns zeroizing storage. Cloning these facts creates
+/// an independent zeroize-on-drop owner when that value is present.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmSessionTerminationAnswer {
     /// Session-Id; absent only on a received RFC 6733 generic E-bit answer,
     /// including the permitted permanent-failure fallback. Diagnostic
     /// formatting is redacted when present.
-    pub session_id: Option<Redacted<String>>,
+    pub session_id: Option<Sensitive<String>>,
     /// Base Diameter result projection.
     pub result: SwmSessionTerminationResult,
     /// Origin-Host; diagnostic formatting is redacted.
@@ -926,11 +935,14 @@ impl fmt::Debug for SwmSessionTerminationAnswer {
     }
 }
 
+impl zeroize::ZeroizeOnDrop for SwmSessionTerminationAnswer {}
+
 /// Parsed or outbound STR together with retained request-correlation facts.
 ///
 /// An inbound request parsed for server-side STA construction has no expected
 /// answer peer. Outbound requests and forwarded requests bind one explicitly;
 /// attempting answer correlation without that binding fails closed.
+/// Retained Session-Id and User-Name clones remain independently zeroizing.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmSessionTerminationRequestEnvelope {
     transaction: super::SwmDiameterTransaction,
@@ -1086,7 +1098,11 @@ impl fmt::Debug for SwmSessionTerminationRequestEnvelope {
     }
 }
 
+impl zeroize::ZeroizeOnDrop for SwmSessionTerminationRequestEnvelope {}
+
 /// Parsed STA together with immutable answer-correlation facts.
+///
+/// Its optional retained Session-Id remains zeroizing across envelope clones.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SwmSessionTerminationAnswerEnvelope {
     transaction: super::SwmDiameterTransaction,
@@ -1148,6 +1164,8 @@ impl fmt::Debug for SwmSessionTerminationAnswerEnvelope {
     }
 }
 
+impl zeroize::ZeroizeOnDrop for SwmSessionTerminationAnswerEnvelope {}
+
 /// Fully correlated typed STR/STA exchange.
 pub struct SwmCorrelatedSessionTerminationExchange {
     request: SwmSessionTerminationRequestEnvelope,
@@ -1184,6 +1202,8 @@ impl fmt::Debug for SwmCorrelatedSessionTerminationExchange {
             .finish()
     }
 }
+
+impl zeroize::ZeroizeOnDrop for SwmCorrelatedSessionTerminationExchange {}
 
 /// Redaction-safe reason a valid STR and STA could not be correlated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1584,13 +1604,13 @@ impl SwmAbortSessionRequestEnvelope {
         }
         Ok(SwmPostAbortSessionTermination::Required(Box::new(
             SwmSessionTerminationRequest {
-                session_id: self.request.session_id.clone(),
+                session_id: Sensitive::from(self.request.session_id.as_ref().to_owned()),
                 origin_host: committed_answer.origin_host.clone(),
                 origin_realm: committed_answer.origin_realm.clone(),
                 destination_realm: self.request.origin_realm.clone(),
                 destination_host: Some(self.request.origin_host.clone()),
                 termination_cause: SwmTerminationCause::Administrative,
-                user_name: self.request.user_name.clone(),
+                user_name: Sensitive::from(self.request.user_name.as_ref().to_owned()),
                 drmp: self.request.drmp,
                 route_records: Vec::new(),
                 additional_avps: Vec::new(),
@@ -2856,7 +2876,7 @@ fn parse_request_parts(
             let key = avp.header.key();
             if key == AvpKey::ietf(base::AVP_SESSION_ID) {
                 let value = parse_core_string(&avp, ctx, offset, value_offset, "8.8")?;
-                builder_helpers::set_once(&mut session_id, Redacted::from(value), offset, "8.8")?;
+                builder_helpers::set_once(&mut session_id, Sensitive::from(value), offset, "8.8")?;
             } else if key == AvpKey::ietf(AVP_DRMP) {
                 validate_drmp(&avp, offset)?;
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "9.1")?;
@@ -2913,7 +2933,7 @@ fn parse_request_parts(
                 builder_helpers::set_once(&mut termination_cause, value, offset, "8.15")?;
             } else if key == AvpKey::ietf(base::AVP_USER_NAME) {
                 let value = parse_core_string(&avp, ctx, offset, value_offset, "8.14")?;
-                builder_helpers::set_once(&mut user_name, Redacted::from(value), offset, "8.14")?;
+                builder_helpers::set_once(&mut user_name, Sensitive::from(value), offset, "8.14")?;
             } else if key == AvpKey::ietf(base::AVP_PROXY_INFO) {
                 if proxy_infos.len() >= MAX_PROXY_INFOS {
                     return Err(count_error(
@@ -3071,7 +3091,7 @@ fn parse_answer_parts(
             let key = avp.header.key();
             if key == AvpKey::ietf(base::AVP_SESSION_ID) {
                 let value = parse_core_string(&avp, ctx, offset, value_offset, "8.8")?;
-                builder_helpers::set_once(&mut session_id, Redacted::from(value), offset, "8.8")?;
+                builder_helpers::set_once(&mut session_id, Sensitive::from(value), offset, "8.8")?;
             } else if key == AvpKey::ietf(AVP_DRMP) {
                 validate_drmp(&avp, offset)?;
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "9.1")?;
