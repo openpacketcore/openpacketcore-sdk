@@ -63,5 +63,10 @@ name = "swm_authorization"
 path = "tests/swm_authorization.rs"
 required-features = ["app-swm"]
 
+[[test]]
+name = "swm_public_lifecycle"
+path = "tests/swm_public_lifecycle.rs"
+required-features = ["app-swm"]
+
 [lints]
 workspace = true

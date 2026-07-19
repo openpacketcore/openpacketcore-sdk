@@ -665,6 +665,27 @@ policy, authorization-timer role/cardinality/type and cross-field semantics,
 zero/absent/maximum timer values, dictionary and role failures, 129th-entry
 bounds, canonical flags, public sequence replay, and redacted diagnostics.
 
+#### Complete public SWm lifecycle acceptance
+
+`tests/swm_public_lifecycle.rs` is a compiler-external integration fixture, so
+it can use only exported crate APIs. Its first deterministic synthetic session
+performs DER/DEA establishment, the public RAR/RAA then AAR/AAA type-state
+update, and ePDG-originated STR/STA termination. A separate deterministic
+session performs DER/DEA establishment, an inbound maintained-state ASR/ASA,
+and the administrative STR/STA derived only after constructing the exact
+request-bound ASA bytes. Every request and answer is independently encoded,
+decoded, parsed into public envelopes, and correlated. The fixture checks exact
+application, command, direction, P/T/E flags, both Diameter identifiers,
+connection and logical-Origin policy where supported, canonical rebuild bytes,
+byte-identical committed retry/replay, and redaction of session, user, and peer
+host/realm identities plus DER/DEA EAP and master-session-key material.
+
+This evidence completes the generic typed SWm lifecycle surface requested by
+#351. It does not make the SDK an active-session authority and does not change
+the broader experimental Diameter conformance status. Session lookup,
+authorization, transport pending state, retry/cache lifetime, teardown and
+compensation ordering, and product side effects remain downstream.
+
 ### 7. Redaction
 
 Sensitive typed fields are wrapped in `Redacted<T>` or redaction-safe identity
@@ -806,8 +827,8 @@ The following are outside the current crate scope:
 - Full message-specific semantic validation (e.g., mandatory-AVP presence for
   every command) beyond what the Rf/SWm typed helpers enforce.
 - Complete 3GPP Rf/SWm/Gx/S6a/S6b/SWx application coverage beyond the current
-  Rf accounting and SWm Diameter-EAP/Session-Termination/Abort-Session typed
-  subsets.
+  Rf accounting and SWm Diameter-EAP, Session-Termination, Abort-Session,
+  Re-Auth, and AA typed subsets.
 - Transport operations, TCP/SCTP transport, TLS/TLS-PSK handling, realm routing,
   peer topology, watchdog thresholds, failover state machines, AAA/HSS/CDF
   behavior, charging decisions, and deployment readiness policy.

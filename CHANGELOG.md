@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Complete public SWm lifecycle acceptance — `opc-proto-diameter`:** adds one
+  compiler-external, deterministic public-API fixture covering a successful
+  DER/DEA establishment followed by RAR/RAA, AAR/AAA, and ePDG STR/STA, plus a
+  separate successful DER/DEA session followed by inbound maintained-state
+  ASR/ASA and the derived administrative STR/STA. Every exchange crosses the
+  exported builder/parser envelope boundary and correlates exact Diameter
+  transaction, application, command, direction, P/T/E flags, session, user,
+  connection generation, and logical Origin as applicable. Canonical rebuilds
+  and committed retries are byte-identical, diagnostics remain redacted, and
+  the fixture leaves session lookup, authorization, transport, retries,
+  teardown ordering, and side effects downstream. This completes the generic
+  typed SWm lifecycle scope requested by #351 without changing the crate's
+  broader experimental Diameter status.
 - **Typed SWm Abort-Session boundary — `opc-proto-diameter`:** adds TS 29.273
   ASR/ASA command definitions, typed redaction-safe request/answer models,
   bounded parsers, request-bound deterministic builders, and exact transaction,
