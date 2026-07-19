@@ -24,6 +24,12 @@
 //! protected message. Random-IV evidence is valid only for IKE and never
 //! carries placeholder counter fields; ownership fencing, key custody, SA
 //! identity, and inbound anti-replay evidence remain mandatory in both modes.
+//! [`SessionRePinCoordinator`] composes those exact single-SA transitions into
+//! one bounded durable IKE/default-ESP/dedicated-ESP saga. It converges forward
+//! after partial monotonic commits and returns whole-session success only after
+//! every ordered SA has durably completed fencing and steering. The session
+//! journal neither proves that caller-declared counters were applied nor
+//! changes the existing encrypted session-payload/HKMS boundary.
 
 #![forbid(unsafe_code)]
 
@@ -42,6 +48,7 @@ pub mod redirect;
 pub mod repin;
 pub mod selector;
 pub mod session;
+pub mod session_repin;
 pub mod spi;
 pub mod unsupported;
 pub mod vip;
@@ -117,6 +124,13 @@ pub use selector::{
 pub use session::{
     SessionOwnershipKeyResolver, SessionOwnershipKeyspace, SessionStoreOwnershipFencer,
     SessionStoreOwnershipSource,
+};
+pub use session_repin::{
+    MockSessionRePinJournal, SessionRePinCheckpoint, SessionRePinCoordinator, SessionRePinError,
+    SessionRePinIdentity, SessionRePinJournal, SessionRePinOperationId, SessionRePinOutcome,
+    SessionRePinPhase, SessionRePinPlan, SessionRePinPlanFingerprint, SessionRePinSessionId,
+    SessionRePinStatus, SessionStoreRePinJournal, MAX_SESSION_REPIN_SAS, MIN_SESSION_REPIN_SAS,
+    SESSION_REPIN_JOURNAL_MAX_BYTES,
 };
 pub use spi::{
     EntropySource, FixedEntropy, RekeyRequest, SpiAllocationRequest, SpiKind, SystemEntropy,

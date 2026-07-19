@@ -326,6 +326,157 @@ Those separate reads cannot make the current `SteeringBackend` mutation atomic
 or order repeated A→B→C failovers; fence-aware steering replacement is tracked in
 [issue #103](https://github.com/openpacketcore/openpacketcore-sdk/issues/103).
 
+### Durable session-level re-pin
+
+Do not coordinate a packet-core session by awaiting several independent
+`RePinCoordinator::repin` calls and treating the loop as atomic. An earlier SA
+can already hold its new monotonic fence when a later SA fails before its own
+commit; rollback or an ownership-record birth/upsert would bypass the exact
+predecessor fence. `SessionRePinCoordinator` supplies the forward-only durable
+saga for that case.
+
+`SessionRePinPlan` fixes one canonical order and a bounded amount of recovery
+work:
+
+1. IKE SA;
+2. default-bearer ESP SA;
+3. zero or more dedicated-bearer ESP SAs in a caller-stable order.
+
+The plan admits 2 through 64 unique SAs. It requires one common previous owner,
+new owner, source shard, and target shard, plus a unique
+`OwnershipTransitionId` and the exact `RePinRequest` for each SA. Its v1
+SHA-256 fingerprint binds the privacy-preserving session stable ID, one
+`SessionRePinOperationId`, the exact prior terminal fingerprint for later
+operations, the order, and every per-SA ownership fingerprint. The journal
+retains the complete requests, a completed-fence prefix, and any current
+post-commit fence. It never derives a replacement request after restart.
+
+```rust,ignore
+use opc_ipsec_lb::{
+    RePinCoordinator, SessionRePinCoordinator, SessionRePinOperationId,
+    SessionRePinPlan, SessionRePinSessionId, SessionStoreRePinJournal,
+};
+
+// `stable_id` is a tenant-keyed digest, never a raw SUPI/IMSI. `requests` is
+// ordered IKE, default ESP, then dedicated ESP and was prepared from exact
+// authoritative predecessor snapshots.
+let session_id = SessionRePinSessionId::from_stable_id(stable_id);
+let operation_id = SessionRePinOperationId::new(operation_nonce)?;
+let plan = SessionRePinPlan::new(
+    session_id.clone(),
+    operation_id,
+    requests,
+)?;
+let identity = plan.identity();
+let journal = SessionStoreRePinJournal::new(
+    encrypted_quorum_backend,
+    tenant,
+    nf_kind,
+);
+journal.validate_authority().await?;
+let saga = SessionRePinCoordinator::new(
+    RePinCoordinator::new(steering, fencer, ownership, audit),
+    journal,
+);
+
+match saga.start(plan).await {
+    Ok(all_sas) => publish_session_continuity(all_sas),
+    Err(error) => quarantine_or_retry_exact(error),
+}
+
+// After process restart, the caller supplies the same privacy-safe session key
+// and exact operation-plus-plan identity. The SDK reloads and replays the
+// retained exact requests.
+let all_sas = saga.resume(&session_id, identity).await?;
+
+// A later failover must prove exact succession from the prior terminal plan.
+let next_plan = SessionRePinPlan::new_successor(
+    session_id,
+    next_operation_id,
+    all_sas.plan().fingerprint(),
+    next_requests,
+)?;
+```
+
+The snippet names product wiring values rather than defining them; the public
+constructor signatures above are the integration contract. `start` first
+linearizes one active plan per session. A competing different plan cannot
+displace a prepared or partially committed saga. An exact duplicate helper is
+safe: ownership grant recovery, steering installs, audit events, and journal
+updates are idempotent. A completed plan may be replaced only through
+`new_successor` with its exact terminal fingerprint. This prevents a stale
+completed operation from displacing a newer restart/status authority; the new
+operation ID and every per-SA transition ID must also be fresh relative to the
+retained predecessor. A rejected successor leaves that terminal predecessor
+unchanged. Resume and status require `SessionRePinIdentity`, which binds both
+the operation ID and whole-plan fingerprint; retaining only the operation ID is
+not sufficient restart authority.
+
+`SessionRePinError::Quarantined` means no SA commit is retained and no
+whole-session success is exposed. Once any ownership commit is known,
+`ForwardConvergenceRequired` is the only failure result: resume the same
+session and exact plan identity until the plan completes or surface an operator-visible
+quarantine. Monotonic SA ownership is never rolled back. `SessionRePinStatus`
+contains only phase and counts; its formatting, and the formatting of plans,
+checkpoints, outcomes, operation IDs, and plan fingerprints, excludes session
+IDs, owner/peer names, SAs, SPIs, counters, rules, and fences.
+
+Before the saga mutates the next SA, and again before it returns terminal
+success, it uses two deliberately separate phases. Phase one reconciles the
+exact steering rule for every completed entry under the `SteeringBackend`
+idempotency contract. Only after all repairs finish does phase two perform a
+global mutation-free sweep that revalidates every authoritative owner, fence,
+transition ID, complete request fingerprint, retry proof, and target shard
+owner. Monotonic fences cannot ABA back to a retained value, so a successful
+phase-two sweep is the prefix linearization point. Any mismatch fails closed
+without touching a later SA. This includes an earlier SA displaced by direct
+per-SA `RePinCoordinator` use while a later steering repair was awaiting
+completion.
+
+Success proves only that one such whole-prefix convergence point existed during
+that `start` or `resume` invocation. It is not an ownership or steering lease
+and does not guarantee that the validated state is still current when the
+future returns or afterward. A later supported transition may advance a fence
+after its validation. Consumers must serialize subsequent transitions and use
+current fenced authority at each action boundary. `status()` reports durable
+journal progress without rerunning convergence validation; it is not live
+ownership or steering authority.
+
+Supported SDK ownership changes go through `RePinCoordinator` and fence before
+steering. A consumer that retains a raw `SteeringBackend` and mutates a rule
+outside that boundary can create post-validation steering drift without an
+ownership-fence change; such direct mutation is out of contract and cannot be
+made linearizable by this saga. Callers must not expose that raw mutation path
+or treat the session journal alone as live ownership/steering authority.
+
+Production HA must wire `SessionStoreRePinJournal` to the majority-committed
+session store and wrap that caller-facing backend with
+`EncryptingSessionBackend`. The journal introduces no alternate consensus or
+encryption path. Exact recovery metadata is plaintext only above the existing
+payload-protection boundary and is an authenticated envelope at the durable
+backend, preserving the configured HKMS/KMS key lifecycle and encrypted-at-rest
+contract. Call `validate_authority` during startup; every read and write repeats
+that check and rejects a capability downgrade or a backend unable to retain the
+maximum bounded checkpoint. `MockSessionRePinJournal` is deterministic test
+support, not durable or split-brain authority.
+
+This saga does not satisfy the applied-counter receipt requested by
+[issue #333](https://github.com/openpacketcore/openpacketcore-sdk/issues/333).
+It retains and revalidates each current `SameSpiResume` byte-for-byte but never
+relabels caller-declared counters as kernel-applied/read-back evidence. When
+that single-SA receipt becomes part of `RePinRequest`, its existing ownership
+fingerprint automatically becomes part of the session plan fingerprint.
+
+Migration from a sequential consumer loop is additive: build all requests
+before the first mutation, retain one privacy-preserving session ID and one
+operation ID, use `start` once, persist no product-local stage, and use `resume`
+after every interruption. Only a terminal `SessionRePinOutcome` authorizes a
+whole-session continuity claim. Retain its plan fingerprint and pass it to
+`new_successor` for the next failover. Products still own SA discovery,
+complete-set membership, transition-ID generation, key custody, counter
+application, dataplane programming, retry scheduling, and operator quarantine
+policy.
+
 ## Authenticated cross-node ingress redirect
 
 Routed multi-ingress products can use the `redirect` module to carry an

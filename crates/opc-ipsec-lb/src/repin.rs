@@ -1,5 +1,6 @@
 //! Kernel-independent re-pin coordination primitives.
 
+use std::fmt;
 use std::num::{NonZeroU128, NonZeroU64};
 
 use sha2::{Digest, Sha256};
@@ -434,7 +435,7 @@ pub enum RePinAuditEventKind {
 }
 
 /// Redaction-safe re-pin audit event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RePinAuditEvent {
     /// Event kind.
     pub kind: RePinAuditEventKind,
@@ -457,6 +458,21 @@ pub struct RePinAuditEvent {
     pub forwarding_proven: bool,
     /// Stable failure code for failed attempts.
     pub failure_code: Option<&'static str>,
+}
+
+impl fmt::Debug for RePinAuditEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RePinAuditEvent")
+            .field("kind", &self.kind)
+            .field("sa", &"[redacted]")
+            .field("transition_id", &"[redacted]")
+            .field("previous_owner", &"[redacted]")
+            .field("new_owner", &"[redacted]")
+            .field("fence_present", &self.fence.is_some())
+            .field("forwarding_proven", &self.forwarding_proven)
+            .field("failure_code", &self.failure_code)
+            .finish()
+    }
 }
 
 impl RePinAuditEvent {
@@ -826,16 +842,7 @@ where
         // Do not trust the fencer port blindly: a grant for a different SA or a
         // different owner would install a steering override toward the wrong
         // node. Reject it before any steering mutation.
-        if grant.sa != request.sa
-            || grant.transition_id != request.transition_id
-            || grant.fingerprint != request.ownership_fingerprint()
-            || grant.owner != request.new_owner
-        {
-            let error = IpsecLbError::ownership_conflict(
-                "fence grant does not match the requested SA and new owner",
-            );
-            return Err(RePinError::BeforeOwnershipCommit(error));
-        }
+        validate_grant_matches(&request, &grant).map_err(RePinError::BeforeOwnershipCommit)?;
 
         let retry_proof = OwnershipRetryProof::from_grant(&grant);
         // A shape-matching successful grant is post-commit by the fencer port
@@ -890,6 +897,70 @@ where
 
         self.continue_committed(partial.request, partial.retry_proof, partial.resume_at)
             .await
+    }
+
+    /// Revalidate and idempotently reconcile one previously completed re-pin.
+    ///
+    /// This boundary is deliberately read-only with respect to ownership: it
+    /// requires recovery of the exact committed transition, verifies its
+    /// owner, fence, transition ID, and complete request fingerprint, and then
+    /// repeats the exact steering install under the backend's idempotency
+    /// contract. It never calls [`OwnershipFencer::fence_sa_owner`] and emits no
+    /// new transition audit events. Session-level recovery uses this before
+    /// mutating a later SA and again before reporting terminal success, which
+    /// detects direct per-SA coordinator use that displaced an earlier prefix.
+    pub async fn reconcile_committed(
+        &self,
+        request: &RePinRequest,
+        expected_fence: OwnershipFence,
+    ) -> Result<RePinOutcome, IpsecLbError> {
+        let outcome = self.validate_committed(request, expected_fence).await?;
+        self.steering.install_rule(request.rule).await?;
+        Ok(outcome)
+    }
+
+    /// Validate one previously completed re-pin without any mutation.
+    ///
+    /// This performs authoritative recovery and exact retry-proof validation
+    /// for the owner, fence, transition ID, and complete request fingerprint,
+    /// then rechecks the target shard owner. It never fences ownership,
+    /// installs or removes steering, or records an audit event. Session-level
+    /// recovery calls this for the whole completed prefix only after every
+    /// steering repair has finished, establishing a mutation-free validation
+    /// sweep before a later SA mutation or terminal result.
+    pub async fn validate_committed(
+        &self,
+        request: &RePinRequest,
+        expected_fence: OwnershipFence,
+    ) -> Result<RePinOutcome, IpsecLbError> {
+        self.validate_pre_commit(request).await?;
+        let fence_request = OwnershipFenceRequest {
+            sa: request.sa,
+            transition_id: request.transition_id,
+            fingerprint: request.ownership_fingerprint(),
+            previous_fence: request.previous_fence,
+            previous_owner: request.previous_owner.clone(),
+            new_owner: request.new_owner.clone(),
+        };
+        let grant = self
+            .fencer
+            .recover_fence_grant(&fence_request)
+            .await?
+            .ok_or_else(|| {
+                IpsecLbError::ownership_conflict(
+                    "completed re-pin has no exact authoritative ownership grant",
+                )
+            })?;
+        validate_grant_matches(request, &grant)?;
+        if grant.fence != expected_fence {
+            return Err(IpsecLbError::ownership_conflict(
+                "completed re-pin fence does not match durable progress",
+            ));
+        }
+        let proof = OwnershipRetryProof::from_grant(&grant);
+        self.fencer.validate_retry_proof(&proof).await?;
+        self.validate_target_owner(request).await?;
+        Ok(RePinOutcome::new(request.sa, grant.fence, request.rule))
     }
 
     async fn validate_pre_commit(&self, request: &RePinRequest) -> Result<(), IpsecLbError> {
@@ -998,6 +1069,22 @@ where
 
         Ok(RePinOutcome::new(request.sa, fence, request.rule))
     }
+}
+
+fn validate_grant_matches(
+    request: &RePinRequest,
+    grant: &OwnershipFenceGrant,
+) -> Result<(), IpsecLbError> {
+    if grant.sa != request.sa
+        || grant.transition_id != request.transition_id
+        || grant.fingerprint != request.ownership_fingerprint()
+        || grant.owner != request.new_owner
+    {
+        return Err(IpsecLbError::ownership_conflict(
+            "fence grant does not match the requested SA and new owner",
+        ));
+    }
+    Ok(())
 }
 
 fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
@@ -1137,7 +1224,7 @@ fn hash_anti_replay_and_key_source(hasher: &mut Sha256, resume: SameSpiResume) {
     }]);
 }
 
-fn validate_request(request: &RePinRequest) -> Result<(), IpsecLbError> {
+pub(crate) fn validate_request(request: &RePinRequest) -> Result<(), IpsecLbError> {
     if request.previous_owner == request.new_owner {
         return Err(IpsecLbError::invalid_config(
             "new_owner",

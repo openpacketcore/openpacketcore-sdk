@@ -40,6 +40,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nor a cross-process writer lease. The mock provides stateful parity and
   redaction-safe corrupt/transitional/changing fault injection through a
   separate reconciliation log that preserves its established operation enum.
+- **Durable session-level multi-SA re-pin — `opc-ipsec-lb`:** new
+  `SessionRePinPlan`, `SessionRePinCoordinator`, and
+  `SessionStoreRePinJournal` APIs bind one privacy-preserving session identity
+  and operation identity to a canonical bounded IKE/default-ESP/dedicated-ESP
+  order and every exact `RePinRequest` fingerprint. The session-store-backed v1
+  journal retains completed per-SA fences and any current post-commit fence,
+  resumes exact requests after process restart, rejects a competing active
+  plan, and exposes success only after every SA durably completes fencing,
+  steering, and final audit. Later operations require
+  `SessionRePinPlan::new_successor` with the exact previous terminal
+  fingerprint, preventing a stale completed retry from replacing newer restart
+  authority. Successors must also use fresh operation and per-SA transition
+  identities, while resume/status use an exact redaction-safe
+  operation-plus-plan token. Before a later mutation or terminal success, every
+  completed prefix first has all steering reconciled, then crosses a separate
+  global mutation-free exact-proof sweep whose monotonic fences provide the
+  linearization point. Pre-commit first-SA failure is quarantined; any known partial
+  commit requires forward convergence and can never fall through to ownership
+  birth/upsert. Public saga diagnostics contain counts and stages only.
+  Every production journal read/write fails closed after a backend authority
+  capability downgrade. Production wiring reuses the existing quorum, payload
+  encryption, and HKMS/KMS lifecycle without a parallel authority; the mock
+  journal is test only. Consumers migrating from sequential per-SA loops must
+  prepare the full ordered plan before mutation, call `start` once, call
+  `resume` with the same privacy-safe session ID and `SessionRePinIdentity`
+  after interruption, retain the
+  terminal fingerprint for the next failover, and claim continuity only from a
+  terminal `SessionRePinOutcome`. This does not claim the adapter-issued
+  applied-counter evidence tracked by #333.
 - **BREAKING — fail-closed eBPF GTP-U downlink endpoint binding —
   `opc-gtpu-dataplane`:** every tc downlink PDR now carries a canonical binding
   to its outer peer, concrete local destination, address family, ingress
