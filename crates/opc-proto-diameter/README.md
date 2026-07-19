@@ -49,8 +49,8 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   truncation and resource-limit failures are explicitly unanswerable.
 - `parser_error` provides sealed, redaction-safe `DiameterParserError` and
   `DiameterMissingAvpProvenance`, grouped-parent, and grouped-set metadata. Additive
-  `*_with_provenance` request parsers cover CER, DWR, DPR, and SWm DER (plus
-  the SWm transaction-envelope form); legacy parser signatures delegate to
+  `*_with_provenance` request parsers cover CER, DWR, DPR, and SWm DER/STR (plus
+  their SWm transaction-envelope forms); legacy parser signatures delegate to
   them and still return the original `DecodeError`. Missing provenance exposes
   only numeric application/command/role metadata and the exact SDK-owned AVP
   definition needed to inspect its vendor-aware key, data type, and flag rules.
@@ -66,7 +66,32 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   advertised Host-IP-Address for an SCTP-multihomed peer; singleton fields and
   the watchdog/disconnect profiles retain conservative duplicate rejection.
 - The `app-rf` feature adds typed Rf accounting helpers.
-- The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA helpers, including
+- The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA and
+  Session-Termination STR/STA helpers. STR/STA envelopes bind both Diameter
+  identifiers, the P bit, a present exact `Session-Id`, and ordered Proxy-Info.
+  Outbound envelopes additionally require an authenticated connection-generation
+  token and may apply an explicit direct-host or routed-realm Origin policy;
+  RFC 6733 generic E-bit answers, including the permitted permanent-failure
+  fallback, may omit Session-Id and skip logical-Origin policy, but still
+  require the exact connection, transaction, P, and Proxy-Info chain. The
+  initial outbound STR clears T, and the envelope exposes a one-way
+  `mark_for_failover_retransmission` transition for queued, unacknowledged
+  state resent after link failover or recovery; the transition atomically
+  installs the replacement connection binding and its caller-reserved
+  Hop-by-Hop Identifier while retaining End-to-End duplicate identity.
+  SWm STR `User-Name` is required by the TS 29.273 procedure table and retains
+  sealed missing-AVP provenance despite the reused command CCF showing it as
+  optional. The
+  request-bound STA builder emits only fully modeled success, base
+  `DIAMETER_UNKNOWN_SESSION_ID` (5002), and `DIAMETER_UNABLE_TO_COMPLY` (5012)
+  contexts without misusing the E bit, and parsed answers require exact
+  transaction, optional-present `Session-Id`, and Proxy-Info correlation.
+  Received non-redirect base result
+  codes remain receive-only projections; redirect 3006 is rejected until its
+  required redirect AVPs have a typed surface. Missing required STR fields retain sealed 5005
+  provenance for the generic RFC 6733 error-answer mapper. Lifecycle ownership,
+  retries, teardown ordering, and compensation remain consumer policy.
+  The DER/DEA surface includes
   exact, fail-closed resolution of an opt-in top-level default
   `Context-Identifier` extension to one of its repeated APN configurations and
   the TS 29.273 DER-only Emergency-Services/Emergency-Indication bitmask. It
@@ -234,7 +259,7 @@ function signatures and their `DecodeError` values remain source-compatible.
 | `base` | yes | RFC 6733 common application and raw base metadata. |
 | `peer` | no | CER/CEA, DWR/DWA, DPR/DPA helpers and peer-session projections. |
 | `app-rf` | no | Rf accounting dictionary plus typed ACR/ACA helpers. |
-| `app-swm` | no | SWm dictionary plus typed Diameter-EAP DER/DEA helpers. |
+| `app-swm` | no | SWm dictionary plus typed Diameter-EAP DER/DEA and Session-Termination STR/STA helpers. |
 | `app-gx` | no | Gx dictionary slot only. |
 | `app-s6a` | no | S6a/S6d dictionary slot only. |
 | `app-s6b` | no | S6b dictionary slot only. |
@@ -250,6 +275,144 @@ redaction policies.
 
 Use `CONFORMANCE.md` for the precise fixture provenance, fuzz target status,
 application dictionary status, and typed helper gaps.
+
+### SWm Session-Termination
+
+An ePDG creates an outbound STR by binding typed facts to identifiers allocated
+by its live Diameter transport:
+
+```rust
+use opc_proto_diameter::apps::swm::{
+    build_swm_session_termination_request, SwmDiameterConnectionToken,
+    SwmDiameterTransaction, SwmExpectedAnswerPeer, SwmSessionTerminationRequest,
+    SwmSessionTerminationRequestEnvelope, SwmTerminationCause,
+};
+use opc_proto_diameter::OwnedMessage;
+use opc_protocol::{EncodeContext, EncodeError};
+
+fn build_str(
+    connection: SwmDiameterConnectionToken,
+) -> Result<OwnedMessage, EncodeError> {
+    let request = SwmSessionTerminationRequest {
+        session_id: "session-id-from-the-established-DER".into(),
+        origin_host: "epdg.example".into(),
+        origin_realm: "example".into(),
+        destination_realm: "example".into(),
+        destination_host: None,
+        termination_cause: SwmTerminationCause::Administrative,
+        user_name: "permanent-user-identity@example".into(),
+        drmp: None,
+        route_records: Vec::new(),
+        additional_avps: Vec::new(),
+    };
+    let pending = SwmSessionTerminationRequestEnvelope::for_outbound(
+        request,
+        SwmDiameterTransaction::new(0x1020_3040, 0x5060_7080),
+        SwmExpectedAnswerPeer::routed(connection),
+    );
+    build_swm_session_termination_request(&pending, EncodeContext::default())
+}
+```
+
+The `connection` argument above is allocated by the transport when that exact
+authenticated connection generation opens; it is never a constant or a peer
+address-derived value.
+
+If transport link failover requires resending that still-unacknowledged queued
+request, retain the same envelope and identifiers, allocate a fresh token for
+the replacement authenticated connection, call
+`pending.mark_for_failover_retransmission(replacement_hop_by_hop,
+SwmExpectedAnswerPeer::routed(new_connection))`, and rebuild it. The transport
+must reserve that Hop-by-Hop Identifier as unique among pending requests on the
+replacement connection. The transition atomically sets T and replaces both
+hop-local correlation fields without changing the End-to-End Identifier or AVP
+bytes. An ordinary timer retry does not call this transition. Retry timing,
+identifier allocation, connection selection, and pending-request ownership
+remain transport/product responsibilities.
+
+`SwmExpectedAnswerPeer::routed(connection)` accepts the final logical Origin
+behind a DRA/proxy/relay while still requiring the exact authenticated
+connection generation. `direct(connection, host, realm)` additionally binds
+one final server, while `routed_in_realm(connection, realm)` permits a trusted
+server pool. FQDN and realm comparisons use ASCII case-insensitive
+DiameterIdentity semantics. Destination-Host and Destination-Realm are routing
+instructions, not authentication evidence, and the SDK never derives a
+logical-Origin policy from them. Generic E-bit answers can be originated by an
+intermediary and skip only the optional logical-Origin check; they never skip
+connection binding.
+
+An AAA endpoint parses an inbound envelope before session lookup and constructs
+an STA from that exact request. The inbound envelope intentionally has no
+outbound peer binding. The answer builder copies identifiers, `Session-Id`, P,
+and the ordered Proxy-Info chain without comparing the local Origin to request
+Destination AVPs; applications do not hand-format an error answer:
+
+```rust
+use opc_proto_diameter::Message;
+use opc_proto_diameter::apps::swm::{
+    build_swm_session_termination_answer,
+    parse_swm_session_termination_request_envelope,
+    SwmSessionTerminationAnswer, SwmSessionTerminationResult,
+};
+use opc_protocol::{DecodeContext, EncodeContext};
+
+# fn answer(message: &Message<'_>) -> Result<(), Box<dyn std::error::Error>> {
+let request = parse_swm_session_termination_request_envelope(
+    message,
+    DecodeContext::conservative(),
+)?;
+let answer = SwmSessionTerminationAnswer::for_request(
+    &request,
+    SwmSessionTerminationResult::UnknownSession,
+    "aaa.example",
+    "example",
+);
+let sta_message = build_swm_session_termination_answer(
+    &request,
+    &answer,
+    EncodeContext::default(),
+)?;
+# let _ = sta_message;
+# Ok(())
+# }
+```
+
+For an outbound STR, consume the transport's pending-request entry and parse an
+STA with `parse_swm_session_termination_answer_envelope_from_connection(message,
+received_on, context)`, then call `pending.correlate_answer(sta)`. Codec
+correlation does not make a replay live and does not own the product session
+registry. The typed answer parser validates the application, command, and
+answer direction and retains the transport-supplied connection generation;
+ordinary STA answers require the exact Session-Id, while an RFC 6733 generic
+E-bit answer may omit it and remains bound by connection, both transaction
+identifiers, P, and the exact ordered Proxy-Info chain. This includes the
+section 7.1.5 permanent-failure fallback. A present Session-Id must match.
+Consumers allocate process-unique nonzero connection tokens and must allocate
+a new one for every reconnect. The values and logical identities are redacted
+from diagnostics.
+
+For a retransmitted duplicate STR, cache and replay the committed application
+answer after application completion. A duplicate retaining the same Hop-by-Hop
+Identifier produces a byte-identical STA. A failover duplicate with a newly
+reserved Hop-by-Hop Identifier produces the same flags and AVPs with that new
+identifier, as RFC 6733 permits. Cache lifetime, duplicate lookup, and
+committed-response ownership remain transport policy.
+
+Known additional STR/STA AVPs are not merely framed: dictionary fixed widths,
+Address, UTF-8, DiameterIdentity, and grouped framing are validated on both
+decode and encode. RFC 7683 OC-Supported-Features/OC-OLR and RFC 8583 Load use
+their bounded child schemas, reject duplicate or unknown mandatory children,
+and enforce their flag and value contracts using the full vendor-aware AVP key.
+Unknown optional grouped children obey preserve/drop policy. The typed answer surface selects
+only RFC 7683's loss algorithm. Received OC-OLR/Load groups retain RFC-defined
+optional children after validating every present child; an originated loss OLR
+must include OC-Reduction-Percentage, and an originated Load must include
+Load-Type, Load-Value, and SourceID. Originated DRMP and Load AVPs always clear
+M; as required by TS 29.273 table 7.2.3.1/2 note 2, the receiver tolerates an
+M-bit mismatch for those recognized AVPs while continuing to enforce V, P,
+type, grouped-child, and cardinality rules. An OC offer permits, but does not
+require, a reporting-node selection in the answer; an emitted selection still
+must be offered, and OC-OLR still requires same-answer OC support.
 
 `SwmDiameterEapAnswer` struct literals must initialize
 `default_context_identifier`; use `None` to preserve the prior wire shape or

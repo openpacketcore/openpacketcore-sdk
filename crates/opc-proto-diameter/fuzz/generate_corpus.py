@@ -8,7 +8,7 @@ No seed lives only in a provenance/documentation directory.
 The spec-valid fixtures are hand-authored from the wire layouts in:
   - IETF RFC 6733 section 3 (message header) and section 4 (AVP framing)
   - 3GPP TS 32.299 (Rf offline charging PS-Information vendor AVPs)
-  - 3GPP TS 29.273 (SWm Diameter-EAP command and AVP codes)
+  - 3GPP TS 29.273 (SWm Diameter-EAP and Session-Termination commands/AVPs)
 
 The malformed fixtures exercise the hostile-input paths that the decode
 surface must never panic on: truncation, invalid lengths, duplicate
@@ -514,6 +514,75 @@ def main() -> None:
             final_emergency_dea,
         ),
         "swm_dea_emergency_final_success_material",
+    )
+
+    # 14. SWm Session-Termination-Request, TS 29.273 §7.2.2.2.1.
+    #     Proxy-Info and Route-Record exercise the RFC 6733 routing surface.
+    proxy_info = avp(280, 0x40, b"proxy.example", None)
+    proxy_info += avp(33, 0x40, b"opaque-proxy-state", None)
+    str_avps = b""
+    str_avps += avp(263, 0x40, b"sess;swm;termination", None)
+    str_avps += avp(301, 0x00, u32(5), None)
+    str_avps += avp(264, 0x40, b"epdg.example", None)
+    str_avps += avp(296, 0x40, b"example", None)
+    str_avps += avp(283, 0x40, b"aaa.example", None)
+    str_avps += avp(258, 0x40, u32(16777264), None)
+    str_avps += avp(295, 0x40, u32(4), None)
+    str_avps += avp(1, 0x40, b"permanent-user@example", None)
+    str_avps += avp(284, 0x40, proxy_info, None)
+    str_avps += avp(282, 0x40, b"proxy.example", None)
+    write_corpus(
+        msg_dir,
+        header(0xC0, 275, 16777264, 0x999999A1, 0xAAAAAAB2, str_avps),
+        "swm_str_session_termination",
+    )
+
+    # 15. Correlated SWm Session-Termination-Answer with success,
+    #     TS 29.273 §7.2.2.2.2. Proxy-Info is copied in wire order.
+    sta_avps = b""
+    sta_avps += avp(263, 0x40, b"sess;swm;termination", None)
+    sta_avps += avp(268, 0x40, u32(2001), None)
+    sta_avps += avp(264, 0x40, b"aaa.example", None)
+    sta_avps += avp(296, 0x40, b"example", None)
+    sta_avps += avp(284, 0x40, proxy_info, None)
+    write_corpus(
+        msg_dir,
+        header(0x40, 275, 16777264, 0x999999A1, 0xAAAAAAB2, sta_avps),
+        "swm_sta_session_termination_success",
+    )
+
+    # 16. STR omission seed for sealed Termination-Cause / 5005 provenance.
+    str_without_termination_cause = str_avps.replace(
+        avp(295, 0x40, u32(4), None), b"", 1
+    )
+    write_corpus(
+        msg_dir,
+        header(
+            0xC0,
+            275,
+            16777264,
+            0x999999A2,
+            0xAAAAAAB3,
+            str_without_termination_cause,
+        ),
+        "swm_str_missing_termination_cause",
+    )
+
+    # 17. STR omission seed for the SWm procedure-table-mandatory User-Name.
+    str_without_user_name = str_avps.replace(
+        avp(1, 0x40, b"permanent-user@example", None), b"", 1
+    )
+    write_corpus(
+        msg_dir,
+        header(
+            0xC0,
+            275,
+            16777264,
+            0x999999A3,
+            0xAAAAAAB4,
+            str_without_user_name,
+        ),
+        "swm_str_missing_user_name",
     )
 
     # -------------------------------------------------------------------------

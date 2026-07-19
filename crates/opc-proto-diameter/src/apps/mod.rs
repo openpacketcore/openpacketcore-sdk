@@ -180,7 +180,7 @@ pub(crate) mod builder_helpers {
         EncodeError, SpecRef, UnknownIePolicy,
     };
 
-    use crate::dictionary::CommandKind;
+    use crate::dictionary::{AvpDataType, CommandKind};
     use crate::{
         ApplicationId, AvpCode, AvpHeader, CommandCode, CommandFlags, Header, OwnedMessage, RawAvp,
         VendorId, DIAMETER_HEADER_LEN, MAX_U24,
@@ -515,6 +515,73 @@ pub(crate) mod builder_helpers {
                 offset,
             )
             .with_spec_ref(app_spec("ietf", "RFC6733", section))),
+        }
+    }
+
+    /// Validate a dictionary-known AVP value whose data type has a complete
+    /// generic wire contract.
+    ///
+    /// Grouped values still require the caller's command-specific child schema;
+    /// this helper validates their bounded framing only. DiameterURI and filter
+    /// rules fail closed until a complete grammar parser is available.
+    pub(crate) fn validate_known_avp_value(
+        value: &[u8],
+        data_type: AvpDataType,
+        ctx: DecodeContext,
+        offset: usize,
+        section: &'static str,
+    ) -> Result<(), DecodeError> {
+        match data_type {
+            AvpDataType::OctetString => Ok(()),
+            AvpDataType::Integer32
+            | AvpDataType::Unsigned32
+            | AvpDataType::Float32
+            | AvpDataType::Time
+            | AvpDataType::Enumerated => validate_exact_value_len(value, 4, offset, section),
+            AvpDataType::Integer64 | AvpDataType::Unsigned64 | AvpDataType::Float64 => {
+                validate_exact_value_len(value, 8, offset, section)
+            }
+            AvpDataType::Grouped => crate::validate_avp_region(value, ctx)
+                .map_err(|error| shift_app_error(error, offset)),
+            AvpDataType::Address => parse_address_value(value, offset, section).map(|_| ()),
+            AvpDataType::Utf8String => parse_utf8_value(value, offset, section).map(|_| ()),
+            AvpDataType::DiameterIdentity => {
+                let identity = parse_string_value(value, offset, section)?;
+                if !identity.is_ascii() {
+                    return Err(decode_structural_error(
+                        "DiameterIdentity AVP must contain ASCII",
+                        offset,
+                        section,
+                    ));
+                }
+                Ok(())
+            }
+            AvpDataType::DiameterUri | AvpDataType::IpFilterRule | AvpDataType::QosFilterRule => {
+                Err(decode_structural_error(
+                    "dictionary-known AVP requires a typed value grammar",
+                    offset,
+                    section,
+                ))
+            }
+        }
+    }
+
+    fn validate_exact_value_len(
+        value: &[u8],
+        expected: usize,
+        offset: usize,
+        section: &'static str,
+    ) -> Result<(), DecodeError> {
+        if value.len() == expected {
+            Ok(())
+        } else {
+            Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "diameter AVP value length does not match its dictionary data type",
+                },
+                offset,
+            )
+            .with_spec_ref(app_spec("ietf", "RFC6733", section)))
         }
     }
 

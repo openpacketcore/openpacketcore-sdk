@@ -1,7 +1,8 @@
-//! 3GPP SWm Diameter-EAP dictionary subset and typed helpers.
+//! 3GPP SWm Diameter dictionary subset and typed helpers.
 //!
 //! This module covers the ePDG-restricted SWm DER/DEA exchange that carries
-//! EAP payloads between the ePDG and an AAA/DRA peer, plus a bounded
+//! EAP payloads between the ePDG and an AAA/DRA peer, the request-bound
+//! Session-Termination STR/STA lifecycle exchange, plus a bounded
 //! subscription-profile extension surface for APN-Configuration, its default
 //! Context-Identifier, Service-Selection, and the TS 29.273 emergency attach
 //! sequence. The top-level default pointer is accepted under the DEA
@@ -40,6 +41,10 @@ use crate::dictionary::{
 };
 use crate::parser_error::DiameterParserError;
 use crate::{ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage, VendorId};
+
+mod lifecycle;
+
+pub use lifecycle::*;
 
 /// 3GPP SWm application identifier.
 pub const APPLICATION_ID: ApplicationId = ApplicationId::new(16_777_264);
@@ -198,6 +203,33 @@ static TERMINAL_INFORMATION_AVP_RULES: [CommandAvpRule; 2] = [
     ),
 ];
 
+static OC_SUPPORTED_FEATURES_AVP_RULES: [CommandAvpRule; 1] = [CommandAvpRule::new(
+    AvpKey::ietf(AVP_OC_FEATURE_VECTOR),
+    AvpCardinality::ZeroOrOne,
+)];
+
+static OC_OLR_AVP_RULES: [CommandAvpRule; 4] = [
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_SEQUENCE_NUMBER),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_VALIDITY_DURATION),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(AvpKey::ietf(AVP_OC_REPORT_TYPE), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_OC_REDUCTION_PERCENTAGE),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+
+static LOAD_AVP_RULES: [CommandAvpRule; 3] = [
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_TYPE), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(AvpKey::ietf(AVP_LOAD_VALUE), AvpCardinality::ZeroOrOne),
+    CommandAvpRule::new(AvpKey::ietf(AVP_SOURCE_ID), AvpCardinality::ZeroOrOne),
+];
+
 /// SWm Diameter-EAP-Request command definition.
 pub const COMMAND_DIAMETER_EAP_REQUEST: CommandDefinition = CommandDefinition::new(
     COMMAND_DIAMETER_EAP,
@@ -236,7 +268,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 23] = [
+const SWM_AVPS: [AvpDefinition; 35] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -271,6 +303,93 @@ const SWM_AVPS: [AvpDefinition; 23] = [
         AvpDataType::OctetString,
         AvpFlagRules::base_optional(),
         SpecRef::new("ietf", "RFC6733", "6.38"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_DRMP),
+        "DRMP",
+        AvpDataType::Enumerated,
+        AvpFlagRules::base_must_not_set_m(),
+        SpecRef::new("ietf", "RFC7944", "9.1"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_OC_SUPPORTED_FEATURES),
+        "OC-Supported-Features",
+        AvpDataType::Grouped,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC7683", "7.1"),
+    )
+    .with_grouped_avp_rules(&OC_SUPPORTED_FEATURES_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_OC_FEATURE_VECTOR),
+        "OC-Feature-Vector",
+        AvpDataType::Unsigned64,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC7683", "7.2"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_OC_OLR),
+        "OC-OLR",
+        AvpDataType::Grouped,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC7683", "7.3"),
+    )
+    .with_grouped_avp_rules(&OC_OLR_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_OC_SEQUENCE_NUMBER),
+        "OC-Sequence-Number",
+        AvpDataType::Unsigned64,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC7683", "7.4"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_OC_VALIDITY_DURATION),
+        "OC-Validity-Duration",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC7683", "7.5"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_OC_REPORT_TYPE),
+        "OC-Report-Type",
+        AvpDataType::Enumerated,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC7683", "7.6"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_OC_REDUCTION_PERCENTAGE),
+        "OC-Reduction-Percentage",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC7683", "7.7"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_SOURCE_ID),
+        "SourceID",
+        AvpDataType::DiameterIdentity,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC8581", "7.3"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_LOAD),
+        "Load",
+        AvpDataType::Grouped,
+        AvpFlagRules::base_must_not_set_m(),
+        SpecRef::new("3gpp", "TS29273", "7.2.3.1"),
+    )
+    .with_grouped_avp_rules(&LOAD_AVP_RULES),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_LOAD_TYPE),
+        "Load-Type",
+        AvpDataType::Enumerated,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC8583", "7.2"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_LOAD_VALUE),
+        "Load-Value",
+        AvpDataType::Unsigned64,
+        AvpFlagRules::base_optional(),
+        SpecRef::new("ietf", "RFC8583", "7.3"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_SERVICE_SELECTION),
@@ -417,11 +536,25 @@ const SWM_AVPS: [AvpDefinition; 23] = [
     ),
 ];
 
-/// Static SWm dictionary covering the ePDG-required DER/DEA subset.
+const SWM_COMMANDS: [CommandDefinition; 4] = [
+    COMMAND_DIAMETER_EAP_REQUEST,
+    COMMAND_DIAMETER_EAP_ANSWER,
+    COMMAND_SESSION_TERMINATION_REQUEST,
+    COMMAND_SESSION_TERMINATION_ANSWER,
+];
+
+const SWM_PROJECTED_PROFILE_COMMANDS: [CommandDefinition; 4] = [
+    COMMAND_DIAMETER_EAP_REQUEST,
+    COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE,
+    COMMAND_SESSION_TERMINATION_REQUEST,
+    COMMAND_SESSION_TERMINATION_ANSWER,
+];
+
+/// Static SWm dictionary covering DER/DEA and the typed STR/STA lifecycle slice.
 pub static DICTIONARY: Dictionary = Dictionary::new(
     "diameter-3gpp-swm-subset",
     &[APPLICATION],
-    &[COMMAND_DIAMETER_EAP_REQUEST, COMMAND_DIAMETER_EAP_ANSWER],
+    &SWM_COMMANDS,
     &SWM_AVPS,
 );
 
@@ -432,10 +565,7 @@ pub static DICTIONARY: Dictionary = Dictionary::new(
 pub static PROJECTED_PROFILE_DICTIONARY: Dictionary = Dictionary::new(
     "diameter-3gpp-swm-projected-apn-profile",
     &[APPLICATION],
-    &[
-        COMMAND_DIAMETER_EAP_REQUEST,
-        COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE,
-    ],
+    &SWM_PROJECTED_PROFILE_COMMANDS,
     &SWM_AVPS,
 );
 
