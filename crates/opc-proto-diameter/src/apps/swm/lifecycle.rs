@@ -82,7 +82,7 @@ struct OcOlrFacts {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValueValidationPurpose {
+pub(super) enum ValueValidationPurpose {
     Decode,
     Encode,
 }
@@ -594,7 +594,7 @@ impl SwmAdditionalAvp {
         Ok(retained)
     }
 
-    fn from_raw(avp: &RawAvp<'_>) -> Self {
+    pub(super) fn from_raw(avp: &RawAvp<'_>) -> Self {
         let mut header = avp.header.clone();
         if header.key() == AvpKey::ietf(AVP_LOAD) {
             // TS 29.273 requires known received Load M-bit mismatches to be
@@ -608,8 +608,20 @@ impl SwmAdditionalAvp {
         }
     }
 
-    fn append_to(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
+    pub(super) fn append_to(
+        &self,
+        dst: &mut BytesMut,
+        ctx: EncodeContext,
+    ) -> Result<(), EncodeError> {
         builder_helpers::append_avp(dst, self.header.clone(), &self.value, ctx)
+    }
+
+    pub(super) const fn header(&self) -> &AvpHeader {
+        &self.header
+    }
+
+    pub(super) fn value(&self) -> &[u8] {
+        &self.value
     }
 
     /// Return the AVP code without exposing its value.
@@ -754,7 +766,7 @@ impl SwmExpectedAnswerPeer {
         self.connection
     }
 
-    fn matches_origin(&self, origin_host: &str, origin_realm: &str) -> bool {
+    pub(super) fn matches_origin(&self, origin_host: &str, origin_realm: &str) -> bool {
         match &self.origin_policy {
             SwmAnswerOriginPolicy::Any => true,
             SwmAnswerOriginPolicy::Exact {
@@ -770,7 +782,7 @@ impl SwmExpectedAnswerPeer {
         }
     }
 
-    fn validate_for_encode(&self) -> Result<(), EncodeError> {
+    pub(super) fn validate_for_encode(&self) -> Result<(), EncodeError> {
         match &self.origin_policy {
             SwmAnswerOriginPolicy::Any => Ok(()),
             SwmAnswerOriginPolicy::Exact {
@@ -3633,7 +3645,49 @@ fn validate_known_value(
     }
 }
 
-fn retain_additional_avp(
+/// Validate a known extension value using request-side overload semantics.
+///
+/// This stable procedure-neutral boundary keeps sibling SWm command codecs
+/// independent of the lifecycle command's internal role variants.
+pub(super) fn validate_known_request_extension_value(
+    avp: &RawAvp<'_>,
+    definition: &AvpDefinition,
+    ctx: DecodeContext,
+    value_offset: usize,
+    purpose: ValueValidationPurpose,
+) -> Result<(), DecodeError> {
+    validate_known_value(
+        avp,
+        definition,
+        ctx,
+        value_offset,
+        LifecycleRole::TerminationRequest,
+        purpose,
+    )
+}
+
+/// Validate a known extension value using answer-side overload semantics.
+///
+/// This stable procedure-neutral boundary keeps sibling SWm command codecs
+/// independent of the lifecycle command's internal role variants.
+pub(super) fn validate_known_answer_extension_value(
+    avp: &RawAvp<'_>,
+    definition: &AvpDefinition,
+    ctx: DecodeContext,
+    value_offset: usize,
+    purpose: ValueValidationPurpose,
+) -> Result<(), DecodeError> {
+    validate_known_value(
+        avp,
+        definition,
+        ctx,
+        value_offset,
+        LifecycleRole::TerminationAnswer,
+        purpose,
+    )
+}
+
+pub(super) fn retain_additional_avp(
     avp: &RawAvp<'_>,
     ctx: DecodeContext,
     value_offset: usize,
@@ -4033,7 +4087,7 @@ fn find_oc_olr(
     Ok(retained)
 }
 
-fn validate_answer_overload_control_decode(
+pub(super) fn validate_answer_overload_control_decode(
     answer_avps: &[SwmAdditionalAvp],
     ctx: DecodeContext,
 ) -> Result<(), DecodeError> {
@@ -4068,7 +4122,7 @@ fn validate_answer_overload_control_encode(
             answer_role.section(),
         )
     })?;
-    validate_offered_overload_control(
+    validate_offered_overload_control_for_roles(
         request_avps,
         answer_avps,
         decode_ctx,
@@ -4083,7 +4137,21 @@ fn validate_answer_overload_control_encode(
     })
 }
 
-fn validate_offered_overload_control(
+pub(super) fn validate_offered_overload_control(
+    request_avps: &[SwmAdditionalAvp],
+    answer_avps: &[SwmAdditionalAvp],
+    ctx: DecodeContext,
+) -> Result<(), DecodeError> {
+    validate_offered_overload_control_for_roles(
+        request_avps,
+        answer_avps,
+        ctx,
+        LifecycleRole::TerminationRequest,
+        LifecycleRole::TerminationAnswer,
+    )
+}
+
+fn validate_offered_overload_control_for_roles(
     request_avps: &[SwmAdditionalAvp],
     answer_avps: &[SwmAdditionalAvp],
     ctx: DecodeContext,
@@ -4211,7 +4279,7 @@ fn validate_abort_correlated_overload_control(
     }
 }
 
-fn validate_proxy_info(
+pub(super) fn validate_proxy_info(
     avp: &RawAvp<'_>,
     ctx: DecodeContext,
     offset: usize,
@@ -4292,7 +4360,7 @@ fn validate_answer_header(message: &Message<'_>) -> Result<(), DecodeError> {
     Ok(())
 }
 
-fn validate_base_definition(avp: &RawAvp<'_>, offset: usize) -> Result<(), DecodeError> {
+pub(super) fn validate_base_definition(avp: &RawAvp<'_>, offset: usize) -> Result<(), DecodeError> {
     match base::dictionary().find_avp(avp.header.key()) {
         Some(definition) => validate_flags(&avp.header, definition.flags(), offset, "4.5"),
         None => Err(decode_error(
@@ -4356,7 +4424,7 @@ fn validate_drmp(avp: &RawAvp<'_>, offset: usize) -> Result<(), DecodeError> {
     )
 }
 
-fn validate_flags(
+pub(super) fn validate_flags(
     header: &AvpHeader,
     rules: AvpFlagRules,
     offset: usize,
@@ -4393,7 +4461,7 @@ fn validate_flags_ignoring_m(
     Ok(())
 }
 
-fn validate_flags_for_encode(
+pub(super) fn validate_flags_for_encode(
     header: &AvpHeader,
     rules: AvpFlagRules,
     section: &'static str,

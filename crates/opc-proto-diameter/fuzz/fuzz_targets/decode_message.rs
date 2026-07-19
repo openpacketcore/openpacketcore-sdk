@@ -155,6 +155,24 @@ fuzz_target!(|data: &[u8]| {
                 DecodeContext::conservative(),
             )
             .err()
+        } else if message.header.application_id == apps::swm::APPLICATION_ID
+            && message.header.command_code == apps::swm::COMMAND_RE_AUTH
+            && message.header.flags.is_request()
+        {
+            apps::swm::parse_swm_re_auth_request_envelope_with_provenance(
+                &message,
+                DecodeContext::conservative(),
+            )
+            .err()
+        } else if message.header.application_id == apps::swm::APPLICATION_ID
+            && message.header.command_code == apps::swm::COMMAND_AA
+            && message.header.flags.is_request()
+        {
+            apps::swm::parse_swm_authorization_request_envelope_with_provenance(
+                &message,
+                DecodeContext::conservative(),
+            )
+            .err()
         } else {
             None
         };
@@ -173,6 +191,26 @@ fuzz_target!(|data: &[u8]| {
             && !message.header.flags.is_request()
         {
             let _ = apps::swm::parse_swm_session_termination_answer_envelope_from_connection(
+                &message,
+                apps::swm::SwmDiameterConnectionToken::new(NonZeroU64::MIN),
+                DecodeContext::conservative(),
+            );
+        }
+        if message.header.application_id == apps::swm::APPLICATION_ID
+            && message.header.command_code == apps::swm::COMMAND_RE_AUTH
+            && !message.header.flags.is_request()
+        {
+            let _ = apps::swm::parse_swm_re_auth_answer_envelope_from_connection(
+                &message,
+                apps::swm::SwmDiameterConnectionToken::new(NonZeroU64::MIN),
+                DecodeContext::conservative(),
+            );
+        }
+        if message.header.application_id == apps::swm::APPLICATION_ID
+            && message.header.command_code == apps::swm::COMMAND_AA
+            && !message.header.flags.is_request()
+        {
+            let _ = apps::swm::parse_swm_authorization_answer_envelope_from_connection(
                 &message,
                 apps::swm::SwmDiameterConnectionToken::new(NonZeroU64::MIN),
                 DecodeContext::conservative(),
