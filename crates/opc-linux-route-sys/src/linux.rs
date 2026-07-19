@@ -76,19 +76,33 @@ pub fn receive_message(socket: &NetlinkSocket, buffer: &mut [u8]) -> io::Result<
     if buffer.is_empty() {
         return Ok(0);
     }
-    // SAFETY: `buffer` is a valid writable byte slice for its length and the
-    // socket fd is live. `MSG_TRUNC` causes the kernel to return the real
-    // datagram length even when it exceeds the buffer.
+    let mut peer = kernel_netlink_addr(0);
+    let mut peer_len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+    // SAFETY: `buffer` is a valid writable byte slice for its length, `peer`
+    // and `peer_len` are initialized writable address outputs, and the socket
+    // fd is live. `MSG_TRUNC` returns the real datagram length when it exceeds
+    // the buffer so truncation can be rejected below.
     let rc = unsafe {
-        libc::recv(
+        libc::recvfrom(
             socket.fd.as_raw_fd(),
             buffer.as_mut_ptr().cast::<libc::c_void>(),
             buffer.len(),
             libc::MSG_TRUNC,
+            (&mut peer as *mut libc::sockaddr_nl).cast::<libc::sockaddr>(),
+            &mut peer_len,
         )
     };
     if rc < 0 {
         Err(io::Error::last_os_error())
+    } else if peer_len != mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t
+        || i32::from(peer.nl_family) != libc::AF_NETLINK
+        || peer.nl_pid != 0
+        || peer.nl_groups != 0
+    {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rtnetlink datagram did not originate from the kernel",
+        ))
     } else if rc as usize > buffer.len() {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,

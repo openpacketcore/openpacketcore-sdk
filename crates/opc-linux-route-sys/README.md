@@ -4,7 +4,8 @@
 
 `opc-linux-route-sys` is the narrow unsafe boundary for Linux rtnetlink route
 and rule operations. It owns the raw socket wrapper and selected UAPI
-constants/layouts used by the safe `opc-route-steering` crate.
+constants/layouts used by the safe `opc-route-steering` crate for bounded
+mutation and readback.
 
 It does not implement route policy, table allocation, session steering,
 namespace management, privilege selection, or product deployment defaults.
@@ -13,10 +14,12 @@ namespace management, privilege selection, or product deployment defaults.
 
 - `NetlinkSocket`: close-on-exec, nonblocking rtnetlink socket wrapper.
 - Functions: `open_route_netlink_socket`, `send_message`, and
-  `receive_message`.
+  `receive_message`; receive rejects truncated datagrams and non-kernel sender
+  addresses before exposing bytes to the safe parser.
 - UAPI constants for netlink flags/control messages, `RTM_NEWROUTE`,
-  `RTM_DELROUTE`, `RTM_NEWRULE`, `RTM_DELRULE`, address families, route tables,
-  route attributes, and rule attributes.
+  `RTM_DELROUTE`, `RTM_GETROUTE`, `RTM_NEWRULE`, `RTM_DELRULE`, `RTM_GETRULE`,
+  multipart dump flags, address families, route tables, route attributes, and
+  rule attributes, including `RTPROT_STATIC` and `FRA_PROTOCOL`.
 - `repr(C)` layouts: `NetlinkMessageHeader`, `RouteAttributeHeader`,
   `RouteMessage`, `FibRuleHeader`, and `NetlinkErrorMessage`.
 - `align_to_netlink` for Linux 4-byte netlink attribute/message alignment.
@@ -53,6 +56,10 @@ let _len = receive_message(&socket, &mut response)?;
   unsupported stubs.
 - The crate sends and receives opaque buffers; request encoding and policy live
   in `opc-route-steering`.
+- Exporting the `FRA_PROTOCOL` constant does not assert runtime kernel support.
+  The safe wrapper performs non-mutating version evidence, per-create readback,
+  and leak-safe rollback; upstream Linux added the attribute in 4.17 and older
+  vendor kernels may backport it.
 
 ## Roadmap
 

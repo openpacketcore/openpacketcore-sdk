@@ -192,6 +192,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Added
+- **Conflict-safe route/rule convergence — `opc-route-steering`,
+  `opc-linux-route-sys`:** backend-neutral typed readback and convergence now
+  distinguish newly installed, exact resident, conflicting, and indeterminate
+  route/rule state instead of treating Linux `EEXIST` as equality. Bounded
+  strict `RTM_GETROUTE`/`RTM_GETRULE` multipart parsing compares every modeled
+  identity field and fails closed on unsupported, incomplete, malformed,
+  oversized, duplicate, or unrepresented kernel state. It recognizes the
+  kernel's extended-table compatibility marker, family-specific default route
+  metrics, effective IPv4/IPv6 destination networks after clearing host bits,
+  and only non-semantic IPv6 cache counters. Legacy route mutation bytes and
+  mock operation records retain the exact caller destination. Conflict-safe
+  Linux routes and rules carry a reserved nonzero namespace ownership protocol;
+  legacy or foreign protocol values, multiplicity, and wildcard-unsafe exact
+  deletion fail closed. The existing mutation API retains static/untagged wire
+  behavior plus mark-zero and IPv4/IPv6 `/0` request compatibility. Explicit
+  `remove_converged_*` methods and typed capability flags keep that legacy
+  contract distinct from owned convergence. Plain upstream pre-4.17 kernels
+  fail before rule convergence; possible vendor backports remain unknown and
+  every allowed rule create is verified. Before positive readback, validated
+  IPv4 kernel rejection becomes typed cached capability evidence; confirmed
+  support is monotonic, and later generic or non-IPv4 create failures retain
+  their operational meaning. An ACK which silently drops `FRA_PROTOCOL` triggers
+  immediate attempt-owned rollback and caches separate typed unsupported
+  evidence without a global probe rule. The mock now uses bounded multimaps
+  with the same exact-plus-conflict behavior while preserving the legacy
+  `MockOperation` variants through a separate read-observation API. Public
+  nonzero-count conflict constructors support external backends. A clone-shared
+  worker lock covers each operation and an entire paired rollback, including
+  after cancellation of its async waiter. Foreign-state preservation assumes
+  one coordinated owner of the reserved protocol within a network namespace;
+  separate instances and external writers still require orchestration-level
+  serialization. Existing mutation APIs remain available, and third-party
+  trait implementations default to indeterminate until they add readback and
+  owned convergence. Pre-upgrade static routes are not silently adopted;
+  known-provenance cleanup and any BGP/export policy for route protocol `242`
+  remain product/operator migration responsibilities.
 - **BREAKING — observed quorum topology attestation — `opc-session-store`:** a bounded,
   product-neutral `QuorumTopologyAttestor` port now authenticates opaque proofs
   over SDK-canonical replica, service, physical-node, failure-domain, durable
