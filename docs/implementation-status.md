@@ -85,6 +85,102 @@ closed as SDK foundation gaps).
 
 ---
 
+## Current authoritative route-steering collection foundation — 2026-07-19
+
+`opc-route-steering` implements the SDK portion of
+[issue #381](https://github.com/openpacketcore/openpacketcore-sdk/issues/381)
+as an additive collection contract alongside the existing singleton and legacy
+APIs. `OwnedRouteRuleScope` declares one exclusive writer's address family,
+route/rule table, route output interface and canonical metric, and rule
+priority. `OwnedRouteRuleSet` validates the complete desired state, and
+`OwnedRouteRuleSnapshot` exposes a bounded, deterministic enumeration of all
+representable protocol-`242` objects in that scope. The separate
+`owned_route_rule_collection` capability prevents callers from inferring this
+stronger contract from legacy mutation, typed singleton readback, or paired
+convergence support. For Linux it means the implementation is present and a
+fail-closed, self-verifying attempt is permitted; it is not positive
+`FRA_PROTOCOL` retention evidence. `LinuxRuleProtocolCapability::Unknown` and
+`ExpectedByKernelVersion` permit fresh-namespace bootstrap, while only
+`Confirmed` attests a tag read back from the kernel and cached rejection or
+discard disables subsequent attempts. Requiring `Confirmed` before the first
+reconcile would deadlock an empty namespace with no resident marker to observe.
+Third-party trait implementations retain fail-closed defaults until they
+implement the collection contract explicitly. Desired and
+final collections admit at most `50,000` routes and `50,000` rules each; the
+install-before-delete old∪new intermediate has a distinct ceiling of
+`100,000` routes and `100,000` rules. Reconciliation's initial recovery
+snapshot also accepts the transient ceiling so a restart can garbage-collect
+an interrupted old∪new residual above the final bound; public and successful
+final snapshots retain the lower ceiling.
+
+Within an owned collection, rules may intentionally share one family and
+priority only when every sibling is a source-only, non-wildcard selector and
+the prefixes are provably disjoint. Overlap, exact duplicates, destination or
+firewall-mark siblings, wildcard selectors, foreign collisions, ownership-
+tagged objects that cannot be represented, and ambiguous resident state fail
+closed before destructive cleanup. This preserves the conservative singleton
+contract, where multiple candidates at the broad family/priority collision key
+remain ambiguous, while providing an exact collection-level removal target
+that preserves disjoint siblings.
+
+Linux and mock reconciliation perform one authoritative workflow serialized
+among clones of the same backend: validate a complete bounded resident
+snapshot and complete desired set, install and verify every missing desired
+route and rule, remove stale rules before stale routes, and verify a final
+exact snapshot. An incomplete, over-limit, malformed, or changing snapshot
+never proves absence. Known attempt-owned installs are the only rollback
+targets; partial or uncertain completion is returned as typed redaction-safe
+`ReconcileIncomplete` phase/count evidence so the caller can retry the complete
+desired set. When attempted cleanup is itself incomplete, that result also
+retains a separate typed rollback-failure classification. This workflow is
+deliberately not described as kernel-atomic because it spans multiple netlink
+mutations. Separate backend instances require external serialization. Each
+Linux snapshot uses one complete route dump and one complete rule dump under
+the separate `LinuxOwnedRouteRuleCollectionLimits`; the defaults allow at most
+`65,535` datagrams, `131,072` decoded messages, and `64 MiB` of aggregate reply
+bytes for each dump. The collection path does not repeat a full dump for every
+desired member or weaken the established singleton limits.
+
+Linux mutation progress is ACK-exact: only one matching zero-error
+`NLMSG_ERROR` ACK completes a requested mutation. Empty and `NOOP`-only
+datagrams keep waiting, while `DONE`, arbitrary payload messages, duplicate
+ACKs, malformed replies, and timeout fail closed. ACK uncertainty is therefore
+reported as incomplete progress rather than counted as an acknowledged change.
+
+Default-limit synthetic Linux gates classify `50,000` owned routes plus
+`50,000` source-disjoint, same-priority owned rules returned by exactly one
+`AF_UNSPEC` route-dump request and one `AF_UNSPEC` rule-dump request, and
+separately pass `50,000` multipart messages through the production
+byte/datagram/message accounting parser. This is bounded enumeration/parser
+evidence, not evidence for `50,000` kernel installs/deletes, end-to-end
+reconciliation throughput, or kernel-atomic application.
+
+Complete protocol-tagged enumeration allows a restarted writer to garbage-
+collect stale routes and rules even after process-local attempt history has
+been lost. Product code must durably reconstruct the authoritative desired set
+before invoking reconciliation; the SDK does not persist intent. Protocol
+`242` is still only a namespace-local reservation, not authentication, so safe
+cleanup depends on one orchestrated exclusive writer for each declared scope
+and external coordination for overlapping scopes or deliberate marker reuse.
+Legacy static routes, untagged rules, singleton convergence, and their existing
+migration requirements remain unchanged. Scripted Linux tests cover
+same-priority sibling install, exact retry, and targeted removal; foreign
+conflict and cross-set prefix-overlap rejection without mutation, including an
+exact retry; marker omission/substitution rollback preserving owned state;
+IPv6 reconciliation; cancellation-safe completion behind the clone-shared
+lock; retained-state restart reconciliation that installs the desired
+route/rule before deleting the orphan rule and then orphan route; recovery from
+a resident transient set above a configured final limit; applied route and rule
+creates with lost ACKs plus rollback ACK loss; production multipart accounting;
+and the bounded `50,000`-route/`50,000`-rule two-dump enumeration above. Mock
+tests provide collection parity, including full `50,002`-rule transient-union
+replacement and restart recovery, without per-key reads. Neither the synthetic
+parser gate nor the mock evidence qualifies kernel mutation/reconciliation
+throughput or atomicity. Privileged isolated-namespace qualification remains
+consuming-release evidence.
+
+---
+
 ## Current conflict-safe route-steering foundation — 2026-07-18
 
 `opc-route-steering` and `opc-linux-route-sys` implement the SDK portion of

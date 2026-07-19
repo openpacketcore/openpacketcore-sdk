@@ -1,5 +1,6 @@
 //! Safe Linux route-steering backend over rtnetlink.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Read};
 use std::net::IpAddr;
@@ -25,6 +26,12 @@ use crate::backend::{
     route_readback_to_convergence, rule_readback_after_owned_rollback, rule_readback_failure_class,
     rule_readback_to_convergence, RouteSteeringBackend,
 };
+use crate::collection::{
+    reconcile_incomplete, reconcile_rollback_incomplete, OwnedRouteRuleReconcileOutcome,
+    OwnedRouteRuleReconcilePhase, OwnedRouteRuleScope, OwnedRouteRuleSet, OwnedRouteRuleSnapshot,
+    RouteSteeringIpFamily, MAX_OWNED_ROUTE_COLLECTION_ENTRIES, MAX_OWNED_RULE_COLLECTION_ENTRIES,
+    MAX_TRANSIENT_OWNED_ROUTE_COLLECTION_ENTRIES, MAX_TRANSIENT_OWNED_RULE_COLLECTION_ENTRIES,
+};
 use crate::error::{RouteSteeringError, RouteSteeringFailureClass};
 use crate::model::{
     FirewallMark, IpPrefix, ReadbackIndeterminateReason, RouteConflict, RouteConvergenceOutcome,
@@ -33,8 +40,8 @@ use crate::model::{
     RuleConvergenceOutcome, RuleMismatch, RuleReadback, RuleRequest,
 };
 use crate::validation::{
-    canonical_route_request, validate_owned_rule_request, validate_route_request,
-    validate_rule_request,
+    canonical_route_priority_for_address, canonical_route_request, validate_owned_rule_request,
+    validate_route_request, validate_rule_request,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -51,6 +58,9 @@ const EOPNOTSUPP: i32 = 95;
 const EAFNOSUPPORT: i32 = 97;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 const MAX_RECEIVE_BUFFER_LEN: usize = 1024 * 1024;
+const MAX_OWNED_COLLECTION_DUMP_DATAGRAMS: u32 = 65_535;
+const MAX_OWNED_COLLECTION_DUMP_MESSAGES: usize = 131_072;
+const MAX_OWNED_COLLECTION_DUMP_BYTES: usize = 64 * 1024 * 1024;
 const MAX_KERNEL_RELEASE_LEN: usize = 256;
 
 /// Nonzero rtnetlink origin protocol reserved for one OpenPacketCore
@@ -151,6 +161,77 @@ impl Default for LinuxRouteReadbackLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxNetlinkDumpLimits {
+    max_datagrams: u32,
+    max_messages: usize,
+    max_bytes: usize,
+}
+
+impl From<LinuxRouteReadbackLimits> for LinuxNetlinkDumpLimits {
+    fn from(limits: LinuxRouteReadbackLimits) -> Self {
+        Self {
+            max_datagrams: u32::from(limits.max_datagrams),
+            max_messages: usize::from(limits.max_messages),
+            max_bytes: limits.max_bytes,
+        }
+    }
+}
+
+/// Hard bounds for one complete Linux owned route/rule collection snapshot.
+///
+/// Each authoritative snapshot performs one route dump and one rule dump.
+/// These larger limits are separate from legacy per-key readback limits so
+/// collection scale does not silently weaken the bounds of existing APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxOwnedRouteRuleCollectionLimits {
+    /// Maximum convergence-owned routes accepted in one desired/final scope,
+    /// up to [`MAX_OWNED_ROUTE_COLLECTION_ENTRIES`].
+    pub max_owned_routes: usize,
+    /// Maximum convergence-owned rules accepted in one desired/final scope,
+    /// up to [`MAX_OWNED_RULE_COLLECTION_ENTRIES`].
+    pub max_owned_rules: usize,
+    /// Maximum transient owned routes while desired state is installed before
+    /// old state is garbage-collected, up to twice the final hard bound.
+    pub max_transient_owned_routes: usize,
+    /// Maximum transient owned rules while desired state is installed before
+    /// old state is garbage-collected, up to twice the final hard bound.
+    pub max_transient_owned_rules: usize,
+    /// Maximum datagrams accepted for each complete route or rule dump, up to
+    /// the default hard envelope of `65,535`.
+    pub max_datagrams: u32,
+    /// Maximum netlink objects accepted for each complete route or rule dump,
+    /// up to the default hard envelope of `131,072`.
+    pub max_messages: usize,
+    /// Maximum aggregate reply bytes accepted for each complete dump, up to
+    /// the default hard envelope of `64 MiB`.
+    pub max_bytes: usize,
+}
+
+impl Default for LinuxOwnedRouteRuleCollectionLimits {
+    fn default() -> Self {
+        Self {
+            max_owned_routes: MAX_OWNED_ROUTE_COLLECTION_ENTRIES,
+            max_owned_rules: MAX_OWNED_RULE_COLLECTION_ENTRIES,
+            max_transient_owned_routes: MAX_TRANSIENT_OWNED_ROUTE_COLLECTION_ENTRIES,
+            max_transient_owned_rules: MAX_TRANSIENT_OWNED_RULE_COLLECTION_ENTRIES,
+            max_datagrams: MAX_OWNED_COLLECTION_DUMP_DATAGRAMS,
+            max_messages: MAX_OWNED_COLLECTION_DUMP_MESSAGES,
+            max_bytes: MAX_OWNED_COLLECTION_DUMP_BYTES,
+        }
+    }
+}
+
+impl From<LinuxOwnedRouteRuleCollectionLimits> for LinuxNetlinkDumpLimits {
+    fn from(limits: LinuxOwnedRouteRuleCollectionLimits) -> Self {
+        Self {
+            max_datagrams: limits.max_datagrams,
+            max_messages: limits.max_messages,
+            max_bytes: limits.max_bytes,
+        }
+    }
+}
+
 /// Production Linux route/rule steering backend.
 ///
 /// Clones share one operation lock. Separate instances or external writers in
@@ -167,6 +248,7 @@ struct LinuxRouteSteeringBackendInner {
     operation_lock: Mutex<()>,
     config: LinuxRouteSteeringBackendConfig,
     readback_limits: LinuxRouteReadbackLimits,
+    owned_collection_limits: LinuxOwnedRouteRuleCollectionLimits,
     rule_protocol_capability: AtomicU8,
 }
 
@@ -175,6 +257,10 @@ impl fmt::Debug for LinuxRouteSteeringBackend {
         f.debug_struct("LinuxRouteSteeringBackend")
             .field("config", &self.inner.config)
             .field("readback_limits", &self.inner.readback_limits)
+            .field(
+                "owned_collection_limits",
+                &self.inner.owned_collection_limits,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -204,6 +290,20 @@ impl LinuxRouteSteeringBackend {
         config: LinuxRouteSteeringBackendConfig,
         readback_limits: LinuxRouteReadbackLimits,
     ) -> Self {
+        Self::with_config_and_limits(
+            config,
+            readback_limits,
+            LinuxOwnedRouteRuleCollectionLimits::default(),
+        )
+    }
+
+    /// Create a backend with custom legacy and owned-collection readback bounds.
+    #[must_use]
+    pub fn with_config_and_limits(
+        config: LinuxRouteSteeringBackendConfig,
+        readback_limits: LinuxRouteReadbackLimits,
+        owned_collection_limits: LinuxOwnedRouteRuleCollectionLimits,
+    ) -> Self {
         Self {
             inner: Arc::new(LinuxRouteSteeringBackendInner {
                 transport: Arc::new(NetlinkRouteTransport),
@@ -211,6 +311,7 @@ impl LinuxRouteSteeringBackend {
                 operation_lock: Mutex::new(()),
                 config,
                 readback_limits,
+                owned_collection_limits,
                 rule_protocol_capability: AtomicU8::new(RULE_PROTOCOL_CAPABILITY_UNCONFIRMED),
             }),
         }
@@ -218,6 +319,20 @@ impl LinuxRouteSteeringBackend {
 
     #[cfg(test)]
     fn with_transport<T>(transport: T) -> Self
+    where
+        T: LinuxRouteTransport + 'static,
+    {
+        Self::with_transport_and_collection_limits(
+            transport,
+            LinuxOwnedRouteRuleCollectionLimits::default(),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_transport_and_collection_limits<T>(
+        transport: T,
+        owned_collection_limits: LinuxOwnedRouteRuleCollectionLimits,
+    ) -> Self
     where
         T: LinuxRouteTransport + 'static,
     {
@@ -232,6 +347,7 @@ impl LinuxRouteSteeringBackend {
                     retry_delay: Duration::ZERO,
                 },
                 readback_limits: LinuxRouteReadbackLimits::default(),
+                owned_collection_limits,
                 rule_protocol_capability: AtomicU8::new(RULE_PROTOCOL_CAPABILITY_UNCONFIRMED),
             }),
         }
@@ -322,7 +438,24 @@ impl LinuxRouteSteeringBackend {
         expected_response_type: u16,
         body: Vec<u8>,
     ) -> Result<Vec<Vec<u8>>, RouteSteeringError> {
-        validate_readback_config(self.inner.config, self.inner.readback_limits)?;
+        self.dump_with_limits(
+            operation,
+            message_type,
+            expected_response_type,
+            body,
+            self.inner.readback_limits.into(),
+        )
+    }
+
+    fn dump_with_limits(
+        &self,
+        operation: &'static str,
+        message_type: u16,
+        expected_response_type: u16,
+        body: Vec<u8>,
+        limits: LinuxNetlinkDumpLimits,
+    ) -> Result<Vec<Vec<u8>>, RouteSteeringError> {
+        validate_dump_config(self.inner.config, limits)?;
         let sequence = self.next_sequence();
         let request =
             encode_netlink_message(message_type, NLM_F_REQUEST | NLM_F_DUMP, sequence, &body)?;
@@ -332,7 +465,7 @@ impl LinuxRouteSteeringBackend {
             sequence,
             expected_response_type,
             self.inner.config,
-            self.inner.readback_limits,
+            limits,
         )
     }
 
@@ -441,6 +574,28 @@ impl LinuxRouteSteeringBackend {
         .await
     }
 
+    async fn run_snapshot_owned_route_rules(
+        &self,
+        scope: OwnedRouteRuleScope,
+    ) -> Result<OwnedRouteRuleSnapshot, RouteSteeringError> {
+        self.run_locked("snapshot_owned_route_rules", move |backend| {
+            backend
+                .snapshot_owned_collection_sync(scope)
+                .map(|state| state.snapshot)
+        })
+        .await
+    }
+
+    async fn run_reconcile_owned_route_rules(
+        &self,
+        desired: OwnedRouteRuleSet,
+    ) -> Result<OwnedRouteRuleReconcileOutcome, RouteSteeringError> {
+        self.run_locked("reconcile_owned_route_rules", move |backend| {
+            backend.reconcile_owned_collection_sync(desired)
+        })
+        .await
+    }
+
     fn read_route_sync(&self, request: &RouteRequest) -> Result<RouteReadback, RouteSteeringError> {
         validate_route_request(request)?;
         let bodies = self.dump(
@@ -505,6 +660,542 @@ impl LinuxRouteSteeringBackend {
             body,
         )?;
         Ok(())
+    }
+
+    fn snapshot_owned_collection_sync(
+        &self,
+        scope: OwnedRouteRuleScope,
+    ) -> Result<LinuxOwnedCollectionState, RouteSteeringError> {
+        self.snapshot_owned_collection_with_limits_sync(
+            scope,
+            self.inner.owned_collection_limits.max_owned_routes,
+            self.inner.owned_collection_limits.max_owned_rules,
+        )
+    }
+
+    fn snapshot_owned_collection_transient_sync(
+        &self,
+        scope: OwnedRouteRuleScope,
+    ) -> Result<LinuxOwnedCollectionState, RouteSteeringError> {
+        self.snapshot_owned_collection_with_limits_sync(
+            scope,
+            self.inner
+                .owned_collection_limits
+                .max_transient_owned_routes,
+            self.inner.owned_collection_limits.max_transient_owned_rules,
+        )
+    }
+
+    fn snapshot_owned_collection_with_limits_sync(
+        &self,
+        scope: OwnedRouteRuleScope,
+        max_owned_routes: usize,
+        max_owned_rules: usize,
+    ) -> Result<LinuxOwnedCollectionState, RouteSteeringError> {
+        validate_owned_collection_config(self.inner.config, self.inner.owned_collection_limits)?;
+        let limits = self.inner.owned_collection_limits.into();
+        let route_bodies = self.dump_with_limits(
+            "snapshot_owned_routes",
+            RTM_GETROUTE,
+            RTM_NEWROUTE,
+            encode_collection_dump_request(ROUTE_MESSAGE_LEN),
+            limits,
+        )?;
+        let rule_bodies = self.dump_with_limits(
+            "snapshot_owned_rules",
+            RTM_GETRULE,
+            RTM_NEWRULE,
+            encode_collection_dump_request(FIB_RULE_HEADER_LEN),
+            limits,
+        )?;
+        let state = classify_owned_collection(
+            scope,
+            &route_bodies,
+            &rule_bodies,
+            max_owned_routes,
+            max_owned_rules,
+        )?;
+        if state.snapshot.routes().len() > max_owned_routes
+            || state.snapshot.rules().len() > max_owned_rules
+        {
+            return Err(RouteSteeringError::indeterminate(
+                ReadbackIndeterminateReason::LimitExceeded,
+            ));
+        }
+        if state.confirmed_rule_protocol {
+            self.confirm_rule_protocol_capability();
+        }
+        Ok(state)
+    }
+
+    fn ensure_collection_collision_free(
+        state: &LinuxOwnedCollectionState,
+        desired: &OwnedRouteRuleSet,
+    ) -> Result<(), RouteSteeringError> {
+        if state
+            .snapshot
+            .routes()
+            .iter()
+            .chain(desired.routes())
+            .any(|route| {
+                state
+                    .colliding_route_destinations
+                    .contains(&route.destination)
+            })
+        {
+            return Err(RouteSteeringError::AlreadyExists);
+        }
+        if state.colliding_rule_key
+            && (!state.snapshot.rules().is_empty() || !desired.rules().is_empty())
+        {
+            return Err(RouteSteeringError::AlreadyExists);
+        }
+        Ok(())
+    }
+
+    fn remove_owned_route_exact_sync(
+        &self,
+        operation: &'static str,
+        request: &RouteRequest,
+    ) -> Result<(), RouteSteeringError> {
+        let body = encode_route_request(request)?;
+        let _ = self.transact(operation, RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, body)?;
+        Ok(())
+    }
+
+    fn remove_owned_rule_exact_sync(
+        &self,
+        operation: &'static str,
+        request: &RuleRequest,
+        marker_was_discarded: bool,
+    ) -> Result<(), RouteSteeringError> {
+        let body = if marker_was_discarded {
+            encode_legacy_rule_request(request)?
+        } else {
+            encode_rule_request(request)?
+        };
+        let _ = self.transact(operation, RTM_DELRULE, NLM_F_REQUEST | NLM_F_ACK, body)?;
+        Ok(())
+    }
+
+    fn rollback_owned_collection_installs(
+        &self,
+        before: &LinuxOwnedCollectionState,
+        desired: &OwnedRouteRuleSet,
+        routes: &[RouteRequest],
+        rules: &[RuleRequest],
+        marker_discarded_rules: &BTreeSet<RuleRequest>,
+    ) -> Result<(), RouteSteeringFailureClass> {
+        for rule in rules.iter().rev() {
+            if let Err(rollback) = self.remove_owned_rule_exact_sync(
+                "rollback_owned_collection_rule",
+                rule,
+                marker_discarded_rules.contains(rule),
+            ) {
+                let _ = self.snapshot_owned_collection_transient_sync(desired.scope());
+                return Err(rollback.class());
+            }
+        }
+        for route in routes.iter().rev() {
+            if let Err(rollback) =
+                self.remove_owned_route_exact_sync("rollback_owned_collection_route", route)
+            {
+                let _ = self.snapshot_owned_collection_transient_sync(desired.scope());
+                return Err(rollback.class());
+            }
+        }
+        let rollback_state = self
+            .snapshot_owned_collection_transient_sync(desired.scope())
+            .map_err(|rollback| rollback.class())?;
+        if rollback_state.snapshot != before.snapshot
+            || Self::ensure_collection_collision_free(&rollback_state, desired).is_err()
+        {
+            return Err(RouteSteeringFailureClass::ReadbackIndeterminate);
+        }
+        Ok(())
+    }
+
+    fn reconcile_owned_collection_sync(
+        &self,
+        desired: OwnedRouteRuleSet,
+    ) -> Result<OwnedRouteRuleReconcileOutcome, RouteSteeringError> {
+        validate_owned_collection_config(self.inner.config, self.inner.owned_collection_limits)?;
+        if desired.routes().len() > self.inner.owned_collection_limits.max_owned_routes
+            || desired.rules().len() > self.inner.owned_collection_limits.max_owned_rules
+        {
+            return Err(RouteSteeringError::invalid_config(
+                "linux.owned_collection",
+                "desired owned collection exceeds configured bounds",
+            ));
+        }
+
+        // A cancelled or crashed prior install-before-delete pass can leave
+        // the old∪new transient union resident. Reconciliation must be able
+        // to enumerate that bounded residual before it can safely collect it;
+        // public and final snapshots remain subject to the lower final bound.
+        let before = self.snapshot_owned_collection_transient_sync(desired.scope())?;
+        Self::ensure_collection_collision_free(&before, &desired)?;
+        let before_routes = before
+            .snapshot
+            .routes()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let before_rules = before
+            .snapshot
+            .rules()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let desired_routes = desired.routes().iter().cloned().collect::<BTreeSet<_>>();
+        let desired_rules = desired.rules().iter().cloned().collect::<BTreeSet<_>>();
+        let missing_routes = desired_routes
+            .difference(&before_routes)
+            .cloned()
+            .collect::<Vec<_>>();
+        let missing_rules = desired_rules
+            .difference(&before_rules)
+            .cloned()
+            .collect::<Vec<_>>();
+        let orphan_rules = before_rules
+            .difference(&desired_rules)
+            .cloned()
+            .collect::<Vec<_>>();
+        let orphan_routes = before_routes
+            .difference(&desired_routes)
+            .cloned()
+            .collect::<Vec<_>>();
+        let retained_routes = before_routes.intersection(&desired_routes).count();
+        let retained_rules = before_rules.intersection(&desired_rules).count();
+
+        let transient_routes = before_routes
+            .len()
+            .checked_add(missing_routes.len())
+            .ok_or_else(|| {
+                RouteSteeringError::indeterminate(ReadbackIndeterminateReason::LimitExceeded)
+            })?;
+        let transient_rules = before_rules
+            .len()
+            .checked_add(missing_rules.len())
+            .ok_or_else(|| {
+                RouteSteeringError::indeterminate(ReadbackIndeterminateReason::LimitExceeded)
+            })?;
+        if transient_routes
+            > self
+                .inner
+                .owned_collection_limits
+                .max_transient_owned_routes
+            || transient_rules > self.inner.owned_collection_limits.max_transient_owned_rules
+        {
+            return Err(RouteSteeringError::indeterminate(
+                ReadbackIndeterminateReason::LimitExceeded,
+            ));
+        }
+        // Desired and resident sets are valid independently, but the
+        // install-before-delete union must also preserve exact collection
+        // invariants. In particular, reject cross-set source-prefix overlap
+        // before a create can leave an unrecoverable ambiguous residual.
+        OwnedRouteRuleSnapshot::new_transient(
+            desired.scope(),
+            before_routes
+                .iter()
+                .cloned()
+                .chain(missing_routes.iter().cloned())
+                .collect(),
+            before_rules
+                .iter()
+                .cloned()
+                .chain(missing_rules.iter().cloned())
+                .collect(),
+        )
+        .map(|_| ())?;
+
+        if !missing_rules.is_empty() {
+            self.require_rule_protocol_capability()?;
+        }
+
+        let mut installed_routes = Vec::with_capacity(missing_routes.len());
+        let mut installed_rules = Vec::with_capacity(missing_rules.len());
+        let no_discarded_markers = BTreeSet::new();
+        for route in missing_routes {
+            if let Err(primary) = self.install_route_sync(&route) {
+                if mutation_definitively_not_applied(&primary) {
+                    if let Err(rollback) = self.rollback_owned_collection_installs(
+                        &before,
+                        &desired,
+                        &installed_routes,
+                        &installed_rules,
+                        &no_discarded_markers,
+                    ) {
+                        return Err(reconcile_rollback_incomplete(
+                            OwnedRouteRuleReconcilePhase::InstallRoutes,
+                            installed_routes.len(),
+                            installed_rules.len(),
+                            0,
+                            0,
+                            &primary,
+                            rollback,
+                        ));
+                    }
+                }
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::InstallRoutes,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    0,
+                    0,
+                    &primary,
+                ));
+            }
+            installed_routes.push(route);
+        }
+        for rule in missing_rules {
+            if let Err(primary) = self.install_rule_sync(&rule) {
+                if rule_protocol_create_rejected(&primary)
+                    && rule_family(&rule)? == AF_INET
+                    && self.rule_protocol_capability() != LinuxRuleProtocolCapability::Confirmed
+                {
+                    self.reject_rule_protocol_capability_from_kernel();
+                }
+                if mutation_definitively_not_applied(&primary) {
+                    if let Err(rollback) = self.rollback_owned_collection_installs(
+                        &before,
+                        &desired,
+                        &installed_routes,
+                        &installed_rules,
+                        &no_discarded_markers,
+                    ) {
+                        return Err(reconcile_rollback_incomplete(
+                            OwnedRouteRuleReconcilePhase::InstallRules,
+                            installed_routes.len(),
+                            installed_rules.len(),
+                            0,
+                            0,
+                            &primary,
+                            rollback,
+                        ));
+                    }
+                }
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::InstallRules,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    0,
+                    0,
+                    &primary,
+                ));
+            }
+            installed_rules.push(rule);
+        }
+
+        let installed_state = match self.snapshot_owned_collection_transient_sync(desired.scope()) {
+            Ok(snapshot) => snapshot,
+            Err(primary) => {
+                if let Err(rollback) = self.rollback_owned_collection_installs(
+                    &before,
+                    &desired,
+                    &installed_routes,
+                    &installed_rules,
+                    &no_discarded_markers,
+                ) {
+                    return Err(reconcile_rollback_incomplete(
+                        OwnedRouteRuleReconcilePhase::VerifyDesired,
+                        installed_routes.len(),
+                        installed_rules.len(),
+                        0,
+                        0,
+                        &primary,
+                        rollback,
+                    ));
+                }
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::VerifyDesired,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    0,
+                    0,
+                    &primary,
+                ));
+            }
+        };
+        let marker_discarded_rules = installed_rules
+            .iter()
+            .filter(|rule| {
+                installed_state
+                    .marker_mismatched_exact_rules
+                    .contains(*rule)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !marker_discarded_rules.is_empty() {
+            self.reject_rule_protocol_capability_from_readback();
+        }
+        let desired_present = desired.routes().iter().all(|route| {
+            installed_state
+                .snapshot
+                .routes()
+                .binary_search(route)
+                .is_ok()
+        }) && desired
+            .rules()
+            .iter()
+            .all(|rule| installed_state.snapshot.rules().binary_search(rule).is_ok());
+        if let Err(primary) = Self::ensure_collection_collision_free(&installed_state, &desired)
+            .and_then(|()| {
+                if desired_present {
+                    Ok(())
+                } else {
+                    Err(RouteSteeringError::indeterminate(
+                        ReadbackIndeterminateReason::ConcurrentModification,
+                    ))
+                }
+            })
+        {
+            if let Err(rollback) = self.rollback_owned_collection_installs(
+                &before,
+                &desired,
+                &installed_routes,
+                &installed_rules,
+                &marker_discarded_rules,
+            ) {
+                return Err(reconcile_rollback_incomplete(
+                    OwnedRouteRuleReconcilePhase::VerifyDesired,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    0,
+                    0,
+                    &primary,
+                    rollback,
+                ));
+            }
+            return Err(reconcile_incomplete(
+                OwnedRouteRuleReconcilePhase::VerifyDesired,
+                installed_routes.len(),
+                installed_rules.len(),
+                0,
+                0,
+                &primary,
+            ));
+        }
+
+        let mut removed_rules = 0_usize;
+        let mut removed_routes = 0_usize;
+        for rule in &orphan_rules {
+            if let Err(primary) =
+                self.remove_owned_rule_exact_sync("remove_owned_collection_rule", rule, false)
+            {
+                let _ = self.snapshot_owned_collection_transient_sync(desired.scope());
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::RemoveRules,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    removed_routes,
+                    removed_rules,
+                    &primary,
+                ));
+            }
+            removed_rules = removed_rules.saturating_add(1);
+        }
+        if !orphan_rules.is_empty() {
+            let rules_removed_state = self
+                .snapshot_owned_collection_transient_sync(desired.scope())
+                .map_err(|primary| {
+                    reconcile_incomplete(
+                        OwnedRouteRuleReconcilePhase::RemoveRules,
+                        installed_routes.len(),
+                        installed_rules.len(),
+                        removed_routes,
+                        removed_rules,
+                        &primary,
+                    )
+                })?;
+            let rules_removed_exact = rules_removed_state.snapshot.routes()
+                == installed_state.snapshot.routes()
+                && rules_removed_state.snapshot.rules() == desired.rules();
+            if let Err(primary) =
+                Self::ensure_collection_collision_free(&rules_removed_state, &desired).and_then(
+                    |()| {
+                        if rules_removed_exact {
+                            Ok(())
+                        } else {
+                            Err(RouteSteeringError::indeterminate(
+                                ReadbackIndeterminateReason::ConcurrentModification,
+                            ))
+                        }
+                    },
+                )
+            {
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::RemoveRules,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    removed_routes,
+                    removed_rules,
+                    &primary,
+                ));
+            }
+        }
+        for route in &orphan_routes {
+            if let Err(primary) =
+                self.remove_owned_route_exact_sync("remove_owned_collection_route", route)
+            {
+                let _ = self.snapshot_owned_collection_transient_sync(desired.scope());
+                return Err(reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::RemoveRoutes,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    removed_routes,
+                    removed_rules,
+                    &primary,
+                ));
+            }
+            removed_routes = removed_routes.saturating_add(1);
+        }
+
+        let final_state = self
+            .snapshot_owned_collection_sync(desired.scope())
+            .map_err(|primary| {
+                reconcile_incomplete(
+                    OwnedRouteRuleReconcilePhase::VerifyFinal,
+                    installed_routes.len(),
+                    installed_rules.len(),
+                    removed_routes,
+                    removed_rules,
+                    &primary,
+                )
+            })?;
+        Self::ensure_collection_collision_free(&final_state, &desired).map_err(|primary| {
+            reconcile_incomplete(
+                OwnedRouteRuleReconcilePhase::VerifyFinal,
+                installed_routes.len(),
+                installed_rules.len(),
+                removed_routes,
+                removed_rules,
+                &primary,
+            )
+        })?;
+        if !final_state.snapshot.matches_desired(&desired) {
+            let primary = RouteSteeringError::indeterminate(
+                ReadbackIndeterminateReason::ConcurrentModification,
+            );
+            return Err(reconcile_incomplete(
+                OwnedRouteRuleReconcilePhase::VerifyFinal,
+                installed_routes.len(),
+                installed_rules.len(),
+                removed_routes,
+                removed_rules,
+                &primary,
+            ));
+        }
+        Ok(OwnedRouteRuleReconcileOutcome {
+            snapshot: final_state.snapshot,
+            retained_routes,
+            installed_routes: installed_routes.len(),
+            removed_routes,
+            retained_rules,
+            installed_rules: installed_rules.len(),
+            removed_rules,
+        })
     }
 
     fn remove_converged_route_sync(
@@ -654,7 +1345,7 @@ impl LinuxRouteSteeringBackend {
                 }
                 Ok((readback, protocol_evidence)) => {
                     let marker_was_discarded = protocol_evidence
-                        == RuleProtocolReadbackEvidence::MissingOnOnlySemanticMatch;
+                        == RuleProtocolReadbackEvidence::MismatchedOnOnlySemanticMatch;
                     if marker_was_discarded {
                         self.reject_rule_protocol_capability_from_readback();
                     }
@@ -878,6 +1569,20 @@ impl RouteSteeringBackend for LinuxRouteSteeringBackend {
         self.run_converge_pair(route, rule).await
     }
 
+    async fn snapshot_owned_route_rules(
+        &self,
+        scope: OwnedRouteRuleScope,
+    ) -> Result<OwnedRouteRuleSnapshot, RouteSteeringError> {
+        self.run_snapshot_owned_route_rules(scope).await
+    }
+
+    async fn reconcile_owned_route_rules(
+        &self,
+        desired: OwnedRouteRuleSet,
+    ) -> Result<OwnedRouteRuleReconcileOutcome, RouteSteeringError> {
+        self.run_reconcile_owned_route_rules(desired).await
+    }
+
     async fn probe(&self) -> Result<RouteSteeringProbe, RouteSteeringError> {
         Ok(self.inner.transport.probe(self.inner.config))
     }
@@ -889,6 +1594,7 @@ impl RouteSteeringBackend for LinuxRouteSteeringBackend {
             conflict_safe_route_convergence: true,
             conflict_safe_rule_convergence: rule_convergence,
             paired_convergence: rule_convergence,
+            owned_route_rule_collection: rule_convergence,
         }
     }
 }
@@ -909,7 +1615,7 @@ trait LinuxRouteTransport: Send + Sync + fmt::Debug {
         _expected_sequence: u32,
         _expected_message_type: u16,
         _config: LinuxRouteSteeringBackendConfig,
-        _limits: LinuxRouteReadbackLimits,
+        _limits: LinuxNetlinkDumpLimits,
     ) -> Result<Vec<Vec<u8>>, RouteSteeringError> {
         Err(RouteSteeringError::indeterminate(
             ReadbackIndeterminateReason::Unsupported,
@@ -949,7 +1655,11 @@ impl LinuxRouteTransport for NetlinkRouteTransport {
         for _ in 0..config.receive_attempts {
             match receive_message(&socket, &mut buffer) {
                 Ok(0) => {}
-                Ok(len) => return parse_netlink_response(&buffer[..len], expected_sequence),
+                Ok(len) => {
+                    if parse_netlink_ack_datagram(&buffer[..len], expected_sequence)? {
+                        return Ok(None);
+                    }
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -975,9 +1685,9 @@ impl LinuxRouteTransport for NetlinkRouteTransport {
         expected_sequence: u32,
         expected_message_type: u16,
         config: LinuxRouteSteeringBackendConfig,
-        limits: LinuxRouteReadbackLimits,
+        limits: LinuxNetlinkDumpLimits,
     ) -> Result<Vec<Vec<u8>>, RouteSteeringError> {
-        validate_readback_config(config, limits)?;
+        validate_dump_config(config, limits)?;
         let socket =
             open_route_netlink_socket().map_err(|error| map_open_error(operation, error))?;
         let sent = send_message(&socket, request)
@@ -991,7 +1701,7 @@ impl LinuxRouteTransport for NetlinkRouteTransport {
 
         let mut buffer = vec![0_u8; config.receive_buffer_len];
         let mut messages = Vec::new();
-        let mut datagrams = 0_u16;
+        let mut datagrams = 0_u32;
         let mut total_bytes = 0_usize;
         let mut empty_attempts = 0_u16;
         while empty_attempts < config.receive_attempts {
@@ -1100,9 +1810,17 @@ fn blocking_task_error(operation: &'static str) -> RouteSteeringError {
     )
 }
 
+#[cfg(test)]
 fn validate_readback_config(
     config: LinuxRouteSteeringBackendConfig,
     limits: LinuxRouteReadbackLimits,
+) -> Result<(), RouteSteeringError> {
+    validate_dump_config(config, limits.into())
+}
+
+fn validate_dump_config(
+    config: LinuxRouteSteeringBackendConfig,
+    limits: LinuxNetlinkDumpLimits,
 ) -> Result<(), RouteSteeringError> {
     if config.receive_attempts == 0 {
         return Err(RouteSteeringError::invalid_config(
@@ -1137,11 +1855,74 @@ fn validate_readback_config(
     Ok(())
 }
 
+fn validate_owned_collection_config(
+    config: LinuxRouteSteeringBackendConfig,
+    limits: LinuxOwnedRouteRuleCollectionLimits,
+) -> Result<(), RouteSteeringError> {
+    validate_dump_config(config, limits.into())?;
+    if limits.max_datagrams > MAX_OWNED_COLLECTION_DUMP_DATAGRAMS {
+        return Err(RouteSteeringError::invalid_config(
+            "linux.owned_collection_max_datagrams",
+            "collection datagram limit exceeds the hard bound",
+        ));
+    }
+    if limits.max_messages > MAX_OWNED_COLLECTION_DUMP_MESSAGES {
+        return Err(RouteSteeringError::invalid_config(
+            "linux.owned_collection_max_messages",
+            "collection message limit exceeds the hard bound",
+        ));
+    }
+    if limits.max_bytes > MAX_OWNED_COLLECTION_DUMP_BYTES {
+        return Err(RouteSteeringError::invalid_config(
+            "linux.owned_collection_max_bytes",
+            "collection byte limit exceeds the hard bound",
+        ));
+    }
+    if limits.max_owned_routes == 0 || limits.max_owned_routes > MAX_OWNED_ROUTE_COLLECTION_ENTRIES
+    {
+        return Err(RouteSteeringError::invalid_config(
+            "linux.max_owned_routes",
+            "owned route limit is outside supported bounds",
+        ));
+    }
+    if limits.max_owned_rules == 0 || limits.max_owned_rules > MAX_OWNED_RULE_COLLECTION_ENTRIES {
+        return Err(RouteSteeringError::invalid_config(
+            "linux.max_owned_rules",
+            "owned rule limit is outside supported bounds",
+        ));
+    }
+    if limits.max_transient_owned_routes < limits.max_owned_routes
+        || limits.max_transient_owned_routes > MAX_TRANSIENT_OWNED_ROUTE_COLLECTION_ENTRIES
+    {
+        return Err(RouteSteeringError::invalid_config(
+            "linux.max_transient_owned_routes",
+            "transient owned route limit is outside supported bounds",
+        ));
+    }
+    if limits.max_transient_owned_rules < limits.max_owned_rules
+        || limits.max_transient_owned_rules > MAX_TRANSIENT_OWNED_RULE_COLLECTION_ENTRIES
+    {
+        return Err(RouteSteeringError::invalid_config(
+            "linux.max_transient_owned_rules",
+            "transient owned rule limit is outside supported bounds",
+        ));
+    }
+    if limits.max_messages < limits.max_transient_owned_routes
+        || limits.max_messages < limits.max_transient_owned_rules
+    {
+        return Err(RouteSteeringError::invalid_config(
+            "linux.owned_collection_readback_messages",
+            "collection dump message limit cannot cover configured owned entries",
+        ));
+    }
+    Ok(())
+}
+
 fn account_dump_datagram(
-    datagrams: &mut u16,
+    datagrams: &mut u32,
     total_bytes: &mut usize,
     received_bytes: usize,
-    limits: LinuxRouteReadbackLimits,
+    limits: LinuxNetlinkDumpLimits,
 ) -> Result<(), RouteSteeringError> {
     *datagrams = datagrams.checked_add(1).ok_or_else(|| {
         RouteSteeringError::indeterminate(ReadbackIndeterminateReason::LimitExceeded)
@@ -1265,6 +2046,13 @@ fn encode_rule_dump_request(request: &RuleRequest) -> Result<Vec<u8>, RouteSteer
     push_u8(&mut out, rule_family(request)?);
     out.resize(FIB_RULE_HEADER_LEN, 0);
     Ok(out)
+}
+
+fn encode_collection_dump_request(message_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(message_len);
+    push_u8(&mut out, AF_UNSPEC);
+    out.resize(message_len, 0);
+    out
 }
 
 fn encode_route_request(request: &RouteRequest) -> Result<Vec<u8>, RouteSteeringError> {
@@ -1408,12 +2196,12 @@ fn append_attr(
     Ok(())
 }
 
-fn parse_netlink_response(
+fn parse_netlink_ack_datagram(
     response: &[u8],
     expected_sequence: u32,
-) -> Result<Option<Vec<u8>>, RouteSteeringError> {
-    let mut offset = 0;
-    let mut payload = None;
+) -> Result<bool, RouteSteeringError> {
+    let mut offset = 0_usize;
+    let mut acknowledged = false;
     while offset < response.len() {
         if response.len() - offset < NETLINK_HEADER_LEN {
             return Err(RouteSteeringError::io(
@@ -1421,8 +2209,13 @@ fn parse_netlink_response(
                 invalid_data("short netlink header"),
             ));
         }
-        let length = read_u32_ne(response, offset)? as usize;
-        if length < NETLINK_HEADER_LEN || offset + length > response.len() {
+        let length = usize::try_from(read_u32_ne(response, offset)?).map_err(|_| {
+            RouteSteeringError::io("netlink_receive", invalid_data("invalid netlink length"))
+        })?;
+        let end = offset.checked_add(length).ok_or_else(|| {
+            RouteSteeringError::io("netlink_receive", invalid_data("netlink length overflow"))
+        })?;
+        if length < NETLINK_HEADER_LEN || end > response.len() {
             return Err(RouteSteeringError::io(
                 "netlink_receive",
                 invalid_data("invalid netlink length"),
@@ -1436,20 +2229,24 @@ fn parse_netlink_response(
                 invalid_data("unexpected netlink sequence"),
             ));
         }
-        let body = &response[offset + NETLINK_HEADER_LEN..offset + length];
+        let body = &response[offset + NETLINK_HEADER_LEN..end];
         match message_type {
             NLMSG_ERROR => {
-                parse_netlink_error(body)?;
-                if payload.is_some() {
-                    return Ok(payload);
+                if acknowledged {
+                    return Err(RouteSteeringError::io(
+                        "netlink_receive",
+                        invalid_data("duplicate netlink acknowledgement"),
+                    ));
                 }
+                parse_netlink_error(body)?;
+                acknowledged = true;
             }
-            NLMSG_DONE => return Ok(payload),
             NLMSG_NOOP => {}
             _ => {
-                if payload.is_none() {
-                    payload = Some(body.to_vec());
-                }
+                return Err(RouteSteeringError::io(
+                    "netlink_receive",
+                    invalid_data("unexpected netlink acknowledgement message"),
+                ));
             }
         }
         let aligned = align_to_netlink(length).ok_or_else(|| {
@@ -1464,16 +2261,29 @@ fn parse_netlink_response(
                 invalid_data("zero netlink alignment"),
             ));
         }
-        offset += aligned;
+        let aligned_end = offset.checked_add(aligned).ok_or_else(|| {
+            RouteSteeringError::io(
+                "netlink_receive",
+                invalid_data("netlink alignment overflow"),
+            )
+        })?;
+        if aligned_end > response.len() || response[end..aligned_end].iter().any(|byte| *byte != 0)
+        {
+            return Err(RouteSteeringError::io(
+                "netlink_receive",
+                invalid_data("invalid netlink alignment padding"),
+            ));
+        }
+        offset = aligned_end;
     }
-    Ok(payload)
+    Ok(acknowledged)
 }
 
 fn parse_dump_datagram(
     response: &[u8],
     expected_sequence: u32,
     expected_message_type: u16,
-    max_messages: u16,
+    max_messages: usize,
     messages: &mut Vec<Vec<u8>>,
 ) -> Result<bool, RouteSteeringError> {
     let mut offset = 0_usize;
@@ -1525,7 +2335,7 @@ fn parse_dump_datagram(
                 let next_count = messages.len().checked_add(1).ok_or_else(|| {
                     RouteSteeringError::indeterminate(ReadbackIndeterminateReason::LimitExceeded)
                 })?;
-                if next_count > usize::from(max_messages) {
+                if next_count > max_messages {
                     return Err(RouteSteeringError::indeterminate(
                         ReadbackIndeterminateReason::LimitExceeded,
                     ));
@@ -1558,11 +2368,157 @@ fn parse_dump_done(body: &[u8]) -> Result<(), RouteSteeringError> {
     parse_netlink_error(body)
 }
 
+struct LinuxOwnedCollectionState {
+    snapshot: OwnedRouteRuleSnapshot,
+    colliding_route_destinations: BTreeSet<IpPrefix>,
+    colliding_rule_key: bool,
+    marker_mismatched_exact_rules: BTreeSet<RuleRequest>,
+    confirmed_rule_protocol: bool,
+}
+
+fn classify_owned_collection(
+    scope: OwnedRouteRuleScope,
+    route_bodies: &[Vec<u8>],
+    rule_bodies: &[Vec<u8>],
+    max_owned_routes: usize,
+    max_owned_rules: usize,
+) -> Result<LinuxOwnedCollectionState, RouteSteeringError> {
+    let expected_family = match scope.family() {
+        RouteSteeringIpFamily::Ipv4 => AF_INET,
+        RouteSteeringIpFamily::Ipv6 => AF_INET6,
+    };
+    let mut routes = Vec::new();
+    let mut rules = Vec::new();
+    let mut colliding_route_destinations = BTreeSet::new();
+    let mut colliding_rule_key = false;
+    let mut marker_mismatched_exact_rules = BTreeSet::new();
+    let mut semantic_rule_candidate_counts = BTreeMap::<RuleRequest, usize>::new();
+    let mut confirmed_rule_protocol = false;
+
+    for body in route_bodies {
+        let Some(candidate) = parse_route_candidate(body)? else {
+            continue;
+        };
+        let tagged = candidate.protocol == LINUX_ROUTE_STEERING_PROTOCOL;
+        let representable = candidate.fixed_semantics_exact
+            && !candidate.has_unrepresented_attributes
+            && candidate.resident.is_some();
+        let could_belong_to_scope = candidate.family == expected_family
+            && candidate.table == scope.table()
+            && candidate.priority == scope.route_priority()
+            && candidate
+                .output_interface
+                .is_none_or(|oif| oif == scope.output_interface());
+        if tagged && !representable && could_belong_to_scope {
+            return Err(RouteSteeringError::indeterminate(
+                ReadbackIndeterminateReason::UnrepresentableObject,
+            ));
+        }
+        match candidate.resident {
+            Some(resident)
+                if tagged
+                    && candidate.fixed_semantics_exact
+                    && !candidate.has_unrepresented_attributes
+                    && scope.contains_route(&resident) =>
+            {
+                if routes.len() >= max_owned_routes {
+                    return Err(RouteSteeringError::indeterminate(
+                        ReadbackIndeterminateReason::LimitExceeded,
+                    ));
+                }
+                routes.push(resident);
+            }
+            _ => {
+                colliding_route_destinations.insert(candidate.destination);
+            }
+        }
+    }
+
+    for body in rule_bodies {
+        let Some(candidate) = parse_rule_candidate(body)? else {
+            continue;
+        };
+        if candidate.protocol == Some(LINUX_ROUTE_STEERING_PROTOCOL) {
+            confirmed_rule_protocol = true;
+        }
+        if candidate.family != expected_family {
+            continue;
+        }
+        if candidate.protocol == Some(LINUX_ROUTE_STEERING_PROTOCOL)
+            && candidate.priority == Some(scope.rule_priority())
+            && (candidate.has_unrepresented_attributes
+                || !candidate.fixed_kernel_semantics_exact
+                || candidate.resident.is_none())
+        {
+            return Err(RouteSteeringError::indeterminate(
+                ReadbackIndeterminateReason::UnrepresentableObject,
+            ));
+        }
+        if candidate.priority != Some(scope.rule_priority()) {
+            continue;
+        }
+        if let Some(resident) = &candidate.resident {
+            let count = semantic_rule_candidate_counts
+                .entry(resident.clone())
+                .or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                RouteSteeringError::indeterminate(ReadbackIndeterminateReason::LimitExceeded)
+            })?;
+        }
+        match candidate.resident {
+            Some(resident)
+                if candidate.protocol == Some(LINUX_ROUTE_STEERING_PROTOCOL)
+                    && candidate.fixed_kernel_semantics_exact
+                    && !candidate.has_unrepresented_attributes
+                    && scope.contains_rule(&resident) =>
+            {
+                if rules.len() >= max_owned_rules {
+                    return Err(RouteSteeringError::indeterminate(
+                        ReadbackIndeterminateReason::LimitExceeded,
+                    ));
+                }
+                rules.push(resident);
+            }
+            Some(resident) => {
+                colliding_rule_key = true;
+                if candidate.protocol != Some(LINUX_ROUTE_STEERING_PROTOCOL)
+                    && candidate.fixed_kernel_semantics_exact
+                    && !candidate.has_unrepresented_attributes
+                {
+                    marker_mismatched_exact_rules.insert(resident);
+                }
+            }
+            None => colliding_rule_key = true,
+        }
+    }
+    marker_mismatched_exact_rules.retain(|rule| {
+        semantic_rule_candidate_counts
+            .get(rule)
+            .is_some_and(|count| *count == 1)
+    });
+
+    let snapshot = OwnedRouteRuleSnapshot::new_transient(scope, routes, rules).map_err(|_| {
+        RouteSteeringError::indeterminate(ReadbackIndeterminateReason::UnrepresentableObject)
+    })?;
+    Ok(LinuxOwnedCollectionState {
+        snapshot,
+        colliding_route_destinations,
+        colliding_rule_key,
+        marker_mismatched_exact_rules,
+        confirmed_rule_protocol,
+    })
+}
+
 #[derive(Debug)]
 struct ParsedRouteCandidate {
+    family: u8,
     destination: IpPrefix,
+    table: u32,
+    output_interface: Option<u32>,
+    priority: Option<u32>,
     resident: Option<RouteRequest>,
     fixed_semantics_exact: bool,
+    protocol: u8,
     has_unrepresented_attributes: bool,
 }
 
@@ -1580,7 +2536,7 @@ struct ParsedRuleCandidate {
 enum RuleProtocolReadbackEvidence {
     None,
     Confirmed,
-    MissingOnOnlySemanticMatch,
+    MismatchedOnOnlySemanticMatch,
 }
 
 fn classify_route_readback(
@@ -1619,9 +2575,12 @@ fn classify_route_readback(
             output_interface: current.oif_ifindex != request.oif_ifindex,
             table: current.table != request.table,
             priority: current.priority != request.priority,
-            kernel_semantics: !candidate.fixed_semantics_exact,
+            kernel_semantics: !candidate.fixed_semantics_exact
+                || candidate.protocol != LINUX_ROUTE_STEERING_PROTOCOL,
         };
-        let exact = current == request && candidate.fixed_semantics_exact;
+        let exact = current == request
+            && candidate.fixed_semantics_exact
+            && candidate.protocol == LINUX_ROUTE_STEERING_PROTOCOL;
         every_candidate_exact &= exact;
         aggregate.output_interface |= mismatch.output_interface;
         aggregate.table |= mismatch.table;
@@ -1692,8 +2651,7 @@ fn classify_rule_readback_with_protocol_evidence(
         if candidate_count == 1 && current == *request && candidate.fixed_kernel_semantics_exact {
             protocol_evidence = match candidate.protocol {
                 Some(LINUX_ROUTE_STEERING_PROTOCOL) => RuleProtocolReadbackEvidence::Confirmed,
-                None => RuleProtocolReadbackEvidence::MissingOnOnlySemanticMatch,
-                Some(_) => RuleProtocolReadbackEvidence::None,
+                _ => RuleProtocolReadbackEvidence::MismatchedOnOnlySemanticMatch,
             };
         } else {
             protocol_evidence = RuleProtocolReadbackEvidence::None;
@@ -1763,7 +2721,6 @@ fn parse_route_candidate(body: &[u8]) -> Result<Option<ParsedRouteCandidate>, Ro
     let header_table = u32::from(body[4]);
     let fixed_semantics_exact = body[2] == 0
         && body[3] == 0
-        && body[5] == LINUX_ROUTE_STEERING_PROTOCOL
         && body[6] == RT_SCOPE_UNIVERSE
         && body[7] == RTN_UNICAST
         && read_u32_ne(body, 8)? == 0;
@@ -1815,6 +2772,7 @@ fn parse_route_candidate(body: &[u8]) -> Result<Option<ParsedRouteCandidate>, Ro
     let table = table_attr.unwrap_or(header_table);
     let address = destination.unwrap_or_else(|| unspecified_address(family));
     let destination = IpPrefix::new(address, destination_prefix_len);
+    let canonical_priority = canonical_route_priority_for_address(address, priority);
     let resident = oif.filter(|_| table != 0).map(|oif_ifindex| {
         canonical_route_request(&RouteRequest {
             destination,
@@ -1824,9 +2782,14 @@ fn parse_route_candidate(body: &[u8]) -> Result<Option<ParsedRouteCandidate>, Ro
         })
     });
     Ok(Some(ParsedRouteCandidate {
+        family,
         destination,
+        table,
+        output_interface: oif,
+        priority: canonical_priority,
         resident,
         fixed_semantics_exact,
+        protocol: body[5],
         has_unrepresented_attributes: unrepresented,
     }))
 }
@@ -2054,6 +3017,20 @@ fn malformed_readback() -> RouteSteeringError {
 
 fn rule_protocol_create_rejected(error: &RouteSteeringError) -> bool {
     matches!(error, RouteSteeringError::UnsupportedPlatform) || error.raw_os_error() == Some(EINVAL)
+}
+
+fn mutation_definitively_not_applied(error: &RouteSteeringError) -> bool {
+    matches!(
+        error,
+        RouteSteeringError::UnsupportedPlatform
+            | RouteSteeringError::AlreadyExists
+            | RouteSteeringError::NotFound
+            | RouteSteeringError::InvalidConfig { .. }
+            | RouteSteeringError::Io {
+                operation: "netlink_ack",
+                ..
+            }
+    )
 }
 
 fn parse_netlink_error(body: &[u8]) -> Result<(), RouteSteeringError> {
@@ -2330,7 +3307,7 @@ mod tests {
             _expected_sequence: u32,
             _expected_message_type: u16,
             _config: LinuxRouteSteeringBackendConfig,
-            _limits: LinuxRouteReadbackLimits,
+            _limits: LinuxNetlinkDumpLimits,
         ) -> Result<Vec<Vec<u8>>, RouteSteeringError> {
             self.requests
                 .lock()
@@ -2414,7 +3391,7 @@ mod tests {
             _expected_sequence: u32,
             _expected_message_type: u16,
             _config: LinuxRouteSteeringBackendConfig,
-            _limits: LinuxRouteReadbackLimits,
+            _limits: LinuxNetlinkDumpLimits,
         ) -> Result<Vec<Vec<u8>>, RouteSteeringError> {
             self.requests
                 .lock()
@@ -2437,6 +3414,10 @@ mod tests {
         rule_started: mpsc::Sender<()>,
         release_rule: Arc<Mutex<mpsc::Receiver<()>>>,
         route_present: Arc<AtomicBool>,
+        rule_present: Arc<AtomicBool>,
+        complete_rule_install: bool,
+        resident_route: RouteRequest,
+        resident_rule: RuleRequest,
     }
 
     impl CancellationTransport {
@@ -2478,6 +3459,10 @@ mod tests {
                             io::Error::new(io::ErrorKind::BrokenPipe, "test sender closed"),
                         )
                     })?;
+                if self.complete_rule_install {
+                    self.rule_present.store(true, AtomicOrdering::Release);
+                    return Ok(None);
+                }
                 return Err(RouteSteeringError::io(
                     "install_rule",
                     io::Error::new(io::ErrorKind::PermissionDenied, "synthetic failure"),
@@ -2487,6 +3472,8 @@ mod tests {
                 self.route_present.store(true, AtomicOrdering::Release);
             } else if message_type == RTM_DELROUTE {
                 self.route_present.store(false, AtomicOrdering::Release);
+            } else if message_type == RTM_DELRULE {
+                self.rule_present.store(false, AtomicOrdering::Release);
             }
             Ok(None)
         }
@@ -2498,7 +3485,7 @@ mod tests {
             _expected_sequence: u32,
             expected_message_type: u16,
             _config: LinuxRouteSteeringBackendConfig,
-            _limits: LinuxRouteReadbackLimits,
+            _limits: LinuxNetlinkDumpLimits,
         ) -> Result<Vec<Vec<u8>>, RouteSteeringError> {
             self.requests
                 .lock()
@@ -2507,12 +3494,18 @@ mod tests {
             match expected_message_type {
                 RTM_NEWROUTE => {
                     if self.route_present.load(AtomicOrdering::Acquire) {
-                        Ok(vec![encode_route_request(&route())?])
+                        Ok(vec![encode_route_request(&self.resident_route)?])
                     } else {
                         Ok(Vec::new())
                     }
                 }
-                RTM_NEWRULE => Ok(Vec::new()),
+                RTM_NEWRULE => {
+                    if self.rule_present.load(AtomicOrdering::Acquire) {
+                        Ok(vec![encode_rule_request(&self.resident_rule)?])
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
                 _ => Err(malformed_readback()),
             }
         }
@@ -2574,6 +3567,55 @@ mod tests {
             }),
             table: 1000,
             priority: 100,
+        }
+    }
+
+    fn collection_scope() -> OwnedRouteRuleScope {
+        OwnedRouteRuleScope::new(RouteSteeringIpFamily::Ipv4, 1000, 42, Some(10), 900).unwrap()
+    }
+
+    fn collection_route(host: u8) -> RouteRequest {
+        RouteRequest {
+            destination: prefix([198, 51, 100, host], 32),
+            oif_ifindex: 42,
+            table: 1000,
+            priority: Some(10),
+        }
+    }
+
+    fn collection_rule(host: u8) -> RuleRequest {
+        RuleRequest {
+            source: Some(prefix([192, 0, 2, host], 32)),
+            destination: None,
+            fwmark: None,
+            table: 1000,
+            priority: 900,
+        }
+    }
+
+    fn ipv6_collection_scope() -> OwnedRouteRuleScope {
+        OwnedRouteRuleScope::new(RouteSteeringIpFamily::Ipv6, 1000, 42, Some(10), 900).unwrap()
+    }
+
+    fn ipv6_collection_route() -> RouteRequest {
+        RouteRequest {
+            destination: IpPrefix::new(IpAddr::V6("2001:db8:100::10".parse().unwrap()), 128),
+            oif_ifindex: 42,
+            table: 1000,
+            priority: Some(10),
+        }
+    }
+
+    fn ipv6_collection_rule() -> RuleRequest {
+        RuleRequest {
+            source: Some(IpPrefix::new(
+                IpAddr::V6("2001:db8:200::10".parse().unwrap()),
+                128,
+            )),
+            destination: None,
+            fwmark: None,
+            table: 1000,
+            priority: 900,
         }
     }
 
@@ -2972,7 +4014,6 @@ mod tests {
                 ..
             })
         ));
-
         for (source, destination, field) in [
             (Some(prefix([0, 0, 0, 0], 0)), None, "rule.source"),
             (None, Some(prefix([0, 0, 0, 0], 0)), "rule.destination"),
@@ -3148,6 +4189,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collection_attempt_capability_is_not_marker_attestation() {
+        for evidence in [
+            LinuxRuleProtocolCapability::Unknown,
+            LinuxRuleProtocolCapability::ExpectedByKernelVersion,
+        ] {
+            let backend = LinuxRouteSteeringBackend::with_transport(CapturingTransport {
+                rule_protocol_capability: evidence,
+                ..CapturingTransport::default()
+            });
+
+            assert_eq!(backend.rule_protocol_capability(), evidence);
+            assert_ne!(evidence, LinuxRuleProtocolCapability::Confirmed);
+            assert!(backend.capabilities().await.owned_route_rule_collection);
+        }
+    }
+
+    #[tokio::test]
     async fn known_unsupported_rule_protocol_fails_before_any_mutation() {
         let transport = CapturingTransport {
             rule_protocol_capability: LinuxRuleProtocolCapability::UnsupportedByKernelVersion,
@@ -3177,6 +4235,7 @@ mod tests {
         assert!(capabilities.conflict_safe_route_convergence);
         assert!(!capabilities.conflict_safe_rule_convergence);
         assert!(!capabilities.paired_convergence);
+        assert!(!capabilities.owned_route_rule_collection);
     }
 
     #[tokio::test]
@@ -3226,6 +4285,7 @@ mod tests {
                 backend.rule_protocol_capability(),
                 LinuxRuleProtocolCapability::UnsupportedByKernelRejection
             );
+            assert!(!backend.capabilities().await.owned_route_rule_collection);
             assert_eq!(
                 transport
                     .requests()
@@ -3274,6 +4334,7 @@ mod tests {
                 backend.rule_protocol_capability(),
                 LinuxRuleProtocolCapability::Confirmed
             );
+            assert!(backend.capabilities().await.owned_route_rule_collection);
 
             let error = backend.converge_rule(failed).await.unwrap_err();
             assert_eq!(error.class(), expected_class);
@@ -3331,6 +4392,7 @@ mod tests {
                     backend.rule_protocol_capability(),
                     LinuxRuleProtocolCapability::Unknown
                 );
+                assert!(backend.capabilities().await.owned_route_rule_collection);
             }
             assert_eq!(
                 transport
@@ -3363,6 +4425,7 @@ mod tests {
             backend.rule_protocol_capability(),
             LinuxRuleProtocolCapability::UnsupportedByReadback
         );
+        assert!(!backend.capabilities().await.owned_route_rule_collection);
         assert_eq!(
             transport
                 .requests()
@@ -3396,6 +4459,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn substituted_rule_protocol_is_rolled_back_and_cached_unsupported() {
+        let mut substituted = encode_rule_request(&rule()).unwrap();
+        set_attr_u8(&mut substituted, FIB_RULE_HEADER_LEN, FRA_PROTOCOL, 0);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(vec![substituted])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+
+        assert!(matches!(
+            backend.converge_rule(rule()).await.unwrap(),
+            RuleConvergenceOutcome::ConflictAfterOwnedRollback(_)
+        ));
+        assert_eq!(
+            backend.rule_protocol_capability(),
+            LinuxRuleProtocolCapability::UnsupportedByReadback
+        );
+        let requests = transport.requests();
+        let delete = requests
+            .iter()
+            .find(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE)
+            .unwrap();
+        assert!(attr_payload(netlink_body(delete), FIB_RULE_HEADER_LEN, FRA_PROTOCOL).is_none());
+    }
+
+    #[tokio::test]
     async fn indeterminate_post_create_readback_still_rolls_back_attempt_owned_rule() {
         let transport = ScriptedTransport::new(vec![
             ScriptedResponse::Dump(Ok(Vec::new())),
@@ -3421,23 +4513,34 @@ mod tests {
 
     #[test]
     fn parses_ack_and_errno_mapping() {
-        assert_eq!(parse_netlink_response(&ack(7), 7).unwrap(), None);
+        assert!(parse_netlink_ack_datagram(&ack(7), 7).unwrap());
         assert!(matches!(
-            parse_netlink_response(&netlink_error(8, 17), 8).unwrap_err(),
+            parse_netlink_ack_datagram(&netlink_error(8, 17), 8).unwrap_err(),
             RouteSteeringError::AlreadyExists
         ));
         assert!(matches!(
-            parse_netlink_response(&netlink_error(9, ENOENT), 9).unwrap_err(),
+            parse_netlink_ack_datagram(&netlink_error(9, ENOENT), 9).unwrap_err(),
             RouteSteeringError::NotFound
         ));
         assert!(matches!(
-            parse_netlink_response(&netlink_error(10, EOPNOTSUPP), 10).unwrap_err(),
+            parse_netlink_ack_datagram(&netlink_error(10, EOPNOTSUPP), 10).unwrap_err(),
             RouteSteeringError::UnsupportedPlatform
         ));
         assert!(matches!(
-            parse_netlink_response(&netlink_error(11, EAFNOSUPPORT), 11).unwrap_err(),
+            parse_netlink_ack_datagram(&netlink_error(11, EAFNOSUPPORT), 11).unwrap_err(),
             RouteSteeringError::UnsupportedPlatform
         ));
+
+        assert!(!parse_netlink_ack_datagram(&[], 12).unwrap());
+        let noop = encode_netlink_message(NLMSG_NOOP, 0, 12, &[]).unwrap();
+        assert!(!parse_netlink_ack_datagram(&noop, 12).unwrap());
+        let done = encode_netlink_message(NLMSG_DONE, 0, 12, &[]).unwrap();
+        assert!(parse_netlink_ack_datagram(&done, 12).is_err());
+        let payload = encode_netlink_message(RTM_NEWROUTE, 0, 12, &[]).unwrap();
+        assert!(parse_netlink_ack_datagram(&payload, 12).is_err());
+        let mut duplicate = ack(12);
+        duplicate.extend_from_slice(&ack(12));
+        assert!(parse_netlink_ack_datagram(&duplicate, 12).is_err());
     }
 
     #[tokio::test]
@@ -3901,6 +5004,58 @@ mod tests {
     }
 
     #[test]
+    fn collection_dump_envelope_accounts_fifty_thousand_multipart_messages() {
+        const MESSAGE_COUNT: usize = 50_000;
+        const MESSAGES_PER_DATAGRAM: usize = 512;
+
+        let sequence = 91;
+        let limits: LinuxNetlinkDumpLimits = LinuxOwnedRouteRuleCollectionLimits::default().into();
+        let message = encode_netlink_message(
+            RTM_NEWRULE,
+            NLM_F_MULTI,
+            sequence,
+            &[0; FIB_RULE_HEADER_LEN],
+        )
+        .unwrap();
+        let mut messages = Vec::with_capacity(MESSAGE_COUNT);
+        let mut datagrams = 0;
+        let mut total_bytes = 0;
+        let mut remaining = MESSAGE_COUNT;
+        while remaining != 0 {
+            let count = remaining.min(MESSAGES_PER_DATAGRAM);
+            let mut datagram = Vec::with_capacity(message.len() * count);
+            for _ in 0..count {
+                datagram.extend_from_slice(&message);
+            }
+            account_dump_datagram(&mut datagrams, &mut total_bytes, datagram.len(), limits)
+                .unwrap();
+            assert!(!parse_dump_datagram(
+                &datagram,
+                sequence,
+                RTM_NEWRULE,
+                limits.max_messages,
+                &mut messages,
+            )
+            .unwrap());
+            remaining -= count;
+        }
+
+        let done = encode_netlink_message(NLMSG_DONE, NLM_F_MULTI, sequence, &[]).unwrap();
+        account_dump_datagram(&mut datagrams, &mut total_bytes, done.len(), limits).unwrap();
+        assert!(parse_dump_datagram(
+            &done,
+            sequence,
+            RTM_NEWRULE,
+            limits.max_messages,
+            &mut messages,
+        )
+        .unwrap());
+        assert_eq!(messages.len(), MESSAGE_COUNT);
+        assert!(datagrams <= limits.max_datagrams);
+        assert!(total_bytes <= limits.max_bytes);
+    }
+
+    #[test]
     fn readback_datagram_and_byte_bounds_fail_closed() {
         let limits = LinuxRouteReadbackLimits {
             max_datagrams: 1,
@@ -3909,9 +5064,9 @@ mod tests {
         };
         let mut datagrams = 0;
         let mut bytes = 0;
-        account_dump_datagram(&mut datagrams, &mut bytes, 32, limits).unwrap();
+        account_dump_datagram(&mut datagrams, &mut bytes, 32, limits.into()).unwrap();
         assert!(matches!(
-            account_dump_datagram(&mut datagrams, &mut bytes, 1, limits),
+            account_dump_datagram(&mut datagrams, &mut bytes, 1, limits.into()),
             Err(RouteSteeringError::ReadbackIndeterminate {
                 reason: ReadbackIndeterminateReason::LimitExceeded
             })
@@ -3925,7 +5080,7 @@ mod tests {
         let mut datagrams = 0;
         let mut bytes = 0;
         assert!(matches!(
-            account_dump_datagram(&mut datagrams, &mut bytes, 65, limits),
+            account_dump_datagram(&mut datagrams, &mut bytes, 65, limits.into()),
             Err(RouteSteeringError::ReadbackIndeterminate {
                 reason: ReadbackIndeterminateReason::LimitExceeded
             })
@@ -3946,6 +5101,41 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn owned_collection_dump_limits_can_only_tighten_the_hard_envelope() {
+        let defaults = LinuxOwnedRouteRuleCollectionLimits::default();
+        let oversized = [
+            (
+                LinuxOwnedRouteRuleCollectionLimits {
+                    max_datagrams: MAX_OWNED_COLLECTION_DUMP_DATAGRAMS + 1,
+                    ..defaults
+                },
+                "linux.owned_collection_max_datagrams",
+            ),
+            (
+                LinuxOwnedRouteRuleCollectionLimits {
+                    max_messages: MAX_OWNED_COLLECTION_DUMP_MESSAGES + 1,
+                    ..defaults
+                },
+                "linux.owned_collection_max_messages",
+            ),
+            (
+                LinuxOwnedRouteRuleCollectionLimits {
+                    max_bytes: MAX_OWNED_COLLECTION_DUMP_BYTES + 1,
+                    ..defaults
+                },
+                "linux.owned_collection_max_bytes",
+            ),
+        ];
+
+        for (limits, expected_field) in oversized {
+            assert!(matches!(
+                validate_owned_collection_config(LinuxRouteSteeringBackendConfig::default(), limits),
+                Err(RouteSteeringError::InvalidConfig { field, .. }) if field == expected_field
+            ));
+        }
     }
 
     #[tokio::test]
@@ -4242,6 +5432,732 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linux_owned_collection_installs_retries_and_removes_same_priority_siblings() {
+        let first = collection_rule(10);
+        let second = collection_rule(11);
+        let first_body = encode_rule_request(&first).unwrap();
+        let second_body = encode_rule_request(&second).unwrap();
+        let both = vec![first_body, second_body.clone()];
+        let only_second = vec![second_body];
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(both.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(both.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(both.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(both.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(both.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(both.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(both)),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(only_second.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(only_second)),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired = OwnedRouteRuleSet::new(
+            collection_scope(),
+            Vec::new(),
+            vec![first.clone(), second.clone()],
+        )
+        .unwrap();
+
+        let installed = backend
+            .reconcile_owned_route_rules(desired.clone())
+            .await
+            .unwrap();
+        assert_eq!(installed.installed_rules, 2);
+        assert_eq!(installed.snapshot.rules(), &[first.clone(), second.clone()]);
+        let retried = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(retried.installed_rules, 0);
+        assert_eq!(retried.retained_rules, 2);
+
+        let reduced =
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), vec![second.clone()]).unwrap();
+        let removed = backend.reconcile_owned_route_rules(reduced).await.unwrap();
+        assert_eq!(removed.removed_rules, 1);
+        assert_eq!(removed.snapshot.rules(), &[second]);
+
+        let delete_requests = transport
+            .requests()
+            .into_iter()
+            .filter(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE)
+            .collect::<Vec<_>>();
+        assert_eq!(delete_requests.len(), 1);
+        let deleted = parse_rule_candidate(netlink_body(&delete_requests[0]))
+            .unwrap()
+            .and_then(|candidate| candidate.resident)
+            .unwrap();
+        assert_eq!(deleted, first);
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_restart_gc_installs_before_rule_then_route_orphans() {
+        let stale_route = collection_route(10);
+        let desired_route = collection_route(11);
+        let stale_rule = collection_rule(10);
+        let desired_rule = collection_rule(11);
+        let stale_route_body = encode_route_request(&stale_route).unwrap();
+        let desired_route_body = encode_route_request(&desired_route).unwrap();
+        let stale_rule_body = encode_rule_request(&stale_rule).unwrap();
+        let desired_rule_body = encode_rule_request(&desired_rule).unwrap();
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(vec![stale_route_body.clone()])),
+            ScriptedResponse::Dump(Ok(vec![stale_rule_body.clone()])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(vec![
+                stale_route_body.clone(),
+                desired_route_body.clone(),
+            ])),
+            ScriptedResponse::Dump(Ok(vec![stale_rule_body.clone(), desired_rule_body.clone()])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(vec![
+                stale_route_body.clone(),
+                desired_route_body.clone(),
+            ])),
+            ScriptedResponse::Dump(Ok(vec![desired_rule_body.clone()])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(vec![desired_route_body])),
+            ScriptedResponse::Dump(Ok(vec![desired_rule_body])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired = OwnedRouteRuleSet::new(
+            collection_scope(),
+            vec![desired_route.clone()],
+            vec![desired_rule.clone()],
+        )
+        .unwrap();
+
+        let outcome = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(outcome.installed_routes, 1);
+        assert_eq!(outcome.installed_rules, 1);
+        assert_eq!(outcome.removed_routes, 1);
+        assert_eq!(outcome.removed_rules, 1);
+        assert_eq!(outcome.snapshot.routes(), &[desired_route]);
+        assert_eq!(outcome.snapshot.rules(), &[desired_rule]);
+        let mutations = transport
+            .requests()
+            .iter()
+            .filter_map(|request| {
+                let message_type = read_u16_ne(request, 4).ok()?;
+                matches!(
+                    message_type,
+                    RTM_NEWROUTE | RTM_NEWRULE | RTM_DELROUTE | RTM_DELRULE
+                )
+                .then_some(message_type)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutations,
+            vec![RTM_NEWROUTE, RTM_NEWRULE, RTM_DELRULE, RTM_DELROUTE]
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_restart_recovers_resident_state_above_final_limit() {
+        let orphan = collection_rule(10);
+        let first = collection_rule(11);
+        let second = collection_rule(12);
+        let orphan_body = encode_rule_request(&orphan).unwrap();
+        let first_body = encode_rule_request(&first).unwrap();
+        let second_body = encode_rule_request(&second).unwrap();
+        let transient = vec![orphan_body, first_body.clone(), second_body.clone()];
+        let final_rules = vec![first_body, second_body];
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(transient.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(transient)),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(final_rules.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(final_rules)),
+        ]);
+        let limits = LinuxOwnedRouteRuleCollectionLimits {
+            max_owned_routes: 2,
+            max_owned_rules: 2,
+            max_transient_owned_routes: 4,
+            max_transient_owned_rules: 4,
+            ..LinuxOwnedRouteRuleCollectionLimits::default()
+        };
+        let backend = LinuxRouteSteeringBackend::with_transport_and_collection_limits(
+            transport.clone(),
+            limits,
+        );
+        let desired =
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), vec![first, second]).unwrap();
+
+        let outcome = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(outcome.retained_rules, 2);
+        assert_eq!(outcome.installed_rules, 0);
+        assert_eq!(outcome.removed_rules, 1);
+        assert_eq!(outcome.snapshot.rules().len(), 2);
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .filter(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_cross_set_overlap_fails_before_create_and_on_retry() {
+        let resident = collection_rule(10);
+        let resident_body = encode_rule_request(&resident).unwrap();
+        let desired_rule = RuleRequest {
+            source: Some(prefix([192, 0, 2, 0], 24)),
+            destination: None,
+            fwmark: None,
+            table: 1000,
+            priority: 900,
+        };
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![resident_body.clone()])),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![resident_body])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired =
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), vec![desired_rule]).unwrap();
+
+        for desired in [desired.clone(), desired] {
+            assert!(matches!(
+                backend.reconcile_owned_route_rules(desired).await,
+                Err(RouteSteeringError::InvalidConfig {
+                    field: "owned.rules",
+                    ..
+                })
+            ));
+        }
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests
+            .iter()
+            .all(|request| matches!(read_u16_ne(request, 4).unwrap(), RTM_GETROUTE | RTM_GETRULE)));
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_foreign_same_priority_rule_blocks_mutation() {
+        let owned = collection_rule(10);
+        let mut foreign = encode_rule_request(&collection_rule(11)).unwrap();
+        set_attr_u8(&mut foreign, FIB_RULE_HEADER_LEN, FRA_PROTOCOL, 99);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![encode_rule_request(&owned).unwrap(), foreign])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired = OwnedRouteRuleSet::new(collection_scope(), Vec::new(), vec![owned]).unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired).await,
+            Err(RouteSteeringError::AlreadyExists)
+        ));
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_duplicate_wildcard_and_unrepresented_rules_fail_closed() {
+        let exact = collection_rule(10);
+        let exact_body = encode_rule_request(&exact).unwrap();
+        let wildcard = RuleRequest {
+            source: Some(prefix([0, 0, 0, 0], 0)),
+            destination: None,
+            fwmark: None,
+            table: 1000,
+            priority: 900,
+        };
+        let wildcard_body =
+            encode_rule_request_with_protocol(&wildcard, Some(LINUX_ROUTE_STEERING_PROTOCOL))
+                .unwrap();
+        let mut unrepresented = exact_body.clone();
+        append_attr_u32_ne(&mut unrepresented, 0x3ffe, 1).unwrap();
+        for rule_bodies in [
+            vec![exact_body.clone(), exact_body.clone()],
+            vec![wildcard_body],
+            vec![unrepresented],
+        ] {
+            let transport = ScriptedTransport::new(vec![
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Dump(Ok(rule_bodies)),
+            ]);
+            let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+
+            assert!(matches!(
+                backend.snapshot_owned_route_rules(collection_scope()).await,
+                Err(RouteSteeringError::ReadbackIndeterminate {
+                    reason: ReadbackIndeterminateReason::UnrepresentableObject,
+                })
+            ));
+            assert_eq!(transport.requests().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_ignores_unrepresentable_objects_proven_outside_scope() {
+        let mut other_route = collection_route(20);
+        other_route.table = 2000;
+        let mut other_route_body = encode_route_request(&other_route).unwrap();
+        remove_attr(&mut other_route_body, ROUTE_MESSAGE_LEN, RTA_OIF);
+        append_attr_u32_ne(&mut other_route_body, 0x3ffe, 1).unwrap();
+
+        let mut zero_priority_rule = encode_rule_request(&collection_rule(20)).unwrap();
+        remove_attr(&mut zero_priority_rule, FIB_RULE_HEADER_LEN, FRA_PRIORITY);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(vec![other_route_body])),
+            ScriptedResponse::Dump(Ok(vec![zero_priority_rule])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+
+        let snapshot = backend
+            .snapshot_owned_route_rules(collection_scope())
+            .await
+            .unwrap();
+        assert!(snapshot.routes().is_empty());
+        assert!(snapshot.rules().is_empty());
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_reconciles_ipv6_route_and_rule() {
+        let expected_route = ipv6_collection_route();
+        let expected_rule = ipv6_collection_rule();
+        let route_body = encode_route_request(&expected_route).unwrap();
+        let rule_body = encode_rule_request(&expected_rule).unwrap();
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(vec![route_body.clone()])),
+            ScriptedResponse::Dump(Ok(vec![rule_body.clone()])),
+            ScriptedResponse::Dump(Ok(vec![route_body])),
+            ScriptedResponse::Dump(Ok(vec![rule_body])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport);
+        let desired = OwnedRouteRuleSet::new(
+            ipv6_collection_scope(),
+            vec![expected_route.clone()],
+            vec![expected_rule.clone()],
+        )
+        .unwrap();
+
+        let outcome = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(outcome.installed_routes, 1);
+        assert_eq!(outcome.installed_rules, 1);
+        assert_eq!(outcome.snapshot.routes(), &[expected_route]);
+        assert_eq!(outcome.snapshot.rules(), &[expected_rule]);
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_post_delete_snapshot_requires_sibling_preservation() {
+        let removed = collection_rule(10);
+        let sibling = collection_rule(11);
+        let both = vec![
+            encode_rule_request(&removed).unwrap(),
+            encode_rule_request(&sibling).unwrap(),
+        ];
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(both.clone())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(both)),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired =
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), vec![sibling]).unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired).await,
+            Err(RouteSteeringError::ReconcileIncomplete {
+                phase: OwnedRouteRuleReconcilePhase::RemoveRules,
+                removed_rules: 1,
+                failure: RouteSteeringFailureClass::ReadbackIndeterminate,
+                ..
+            })
+        ));
+        let deletes = transport
+            .requests()
+            .into_iter()
+            .filter(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE)
+            .collect::<Vec<_>>();
+        assert_eq!(deletes.len(), 1);
+        let deleted = parse_rule_candidate(netlink_body(&deletes[0]))
+            .unwrap()
+            .and_then(|candidate| candidate.resident)
+            .unwrap();
+        assert_eq!(deleted, removed);
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_marker_discard_rollback_preserves_owned_sibling() {
+        let sibling = collection_rule(10);
+        let attempted = collection_rule(11);
+        let sibling_body = encode_rule_request(&sibling).unwrap();
+        let mut untagged_attempt = encode_rule_request(&attempted).unwrap();
+        remove_attr(&mut untagged_attempt, FIB_RULE_HEADER_LEN, FRA_PROTOCOL);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![sibling_body.clone()])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![sibling_body.clone(), untagged_attempt])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![sibling_body])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired = OwnedRouteRuleSet::new(
+            collection_scope(),
+            Vec::new(),
+            vec![sibling, attempted.clone()],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired).await,
+            Err(RouteSteeringError::ReconcileIncomplete {
+                phase: OwnedRouteRuleReconcilePhase::VerifyDesired,
+                installed_rules: 1,
+                ..
+            })
+        ));
+        let requests = transport.requests();
+        let delete = requests
+            .iter()
+            .find(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE)
+            .unwrap();
+        assert!(attr_payload(netlink_body(delete), FIB_RULE_HEADER_LEN, FRA_PROTOCOL).is_none());
+        let deleted = parse_rule_candidate(netlink_body(delete))
+            .unwrap()
+            .and_then(|candidate| candidate.resident)
+            .unwrap();
+        assert_eq!(deleted, attempted);
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_zero_substituted_marker_uses_legacy_exact_rollback() {
+        let attempted = collection_rule(11);
+        let mut substituted_attempt = encode_rule_request(&attempted).unwrap();
+        set_attr_u8(
+            &mut substituted_attempt,
+            FIB_RULE_HEADER_LEN,
+            FRA_PROTOCOL,
+            0,
+        );
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![substituted_attempt])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired =
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), vec![attempted.clone()])
+                .unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired).await,
+            Err(RouteSteeringError::ReconcileIncomplete {
+                phase: OwnedRouteRuleReconcilePhase::VerifyDesired,
+                installed_rules: 1,
+                failure: RouteSteeringFailureClass::AlreadyExists,
+                rollback_failure: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            backend.rule_protocol_capability(),
+            LinuxRuleProtocolCapability::UnsupportedByReadback
+        );
+        let requests = transport.requests();
+        let delete = requests
+            .iter()
+            .find(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE)
+            .unwrap();
+        assert!(attr_payload(netlink_body(delete), FIB_RULE_HEADER_LEN, FRA_PROTOCOL).is_none());
+        let deleted = parse_rule_candidate(netlink_body(delete))
+            .unwrap()
+            .and_then(|candidate| candidate.resident)
+            .unwrap();
+        assert_eq!(deleted, attempted);
+    }
+
+    #[tokio::test]
+    async fn linux_owned_collection_duplicate_marker_mismatch_never_uses_broad_rollback() {
+        let attempted = collection_rule(11);
+        let tagged_attempt = encode_rule_request(&attempted).unwrap();
+        let mut untagged_attempt = tagged_attempt.clone();
+        remove_attr(&mut untagged_attempt, FIB_RULE_HEADER_LEN, FRA_PROTOCOL);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![tagged_attempt, untagged_attempt.clone()])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![untagged_attempt])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired =
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), vec![attempted.clone()])
+                .unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired).await,
+            Err(RouteSteeringError::ReconcileIncomplete {
+                phase: OwnedRouteRuleReconcilePhase::VerifyDesired,
+                installed_rules: 1,
+                failure: RouteSteeringFailureClass::AlreadyExists,
+                rollback_failure: Some(RouteSteeringFailureClass::ReadbackIndeterminate),
+                ..
+            })
+        ));
+        let requests = transport.requests();
+        let delete = requests
+            .iter()
+            .find(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE)
+            .unwrap();
+        assert_eq!(
+            attr_payload(netlink_body(delete), FIB_RULE_HEADER_LEN, FRA_PROTOCOL),
+            Some(&[LINUX_ROUTE_STEERING_PROTOCOL][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_collection_route_create_ack_loss_never_rolls_back_and_retry_adopts() {
+        let desired_route = collection_route(10);
+        let route_body = encode_route_request(&desired_route).unwrap();
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Err(RouteSteeringError::io(
+                "install_route",
+                io::Error::new(io::ErrorKind::TimedOut, "synthetic applied ack loss"),
+            ))),
+            ScriptedResponse::Dump(Ok(vec![route_body.clone()])),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![route_body.clone()])),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![route_body])),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired =
+            OwnedRouteRuleSet::new(collection_scope(), vec![desired_route], Vec::new()).unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired.clone()).await,
+            Err(RouteSteeringError::ReconcileIncomplete {
+                phase: OwnedRouteRuleReconcilePhase::InstallRoutes,
+                installed_routes: 0,
+                ..
+            })
+        ));
+        let retried = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(retried.retained_routes, 1);
+        assert!(!transport
+            .requests()
+            .iter()
+            .any(|request| read_u16_ne(request, 4).unwrap() == RTM_DELROUTE));
+    }
+
+    #[tokio::test]
+    async fn owned_collection_rule_create_ack_loss_never_rolls_back_and_retry_adopts() {
+        let desired_rule = collection_rule(10);
+        let rule_body = encode_rule_request(&desired_rule).unwrap();
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Err(RouteSteeringError::io(
+                "install_rule",
+                io::Error::new(io::ErrorKind::TimedOut, "synthetic applied ack loss"),
+            ))),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![rule_body.clone()])),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![rule_body.clone()])),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![rule_body])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired =
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), vec![desired_rule]).unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired.clone()).await,
+            Err(RouteSteeringError::ReconcileIncomplete {
+                phase: OwnedRouteRuleReconcilePhase::InstallRules,
+                installed_rules: 0,
+                ..
+            })
+        ));
+        let retried = backend.reconcile_owned_route_rules(desired).await.unwrap();
+        assert_eq!(retried.retained_rules, 1);
+        assert!(!transport
+            .requests()
+            .iter()
+            .any(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE));
+    }
+
+    #[tokio::test]
+    async fn owned_collection_rollback_ack_loss_stops_after_authoritative_snapshot() {
+        let sibling = collection_rule(10);
+        let attempted = collection_rule(11);
+        let sibling_body = encode_rule_request(&sibling).unwrap();
+        let mut untagged_attempt = encode_rule_request(&attempted).unwrap();
+        remove_attr(&mut untagged_attempt, FIB_RULE_HEADER_LEN, FRA_PROTOCOL);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![sibling_body.clone()])),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![sibling_body.clone(), untagged_attempt])),
+            ScriptedResponse::Transaction(Err(RouteSteeringError::io(
+                "rollback_owned_collection_rule",
+                io::Error::new(io::ErrorKind::TimedOut, "synthetic applied ack loss"),
+            ))),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(vec![sibling_body])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired = OwnedRouteRuleSet::new(
+            collection_scope(),
+            Vec::new(),
+            vec![sibling, attempted.clone()],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(desired).await,
+            Err(RouteSteeringError::ReconcileIncomplete {
+                phase: OwnedRouteRuleReconcilePhase::VerifyDesired,
+                installed_rules: 1,
+                failure: RouteSteeringFailureClass::AlreadyExists,
+                rollback_failure: Some(RouteSteeringFailureClass::Io),
+                ..
+            })
+        ));
+        let deletes = transport
+            .requests()
+            .into_iter()
+            .filter(|request| read_u16_ne(request, 4).unwrap() == RTM_DELRULE)
+            .collect::<Vec<_>>();
+        assert_eq!(deletes.len(), 1);
+        let deleted = parse_rule_candidate(netlink_body(&deletes[0]))
+            .unwrap()
+            .and_then(|candidate| candidate.resident)
+            .unwrap();
+        assert_eq!(deleted, attempted);
+    }
+
+    #[tokio::test]
+    async fn linux_owned_snapshot_accepts_fifty_thousand_pairs_in_two_bounded_dumps() {
+        let scope =
+            OwnedRouteRuleScope::new(RouteSteeringIpFamily::Ipv4, 2000, 42, Some(10), 900).unwrap();
+        let base = u32::from(Ipv4Addr::new(198, 18, 0, 0));
+        let mut routes = Vec::with_capacity(MAX_OWNED_ROUTE_COLLECTION_ENTRIES);
+        let mut rules = Vec::with_capacity(MAX_OWNED_RULE_COLLECTION_ENTRIES);
+        for offset in 0..MAX_OWNED_ROUTE_COLLECTION_ENTRIES {
+            let address = IpAddr::V4(Ipv4Addr::from(base + u32::try_from(offset).unwrap()));
+            let prefix = IpPrefix::new(address, 32);
+            routes.push(
+                encode_route_request(&RouteRequest {
+                    destination: prefix,
+                    oif_ifindex: 42,
+                    table: 2000,
+                    priority: Some(10),
+                })
+                .unwrap(),
+            );
+            rules.push(
+                encode_rule_request(&RuleRequest {
+                    source: Some(prefix),
+                    destination: None,
+                    fwmark: None,
+                    table: 2000,
+                    priority: 900,
+                })
+                .unwrap(),
+            );
+        }
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(routes)),
+            ScriptedResponse::Dump(Ok(rules)),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+
+        let snapshot = backend.snapshot_owned_route_rules(scope).await.unwrap();
+        assert_eq!(snapshot.routes().len(), 50_000);
+        assert_eq!(snapshot.rules().len(), 50_000);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(netlink_body(&requests[0])[0], AF_UNSPEC);
+        assert_eq!(netlink_body(&requests[1])[0], AF_UNSPEC);
+        assert_eq!(read_u16_ne(&requests[0], 4).unwrap(), RTM_GETROUTE);
+        assert_eq!(read_u16_ne(&requests[1], 4).unwrap(), RTM_GETRULE);
+    }
+
+    #[test]
+    fn linux_owned_classifier_accepts_install_first_transient_union_above_final_bound() {
+        const SET_SIZE: usize = 25_001;
+
+        let scope =
+            OwnedRouteRuleScope::new(RouteSteeringIpFamily::Ipv4, 2000, 42, Some(10), 900).unwrap();
+        let base = u32::from(Ipv4Addr::new(198, 18, 0, 0));
+        let mut transient_rules = Vec::with_capacity(SET_SIZE * 2);
+        for offset in 0..(SET_SIZE * 2) {
+            let address = IpAddr::V4(Ipv4Addr::from(base + u32::try_from(offset).unwrap()));
+            transient_rules.push(
+                encode_rule_request(&RuleRequest {
+                    source: Some(IpPrefix::new(address, 32)),
+                    destination: None,
+                    fwmark: None,
+                    table: 2000,
+                    priority: 900,
+                })
+                .unwrap(),
+            );
+        }
+
+        let state = classify_owned_collection(
+            scope,
+            &[],
+            &transient_rules,
+            MAX_TRANSIENT_OWNED_ROUTE_COLLECTION_ENTRIES,
+            MAX_TRANSIENT_OWNED_RULE_COLLECTION_ENTRIES,
+        )
+        .unwrap();
+        assert_eq!(state.snapshot.rules().len(), SET_SIZE * 2);
+        assert!(
+            OwnedRouteRuleSnapshot::new(scope, Vec::new(), state.snapshot.rules().to_vec(),)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn cancelling_waiter_does_not_cancel_linux_owned_rollback_worker() {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -4250,6 +6166,10 @@ mod tests {
             rule_started: started_tx,
             release_rule: Arc::new(Mutex::new(release_rx)),
             route_present: Arc::new(AtomicBool::new(false)),
+            rule_present: Arc::new(AtomicBool::new(false)),
+            complete_rule_install: false,
+            resident_route: route(),
+            resident_rule: rule(),
         };
         let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
         let worker_backend = backend.clone();
@@ -4287,5 +6207,73 @@ mod tests {
                 RTM_GETROUTE,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_waiter_does_not_cancel_serialized_owned_collection_reconcile() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let desired_route = collection_route(10);
+        let desired_rule = collection_rule(10);
+        let transport = CancellationTransport {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            rule_started: started_tx,
+            release_rule: Arc::new(Mutex::new(release_rx)),
+            route_present: Arc::new(AtomicBool::new(false)),
+            rule_present: Arc::new(AtomicBool::new(false)),
+            complete_rule_install: true,
+            resident_route: desired_route.clone(),
+            resident_rule: desired_rule.clone(),
+        };
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired = OwnedRouteRuleSet::new(
+            collection_scope(),
+            vec![desired_route.clone()],
+            vec![desired_rule.clone()],
+        )
+        .unwrap();
+        let worker_backend = backend.clone();
+        let task =
+            tokio::spawn(async move { worker_backend.reconcile_owned_route_rules(desired).await });
+
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        let follower =
+            tokio::spawn(
+                async move { backend.snapshot_owned_route_rules(collection_scope()).await },
+            );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(transport.requests().len(), 4);
+        release_tx.send(()).unwrap();
+
+        let snapshot = follower.await.unwrap().unwrap();
+        assert_eq!(snapshot.routes(), &[desired_route]);
+        assert_eq!(snapshot.rules(), &[desired_rule]);
+        let message_types = transport
+            .requests()
+            .iter()
+            .map(|request| u16::from_ne_bytes([request[4], request[5]]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            message_types,
+            vec![
+                RTM_GETROUTE,
+                RTM_GETRULE,
+                RTM_NEWROUTE,
+                RTM_NEWRULE,
+                RTM_GETROUTE,
+                RTM_GETRULE,
+                RTM_GETROUTE,
+                RTM_GETRULE,
+                RTM_GETROUTE,
+                RTM_GETRULE,
+            ]
+        );
+        assert!(!message_types
+            .iter()
+            .any(|message_type| matches!(*message_type, RTM_DELROUTE | RTM_DELRULE)));
     }
 }

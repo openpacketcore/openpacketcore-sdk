@@ -221,6 +221,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Added
+- **Authoritative owned route/rule collection reconciliation —
+  `opc-route-steering`:** additive `OwnedRouteRuleScope`,
+  `OwnedRouteRuleSet`, and `OwnedRouteRuleSnapshot` APIs let Linux and mock
+  backends enumerate and reconcile one complete, explicitly allocated
+  protocol-`242` writer scope. Same-family/same-priority rules can now coexist
+  when they are source-only, non-wildcard, and provably prefix-disjoint; exact
+  duplicates, overlap, unrepresentable owned state, wildcard selectors, and
+  ambiguous or foreign target collisions fail closed. Reconciliation takes
+  bounded complete snapshots, installs and verifies all desired objects before
+  garbage collection, removes orphan rules before routes, and finishes with an
+  exact snapshot, allowing a restarted process to remove stale owned state
+  without retained in-memory attempt history. It is serialized among clones of
+  one backend, but separate instances are not serialized and the operation is
+  not kernel-atomic. Partial or uncertain completion returns typed redaction-safe
+  `ReconcileIncomplete` phase/count evidence, including a separate typed
+  rollback-failure classification when attempted cleanup is incomplete, and
+  never treats an incomplete dump as proof of absence. Mutation progress is
+  counted only after exactly one matching zero-error netlink ACK; missing,
+  duplicate, `DONE`, or arbitrary transaction replies fail closed. Desired and
+  final sets admit at most `50,000` routes and `50,000` rules each; the
+  install-before-delete old∪new intermediate admits at most `100,000` routes
+  and `100,000` rules. Reconciliation's initial recovery snapshot accepts that
+  transient bound so a restart can garbage-collect an interrupted old∪new
+  residual; public and successful final snapshots retain the lower bound. The
+  default Linux hard envelope for each complete dump is `65,535` datagrams,
+  `131,072` decoded messages, and `64 MiB` of aggregate reply bytes.
+  Default-limit synthetic Linux gates classify `50,000` owned routes plus
+  `50,000` source-disjoint, same-priority owned rules returned by exactly one
+  `AF_UNSPEC` route-dump request and one `AF_UNSPEC` rule-dump request, and
+  separately pass `50,000` multipart messages through the production
+  byte/datagram/message accounting parser. This proves bounded snapshot
+  enumeration capacity, not `50,000` kernel mutations, atomic application, or
+  end-to-end reconciliation throughput. The mock covers the same collection
+  semantics without per-key reads; it does not broaden that kernel evidence.
+  The new `owned_route_rule_collection` attempt capability is separate from
+  singleton and legacy mutation support. On Linux it permits a fail-closed,
+  self-verifying bootstrap and is not `FRA_PROTOCOL` retention attestation;
+  only `LinuxRuleProtocolCapability::Confirmed` records positive tagged
+  readback, while cached rejection/discard disables later attempts. Protocol
+  `242` remains a namespace-local
+  reservation rather than authentication, so the declared scope requires one
+  exclusive orchestrated writer. Existing singleton convergence and
+  static/untagged legacy APIs retain their behavior.
 - **Conflict-safe route/rule convergence — `opc-route-steering`,
   `opc-linux-route-sys`:** backend-neutral typed readback and convergence now
   distinguish newly installed, exact resident, conflicting, and indeterminate

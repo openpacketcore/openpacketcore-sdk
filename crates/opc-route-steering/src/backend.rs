@@ -2,6 +2,9 @@
 
 use async_trait::async_trait;
 
+use crate::collection::{
+    OwnedRouteRuleReconcileOutcome, OwnedRouteRuleScope, OwnedRouteRuleSet, OwnedRouteRuleSnapshot,
+};
 use crate::error::RouteSteeringError;
 use crate::model::{
     ReadbackIndeterminateReason, RouteConvergenceOutcome, RouteReadback, RouteRequest,
@@ -153,6 +156,39 @@ pub trait RouteSteeringBackend: Send + Sync + std::fmt::Debug {
             rule: RuleConvergenceOutcome::NotAttempted,
             rollback: RouteRuleRollback::NotNeeded,
         })
+    }
+
+    /// Enumerate all representable ownership-tagged routes and rules in one
+    /// explicit exclusive-writer scope.
+    ///
+    /// The safe default never infers collection ownership from legacy or
+    /// single-candidate mutation support.
+    async fn snapshot_owned_route_rules(
+        &self,
+        _scope: OwnedRouteRuleScope,
+    ) -> Result<OwnedRouteRuleSnapshot, RouteSteeringError> {
+        Err(RouteSteeringError::indeterminate(
+            ReadbackIndeterminateReason::Unsupported,
+        ))
+    }
+
+    /// Reconcile one complete exclusive-writer scope to authoritative desired
+    /// state.
+    ///
+    /// Implementations must validate a complete bounded snapshot and desired
+    /// set before deletion, install and verify desired state first, delete
+    /// orphan rules before routes, and finish with a complete exact snapshot.
+    /// Their initial recovery readback must also enumerate every bounded
+    /// intermediate their own interrupted install-before-delete workflow can
+    /// leave. The operation is serialized but is not a kernel-atomic
+    /// transaction.
+    async fn reconcile_owned_route_rules(
+        &self,
+        _desired: OwnedRouteRuleSet,
+    ) -> Result<OwnedRouteRuleReconcileOutcome, RouteSteeringError> {
+        Err(RouteSteeringError::indeterminate(
+            ReadbackIndeterminateReason::Unsupported,
+        ))
     }
 
     /// Probe backend capability and reachability.

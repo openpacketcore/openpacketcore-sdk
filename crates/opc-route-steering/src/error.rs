@@ -4,6 +4,7 @@ use std::io;
 
 use thiserror::Error;
 
+use crate::collection::OwnedRouteRuleReconcilePhase;
 use crate::model::ReadbackIndeterminateReason;
 
 /// Stable, payload-free class for an operation failure.
@@ -24,6 +25,8 @@ pub enum RouteSteeringFailureClass {
     ReadbackIndeterminate,
     /// A paired operation failed and its owned rollback also failed.
     RollbackFailed,
+    /// A serialized collection reconciliation stopped after a partial change.
+    ReconcileIncomplete,
 }
 
 /// Error type for safe route-steering backend operations.
@@ -71,6 +74,28 @@ pub enum RouteSteeringError {
         /// Failure class for the owned rollback operation.
         rollback: RouteSteeringFailureClass,
     },
+    /// A serialized collection reconciliation stopped with count-only partial
+    /// progress evidence. A new authoritative snapshot is required before the
+    /// caller infers resident state.
+    #[error(
+        "owned route/rule reconciliation stopped during {phase:?} after installing {installed_routes} routes/{installed_rules} rules and removing {removed_routes} routes/{removed_rules} rules ({failure:?}, rollback {rollback_failure:?})"
+    )]
+    ReconcileIncomplete {
+        /// Phase which did not complete.
+        phase: OwnedRouteRuleReconcilePhase,
+        /// Routes whose create was acknowledged in this attempt.
+        installed_routes: usize,
+        /// Rules whose create was acknowledged in this attempt.
+        installed_rules: usize,
+        /// Routes whose deletion was acknowledged in this attempt.
+        removed_routes: usize,
+        /// Rules whose deletion was acknowledged in this attempt.
+        removed_rules: usize,
+        /// Payload-free class of the stopping failure.
+        failure: RouteSteeringFailureClass,
+        /// Rollback failure class when attempt-owned cleanup was inconclusive.
+        rollback_failure: Option<RouteSteeringFailureClass>,
+    },
 }
 
 impl RouteSteeringError {
@@ -103,6 +128,7 @@ impl RouteSteeringError {
             Self::InvalidConfig { .. } => RouteSteeringFailureClass::InvalidConfig,
             Self::ReadbackIndeterminate { .. } => RouteSteeringFailureClass::ReadbackIndeterminate,
             Self::RollbackFailed { .. } => RouteSteeringFailureClass::RollbackFailed,
+            Self::ReconcileIncomplete { .. } => RouteSteeringFailureClass::ReconcileIncomplete,
         }
     }
 

@@ -102,6 +102,7 @@ async fn external_backend_can_construct_typed_conflicts() {
     assert!(!capabilities.conflict_safe_route_convergence);
     assert!(!capabilities.conflict_safe_rule_convergence);
     assert!(!capabilities.paired_convergence);
+    assert!(!capabilities.owned_route_rule_collection);
     assert!(matches!(
         backend.remove_converged_route(route()).await,
         Err(RouteSteeringError::ReadbackIndeterminate { .. })
