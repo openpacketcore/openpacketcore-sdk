@@ -25,6 +25,8 @@ pub const COMMAND_DISCONNECT_PEER: CommandCode = CommandCode::new(282);
 
 /// User-Name AVP code.
 pub const AVP_USER_NAME: AvpCode = AvpCode::new(1);
+/// Class AVP code.
+pub const AVP_CLASS: AvpCode = AvpCode::new(25);
 /// Proxy-State AVP code.
 pub const AVP_PROXY_STATE: AvpCode = AvpCode::new(33);
 /// Host-IP-Address AVP code.
@@ -77,6 +79,8 @@ pub const AVP_EXPERIMENTAL_RESULT: AvpCode = AvpCode::new(297);
 pub const AVP_EXPERIMENTAL_RESULT_CODE: AvpCode = AvpCode::new(298);
 /// Inband-Security-Id AVP code.
 pub const AVP_INBAND_SECURITY_ID: AvpCode = AvpCode::new(299);
+/// Termination-Cause AVP code.
+pub const AVP_TERMINATION_CAUSE: AvpCode = AvpCode::new(295);
 
 /// Diameter success result code.
 pub const RESULT_CODE_DIAMETER_SUCCESS: u32 = 2001;
@@ -90,6 +94,8 @@ pub const RESULT_CODE_DIAMETER_INVALID_HDR_BITS: u32 = 3008;
 pub const RESULT_CODE_DIAMETER_INVALID_AVP_BITS: u32 = 3009;
 /// Unsupported mandatory AVP permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_AVP_UNSUPPORTED: u32 = 5001;
+/// Unknown Session-Id permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_UNKNOWN_SESSION_ID: u32 = 5002;
 /// Invalid AVP value permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_INVALID_AVP_VALUE: u32 = 5004;
 /// Missing mandatory AVP permanent-failure result code.
@@ -102,6 +108,8 @@ pub const RESULT_CODE_DIAMETER_AVP_OCCURS_TOO_MANY_TIMES: u32 = 5009;
 pub const RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION: u32 = 5010;
 /// Unsupported Diameter version permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_UNSUPPORTED_VERSION: u32 = 5011;
+/// Unable-to-comply permanent-failure result code.
+pub const RESULT_CODE_DIAMETER_UNABLE_TO_COMPLY: u32 = 5012;
 /// Invalid reserved or otherwise incorrect Diameter header bit permanent-failure result code.
 pub const RESULT_CODE_DIAMETER_INVALID_BIT_IN_HEADER: u32 = 5013;
 /// Invalid AVP length permanent-failure result code.
@@ -219,13 +227,20 @@ const BASE_COMMANDS: [CommandDefinition; 6] = [
     ),
 ];
 
-const BASE_AVPS: [AvpDefinition; 27] = [
+const BASE_AVPS: [AvpDefinition; 29] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_USER_NAME),
         "User-Name",
         AvpDataType::Utf8String,
         AvpFlagRules::base_mandatory(),
         SpecRef::new("ietf", "RFC6733", "8.14"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_CLASS),
+        "Class",
+        AvpDataType::OctetString,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.20"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_PROXY_STATE),
@@ -405,6 +420,13 @@ const BASE_AVPS: [AvpDefinition; 27] = [
         SpecRef::new("ietf", "RFC6733", "7.7"),
     ),
     AvpDefinition::new(
+        AvpKey::ietf(AVP_TERMINATION_CAUSE),
+        "Termination-Cause",
+        AvpDataType::Enumerated,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.15"),
+    ),
+    AvpDefinition::new(
         AvpKey::ietf(AVP_INBAND_SECURITY_ID),
         "Inband-Security-Id",
         AvpDataType::Unsigned32,
@@ -516,6 +538,16 @@ mod tests {
         let dictionary = dictionary();
         let origin_host = dictionary.find_avp(AvpKey::ietf(AVP_ORIGIN_HOST));
         assert!(matches!(origin_host, Some(definition) if definition.name() == "Origin-Host"));
+    }
+
+    #[test]
+    fn base_dictionary_contains_repeatable_session_class_definition() {
+        let definition = dictionary()
+            .find_avp(AvpKey::ietf(AVP_CLASS))
+            .unwrap_or_else(|| panic!("Class missing from base dictionary"));
+        assert_eq!(definition.name(), "Class");
+        assert_eq!(definition.data_type(), AvpDataType::OctetString);
+        assert_eq!(definition.flags(), AvpFlagRules::base_mandatory());
     }
 
     #[test]

@@ -53,5 +53,10 @@ name = "error_answers"
 path = "tests/error_answers.rs"
 required-features = ["app-swm", "peer"]
 
+[[test]]
+name = "swm_lifecycle"
+path = "tests/swm_lifecycle.rs"
+required-features = ["app-swm"]
+
 [lints]
 workspace = true

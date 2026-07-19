@@ -14,6 +14,7 @@ use opc_proto_diameter::{Message, OwnedMessage};
 use opc_protocol::{
     BorrowDecode, DecodeContext, EncodeContext, OwnedDecode, ValidationLevel,
 };
+use std::num::NonZeroU64;
 
 fuzz_target!(|data: &[u8]| {
     // Bounded request inspection and error-context capture.
@@ -136,9 +137,28 @@ fuzz_target!(|data: &[u8]| {
                 DecodeContext::conservative(),
             )
             .err()
+        } else if message.header.application_id == apps::swm::APPLICATION_ID
+            && message.header.command_code == apps::swm::COMMAND_SESSION_TERMINATION
+            && message.header.flags.is_request()
+        {
+            apps::swm::parse_swm_session_termination_request_envelope_with_provenance(
+                &message,
+                DecodeContext::conservative(),
+            )
+            .err()
         } else {
             None
         };
+        if message.header.application_id == apps::swm::APPLICATION_ID
+            && message.header.command_code == apps::swm::COMMAND_SESSION_TERMINATION
+            && !message.header.flags.is_request()
+        {
+            let _ = apps::swm::parse_swm_session_termination_answer_envelope_from_connection(
+                &message,
+                apps::swm::SwmDiameterConnectionToken::new(NonZeroU64::MIN),
+                DecodeContext::conservative(),
+            );
+        }
         if let (
             Some(parser_error),
             DiameterRequestInspection::Request(envelope),

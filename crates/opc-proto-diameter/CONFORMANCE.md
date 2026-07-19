@@ -215,7 +215,7 @@ AVPs, data types, flag rules) is present; typed builders/parsers are limited to
 | Feature | Application | Command | Typed helpers |
 |:--------|:------------|:--------|:--------------|
 | `app-rf` | 3GPP Rf accounting (id 3) | Accounting-Request / Accounting-Answer (271) | `RfAccountingRequest`, `RfAccountingAnswer` |
-| `app-swm` | 3GPP SWm (id 16_777_264) | Diameter-EAP-Request / Diameter-EAP-Answer (268) | `SwmDiameterEapRequest`, `SwmDiameterEapAnswer` |
+| `app-swm` | 3GPP SWm (id 16_777_264) | Diameter-EAP-Request / Diameter-EAP-Answer (268); Session-Termination-Request / Session-Termination-Answer (275) | `SwmDiameterEapRequest`, `SwmDiameterEapAnswer`; `SwmSessionTerminationRequest`, `SwmSessionTerminationAnswer` |
 | `app-gx` | 3GPP Gx (id 16_777_238) | — | dictionary only |
 | `app-s6a` | 3GPP S6a/S6d (id 16_777_251) | — | dictionary only |
 | `app-s6b` | 3GPP S6b (id 16_777_272) | — | dictionary only |
@@ -236,6 +236,9 @@ aware entry points. Missing Session-Id, Auth-Application-Id, Origin-Host,
 Origin-Realm, Destination-Realm, Auth-Request-Type, or EAP-Payload can therefore
 be mapped to checked request-bound 5005 without downstream command-grammar
 duplication or human-readable reason matching.
+The STR parser and transaction-envelope parser use the same sealed boundary for
+missing Session-Id, Origin-Host, Origin-Realm, Destination-Realm,
+Auth-Application-Id, and Termination-Cause.
 When optional Terminal-Information is received, its mandatory IMEI child is
 also covered: 5005 contains a vendor-correct minimum IMEI nested inside the
 exact received Terminal-Information header, without reflecting Software-Version.
@@ -333,6 +336,123 @@ children (for example `VPLMN-Dynamic-Address-Allowed`,
 `3GPP-Charging-Characteristics`) are deliberately not modeled yet and are
 handled by the unknown-AVP policy.
 
+#### SWm Session-Termination scope
+
+The typed TS 29.273 V19.2.0 STR/STA slice covers command 275 under application
+id 16_777_264. STR requires P plus Session-Id, Origin-Host, Origin-Realm,
+Destination-Realm, Auth-Application-Id, Termination-Cause, and User-Name; it
+permits the specified DRMP, Destination-Host, overload offer, ordered
+Proxy-Info/Route-Record, repeated RFC 6733 Class state, and extension surfaces.
+Ordinary STA requires P plus Session-Id, base Result-Code, Origin-Host, and Origin-Realm,
+permits DRMP, the specified overload/Load AVPs, repeated Class state, and
+extension surfaces, and rejects request-only AVPs. RFC 6733 generic E-bit
+answers instead permit zero or one Session-Id, including the section 7.1.5
+permanent-failure fallback. The profile always requires the base Result-Code;
+generic E-bit answers may additionally preserve one structurally validated
+Experimental-Result, while ordinary STA rejects that combination.
+
+TS 29.273 V19.2.0 section 7.1.2.3.1 table 7.1.2.3.1/1 classifies the permanent
+user identity carried in User-Name as mandatory, and section 7.1.2.3.2 requires
+session lookup against both Session-Id and User-Name. Section 7.2.2.2.1's
+reused command CCF nevertheless renders User-Name as optional. This typed SWm
+procedure boundary applies the stricter semantic-table requirement and returns
+sealed 5005 provenance when User-Name is absent.
+
+`SwmSessionTerminationRequestEnvelope` binds the typed request to Hop-by-Hop
+and End-to-End identifiers, P, exact Session-Id, and a bounded ordered
+Proxy-Info chain. An inbound envelope has no outbound correlation authority but
+remains usable for local processing and STA construction until the caller
+explicitly binds authenticated outbound routing state. `for_outbound` requires
+`SwmExpectedAnswerPeer`: `routed` binds only the
+opaque authenticated connection generation, while `direct` and
+`routed_in_realm` add caller-proven logical-Origin constraints using ASCII
+case-insensitive DiameterIdentity comparison. Destination AVPs never imply an
+Origin policy. An unbound envelope cannot encode an
+outbound STR or correlate an STA. A newly created outbound envelope clears T;
+after an
+unacknowledged request is recovered for resend following link failover,
+`mark_for_failover_retransmission` atomically installs the replacement
+connection binding plus its caller-reserved, connection-unique Hop-by-Hop
+Identifier and performs a one-way transition that sets T while preserving the
+End-to-End Identifier and AVP bytes. An answer arriving on the old connection,
+or using the old Hop-by-Hop Identifier on the replacement connection, then
+fails correlation. Ordinary timer retries do not set T.
+`build_swm_session_termination_answer` can answer only that
+envelope and copies all correlation material and Proxy-Info in wire order.
+`correlate_answer` consumes independently parsed request/answer envelopes and
+rejects connection generation, identifier, P, present Session-Id, exact ordered
+Proxy-Info, or unsolicited overload-control drift. It also rejects an ordinary
+answer whose Origin identity violates an explicit direct/realm policy. A
+generic E-bit answer without Session-Id can originate at an intermediary and
+therefore skips only that logical-Origin policy; connection, transaction, P,
+Proxy-Info, and overload checks remain mandatory. The correlation-capable
+answer parser requires the authenticated connection token and enforces
+application, command, and R-bit direction. Connection-token allocation,
+authentication, dispatch, and realm-routing policy remain consumer
+responsibilities.
+
+Duplicate/retransmission fixtures prove that the initial T-clear STR and its
+same-Hop T-set duplicate build byte-identical committed success and
+unknown-session STA responses. A failover duplicate using a newly allocated
+Hop-by-Hop Identifier produces the same flags and AVPs with only the permitted
+hop-local identifier difference. The consumer still owns duplicate lookup,
+identifier allocation, committed-response caching, and replay lifetime.
+RFC 7683 capability correlation permits an answer to omit
+OC-Supported-Features after the request offered it, representing a selected
+server that is not a reporting node. A returned selection must have been
+offered, and OC-OLR cannot substitute for same-answer OC support.
+OC-Supported-Features and OC-OLR use explicit
+RFC 7683 child schemas, accept RFC-permitted M-bit selection, require the exact
+non-vendor AVP keys with P clear, reject duplicates, malformed known children,
+and unknown mandatory children, and limit typed selection to the loss
+algorithm. Numeric collisions under another Vendor-Id remain distinct unknown
+extensions. A received loss OC-OLR may omit
+the optional reduction child, but an originated one may not. RFC 8583 Load
+applies the same child/flag/duplicate boundary. Originated DRMP and top-level
+Load clear M under the TS 29.273 SWm override; table 7.2.3.1/2 note 2 makes a
+known inbound M-bit mismatch non-fatal, without relaxing V, P, type, child, or
+cardinality validation. Every known received Load child is
+value-validated without treating RFC-optional children as mandatory, while an
+originated report requires Load-Type, Load-Value, and SourceID. Unknown
+optional children are framing-checked and preserved or removed according to
+the decode policy; unknown mandatory children fail closed.
+`SwmSessionTerminationResult` distinguishes success, unknown session (5002),
+unable to comply (5012), and other received base result codes. The typed STA
+builder intentionally emits only 2001, 5002, and 5012 because those result AVP
+contexts are completely modeled; `Other` is receive-only. Redirect 3006 is
+rejected on receive until Redirect-Host and its related context are modeled.
+Received 3xxx protocol errors require E. Informational, success, and transient
+results require E clear. Permanent and unrecognized result classes accept
+either their ordinary E-clear application CCF or RFC 6733's generic E-bit
+fallback. The typed builder emits 5002 and 5012 only in ordinary E-clear STA.
+
+The redacted additional-AVP surface applies dictionary-driven value validation
+on decode and encode: fixed-width primitives, Address, UTF-8,
+DiameterIdentity, and grouped framing are checked, while dictionary grammars
+without a complete typed validator fail closed. Group-only children are
+rejected at command top level. Unknown optional extensions remain preservable.
+Command-owned host, realm, route, and Proxy-Host fields pass through the same
+nonempty ASCII DiameterIdentity contract; Session-Id and User-Name retain their
+dictionary UTF8String representation.
+
+Independent fixtures in `tests/swm_lifecycle.rs` are hand-authored from RFC
+6733 framing and TS 29.273 sections 7.2.2.2.1-.2. They prove byte-exact STR and
+STA parse/build, declared Proxy-Info/Route-Record/Class repetition, exact
+response correlation, 5002/5012, receive-side 3xxx and permanent-fallback E-bit
+handling, initial and failover-retransmitted outbound/inbound STR handling,
+unknown optional preservation, and ordered Proxy-Info answer copying. Negative
+cases cover every required STR omission through checked 5005 provenance,
+duplicate core and extension singletons, wrong
+role/vendor/type/command/application, malformed dictionary values, OC/Load
+group semantics, unknown mandatory AVPs, exact 129th-entry count bounds, and
+redacted diagnostics.
+
+This is protocol machinery, not a live-session authority. Active-session
+lookup, duplicate/retry timers, transport pending-request consumption,
+teardown ordering, compensation, and evidence publication remain product
+owned. SWm AAR/AAA, ASR/ASA, RAR/RAA, and their multi-command lifecycle
+sequence are not claimed by this slice and remain open application coverage.
+
 ### 7. Redaction
 
 Sensitive typed fields are wrapped in `Redacted<T>` or redaction-safe identity
@@ -351,6 +471,10 @@ Covered redacted fields:
   `ApnConfiguration::service_selection`). `SwmDiameterEapAnswer` debug output
   shows only the count of `apn_configurations`, never their contents. Context
   identifiers are numeric selectors and are not treated as subscriber data.
+- `SwmSessionTerminationRequest` / `SwmSessionTerminationAnswer`: Session-Id,
+  origin/destination identities, User-Name, Route-Record, retained Proxy-Info,
+  and all additional AVP values. Diagnostics expose only enum values, counts,
+  numeric AVP keys, and value lengths.
 
 Raw AVP bytes are **not** redacted: the raw layer is intentionally a
 byte-preserving forwarding surface, and redaction is a typed-layer policy.
@@ -370,7 +494,8 @@ preallocate from a wire-declared length. Three layers guard them:
   IMEI. Seeds also include repeated SWm State and the explicit projected two-APN
   profile. The SWm set covers the DER-only emergency indication, 3GPP
   experimental result 5001, the Terminal-Information retry, and final
-  EAP-Success/MSK/Mobile-Node-Identifier material.
+  EAP-Success/MSK/Mobile-Node-Identifier material. STR/STA seeds cover one
+  routed termination exchange and missing Termination-Cause provenance.
   Runs in ordinary `cargo test`; no nightly toolchain or libFuzzer required.
 - **Corpus generator helper guard** — `fuzz/generate_corpus.py self-test`
   exercises the `avp()` helper's acceptance of valid flags and rejection of
@@ -405,6 +530,7 @@ fuzz/corpus/
 │   ├── dpr_request-*
 │   ├── rf_acr_start-*
 │   ├── swm_der-* / swm_dea-*       # normal and emergency recovery stages
+│   ├── swm_str-* / swm_sta-*       # Session-Termination and omission seeds
 │   └── malformed_*-*         # hostile seeds: truncation, duplicate, depth, flags
 └── decode_avp/               # seeds for the decode_avp fuzz target
     ├── ietf_origin_host-*

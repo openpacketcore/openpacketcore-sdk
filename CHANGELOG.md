@@ -8,6 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Typed SWm Session-Termination boundary — `opc-proto-diameter`:** adds
+  TS 29.273 STR/STA command definitions, typed redaction-safe request/answer
+  models, bounded parsers, and request-bound builders. Envelopes preserve both
+  Diameter identifiers, P, exact `Session-Id`, and ordered Proxy-Info. Outbound
+  envelopes require an opaque authenticated connection-generation token and
+  optionally constrain a direct host or routed realm using ASCII
+  case-insensitive DiameterIdentity matching; answer correlation rejects
+  connection, identifier, present Session-Id, logical-Origin-policy, or
+  Proxy-Info drift without inferring identity from Destination AVPs.
+  RFC 6733 generic E-bit answers, including permanent-failure fallback, may
+  omit Session-Id and then correlate by transaction, P, and the exact
+  Proxy-Info chain; intermediary-origin errors skip only optional logical-Origin
+  matching and remain connection-bound. The request-bound builder
+  emits only the fully modeled `DIAMETER_SUCCESS` (2001),
+  `DIAMETER_UNKNOWN_SESSION_ID` (5002), and `DIAMETER_UNABLE_TO_COMPLY` (5012)
+  contexts with RFC-correct E-bit handling; received non-redirect base results
+  remain forward-compatible projections, while unmodeled redirect 3006 fails
+  closed. Repeated RFC 6733 `Class` state is preserved through the redacted
+  extension surface. Dictionary-known additional AVPs are value-validated on
+  decode and encode, and RFC 7683 OC plus RFC 8583 Load groups receive bounded
+  child, flag, type, duplicate, unknown-M, and offer/answer validation.
+  Originated DRMP and Load clear M while recognized inbound M mismatches follow
+  the TS 29.273 table-note tolerance without weakening other flag checks. A loss
+  overload selection requires an offer, while an answer without the capability
+  is correctly treated as a non-reporting node; originating a loss report
+  additionally requires its reduction percentage. Missing required
+  STR AVPs, including the procedure-table-mandatory permanent User-Name, use
+  the existing sealed parser-provenance path to checked 5005 responses despite
+  the reused command CCF marking User-Name optional. Initial outbound requests
+  clear T, while a one-way envelope transition marks queued, unacknowledged
+  state resent after link failover/recovery, atomically installs the replacement
+  connection plus a caller-reserved Hop-by-Hop Identifier, and preserves the
+  End-to-End Identifier and AVPs; ordinary timer retries do not set T.
+  Independent wire fixtures
+  and hostile-input tests cover
+  cardinality, wrong role/vendor/type/application, grouped AVPs, limits,
+  extension preservation, non-ASCII DiameterIdentity rejection,
+  retransmission shape, same-hop byte-identical success/error replay,
+  failover-hop replay equivalence, direct/routed peer binding, and diagnostics.
+  Active session lookup, identifier allocation, response caching, teardown
+  ordering, retry, and compensation remain downstream.
 - **Request-bound Diameter missing-AVP provenance — `opc-proto-diameter`:**
   additive provenance-aware CER, DWR, DPR, and SWm DER parsers now retain the
   original `DecodeError` plus sealed exact-Diameter-message and numeric command/
