@@ -57,6 +57,34 @@ pub type TelemetryInitFn = dyn Fn(
     + Send
     + Sync;
 
+/// Security bootstrap callback stored in `StartupPhases::init_security`.
+///
+/// Invoked with the runtime profile during the `SecurityInit` phase — after
+/// `TelemetryInit` but before `ConfigBootstrap`, `ResourcePreflight`,
+/// `ServiceBind`, and `PeerWarmup` — so a returned `BootstrapError` aborts
+/// startup before the runtime binds any service listener: the supervisor,
+/// signal handlers, and the `try_with_init` callback where products bind
+/// their listeners are all unreachable past this point. Use it for
+/// fail-closed security admission, for example probing a cryptographic
+/// module's capability report and rejecting startup when a policy-required
+/// capability is not effective.
+///
+/// The guarantee covers runtime-mediated listeners only. `init_logging` and
+/// `init_telemetry` run in earlier phases, so anything they bind — a metrics
+/// scrape endpoint, for instance — already exists when this callback runs and
+/// is not torn down when it rejects. Bind nothing that must not outlive a
+/// failed security admission before this phase.
+///
+/// An `Err` is fatal in every runtime mode. The callback receives the
+/// profile, so any mode-conditional leniency (e.g. warn instead of fail in
+/// `Dev`) is a decision the callback itself must make explicitly.
+pub type SecurityInitFn = dyn Fn(
+        &RuntimeProfile,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BootstrapError>> + Send>>
+    + Send
+    + Sync;
+
 /// Builder for RuntimeHandle.
 pub struct Builder {
     pub(crate) profile: RuntimeProfile,
@@ -264,7 +292,10 @@ impl Builder {
         }
         self.phases.init_telemetry(&self.profile).await?;
 
-        // Phase 2: SecurityInit (placeholder — RFC 003 handles actual identity)
+        // Phase 2: SecurityInit — run the fail-closed security bootstrap
+        // callback (e.g. cryptographic capability admission). An `Err` aborts
+        // startup here, before ConfigBootstrap/ServiceBind, so no listener can
+        // exist yet. (RFC 003 handles actual identity distribution.)
         {
             let mut p = phase.write().await;
             *p = RuntimePhase::SecurityInit;
@@ -272,6 +303,7 @@ impl Builder {
                 obs(RuntimePhase::SecurityInit);
             }
         }
+        self.phases.init_security(&self.profile).await?;
 
         // Phase 3: ConfigBootstrap (placeholder — RFC 001 handles actual config)
         {
@@ -521,6 +553,16 @@ pub struct StartupPhases {
     /// phase with the runtime profile; `None` is a no-op. A `BootstrapError`
     /// aborts startup.
     pub init_telemetry: Option<Box<TelemetryInitFn>>,
+    /// Optional security bootstrap callback run during the `SecurityInit`
+    /// phase with the runtime profile; `None` is a no-op. A `BootstrapError`
+    /// aborts startup before `ConfigBootstrap`, `ResourcePreflight`,
+    /// `ServiceBind`, or `PeerWarmup` is entered, so the runtime binds no
+    /// service listener — this is the enforcement point for fail-closed crypto
+    /// capability admission. Exporters bound by the earlier `init_telemetry`
+    /// callback are outside that guarantee and are not torn down. The related
+    /// `known_gates::CRYPTO_PROVIDER` health gate is observability only and
+    /// enforces nothing.
+    pub init_security: Option<Box<SecurityInitFn>>,
 }
 
 impl StartupPhases {
@@ -539,6 +581,18 @@ impl StartupPhases {
     /// `Builder::build` during the `TelemetryInit` phase.
     pub async fn init_telemetry(&self, profile: &RuntimeProfile) -> Result<(), BootstrapError> {
         if let Some(f) = &self.init_telemetry {
+            f(profile).await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Runs the configured security callback with the given profile, or
+    /// returns `Ok(())` when none is set. An `Err` from the callback aborts
+    /// `Builder::build` during the `SecurityInit` phase — before any listener
+    /// is bound — regardless of runtime mode.
+    pub async fn init_security(&self, profile: &RuntimeProfile) -> Result<(), BootstrapError> {
+        if let Some(f) = &self.init_security {
             f(profile).await
         } else {
             Ok(())

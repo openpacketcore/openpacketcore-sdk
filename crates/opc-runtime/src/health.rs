@@ -181,6 +181,17 @@ pub mod known_gates {
     pub const LISTENERS: &str = "listeners";
     /// Identity, trust, and security material is valid.
     pub const SECURITY_MATERIAL: &str = "security_material";
+    /// Cryptographic provider capability admission evidence.
+    ///
+    /// Observability only: attach the admission outcome — for example a
+    /// serialized `opc-crypto-provider` `CapabilityReport`, whose bounded
+    /// JSON form (at most 2 KiB) fits comfortably in
+    /// [`HealthGate::with_details`](super::HealthGate::with_details) — so
+    /// operators can see which module was admitted and with which effective
+    /// capabilities. Enforcement lives elsewhere: the `SecurityInit` startup
+    /// callback (`StartupPhases::init_security`) fails `Builder::build`
+    /// before any listener binds. This gate never prevents traffic by itself.
+    pub const CRYPTO_PROVIDER: &str = "crypto_provider";
     /// Reachability of a generic external peer.
     pub const EXTERNAL_PEER: &str = "external_peer";
     /// Diameter peer connectivity.
@@ -1090,5 +1101,35 @@ mod health_gate_tests {
 
         let names: Vec<&str> = gates.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn crypto_provider_gate_unknown_or_failing_blocks_readiness() {
+        for status in [GateStatus::Unknown, GateStatus::Failing] {
+            let gates = HealthGateSet::new().with_gate(
+                HealthGate::new(known_gates::CRYPTO_PROVIDER, GateImpact::BlocksReadiness)
+                    .with_status(status),
+            );
+            assert_eq!(
+                gates.readiness(),
+                Readiness::NotReady,
+                "crypto provider gate with status {status:?} must aggregate to NotReady"
+            );
+        }
+    }
+
+    #[test]
+    fn crypto_provider_gate_passing_with_report_details_is_ready() {
+        let gates = HealthGateSet::new().with_gate(
+            HealthGate::new(known_gates::CRYPTO_PROVIDER, GateImpact::BlocksReadiness)
+                .with_status(GateStatus::Passing)
+                .with_message("module admitted")
+                .with_details(serde_json::json!({ "effective": ["tls"] })),
+        );
+        assert_eq!(gates.readiness(), Readiness::Ready);
+
+        let json = serde_json::to_string(&gates).unwrap();
+        assert!(json.contains("\"crypto_provider\":"));
+        assert!(json.contains("\"effective\":[\"tls\"]"));
     }
 }

@@ -75,6 +75,8 @@ pub enum RuntimePhase {
     /// Telemetry initialization: metrics/tracing/logging exporters.
     TelemetryInit = 1,
     /// Security initialization: identity, trust bundles, key providers.
+    /// Runs the fallible `StartupPhases::init_security` callback; an error
+    /// fails startup here, before any listener binds.
     SecurityInit = 2,
     /// Configuration bootstrap: load initial config.
     ConfigBootstrap = 3,

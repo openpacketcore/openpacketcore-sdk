@@ -39,5 +39,6 @@ opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0", features = ["testkit"] }
 opc-sbi = { path = "../opc-sbi", version = "0.2.0", features = ["testkit", "runtime-hooks"] }
 opc-types = { path = "../opc-types", version = "0.2.0" }

@@ -34,6 +34,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FakeCryptoModule` behind the `testkit` feature lets tests satisfy an
   advertised capability set and then drop a capability, fail the self-test,
   or lose readiness to prove the fail-closed behavior end to end.
+- **Fail-closed `SecurityInit` startup hook — `opc-runtime`:** the previously
+  placeholder `SecurityInit` phase now runs an optional fallible
+  `StartupPhases::init_security` callback (type alias `SecurityInitFn`,
+  mirroring `init_telemetry`), the enforcement point requested by #334
+  (slice 2 of 5). An `Err` — wrapped in the new
+  `BootstrapError::SecurityInit` variant — makes `Builder::build` fail
+  before `ConfigBootstrap`, `ResourcePreflight`, `ServiceBind`, and
+  `PeerWarmup`, so the runtime binds no service listener when, for example, a
+  policy-required cryptographic capability is not effective on the selected
+  module. That guarantee covers runtime-mediated listeners: `init_logging` and
+  `init_telemetry` run in earlier phases, so anything they bind — a metrics
+  scrape endpoint, for instance — already exists and is not torn down. The
+  failure is fatal in every runtime mode; mode-conditional
+  leniency belongs inside the callback, which receives the
+  `RuntimeProfile`. `opc-runtime` takes no dependency on
+  `opc-crypto-provider`: consumers wire `probe_capability_report` and
+  `ProviderPolicy::admit` into the hook themselves (proven end to end in
+  tests with the `FakeCryptoModule` testkit). A new
+  `known_gates::CRYPTO_PROVIDER` health-gate name carries the admission
+  evidence (a bounded `CapabilityReport` fits in `HealthGate::details`) for
+  observability only — the startup hook, not the gate, is what prevents
+  traffic. Absent hook, startup behavior is unchanged. `StartupPhases` gains a
+  public field, so construct it with `..Default::default()` rather than an
+  exhaustive struct literal.
 
 ### Fixed
 - **Zeroizing retained SWm lifecycle identities — `opc-proto-diameter`:** adds
