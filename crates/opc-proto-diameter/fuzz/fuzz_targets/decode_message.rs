@@ -138,6 +138,15 @@ fuzz_target!(|data: &[u8]| {
             )
             .err()
         } else if message.header.application_id == apps::swm::APPLICATION_ID
+            && message.header.command_code == apps::swm::COMMAND_ABORT_SESSION
+            && message.header.flags.is_request()
+        {
+            apps::swm::parse_swm_abort_session_request_envelope_with_provenance(
+                &message,
+                DecodeContext::conservative(),
+            )
+            .err()
+        } else if message.header.application_id == apps::swm::APPLICATION_ID
             && message.header.command_code == apps::swm::COMMAND_SESSION_TERMINATION
             && message.header.flags.is_request()
         {
@@ -149,6 +158,16 @@ fuzz_target!(|data: &[u8]| {
         } else {
             None
         };
+        if message.header.application_id == apps::swm::APPLICATION_ID
+            && message.header.command_code == apps::swm::COMMAND_ABORT_SESSION
+            && !message.header.flags.is_request()
+        {
+            let _ = apps::swm::parse_swm_abort_session_answer_envelope_from_connection(
+                &message,
+                apps::swm::SwmDiameterConnectionToken::new(NonZeroU64::MIN),
+                DecodeContext::conservative(),
+            );
+        }
         if message.header.application_id == apps::swm::APPLICATION_ID
             && message.header.command_code == apps::swm::COMMAND_SESSION_TERMINATION
             && !message.header.flags.is_request()

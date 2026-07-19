@@ -8,7 +8,8 @@ No seed lives only in a provenance/documentation directory.
 The spec-valid fixtures are hand-authored from the wire layouts in:
   - IETF RFC 6733 section 3 (message header) and section 4 (AVP framing)
   - 3GPP TS 32.299 (Rf offline charging PS-Information vendor AVPs)
-  - 3GPP TS 29.273 (SWm Diameter-EAP and Session-Termination commands/AVPs)
+  - 3GPP TS 29.273 (SWm Diameter-EAP, Abort-Session, and
+    Session-Termination commands/AVPs)
 
 The malformed fixtures exercise the hostile-input paths that the decode
 surface must never panic on: truncation, invalid lengths, duplicate
@@ -583,6 +584,58 @@ def main() -> None:
             str_without_user_name,
         ),
         "swm_str_missing_user_name",
+    )
+
+    # 18. SWm Abort-Session-Request, TS 29.273 §7.2.2.3.1. The explicit
+    #     STATE_MAINTAINED value requires the post-abort STR sequence after a
+    #     successful ASA; Proxy-Info and Route-Record exercise bounded routing.
+    asr_avps = b""
+    asr_avps += avp(263, 0x40, b"sess;swm;abort", None)
+    asr_avps += avp(301, 0x00, u32(5), None)
+    asr_avps += avp(264, 0x40, b"aaa.example", None)
+    asr_avps += avp(296, 0x40, b"example", None)
+    asr_avps += avp(283, 0x40, b"visited.example", None)
+    asr_avps += avp(293, 0x40, b"epdg.example", None)
+    asr_avps += avp(258, 0x40, u32(16777264), None)
+    asr_avps += avp(1, 0x40, b"subscriber@example.invalid", None)
+    asr_avps += avp(277, 0x40, u32(0), None)
+    asr_avps += avp(284, 0x40, proxy_info, None)
+    asr_avps += avp(282, 0x40, b"proxy.example", None)
+    write_corpus(
+        msg_dir,
+        header(0xC0, 274, 16777264, 0x999999A3, 0xAAAAAAB4, asr_avps),
+        "swm_asr_abort_session",
+    )
+
+    # 19. Correlated successful SWm Abort-Session-Answer, TS 29.273
+    #     §7.2.2.3.2. Proxy-Info is copied in wire order.
+    asa_avps = b""
+    asa_avps += avp(263, 0x40, b"sess;swm;abort", None)
+    asa_avps += avp(268, 0x40, u32(2001), None)
+    asa_avps += avp(264, 0x40, b"epdg.example", None)
+    asa_avps += avp(296, 0x40, b"visited.example", None)
+    asa_avps += avp(284, 0x40, proxy_info, None)
+    write_corpus(
+        msg_dir,
+        header(0x40, 274, 16777264, 0x999999A3, 0xAAAAAAB4, asa_avps),
+        "swm_asa_abort_session_success",
+    )
+
+    # 20. ASR omission seed for sealed Destination-Host / 5005 provenance.
+    asr_without_destination_host = asr_avps.replace(
+        avp(293, 0x40, b"epdg.example", None), b"", 1
+    )
+    write_corpus(
+        msg_dir,
+        header(
+            0xC0,
+            274,
+            16777264,
+            0x999999A4,
+            0xAAAAAAB5,
+            asr_without_destination_host,
+        ),
+        "swm_asr_missing_destination_host",
     )
 
     # -------------------------------------------------------------------------
