@@ -40,6 +40,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   teardown, duplicate-cache lifetime, exact encoded-byte replay, fresh STR
   transaction allocation, transport, retry, and compensation remain product
   responsibilities.
+- **Typed SWm authorization-information update boundary — `opc-proto-diameter`:**
+  adds TS 29.273 RAR/RAA command 258 and AAR/AAA command 265 definitions,
+  redaction-safe typed models, bounded builders/parsers, sealed missing-AVP
+  provenance, exact identifier/session/user/proxy/overload correlation, typed
+  AAR flags and UE address state, base or experimental AAA results, and typed
+  successful APN projection. Outbound envelopes require an authenticated
+  connection-generation token plus an explicit direct, realm-routed, or routed
+  logical-Origin policy instead of treating Destination AVPs as authentication
+  evidence. Generic RFC 6733 E-bit agent errors retain their actual grammar,
+  accept permitted missing application fields, skip only logical-Origin policy,
+  and remain connection- and transaction-bound. A public type-state sequence
+  commits the RAA, enforces the immediate matching AAR, caches byte-identical
+  T-clear ordinary retries, exposes an explicit failover-only transition that
+  atomically replaces the Hop-by-Hop Identifier and peer binding, and correlates
+  the terminal AAA without owning product session policy. Independent wire
+  fixtures cover all roles, the published AAA ABNF R-bit editorial error,
+  proxy drift, result families,
+  canonical Table 7.2.3.1/2 flag handling, hostile input, bounds, replay, and
+  redaction. Decode ignores understood M-bit mismatches as required by the
+  table note while encode remains canonical, including M-clear
+  UE-Local-IP-Address. Command-derived additional-AVP rules preserve repeated
+  RAA/AAA Failed-AVP and Reply-Message, declare RAR Reply-Message singleton,
+  and expose the optional answer-side Re-Auth-Request-Type as a typed value.
+  Canonical RFC 6733 Session-Timeout, Authorization-Lifetime, and
+  Auth-Grace-Period definitions add typed SWm request/answer timer fields with
+  exact command roles: RAA/AAR admit lifetime and grace, AAA additionally
+  admits TS 29.273 Session-Timeout, and RAR admits none. Singleton/type/flag
+  checks, positive-lifetime re-auth requirements, timeout/lifetime ordering,
+  success-class AAA enforcement of the AAR lifetime ceiling,
+  zero/absent/maximum semantics, value-free diagnostics, independent fixtures,
+  and corpus coverage fail closed before product policy,
+  while rejecting wrong-role lifecycle/diagnostic state and AAR Class. Request
+  roles forbid redirect-only state; answer metadata retains
+  RFC 6733 Redirect-Host repeatability, while typed parsing and emission reject
+  every redirect context until the complete result surface is modeled.
+  Experimental-Result-only 3xxx AAA emission fails closed because it cannot
+  satisfy the generic E-bit grammar. Session lookup, duplicate-cache
+  lifetime, retry timers, authorization policy, and side effects remain
+  downstream. Migration: downstream exhaustive matches on `AuthRequestType`
+  must add `AuthorizeOnly`; wire value 2 now projects to that named variant
+  instead of `Other(2)`.
 - **Typed SWm Session-Termination boundary — `opc-proto-diameter`:** adds
   TS 29.273 STR/STA command definitions, typed redaction-safe request/answer
   models, bounded parsers, and request-bound builders. Envelopes preserve both

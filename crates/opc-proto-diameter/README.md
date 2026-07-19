@@ -49,8 +49,9 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   truncation and resource-limit failures are explicitly unanswerable.
 - `parser_error` provides sealed, redaction-safe `DiameterParserError` and
   `DiameterMissingAvpProvenance`, grouped-parent, and grouped-set metadata. Additive
-  `*_with_provenance` request parsers cover CER, DWR, DPR, and SWm DER/STR/ASR (plus
-  their SWm transaction-envelope forms); legacy parser signatures delegate to
+  `*_with_provenance` request parsers cover CER, DWR, DPR, and SWm
+  DER/STR/ASR/RAR/AAR (plus their SWm transaction-envelope forms); legacy
+  parser signatures delegate to
   them and still return the original `DecodeError`. Missing provenance exposes
   only numeric application/command/role metadata and the exact SDK-owned AVP
   definition needed to inspect its vendor-aware key, data type, and flag rules.
@@ -67,15 +68,17 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   the watchdog/disconnect profiles retain conservative duplicate rejection.
 - The `app-rf` feature adds typed Rf accounting helpers.
 - The `app-swm` feature adds typed SWm Diameter-EAP DER/DEA,
-  Session-Termination STR/STA, and Abort-Session ASR/ASA helpers. Lifecycle
-  envelopes bind both Diameter identifiers, the P bit, a present exact
-  `Session-Id`, and ordered Proxy-Info. Outbound envelopes additionally require
-  an authenticated connection-generation token and may apply an explicit
-  direct-host, routed-realm, or connection-only Origin policy. RFC 6733 generic
-  E-bit answers, including the permitted permanent-failure fallback, may omit
-  Session-Id and skip logical-Origin policy, but still require the exact
-  connection, transaction, P, and Proxy-Info chain. The
-  initial outbound STR or ASR clears T, and each envelope exposes a one-way
+  Session-Termination STR/STA, Abort-Session ASR/ASA, Re-Auth RAR/RAA, and AA
+  AAR/AAA helpers. The
+  lifecycle envelopes bind both Diameter identifiers, the P bit, a present
+  exact `Session-Id`, and ordered Proxy-Info. Outbound envelopes additionally
+  require an authenticated connection-generation token and may apply an
+  explicit direct-host, routed-realm, or connection-only routed Origin policy;
+  RFC 6733 generic E-bit answers, including the permitted permanent-failure
+  fallback, may omit Session-Id and skip logical-Origin policy, but still
+  require the exact connection, transaction, P, and Proxy-Info chain. The
+  initial outbound STR, ASR, RAR, or AAR clears T, and each envelope exposes a
+  one-way
   `mark_for_failover_retransmission` transition for queued, unacknowledged
   state resent after link failover or recovery; the transition atomically
   installs the replacement connection binding and its caller-reserved
@@ -83,7 +86,11 @@ charging decisions, watchdog policy, or a carrier-ready EPC/ePDG product claim.
   SWm STR and ASR `User-Name` are required by the TS 29.273 procedure tables and
   retain
   sealed missing-AVP provenance despite the reused command CCF showing it as
-  optional. The
+  optional. RAR/RAA and AAR/AAA use the same connection-bound answer contract
+  and add checked request omission provenance, typed authorization-update
+  state, exact ordinary-answer session/user/proxy correlation, generic E-bit
+  error reception, and failover-only T-bit transitions that atomically replace
+  the Hop-by-Hop Identifier and authenticated peer binding. The
   request-bound STA builder emits only fully modeled success, base
   `DIAMETER_UNKNOWN_SESSION_ID` (5002), and `DIAMETER_UNABLE_TO_COMPLY` (5012)
   contexts without misusing the E bit, and parsed answers require exact
@@ -267,7 +274,7 @@ function signatures and their `DecodeError` values remain source-compatible.
 | `base` | yes | RFC 6733 common application and raw base metadata. |
 | `peer` | no | CER/CEA, DWR/DWA, DPR/DPA helpers and peer-session projections. |
 | `app-rf` | no | Rf accounting dictionary plus typed ACR/ACA helpers. |
-| `app-swm` | no | SWm dictionary plus typed Diameter-EAP DER/DEA, Session-Termination STR/STA, and Abort-Session ASR/ASA helpers. |
+| `app-swm` | no | SWm dictionary plus typed DER/DEA, STR/STA, ASR/ASA, RAR/RAA, and AAR/AAA helpers. |
 | `app-gx` | no | Gx dictionary slot only. |
 | `app-s6a` | no | S6a/S6d dictionary slot only. |
 | `app-s6b` | no | S6b dictionary slot only. |
@@ -515,6 +522,143 @@ M-bit mismatch for those recognized AVPs while continuing to enforce V, P,
 type, grouped-child, and cardinality rules. An OC offer permits, but does not
 require, a reporting-node selection in the answer; an emitted selection still
 must be offered, and OC-OLR still requires same-answer OC support.
+
+### SWm authorization-information update
+
+The TS 29.273 authorization-update boundary models the complete RAR/RAA then
+AAR/AAA protocol sequence without owning subscriber policy or session lookup.
+RAR and AAR request parsers have provenance-aware forms for checked 5005
+answers. Request and answer envelopes retain both transaction identifiers, P,
+present Session-Id/User-Name, the actual E bit, and the ordered Proxy-Info
+chain. An outbound RAR or AAR additionally requires an authenticated
+connection-generation token and an explicit direct, realm-routed, or routed
+logical-Origin policy. Destination AVPs are not authentication evidence: an
+AAR sent through a DRA should normally use `SwmExpectedAnswerPeer::routed`, so
+the final AAA server's Origin remains valid. Generic E-bit agent errors may
+omit the application CCF fields and are exempt from logical-Origin matching,
+but still require the exact authenticated connection, transaction, P bit, and
+Proxy-Info chain. Correlation also validates RFC 7683 overload negotiation.
+The answer command metadata retains RFC 6733 Redirect-Host cardinality for the
+generic error boundary, while typed RAA/AAA parsing and emission fail closed on
+redirect contexts until their complete result-specific surface is modeled.
+
+An endpoint acknowledges a valid RAR, then commits the follow-up AAR through
+the public type-state sequence:
+
+```rust
+use opc_proto_diameter::Message;
+use opc_proto_diameter::apps::swm::{
+    parse_swm_re_auth_request_envelope, AuthRequestType,
+    SwmAcceptedAuthorizationUpdate, SwmAuthorizationRequest,
+    SwmDiameterConnectionToken, SwmDiameterTransaction, SwmExpectedAnswerPeer,
+    SwmReAuthAnswer, SwmReAuthResult,
+};
+use opc_protocol::{DecodeContext, EncodeContext};
+
+# fn update(
+#     message: &Message<'_>,
+#     local_origin_host: &str,
+#     local_origin_realm: &str,
+#     aar_connection: SwmDiameterConnectionToken,
+#     replacement_connection: SwmDiameterConnectionToken,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let rar = parse_swm_re_auth_request_envelope(
+    message,
+    DecodeContext::conservative(),
+)?;
+let session_id = rar.request().session_id.clone();
+let user_name = rar.request().user_name.clone();
+let raa = SwmReAuthAnswer::for_request(
+    &rar,
+    SwmReAuthResult::Success,
+    local_origin_host.to_owned(),
+    local_origin_realm.to_owned(),
+);
+let accepted = SwmAcceptedAuthorizationUpdate::accept(
+    rar,
+    raa,
+    EncodeContext::default(),
+)?;
+let mut pending = accepted.begin_authorization(
+    SwmAuthorizationRequest {
+        session_id,
+        origin_host: "epdg.example".to_owned().into(),
+        origin_realm: "example".to_owned().into(),
+        destination_realm: "aaa.example".to_owned().into(),
+        destination_host: None,
+        user_name,
+        auth_request_type: AuthRequestType::AuthorizeOnly,
+        authorization_lifetime: None,
+        auth_grace_period: None,
+        aar_flags: None,
+        ue_local_ip_address: None,
+        high_priority_access_info: None,
+        drmp: None,
+        route_records: Vec::new(),
+        additional_avps: Vec::new(),
+    },
+    SwmDiameterTransaction::new(0x1020_3041, 0x5060_7081),
+    SwmExpectedAnswerPeer::routed(aar_connection),
+    EncodeContext::default(),
+)?;
+let initial_aar = pending.initial_authorization_request();
+let retry_aar = pending.retransmit_authorization_request();
+// Only after a link failover or equivalent recovery:
+pending.mark_for_failover_retransmission(
+    0x1020_3042,
+    SwmExpectedAnswerPeer::routed(replacement_connection),
+    EncodeContext::default(),
+)?;
+let failover_aar = pending.retransmit_authorization_request();
+# let _ = (initial_aar, retry_aar, failover_aar);
+# Ok(())
+# }
+```
+
+The initial AAR and ordinary cached timer retry are byte-identical with T
+clear. `mark_for_failover_retransmission` is the explicit one-way transition
+that creates a stable T-set form for queued, unacknowledged state resent after
+link failover or equivalent recovery. It atomically installs the caller-reserved
+replacement Hop-by-Hop Identifier and authenticated connection binding while
+preserving the End-to-End Identifier. RAR and AAR envelopes retain an inbound T
+bit, while RAA and AAA always clear it.
+`SwmAcceptedAuthorizationUpdate` also caches the committed RAA for exact
+duplicate-request replay. The consumer still owns duplicate detection, cache
+lifetime, retry timers, session mutation, and when an accepted RAA advances to
+AAR.
+
+RAR requires `AUTHORIZE_ONLY`, exact Session-Id/User-Name, and the addressed
+Destination-Host used by the procedure. AAR/AAA require
+`Auth-Request-Type = AUTHORIZE_ONLY`. AAA preserves exactly one base or grouped
+experimental result and optionally exposes a typed APN-Configuration on exact
+base success. RAA and AAA expose the optional typed Re-Auth-Request-Type and
+preserve repeated Reply-Message values in their redaction-safe extension
+collections; RAR declares Reply-Message as a singleton. A protocol-error-class
+experimental result is rejected on origination because RFC 6733's E-bit
+grammar requires a base Result-Code.
+RAA and AAR expose singleton RFC 6733 `Authorization-Lifetime` and
+`Auth-Grace-Period` values in seconds; AAA exposes both plus the singleton
+TS 29.273 `Session-Timeout`. RAR forbids all three, and `Session-Timeout` is
+forbidden in the other two SWm roles. A positive answer lifetime requires a
+typed `Re-Auth-Request-Type`, and a nonzero AAA `Session-Timeout` cannot be
+smaller than its `Authorization-Lifetime`. When AAR supplies an
+`Authorization-Lifetime` maximum, every success-class AAA must return a
+lifetime no greater than that request value; request-bound build and
+correlation reject an omission or increase. Authorization lifetime zero means immediate
+re-authorization, `u32::MAX` or absence means none is expected; session timeout
+zero or absence means unlimited. Typed diagnostics expose only presence, never
+timer values.
+Typed AAR flags, UE local IP address, and high-priority access values are
+canonicalized; originated UE-Local-IP-Address clears M. The RAA Origin values
+must come from trusted local endpoint configuration and are never inferred
+from request Destination AVPs. Received generic E-bit RAA/AAA errors require a
+base Result-Code but may omit Session-Id, User-Name, Auth-Application-Id, and
+Auth-Request-Type as allowed by RFC 6733's generic answer grammar. Following
+TS 29.273 Table 7.2.3.1 Note 2, decode
+ignores an M-bit mismatch on understood table AVPs; encode always emits the
+table's canonical M bit. Unknown optional AVPs obey the configured preserve,
+drop, or reject policy. All typed diagnostics redact subscriber, session,
+address, proxy, and extension values.
 
 `SwmDiameterEapAnswer` struct literals must initialize
 `default_context_identifier`; use `None` to preserve the prior wire shape or

@@ -27,6 +27,8 @@ pub const COMMAND_DISCONNECT_PEER: CommandCode = CommandCode::new(282);
 pub const AVP_USER_NAME: AvpCode = AvpCode::new(1);
 /// Class AVP code.
 pub const AVP_CLASS: AvpCode = AvpCode::new(25);
+/// Session-Timeout AVP code.
+pub const AVP_SESSION_TIMEOUT: AvpCode = AvpCode::new(27);
 /// Proxy-State AVP code.
 pub const AVP_PROXY_STATE: AvpCode = AvpCode::new(33);
 /// Host-IP-Address AVP code.
@@ -57,10 +59,16 @@ pub const AVP_RESULT_CODE: AvpCode = AvpCode::new(268);
 pub const AVP_PRODUCT_NAME: AvpCode = AvpCode::new(269);
 /// Disconnect-Cause AVP code.
 pub const AVP_DISCONNECT_CAUSE: AvpCode = AvpCode::new(273);
+/// Auth-Grace-Period AVP code.
+pub const AVP_AUTH_GRACE_PERIOD: AvpCode = AvpCode::new(276);
 /// Auth-Session-State AVP code.
 pub const AVP_AUTH_SESSION_STATE: AvpCode = AvpCode::new(277);
 /// Origin-State-Id AVP code.
 pub const AVP_ORIGIN_STATE_ID: AvpCode = AvpCode::new(278);
+/// Re-Auth-Request-Type AVP code.
+pub const AVP_RE_AUTH_REQUEST_TYPE: AvpCode = AvpCode::new(285);
+/// Authorization-Lifetime AVP code.
+pub const AVP_AUTHORIZATION_LIFETIME: AvpCode = AvpCode::new(291);
 /// Failed-AVP AVP code.
 pub const AVP_FAILED_AVP: AvpCode = AvpCode::new(279);
 /// Proxy-Host AVP code.
@@ -235,7 +243,7 @@ const BASE_COMMANDS: [CommandDefinition; 6] = [
     ),
 ];
 
-const BASE_AVPS: [AvpDefinition; 33] = [
+const BASE_AVPS: [AvpDefinition; 37] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_USER_NAME),
         "User-Name",
@@ -249,6 +257,13 @@ const BASE_AVPS: [AvpDefinition; 33] = [
         AvpDataType::OctetString,
         AvpFlagRules::base_mandatory(),
         SpecRef::new("ietf", "RFC6733", "8.20"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_SESSION_TIMEOUT),
+        "Session-Timeout",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.13"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_PROXY_STATE),
@@ -357,6 +372,13 @@ const BASE_AVPS: [AvpDefinition; 33] = [
         SpecRef::new("ietf", "RFC6733", "5.4.3"),
     ),
     AvpDefinition::new(
+        AvpKey::ietf(AVP_AUTH_GRACE_PERIOD),
+        "Auth-Grace-Period",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.10"),
+    ),
+    AvpDefinition::new(
         AvpKey::ietf(AVP_AUTH_SESSION_STATE),
         "Auth-Session-State",
         AvpDataType::Enumerated,
@@ -369,6 +391,20 @@ const BASE_AVPS: [AvpDefinition; 33] = [
         AvpDataType::Unsigned32,
         AvpFlagRules::base_mandatory(),
         SpecRef::new("ietf", "RFC6733", "8.16"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_RE_AUTH_REQUEST_TYPE),
+        "Re-Auth-Request-Type",
+        AvpDataType::Enumerated,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.12"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_AUTHORIZATION_LIFETIME),
+        "Authorization-Lifetime",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC6733", "8.9"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_FAILED_AVP),
@@ -607,6 +643,24 @@ mod tests {
             assert_eq!(definition.name(), name);
             assert_eq!(definition.data_type(), data_type);
             assert_eq!(definition.flags(), AvpFlagRules::base_mandatory());
+        }
+    }
+
+    #[test]
+    fn base_dictionary_contains_normative_authorization_timer_definitions() {
+        for (code, name, section) in [
+            (AVP_SESSION_TIMEOUT, "Session-Timeout", "8.13"),
+            (AVP_AUTH_GRACE_PERIOD, "Auth-Grace-Period", "8.10"),
+            (AVP_AUTHORIZATION_LIFETIME, "Authorization-Lifetime", "8.9"),
+        ] {
+            let definition = dictionary()
+                .find_avp(AvpKey::ietf(code))
+                .unwrap_or_else(|| panic!("{name} missing from base dictionary"));
+            assert_eq!(definition.name(), name);
+            assert_eq!(definition.data_type(), AvpDataType::Unsigned32);
+            assert_eq!(definition.flags(), AvpFlagRules::base_mandatory());
+            assert_eq!(definition.spec_ref().doc(), "RFC6733");
+            assert_eq!(definition.spec_ref().section(), section);
         }
     }
 

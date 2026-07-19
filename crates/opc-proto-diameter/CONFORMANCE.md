@@ -96,7 +96,7 @@ This document defines the conformance status of the `opc-proto-diameter` crate.
   sealed `DiameterMissingAvpProvenance`
   exposes only the request role plus numeric application, command, vendor-aware
   AVP key, data type, and flag-rule schema metadata. Provenance-aware CER, DWR,
-  DPR, and SWm DER parsers cover every required top-level field, CER's nested
+  DPR, and SWm DER/STR/RAR/AAR parsers cover every required top-level field, CER's nested
   Vendor-Id and Auth/Acct one-of grammar, and SWm DER's optional-present
   Terminal-Information mandatory IMEI child while their legacy entry points
   delegate and retain the original return type.
@@ -215,7 +215,7 @@ AVPs, data types, flag rules) is present; typed builders/parsers are limited to
 | Feature | Application | Command | Typed helpers |
 |:--------|:------------|:--------|:--------------|
 | `app-rf` | 3GPP Rf accounting (id 3) | Accounting-Request / Accounting-Answer (271) | `RfAccountingRequest`, `RfAccountingAnswer` |
-| `app-swm` | 3GPP SWm (id 16_777_264) | Diameter-EAP-Request / Diameter-EAP-Answer (268); Abort-Session-Request / Abort-Session-Answer (274); Session-Termination-Request / Session-Termination-Answer (275) | `SwmDiameterEapRequest`, `SwmDiameterEapAnswer`; `SwmAbortSessionRequest`, `SwmAbortSessionAnswer`; `SwmSessionTerminationRequest`, `SwmSessionTerminationAnswer` |
+| `app-swm` | 3GPP SWm (id 16_777_264) | DER/DEA (268); RAR/RAA (258); AAR/AAA (265); ASR/ASA (274); STR/STA (275) | Typed Diameter-EAP, authorization-update, Abort-Session, and Session-Termination request/answer models and envelopes |
 | `app-gx` | 3GPP Gx (id 16_777_238) | — | dictionary only |
 | `app-s6a` | 3GPP S6a/S6d (id 16_777_251) | — | dictionary only |
 | `app-s6b` | 3GPP S6b (id 16_777_272) | — | dictionary only |
@@ -552,8 +552,118 @@ and DRMP receive-tolerant/originate-clear M-bit contract.
 This is protocol machinery, not a live-session authority. Active-session
 lookup, duplicate/retry timers, transport pending-request consumption,
 teardown ordering, compensation, and evidence publication remain product
-owned. SWm AAR/AAA, RAR/RAA, and their remaining multi-command lifecycle
-sequences are not claimed by this slice and remain open application coverage.
+owned. Broader application procedures outside the declared matrix remain
+separate coverage.
+
+#### SWm authorization-information update scope
+
+The typed TS 29.273 V19.2.0 authorization slice covers Re-Auth command 258 and
+AA command 265 under application id 16_777_264. RAR requires P, Session-Id,
+Origin-Host/Realm, Destination-Realm/Host, the exact SWm
+Auth-Application-Id, `Re-Auth-Request-Type = AUTHORIZE_ONLY`, and User-Name.
+Ordinary RAA clears R/T, preserves P, and requires Session-Id, one base
+Result-Code, Origin-Host/Realm, and User-Name. It exposes the optional typed
+Re-Auth-Request-Type, Authorization-Lifetime, and Auth-Grace-Period and
+preserves repeated Reply-Message values. A positive Authorization-Lifetime
+requires Re-Auth-Request-Type. The emitted
+RAA result surface is deliberately limited to 2001, 5002, and 5012, which are
+the result contexts specified by the authorization-update procedure.
+
+AAR requires P, Session-Id, the SWm Auth-Application-Id,
+Origin-Host/Realm, Destination-Realm, `Auth-Request-Type = AUTHORIZE_ONLY`, and
+User-Name. It types optional AAR-Flags, UE-Local-IP-Address,
+High-Priority-Access-Info, Authorization-Lifetime and Auth-Grace-Period hints,
+DRMP, routing, proxy, overload, and extension state.
+Ordinary AAA clears R/T, requires the correlated session/request type/user and exactly
+one base Result-Code or grouped Experimental-Result, and exposes an optional
+typed APN-Configuration only on exact base `DIAMETER_SUCCESS`. It exposes the
+optional typed Re-Auth-Request-Type, Authorization-Lifetime,
+Auth-Grace-Period, and TS 29.273 Session-Timeout, and preserves repeated
+Reply-Message values. All timer AVPs are singleton Unsigned32 values with
+RFC 6733 M=1/V=0/P=0 flags. A positive answer lifetime requires
+Re-Auth-Request-Type, and a nonzero Session-Timeout must not be smaller than
+Authorization-Lifetime. Every success-class AAA answering an AAR that supplied
+an Authorization-Lifetime maximum must include a value no greater than that
+maximum; request-bound construction and correlation enforce the ceiling with
+value-free errors. Non-success answers need not grant a lifetime. Zero and
+absent lifetime/timeout semantics are preserved distinctly on the typed wire
+surface; diagnostics expose presence only. RAR forbids all three timers, while
+Session-Timeout is forbidden in RAA and AAR.
+Redirect 3006 fails closed until its required Redirect-Host context is modeled. The AAA
+command definition intentionally follows §7.2.2.1.4 prose and clears R; the
+displayed request token in that section's ABNF is treated as an editorial
+error.
+
+Received RFC 6733 generic E-bit RAA/AAA errors require a base Result-Code and
+Origin-Host/Realm, but may omit the application CCF's Session-Id, User-Name,
+Auth-Application-Id, and Auth-Request-Type. A supplemental structurally valid
+Experimental-Result may be retained, but it cannot replace the generic base
+Result-Code. Permanent 5xxx failures may use either the ordinary E-clear CCF
+or the generic E-bit fallback; protocol 3xxx results require E.
+
+Inbound request envelopes retain T but have no outbound answer-correlation
+authority. An originated or retained outbound RAR/AAR must bind a
+`SwmExpectedAnswerPeer` containing its authenticated connection generation and
+an explicit direct, routed-realm, or connection-only routed logical-Origin
+policy. Destination AVPs never imply authentication evidence. Request envelopes
+expose a one-way `mark_for_failover_retransmission` transition for queued,
+unacknowledged state resent only after link failover or equivalent recovery; it
+atomically replaces the Hop-by-Hop Identifier and connection binding while
+preserving the End-to-End Identifier and request AVPs. Ordinary retries keep T
+clear and byte-identical. Answer builders always clear T. The public `SwmAcceptedAuthorizationUpdate` and
+`SwmPendingAuthorizationUpdate` type-state sequence commits an exact RAA,
+requires the follow-up AAR to preserve Session-Id/User-Name, caches the initial
+T-clear AAR plus a byte-identical ordinary retry; its explicit failover
+transition caches that replacement-bound T-set form and correlates the terminal AAA. RAA duplicate
+replay and repeated AAR retrieval are byte-identical within each state.
+Duplicate detection, retry timers, cache lifetime, session lookup, and policy
+mutation remain downstream responsibilities.
+
+Both exchanges correlate the authenticated connection generation, Hop-by-Hop
+and End-to-End identifiers, P, every present Session-Id/User-Name, the ordered
+byte-exact Proxy-Info chain, request type where applicable, and overload-control
+offer/answer state. Ordinary answers must also satisfy the caller-selected
+logical-Origin policy. Generic E-bit agent errors are exempt only from that
+logical-Origin policy and remain connection-bound. Request omissions
+use sealed vendor-aware `DiameterParserError` provenance for the checked 5005
+mapper. Core and extension counts are independently bounded at 128. Duplicate
+singletons, wrong role/vendor/type/flags, malformed grouped state, unknown
+mandatory AVPs, and unmodeled originated result contexts fail closed. Other
+received RAA base results remain forward-compatible `Other` projections.
+Command definitions are also the typed parser/builder source of truth for
+known additional-AVP occurrence rules: RAA and AAA preserve bounded repeated
+`Failed-AVP` and `Reply-Message`, RAR declares `Reply-Message` singleton,
+RAR/RAA/AAA preserve repeated `Class`, AAR forbids `Class`, and
+all four authorization-update roles forbid lifecycle `Termination-Cause` and
+`Auth-Session-State`. Request roles reject answer diagnostics. An originated
+request also rejects redirect-only AVPs. RAA/AAA command metadata preserves
+RFC 6733's repeatable Redirect-Host plus singleton usage/cache AVPs, but the
+typed parsers and builders reject every redirect result context until its
+complete surface is modeled. An originated experimental 3xxx AAA is rejected
+because RFC 6733's generic E-bit grammar requires a base Result-Code rather
+than an Experimental-Result-only body.
+Unknown optional
+extensions obey preserve/drop/reject policy. Dictionary-known additional AVPs
+receive fixed-width, Address, UTF-8, DiameterIdentity, or bounded grouped-value
+validation before retention.
+
+TS 29.273 Table 7.2.3.1/2 flag values are canonical on encode. Per Table
+7.2.3.1 Note 2, decode ignores an M-bit mismatch for understood table AVPs
+while still enforcing V, P, vendor identity, type, and value semantics. In
+particular, AAR-Flags, UE-Local-IP-Address, High-Priority-Access-Info, DRMP,
+and Load have direct asymmetric regression evidence. Originated
+UE-Local-IP-Address clears M as required by TS 29.212 Table 5.3.0.1.
+Undefined AAR-Flags and High-Priority-Access-Info bits are discarded on
+receive and never re-emitted.
+
+Independent fixtures in `tests/swm_authorization.rs` are hand-authored from
+RFC 6733 framing and TS 29.273 §§7.2.2.4.1-.2 and §§7.2.2.1.3-.4. They cover
+all four message roles, exact rebuild, the AAA R-bit editorial regression,
+base and experimental results, typed APN and AAR vendor state, T-bit
+retransmission, exact proxy correlation, checked omission provenance, unknown
+policy, authorization-timer role/cardinality/type and cross-field semantics,
+zero/absent/maximum timer values, dictionary and role failures, 129th-entry
+bounds, canonical flags, public sequence replay, and redacted diagnostics.
 
 ### 7. Redaction
 
@@ -581,6 +691,11 @@ Covered redacted fields:
   origin/destination identities, permanent User-Name, Route-Record, retained
   Proxy-Info, Error-Message/Error-Reporting-Host, and all additional AVP values.
   Correlation errors expose stable codes rather than either side's values.
+- `SwmReAuthRequest` / `SwmReAuthAnswer` and `SwmAuthorizationRequest` /
+  `SwmAuthorizationAnswer`: session, user, origin/destination, routing, proxy,
+  address, APN, and extension values are redacted. Authorization-Lifetime,
+  Auth-Grace-Period, and Session-Timeout remain available through typed fields,
+  while diagnostics disclose only whether each value is present.
 
 Raw AVP bytes are **not** redacted: the raw layer is intentionally a
 byte-preserving forwarding surface, and redaction is a typed-layer policy.
@@ -604,6 +719,9 @@ preallocate from a wire-declared length. Three layers guard them:
   routed termination exchange and missing Termination-Cause provenance.
   ASR/ASA seeds cover a routed maintained-state abort, a successful answer,
   and missing Destination-Host provenance.
+  RAR/RAA and AAR/AAA seeds cover one complete authorization update, typed
+  authorization timers, the AAA answer-role regression, and missing
+  request-type provenance for each request.
   Runs in ordinary `cargo test`; no nightly toolchain or libFuzzer required.
 - **Corpus generator helper guard** — `fuzz/generate_corpus.py self-test`
   exercises the `avp()` helper's acceptance of valid flags and rejection of

@@ -4,7 +4,8 @@
 //! EAP payloads between the ePDG and an AAA/DRA peer, the request-bound
 //! Session-Termination STR/STA and Abort-Session ASR/ASA lifecycle exchanges,
 //! including the deterministic successful-ASA transition to an administrative
-//! STR when Diameter session state is maintained, plus a bounded
+//! STR when Diameter session state is maintained, and the RAR/RAA then AAR/AAA
+//! authorization-information update sequence, plus a bounded
 //! subscription-profile extension surface for APN-Configuration, its default
 //! Context-Identifier, Service-Selection, and the TS 29.273 emergency attach
 //! sequence. The top-level default pointer is accepted under the DEA
@@ -45,8 +46,10 @@ use crate::dictionary::{
 use crate::parser_error::DiameterParserError;
 use crate::{ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage, VendorId};
 
+mod authorization;
 mod lifecycle;
 
+pub use authorization::*;
 pub use lifecycle::*;
 
 /// 3GPP SWm application identifier.
@@ -63,6 +66,12 @@ pub const AVP_EAP_REISSUED_PAYLOAD: AvpCode = AvpCode::new(463);
 pub const AVP_EAP_MASTER_SESSION_KEY: AvpCode = AvpCode::new(464);
 /// Auth-Request-Type AVP code.
 pub const AVP_AUTH_REQUEST_TYPE: AvpCode = AvpCode::new(274);
+/// AAR-Flags AVP code (3GPP TS 29.273 section 7.2.3.5).
+pub const AVP_AAR_FLAGS: AvpCode = AvpCode::new(1539);
+/// UE-Local-IP-Address AVP code (3GPP TS 29.212 section 5.3.96).
+pub const AVP_UE_LOCAL_IP_ADDRESS: AvpCode = AvpCode::new(2805);
+/// High-Priority-Access-Info AVP code (3GPP TS 29.273 section 5.2.3.36).
+pub const AVP_HIGH_PRIORITY_ACCESS_INFO: AvpCode = AvpCode::new(1542);
 /// State AVP code.
 pub const AVP_STATE: AvpCode = AvpCode::new(24);
 /// Reply-Message AVP code (RFC 4005 section 4.9).
@@ -120,6 +129,8 @@ pub const AVP_MAX_REQUESTED_BANDWIDTH_DL: AvpCode = AvpCode::new(515);
 
 /// Auth-Request-Type value for AUTHORIZE_AUTHENTICATE.
 pub const AUTH_REQUEST_TYPE_AUTHORIZE_AUTHENTICATE: u32 = 3;
+/// Auth-Request-Type value for AUTHORIZE_ONLY.
+pub const AUTH_REQUEST_TYPE_AUTHORIZE_ONLY: u32 = 2;
 
 /// 3GPP SWm application definition.
 pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
@@ -273,7 +284,7 @@ pub const COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE: CommandDefinition =
     )
     .with_avp_rules(&SWM_PROJECTED_PROFILE_ANSWER_AVP_RULES);
 
-const SWM_AVPS: [AvpDefinition; 36] = [
+const SWM_AVPS: [AvpDefinition; 39] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_EAP_PAYLOAD),
         "EAP-Payload",
@@ -300,7 +311,40 @@ const SWM_AVPS: [AvpDefinition; 36] = [
         "Auth-Request-Type",
         AvpDataType::Enumerated,
         AvpFlagRules::base_mandatory(),
-        SpecRef::new("ietf", "RFC6733", "6.12"),
+        SpecRef::new("ietf", "RFC6733", "8.7"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_AAR_FLAGS, VENDOR_ID_3GPP),
+        "AAR-Flags",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29273", "7.2.3.5"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_UE_LOCAL_IP_ADDRESS, VENDOR_ID_3GPP),
+        "UE-Local-IP-Address",
+        AvpDataType::Address,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29212", "5.3.96"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_HIGH_PRIORITY_ACCESS_INFO, VENDOR_ID_3GPP),
+        "High-Priority-Access-Info",
+        AvpDataType::Unsigned32,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeUnset,
+        ),
+        SpecRef::new("3gpp", "TS29273", "5.2.3.36"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_STATE),
@@ -552,25 +596,34 @@ const SWM_AVPS: [AvpDefinition; 36] = [
     ),
 ];
 
-const SWM_COMMANDS: [CommandDefinition; 6] = [
+const SWM_COMMANDS: [CommandDefinition; 10] = [
     COMMAND_DIAMETER_EAP_REQUEST,
     COMMAND_DIAMETER_EAP_ANSWER,
     COMMAND_ABORT_SESSION_REQUEST,
     COMMAND_ABORT_SESSION_ANSWER,
     COMMAND_SESSION_TERMINATION_REQUEST,
     COMMAND_SESSION_TERMINATION_ANSWER,
+    COMMAND_RE_AUTH_REQUEST,
+    COMMAND_RE_AUTH_ANSWER,
+    COMMAND_AA_REQUEST,
+    COMMAND_AA_ANSWER,
 ];
 
-const SWM_PROJECTED_PROFILE_COMMANDS: [CommandDefinition; 6] = [
+const SWM_PROJECTED_PROFILE_COMMANDS: [CommandDefinition; 10] = [
     COMMAND_DIAMETER_EAP_REQUEST,
     COMMAND_DIAMETER_EAP_ANSWER_PROJECTED_PROFILE,
     COMMAND_ABORT_SESSION_REQUEST,
     COMMAND_ABORT_SESSION_ANSWER,
     COMMAND_SESSION_TERMINATION_REQUEST,
     COMMAND_SESSION_TERMINATION_ANSWER,
+    COMMAND_RE_AUTH_REQUEST,
+    COMMAND_RE_AUTH_ANSWER,
+    COMMAND_AA_REQUEST,
+    COMMAND_AA_ANSWER,
 ];
 
-/// Static SWm dictionary covering DER/DEA and typed ASR/ASA plus STR/STA lifecycle slices.
+/// Static SWm dictionary covering DER/DEA and typed STR/STA, ASR/ASA,
+/// RAR/RAA, and AAR/AAA lifecycle slices.
 pub static DICTIONARY: Dictionary = Dictionary::new(
     "diameter-3gpp-swm-subset",
     &[APPLICATION],
@@ -602,6 +655,8 @@ pub const fn projected_profile_dictionary() -> &'static Dictionary {
 /// Auth-Request-Type values used by SWm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthRequestType {
+    /// AUTHORIZE_ONLY.
+    AuthorizeOnly,
     /// AUTHORIZE_AUTHENTICATE.
     AuthorizeAuthenticate,
     /// Unknown or application-specific value.
@@ -612,6 +667,7 @@ impl AuthRequestType {
     /// Return the wire value.
     pub const fn value(self) -> u32 {
         match self {
+            Self::AuthorizeOnly => AUTH_REQUEST_TYPE_AUTHORIZE_ONLY,
             Self::AuthorizeAuthenticate => AUTH_REQUEST_TYPE_AUTHORIZE_AUTHENTICATE,
             Self::Other(v) => v,
         }
@@ -619,16 +675,21 @@ impl AuthRequestType {
 
     /// Parse from a wire value.
     pub const fn from_value(value: u32) -> Self {
-        if value == AUTH_REQUEST_TYPE_AUTHORIZE_AUTHENTICATE {
-            Self::AuthorizeAuthenticate
-        } else {
-            Self::Other(value)
+        match value {
+            AUTH_REQUEST_TYPE_AUTHORIZE_ONLY => Self::AuthorizeOnly,
+            AUTH_REQUEST_TYPE_AUTHORIZE_AUTHENTICATE => Self::AuthorizeAuthenticate,
+            other => Self::Other(other),
         }
     }
 
     /// Return true for AUTHORIZE_AUTHENTICATE.
     pub const fn is_authorize_authenticate(self) -> bool {
         matches!(self, Self::AuthorizeAuthenticate)
+    }
+
+    /// Return true for AUTHORIZE_ONLY.
+    pub const fn is_authorize_only(self) -> bool {
+        matches!(self, Self::AuthorizeOnly)
     }
 }
 
@@ -1906,12 +1967,12 @@ pub fn parse_swm_diameter_eap_request_with_provenance(
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.14")?;
                 builder_helpers::set_once(&mut user_name, Redacted::from(value), offset, "8.14")?;
             } else if code == AVP_AUTH_REQUEST_TYPE {
-                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.12")?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.7")?;
                 builder_helpers::set_once(
                     &mut auth_request_type,
                     AuthRequestType::from_value(value),
                     offset,
-                    "6.12",
+                    "8.7",
                 )?;
             } else if code == AVP_EAP_PAYLOAD {
                 builder_helpers::set_once(
@@ -2317,12 +2378,12 @@ pub fn parse_swm_diameter_eap_answer(
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.8")?;
                 builder_helpers::set_once(&mut auth_application_id, value, offset, "6.8")?;
             } else if code == AVP_AUTH_REQUEST_TYPE {
-                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.12")?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.7")?;
                 builder_helpers::set_once(
                     &mut auth_request_type,
                     AuthRequestType::from_value(value),
                     offset,
-                    "6.12",
+                    "8.7",
                 )?;
             } else if code == base::AVP_RESULT_CODE {
                 validate_base_mandatory_flags(&avp.header, offset, "7.1")?;
@@ -2537,7 +2598,7 @@ fn validate_base_mandatory_flags(
     Ok(())
 }
 
-fn append_experimental_result_avp(
+pub(super) fn append_experimental_result_avp(
     dst: &mut BytesMut,
     vendor_id: VendorId,
     code: u32,
@@ -2560,7 +2621,7 @@ fn append_experimental_result_avp(
     )
 }
 
-fn parse_experimental_result(
+pub(super) fn parse_experimental_result(
     value: &[u8],
     ctx: DecodeContext,
     base_offset: usize,
@@ -2696,7 +2757,7 @@ fn parse_terminal_information(
     })
 }
 
-fn append_apn_configuration_avp(
+pub(super) fn append_apn_configuration_avp(
     dst: &mut BytesMut,
     apn: &ApnConfiguration,
     ctx: EncodeContext,
@@ -2739,7 +2800,7 @@ fn append_apn_configuration_avp(
     )
 }
 
-fn parse_apn_configuration(
+pub(super) fn parse_apn_configuration(
     value: &[u8],
     ctx: DecodeContext,
     base_offset: usize,

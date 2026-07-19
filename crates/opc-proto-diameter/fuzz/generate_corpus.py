@@ -8,8 +8,8 @@ No seed lives only in a provenance/documentation directory.
 The spec-valid fixtures are hand-authored from the wire layouts in:
   - IETF RFC 6733 section 3 (message header) and section 4 (AVP framing)
   - 3GPP TS 32.299 (Rf offline charging PS-Information vendor AVPs)
-  - 3GPP TS 29.273 (SWm Diameter-EAP, Abort-Session, and
-    Session-Termination commands/AVPs)
+  - 3GPP TS 29.273 (SWm Diameter-EAP, Session-Termination, Abort-Session,
+    Re-Auth, and AA commands/AVPs)
 
 The malformed fixtures exercise the hostile-input paths that the decode
 surface must never panic on: truncation, invalid lengths, duplicate
@@ -636,6 +636,113 @@ def main() -> None:
             asr_without_destination_host,
         ),
         "swm_asr_missing_destination_host",
+    )
+
+    # 21. SWm Re-Auth-Request / Re-Auth-Answer authorization update,
+    #     TS 29.273 §§7.2.2.4.1-.2. Re-Auth-Request-Type is AUTHORIZE_ONLY.
+    authorization_proxy = avp(280, 0x40, b"proxy.example", None)
+    authorization_proxy += avp(33, 0x40, b"opaque-authorization-state", None)
+    rar_avps = b""
+    rar_avps += avp(263, 0x40, b"sess;swm;authorization", None)
+    rar_avps += avp(264, 0x40, b"aaa.example", None)
+    rar_avps += avp(296, 0x40, b"example", None)
+    rar_avps += avp(283, 0x40, b"access.example", None)
+    rar_avps += avp(293, 0x40, b"epdg.example", None)
+    rar_avps += avp(258, 0x40, u32(16777264), None)
+    rar_avps += avp(285, 0x40, u32(0), None)
+    rar_avps += avp(1, 0x40, b"subscriber@example", None)
+    rar_avps += avp(284, 0x40, authorization_proxy, None)
+    write_corpus(
+        msg_dir,
+        header(0xC0, 258, 16777264, 0x999999A5, 0xAAAAAAB6, rar_avps),
+        "swm_rar_authorization_update",
+    )
+    raa_avps = b""
+    raa_avps += avp(263, 0x40, b"sess;swm;authorization", None)
+    raa_avps += avp(268, 0x40, u32(2001), None)
+    raa_avps += avp(285, 0x40, u32(0), None)
+    raa_avps += avp(291, 0x40, u32(600), None)
+    raa_avps += avp(276, 0x40, u32(60), None)
+    raa_avps += avp(264, 0x40, b"epdg.example", None)
+    raa_avps += avp(296, 0x40, b"access.example", None)
+    raa_avps += avp(1, 0x40, b"subscriber@example", None)
+    raa_avps += avp(284, 0x40, authorization_proxy, None)
+    write_corpus(
+        msg_dir,
+        header(0x40, 258, 16777264, 0x999999A5, 0xAAAAAAB6, raa_avps),
+        "swm_raa_authorization_update_success",
+    )
+
+    # 22. Follow-up AA-Request / AA-Answer, TS 29.273 §§7.2.2.1.3-.4.
+    #     AAA intentionally clears R despite the displayed ABNF editorial typo.
+    aar_avps = b""
+    aar_avps += avp(263, 0x40, b"sess;swm;authorization", None)
+    aar_avps += avp(258, 0x40, u32(16777264), None)
+    aar_avps += avp(264, 0x40, b"epdg.example", None)
+    aar_avps += avp(296, 0x40, b"example", None)
+    aar_avps += avp(283, 0x40, b"aaa.example", None)
+    aar_avps += avp(293, 0x40, b"dra.example", None)
+    aar_avps += avp(274, 0x40, u32(2), None)
+    aar_avps += avp(1, 0x40, b"subscriber@example", None)
+    aar_avps += avp(291, 0x40, u32(600), None)
+    aar_avps += avp(276, 0x40, u32(60), None)
+    aar_avps += avp(1539, 0x80, u32(1), vendor=10415)
+    aar_avps += avp(2805, 0x80, b"\x00\x01" + bytes([198, 51, 100, 10]), vendor=10415)
+    aar_avps += avp(1542, 0x80, u32(1), vendor=10415)
+    aar_avps += avp(284, 0x40, authorization_proxy, None)
+    write_corpus(
+        msg_dir,
+        header(0xC0, 265, 16777264, 0x999999A6, 0xAAAAAAB7, aar_avps),
+        "swm_aar_authorization_update",
+    )
+    apn_children = b""
+    apn_children += avp(1423, 0xC0, u32(7), vendor=10415)
+    apn_children += avp(1456, 0xC0, u32(2), vendor=10415)
+    apn_children += avp(493, 0x40, b"ims", None)
+    aaa_avps = b""
+    aaa_avps += avp(263, 0x40, b"sess;swm;authorization", None)
+    aaa_avps += avp(258, 0x40, u32(16777264), None)
+    aaa_avps += avp(274, 0x40, u32(2), None)
+    aaa_avps += avp(268, 0x40, u32(2001), None)
+    aaa_avps += avp(285, 0x40, u32(0), None)
+    aaa_avps += avp(291, 0x40, u32(300), None)
+    aaa_avps += avp(276, 0x40, u32(60), None)
+    aaa_avps += avp(27, 0x40, u32(900), None)
+    aaa_avps += avp(264, 0x40, b"dra.example", None)
+    aaa_avps += avp(296, 0x40, b"aaa.example", None)
+    aaa_avps += avp(1, 0x40, b"subscriber@example", None)
+    aaa_avps += avp(1430, 0xC0, apn_children, vendor=10415)
+    aaa_avps += avp(284, 0x40, authorization_proxy, None)
+    write_corpus(
+        msg_dir,
+        header(0x40, 265, 16777264, 0x999999A6, 0xAAAAAAB7, aaa_avps),
+        "swm_aaa_authorization_update_success",
+    )
+
+    # 23. Header-complete omissions exercise sealed 5005 provenance.
+    write_corpus(
+        msg_dir,
+        header(
+            0xC0,
+            258,
+            16777264,
+            0x999999A7,
+            0xAAAAAAB8,
+            rar_avps.replace(avp(285, 0x40, u32(0), None), b"", 1),
+        ),
+        "swm_rar_missing_re_auth_request_type",
+    )
+    write_corpus(
+        msg_dir,
+        header(
+            0xC0,
+            265,
+            16777264,
+            0x999999A8,
+            0xAAAAAAB9,
+            aar_avps.replace(avp(274, 0x40, u32(2), None), b"", 1),
+        ),
+        "swm_aar_missing_auth_request_type",
     )
 
     # -------------------------------------------------------------------------

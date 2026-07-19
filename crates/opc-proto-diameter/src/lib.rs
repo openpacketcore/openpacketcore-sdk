@@ -14,7 +14,7 @@
 //! answer boundary without exposing sensitive AVP contents or retaining an
 //! unbounded request suffix.
 //! `parser_error` adds sealed, request-bound missing-AVP and grouped-set
-//! provenance for the typed CER, DWR, DPR, and SWm DER/STR/ASR parsers. Legacy parser
+//! provenance for the typed CER, DWR, DPR, and SWm DER/STR/ASR/RAR/AAR parsers. Legacy parser
 //! signatures continue to return [`DecodeError`]; additive
 //! `*_with_provenance` entry points retain the command/application identity and
 //! exact SDK-owned vendor-aware AVP schema required by
