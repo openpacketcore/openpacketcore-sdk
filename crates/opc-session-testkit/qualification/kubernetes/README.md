@@ -245,6 +245,8 @@ independent provenance trust root. Only a `Passed`, cleanup-complete result with
 history proceeds to private descriptor-relative staging. The atomic bundle
 contains:
 
+- `session-ha-profile-v5.json`, the exact closed candidate profile named by
+  the evidence;
 - `concurrent-history-v5.jsonl`;
 - `fault-schedule-v5.json`;
 - `workload-schedule-v5.json`;
@@ -254,7 +256,9 @@ contains:
   `check-session-ha-kubernetes-concurrent-v5-workload-v1.py` bytes;
 - bounded exact `checker-output-v5.json`;
 - bounded exact `workload-verifier-output-v1.json`; and
-- `summary.json` with all retained digests and serialized
+- `summary.json` using
+  `opc-session-kubernetes-concurrent-v5-artifacts/v2`, with the retained
+  profile binding, all other retained digests, and serialized
   interpreter/path/version/digest identity.
 
 Both verification programs are launched directly with Python `-I -B -S`,
@@ -303,6 +307,8 @@ controls only the existing qualification RPC fault gate; it does not claim
 NetworkPolicy, packet impairment, process/host/PVC failure, remote-HKMS,
 rotation, soak, or production qualification coverage. Every v5 evidence and
 summary maturity field remains experimental and false for production credit.
+The retained profile makes that exclusion and the complete eight-gate
+acceptance inventory machine-readable; it does not satisfy any gate.
 
 The rendered ServiceAccount remains tokenless and the manifest grants no RBAC
 or controller identity. Kubernetes authorization to use `pods/exec` for this

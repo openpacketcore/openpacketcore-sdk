@@ -620,10 +620,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Linux output parent and Python interpreter before campaign mutation, run the
   deployed v5 batch/watch/restore/readiness campaign, and publish only after
   cleanup completes and both the frozen checker and additive workload verifier
-  pass. Private descriptor-relative staging retains
-  the exact v5 JSONL history, fault schedule, generated workload schedule,
-  closed candidate evidence, unchanged frozen independent checker, separate
-  additive workload verifier, both bounded outputs, and digest summary;
+  pass. The exact v5 machine-readable profile now closes the crate, feature,
+  platform, protocol, threshold, checker, workload-verifier, and remaining-gate
+  inventory named by the evidence. Private descriptor-relative staging retains
+  that profile, the exact v5 JSONL history, fault schedule, generated workload
+  schedule, closed candidate evidence, unchanged frozen independent checker,
+  separate additive workload verifier, both bounded outputs, and a v2 digest
+  summary that binds the profile bytes;
   `renameat2(NOREPLACE)` prevents replacement. Reusable-API callers must supply
   both expected digests; the dedicated CLI binds the exact programs embedded in
   the invoked binary and is not an independent provenance trust root.

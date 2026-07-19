@@ -55,9 +55,11 @@ use rustix::fs::{
 #[cfg(target_os = "linux")]
 use rustix::process::{kill_process_group, Pid, Signal};
 
-#[cfg(target_os = "linux")]
-use crate::qualification::SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4;
 use crate::qualification::{QualificationCandidateSourceTreeStatus, QualificationSha256};
+#[cfg(target_os = "linux")]
+use crate::qualification::{
+    SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V5, SESSION_HA_CANDIDATE_PROFILE_V5_JSON,
+};
 #[cfg(target_os = "linux")]
 use crate::qualification_concurrent_v5::QualificationConcurrentHistoryV5;
 #[cfg(target_os = "linux")]
@@ -73,7 +75,9 @@ use crate::qualification_kubernetes_concurrent_v5::{
 
 /// Schema identifier for one atomically published candidate-only v5 bundle.
 pub const QUALIFICATION_KUBERNETES_CONCURRENT_V5_ARTIFACT_SUMMARY_SCHEMA: &str =
-    "opc-session-kubernetes-concurrent-v5-artifacts/v1";
+    "opc-session-kubernetes-concurrent-v5-artifacts/v2";
+/// Exact retained v5 candidate-profile filename.
+pub const QUALIFICATION_KUBERNETES_CONCURRENT_V5_PROFILE_FILE: &str = "session-ha-profile-v5.json";
 /// Exact retained v5 JSONL history filename.
 pub const QUALIFICATION_KUBERNETES_CONCURRENT_V5_HISTORY_FILE: &str = "concurrent-history-v5.jsonl";
 /// Exact retained v5 fault-schedule filename.
@@ -131,6 +135,8 @@ const EMBEDDED_CHECKER: &[u8] =
     include_bytes!("../../../scripts/check-session-ha-concurrent-history-v5.py");
 const EMBEDDED_WORKLOAD_VERIFIER: &[u8] =
     include_bytes!("../../../scripts/check-session-ha-kubernetes-concurrent-v5-workload-v1.py");
+#[cfg(target_os = "linux")]
+const EMBEDDED_PROFILE: &[u8] = SESSION_HA_CANDIDATE_PROFILE_V5_JSON.as_bytes();
 
 #[cfg(target_os = "linux")]
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -317,6 +323,8 @@ pub struct QualificationKubernetesConcurrentV5ArtifactSummary {
     pub operation_counts: QualificationKubernetesConcurrentV5OperationCounts,
     /// Canonical checker interpreter identity.
     pub checker_interpreter: QualificationKubernetesConcurrentV5InterpreterSummary,
+    /// Exact retained machine-readable v5 candidate profile.
+    pub profile: QualificationKubernetesConcurrentV5ArtifactDigest,
     /// Exact retained history binding.
     pub history: QualificationKubernetesConcurrentV5ArtifactDigest,
     /// Exact retained fault-schedule binding.
@@ -911,6 +919,10 @@ fn stage_candidate_artifacts(
         validate_private_staging(&staging_descriptor)?;
         for (name, bytes) in [
             (
+                QUALIFICATION_KUBERNETES_CONCURRENT_V5_PROFILE_FILE,
+                EMBEDDED_PROFILE,
+            ),
+            (
                 QUALIFICATION_KUBERNETES_CONCURRENT_V5_HISTORY_FILE,
                 encoded.history.as_slice(),
             ),
@@ -1065,6 +1077,10 @@ fn finalize_candidate_artifacts(
                 sha256: staged.prepared.interpreter.identity.sha256.clone(),
                 version: staged.prepared.interpreter_version.clone(),
             },
+            profile: artifact_digest(
+                QUALIFICATION_KUBERNETES_CONCURRENT_V5_PROFILE_FILE,
+                EMBEDDED_PROFILE,
+            ),
             history: artifact_digest(
                 QUALIFICATION_KUBERNETES_CONCURRENT_V5_HISTORY_FILE,
                 &staged.encoded.history,
@@ -1097,7 +1113,7 @@ fn finalize_candidate_artifacts(
                 QUALIFICATION_KUBERNETES_CONCURRENT_V5_EVIDENCE_FILE,
                 &staged.encoded.evidence,
             ),
-            remaining_acceptance: SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4
+            remaining_acceptance: SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V5
                 .iter()
                 .map(|gate| (*gate).to_owned())
                 .collect(),
@@ -1109,6 +1125,10 @@ fn finalize_candidate_artifacts(
             &summary_bytes,
         )?;
         for (name, expected) in [
+            (
+                QUALIFICATION_KUBERNETES_CONCURRENT_V5_PROFILE_FILE,
+                EMBEDDED_PROFILE,
+            ),
             (
                 QUALIFICATION_KUBERNETES_CONCURRENT_V5_HISTORY_FILE,
                 staged.encoded.history.as_slice(),
@@ -1290,7 +1310,7 @@ impl CandidateEvidenceV5 {
                 fixed_campaign_lease_guards: true,
                 authoritative_non_expiring_records: true,
             },
-            remaining_acceptance: SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4
+            remaining_acceptance: SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V5
                 .iter()
                 .map(|gate| (*gate).to_owned())
                 .collect(),
@@ -2450,6 +2470,7 @@ fn cleanup_staging_directory<ParentFd: AsFd, StagingFd: AsFd>(
     staging_name: &str,
 ) -> Result<(), ()> {
     for name in [
+        QUALIFICATION_KUBERNETES_CONCURRENT_V5_PROFILE_FILE,
         QUALIFICATION_KUBERNETES_CONCURRENT_V5_HISTORY_FILE,
         QUALIFICATION_KUBERNETES_CONCURRENT_V5_FAULT_SCHEDULE_FILE,
         QUALIFICATION_KUBERNETES_CONCURRENT_V5_WORKLOAD_SCHEDULE_FILE,

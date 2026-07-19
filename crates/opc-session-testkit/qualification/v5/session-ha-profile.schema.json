@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-profile/v5-candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "maturity",
+    "qualification_complete",
+    "workspace",
+    "source_build_gate",
+    "artifacts",
+    "platforms",
+    "topology",
+    "protocol",
+    "consensus_timing",
+    "bounds",
+    "provisional_test_thresholds",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": { "const": "opc-session-ha-profile/v5-candidate" },
+    "profile_id": { "const": "opc-session-openraft-ha/v5-candidate" },
+    "maturity": { "const": "experimental" },
+    "qualification_complete": { "const": false },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "rust_msrv", "source_revision"],
+      "properties": {
+        "version": { "const": "0.2.0" },
+        "rust_msrv": { "const": "1.88" },
+        "source_revision": { "const": "required-in-evidence" }
+      }
+    },
+    "source_build_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tracking_issue",
+        "openraft_git",
+        "openraft_rev",
+        "affected_workspace_crates",
+        "crates_io_check_date",
+        "crates_io_exact_matches",
+        "removal_condition"
+      ],
+      "properties": {
+        "tracking_issue": { "const": 143 },
+        "openraft_git": { "const": "https://github.com/openpacketcore/openraft" },
+        "openraft_rev": { "const": "f607e636406b16bd0ad7925dbb631da1b7a4cd96" },
+        "affected_workspace_crates": {
+          "const": [
+            "opc-alarm",
+            "opc-alarm-k8s",
+            "opc-alarm-testkit",
+            "opc-alarm-yang",
+            "opc-amf-lite",
+            "opc-amf-lite-testkit",
+            "opc-config-bus",
+            "opc-consensus",
+            "opc-gnmi-server",
+            "opc-ipsec-lb",
+            "opc-mgmt-authz",
+            "opc-mgmt-transport",
+            "opc-netconf-server",
+            "opc-persist",
+            "opc-runtime",
+            "opc-sa-mirror",
+            "opc-sbi",
+            "opc-sdk",
+            "opc-sdk-integration",
+            "opc-session-cache",
+            "opc-session-net",
+            "opc-session-store",
+            "opc-session-testkit",
+            "operator-controller",
+            "operator-lifecycle",
+            "operator-lifecycle-cli"
+          ]
+        },
+        "crates_io_check_date": { "const": "2026-07-13" },
+        "crates_io_exact_matches": { "type": "array", "maxItems": 0 },
+        "removal_condition": {
+          "const": "official stable Openraft release containing the fix, registry pin and checksum, and full issue #143 requalification"
+        }
+      }
+    },
+    "artifacts": {
+      "const": [
+        {
+          "crate_name": "opc-consensus",
+          "version": "0.2.0",
+          "publish": false,
+          "required_features": [],
+          "excluded_features": []
+        },
+        {
+          "crate_name": "opc-session-store",
+          "version": "0.2.0",
+          "publish": false,
+          "required_features": [],
+          "excluded_features": []
+        },
+        {
+          "crate_name": "opc-persist",
+          "version": "0.2.0",
+          "publish": false,
+          "required_features": [],
+          "excluded_features": []
+        },
+        {
+          "crate_name": "opc-session-net",
+          "version": "0.2.0",
+          "publish": false,
+          "required_features": [],
+          "excluded_features": [
+            "insecure-test",
+            "legacy-session-net-compat"
+          ]
+        },
+        {
+          "crate_name": "openraft",
+          "version": "0.9.24",
+          "publish": false,
+          "required_features": [
+            "serde",
+            "single-term-leader",
+            "storage-v2"
+          ],
+          "excluded_features": []
+        }
+      ]
+    },
+    "platforms": {
+      "const": [
+        {
+          "target": "x86_64-unknown-linux-gnu",
+          "status": "qualification-pending"
+        },
+        {
+          "target": "aarch64-unknown-linux-gnu",
+          "status": "qualification-pending"
+        }
+      ]
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "member_counts",
+        "maximum_members",
+        "quorum_rule",
+        "distinct_failure_domain_per_voter",
+        "distinct_backing_store_per_voter",
+        "stable_identity_independent_of_route"
+      ],
+      "properties": {
+        "member_counts": { "const": [3, 5] },
+        "maximum_members": { "const": 31 },
+        "quorum_rule": { "const": "floor(n/2)+1" },
+        "distinct_failure_domain_per_voter": { "const": true },
+        "distinct_backing_store_per_voter": { "const": true },
+        "stable_identity_independent_of_route": { "const": true }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "consensus_alpn",
+        "transport_revision",
+        "wire_schema_revision",
+        "error_set_revision",
+        "consensus_schema_version",
+        "min_frame_bytes",
+        "max_frame_bytes",
+        "max_rpc_payload_bytes",
+        "legacy_direct_backend_enabled"
+      ],
+      "properties": {
+        "consensus_alpn": { "const": "opc-session-consensus/2" },
+        "transport_revision": { "const": 2 },
+        "wire_schema_revision": { "const": 2 },
+        "error_set_revision": { "const": 4 },
+        "consensus_schema_version": { "const": 1 },
+        "min_frame_bytes": { "const": 9437184 },
+        "max_frame_bytes": { "const": 16777216 },
+        "max_rpc_payload_bytes": { "const": 2097152 },
+        "legacy_direct_backend_enabled": { "const": false }
+      }
+    },
+    "consensus_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cold_connect_budget_composition",
+        "cold_connect_timeout_millis",
+        "append_entries_timeout_millis",
+        "heartbeat_interval_millis",
+        "vote_timeout_millis",
+        "election_timeout_min_millis",
+        "election_timeout_max_millis",
+        "install_snapshot_timeout_millis",
+        "forward_mutation_timeout_millis",
+        "read_barrier_timeout_millis",
+        "server_idle_timeout_millis",
+        "server_handler_timeout_millis"
+      ],
+      "properties": {
+        "cold_connect_budget_composition": { "const": "contained-within-family-deadline" },
+        "cold_connect_timeout_millis": { "const": 1500 },
+        "append_entries_timeout_millis": { "const": 2000 },
+        "heartbeat_interval_millis": { "const": 2000 },
+        "vote_timeout_millis": { "const": 5000 },
+        "election_timeout_min_millis": { "const": 5000 },
+        "election_timeout_max_millis": { "const": 8000 },
+        "install_snapshot_timeout_millis": { "const": 10000 },
+        "forward_mutation_timeout_millis": { "const": 10000 },
+        "read_barrier_timeout_millis": { "const": 10000 },
+        "server_idle_timeout_millis": { "const": 30000 },
+        "server_handler_timeout_millis": { "const": 30000 }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_timeout_millis",
+        "max_session_ttl_seconds",
+        "max_stable_id_bytes",
+        "max_replication_transaction_id_bytes",
+        "max_replication_operation_depth",
+        "max_replication_operations_per_entry",
+        "max_replication_log_page_entries",
+        "max_watch_backlog_entries",
+        "max_restore_page_records",
+        "max_restore_page_payload_bytes",
+        "max_restore_examined_rows",
+        "max_restore_sqlite_work_millis"
+      ],
+      "properties": {
+        "operation_timeout_millis": { "const": 10000 },
+        "max_session_ttl_seconds": { "const": 31536000 },
+        "max_stable_id_bytes": { "const": 64 },
+        "max_replication_transaction_id_bytes": { "const": 128 },
+        "max_replication_operation_depth": { "const": 16 },
+        "max_replication_operations_per_entry": { "const": 256 },
+        "max_replication_log_page_entries": { "const": 65536 },
+        "max_watch_backlog_entries": { "const": 64 },
+        "max_restore_page_records": { "const": 1024 },
+        "max_restore_page_payload_bytes": { "const": 4194304 },
+        "max_restore_examined_rows": { "const": 4096 },
+        "max_restore_sqlite_work_millis": { "const": 1000 }
+      }
+    },
+    "provisional_test_thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acknowledged_write_loss",
+        "stale_owner_mutation_successes",
+        "conflicting_committed_entries",
+        "watch_gaps",
+        "max_startup_millis",
+        "max_single_member_stop_service_continuity_millis",
+        "max_restart_catchup_millis",
+        "max_leader_failover_millis",
+        "max_leader_restart_catchup_millis",
+        "minimum_soak_seconds"
+      ],
+      "properties": {
+        "acknowledged_write_loss": { "const": 0 },
+        "stale_owner_mutation_successes": { "const": 0 },
+        "conflicting_committed_entries": { "const": 0 },
+        "watch_gaps": { "const": 0 },
+        "max_startup_millis": { "const": 30000 },
+        "max_single_member_stop_service_continuity_millis": { "const": 30000 },
+        "max_restart_catchup_millis": { "const": 120000 },
+        "max_leader_failover_millis": { "const": 30000 },
+        "max_leader_restart_catchup_millis": { "const": 120000 },
+        "minimum_soak_seconds": { "const": 86400 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequential_schedule_schema",
+        "sequential_history_schema",
+        "sequential_checker",
+        "concurrent_evidence_schema",
+        "concurrent_history_schema",
+        "concurrent_fault_schedule_schema",
+        "concurrent_checker",
+        "concurrent_workload_schema",
+        "concurrent_workload_verifier",
+        "candidate_artifact_summary_schema",
+        "required_topologies",
+        "required_transport_modes",
+        "foundation_transport_mode",
+        "foundation_counts_for_tls_rotation",
+        "foundation_payload_protection",
+        "foundation_counts_for_production_encryption",
+        "unresolved_dependencies",
+        "acceptance_gates"
+      ],
+      "properties": {
+        "sequential_schedule_schema": {
+          "const": "qualification/v1/session-ha-schedule.schema.json"
+        },
+        "sequential_history_schema": {
+          "const": "qualification/v1/session-ha-history.schema.json"
+        },
+        "sequential_checker": { "const": "scripts/check-session-ha-history.py" },
+        "concurrent_evidence_schema": {
+          "const": "qualification/v5/session-ha-candidate-evidence.schema.json"
+        },
+        "concurrent_history_schema": {
+          "const": "qualification/v5/session-ha-concurrent-history.schema.json"
+        },
+        "concurrent_fault_schedule_schema": {
+          "const": "qualification/v5/session-ha-fault-schedule.schema.json"
+        },
+        "concurrent_checker": {
+          "const": "scripts/check-session-ha-concurrent-history-v5.py"
+        },
+        "concurrent_workload_schema": {
+          "const": "opc-session-kubernetes-concurrent-v5-workload/v1"
+        },
+        "concurrent_workload_verifier": {
+          "const": "scripts/check-session-ha-kubernetes-concurrent-v5-workload-v1.py"
+        },
+        "candidate_artifact_summary_schema": {
+          "const": "opc-session-kubernetes-concurrent-v5-artifacts/v2"
+        },
+        "required_topologies": { "const": [3, 5] },
+        "required_transport_modes": { "const": ["mtls"] },
+        "foundation_transport_mode": { "const": "loopback-plaintext-test-only" },
+        "foundation_counts_for_tls_rotation": { "const": false },
+        "foundation_payload_protection": {
+          "const": "fixed-memory-provider-synthetic-wrapper-only"
+        },
+        "foundation_counts_for_production_encryption": { "const": false },
+        "unresolved_dependencies": { "const": [143, 158, 164] },
+        "acceptance_gates": {
+          "const": [
+            "deployed_kubernetes_3_5",
+            "real_network_and_storage_faults",
+            "crash_point_matrix",
+            "version_migration_and_rollback",
+            "platform_resource_soak",
+            "remote_hkms_rotation",
+            "live_alert_fire_and_clear",
+            "signed_release_bundle"
+          ]
+        }
+      }
+    }
+  }
+}

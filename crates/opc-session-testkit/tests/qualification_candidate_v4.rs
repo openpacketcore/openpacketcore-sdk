@@ -3,11 +3,15 @@ use std::process::{Command, Output};
 
 use opc_session_testkit::qualification::{
     QualificationCandidateContractError, QualificationSha256, SessionHaCandidateManifestV4,
-    SessionHaCandidateQualificationProfileV4, SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4,
+    SessionHaCandidateQualificationProfileV4, SessionHaCandidateQualificationProfileV5,
+    SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4, SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V5,
     SESSION_HA_CANDIDATE_MANIFEST_V4_MAX_BYTES, SESSION_HA_CANDIDATE_MANIFEST_V4_SCHEMA_JSON,
     SESSION_HA_CANDIDATE_PROFILE_V4_JSON, SESSION_HA_CANDIDATE_PROFILE_V4_MAX_BYTES,
-    SESSION_HA_CANDIDATE_PROFILE_V4_SCHEMA_JSON, SESSION_HA_PROFILE_JSON,
+    SESSION_HA_CANDIDATE_PROFILE_V4_SCHEMA_JSON, SESSION_HA_CANDIDATE_PROFILE_V5_JSON,
+    SESSION_HA_CANDIDATE_PROFILE_V5_MAX_BYTES, SESSION_HA_CANDIDATE_PROFILE_V5_SCHEMA_JSON,
+    SESSION_HA_PROFILE_JSON,
 };
+use opc_session_testkit::qualification_kubernetes_concurrent_v5_artifacts::QUALIFICATION_KUBERNETES_CONCURRENT_V5_ARTIFACT_SUMMARY_SCHEMA;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -191,6 +195,119 @@ fn v4_profile_is_an_additive_frozen_candidate_contract() {
     let mut unsupported_claim = profile_value;
     unsupported_claim["qualification_complete"] = true.into();
     assert!(validate_structural_schema(&profile_schema, &unsupported_claim).is_err());
+}
+
+#[test]
+fn v5_profile_closes_the_deployed_collector_inventory_without_graduating_it() {
+    let profile_schema: Value = serde_json::from_str(SESSION_HA_CANDIDATE_PROFILE_V5_SCHEMA_JSON)
+        .expect("v5 profile schema");
+    let profile_value: Value =
+        serde_json::from_str(SESSION_HA_CANDIDATE_PROFILE_V5_JSON).expect("v5 profile");
+    validate_structural_schema(&profile_schema, &profile_value)
+        .expect("v5 profile satisfies its closed schema");
+
+    let profile = SessionHaCandidateQualificationProfileV5::from_json(
+        SESSION_HA_CANDIDATE_PROFILE_V5_JSON.as_bytes(),
+    )
+    .expect("strict typed v5 profile");
+    assert_eq!(
+        profile.schema_version,
+        "opc-session-ha-profile/v5-candidate"
+    );
+    assert_eq!(profile.profile_id, "opc-session-openraft-ha/v5-candidate");
+    assert_eq!(profile.maturity, "experimental");
+    assert!(!profile.qualification_complete);
+    assert_eq!(
+        profile.evidence.acceptance_gates,
+        SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V5
+    );
+
+    let baseline: Value = serde_json::from_str(SESSION_HA_PROFILE_JSON).expect("v2 profile");
+    for field in [
+        "workspace",
+        "source_build_gate",
+        "artifacts",
+        "platforms",
+        "topology",
+        "protocol",
+        "consensus_timing",
+        "bounds",
+        "provisional_test_thresholds",
+    ] {
+        assert_eq!(
+            profile_value[field], baseline[field],
+            "v5 drifted at {field}"
+        );
+    }
+
+    let evidence: Value = serde_json::from_slice(include_bytes!(
+        "fixtures/session-ha/candidate-evidence-v5.json"
+    ))
+    .expect("v5 evidence fixture");
+    assert_eq!(evidence["profile_id"], profile.profile_id);
+    assert_eq!(
+        evidence["schema_version"],
+        "opc-session-ha-candidate-evidence/v5"
+    );
+    assert_eq!(
+        profile.evidence.concurrent_evidence_schema,
+        "qualification/v5/session-ha-candidate-evidence.schema.json"
+    );
+    assert_eq!(
+        profile.evidence.concurrent_history_schema,
+        "qualification/v5/session-ha-concurrent-history.schema.json"
+    );
+    assert_eq!(
+        profile.evidence.concurrent_fault_schedule_schema,
+        "qualification/v5/session-ha-fault-schedule.schema.json"
+    );
+    assert_eq!(
+        profile.evidence.candidate_artifact_summary_schema,
+        QUALIFICATION_KUBERNETES_CONCURRENT_V5_ARTIFACT_SUMMARY_SCHEMA
+    );
+
+    let mut drifted = profile_value.clone();
+    drifted["evidence"]["candidate_artifact_summary_schema"] =
+        "opc-session-kubernetes-concurrent-v5-artifacts/v1".into();
+    assert!(validate_structural_schema(&profile_schema, &drifted).is_err());
+    let encoded = serde_json::to_vec(&drifted).expect("encode drifted profile");
+    assert_eq!(
+        SessionHaCandidateQualificationProfileV5::from_json(&encoded),
+        Err(QualificationCandidateContractError::InvalidProfile)
+    );
+
+    let mut unsupported_claim = profile_value;
+    unsupported_claim["qualification_complete"] = true.into();
+    assert!(validate_structural_schema(&profile_schema, &unsupported_claim).is_err());
+    let encoded = serde_json::to_vec(&unsupported_claim).expect("encode unsupported claim");
+    assert_eq!(
+        SessionHaCandidateQualificationProfileV5::from_json(&encoded),
+        Err(QualificationCandidateContractError::UnsupportedClaim)
+    );
+}
+
+#[test]
+fn v5_profile_decoder_is_bounded_and_closed() {
+    let mut exact_limit = SESSION_HA_CANDIDATE_PROFILE_V5_JSON.as_bytes().to_vec();
+    exact_limit.resize(SESSION_HA_CANDIDATE_PROFILE_V5_MAX_BYTES, b' ');
+    SessionHaCandidateQualificationProfileV5::from_json(&exact_limit)
+        .expect("valid v5 profile at exact document limit");
+
+    exact_limit.push(b' ');
+    assert_eq!(
+        SessionHaCandidateQualificationProfileV5::from_json(&exact_limit),
+        Err(QualificationCandidateContractError::DocumentTooLarge)
+    );
+
+    let mut unknown: Value =
+        serde_json::from_str(SESSION_HA_CANDIDATE_PROFILE_V5_JSON).expect("v5 profile value");
+    unknown["unreviewed"] = true.into();
+    assert_eq!(
+        SessionHaCandidateQualificationProfileV5::from_json(
+            &serde_json::to_vec(&unknown).expect("encode unknown field")
+        ),
+        Err(QualificationCandidateContractError::InvalidDocument)
+    );
 }
 
 #[test]
