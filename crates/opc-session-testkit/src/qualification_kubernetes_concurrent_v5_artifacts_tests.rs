@@ -166,6 +166,10 @@ async fn conclusive_campaign_publishes_private_digest_bound_bundle_once() {
     assert!(summary.experimental);
     assert!(!summary.qualification_complete);
     assert!(!summary.counts_for_production);
+    assert_eq!(
+        summary.schema_version,
+        "opc-session-kubernetes-concurrent-v5-artifacts/v2"
+    );
     assert!(summary.cleanup_complete);
     assert_eq!(summary.checker_status, "pass");
     assert_eq!(summary.workload_verifier_status, "pass");
@@ -181,6 +185,10 @@ async fn conclusive_campaign_publishes_private_digest_bound_bundle_once() {
         summary.workload_verifier.sha256,
         embedded_v5_workload_verifier_sha256()
     );
+    assert_eq!(
+        summary.profile.sha256,
+        QualificationSha256::digest(SESSION_HA_CANDIDATE_PROFILE_V5_JSON.as_bytes())
+    );
 
     let destination = &config.output_directory;
     assert_eq!(
@@ -188,6 +196,7 @@ async fn conclusive_campaign_publishes_private_digest_bound_bundle_once() {
         0o700
     );
     for name in [
+        QUALIFICATION_KUBERNETES_CONCURRENT_V5_PROFILE_FILE,
         QUALIFICATION_KUBERNETES_CONCURRENT_V5_HISTORY_FILE,
         QUALIFICATION_KUBERNETES_CONCURRENT_V5_FAULT_SCHEDULE_FILE,
         QUALIFICATION_KUBERNETES_CONCURRENT_V5_WORKLOAD_SCHEDULE_FILE,
@@ -207,6 +216,11 @@ async fn conclusive_campaign_publishes_private_digest_bound_bundle_once() {
             "{name} is not private"
         );
     }
+    assert_eq!(
+        fs::read(destination.join(QUALIFICATION_KUBERNETES_CONCURRENT_V5_PROFILE_FILE))
+            .expect("retained profile"),
+        SESSION_HA_CANDIDATE_PROFILE_V5_JSON.as_bytes()
+    );
     assert_eq!(
         fs::read(destination.join(QUALIFICATION_KUBERNETES_CONCURRENT_V5_CHECKER_FILE))
             .expect("retained checker"),

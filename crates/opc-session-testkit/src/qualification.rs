@@ -78,6 +78,13 @@ pub const SESSION_HA_CANDIDATE_EVIDENCE_V5_SCHEMA_JSON: &str =
 /// schedule rather than trusted from history rows.
 pub const SESSION_HA_FAULT_SCHEDULE_V5_SCHEMA_JSON: &str =
     include_str!("../qualification/v5/session-ha-fault-schedule.schema.json");
+/// Exact v5 profile matching the deployed concurrent-history collector,
+/// workload verifier, and atomic candidate-artifact publisher.
+pub const SESSION_HA_CANDIDATE_PROFILE_V5_JSON: &str =
+    include_str!("../qualification/v5/session-ha-profile.json");
+/// JSON Schema for the exact v5 candidate profile inventory.
+pub const SESSION_HA_CANDIDATE_PROFILE_V5_SCHEMA_JSON: &str =
+    include_str!("../qualification/v5/session-ha-profile.schema.json");
 /// Exact additive v4 profile that binds both independent history-checker
 /// families without making a production claim.
 pub const SESSION_HA_CANDIDATE_PROFILE_V4_JSON: &str =
@@ -91,6 +98,8 @@ pub const SESSION_HA_CANDIDATE_MANIFEST_V4_SCHEMA_JSON: &str =
     include_str!("../qualification/v4/session-ha-candidate-manifest.schema.json");
 /// Maximum accepted size of one v4 candidate profile document.
 pub const SESSION_HA_CANDIDATE_PROFILE_V4_MAX_BYTES: usize = 128 * 1024;
+/// Maximum accepted size of one v5 candidate profile document.
+pub const SESSION_HA_CANDIDATE_PROFILE_V5_MAX_BYTES: usize = 128 * 1024;
 /// Maximum accepted size of one v4 combined candidate manifest.
 pub const SESSION_HA_CANDIDATE_MANIFEST_V4_MAX_BYTES: usize = 256 * 1024;
 /// Complete fixed production-acceptance inventory retained by the v4
@@ -105,6 +114,10 @@ pub const SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4: [&str; 8] = [
     "live_alert_fire_and_clear",
     "signed_release_bundle",
 ];
+/// Complete fixed production-acceptance inventory retained by the v5
+/// non-production candidate contract.
+pub const SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V5: [&str; 8] =
+    SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V4;
 /// Strict schema for one incomplete production-mTLS harness checkpoint.
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../qualification/v1/session-mtls-candidate-evidence.schema.json");
@@ -1519,7 +1532,157 @@ pub struct QualificationCandidateEvidenceRequirementsV4 {
     pub acceptance_gates: Vec<String>,
 }
 
-/// Exact lowercase SHA-256 binding used by v4 candidate manifests.
+/// Additive, non-production v5 profile matching the deployed concurrent
+/// collector and its retained candidate-artifact bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionHaCandidateQualificationProfileV5 {
+    /// Frozen profile schema identifier.
+    pub schema_version: String,
+    /// Frozen candidate profile identifier used by v5 evidence.
+    pub profile_id: String,
+    /// Candidate maturity, which remains experimental.
+    pub maturity: String,
+    /// Whether the profile has completed production qualification.
+    pub qualification_complete: bool,
+    /// Workspace and toolchain inventory.
+    pub workspace: QualificationWorkspace,
+    /// Interim Openraft source-build restriction.
+    pub source_build_gate: QualificationSourceBuildGate,
+    /// Exact crate and dependency inventory.
+    pub artifacts: Vec<QualificationArtifact>,
+    /// Required target-platform inventory.
+    pub platforms: Vec<QualificationPlatform>,
+    /// Supported quorum topology.
+    pub topology: QualificationTopology,
+    /// Exact consensus protocol profile.
+    pub protocol: QualificationProtocol,
+    /// Exact consensus timing profile.
+    pub consensus_timing: QualificationConsensusTiming,
+    /// Resource and data-shape bounds.
+    pub bounds: QualificationBounds,
+    /// Provisional qualification thresholds.
+    pub provisional_test_thresholds: QualificationThresholds,
+    /// v1 sequential plus v5 concurrent evidence and remaining acceptance.
+    pub evidence: QualificationCandidateEvidenceRequirementsV5,
+}
+
+impl SessionHaCandidateQualificationProfileV5 {
+    /// Decode and validate one bounded v5 candidate profile document.
+    pub fn from_json(document: &[u8]) -> Result<Self, QualificationCandidateContractError> {
+        if document.len() > SESSION_HA_CANDIDATE_PROFILE_V5_MAX_BYTES {
+            return Err(QualificationCandidateContractError::DocumentTooLarge);
+        }
+        let profile: Self = serde_json::from_slice(document)
+            .map_err(|_| QualificationCandidateContractError::InvalidDocument)?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Validate the frozen v5 candidate-only claims and component inventory.
+    pub fn validate(&self) -> Result<(), QualificationCandidateContractError> {
+        if self.schema_version != "opc-session-ha-profile/v5-candidate"
+            || self.profile_id != "opc-session-openraft-ha/v5-candidate"
+            || self.maturity != "experimental"
+            || self.qualification_complete
+        {
+            return Err(QualificationCandidateContractError::UnsupportedClaim);
+        }
+        let baseline: SessionHaQualificationProfile = serde_json::from_str(SESSION_HA_PROFILE_JSON)
+            .map_err(|_| QualificationCandidateContractError::InvalidProfile)?;
+        if self.workspace != baseline.workspace
+            || self.source_build_gate != baseline.source_build_gate
+            || self.artifacts != baseline.artifacts
+            || self.platforms != baseline.platforms
+            || self.topology != baseline.topology
+            || self.protocol != baseline.protocol
+            || self.consensus_timing != baseline.consensus_timing
+            || self.bounds != baseline.bounds
+            || self.provisional_test_thresholds != baseline.provisional_test_thresholds
+        {
+            return Err(QualificationCandidateContractError::InvalidProfile);
+        }
+        let evidence = &self.evidence;
+        if evidence.sequential_schedule_schema != "qualification/v1/session-ha-schedule.schema.json"
+            || evidence.sequential_history_schema
+                != "qualification/v1/session-ha-history.schema.json"
+            || evidence.sequential_checker != "scripts/check-session-ha-history.py"
+            || evidence.concurrent_evidence_schema
+                != "qualification/v5/session-ha-candidate-evidence.schema.json"
+            || evidence.concurrent_history_schema
+                != "qualification/v5/session-ha-concurrent-history.schema.json"
+            || evidence.concurrent_fault_schedule_schema
+                != "qualification/v5/session-ha-fault-schedule.schema.json"
+            || evidence.concurrent_checker != "scripts/check-session-ha-concurrent-history-v5.py"
+            || evidence.concurrent_workload_schema
+                != "opc-session-kubernetes-concurrent-v5-workload/v1"
+            || evidence.concurrent_workload_verifier
+                != "scripts/check-session-ha-kubernetes-concurrent-v5-workload-v1.py"
+            || evidence.candidate_artifact_summary_schema
+                != "opc-session-kubernetes-concurrent-v5-artifacts/v2"
+            || evidence.required_topologies != [3, 5]
+            || evidence.required_transport_modes != ["mtls"]
+            || evidence.foundation_transport_mode != "loopback-plaintext-test-only"
+            || evidence.foundation_counts_for_tls_rotation
+            || evidence.foundation_payload_protection
+                != "fixed-memory-provider-synthetic-wrapper-only"
+            || evidence.foundation_counts_for_production_encryption
+            || evidence.unresolved_dependencies != [143, 158, 164]
+            || !evidence
+                .acceptance_gates
+                .iter()
+                .map(String::as_str)
+                .eq(SESSION_HA_CANDIDATE_ACCEPTANCE_GATES_V5)
+        {
+            return Err(QualificationCandidateContractError::InvalidProfile);
+        }
+        Ok(())
+    }
+}
+
+/// Exact component paths and unresolved gates for the v5 candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationCandidateEvidenceRequirementsV5 {
+    /// Frozen sequential workload schema path.
+    pub sequential_schedule_schema: String,
+    /// Frozen sequential history schema path.
+    pub sequential_history_schema: String,
+    /// SDK-independent sequential checker path.
+    pub sequential_checker: String,
+    /// Closed v5 concurrent evidence schema path.
+    pub concurrent_evidence_schema: String,
+    /// Closed v5 concurrent history schema path.
+    pub concurrent_history_schema: String,
+    /// Closed v5 fault-schedule schema path.
+    pub concurrent_fault_schedule_schema: String,
+    /// SDK-independent v5 concurrent checker path.
+    pub concurrent_checker: String,
+    /// Closed deployed-workload schema identifier.
+    pub concurrent_workload_schema: String,
+    /// Additive deployed-workload verifier path.
+    pub concurrent_workload_verifier: String,
+    /// Atomic candidate-artifact summary schema identifier.
+    pub candidate_artifact_summary_schema: String,
+    /// Required voter counts.
+    pub required_topologies: Vec<usize>,
+    /// Required authenticated transport modes.
+    pub required_transport_modes: Vec<String>,
+    /// Older foundation transport mode that receives no production credit.
+    pub foundation_transport_mode: String,
+    /// Whether the plaintext foundation counts as TLS-rotation evidence.
+    pub foundation_counts_for_tls_rotation: bool,
+    /// Older foundation payload-protection mode.
+    pub foundation_payload_protection: String,
+    /// Whether the synthetic memory provider counts as production encryption.
+    pub foundation_counts_for_production_encryption: bool,
+    /// Open tracking issues that still block graduation.
+    pub unresolved_dependencies: Vec<u64>,
+    /// Complete fixed production-acceptance inventory.
+    pub acceptance_gates: Vec<String>,
+}
+
+/// Exact lowercase SHA-256 binding used by candidate evidence artifacts.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct QualificationSha256(String);
 

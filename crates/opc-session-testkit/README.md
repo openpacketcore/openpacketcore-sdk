@@ -518,6 +518,13 @@ batch invocations while allowing watch, restore, and readiness intervals to
 overlap; this keeps the first independent state checker bounded without
 claiming a general concurrent-batch linearizability search.
 
+`qualification/v5/session-ha-profile.json` is the exact machine-readable
+profile named by that evidence. It preserves the v2/v4 crate, feature,
+platform, topology, protocol, timing, bound, threshold, and unresolved-gate
+inventory, then pins the v5 history, fault schedule, checker, deployed workload
+verifier, and artifact-summary contracts. Its schema and typed bounded decoder
+reject inventory drift and any production-maturity claim.
+
 The private node protocol exposes additive v5 collector controls over the
 existing protected `ConsensusSessionStore`: strict readiness followed by a
 separately linearized application-journal head, real watch registration and
@@ -659,10 +666,12 @@ The adapter returns a checker-ready in-memory history only for a conclusive
 run. The separate `qualification_kubernetes_concurrent_v5_artifacts` boundary
 now preflights publication before Kubernetes mutation, accepts only a
 `Passed`, cleanup-complete outcome with history, and privately stages the exact
-history JSONL, fault schedule, generated fixed-workload schedule, closed v5
-evidence, unchanged frozen-checker bytes, additive workload-verifier bytes,
-both bounded outputs, and digest summary. Reusable-API callers explicitly pin
-both expected program digests. The dedicated CLI binds the exact programs
+v5 profile, history JSONL, fault schedule, generated fixed-workload schedule,
+closed v5 evidence, unchanged frozen-checker bytes, additive
+workload-verifier bytes, both bounded outputs, and digest summary. The v2
+summary binds the exact retained profile bytes, so a bundle cannot identify a
+v5 profile that it did not preserve. Reusable-API callers explicitly pin both
+expected program digests. The dedicated CLI binds the exact programs
 embedded in the invoked binary; that self-binding is not an independent
 provenance trust root.
 It pins the validated interpreter descriptor and SHA-256 before the campaign,
@@ -819,6 +828,12 @@ This additive verification does not alter the existing evidence schema or
 grant new maturity.
 
 ## Combined HA Candidate Manifest
+
+The v5 deployed collector now has its own exact
+`qualification/v5/session-ha-profile.json`; every atomic v5 bundle retains that
+file and its digest in the v2 summary. This closes the profile-to-evidence
+inventory binding only. It does not replace the v4 aggregate release manifest,
+authenticate caller-asserted release metadata, or grant production credit.
 
 `qualification/v4/session-ha-profile.json` is an additive candidate profile.
 It keeps the v2 workspace, source-build, artifact, platform, topology,
