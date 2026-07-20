@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2CryptoRequirements` authorization independent of NAT-D, and rechecks
   module evidence, readiness, capability, operation support, provider success,
   and output width on every call with no implicit fallback (#412).
+- **Typed TS 24.302 P-CSCF restoration exchange — `opc-proto-ikev2`:** adds
+  a bounded, order-preserving, redaction-safe IPv4/IPv6 address-list
+  `CFG_REQUEST` builder plus a strict decoder for an already-authenticated and
+  opened `INFORMATIONAL` `CFG_REPLY`. The request forwards every PGW-provided
+  P-CSCF address in exact order, including repeats, as an exact RFC 7651 value;
+  replies must contain exactly one empty acknowledgement for every requested
+  family. Unsupported Configuration attributes and RFC 7296 non-critical
+  extensions are retained, while error Notify and critical or semantically
+  invalid payloads fail closed. Exact IKE SPI, exchange, direction, and Message
+  ID correlation is available before product state changes (#426).
 - **SWm DER access authorization context — `opc-proto-diameter`:**
   `SwmDiameterEapRequest` can now encode and decode typed `RAT-Type` and
   redacted `Service-Selection` fields with their exact 3GPP/IETF vendor, flag,
