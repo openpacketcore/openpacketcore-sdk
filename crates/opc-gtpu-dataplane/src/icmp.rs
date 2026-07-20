@@ -1,7 +1,8 @@
 //! Minimal ICMP Packet-Too-Big generation for host callers of
 //! `decide_uplink_encap`.
 //!
-//! When a host-side encapsulator receives [`UplinkEncapOutcome::RejectTooBig`]
+//! When a host-side encapsulator receives
+//! [`UplinkEncapOutcome::RejectTooBig`](opc_gtpu_ebpf_common::UplinkEncapOutcome::RejectTooBig)
 //! it can turn the typed [`GtpuPmtuSignal`] into a wire packet toward the
 //! inner source here: RFC 792 type 3 code 4 with the RFC 1191 next-hop MTU
 //! for IPv4, or RFC 8200 section 5 / RFC 8201 type 2 for IPv6. The eBPF tc
