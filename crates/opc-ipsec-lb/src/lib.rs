@@ -29,7 +29,10 @@
 //! after partial monotonic commits and returns whole-session success only after
 //! every ordered SA has durably completed fencing and steering. The session
 //! journal neither proves that caller-declared counters were applied nor
-//! changes the existing encrypted session-payload/HKMS boundary.
+//! changes the existing encrypted session-payload/HKMS boundary. After
+//! product-owned teardown, an exact terminal identity can be retired to a
+//! fenced encrypted tombstone that blocks stale recreation for the fixed
+//! seven-day bounded retry horizon.
 
 #![forbid(unsafe_code)]
 
@@ -128,9 +131,10 @@ pub use session::{
 pub use session_repin::{
     MockSessionRePinJournal, SessionRePinCheckpoint, SessionRePinCoordinator, SessionRePinError,
     SessionRePinIdentity, SessionRePinJournal, SessionRePinOperationId, SessionRePinOutcome,
-    SessionRePinPhase, SessionRePinPlan, SessionRePinPlanFingerprint, SessionRePinSessionId,
+    SessionRePinPhase, SessionRePinPlan, SessionRePinPlanFingerprint,
+    SessionRePinRetirementDisposition, SessionRePinRetirementOutcome, SessionRePinSessionId,
     SessionRePinStatus, SessionStoreRePinJournal, MAX_SESSION_REPIN_SAS, MIN_SESSION_REPIN_SAS,
-    SESSION_REPIN_JOURNAL_MAX_BYTES,
+    SESSION_REPIN_JOURNAL_MAX_BYTES, SESSION_REPIN_RETIREMENT_RETENTION,
 };
 pub use spi::{
     EntropySource, FixedEntropy, RekeyRequest, SpiAllocationRequest, SpiKind, SystemEntropy,

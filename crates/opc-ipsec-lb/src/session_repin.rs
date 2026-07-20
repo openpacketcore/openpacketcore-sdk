@@ -4,7 +4,10 @@
 //! optionally more dedicated-bearer ESP SAs. [`RePinCoordinator`] deliberately
 //! coordinates one SA at a time. This module adds the durable ordered saga that
 //! binds those exact requests into one operation and exposes success only after
-//! every SA has crossed the ownership fence and completed steering.
+//! every SA has crossed the ownership fence and completed steering. An
+//! authoritative teardown can then retire only that exact terminal identity;
+//! a bounded encrypted tombstone rejects stale recreation during the declared
+//! retry horizon without retaining complete SA recovery inputs indefinitely.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -16,11 +19,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use opc_session_store::{
-    decode_json_payload, encode_json_payload, BackendCapabilities, CompareAndSet,
-    CompareAndSetResult, EncryptedSessionPayload, Generation, LeaseError, LeaseGuard, OwnerId,
-    SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager, SessionPayloadEncoding,
-    SessionPayloadFormat, SessionPayloadVersion, StableId, StateClass, StateType, StoreError,
-    StoredSessionRecord,
+    decode_json_payload, decode_session_payload_envelope, encode_json_payload,
+    ttl::checked_session_deadline, BackendCapabilities, Clock, CompareAndSet, CompareAndSetResult,
+    EncryptedSessionPayload, Generation, LeaseError, LeaseGuard, OwnerId, SessionBackend,
+    SessionKey, SessionKeyType, SessionLeaseManager, SessionPayloadEncoding, SessionPayloadFormat,
+    SessionPayloadVersion, StableId, StateClass, StateType, StoreError, StoredSessionRecord,
+    SystemClock, Timestamp, SESSION_PAYLOAD_JSON_CONTENT_TYPE,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use serde::{Deserialize, Serialize};
@@ -48,12 +52,22 @@ pub const MAX_SESSION_REPIN_SAS: usize = 64;
 
 const SESSION_REPIN_KEY_TYPE: &str = "ipsec-lb-session-repin";
 const SESSION_REPIN_PAYLOAD_FORMAT: &str = "openpacketcore/ipsec-lb/session-repin";
-const SESSION_REPIN_PAYLOAD_VERSION: u16 = 1;
+const SESSION_REPIN_CHECKPOINT_PAYLOAD_VERSION: u16 = 1;
+const SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION: u16 = 2;
 /// Maximum encoded durable checkpoint size admitted by the session saga.
 ///
 /// This includes the SDK session-payload envelope as well as the complete exact
 /// request set. Backends may advertise a smaller limit, which is enforced too.
 pub const SESSION_REPIN_JOURNAL_MAX_BYTES: usize = 256 * 1024;
+/// Fixed horizon for a retired session re-pin identity tombstone.
+///
+/// The tombstone prevents a delayed exact `begin`, resume, or successor call
+/// from recreating a torn-down session. It is deliberately not refreshed by
+/// retries, so storage is bounded by the deployment's retirement rate over
+/// seven days. After this horizon the backend may garbage-collect the record;
+/// callers must use non-reused privacy-preserving session IDs and keep every
+/// retry horizon shorter than this duration.
+pub const SESSION_REPIN_RETIREMENT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SESSION_REPIN_LEASE_TTL: Duration = Duration::from_secs(10);
 const SESSION_REPIN_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const SESSION_REPIN_MAX_CAS_ATTEMPTS: usize = 16;
@@ -669,6 +683,162 @@ impl fmt::Debug for SessionRePinStatus {
     }
 }
 
+/// Durable result of one exact terminal-journal retirement attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionRePinRetirementDisposition {
+    /// This mutation attempt established or confirmed the retirement tombstone.
+    Retired,
+    /// The same exact retirement was already durably committed.
+    AlreadyRetired,
+}
+
+/// Redaction-safe result of retiring one terminal session re-pin journal.
+///
+/// The deadline is returned so a consumer can bound its teardown retry queue.
+/// Formatting deliberately omits the exact timestamp as well as every session,
+/// operation, SA, fence, and counter input.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionRePinRetirementOutcome {
+    disposition: SessionRePinRetirementDisposition,
+    retained_until: Timestamp,
+}
+
+impl SessionRePinRetirementOutcome {
+    fn new(disposition: SessionRePinRetirementDisposition, retained_until: Timestamp) -> Self {
+        Self {
+            disposition,
+            retained_until,
+        }
+    }
+
+    /// Whether this call committed the tombstone or observed an exact retry.
+    #[must_use]
+    pub const fn disposition(self) -> SessionRePinRetirementDisposition {
+        self.disposition
+    }
+
+    /// Return the fixed deadline through which stale recreation is rejected.
+    ///
+    /// Retrying retirement does not extend this deadline. Once it passes, the
+    /// session ID must remain unused; the SDK cannot distinguish an ancient
+    /// request from a new initial plan after bounded tombstone cleanup.
+    #[must_use]
+    pub const fn retained_until(self) -> Timestamp {
+        self.retained_until
+    }
+}
+
+impl fmt::Debug for SessionRePinRetirementOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRePinRetirementOutcome")
+            .field("disposition", &self.disposition)
+            .field("retained_until", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SessionRePinRetirementTombstone {
+    session_id: SessionRePinSessionId,
+    identity: SessionRePinIdentity,
+    owner: OwnerId,
+    retired_at: Timestamp,
+    retained_until: Timestamp,
+    fingerprint: [u8; 32],
+}
+
+impl SessionRePinRetirementTombstone {
+    fn from_terminal(
+        checkpoint: &SessionRePinCheckpoint,
+        owner: OwnerId,
+        retired_at: Timestamp,
+        retained_until: Timestamp,
+    ) -> Result<Self, IpsecLbError> {
+        if !checkpoint.is_complete() {
+            return Err(progress_conflict());
+        }
+        let session_id = checkpoint.plan().session_id().clone();
+        let identity = checkpoint.plan().identity();
+        let fingerprint =
+            fingerprint_retirement(&session_id, identity, &owner, retired_at, retained_until);
+        Ok(Self {
+            session_id,
+            identity,
+            owner,
+            retired_at,
+            retained_until,
+            fingerprint,
+        })
+    }
+
+    fn validate(&self) -> Result<(), IpsecLbError> {
+        let expected = fingerprint_retirement(
+            &self.session_id,
+            self.identity,
+            &self.owner,
+            self.retired_at,
+            self.retained_until,
+        );
+        let expected_deadline =
+            checked_session_deadline(self.retired_at, SESSION_REPIN_RETIREMENT_RETENTION)
+                .map_err(map_store_error)?;
+        if self.fingerprint == expected && self.retained_until == expected_deadline {
+            Ok(())
+        } else {
+            Err(progress_conflict())
+        }
+    }
+
+    fn exact_identity(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> bool {
+        self.session_id == *session_id && self.identity == identity
+    }
+
+    fn outcome(
+        &self,
+        disposition: SessionRePinRetirementDisposition,
+    ) -> SessionRePinRetirementOutcome {
+        SessionRePinRetirementOutcome::new(disposition, self.retained_until)
+    }
+}
+
+impl fmt::Debug for SessionRePinRetirementTombstone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRePinRetirementTombstone")
+            .field("session_id", &"[redacted]")
+            .field("identity", &"[redacted]")
+            .field("owner", &"[redacted]")
+            .field("retired_at", &"[redacted]")
+            .field("retained_until", &"[redacted]")
+            .finish()
+    }
+}
+
+fn fingerprint_retirement(
+    session_id: &SessionRePinSessionId,
+    identity: SessionRePinIdentity,
+    owner: &OwnerId,
+    retired_at: Timestamp,
+    retained_until: Timestamp,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"opc-ipsec-lb/session-repin-retirement/v1");
+    hash_len_prefixed(&mut hasher, session_id.as_stable_id().as_bytes());
+    hasher.update(identity.operation_id().get().to_be_bytes());
+    hasher.update(identity.fingerprint().as_bytes());
+    hash_len_prefixed(&mut hasher, owner.as_str().as_bytes());
+    let retired = retired_at.as_offset_datetime();
+    hasher.update(retired.unix_timestamp().to_be_bytes());
+    hasher.update(retired.nanosecond().to_be_bytes());
+    let deadline = retained_until.as_offset_datetime();
+    hasher.update(deadline.unix_timestamp().to_be_bytes());
+    hasher.update(deadline.nanosecond().to_be_bytes());
+    hasher.finalize().into()
+}
+
 /// Durable journal port for session-level re-pin progress.
 ///
 /// Checkpoint construction is SDK-private: external code may wrap/delegate an
@@ -683,7 +853,9 @@ impl fmt::Debug for SessionRePinStatus {
 /// predecessor. Rejection must preserve the terminal checkpoint. It must
 /// conflict with a prepared, forward-converging, unbound, or stale plan.
 /// Progress can advance only in order and may never discard a retained
-/// ownership commit.
+/// ownership commit. Retirement is permitted only for the exact terminal
+/// identity. Its retained tombstone conflicts with every new or stale plan
+/// until [`SESSION_REPIN_RETIREMENT_RETENTION`] elapses.
 #[async_trait]
 pub trait SessionRePinJournal: Send + Sync + fmt::Debug {
     /// Create the exact plan or load its existing durable progress.
@@ -710,18 +882,47 @@ pub trait SessionRePinJournal: Send + Sync + fmt::Debug {
         index: usize,
         fence: OwnershipFence,
     ) -> Result<SessionRePinCheckpoint, IpsecLbError>;
+
+    /// Retire the exact terminal checkpoint after authoritative teardown.
+    ///
+    /// An exact retry is idempotent. Prepared, forward-converging, stale, or
+    /// missing identities fail closed. The default preserves source
+    /// compatibility for external journal implementations while explicitly
+    /// reporting that durable retirement is unavailable.
+    async fn retire(
+        &self,
+        _session_id: &SessionRePinSessionId,
+        _identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementOutcome, IpsecLbError> {
+        Err(IpsecLbError::Unsupported)
+    }
 }
 
 /// Deterministic in-memory journal for unit tests and non-durable examples.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MockSessionRePinJournal {
     state: Arc<Mutex<MockJournalState>>,
+    clock: Arc<dyn Clock>,
 }
 
 #[derive(Default)]
 struct MockJournalState {
-    checkpoints: BTreeMap<SessionRePinSessionId, SessionRePinCheckpoint>,
+    entries: BTreeMap<SessionRePinSessionId, MockJournalEntry>,
     failure: Option<IpsecLbError>,
+}
+
+enum MockJournalEntry {
+    Active(SessionRePinCheckpoint),
+    Retired(SessionRePinRetirementTombstone),
+}
+
+impl Default for MockSessionRePinJournal {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MockJournalState::default())),
+            clock: Arc::new(SystemClock),
+        }
+    }
 }
 
 impl fmt::Debug for MockSessionRePinJournal {
@@ -732,6 +933,18 @@ impl fmt::Debug for MockSessionRePinJournal {
 }
 
 impl MockSessionRePinJournal {
+    /// Build deterministic test support with an injected session-store clock.
+    ///
+    /// Share this clock with a fake backend when testing the fixed tombstone
+    /// expiry boundary. Production code should use [`SessionStoreRePinJournal`].
+    #[must_use]
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MockJournalState::default())),
+            clock,
+        }
+    }
+
     /// Inject a redaction-safe journal failure.
     pub fn set_failure(&self, failure: IpsecLbError) {
         let mut state = lock_unpoisoned(&self.state);
@@ -753,18 +966,38 @@ impl MockSessionRePinJournal {
         if let Some(error) = &state.failure {
             return Err(error.clone());
         }
-        let checkpoint = state
-            .checkpoints
+        prune_mock_retirement(&mut state, plan.session_id(), self.clock.now_utc());
+        let checkpoint = match state
+            .entries
             .get(plan.session_id())
-            .ok_or(IpsecLbError::NotFound)?;
+            .ok_or(IpsecLbError::NotFound)?
+        {
+            MockJournalEntry::Active(checkpoint) => checkpoint,
+            MockJournalEntry::Retired(_) => return Err(progress_conflict()),
+        };
         if checkpoint.plan() != plan {
             return Err(progress_conflict());
         }
         let next = mutate(checkpoint)?;
-        state
-            .checkpoints
-            .insert(plan.session_id().clone(), next.clone());
+        state.entries.insert(
+            plan.session_id().clone(),
+            MockJournalEntry::Active(next.clone()),
+        );
         Ok(next)
+    }
+}
+
+fn prune_mock_retirement(
+    state: &mut MockJournalState,
+    session_id: &SessionRePinSessionId,
+    now: Timestamp,
+) {
+    let expired = matches!(
+        state.entries.get(session_id),
+        Some(MockJournalEntry::Retired(tombstone)) if tombstone.retained_until <= now
+    );
+    if expired {
+        state.entries.remove(session_id);
     }
 }
 
@@ -775,16 +1008,26 @@ impl SessionRePinJournal for MockSessionRePinJournal {
         if let Some(error) = &state.failure {
             return Err(error.clone());
         }
-        if let Some(existing) = state.checkpoints.get(plan.session_id()) {
-            if existing.plan() == plan {
-                return Ok(existing.clone());
+        prune_mock_retirement(&mut state, plan.session_id(), self.clock.now_utc());
+        if let Some(existing) = state.entries.get(plan.session_id()) {
+            match existing {
+                MockJournalEntry::Active(checkpoint) if checkpoint.plan() == plan => {
+                    return Ok(checkpoint.clone());
+                }
+                MockJournalEntry::Active(_) | MockJournalEntry::Retired(_) => {}
             }
         }
-        validate_plan_succession(state.checkpoints.get(plan.session_id()), plan)?;
+        let existing = match state.entries.get(plan.session_id()) {
+            Some(MockJournalEntry::Active(checkpoint)) => Some(checkpoint),
+            Some(MockJournalEntry::Retired(_)) => return Err(progress_conflict()),
+            None => None,
+        };
+        validate_plan_succession(existing, plan)?;
         let checkpoint = SessionRePinCheckpoint::from_progress(plan.clone(), Vec::new(), None)?;
-        state
-            .checkpoints
-            .insert(plan.session_id().clone(), checkpoint.clone());
+        state.entries.insert(
+            plan.session_id().clone(),
+            MockJournalEntry::Active(checkpoint.clone()),
+        );
         Ok(checkpoint)
     }
 
@@ -792,11 +1035,15 @@ impl SessionRePinJournal for MockSessionRePinJournal {
         &self,
         session_id: &SessionRePinSessionId,
     ) -> Result<Option<SessionRePinCheckpoint>, IpsecLbError> {
-        let state = lock_unpoisoned(&self.state);
+        let mut state = lock_unpoisoned(&self.state);
         if let Some(error) = &state.failure {
             return Err(error.clone());
         }
-        Ok(state.checkpoints.get(session_id).cloned())
+        prune_mock_retirement(&mut state, session_id, self.clock.now_utc());
+        Ok(match state.entries.get(session_id) {
+            Some(MockJournalEntry::Active(checkpoint)) => Some(checkpoint.clone()),
+            Some(MockJournalEntry::Retired(_)) | None => None,
+        })
     }
 
     async fn record_ownership_committed(
@@ -817,6 +1064,54 @@ impl SessionRePinJournal for MockSessionRePinJournal {
         fence: OwnershipFence,
     ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
         self.mutate(plan, |checkpoint| checkpoint.with_sa_complete(index, fence))
+    }
+
+    async fn retire(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementOutcome, IpsecLbError> {
+        let mut state = lock_unpoisoned(&self.state);
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        let retired_at = self.clock.now_utc();
+        prune_mock_retirement(&mut state, session_id, retired_at);
+        match state.entries.get(session_id) {
+            Some(MockJournalEntry::Active(checkpoint)) => {
+                if checkpoint.plan().identity() != identity || !checkpoint.is_complete() {
+                    return Err(progress_conflict());
+                }
+                let retained_until =
+                    checked_session_deadline(retired_at, SESSION_REPIN_RETIREMENT_RETENTION)
+                        .map_err(map_store_error)?;
+                let owner = OwnerId::new(checkpoint.plan().new_owner().as_str()).map_err(|_| {
+                    IpsecLbError::invalid_config(
+                        "session_repin.owner",
+                        "session re-pin owner is invalid",
+                    )
+                })?;
+                let tombstone = SessionRePinRetirementTombstone::from_terminal(
+                    checkpoint,
+                    owner,
+                    retired_at,
+                    retained_until,
+                )?;
+                let outcome = tombstone.outcome(SessionRePinRetirementDisposition::Retired);
+                state
+                    .entries
+                    .insert(session_id.clone(), MockJournalEntry::Retired(tombstone));
+                Ok(outcome)
+            }
+            Some(MockJournalEntry::Retired(tombstone))
+                if tombstone.exact_identity(session_id, identity) =>
+            {
+                tombstone.validate()?;
+                Ok(tombstone.outcome(SessionRePinRetirementDisposition::AlreadyRetired))
+            }
+            Some(MockJournalEntry::Retired(_)) => Err(progress_conflict()),
+            None => Err(IpsecLbError::NotFound),
+        }
     }
 }
 
@@ -1011,6 +1306,23 @@ where
             Some(_) => Err(SessionRePinError::Journal(progress_conflict())),
             None => Ok(None),
         }
+    }
+
+    /// Retire the exact terminal journal after the product proves teardown.
+    ///
+    /// This method performs no SA, steering, or key teardown itself. The
+    /// consumer owns that ordering and may invoke retirement only after those
+    /// effects are authoritatively complete. A retained tombstone prevents
+    /// stale restart or successor calls from recreating journal authority.
+    pub async fn retire(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementOutcome, SessionRePinError> {
+        self.journal
+            .retire(session_id, identity)
+            .await
+            .map_err(SessionRePinError::Journal)
     }
 
     async fn drive(
@@ -1212,6 +1524,41 @@ fn known_committed_status(checkpoint: &SessionRePinCheckpoint) -> SessionRePinSt
     )
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum SessionRePinJournalEntry {
+    Active(SessionRePinCheckpoint),
+    Retired(SessionRePinRetirementTombstone),
+}
+
+impl SessionRePinJournalEntry {
+    fn session_id(&self) -> &SessionRePinSessionId {
+        match self {
+            Self::Active(checkpoint) => checkpoint.plan().session_id(),
+            Self::Retired(tombstone) => &tombstone.session_id,
+        }
+    }
+
+    fn owner(&self) -> Result<OwnerId, IpsecLbError> {
+        match self {
+            Self::Active(checkpoint) => OwnerId::new(checkpoint.plan().new_owner().as_str())
+                .map_err(|_| {
+                    IpsecLbError::invalid_config(
+                        "session_repin.owner",
+                        "session re-pin owner is invalid",
+                    )
+                }),
+            Self::Retired(tombstone) => Ok(tombstone.owner.clone()),
+        }
+    }
+
+    const fn expires_at(&self) -> Option<Timestamp> {
+        match self {
+            Self::Active(_) => None,
+            Self::Retired(tombstone) => Some(tombstone.retained_until),
+        }
+    }
+}
+
 /// Durable session re-pin journal backed by fenced session-store CAS.
 ///
 /// The record key is tenant/NF scoped and uses the plan's privacy-preserving
@@ -1227,6 +1574,7 @@ pub struct SessionStoreRePinJournal<B> {
     tenant: TenantId,
     nf_kind: NetworkFunctionKind,
     lease_ttl: Duration,
+    clock: Arc<dyn Clock>,
 }
 
 impl<B> fmt::Debug for SessionStoreRePinJournal<B> {
@@ -1249,7 +1597,19 @@ where
             tenant,
             nf_kind,
             lease_ttl: SESSION_REPIN_LEASE_TTL,
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Use one injected clock for the fixed retirement tombstone deadline.
+    ///
+    /// Production callers normally use the monotonic [`SystemClock`] selected
+    /// by [`Self::new`]. Tests should share this clock with their fake backend
+    /// so retirement expiry is deterministic.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Fail closed unless the backend can retain the complete authority record.
@@ -1281,17 +1641,17 @@ where
         })
     }
 
-    async fn read(
+    async fn read_entry(
         &self,
         session_id: &SessionRePinSessionId,
-    ) -> Result<Option<(StoredSessionRecord, SessionRePinCheckpoint)>, IpsecLbError> {
+    ) -> Result<Option<(StoredSessionRecord, SessionRePinJournalEntry)>, IpsecLbError> {
         self.validate_authority().await?;
         let key = self.key(session_id)?;
         let Some(record) = self.backend.get(&key).await.map_err(map_store_error)? else {
             return Ok(None);
         };
-        let checkpoint = decode_journal_record(&record, &key, session_id)?;
-        Ok(Some((record, checkpoint)))
+        let entry = decode_journal_record(&record, &key, session_id)?;
+        Ok(Some((record, entry)))
     }
 
     async fn begin_inner(
@@ -1299,19 +1659,35 @@ where
         plan: &SessionRePinPlan,
     ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
         for _ in 0..SESSION_REPIN_MAX_CAS_ATTEMPTS {
-            let current = self.read(plan.session_id()).await?;
-            if let Some((_, checkpoint)) = &current {
-                if checkpoint.plan() == plan {
-                    return Ok(checkpoint.clone());
+            let current = self.read_entry(plan.session_id()).await?;
+            if let Some((_, entry)) = &current {
+                match entry {
+                    SessionRePinJournalEntry::Active(checkpoint) if checkpoint.plan() == plan => {
+                        return Ok(checkpoint.clone());
+                    }
+                    SessionRePinJournalEntry::Retired(_) => return Err(progress_conflict()),
+                    SessionRePinJournalEntry::Active(_) => {}
                 }
             }
-            validate_plan_succession(current.as_ref().map(|value| &value.1), plan)?;
+            let existing = current.as_ref().and_then(|value| match &value.1 {
+                SessionRePinJournalEntry::Active(checkpoint) => Some(checkpoint),
+                SessionRePinJournalEntry::Retired(_) => None,
+            });
+            validate_plan_succession(existing, plan)?;
             let desired = SessionRePinCheckpoint::from_progress(plan.clone(), Vec::new(), None)?;
             match self
-                .write_checkpoint(current.as_ref().map(|value| &value.0), &desired)
+                .write_entry(
+                    current.as_ref().map(|value| &value.0),
+                    &SessionRePinJournalEntry::Active(desired),
+                )
                 .await?
             {
-                JournalWrite::Committed(checkpoint) => return Ok(checkpoint),
+                JournalWrite::Committed(SessionRePinJournalEntry::Active(checkpoint)) => {
+                    return Ok(checkpoint);
+                }
+                JournalWrite::Committed(SessionRePinJournalEntry::Retired(_)) => {
+                    return Err(progress_conflict());
+                }
                 JournalWrite::Conflict => continue,
             }
         }
@@ -1326,8 +1702,11 @@ where
         mutation: JournalMutation,
     ) -> Result<SessionRePinCheckpoint, IpsecLbError> {
         for _ in 0..SESSION_REPIN_MAX_CAS_ATTEMPTS {
-            let Some((record, current)) = self.read(plan.session_id()).await? else {
+            let Some((record, entry)) = self.read_entry(plan.session_id()).await? else {
                 return Err(IpsecLbError::NotFound);
+            };
+            let SessionRePinJournalEntry::Active(current) = entry else {
+                return Err(progress_conflict());
             };
             if current.plan() != plan {
                 return Err(progress_conflict());
@@ -1343,8 +1722,16 @@ where
             if desired == current {
                 return Ok(current);
             }
-            match self.write_checkpoint(Some(&record), &desired).await? {
-                JournalWrite::Committed(checkpoint) => return Ok(checkpoint),
+            match self
+                .write_entry(Some(&record), &SessionRePinJournalEntry::Active(desired))
+                .await?
+            {
+                JournalWrite::Committed(SessionRePinJournalEntry::Active(checkpoint)) => {
+                    return Ok(checkpoint);
+                }
+                JournalWrite::Committed(SessionRePinJournalEntry::Retired(_)) => {
+                    return Err(progress_conflict());
+                }
                 JournalWrite::Conflict => continue,
             }
         }
@@ -1353,12 +1740,63 @@ where
         ))
     }
 
-    async fn write_checkpoint(
+    async fn retire_inner(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementOutcome, IpsecLbError> {
+        for _ in 0..SESSION_REPIN_MAX_CAS_ATTEMPTS {
+            let Some((record, entry)) = self.read_entry(session_id).await? else {
+                return Err(IpsecLbError::NotFound);
+            };
+            let checkpoint = match entry {
+                SessionRePinJournalEntry::Active(checkpoint) => checkpoint,
+                SessionRePinJournalEntry::Retired(tombstone) => {
+                    if tombstone.exact_identity(session_id, identity) {
+                        tombstone.validate()?;
+                        return Ok(
+                            tombstone.outcome(SessionRePinRetirementDisposition::AlreadyRetired)
+                        );
+                    }
+                    return Err(progress_conflict());
+                }
+            };
+            if checkpoint.plan().identity() != identity || !checkpoint.is_complete() {
+                return Err(progress_conflict());
+            }
+
+            let retired_at = self.clock.now_utc();
+            let retained_until =
+                checked_session_deadline(retired_at, SESSION_REPIN_RETIREMENT_RETENTION)
+                    .map_err(map_store_error)?;
+            let tombstone = SessionRePinRetirementTombstone::from_terminal(
+                &checkpoint,
+                record.owner.clone(),
+                retired_at,
+                retained_until,
+            )?;
+            let desired = SessionRePinJournalEntry::Retired(tombstone);
+            match self.write_entry(Some(&record), &desired).await? {
+                JournalWrite::Committed(SessionRePinJournalEntry::Retired(tombstone)) => {
+                    return Ok(tombstone.outcome(SessionRePinRetirementDisposition::Retired));
+                }
+                JournalWrite::Committed(SessionRePinJournalEntry::Active(_)) => {
+                    return Err(progress_conflict());
+                }
+                JournalWrite::Conflict => continue,
+            }
+        }
+        Err(IpsecLbError::ownership_conflict(
+            "session re-pin journal CAS attempts exhausted",
+        ))
+    }
+
+    async fn write_entry(
         &self,
         current: Option<&StoredSessionRecord>,
-        desired: &SessionRePinCheckpoint,
+        desired: &SessionRePinJournalEntry,
     ) -> Result<JournalWrite, IpsecLbError> {
-        let key = self.key(desired.plan().session_id())?;
+        let key = self.key(desired.session_id())?;
         if current.is_some_and(|record| record.key != key) {
             return Err(progress_conflict());
         }
@@ -1371,10 +1809,11 @@ where
             })?,
             None => Generation::new(1),
         };
-        let owner = OwnerId::new(desired.plan().new_owner().as_str()).map_err(|_| {
-            IpsecLbError::invalid_config("session_repin.owner", "session re-pin owner is invalid")
-        })?;
-        let payload = encode_checkpoint(desired)?;
+        let owner = desired.owner()?;
+        let payload = match desired {
+            SessionRePinJournalEntry::Active(checkpoint) => encode_checkpoint(checkpoint)?,
+            SessionRePinJournalEntry::Retired(tombstone) => encode_retirement(tombstone)?,
+        };
         let capabilities = self.backend.capabilities().await;
         if !session_repin_authority_supported(capabilities) {
             return Err(IpsecLbError::Unsupported);
@@ -1411,7 +1850,7 @@ where
             fence: guard.fence(),
             state_class: StateClass::AuthoritativeSession,
             state_type,
-            expires_at: None,
+            expires_at: desired.expires_at(),
             payload,
         };
         let expected_generation = current.map(|value| value.generation);
@@ -1430,8 +1869,7 @@ where
             Ok(Ok(CompareAndSetResult::Success)) => Ok(JournalWrite::Committed(desired.clone())),
             Ok(Ok(CompareAndSetResult::Conflict { current })) => {
                 if let Some(record) = current {
-                    let observed =
-                        decode_journal_record(&record, &key, desired.plan().session_id())?;
+                    let observed = decode_journal_record(&record, &key, desired.session_id())?;
                     if observed == *desired {
                         return Ok(JournalWrite::Committed(observed));
                     }
@@ -1466,12 +1904,12 @@ where
     async fn read_back_desired(
         &self,
         key: &SessionKey,
-        desired: &SessionRePinCheckpoint,
-    ) -> Result<Option<SessionRePinCheckpoint>, IpsecLbError> {
+        desired: &SessionRePinJournalEntry,
+    ) -> Result<Option<SessionRePinJournalEntry>, IpsecLbError> {
         let Some(record) = self.backend.get(key).await.map_err(map_store_error)? else {
             return Ok(None);
         };
-        let observed = decode_journal_record(&record, key, desired.plan().session_id())?;
+        let observed = decode_journal_record(&record, key, desired.session_id())?;
         Ok((observed == *desired).then_some(observed))
     }
 }
@@ -1497,9 +1935,12 @@ where
         &self,
         session_id: &SessionRePinSessionId,
     ) -> Result<Option<SessionRePinCheckpoint>, IpsecLbError> {
-        self.read(session_id)
-            .await
-            .map(|record| record.map(|value| value.1))
+        self.read_entry(session_id).await.map(|record| {
+            record.and_then(|value| match value.1 {
+                SessionRePinJournalEntry::Active(checkpoint) => Some(checkpoint),
+                SessionRePinJournalEntry::Retired(_) => None,
+            })
+        })
     }
 
     async fn record_ownership_committed(
@@ -1521,6 +1962,14 @@ where
         self.mutate(plan, JournalMutation::SaComplete { index, fence })
             .await
     }
+
+    async fn retire(
+        &self,
+        session_id: &SessionRePinSessionId,
+        identity: SessionRePinIdentity,
+    ) -> Result<SessionRePinRetirementOutcome, IpsecLbError> {
+        self.retire_inner(session_id, identity).await
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1530,7 +1979,7 @@ enum JournalMutation {
 }
 
 enum JournalWrite {
-    Committed(SessionRePinCheckpoint),
+    Committed(SessionRePinJournalEntry),
     Conflict,
 }
 
@@ -1633,7 +2082,7 @@ fn encode_checkpoint(
     let wire = JournalWire::from_checkpoint(checkpoint);
     encode_json_payload(
         &journal_payload_format()?,
-        SessionPayloadVersion::new(SESSION_REPIN_PAYLOAD_VERSION),
+        SessionPayloadVersion::new(SESSION_REPIN_CHECKPOINT_PAYLOAD_VERSION),
         &wire,
         Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
     )
@@ -1645,18 +2094,36 @@ fn encode_checkpoint(
     })
 }
 
+fn encode_retirement(
+    tombstone: &SessionRePinRetirementTombstone,
+) -> Result<EncryptedSessionPayload, IpsecLbError> {
+    tombstone.validate()?;
+    let wire = RetirementWire::from_tombstone(tombstone);
+    encode_json_payload(
+        &journal_payload_format()?,
+        SessionPayloadVersion::new(SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION),
+        &wire,
+        Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+    )
+    .map_err(|_| {
+        IpsecLbError::invalid_config(
+            "session_repin.payload",
+            "session re-pin retirement encoding failed",
+        )
+    })
+}
+
 fn decode_journal_record(
     record: &StoredSessionRecord,
     expected_key: &SessionKey,
     expected_session_id: &SessionRePinSessionId,
-) -> Result<SessionRePinCheckpoint, IpsecLbError> {
+) -> Result<SessionRePinJournalEntry, IpsecLbError> {
     if &record.key != expected_key
         || record.key.key_type.as_str() != SESSION_REPIN_KEY_TYPE
         || record.state_type.as_str() != SESSION_REPIN_KEY_TYPE
         || record.state_class != StateClass::AuthoritativeSession
         || record.generation.get() == 0
         || record.fence.get() == 0
-        || record.expires_at.is_some()
         || record.payload.encoding() != SessionPayloadEncoding::Plaintext
     {
         return Err(IpsecLbError::invalid_config(
@@ -1664,25 +2131,70 @@ fn decode_journal_record(
             "session re-pin journal metadata is invalid",
         ));
     }
-    let wire: JournalWire = decode_json_payload(
-        &record.payload,
-        &journal_payload_format()?,
-        SessionPayloadVersion::new(SESSION_REPIN_PAYLOAD_VERSION),
-        Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
-    )
-    .map_err(|_| {
-        IpsecLbError::invalid_config(
-            "session_repin.payload",
-            "session re-pin checkpoint is unreadable",
-        )
-    })?;
-    let checkpoint = wire.into_checkpoint()?;
-    if checkpoint.plan().session_id() != expected_session_id
-        || record.owner.as_str() != checkpoint.plan().new_owner().as_str()
+    let format = journal_payload_format()?;
+    let envelope =
+        decode_session_payload_envelope(&record.payload, Some(SESSION_REPIN_JOURNAL_MAX_BYTES))
+            .map_err(|_| unreadable_journal_payload())?;
+    if envelope.format() != &format
+        || envelope.content_type() != Some(SESSION_PAYLOAD_JSON_CONTENT_TYPE)
     {
-        return Err(progress_conflict());
+        return Err(unreadable_journal_payload());
     }
-    Ok(checkpoint)
+
+    match envelope.version().get() {
+        SESSION_REPIN_CHECKPOINT_PAYLOAD_VERSION => {
+            if record.expires_at.is_some() {
+                return Err(invalid_journal_metadata());
+            }
+            let wire: JournalWire = decode_json_payload(
+                &record.payload,
+                &format,
+                SessionPayloadVersion::new(SESSION_REPIN_CHECKPOINT_PAYLOAD_VERSION),
+                Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+            )
+            .map_err(|_| unreadable_journal_payload())?;
+            let checkpoint = wire.into_checkpoint()?;
+            if checkpoint.plan().session_id() != expected_session_id
+                || record.owner.as_str() != checkpoint.plan().new_owner().as_str()
+            {
+                return Err(progress_conflict());
+            }
+            Ok(SessionRePinJournalEntry::Active(checkpoint))
+        }
+        SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION => {
+            let wire: RetirementWire = decode_json_payload(
+                &record.payload,
+                &format,
+                SessionPayloadVersion::new(SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION),
+                Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+            )
+            .map_err(|_| unreadable_journal_payload())?;
+            let tombstone = wire.into_tombstone()?;
+            tombstone.validate()?;
+            if &tombstone.session_id != expected_session_id
+                || record.owner != tombstone.owner
+                || record.expires_at != Some(tombstone.retained_until)
+            {
+                return Err(progress_conflict());
+            }
+            Ok(SessionRePinJournalEntry::Retired(tombstone))
+        }
+        _ => Err(unreadable_journal_payload()),
+    }
+}
+
+fn invalid_journal_metadata() -> IpsecLbError {
+    IpsecLbError::invalid_config(
+        "session_repin.record",
+        "session re-pin journal metadata is invalid",
+    )
+}
+
+fn unreadable_journal_payload() -> IpsecLbError {
+    IpsecLbError::invalid_config(
+        "session_repin.payload",
+        "session re-pin journal payload is unreadable",
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1769,6 +2281,58 @@ impl JournalWire {
             .collect::<Result<Vec<_>, _>>()?;
         let current_fence = self.current_fence.map(OwnershipFence::new).transpose()?;
         SessionRePinCheckpoint::from_progress(plan, completed_fences, current_fence)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementWire {
+    session_id: Vec<u8>,
+    operation_id: u128,
+    plan_fingerprint: [u8; 32],
+    owner: String,
+    retired_at: Timestamp,
+    expires_at: Timestamp,
+    retirement_fingerprint: [u8; 32],
+}
+
+impl RetirementWire {
+    fn from_tombstone(tombstone: &SessionRePinRetirementTombstone) -> Self {
+        Self {
+            session_id: tombstone.session_id.as_stable_id().as_bytes().to_vec(),
+            operation_id: tombstone.identity.operation_id().get(),
+            plan_fingerprint: tombstone.identity.fingerprint().as_bytes(),
+            owner: tombstone.owner.as_str().to_owned(),
+            retired_at: tombstone.retired_at,
+            expires_at: tombstone.retained_until,
+            retirement_fingerprint: tombstone.fingerprint,
+        }
+    }
+
+    fn into_tombstone(self) -> Result<SessionRePinRetirementTombstone, IpsecLbError> {
+        let stable_id = StableId::new(Bytes::from(self.session_id)).map_err(|_| {
+            IpsecLbError::invalid_config(
+                "session_repin.session_id",
+                "session re-pin session identity is invalid",
+            )
+        })?;
+        let operation_id = SessionRePinOperationId::new(self.operation_id)?;
+        let owner = OwnerId::new(self.owner).map_err(|_| {
+            IpsecLbError::invalid_config("session_repin.owner", "session re-pin owner is invalid")
+        })?;
+        let tombstone = SessionRePinRetirementTombstone {
+            session_id: SessionRePinSessionId::from_stable_id(stable_id),
+            identity: SessionRePinIdentity::new(
+                operation_id,
+                SessionRePinPlanFingerprint::from_bytes(self.plan_fingerprint),
+            ),
+            owner,
+            retired_at: self.retired_at,
+            retained_until: self.expires_at,
+            fingerprint: self.retirement_fingerprint,
+        };
+        tombstone.validate()?;
+        Ok(tombstone)
     }
 }
 
@@ -2211,7 +2775,7 @@ mod tests {
     use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
     use opc_session_store::{
         BackendCapabilities, EncryptingSessionBackend, FakeSessionBackend, SessionOp,
-        SessionOpResult, SessionPayloadEncoding, SessionStore,
+        SessionOpResult, SessionPayloadEncoding, SessionStore, SqliteSessionBackend,
     };
 
     use super::*;
@@ -2226,6 +2790,39 @@ mod tests {
     };
 
     const SESSION_SA_COUNT: usize = 4;
+    static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug)]
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir();
+            for _ in 0..100 {
+                let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path = base.join(format!(
+                    "opc-ipsec-lb-{label}-{}-{sequence}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("failed to create test directory: {error}"),
+                }
+            }
+            panic!("failed to allocate a unique test directory");
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn tenant() -> TenantId {
         TenantId::new("tenant-a").unwrap()
@@ -2622,7 +3219,9 @@ mod tests {
             &self,
             session_id: &SessionRePinSessionId,
         ) -> Result<Option<SessionRePinCheckpoint>, IpsecLbError> {
-            self.inner.load(session_id).await
+            let loaded = self.inner.load(session_id).await;
+            self.block_if_selected(3).await;
+            loaded
         }
 
         async fn record_ownership_committed(
@@ -2940,11 +3539,52 @@ mod tests {
         let decoded: JournalWire = decode_json_payload(
             &payload,
             &journal_payload_format().unwrap(),
-            SessionPayloadVersion::new(SESSION_REPIN_PAYLOAD_VERSION),
+            SessionPayloadVersion::new(SESSION_REPIN_CHECKPOINT_PAYLOAD_VERSION),
             Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
         )
         .unwrap();
         assert_eq!(decoded.into_checkpoint().unwrap(), checkpoint);
+    }
+
+    #[test]
+    fn checkpoint_v1_encoding_remains_byte_compatible_and_backward_decodable() {
+        // Captured from the unmodified 9be2e01 v1 encoder with this synthetic
+        // plan. Keep this immutable: generating both sides from the current
+        // wire DTO would allow an accidental migration break to self-agree.
+        const LEGACY_V1_SHA256: [u8; 32] = [
+            107, 231, 107, 94, 20, 132, 232, 3, 34, 95, 4, 165, 220, 200, 44, 214, 203, 191, 46,
+            163, 69, 103, 214, 240, 166, 210, 249, 125, 189, 145, 87, 169,
+        ];
+        let plan = plan_with(1, 1, 100, 3);
+        let checkpoint =
+            SessionRePinCheckpoint::from_progress(plan.clone(), Vec::new(), None).unwrap();
+        let legacy_v1 = encode_checkpoint(&checkpoint).unwrap();
+        let encoded_hash: [u8; 32] = Sha256::digest(legacy_v1.as_bytes()).into();
+        assert_eq!(encoded_hash, LEGACY_V1_SHA256);
+
+        let key = SessionKey {
+            tenant: tenant(),
+            nf_kind: nf_kind(),
+            key_type: SessionKeyType::other(SESSION_REPIN_KEY_TYPE).unwrap(),
+            stable_id: plan.session_id().as_stable_id().clone(),
+        };
+        let record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner: OwnerId::new(plan.new_owner().as_str()).unwrap(),
+            fence: opc_session_store::FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new(SESSION_REPIN_KEY_TYPE).unwrap(),
+            expires_at: None,
+            payload: legacy_v1,
+        };
+        let SessionRePinJournalEntry::Active(decoded) =
+            decode_journal_record(&record, &key, plan.session_id()).unwrap()
+        else {
+            panic!("expected v1 checkpoint");
+        };
+        assert_eq!(decoded, checkpoint);
+        assert_eq!(encode_checkpoint(&decoded).unwrap(), record.payload);
     }
 
     #[test]
@@ -3010,6 +3650,90 @@ mod tests {
         for index in 0..harness.plan.len() {
             assert_eq!(outcome.fence(index), checkpoint.completed_fence(index));
         }
+    }
+
+    #[tokio::test]
+    async fn coordinator_retirement_blocks_later_resume_without_teardown_side_effects() {
+        let harness = Harness::new();
+        let coordinator = harness.coordinator();
+        let outcome = coordinator.start(harness.plan.clone()).await.unwrap();
+        let steering_attempts = harness.steering.install_attempts();
+        let fence_operations = harness.fencer.inner.operations().len();
+        let retired = coordinator
+            .retire(harness.plan.session_id(), outcome.identity())
+            .await
+            .unwrap();
+        assert_eq!(
+            retired.disposition(),
+            SessionRePinRetirementDisposition::Retired
+        );
+        assert_eq!(
+            coordinator
+                .status(harness.plan.session_id(), outcome.identity())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            coordinator
+                .resume(harness.plan.session_id(), outcome.identity())
+                .await,
+            Err(SessionRePinError::Journal(IpsecLbError::NotFound))
+        ));
+        assert_eq!(harness.steering.install_attempts(), steering_attempts);
+        assert_eq!(harness.fencer.inner.operations().len(), fence_operations);
+    }
+
+    #[tokio::test]
+    async fn overlapping_terminal_resume_can_reinstall_steering_after_retirement() {
+        let harness = Harness::new();
+        let terminal = harness
+            .coordinator()
+            .start(harness.plan.clone())
+            .await
+            .unwrap();
+        let steering_attempts = harness.steering.install_attempts();
+        let blocking = BlockingJournal::new(harness.journal.clone(), 3);
+        let coordinator = SessionRePinCoordinator::new(
+            RePinCoordinator::new(
+                harness.steering.clone(),
+                harness.fencer.clone(),
+                harness.ownership.clone(),
+                harness.audit.clone(),
+            ),
+            blocking.clone(),
+        );
+        let session_id = harness.plan.session_id().clone();
+        let identity = terminal.identity();
+        let task = tokio::spawn(async move { coordinator.resume(&session_id, identity).await });
+        wait_until_entered(&blocking.entered).await;
+
+        harness
+            .journal
+            .retire(harness.plan.session_id(), terminal.identity())
+            .await
+            .unwrap();
+        blocking.unblock();
+        assert!(task.await.unwrap().is_ok());
+        assert_eq!(
+            harness.steering.install_attempts(),
+            steering_attempts + harness.plan.len()
+        );
+        assert_eq!(
+            harness
+                .journal
+                .load(harness.plan.session_id())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            harness
+                .coordinator()
+                .resume(harness.plan.session_id(), terminal.identity())
+                .await,
+            Err(SessionRePinError::Journal(IpsecLbError::NotFound))
+        ));
     }
 
     #[tokio::test]
@@ -3444,6 +4168,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_terminal_retirement_is_exact_idempotent_and_blocks_stale_recreation() {
+        let journal = MockSessionRePinJournal::default();
+        let plan = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&journal, &plan, 2).await;
+
+        let retired = journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        assert_eq!(
+            retired.disposition(),
+            SessionRePinRetirementDisposition::Retired
+        );
+        let replayed = journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.disposition(),
+            SessionRePinRetirementDisposition::AlreadyRetired
+        );
+        assert_eq!(replayed.retained_until(), retired.retained_until());
+        assert_eq!(journal.load(plan.session_id()).await.unwrap(), None);
+
+        assert!(journal.begin(&plan).await.is_err());
+        assert!(journal.begin(&successor_of(&plan, 2, 500)).await.is_err());
+        let stale_fence = OwnershipFence::new(2).unwrap();
+        assert!(journal
+            .record_ownership_committed(&plan, 0, stale_fence)
+            .await
+            .is_err());
+        assert!(journal
+            .record_sa_complete(&plan, 0, stale_fence)
+            .await
+            .is_err());
+        let stale = SessionRePinIdentity::new(operation_id(2), plan.fingerprint());
+        assert!(journal.retire(plan.session_id(), stale).await.is_err());
+
+        let rendered = format!("{retired:?} {replayed:?}");
+        assert!(rendered.contains("[redacted]"));
+        for forbidden in ["worker-target-sensitive", "8877665544332200", "100"] {
+            assert!(!rendered.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_retirement_rejects_nonterminal_and_stale_successor_identities() {
+        let journal = MockSessionRePinJournal::default();
+        let first = plan_with(1, 1, 100, 3);
+        journal.begin(&first).await.unwrap();
+        assert!(journal
+            .retire(first.session_id(), first.identity())
+            .await
+            .is_err());
+        let fence = OwnershipFence::new(2).unwrap();
+        journal
+            .record_ownership_committed(&first, 0, fence)
+            .await
+            .unwrap();
+        assert!(journal
+            .retire(first.session_id(), first.identity())
+            .await
+            .is_err());
+        assert!(journal
+            .load(first.session_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .current_fence()
+            .is_some());
+
+        journal.record_sa_complete(&first, 0, fence).await.unwrap();
+        for index in 1..first.len() {
+            journal
+                .record_ownership_committed(&first, index, fence)
+                .await
+                .unwrap();
+            journal
+                .record_sa_complete(&first, index, fence)
+                .await
+                .unwrap();
+        }
+        let successor = successor_of(&first, 2, 500);
+        journal.begin(&successor).await.unwrap();
+        assert!(journal
+            .retire(first.session_id(), first.identity())
+            .await
+            .is_err());
+        assert!(journal
+            .retire(successor.session_id(), successor.identity())
+            .await
+            .is_err());
+        complete_journal_plan(&journal, &successor, 3).await;
+        assert!(journal
+            .retire(first.session_id(), first.identity())
+            .await
+            .is_err());
+        assert_eq!(
+            journal
+                .retire(successor.session_id(), successor.identity())
+                .await
+                .unwrap()
+                .disposition(),
+            SessionRePinRetirementDisposition::Retired
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mock_tombstone_has_an_exact_bounded_cleanup_horizon() {
+        let clock = Arc::new(opc_session_store::TokioVirtualClock::new());
+        let journal = MockSessionRePinJournal::with_clock(clock);
+        let plan = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&journal, &plan, 2).await;
+        let retired = journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+
+        tokio::time::advance(SESSION_REPIN_RETIREMENT_RETENTION - Duration::from_nanos(1)).await;
+        assert!(journal.begin(&plan).await.is_err());
+        assert_eq!(
+            journal
+                .retire(plan.session_id(), plan.identity())
+                .await
+                .unwrap()
+                .retained_until(),
+            retired.retained_until()
+        );
+
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert_eq!(journal.load(plan.session_id()).await.unwrap(), None);
+        // Cleanup ends the bounded stale-retry guarantee. Production callers
+        // must never reuse this privacy-safe per-session ID after teardown.
+        assert!(journal.begin(&plan).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_retire_and_successor_begin_linearize_without_mixed_state() {
+        let journal = MockSessionRePinJournal::default();
+        let first = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&journal, &first, 2).await;
+        let successor = successor_of(&first, 2, 500);
+
+        let (retired, started) = tokio::join!(
+            journal.retire(first.session_id(), first.identity()),
+            journal.begin(&successor)
+        );
+        assert_ne!(retired.is_ok(), started.is_ok());
+        match journal.load(first.session_id()).await.unwrap() {
+            Some(checkpoint) => assert_eq!(checkpoint.plan(), &successor),
+            None => assert!(retired.is_ok()),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_final_progress_and_retirement_race_never_loses_a_known_commit() {
+        let journal = MockSessionRePinJournal::default();
+        let plan = plan_with(1, 1, 100, 3);
+        journal.begin(&plan).await.unwrap();
+        let fence = OwnershipFence::new(2).unwrap();
+        for index in 0..plan.len() - 1 {
+            journal
+                .record_ownership_committed(&plan, index, fence)
+                .await
+                .unwrap();
+            journal
+                .record_sa_complete(&plan, index, fence)
+                .await
+                .unwrap();
+        }
+        let last = plan.len() - 1;
+        journal
+            .record_ownership_committed(&plan, last, fence)
+            .await
+            .unwrap();
+
+        let (completed, retired) = tokio::join!(
+            journal.record_sa_complete(&plan, last, fence),
+            journal.retire(plan.session_id(), plan.identity())
+        );
+        assert!(completed.is_ok());
+        if retired.is_err() {
+            assert_eq!(
+                journal
+                    .load(plan.session_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status()
+                    .phase(),
+                SessionRePinPhase::Complete
+            );
+            journal
+                .retire(plan.session_id(), plan.identity())
+                .await
+                .unwrap();
+        }
+        assert_eq!(journal.load(plan.session_id()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn restart_requires_the_exact_retained_operation_identity() {
         let harness = Harness::new();
         harness.journal.begin(&harness.plan).await.unwrap();
@@ -3743,6 +4668,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_store_terminal_retirement_is_fenced_versioned_and_restart_idempotent() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let journal = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
+        let plan = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&journal, &plan, 2).await;
+        let key = journal.key(plan.session_id()).unwrap();
+        let active_record = store.get(&key).await.unwrap().unwrap();
+        let active_envelope = decode_session_payload_envelope(
+            &active_record.payload,
+            Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+        )
+        .unwrap();
+        assert_eq!(
+            active_envelope.version().get(),
+            SESSION_REPIN_CHECKPOINT_PAYLOAD_VERSION
+        );
+        assert_eq!(active_record.expires_at, None);
+
+        let retired = journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        assert_eq!(
+            retired.disposition(),
+            SessionRePinRetirementDisposition::Retired
+        );
+        assert_eq!(journal.load(plan.session_id()).await.unwrap(), None);
+        let retired_record = store.get(&key).await.unwrap().unwrap();
+        assert!(retired_record.generation > active_record.generation);
+        assert!(retired_record.fence > active_record.fence);
+        assert_eq!(retired_record.expires_at, Some(retired.retained_until()));
+        let retired_envelope = decode_session_payload_envelope(
+            &retired_record.payload,
+            Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+        )
+        .unwrap();
+        assert_eq!(
+            retired_envelope.version().get(),
+            SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION
+        );
+        let SessionRePinJournalEntry::Retired(tombstone) =
+            decode_journal_record(&retired_record, &key, plan.session_id()).unwrap()
+        else {
+            panic!("expected retirement tombstone");
+        };
+        assert_eq!(tombstone.retained_until, retired.retained_until());
+        assert_eq!(
+            checked_session_deadline(tombstone.retired_at, SESSION_REPIN_RETIREMENT_RETENTION)
+                .unwrap(),
+            tombstone.retained_until
+        );
+
+        let restarted = SessionStoreRePinJournal::new(store, tenant(), nf_kind());
+        let replayed = restarted
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.disposition(),
+            SessionRePinRetirementDisposition::AlreadyRetired
+        );
+        assert_eq!(replayed.retained_until(), retired.retained_until());
+        assert!(restarted.begin(&plan).await.is_err());
+        assert!(restarted.begin(&successor_of(&plan, 2, 500)).await.is_err());
+        let stale_fence = OwnershipFence::new(2).unwrap();
+        assert!(restarted
+            .record_ownership_committed(&plan, 0, stale_fence)
+            .await
+            .is_err());
+        assert!(restarted
+            .record_sa_complete(&plan, 0, stale_fence)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_store_retirement_expiry_matches_the_documented_retry_horizon() {
+        let clock = Arc::new(opc_session_store::TokioVirtualClock::new());
+        let backend = FakeSessionBackend::new().with_clock(clock.clone());
+        let store = SessionStore::new(backend);
+        let journal =
+            SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind()).with_clock(clock);
+        let plan = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&journal, &plan, 2).await;
+        let retired = journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+
+        tokio::time::advance(SESSION_REPIN_RETIREMENT_RETENTION - Duration::from_nanos(1)).await;
+        assert!(journal.begin(&plan).await.is_err());
+        assert_eq!(
+            journal
+                .retire(plan.session_id(), plan.identity())
+                .await
+                .unwrap()
+                .retained_until(),
+            retired.retained_until()
+        );
+
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert_eq!(journal.load(plan.session_id()).await.unwrap(), None);
+        // As documented, ancient requests are indistinguishable after bounded
+        // cleanup; callers must never reuse a retired session stable ID.
+        assert!(journal.begin(&plan).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_store_retirement_rejects_nonterminal_and_stale_identity() {
+        let journal = SessionStoreRePinJournal::new(
+            SessionStore::new(FakeSessionBackend::new()),
+            tenant(),
+            nf_kind(),
+        );
+        let plan = plan_with(1, 1, 100, 3);
+        journal.begin(&plan).await.unwrap();
+        assert!(journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .is_err());
+        let stale = SessionRePinIdentity::new(operation_id(99), plan.fingerprint());
+        assert!(journal.retire(plan.session_id(), stale).await.is_err());
+        assert_eq!(
+            journal
+                .load(plan.session_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .status()
+                .phase(),
+            SessionRePinPhase::Prepared
+        );
+    }
+
+    #[tokio::test]
+    async fn session_store_retire_and_successor_begin_linearize_at_one_generation() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let journal = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
+        let first = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&journal, &first, 2).await;
+        let successor = successor_of(&first, 2, 500);
+        let retiring = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
+        let starting = SessionStoreRePinJournal::new(store, tenant(), nf_kind());
+
+        let (retired, started) = tokio::join!(
+            retiring.retire(first.session_id(), first.identity()),
+            starting.begin(&successor)
+        );
+        assert_ne!(retired.is_ok(), started.is_ok());
+        match journal.load(first.session_id()).await.unwrap() {
+            Some(checkpoint) => assert_eq!(checkpoint.plan(), &successor),
+            None => assert!(retired.is_ok()),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_store_final_progress_and_retire_race_preserves_terminal_state() {
+        let journal = SessionStoreRePinJournal::new(
+            SessionStore::new(FakeSessionBackend::new()),
+            tenant(),
+            nf_kind(),
+        );
+        let plan = plan_with(1, 1, 100, 3);
+        journal.begin(&plan).await.unwrap();
+        let fence = OwnershipFence::new(2).unwrap();
+        for index in 0..plan.len() - 1 {
+            journal
+                .record_ownership_committed(&plan, index, fence)
+                .await
+                .unwrap();
+            journal
+                .record_sa_complete(&plan, index, fence)
+                .await
+                .unwrap();
+        }
+        let last = plan.len() - 1;
+        journal
+            .record_ownership_committed(&plan, last, fence)
+            .await
+            .unwrap();
+
+        let (completed, retired) = tokio::join!(
+            journal.record_sa_complete(&plan, last, fence),
+            journal.retire(plan.session_id(), plan.identity())
+        );
+        assert!(completed.is_ok());
+        if retired.is_err() {
+            assert_eq!(
+                journal
+                    .load(plan.session_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status()
+                    .phase(),
+                SessionRePinPhase::Complete
+            );
+            journal
+                .retire(plan.session_id(), plan.identity())
+                .await
+                .unwrap();
+        }
+        assert_eq!(journal.load(plan.session_id()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn session_store_journal_rejects_non_authoritative_backend_capabilities() {
         let backend = FakeSessionBackend::with_capabilities(BackendCapabilities::minimal());
         let journal =
@@ -3830,6 +4961,8 @@ mod tests {
     struct CommitThenErrorBackend<B> {
         inner: B,
         inject: Arc<AtomicBool>,
+        fail_readback_after_injected_cas: Arc<AtomicBool>,
+        fail_next_get: Arc<AtomicBool>,
         cas_calls: Arc<AtomicUsize>,
     }
 
@@ -3838,8 +4971,16 @@ mod tests {
             Self {
                 inner,
                 inject: Arc::new(AtomicBool::new(true)),
+                fail_readback_after_injected_cas: Arc::new(AtomicBool::new(false)),
+                fail_next_get: Arc::new(AtomicBool::new(false)),
                 cas_calls: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn arm_lost_ack_and_failed_readback(&self) {
+            self.fail_readback_after_injected_cas
+                .store(true, Ordering::SeqCst);
+            self.inject.store(true, Ordering::SeqCst);
         }
     }
 
@@ -3853,6 +4994,11 @@ mod tests {
         }
 
         async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+            if self.fail_next_get.swap(false, Ordering::SeqCst) {
+                return Err(StoreError::BackendUnavailable(
+                    "injected read-back failure".to_owned(),
+                ));
+            }
             self.inner.get(key).await
         }
 
@@ -3864,6 +5010,12 @@ mod tests {
             let result = self.inner.compare_and_set(op).await?;
             if self.inject.swap(false, Ordering::SeqCst) {
                 assert_eq!(result, CompareAndSetResult::Success);
+                if self
+                    .fail_readback_after_injected_cas
+                    .swap(false, Ordering::SeqCst)
+                {
+                    self.fail_next_get.store(true, Ordering::SeqCst);
+                }
                 Err(StoreError::BackendUnavailable(
                     "injected lost acknowledgement".to_owned(),
                 ))
@@ -3923,6 +5075,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retirement_restart_recovers_after_ambiguous_commit_and_failed_readback() {
+        let backend = CommitThenErrorBackend::new(SessionStore::new(FakeSessionBackend::new()));
+        let journal = SessionStoreRePinJournal::new(backend.clone(), tenant(), nf_kind());
+        let plan = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&journal, &plan, 2).await;
+        backend.arm_lost_ack_and_failed_readback();
+
+        assert!(journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .is_err());
+        let restarted = SessionStoreRePinJournal::new(backend, tenant(), nf_kind());
+        let recovered = restarted
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.disposition(),
+            SessionRePinRetirementDisposition::AlreadyRetired
+        );
+        assert_eq!(restarted.load(plan.session_id()).await.unwrap(), None);
+        assert!(restarted.begin(&plan).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn contended_session_store_retirement_converges_on_one_tombstone() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let setup = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
+        let plan = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&setup, &plan, 2).await;
+        let left = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
+        let right = SessionStoreRePinJournal::new(store, tenant(), nf_kind());
+
+        let (left_result, right_result) = tokio::join!(
+            left.retire(plan.session_id(), plan.identity()),
+            right.retire(plan.session_id(), plan.identity())
+        );
+        assert!(left_result.is_ok() || right_result.is_ok());
+        let retry = if left_result.is_err() { &left } else { &right };
+        assert_eq!(
+            retry
+                .retire(plan.session_id(), plan.identity())
+                .await
+                .unwrap()
+                .disposition(),
+            SessionRePinRetirementDisposition::AlreadyRetired
+        );
+        assert_eq!(setup.load(plan.session_id()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn capability_downgrade_cannot_read_or_resume_a_terminal_checkpoint() {
         let store = SessionStore::new(FakeSessionBackend::new());
         let authoritative = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
@@ -3946,6 +5149,10 @@ mod tests {
             Err(IpsecLbError::Unsupported)
         );
         assert_eq!(degraded.begin(&plan).await, Err(IpsecLbError::Unsupported));
+        assert_eq!(
+            degraded.retire(plan.session_id(), plan.identity()).await,
+            Err(IpsecLbError::Unsupported)
+        );
         let ports = Harness::new();
         let coordinator = SessionRePinCoordinator::new(
             RePinCoordinator::new(ports.steering, ports.fencer, ports.ownership, ports.audit),
@@ -4135,10 +5342,13 @@ mod tests {
             SessionPayloadEncoding::EnvelopeV1
         );
         let raw_payload = stored.payload.as_bytes();
+        let fingerprint_json = serde_json::to_vec(&plan.fingerprint().as_bytes()).unwrap();
         for forbidden in [
             b"worker-source-sensitive".as_slice(),
             b"worker-target-sensitive".as_slice(),
             b"8877665544332200".as_slice(),
+            b"\"operation_id\":99".as_slice(),
+            fingerprint_json.as_slice(),
         ] {
             assert!(!raw_payload
                 .windows(forbidden.len())
@@ -4147,6 +5357,73 @@ mod tests {
 
         let loaded = journal.load(plan.session_id()).await.unwrap().unwrap();
         assert_eq!(loaded.plan(), &plan);
+
+        complete_journal_plan(&journal, &plan, 2).await;
+        journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        let retired = raw.get(&key).await.unwrap().unwrap();
+        assert_eq!(
+            retired.payload.encoding(),
+            SessionPayloadEncoding::EnvelopeV1
+        );
+        for forbidden in [
+            b"worker-source-sensitive".as_slice(),
+            b"worker-target-sensitive".as_slice(),
+            b"8877665544332200".as_slice(),
+            b"\"operation_id\":99".as_slice(),
+            fingerprint_json.as_slice(),
+            b"\"plan_fingerprint\"".as_slice(),
+            b"\"retired_at\"".as_slice(),
+        ] {
+            assert!(!retired
+                .payload
+                .as_bytes()
+                .windows(forbidden.len())
+                .any(|window| window == forbidden));
+        }
+        assert_eq!(journal.load(plan.session_id()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn encrypted_sqlite_retirement_survives_adapter_restart() {
+        let directory = TestDirectory::new("encrypted-retirement-restart");
+        let database_path = directory.path().join("session-store.sqlite");
+        let provider = encryption_provider();
+        let encrypted = EncryptingSessionBackend::new(
+            Arc::new(SqliteSessionBackend::open(&database_path).unwrap()),
+            Arc::clone(&provider),
+            "session-repin-retirement-sqlite",
+        );
+        let journal = SessionStoreRePinJournal::new(encrypted, tenant(), nf_kind());
+        let plan = plan_with(0x33, 77, 900, 3);
+        complete_journal_plan(&journal, &plan, 2).await;
+        let retired = journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        drop(journal);
+
+        let restarted = SessionStoreRePinJournal::new(
+            EncryptingSessionBackend::new(
+                Arc::new(SqliteSessionBackend::open(&database_path).unwrap()),
+                provider,
+                "session-repin-retirement-sqlite",
+            ),
+            tenant(),
+            nf_kind(),
+        );
+        let replayed = restarted
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.disposition(),
+            SessionRePinRetirementDisposition::AlreadyRetired
+        );
+        assert_eq!(replayed.retained_until(), retired.retained_until());
+        assert_eq!(restarted.load(plan.session_id()).await.unwrap(), None);
     }
 
     #[test]
@@ -4164,6 +5441,66 @@ mod tests {
         let mut wire = JournalWire::from_checkpoint(&checkpoint);
         wire.current_fence = Some(0);
         assert!(wire.into_checkpoint().is_err());
+    }
+
+    #[tokio::test]
+    async fn retirement_decode_rejects_expiry_fingerprint_and_version_tampering() {
+        let store = SessionStore::new(FakeSessionBackend::new());
+        let journal = SessionStoreRePinJournal::new(store.clone(), tenant(), nf_kind());
+        let plan = plan_with(1, 1, 100, 3);
+        complete_journal_plan(&journal, &plan, 2).await;
+        journal
+            .retire(plan.session_id(), plan.identity())
+            .await
+            .unwrap();
+        let key = journal.key(plan.session_id()).unwrap();
+        let record = store.get(&key).await.unwrap().unwrap();
+        let SessionRePinJournalEntry::Retired(tombstone) =
+            decode_journal_record(&record, &key, plan.session_id()).unwrap()
+        else {
+            panic!("expected retirement tombstone");
+        };
+
+        let mut wrong_expiry = record.clone();
+        wrong_expiry.expires_at = Some(tombstone.retired_at);
+        assert!(decode_journal_record(&wrong_expiry, &key, plan.session_id()).is_err());
+
+        let mut tampered_wire = RetirementWire::from_tombstone(&tombstone);
+        tampered_wire.retirement_fingerprint[0] ^= 1;
+        let mut tampered = record.clone();
+        tampered.payload = encode_json_payload(
+            &journal_payload_format().unwrap(),
+            SessionPayloadVersion::new(SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION),
+            &tampered_wire,
+            Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+        )
+        .unwrap();
+        assert!(decode_journal_record(&tampered, &key, plan.session_id()).is_err());
+
+        let malformed_envelope = opc_session_store::SessionPayloadEnvelope::new(
+            journal_payload_format().unwrap(),
+            SessionPayloadVersion::new(SESSION_REPIN_RETIREMENT_PAYLOAD_VERSION),
+            b"{\"session_id\":".to_vec(),
+        )
+        .with_content_type(SESSION_PAYLOAD_JSON_CONTENT_TYPE)
+        .unwrap();
+        let mut malformed = record.clone();
+        malformed.payload = opc_session_store::encode_session_payload_envelope(
+            &malformed_envelope,
+            Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+        )
+        .unwrap();
+        assert!(decode_journal_record(&malformed, &key, plan.session_id()).is_err());
+
+        let mut unknown_version = record;
+        unknown_version.payload = encode_json_payload(
+            &journal_payload_format().unwrap(),
+            SessionPayloadVersion::new(99),
+            &RetirementWire::from_tombstone(&tombstone),
+            Some(SESSION_REPIN_JOURNAL_MAX_BYTES),
+        )
+        .unwrap();
+        assert!(decode_journal_record(&unknown_version, &key, plan.session_id()).is_err());
     }
 
     #[test]

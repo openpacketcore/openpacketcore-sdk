@@ -318,6 +318,29 @@ sealed before persistence and follows the existing HKMS/KMS rotation path; no
 second encryption or consensus implementation was added. Startup and every
 read/write validate the complete lease/CAS authority capability set and fixed
 checkpoint budget, so a downgraded backend cannot replay terminal success.
+
+An authoritative teardown can call the typed terminal retirement boundary
+with the exact session and operation-plus-plan identity. The journal admits it
+only from `Complete`, then replaces the v1 checkpoint through the same fenced
+CAS with an encrypted v2 tombstone. Exact retries are idempotent across lost
+acknowledgements and restart; prepared/forward progress, stale predecessors,
+stale successors, and concurrent losing generations conflict without
+discarding a known ownership commit. The v2 payload binds `retired_at` and
+`expires_at`; record expiry must match it exactly and the interval must equal
+the fixed seven-day `SESSION_REPIN_RETIREMENT_RETENTION`. Checkpoint writes stay
+byte-compatible v1, decoder dispatch accepts only exact v1/v2, and older
+v1-only SDKs fail closed on a v2 tombstone rather than interpreting another
+shape.
+
+Tombstone storage is bounded by retirement rate over seven days and is cleaned
+through the session store's already-required per-key TTL capability. Stale
+recreation is prevented exactly during that horizon. After cleanup, callers
+must rely on the documented outer invariant: privacy-safe logical-session IDs
+are never reused and all teardown retries expire before the tombstone. The
+tombstone uses the existing private tenant/NF/session key and
+`EncryptingSessionBackend`, so the configured encryption-at-rest and HKMS/KMS
+rotation boundary is unchanged.
+
 Tests cover failures
 before ownership, immediately after commit, during steering, and at all three
 audit positions for every SA position; restart from prepared, committed,
@@ -326,7 +349,9 @@ rejection; successor identity reuse; stale resume/status identities; completed
 prefix owner/fence/transition/fingerprint and steering conflicts; direct
 single-SA displacement; deterministic earlier/later repair interleavings on
 both mock and session-store journals; codec corruption; encrypted raw storage;
-and redaction.
+terminal retirement races; lost-acknowledgement restart; exact tombstone TTL
+cleanup; v1/v2 codec and metadata corruption; encrypted raw storage; and
+redaction.
 
 This is an SDK recovery foundation, not a product continuity attestation. The
 consumer remains responsible for enumerating the complete live SA set,

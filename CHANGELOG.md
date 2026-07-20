@@ -258,6 +258,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal fingerprint for the next failover, and claim continuity only from a
   terminal `SessionRePinOutcome`. This does not claim the adapter-issued
   applied-counter evidence tracked by #333.
+- **Fenced terminal session re-pin retirement — `opc-ipsec-lb`:** the typed
+  journal and coordinator retirement boundary now accepts only the exact
+  terminal session/operation/plan identity, replaces its byte-compatible v1
+  checkpoint with an encrypted, fenced-CAS v2 tombstone, and makes ambiguous
+  retries idempotent across restart. Prepared or forward-converging plans,
+  stale predecessor/successor identities, and losing concurrent generations
+  fail closed without discarding known ownership progress. Tombstones bind
+  their retirement and record-expiry timestamps to one fixed seven-day
+  interval; retries never extend it, the existing per-key TTL bounds cleanup,
+  and callers must use non-reused privacy-safe session IDs with shorter retry
+  horizons after cleanup. Exact version dispatch makes older v1-only SDKs fail
+  closed on tombstones. The private tenant/NF/session key,
+  `EncryptingSessionBackend`, quorum authority, and HKMS/KMS rotation path are
+  unchanged.
 - **BREAKING — fail-closed eBPF GTP-U downlink endpoint binding —
   `opc-gtpu-dataplane`:** every tc downlink PDR now carries a canonical binding
   to its outer peer, concrete local destination, address family, ingress
