@@ -49,6 +49,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapInfo, PerCpuArray};
@@ -147,6 +149,21 @@ fn run(program: &str, args: &[&str]) {
     );
 }
 
+/// Serializes the privileged tests in this process. The netns names, bpffs
+/// pin root, and nft table are unique per provision, but the host-side veth
+/// ends (`s2bu`, `ue0`) and their tc clsact attachments live in the shared
+/// harness netns and cannot vary per test without renaming the interface
+/// through the entire suite. Every privileged test holds this guard for its
+/// whole body, so N tests on parallel threads cannot interleave provisioning
+/// or datapath assertions. This scopes serialization to this binary's
+/// privileged tests only; CI keeps its existing test-thread settings.
+static PRIVILEGED_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Per-process provision sequence keeping every PID-derived harness name
+/// unique across tests in the same process (the PID already keeps them
+/// unique across processes sharing one harness netns).
+static PRIVILEGED_TEST_SEQ: AtomicU32 = AtomicU32::new(0);
+
 fn parse_link_address(value: &str) -> [u8; 6] {
     let mut address = [0_u8; 6];
     let mut components = value.trim().split(':');
@@ -221,18 +238,61 @@ struct TestNet {
     nft_table: String,
 }
 
+/// Best-effort cleanup for a test network whose provisioning panicked
+/// partway. Recorded child namespaces and root-netns veth ends are removed
+/// (deleting one veth end removes the pair), so a retry or a later test in
+/// the same process does not inherit wedged state. `TestNet::provision`
+/// disarms the guard once the complete topology exists; steady-state
+/// teardown stays with `TestNet::drop`.
+struct PartialProvisionCleanup {
+    netns: Vec<String>,
+    root_links: Vec<&'static str>,
+    armed: bool,
+}
+
+impl PartialProvisionCleanup {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PartialProvisionCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for link in &self.root_links {
+            let _ = Command::new("ip").args(["link", "del", link]).output();
+        }
+        for namespace in &self.netns {
+            let _ = Command::new("ip")
+                .args(["netns", "del", namespace])
+                .output();
+        }
+    }
+}
+
 impl TestNet {
     fn provision() -> Self {
         let pid = std::process::id();
-        let auth_ns = format!("opc-auth-{pid}");
-        let pgw_ns = format!("opc-pgw-{pid}");
-        let ue_ns = format!("opc-ue-{pid}");
-        let pin_root = PathBuf::from(format!("/sys/fs/bpf/opc-gtpu-test-{pid}"));
-        let nft_table = format!("opc_gtpu_{pid}");
+        let sequence = PRIVILEGED_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let auth_ns = format!("opc-auth-{pid}-{sequence}");
+        let pgw_ns = format!("opc-pgw-{pid}-{sequence}");
+        let ue_ns = format!("opc-ue-{pid}-{sequence}");
+        let pin_root = PathBuf::from(format!("/sys/fs/bpf/opc-gtpu-test-{pid}-{sequence}"));
+        let nft_table = format!("opc_gtpu_{pid}_{sequence}");
+        let mut cleanup = PartialProvisionCleanup {
+            netns: Vec::new(),
+            root_links: Vec::new(),
+            armed: true,
+        };
 
         run("ip", &["netns", "add", &auth_ns]);
+        cleanup.netns.push(auth_ns.clone());
         run("ip", &["netns", "add", &pgw_ns]);
+        cleanup.netns.push(pgw_ns.clone());
         run("ip", &["netns", "add", &ue_ns]);
+        cleanup.netns.push(ue_ns.clone());
 
         run(
             "ip",
@@ -240,11 +300,13 @@ impl TestNet {
                 "link", "add", "s2bu", "type", "veth", "peer", "name", "s2bup",
             ],
         );
+        cleanup.root_links.push("s2bu");
         run("ip", &["link", "set", "s2bup", "netns", &pgw_ns]);
         run(
             "ip",
             &["link", "add", "ue0", "type", "veth", "peer", "name", "ue1"],
         );
+        cleanup.root_links.push("ue0");
         run("ip", &["link", "set", "ue1", "netns", &ue_ns]);
 
         run("ip", &["addr", "add", "192.0.2.1/24", "dev", "s2bu"]);
@@ -375,6 +437,7 @@ impl TestNet {
             ],
         );
 
+        cleanup.disarm();
         Self {
             auth_ns,
             pgw_ns,
@@ -2214,6 +2277,10 @@ fn exact_pinned_map_ids(pin_dir: &std::path::Path, names: &[&str]) -> Vec<u32> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+// The serial guard is deliberately held for the entire test body: the
+// root-netns veth pairs and tc attachments are shared harness state, so the
+// whole privileged scenario (not just provisioning) is the critical section.
+#[allow(clippy::await_holding_lock)]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
 async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
@@ -2221,6 +2288,9 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         return Ok(());
     }
 
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let net = TestNet::provision();
 
     let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
@@ -3557,6 +3627,9 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
 const SELECTED_SOURCE_PORT: u16 = 40_000;
 
 #[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
 async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3565,6 +3638,9 @@ async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
         return Ok(());
     }
 
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let net = TestNet::provision();
     let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
         bpffs_pin_root: net.pin_root.clone(),
