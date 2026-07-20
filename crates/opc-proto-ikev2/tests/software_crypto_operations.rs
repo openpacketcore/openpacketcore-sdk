@@ -14,11 +14,13 @@ use opc_proto_ikev2::{
     verify_ike_auth_signature, Ikev2AuthenticationPayload, Ikev2DhGroup, Ikev2EncryptionAlgorithm,
     Ikev2EphemeralDhKey, Ikev2IdentificationPayloadBuild, Ikev2IkeAuthPeer,
     Ikev2IkeAuthSignedOctets, Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm,
-    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile,
-    Ikev2SaInitKeyMaterial, Ikev2SignatureAuthKey, Ikev2SoftwareCryptoOperations,
-    ProtectedPayloadKind, ProtectedPayloadSealContext, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
+    Ikev2ProtectedPayloadDirection, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
+    Ikev2SignatureAuthKey, Ikev2SoftwareCryptoOperations, ProtectedPayloadKind,
+    ProtectedPayloadSealContext, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
     RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384,
 };
+
+mod support;
 
 const P256_PKCS8_DER: &[u8] = include_bytes!("data/p256_pkcs8.der");
 const P256_SPKI_DER: &[u8] = include_bytes!("data/p256_spki.der");
@@ -110,27 +112,24 @@ fn software_prf_hashes_an_oversized_key_first_per_rfc4868_prf_five() {
 }
 
 #[test]
-fn software_prf_rejects_an_empty_key_with_a_stable_code_and_chained_source() {
+fn software_prf_rejects_an_empty_key_without_exposing_a_provider_source() {
     let error = OPERATIONS
         .prf(IkePrfAlgorithm::HmacSha2_256, &[], b"data")
         .expect_err("empty PRF key must fail closed");
     assert_eq!(error.code(), CryptoOperationErrorCode::InvalidKeyLength);
     assert_eq!(error.as_str(), "crypto_op_invalid_key_length");
-    let source = std::error::Error::source(&error)
-        .and_then(|source| source.downcast_ref::<Ikev2SaInitCryptoError>())
-        .expect("underlying typed error is chained");
+    assert!(std::error::Error::source(&error).is_none());
+    assert_eq!(format!("{error}"), "crypto_op_invalid_key_length");
     assert_eq!(
-        source,
-        &Ikev2SaInitCryptoError::InvalidKeyLength {
-            name: "PRF key",
-            len: 0,
-        }
+        format!("{error:?}"),
+        "CryptoOperationError { code: \"crypto_op_invalid_key_length\" }"
     );
-    assert_eq!(source.as_str(), "ike_sa_init_crypto_invalid_key_length");
 }
 
 #[test]
 fn software_prf_plus_reproduces_the_independent_sha512_ike_sa_kdf_vector_byte_for_byte() {
+    support::ensure_ike_crypto();
+
     // The same independently generated (OpenSSL 3) RFC 7296 section 2.13/2.14
     // vector that pins `derive_ike_sa_init_key_material`, replayed through
     // the trait `prf`/`prf_plus` primitives and cross-checked against the
@@ -477,6 +476,7 @@ fn aead_profile(encryption: Ikev2EncryptionAlgorithm) -> Ikev2SaInitCryptoProfil
 }
 
 fn established_material(profile: Ikev2SaInitCryptoProfile) -> Ikev2SaInitKeyMaterial {
+    support::ensure_ike_crypto();
     let prf_len = profile.prf().output_len();
     let integrity_len = profile.integrity_key_len();
     let encryption_len = profile.encryption().key_material_len();
@@ -627,6 +627,7 @@ fn software_aead_open_rejects_tampering_and_bad_lengths_with_stable_codes() {
 
 #[test]
 fn software_dh_round_trips_through_opaque_handles_and_matches_the_existing_path_for_all_groups() {
+    support::ensure_ike_crypto();
     let cases = [
         (IkeDhGroup::Modp2048, Ikev2DhGroup::Modp2048),
         (IkeDhGroup::Ecp256, Ikev2DhGroup::Ecp256),
@@ -691,6 +692,7 @@ fn signature_profile() -> Ikev2SaInitCryptoProfile {
 }
 
 fn signature_key_material() -> Ikev2SaInitKeyMaterial {
+    support::ensure_ike_crypto();
     derive_ike_sa_init_key_material(
         signature_profile(),
         [0x11; 8],
@@ -787,6 +789,7 @@ fn software_ecdsa_signatures_are_byte_identical_to_the_existing_ike_auth_signatu
             .load_signing_key(algorithm, pkcs8_der)
             .expect("software signing key loads");
         assert_eq!(signing_key.algorithm(), algorithm);
+        assert_eq!(signing_key.rsa_modulus_len(), None);
         let signature = signing_key.sign(&signed).expect("software path signs");
         assert_eq!(signature.as_slice(), existing_signature, "{algorithm}");
 
@@ -929,6 +932,7 @@ mod rsa_signing {
         let signing_key = OPERATIONS
             .load_signing_key(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256, RSA_PKCS8_DER)
             .expect("software RSA key loads");
+        assert_eq!(signing_key.rsa_modulus_len(), Some(256));
         let signature = signing_key.sign(&signed).expect("software RSA path signs");
         assert_eq!(signature, auth_data);
 

@@ -5,22 +5,24 @@
 //!
 //! | Trait                         | Capability                                  |
 //! |-------------------------------|---------------------------------------------|
+//! | [`IkeHashOperations`]         | [`crate::CryptoCapability::IkeHash`]         |
 //! | [`IkePrfOperations`]          | [`crate::CryptoCapability::IkePrf`]          |
 //! | [`IkeIntegrityOperations`]    | [`crate::CryptoCapability::IkeIntegrity`]    |
 //! | [`IkeEncryptionOperations`]   | [`crate::CryptoCapability::IkeEncryption`]   |
 //! | [`IkeDiffieHellmanOperations`]| [`crate::CryptoCapability::IkeDiffieHellman`]|
 //! | [`IkeSignatureOperations`]    | [`crate::CryptoCapability::IkeSignature`]    |
+//! | [`IkeEntropyOperations`]      | [`crate::CryptoCapability::ApprovedEntropy`] |
 //!
 //! This crate still implements no cryptography: every trait here is a
 //! provider-neutral contract that a cryptographic module implements elsewhere.
 //! The traits are deliberately **synchronous** — they are called from
-//! synchronous codec code — and **object-safe**, so a later slice can hold an
-//! admitted module behind `dyn` references at a plugin boundary.
+//! synchronous codec code — and **object-safe**, so an admitted module can be
+//! held behind `dyn` references at a plugin boundary.
 //!
-//! Random material (AEAD explicit IVs, CBC IVs) is always a caller input.
-//! Nothing in these traits generates randomness, which keeps entropy routing
-//! out of scope and keeps generic RNG parameters (which would break object
-//! safety) out of the contract.
+//! AEAD explicit IVs and low-level caller-controlled vector inputs remain
+//! operation inputs. Fresh module-owned random material is obtained through
+//! [`IkeEntropyOperations`], an object-safe byte-filling boundary associated
+//! with [`crate::CryptoCapability::ApprovedEntropy`].
 //!
 //! # Secret handling
 //!
@@ -72,6 +74,8 @@ pub enum CryptoOperationErrorCode {
     SignatureComputationFailed,
     /// The signature does not verify over the supplied message.
     SignatureVerificationFailed,
+    /// The module's admitted entropy source was unavailable.
+    EntropyUnavailable,
     /// The operation failed for a reason not covered by a more specific code.
     OperationFailed,
 }
@@ -94,6 +98,7 @@ impl CryptoOperationErrorCode {
             Self::SignatureEncodingInvalid => "crypto_op_signature_encoding_invalid",
             Self::SignatureComputationFailed => "crypto_op_signature_computation_failed",
             Self::SignatureVerificationFailed => "crypto_op_signature_verification_failed",
+            Self::EntropyUnavailable => "crypto_op_entropy_unavailable",
             Self::OperationFailed => "crypto_op_operation_failed",
         }
     }
@@ -107,33 +112,19 @@ impl fmt::Display for CryptoOperationErrorCode {
 
 /// Error returned by every operation trait in this module.
 ///
-/// `Display` prints only the stable code. An optional source error is
-/// reachable through [`Error::source`] for local diagnostics; sources must
-/// themselves be redaction-safe (no key, nonce, secret, or SPI bytes in their
-/// `Debug`/`Display` output), because this type renders its source when
-/// formatted with `Debug`.
+/// The boundary deliberately retains only a stable code. Provider-native
+/// errors may contain key labels, backend paths, token identifiers, or other
+/// sensitive context, so arbitrary sources never cross this public boundary
+/// and neither `Debug` nor `Display` can render them.
 pub struct CryptoOperationError {
     code: CryptoOperationErrorCode,
-    source: Option<Box<dyn Error + Send + Sync + 'static>>,
 }
 
 impl CryptoOperationError {
     /// Build an error carrying only a stable code.
     #[must_use]
     pub const fn new(code: CryptoOperationErrorCode) -> Self {
-        Self { code, source: None }
-    }
-
-    /// Build an error chaining a redaction-safe underlying error.
-    #[must_use]
-    pub fn with_source(
-        code: CryptoOperationErrorCode,
-        source: impl Error + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            code,
-            source: Some(Box::new(source)),
-        }
+        Self { code }
     }
 
     /// Stable machine-readable error code.
@@ -154,7 +145,6 @@ impl fmt::Debug for CryptoOperationError {
         formatter
             .debug_struct("CryptoOperationError")
             .field("code", &self.code.as_str())
-            .field("source", &self.source.as_ref().map(ToString::to_string))
             .finish()
     }
 }
@@ -165,11 +155,36 @@ impl fmt::Display for CryptoOperationError {
     }
 }
 
-impl Error for CryptoOperationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| source.as_ref() as &(dyn Error + 'static))
+impl Error for CryptoOperationError {}
+
+/// IKEv2 protocol hash algorithm.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IkeHashAlgorithm {
+    /// SHA-1 for RFC 7296 NAT detection only.
+    Sha1,
+}
+
+impl IkeHashAlgorithm {
+    /// Stable machine-readable algorithm code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+        }
+    }
+
+    /// Digest length in octets.
+    #[must_use]
+    pub const fn output_len(self) -> usize {
+        match self {
+            Self::Sha1 => 20,
+        }
+    }
+}
+
+impl fmt::Display for IkeHashAlgorithm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -428,6 +443,8 @@ pub enum IkeSignatureAlgorithm {
     RsaPkcs1V15Sha2_256,
     /// ECDSA over P-256 with SHA-256, DER-encoded `ECDSA-Sig-Value`.
     EcdsaP256Sha2_256,
+    /// ECDSA over P-384 with SHA-256, DER-encoded `ECDSA-Sig-Value`.
+    EcdsaP384Sha2_256,
     /// ECDSA over P-384 with SHA-384, DER-encoded `ECDSA-Sig-Value`.
     EcdsaP384Sha2_384,
 }
@@ -438,6 +455,7 @@ impl IkeSignatureAlgorithm {
         match self {
             Self::RsaPkcs1V15Sha2_256 => "rsa_pkcs1_v1_5_sha2_256",
             Self::EcdsaP256Sha2_256 => "ecdsa_p256_sha2_256",
+            Self::EcdsaP384Sha2_256 => "ecdsa_p384_sha2_256",
             Self::EcdsaP384Sha2_384 => "ecdsa_p384_sha2_384",
         }
     }
@@ -454,6 +472,9 @@ impl fmt::Display for IkeSignatureAlgorithm {
 /// RFC 7296 section 2.13 `prf` and `prf+` over the negotiated HMAC-SHA2
 /// family.
 pub trait IkePrfOperations: Send + Sync {
+    /// Whether this module can execute `algorithm`.
+    fn supports_prf(&self, algorithm: IkePrfAlgorithm) -> bool;
+
     /// Compute `prf(key, data)`.
     ///
     /// The output is exactly [`IkePrfAlgorithm::output_len`] octets. A key
@@ -495,6 +516,9 @@ pub trait IkePrfOperations: Send + Sync {
 
 /// IKEv2 integrity operations ([`crate::CryptoCapability::IkeIntegrity`]).
 pub trait IkeIntegrityOperations: Send + Sync {
+    /// Whether this module can execute `algorithm`.
+    fn supports_integrity(&self, algorithm: IkeIntegrityAlgorithm) -> bool;
+
     /// Compute the truncated integrity checksum over
     /// `message_prefix || message_suffix`.
     ///
@@ -548,11 +572,19 @@ pub trait IkeIntegrityOperations: Send + Sync {
 /// IKEv2 payload encryption operations
 /// ([`crate::CryptoCapability::IkeEncryption`]).
 ///
-/// IV material is always a caller input: AEAD explicit IVs must come from a
-/// caller-owned monotonic counter and CBC IVs from a caller-owned CSPRNG.
-/// This keeps entropy routing out of the operation contract and keeps the
-/// traits object-safe.
+/// IV material is explicit at this low-level boundary: AEAD explicit IVs come
+/// from a caller-owned monotonic counter, while production CBC callers obtain
+/// a fresh IV through the same module's [`IkeEntropyOperations`] before
+/// invoking the cipher operation. Explicit IV inputs remain available for
+/// deterministic vectors and make the cipher traits object-safe without a
+/// generic RNG parameter.
 pub trait IkeEncryptionOperations: Send + Sync {
+    /// Whether this module can execute `algorithm`.
+    fn supports_aead(&self, algorithm: IkeAeadAlgorithm) -> bool;
+
+    /// Whether this module can execute `algorithm`.
+    fn supports_cbc(&self, algorithm: IkeCbcAlgorithm) -> bool;
+
     /// Authenticate and encrypt one AEAD body.
     ///
     /// The nonce is `salt || explicit_iv` (RFC 4106/RFC 5282). The returned
@@ -642,6 +674,9 @@ pub trait IkeEncryptionOperations: Send + Sync {
 /// IKEv2 Diffie-Hellman operations
 /// ([`crate::CryptoCapability::IkeDiffieHellman`]).
 pub trait IkeDiffieHellmanOperations: Send + Sync {
+    /// Whether this module can execute `group`.
+    fn supports_dh_group(&self, group: IkeDhGroup) -> bool;
+
     /// Generate an ephemeral key pair for `group` behind an opaque handle.
     ///
     /// The handle owns the backend-native private key; the secret never
@@ -696,6 +731,12 @@ pub trait IkeDhKeyPair: fmt::Debug + Send + Sync {
 /// framing, transcript construction, and certificate trust decisions stay
 /// with the protocol layer.
 pub trait IkeSignatureOperations: Send + Sync {
+    /// Whether this module can verify signatures for `algorithm`.
+    fn supports_signature_verification(&self, algorithm: IkeSignatureAlgorithm) -> bool;
+
+    /// Whether this module can load a private key and sign for `algorithm`.
+    fn supports_signature_generation(&self, algorithm: IkeSignatureAlgorithm) -> bool;
+
     /// Load a private signing key from PKCS#8 DER behind an opaque handle.
     ///
     /// # Errors
@@ -747,6 +788,17 @@ pub trait IkeSigningKey: fmt::Debug + Send + Sync {
     /// Algorithm this key signs with.
     fn algorithm(&self) -> IkeSignatureAlgorithm;
 
+    /// RSA modulus width in octets, when this is an RSA signing key.
+    ///
+    /// The modulus width is public key metadata, not private key material. It
+    /// lets the protocol boundary enforce the fixed-width raw RSA signature
+    /// encoding without exporting the private key or backend-native handle.
+    /// ECDSA implementations return `None`; RSA implementations that retain
+    /// the default also fail closed when their output is validated.
+    fn rsa_modulus_len(&self) -> Option<usize> {
+        None
+    }
+
     /// Sign `message` (the implementation applies the algorithm's digest).
     ///
     /// The output is the raw RSASSA-PKCS1-v1_5 signature for RSA, or a
@@ -760,10 +812,79 @@ pub trait IkeSigningKey: fmt::Debug + Send + Sync {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CryptoOperationError>;
 }
 
+/// IKEv2 protocol hashing ([`crate::CryptoCapability::IkeHash`]).
+pub trait IkeHashOperations: Send + Sync {
+    /// Whether this module can execute `algorithm`.
+    fn supports_hash(&self, algorithm: IkeHashAlgorithm) -> bool;
+
+    /// Hash the ordered concatenation of `parts`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoOperationErrorCode::UnsupportedAlgorithm`] when the
+    /// module does not implement `algorithm`.
+    fn hash(
+        &self,
+        algorithm: IkeHashAlgorithm,
+        parts: &[&[u8]],
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoOperationError>;
+}
+
+/// Entropy supplied by the admitted cryptographic module.
+///
+/// This operation is used for fresh IKEv2 IV material. Ephemeral DH key
+/// generation stays behind [`IkeDiffieHellmanOperations`] because private
+/// values never cross the opaque handle boundary.
+pub trait IkeEntropyOperations: Send + Sync {
+    /// Fill the complete caller buffer with cryptographically secure random
+    /// bytes from the module's admitted entropy source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoOperationErrorCode::EntropyUnavailable`] if the source
+    /// cannot fill the whole buffer. Partial output must be treated as secret
+    /// failure material and overwritten by the implementation before return.
+    fn fill_random(&self, output: &mut [u8]) -> Result<(), CryptoOperationError>;
+}
+
+/// Complete synchronous IKEv2 operation surface implemented by one module.
+///
+/// The supertraits make it impossible to install a partially shaped operation
+/// object and let the process-level admission boundary bind all IKE operations
+/// to the same module instance.
+pub trait IkeCryptoOperations:
+    IkeHashOperations
+    + IkeEntropyOperations
+    + IkePrfOperations
+    + IkeIntegrityOperations
+    + IkeEncryptionOperations
+    + IkeDiffieHellmanOperations
+    + IkeSignatureOperations
+    + Send
+    + Sync
+{
+}
+
+impl<T> IkeCryptoOperations for T where
+    T: IkeHashOperations
+        + IkeEntropyOperations
+        + IkePrfOperations
+        + IkeIntegrityOperations
+        + IkeEncryptionOperations
+        + IkeDiffieHellmanOperations
+        + IkeSignatureOperations
+        + Send
+        + Sync
+{
+}
+
 /// Compile-time proof that every operation trait is object-safe: this
 /// function only type-checks if `dyn` references to each trait exist.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn assert_operation_traits_are_object_safe(
+    _hash: &dyn IkeHashOperations,
+    _entropy: &dyn IkeEntropyOperations,
     _prf: &dyn IkePrfOperations,
     _integrity: &dyn IkeIntegrityOperations,
     _encryption: &dyn IkeEncryptionOperations,
@@ -780,7 +901,8 @@ mod tests {
 
     use super::{
         CryptoOperationError, CryptoOperationErrorCode, IkeAeadAlgorithm, IkeCbcAlgorithm,
-        IkeDhGroup, IkeIntegrityAlgorithm, IkePrfAlgorithm, IkeSignatureAlgorithm,
+        IkeDhGroup, IkeHashAlgorithm, IkeIntegrityAlgorithm, IkePrfAlgorithm,
+        IkeSignatureAlgorithm,
     };
 
     #[test]
@@ -843,6 +965,10 @@ mod tests {
                 "crypto_op_signature_verification_failed",
             ),
             (
+                CryptoOperationErrorCode::EntropyUnavailable,
+                "crypto_op_entropy_unavailable",
+            ),
+            (
                 CryptoOperationErrorCode::OperationFailed,
                 "crypto_op_operation_failed",
             ),
@@ -862,23 +988,19 @@ mod tests {
     }
 
     #[test]
-    fn operation_error_chains_its_source_and_debug_prints_only_stable_text() {
-        let source = CryptoOperationError::new(CryptoOperationErrorCode::AuthenticationFailed);
-        let error =
-            CryptoOperationError::with_source(CryptoOperationErrorCode::OperationFailed, source);
+    fn operation_error_debug_and_display_print_only_the_stable_code() {
+        let error = CryptoOperationError::new(CryptoOperationErrorCode::OperationFailed);
         assert_eq!(error.as_str(), "crypto_op_operation_failed");
-        let chained = match error.source() {
-            Some(chained) => chained,
-            None => panic!("source must be chained"),
-        };
-        assert_eq!(chained.to_string(), "crypto_op_authentication_failed");
+        assert!(error.source().is_none());
         let debug = format!("{error:?}");
         assert!(debug.contains("crypto_op_operation_failed"));
-        assert!(debug.contains("crypto_op_authentication_failed"));
+        assert!(!debug.contains("source"));
     }
 
     #[test]
     fn algorithm_identifiers_have_stable_codes_and_consistent_lengths() {
+        assert_eq!(IkeHashAlgorithm::Sha1.as_str(), "sha1");
+        assert_eq!(IkeHashAlgorithm::Sha1.output_len(), 20);
         assert_eq!(IkePrfAlgorithm::HmacSha2_256.as_str(), "prf_hmac_sha2_256");
         assert_eq!(IkePrfAlgorithm::HmacSha2_384.as_str(), "prf_hmac_sha2_384");
         assert_eq!(IkePrfAlgorithm::HmacSha2_512.as_str(), "prf_hmac_sha2_512");
@@ -949,6 +1071,10 @@ mod tests {
         assert_eq!(
             IkeSignatureAlgorithm::EcdsaP256Sha2_256.as_str(),
             "ecdsa_p256_sha2_256"
+        );
+        assert_eq!(
+            IkeSignatureAlgorithm::EcdsaP384Sha2_256.as_str(),
+            "ecdsa_p384_sha2_256"
         );
         assert_eq!(
             IkeSignatureAlgorithm::EcdsaP384Sha2_384.as_str(),

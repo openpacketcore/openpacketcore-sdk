@@ -23,6 +23,7 @@ rsa-signing = []
 testkit = []
 
 [dependencies]
+async-trait = { workspace = true }
 aes = { workspace = true }
 aes-gcm = { workspace = true }
 bytes = { workspace = true }

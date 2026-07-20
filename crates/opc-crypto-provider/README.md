@@ -6,12 +6,12 @@ cryptographic modules.
 ## Purpose
 
 `opc-crypto-provider` defines the seam through which security-critical
-operations (TLS, IKEv2 PRF/integrity/encryption/signature/Diffie-Hellman,
-entropy, zeroization, sealed key storage) can later be routed to exactly one
+operations (TLS, IKEv2 hash/PRF/integrity/encryption/signature/Diffie-Hellman,
+entropy, zeroization, sealed key storage) can be routed to exactly one
 explicitly selected cryptographic module, and through which a deployment can
 prove at runtime which module answered. It implements **no cryptographic
-algorithms** and integrates with no other SDK crate; it is the capability
-model, evidence, and admission policy only.
+algorithms** and integrates with no other SDK crate; it defines capability
+evidence, admission policy, and provider-neutral operation contracts only.
 
 The design is fail-closed throughout: an unknown or unreported capability
 never reads as available, a failed or unrun self-test and any loss of
@@ -37,6 +37,9 @@ falling back to another code path.
   `ProviderPolicy::admit`.
 - `CryptoModule` — the async provider trait: identity, capabilities,
   self-test, readiness.
+- `IkeCryptoModule` — one composite object supplying both that evidence and
+  the complete synchronous IKEv2 operation surface, including module-owned
+  entropy and opaque DH/signing handles.
 - `testkit::FakeCryptoModule` (feature `testkit`) — configurable fixture that
   can drop capabilities, fail its self-test, or lose readiness so tests can
   prove the fail-closed behavior.

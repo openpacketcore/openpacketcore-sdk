@@ -22,6 +22,8 @@ use opc_protocol::{BorrowDecode, DecodeContext, Encode, EncodeContext};
 use rand::{rngs::SysRng, TryRng};
 use sha2::Sha512;
 
+mod support;
+
 const INITIATOR_SPI: u64 = 0x0102_0304_0506_0708;
 const RESPONDER_SPI: u64 = 0x1112_1314_1516_1718;
 const TRANSFORM_TYPE_ENCR: u8 = 1;
@@ -312,6 +314,7 @@ fn literal_capture_offsets_and_lengths_are_independently_self_consistent() {
 
 #[test]
 fn capture_shaped_responder_proof_reaches_bidirectional_protected_ike_auth() {
+    support::ensure_ike_crypto();
     let request_bytes = synthetic_capture();
     let (request, payloads) = decode_request(&request_bytes);
     assert_eq!(payloads.key_exchange.dh_group, 14);

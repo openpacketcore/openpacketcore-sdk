@@ -15,7 +15,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
-    hmac_sha2::{hmac_sha2_256, hmac_sha2_384, hmac_sha2_512},
+    crypto_module::{execute_prf, Ikev2CryptoModuleError},
     notify::{Ikev2NotifyPayload, Ikev2NotifyPayloadError, IKEV2_NOTIFY_REKEY_SA},
     payload::{PayloadChain, PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     sa_init::{
@@ -2144,11 +2144,8 @@ fn ike_auth_prf(
     if key.is_empty() {
         return Err(Ikev2IkeAuthVerificationError::PrfKeyEmpty);
     }
-    match algorithm {
-        Ikev2PrfAlgorithm::HmacSha2_256 => Ok(hmac_sha2_256(key, &[data])),
-        Ikev2PrfAlgorithm::HmacSha2_384 => Ok(hmac_sha2_384(key, &[data])),
-        Ikev2PrfAlgorithm::HmacSha2_512 => Ok(hmac_sha2_512(key, &[data])),
-    }
+    execute_prf(algorithm, key, data)
+        .map_err(|error| Ikev2IkeAuthVerificationError::CryptoModuleFailure { error })
 }
 
 /// Error returned while decoding an IKE_AUTH cleartext payload.
@@ -2469,6 +2466,11 @@ pub enum Ikev2IkeAuthVerificationError {
     SignatureComputationFailed,
     /// Signature did not verify over the transcript-bound signed octets.
     SignatureVerificationFailed,
+    /// The admitted process crypto module was absent, withdrawn, or failed.
+    CryptoModuleFailure {
+        /// Stable, redaction-safe module boundary error.
+        error: Ikev2CryptoModuleError,
+    },
 }
 
 impl Ikev2IkeAuthVerificationError {
@@ -2497,6 +2499,7 @@ impl Ikev2IkeAuthVerificationError {
             Self::SignatureKeyMismatch => "ike_auth_verify_signature_key_mismatch",
             Self::SignatureComputationFailed => "ike_auth_verify_signature_computation_failed",
             Self::SignatureVerificationFailed => "ike_auth_verify_signature_verification_failed",
+            Self::CryptoModuleFailure { .. } => "ike_auth_verify_crypto_module_failure",
         }
     }
 }
@@ -2561,6 +2564,7 @@ mod tests {
 
     #[test]
     fn ike_auth_prf_returns_zeroizing_output() {
+        crate::test_support::ensure_ike_crypto();
         let output: Zeroizing<Vec<u8>> =
             match ike_auth_prf(Ikev2PrfAlgorithm::HmacSha2_256, b"key", b"data") {
                 Ok(output) => output,

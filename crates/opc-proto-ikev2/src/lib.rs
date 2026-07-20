@@ -31,11 +31,22 @@
 //! [`Ikev2ValidationProfile::SenderCanonical`] only to audit generated
 //! outbound fixtures.
 //!
+//! Cryptographic operations require an explicit once-only process admission
+//! through [`install_ikev2_crypto_module`]. The selected module is preflighted
+//! against [`Ikev2CryptoRequirements`], and there is no implicit software or
+//! `testkit` fallback. The bundled [`Ikev2SoftwareCryptoModule`] is one
+//! explicit non-validated module choice. The generic caller-owned
+//! [`CryptoProvider`] boundary cannot establish module identity by itself;
+//! validated deployments use [`Ikev2SaInitProtectedPayloadProvider`] or bind
+//! their adapter to the admitted module. Direct external crypto is outside the
+//! SDK admission evidence.
+//!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
 //! @conformance experimental-mechanism boundary — see CONFORMANCE.md
 
 pub mod crypto;
+pub mod crypto_module;
 pub mod dedicated_bearer;
 pub mod device_identity;
 pub mod exchange;
@@ -62,6 +73,10 @@ pub mod validation;
 pub use crypto::{
     open_protected_payloads, CryptoProvider, OpenedProtectedPayload, ProtectedPayloadContext,
     ProtectedPayloadKind, ProtectedPayloadOpenError, ProtectedPayloadOpenFailure,
+};
+pub use crypto_module::{
+    install_ikev2_crypto_module, Ikev2CryptoModuleError, Ikev2CryptoModuleErrorCode,
+    Ikev2CryptoModuleInstallError, Ikev2CryptoRequirements,
 };
 pub use dedicated_bearer::{
     build_ikev2_dedicated_bearer_create_child_sa_error_response,
@@ -240,5 +255,30 @@ pub use sa_init_negotiation::{
     negotiate_ike_sa_init, Ikev2SaInitNegotiation, Ikev2SaInitNegotiationError,
     Ikev2SaInitNegotiationPolicy,
 };
-pub use software_crypto::Ikev2SoftwareCryptoOperations;
+pub use software_crypto::{
+    install_ikev2_software_crypto_module, Ikev2SoftwareCryptoModule, Ikev2SoftwareCryptoOperations,
+};
 pub use validation::Ikev2ValidationProfile;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::OnceLock;
+
+    use opc_crypto_provider::ProviderPolicy;
+
+    use crate::{install_ikev2_software_crypto_module, Ikev2CryptoRequirements};
+
+    pub(crate) fn ensure_ike_crypto() {
+        static INSTALL: OnceLock<Result<(), &'static str>> = OnceLock::new();
+        let result = INSTALL.get_or_init(|| {
+            let requirements = Ikev2CryptoRequirements::all_software_supported();
+            let policy = ProviderPolicy::new().require_all(requirements.required_capabilities());
+            install_ikev2_software_crypto_module(policy, requirements)
+                .map(|_| ())
+                .map_err(|_| "explicit unit-test IKEv2 software module admission failed")
+        });
+        if let Err(message) = result {
+            panic!("{message}");
+        }
+    }
+}

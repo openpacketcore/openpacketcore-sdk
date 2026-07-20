@@ -29,7 +29,11 @@ control-plane stack.
 - `validation` exposes `Ikev2ValidationProfile`, separating conformant network
   receive behavior from opt-in sender-canonical fixture validation.
 - `crypto` defines the caller-supplied `CryptoProvider` boundary and protected
-  payload open result types.
+  payload open result types. An arbitrary implementation is not covered by
+  process-module admission; validated deployments use the module-routed
+  `Ikev2SaInitProtectedPayloadProvider` or an adapter whose identity is bound
+  to their admitted module. Direct caller crypto invalidates SDK admission
+  claims rather than gaining them from a slot-presence check.
 - `sa_init`, `sa_init_crypto`, and `sa_init_negotiation` provide typed
   SA/KE/Nonce/Notify helpers, SA_INIT response builders, product-neutral
   responder proposal selection, Diffie-Hellman group/profile types, and
@@ -49,8 +53,8 @@ control-plane stack.
 - `protected_payload_crypto` provides caller-keyed AES-GCM-16 and
   AES-CBC/SHA-2 encrypt-then-MAC `SK`/`SKF` open/seal helpers for
   already-derived SA_INIT key material. Production CBC sealing obtains a fresh
-  16-octet IV from a cryptographically secure random source; callers cache the
-  complete already-sealed response for retransmission.
+  16-octet IV from the admitted module's `ApprovedEntropy` operation; callers
+  cache the complete already-sealed response for retransmission.
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
   helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
   selector/proposal helpers.
@@ -71,6 +75,133 @@ control-plane stack.
   proposal/transforms, optional KE group, and traffic-selector narrowing.
 - `fragmentation`, `notify`, `nat_detection`, `nat_traversal`, and `exchange`
   expose RFC-specific mechanism helpers without owning product state.
+
+## Process-wide cryptographic module admission
+
+IKEv2 cryptographic operations have no implicit software or `testkit`
+fallback. Before accepting IKE traffic, a process must build
+`Ikev2CryptoRequirements` from every configured IKE-SA profile, NAT-detection
+use, and signature direction, then admit one exact `Arc<dyn IkeCryptoModule>`.
+Admission probes the module, applies `ProviderPolicy`, preflights every named
+algorithm, and sets an immutable process slot only after all checks succeed.
+A failed preflight leaves the slot unset; a successful slot cannot be reset or
+replaced. The module object may rotate its own keys, trust, sessions, or
+material epochs internally without changing its admitted identity.
+
+The runtime integration point is the async `StartupPhases::init_security`
+hook. This complete composition aborts startup before any runtime-mediated
+service listener binds:
+
+```rust
+use std::sync::Arc;
+
+use opc_crypto_provider::{
+    IkeCryptoModule, IkeSignatureAlgorithm, ProviderPolicy,
+};
+use opc_proto_ikev2::{
+    install_ikev2_crypto_module, Ikev2CryptoRequirements,
+    Ikev2SaInitCryptoError, Ikev2SaInitCryptoProfile,
+};
+use opc_runtime::{BootstrapError, StartupPhases};
+
+fn security_phases(
+    module: Arc<dyn IkeCryptoModule>,
+    configured_profiles: &[Ikev2SaInitCryptoProfile],
+) -> Result<StartupPhases, Ikev2SaInitCryptoError> {
+    let mut requirements = Ikev2CryptoRequirements::new();
+    for profile in configured_profiles.iter().copied() {
+        requirements.require_ike_sa_profile(profile)?;
+    }
+    requirements.require_nat_detection();
+    requirements.require_signature_generation(
+        IkeSignatureAlgorithm::EcdsaP256Sha2_256,
+    );
+    requirements.require_signature_verification(
+        IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256,
+    );
+    let policy = ProviderPolicy::new()
+        .require_all(requirements.required_capabilities());
+
+    Ok(StartupPhases {
+        init_security: Some(Box::new(move |_runtime_profile| {
+            let module = Arc::clone(&module);
+            let requirements = requirements.clone();
+            Box::pin(async move {
+                install_ikev2_crypto_module(module, policy, requirements)
+                    .await
+                    .map(|_report| ())
+                    .map_err(|error| BootstrapError::SecurityInit(Box::new(error)))
+            })
+        })),
+        ..StartupPhases::default()
+    })
+}
+```
+
+`require_signature_generation` and `require_signature_verification` are
+deliberately separate. Default builds can verify RSA peer AUTH but reject RSA
+private-key signing unless the `rsa-signing` feature is compiled. The bundled
+`Ikev2SoftwareCryptoModule` is an explicit RustCrypto-backed choice and reports
+`ValidationState::NotValidated`; selecting it makes no certification claim.
+
+Every operation rechecks the complete admitted capability set, current module
+identity and validation declaration, readiness, advertisement, and the exact
+algorithm requirement. Capability withdrawal fails before the provider
+operation executes, including reuse of already-created opaque DH or signing
+handles. Successful hash, PRF/PRF+, integrity, AEAD/CBC, and DH results are
+checked immediately against their algorithm-derived widths. AEAD output must
+retain the requested explicit IV; ECDSA output must be valid DER with scalars
+in range for the selected curve; and RSA output must match the opaque handle's
+public modulus width. DH public values are semantically validated and
+snapshotted, and opaque DH/signing handles are rechecked when used. A module
+contract violation fails with
+`ike_crypto_module_invalid_output` before malformed bytes reach protocol
+consumers. Production CBC IVs come from the admitted module's
+`ApprovedEntropy` operation. Caller-supplied RNG and explicit-IV APIs remain
+caller-owned compatibility/vector boundaries: encryption and integrity still
+route through the module, but their supplied IV entropy is outside admission
+evidence.
+
+`require_child_sa_profile` admits the PRF used for Child-SA KEYMAT. A
+CREATE_CHILD_SA configuration that offers PFS must additionally call
+`require_child_sa_pfs_group` for every offered Child-SA DH group; the ESP
+profile intentionally does not conflate its transforms with the separately
+negotiated PFS transform.
+
+The generic `CryptoProvider::open_payload` SPI/SA-lookup boundary remains
+caller-owned. It cannot prove the identity of arbitrary external crypto and is
+therefore not itself admitted or validated. The SDK-owned concrete
+`Ikev2SaInitProtectedPayloadProvider` routes through this admitted slot. A
+deployment using another adapter must bind that adapter to its admitted module;
+performing crypto directly outside it is outside the SDK's admission evidence.
+
+### Migration to admitted IKEv2 cryptography
+
+Install the module during `StartupPhases::init_security` before invoking any
+IKEv2 cryptographic operation. `ikev2_nat_detection_hash` and
+`evaluate_ikev2_nat_detection` are now fallible and return
+`Ikev2CryptoModuleError`; callers must propagate or map that error rather than
+assuming NAT-D hashing cannot fail.
+
+This additive API is source-breaking for downstream exhaustive matches. Add a
+`CryptoModuleFailure { error }` arm to matches over:
+
+- `Ikev2SaInitCryptoError`;
+- `Ikev2ProtectedPayloadCryptoError`;
+- `Ikev2IkeAuthVerificationError`; and
+- `Ikev2SignatureKeyError`.
+
+Code-enum matches must also accept
+`Ikev2SaInitCryptoErrorCode::CryptoModuleFailure` and
+`Ikev2ProtectedPayloadCryptoErrorCode::CryptoModuleFailure`. Existing semantic
+error variants and their stable strings are unchanged; the new module-failure
+strings are `ike_sa_init_crypto_module_failure`,
+`ike_protected_payload_crypto_module_failure`,
+`ike_auth_verify_crypto_module_failure`, and
+`ike_auth_signature_crypto_module_failure`.
+
+TLS and `opc-key` custody do not use this IKEv2 slot yet; those remain later
+#334 slices.
 
 ## Network receive and sender-canonical validation
 

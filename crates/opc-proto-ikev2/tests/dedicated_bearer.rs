@@ -49,6 +49,8 @@ use opc_proto_tft::{
 };
 use quickcheck::quickcheck;
 
+mod support;
+
 const TRANSFORM_TYPE_ENCR: u8 = 1;
 const TRANSFORM_TYPE_PRF: u8 = 2;
 const TRANSFORM_TYPE_INTEG: u8 = 3;
@@ -718,6 +720,7 @@ fn production_builders_revalidate_manual_qos_resource_tiers_and_external_sentine
 
 #[test]
 fn new_child_sa_build_decode_and_response_correlation_succeed() {
+    support::ensure_ike_crypto();
     let request_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(
         &create_request_build(),
     ));

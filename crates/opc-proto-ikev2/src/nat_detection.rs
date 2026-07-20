@@ -9,11 +9,12 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-use sha1::{Digest, Sha1};
-
-use crate::notify::{
-    Ikev2NotifyPayload, IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP,
-    IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
+use crate::{
+    crypto_module::{execute_nat_hash, Ikev2CryptoModuleError},
+    notify::{
+        Ikev2NotifyPayload, IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP,
+        IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
+    },
 };
 
 /// Length in octets of an IKEv2 NAT-D SHA-1 digest.
@@ -23,25 +24,30 @@ pub const IKEV2_NAT_DETECTION_HASH_LEN: usize = 20;
 ///
 /// The input SPIs are encoded in network byte order before the endpoint IP
 /// address and UDP port.
-#[must_use]
 pub fn ikev2_nat_detection_hash(
     initiator_spi: u64,
     responder_spi: u64,
     endpoint: SocketAddr,
-) -> [u8; IKEV2_NAT_DETECTION_HASH_LEN] {
-    let mut hasher = Sha1::new();
-    hasher.update(initiator_spi.to_be_bytes());
-    hasher.update(responder_spi.to_be_bytes());
-    match endpoint.ip() {
-        IpAddr::V4(ip) => hasher.update(ip.octets()),
-        IpAddr::V6(ip) => hasher.update(ip.octets()),
-    }
-    hasher.update(endpoint.port().to_be_bytes());
-
-    let digest = hasher.finalize();
+) -> Result<[u8; IKEV2_NAT_DETECTION_HASH_LEN], Ikev2CryptoModuleError> {
+    let initiator_spi = initiator_spi.to_be_bytes();
+    let responder_spi = responder_spi.to_be_bytes();
+    let port = endpoint.port().to_be_bytes();
+    let digest = match endpoint.ip() {
+        IpAddr::V4(ip) => {
+            let address = ip.octets();
+            execute_nat_hash(&[&initiator_spi, &responder_spi, &address, &port])?
+        }
+        IpAddr::V6(ip) => {
+            let address = ip.octets();
+            execute_nat_hash(&[&initiator_spi, &responder_spi, &address, &port])?
+        }
+    };
     let mut out = [0_u8; IKEV2_NAT_DETECTION_HASH_LEN];
+    if digest.len() != out.len() {
+        return Err(Ikev2CryptoModuleError::invalid_output());
+    }
     out.copy_from_slice(&digest);
-    out
+    Ok(out)
 }
 
 /// Borrowed NAT-D Notify payload set.
@@ -420,60 +426,59 @@ impl fmt::Debug for Ikev2NatDetectionEvaluation {
 /// [`Ikev2NatDetectionOutcome::Unknown`]. Multiple source hashes are treated as
 /// an OR set: any matching source hash means the observed source endpoint was
 /// not NATed.
-#[must_use]
 pub fn evaluate_ikev2_nat_detection(
     payloads: &Ikev2NatDetectionPayloads<'_>,
     initiator_spi: u64,
     responder_spi: u64,
     source_endpoint: Ikev2NatDetectionObservedEndpoint,
     destination_endpoint: Ikev2NatDetectionObservedEndpoint,
-) -> Ikev2NatDetectionEvaluation {
+) -> Result<Ikev2NatDetectionEvaluation, Ikev2CryptoModuleError> {
     let source_status = source_endpoint.status();
     let destination_status = destination_endpoint.status();
 
     let Some(source_hashes) =
         (!payloads.source_hashes.is_empty()).then_some(&payloads.source_hashes)
     else {
-        return Ikev2NatDetectionEvaluation::unknown(
+        return Ok(Ikev2NatDetectionEvaluation::unknown(
             payloads,
             source_status,
             destination_status,
             None,
             None,
-        );
+        ));
     };
     let Some(destination_hash) = payloads.destination_hash else {
-        return Ikev2NatDetectionEvaluation::unknown(
+        return Ok(Ikev2NatDetectionEvaluation::unknown(
             payloads,
             source_status,
             destination_status,
             None,
             None,
-        );
+        ));
     };
 
     let Some(source_endpoint) = source_endpoint.concrete_socket_addr() else {
-        return Ikev2NatDetectionEvaluation::unknown(
+        return Ok(Ikev2NatDetectionEvaluation::unknown(
             payloads,
             source_status,
             destination_status,
             None,
             None,
-        );
+        ));
     };
     let Some(destination_endpoint) = destination_endpoint.concrete_socket_addr() else {
-        return Ikev2NatDetectionEvaluation::unknown(
+        return Ok(Ikev2NatDetectionEvaluation::unknown(
             payloads,
             source_status,
             destination_status,
             None,
             None,
-        );
+        ));
     };
 
-    let source_hash = ikev2_nat_detection_hash(initiator_spi, responder_spi, source_endpoint);
+    let source_hash = ikev2_nat_detection_hash(initiator_spi, responder_spi, source_endpoint)?;
     let destination_hash_expected =
-        ikev2_nat_detection_hash(initiator_spi, responder_spi, destination_endpoint);
+        ikev2_nat_detection_hash(initiator_spi, responder_spi, destination_endpoint)?;
     let source_hash_matched = source_hashes.contains(&source_hash.as_slice());
     let destination_hash_matched = destination_hash == destination_hash_expected.as_slice();
     let outcome = match (source_hash_matched, destination_hash_matched) {
@@ -483,7 +488,7 @@ pub fn evaluate_ikev2_nat_detection(
         (false, false) => Ikev2NatDetectionOutcome::Both,
     };
 
-    Ikev2NatDetectionEvaluation {
+    Ok(Ikev2NatDetectionEvaluation {
         outcome,
         source_hash_count: payloads.source_hashes.len(),
         has_destination_hash: payloads.destination_hash.is_some(),
@@ -491,5 +496,5 @@ pub fn evaluate_ikev2_nat_detection(
         destination_endpoint_status: destination_status,
         source_hash_matched: Some(source_hash_matched),
         destination_hash_matched: Some(destination_hash_matched),
-    }
+    })
 }

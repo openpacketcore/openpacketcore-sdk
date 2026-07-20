@@ -17,6 +17,8 @@ pub enum CryptoCapability {
     Tls,
     /// IKEv2 pseudo-random function (PRF) computation.
     IkePrf,
+    /// IKEv2 protocol hashing, including RFC 7296 NAT detection SHA-1.
+    IkeHash,
     /// IKEv2 integrity protection.
     IkeIntegrity,
     /// IKEv2 payload encryption and decryption.
@@ -41,6 +43,7 @@ impl CryptoCapability {
     pub const ALL: &'static [CryptoCapability] = &[
         CryptoCapability::Tls,
         CryptoCapability::IkePrf,
+        CryptoCapability::IkeHash,
         CryptoCapability::IkeIntegrity,
         CryptoCapability::IkeEncryption,
         CryptoCapability::IkeSignature,
@@ -55,6 +58,7 @@ impl CryptoCapability {
         match self {
             Self::Tls => "tls",
             Self::IkePrf => "ike_prf",
+            Self::IkeHash => "ike_hash",
             Self::IkeIntegrity => "ike_integrity",
             Self::IkeEncryption => "ike_encryption",
             Self::IkeSignature => "ike_signature",

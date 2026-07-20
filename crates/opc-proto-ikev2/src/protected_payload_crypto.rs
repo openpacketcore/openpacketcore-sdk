@@ -14,13 +14,19 @@ use aes_gcm::{
 };
 use bytes::Bytes;
 use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
-use rand::{rngs::SysRng, TryCryptoRng};
+use opc_crypto_provider::CryptoOperationErrorCode;
+use rand::TryCryptoRng;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
         CryptoProvider, ProtectedPayloadContext, ProtectedPayloadKind, ProtectedPayloadOpenError,
+    },
+    crypto_module::{
+        execute_aead_open, execute_aead_seal, execute_cbc_decrypt, execute_cbc_encrypt,
+        execute_integrity_checksum, execute_integrity_verification, with_entropy_operation,
+        Ikev2CryptoModuleError,
     },
     fragmentation::IKEV2_ENCRYPTED_FRAGMENT_FIXED_BODY_LEN,
     hmac_sha2::{hmac_sha2_256, hmac_sha2_384, hmac_sha2_512},
@@ -249,8 +255,10 @@ pub enum Ikev2ProtectedPayloadCryptoErrorCode {
     InvalidPadding,
     /// AES-GCM explicit IV counter cannot allocate without wrapping.
     ExplicitIvExhausted,
-    /// The operating-system CSPRNG could not produce a fresh AES-CBC IV.
+    /// The selected secure entropy source could not produce a fresh AES-CBC IV.
     RandomIvGenerationFailed,
+    /// The admitted process crypto module was absent, withdrawn, or failed.
+    CryptoModuleFailure,
 }
 
 impl Ikev2ProtectedPayloadCryptoErrorCode {
@@ -276,6 +284,7 @@ impl Ikev2ProtectedPayloadCryptoErrorCode {
             Self::RandomIvGenerationFailed => {
                 "ike_protected_payload_crypto_random_iv_generation_failed"
             }
+            Self::CryptoModuleFailure => "ike_protected_payload_crypto_module_failure",
         }
     }
 }
@@ -343,6 +352,11 @@ pub enum Ikev2ProtectedPayloadCryptoError {
     ExplicitIvExhausted,
     /// The secure random source failed to generate an AES-CBC IV.
     RandomIvGenerationFailed,
+    /// The admitted process crypto module was absent, withdrawn, or failed.
+    CryptoModuleFailure {
+        /// Stable, redaction-safe module boundary error.
+        error: Ikev2CryptoModuleError,
+    },
 }
 
 /// Exact authentication context for sealing one IKEv2 protected payload body.
@@ -405,6 +419,9 @@ impl Ikev2ProtectedPayloadCryptoError {
             Self::ExplicitIvExhausted => Ikev2ProtectedPayloadCryptoErrorCode::ExplicitIvExhausted,
             Self::RandomIvGenerationFailed => {
                 Ikev2ProtectedPayloadCryptoErrorCode::RandomIvGenerationFailed
+            }
+            Self::CryptoModuleFailure { .. } => {
+                Ikev2ProtectedPayloadCryptoErrorCode::CryptoModuleFailure
             }
         }
     }
@@ -478,6 +495,9 @@ impl fmt::Display for Ikev2ProtectedPayloadCryptoError {
             Self::ExplicitIvExhausted => f.write_str("IKEv2 AES-GCM explicit IV counter exhausted"),
             Self::RandomIvGenerationFailed => {
                 f.write_str("IKEv2 AES-CBC secure IV generation failed")
+            }
+            Self::CryptoModuleFailure { error } => {
+                write!(f, "IKEv2 crypto module operation failed: {error}")
             }
         }
     }
@@ -683,12 +703,13 @@ pub fn seal_ikev2_sa_init_protected_payload_with_iv_counter(
     Ok(Bytes::from(sealed))
 }
 
-/// Seal one AES-CBC/HMAC IKEv2 `SK`/`SKF` crypto body with a fresh OS-random IV.
+/// Seal one AES-CBC/HMAC IKEv2 `SK`/`SKF` crypto body with a fresh random IV.
 ///
 /// This is the production-safe AES-CBC entry point. It always obtains a new
-/// 16-octet IV from [`SysRng`], applies the shortest block-aligning RFC 7296 IKE
-/// padding, encrypts with the directional `SK_e*`, and authenticates the final
-/// message prefix plus IV and ciphertext with directional `SK_a*`.
+/// 16-octet IV from the admitted module's approved entropy operation, applies
+/// the shortest block-aligning RFC 7296 IKE padding, encrypts with the
+/// directional `SK_e*`, and authenticates the final message prefix plus IV and
+/// ciphertext with directional `SK_a*`.
 ///
 /// The caller must construct final IKE and generic payload length fields before
 /// calling. Use [`ikev2_aes_cbc_protected_body_len`] or
@@ -700,7 +721,7 @@ pub fn seal_ikev2_sa_init_protected_payload_with_iv_counter(
 ///
 /// Returns [`Ikev2ProtectedPayloadCryptoError`] when the profile, key material,
 /// final length fields, fragment prefix, padding length, encryption, integrity,
-/// or operating-system random source is invalid.
+/// or admitted secure entropy source is invalid.
 pub fn seal_ikev2_sa_init_aes_cbc_protected_payload(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &Ikev2SaInitKeyMaterial,
@@ -708,23 +729,33 @@ pub fn seal_ikev2_sa_init_aes_cbc_protected_payload(
     context: ProtectedPayloadSealContext<'_>,
     cleartext_payloads: &[u8],
 ) -> Result<Bytes, Ikev2ProtectedPayloadCryptoError> {
-    let mut rng = SysRng;
-    seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng(
+    let mut iv = [0_u8; IKEV2_AES_CBC_IV_LEN];
+    with_entropy_operation(|module| module.fill_random(&mut iv)).map_err(|error| {
+        if error.operation_code() == Some(CryptoOperationErrorCode::EntropyUnavailable) {
+            Ikev2ProtectedPayloadCryptoError::RandomIvGenerationFailed
+        } else {
+            map_crypto_module_error(error)
+        }
+    })?;
+    seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector(
         profile,
         key_material,
         direction,
         context,
         cleartext_payloads,
-        &mut rng,
+        iv,
     )
 }
 
-/// Seal one AES-CBC/HMAC IKEv2 `SK`/`SKF` body with a caller-supplied CSPRNG.
+/// Seal one AES-CBC/HMAC IKEv2 `SK`/`SKF` body with caller-owned entropy.
 ///
 /// The [`TryCryptoRng`] bound requires a cryptographic RNG implementation. The
 /// caller must still seed it unpredictably and must never use a fixed-seed RNG
-/// in production. The generated IV is never logged or exposed separately from
-/// the protected wire body.
+/// in production. This compatibility boundary does not prove that IV entropy
+/// came from the process's admitted module; validated deployments should use
+/// [`seal_ikev2_sa_init_aes_cbc_protected_payload`]. AES-CBC and integrity
+/// operations still route through the admitted module. The generated IV is
+/// never logged or exposed separately from the protected wire body.
 ///
 /// # Errors
 ///
@@ -758,10 +789,11 @@ where
 ///
 /// # Security
 ///
-/// This is a low-level interoperability/vector boundary. Production code must
-/// use [`seal_ikev2_sa_init_aes_cbc_protected_payload`] or the CSPRNG-bound
-/// variant. Reusing or predicting an IV with the same directional key violates
-/// the IKEv2 AES-CBC security contract.
+/// This is a low-level interoperability/vector boundary. Production code in a
+/// validated deployment must use
+/// [`seal_ikev2_sa_init_aes_cbc_protected_payload`]. Reusing or predicting an
+/// IV with the same directional key violates the IKEv2 AES-CBC security
+/// contract.
 ///
 /// # Errors
 ///
@@ -1078,6 +1110,33 @@ pub(crate) fn decrypt_aes_gcm(
     aad: &[u8],
     protected_body: &[u8],
 ) -> Result<Vec<u8>, Ikev2ProtectedPayloadCryptoError> {
+    // Preserve the public protocol-boundary validation and stable error shape
+    // before delegating to a provider. Providers may use a coarser invalid
+    // input error, but callers must still receive the RFC-shaped minimum.
+    let min_len = AES_GCM_EXPLICIT_IV_LEN + AES_GCM_ICV_LEN;
+    if protected_body.len() < min_len {
+        return Err(Ikev2ProtectedPayloadCryptoError::ProtectedPayloadTooShort {
+            min_len,
+            actual: protected_body.len(),
+        });
+    }
+    execute_aead_open(
+        encryption,
+        keys.encryption_key,
+        keys.salt,
+        aad,
+        protected_body,
+    )
+    .map(|plaintext| plaintext.to_vec())
+    .map_err(map_crypto_module_error)
+}
+
+pub(crate) fn software_decrypt_aes_gcm(
+    encryption: Ikev2EncryptionAlgorithm,
+    keys: SelectedProtectedPayloadKeys<'_>,
+    aad: &[u8],
+    protected_body: &[u8],
+) -> Result<Vec<u8>, Ikev2ProtectedPayloadCryptoError> {
     let min_len = AES_GCM_EXPLICIT_IV_LEN + AES_GCM_ICV_LEN;
     if protected_body.len() < min_len {
         return Err(Ikev2ProtectedPayloadCryptoError::ProtectedPayloadTooShort {
@@ -1165,6 +1224,24 @@ pub(crate) fn decrypt_aes_gcm(
 }
 
 pub(crate) fn encrypt_aes_gcm(
+    encryption: Ikev2EncryptionAlgorithm,
+    keys: SelectedProtectedPayloadKeys<'_>,
+    aad: &[u8],
+    plaintext: &[u8],
+    explicit_iv: [u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN],
+) -> Result<Vec<u8>, Ikev2ProtectedPayloadCryptoError> {
+    execute_aead_seal(
+        encryption,
+        keys.encryption_key,
+        keys.salt,
+        &explicit_iv,
+        aad,
+        plaintext,
+    )
+    .map_err(map_crypto_module_error)
+}
+
+pub(crate) fn software_encrypt_aes_gcm(
     encryption: Ikev2EncryptionAlgorithm,
     keys: SelectedProtectedPayloadKeys<'_>,
     aad: &[u8],
@@ -1326,6 +1403,24 @@ pub(crate) fn encrypt_aes_cbc(
     iv: &[u8],
     plaintext: &mut [u8],
 ) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
+    let ciphertext = execute_cbc_encrypt(encryption, encryption_key, iv, plaintext)
+        .map_err(map_crypto_module_error)?;
+    if ciphertext.len() != plaintext.len() {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+            block_len: AES_CBC_BLOCK_LEN,
+            actual: ciphertext.len(),
+        });
+    }
+    plaintext.copy_from_slice(&ciphertext);
+    Ok(())
+}
+
+pub(crate) fn software_encrypt_aes_cbc(
+    encryption: Ikev2EncryptionAlgorithm,
+    encryption_key: &[u8],
+    iv: &[u8],
+    plaintext: &mut [u8],
+) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
     if plaintext.is_empty() || !plaintext.len().is_multiple_of(AES_CBC_BLOCK_LEN) {
         return Err(Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
             block_len: AES_CBC_BLOCK_LEN,
@@ -1409,6 +1504,24 @@ pub(crate) fn decrypt_aes_cbc_in_place(
     iv: &[u8],
     ciphertext: &mut [u8],
 ) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
+    let plaintext = execute_cbc_decrypt(encryption, encryption_key, iv, ciphertext)
+        .map_err(map_crypto_module_error)?;
+    if plaintext.len() != ciphertext.len() {
+        return Err(Ikev2ProtectedPayloadCryptoError::InvalidCiphertextLength {
+            block_len: AES_CBC_BLOCK_LEN,
+            actual: plaintext.len(),
+        });
+    }
+    ciphertext.copy_from_slice(&plaintext);
+    Ok(())
+}
+
+pub(crate) fn software_decrypt_aes_cbc_in_place(
+    encryption: Ikev2EncryptionAlgorithm,
+    encryption_key: &[u8],
+    iv: &[u8],
+    ciphertext: &mut [u8],
+) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
     let ciphertext_len = ciphertext.len();
     match encryption {
         Ikev2EncryptionAlgorithm::AesCbc128 => {
@@ -1486,6 +1599,16 @@ pub(crate) fn compute_integrity_checksum(
     first: &[u8],
     second: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, Ikev2ProtectedPayloadCryptoError> {
+    execute_integrity_checksum(integrity, integrity_key, first, second)
+        .map_err(map_crypto_module_error)
+}
+
+pub(crate) fn software_compute_integrity_checksum(
+    integrity: Ikev2IntegrityAlgorithm,
+    integrity_key: &[u8],
+    first: &[u8],
+    second: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, Ikev2ProtectedPayloadCryptoError> {
     validate_key_len("SK_a", integrity.key_len(), integrity_key.len())?;
     let mut checksum = match integrity {
         Ikev2IntegrityAlgorithm::HmacSha2_256_128 => hmac_sha2_256(integrity_key, &[first, second]),
@@ -1497,6 +1620,21 @@ pub(crate) fn compute_integrity_checksum(
 }
 
 pub(crate) fn verify_integrity_checksum(
+    integrity: Ikev2IntegrityAlgorithm,
+    integrity_key: &[u8],
+    authenticated_message: &[u8],
+    received_icv: &[u8],
+) -> Result<(), Ikev2ProtectedPayloadCryptoError> {
+    execute_integrity_verification(
+        integrity,
+        integrity_key,
+        authenticated_message,
+        received_icv,
+    )
+    .map_err(map_crypto_module_error)
+}
+
+pub(crate) fn software_verify_integrity_checksum(
     integrity: Ikev2IntegrityAlgorithm,
     integrity_key: &[u8],
     authenticated_message: &[u8],
@@ -1521,6 +1659,14 @@ pub(crate) fn verify_integrity_checksum(
         Ok(())
     } else {
         Err(Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
+    }
+}
+
+fn map_crypto_module_error(error: Ikev2CryptoModuleError) -> Ikev2ProtectedPayloadCryptoError {
+    if error.operation_code() == Some(CryptoOperationErrorCode::AuthenticationFailed) {
+        Ikev2ProtectedPayloadCryptoError::AuthenticationFailed
+    } else {
+        Ikev2ProtectedPayloadCryptoError::CryptoModuleFailure { error }
     }
 }
 
@@ -1574,6 +1720,7 @@ mod tests {
     #[test]
     fn sha256_and_sha384_integrity_match_rfc4868_auth_vectors(
     ) -> Result<(), super::Ikev2ProtectedPayloadCryptoError> {
+        crate::test_support::ensure_ike_crypto();
         // RFC 4868 section 2.7.2, AUTH256-1 and AUTH384-1. These fixed-key
         // authenticator vectors independently cover the left-half truncation
         // used by IKEv2 AES-CBC/HMAC profiles.

@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Validated-provider capability seam — `opc-crypto-provider`:** a new
   standalone crate defining the capability-reporting and key-custody boundary
   requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the
-  security-critical operation families (TLS, IKE PRF, IKE integrity, IKE
+  security-critical operation families (TLS, IKE hash, IKE PRF, IKE integrity, IKE
   encryption, IKE signature, IKE Diffie-Hellman, approved entropy,
   zeroization, sealed key storage) and `CapabilitySet` is fail-closed: an
   unreported or unknown capability never reads as available and the default
@@ -48,9 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructor of `PolicyAdmission`, so no operation can be admitted past a
   rejected policy and no implicit software fallback exists. The async
   `CryptoModule` trait exposes identity, capabilities, self-test, and
-  readiness so later slices can bind runtime health gates, IKEv2, TLS, and
-  `opc-key` custody to one approved module; this slice implements no
-  cryptographic algorithm and modifies no existing crate. A configurable
+  readiness; slice 3 now composes it with IKEv2 operations through
+  `IkeCryptoModule`, while TLS and `opc-key` custody remain later work. This
+  provider crate implements no cryptographic algorithm. A configurable
   `FakeCryptoModule` behind the `testkit` feature lets tests satisfy an
   advertised capability set and then drop a capability, fail the self-test,
   or lose readiness to prove the fail-closed behavior end to end.
@@ -78,32 +78,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traffic. Absent hook, startup behavior is unchanged. `StartupPhases` gains a
   public field, so construct it with `..Default::default()` rather than an
   exhaustive struct literal.
-- **IKEv2 operation traits and default software binding —
-  `opc-crypto-provider`, `opc-proto-ikev2`:** the new `ops` module defines the
-  synchronous, object-safe cryptographic operation traits requested by #334
-  (slice 3 of 5), grouped along the existing capability taxonomy:
-  `IkePrfOperations` (`prf`/`prf+`), `IkeIntegrityOperations` (truncated
-  checksum compute plus a constant-time-contract verify),
-  `IkeEncryptionOperations` (RFC 5282 AES-GCM seal/open and raw AES-CBC),
-  `IkeDiffieHellmanOperations` with an opaque `IkeDhKeyPair` handle so
-  backend-native private keys never cross the boundary, and
-  `IkeSignatureOperations` with an opaque `IkeSigningKey` handle for RSA
-  PKCS#1 v1.5 SHA-256 and deterministic ECDSA P-256/P-384. Randomness (AEAD
-  explicit IVs, CBC IVs) is always a caller input, keeping entropy routing out
-  of scope and the traits `dyn`-compatible. Secret-bearing outputs are
-  `zeroize::Zeroizing` buffers, and the shared `CryptoOperationError` carries
-  a stable `crypto_op_*` code, a code-only `Display`, and `Error::source`
-  chaining to the underlying typed error. `opc-proto-ikev2` gains the default
-  software implementation, `Ikev2SoftwareCryptoOperations`, which delegates to
-  the crate's existing private algorithm code (introducing the acyclic
-  dependency edge `opc-proto-ikev2 → opc-crypto-provider`); byte-for-byte
-  parity with the pre-existing code paths is pinned against RFC 4868/4231 PRF
-  and AUTH vectors, the independent OpenSSL IKE-SA KDF and AES-CBC/HMAC
-  complete-message vectors, the GCM specification known answers, DH
-  round-trips across all four groups, and deterministic signature
-  comparisons. This slice is purely additive: no existing call site is
-  rerouted, no public signature changes, and nothing gates on
-  `PolicyAdmission` yet — rerouting is a later slice.
+- **Process-wide admitted IKEv2 cryptographic module —
+  `opc-crypto-provider`, `opc-proto-ikev2`:** completes #334 slice 3 by
+  composing evidence and the synchronous hash, entropy, PRF, integrity,
+  encryption, Diffie-Hellman, and signature operation traits into one
+  `IkeCryptoModule` object. `install_ikev2_crypto_module` probes and applies
+  `ProviderPolicy`, preflights every configured typed algorithm, then sets an
+  immutable process slot; failed preflight leaves it unset and there is no
+  production or `testkit` fallback. Every operation rechecks the exact module
+  identity/validation declaration and the full policy-granted capability set
+  against live advertisement/readiness before dispatch. Opaque DH and signing
+  handles are gated again when used. Successful hash, PRF/PRF+, integrity,
+  AEAD/CBC, and DH results must match their algorithm-derived widths; AEAD
+  results must retain the requested explicit IV, ECDSA signatures must be
+  valid curve-specific DER scalars, and RSA signatures must match the opaque
+  key handle's public modulus width. DH public values are semantically
+  validated and snapshotted, and DH/signing handles must retain their admitted
+  identity at use time. Child-SA PFS groups
+  can be named separately from their ESP KEYMAT profile during preflight.
+  Provider contract violations are rejected as stable `InvalidOutput` failures.
+  Signature generation and verification requirements are distinct, preserving
+  default-build RSA peer verification while RSA private signing remains
+  feature-gated. `CryptoOperationError`
+  exposes stable codes without provider-native source text, secret outputs use
+  zeroizing buffers, and production CBC IVs come from the same admitted
+  module's `ApprovedEntropy` operation. The explicit
+  `Ikev2SoftwareCryptoModule` delegates to the existing RustCrypto paths and
+  declares `NotValidated`; it makes no certification claim. Existing AES-GCM,
+  AES-CBC/HMAC, PRF/KDF, NAT-D, DH, IKE_AUTH signature, rekey, restore, and
+  dedicated-bearer crypto call sites now route through admission with their
+  stable protocol errors preserved. Consumers install the module from the
+  async `StartupPhases::init_security` hook and propagate the newly fallible
+  NAT-D helpers. This is source-breaking for exhaustive downstream matches:
+  add `CryptoModuleFailure { error }` to `Ikev2SaInitCryptoError`,
+  `Ikev2ProtectedPayloadCryptoError`, `Ikev2IkeAuthVerificationError`, and
+  `Ikev2SignatureKeyError` matches, and add `CryptoModuleFailure` to
+  `Ikev2SaInitCryptoErrorCode` and `Ikev2ProtectedPayloadCryptoErrorCode`
+  matches. Existing semantic variants and codes are unchanged. TLS and
+  `opc-key` custody remain later #334 slices.
 
 ### Fixed
 - **Exact IKEv2 signature trust-material DER parsing:**

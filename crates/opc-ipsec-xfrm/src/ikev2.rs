@@ -742,14 +742,32 @@ fn same_address_family(left: IpAddress, right: IpAddress) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
     use crate::{
         XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA256, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
     };
+    use opc_crypto_provider::ProviderPolicy;
     use opc_proto_ikev2::{
-        Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation, Ikev2EncryptionAlgorithm,
-        Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoErrorCode,
+        install_ikev2_software_crypto_module, Ikev2ChildSaCryptoProfile, Ikev2ChildSaNegotiation,
+        Ikev2CryptoRequirements, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm,
+        Ikev2PrfAlgorithm, Ikev2SaInitCryptoErrorCode,
     };
+
+    fn ensure_ike_crypto() {
+        static INSTALL: OnceLock<Result<(), &'static str>> = OnceLock::new();
+        let result = INSTALL.get_or_init(|| {
+            let requirements = Ikev2CryptoRequirements::all_software_supported();
+            let policy = ProviderPolicy::new().require_all(requirements.required_capabilities());
+            install_ikev2_software_crypto_module(policy, requirements)
+                .map(|_| ())
+                .map_err(|_| "explicit opc-ipsec-xfrm test crypto admission failed")
+        });
+        if let Err(message) = result {
+            panic!("{message}");
+        }
+    }
 
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
         IpAddress::Ipv4([a, b, c, d])
@@ -1259,6 +1277,7 @@ mod tests {
 
     #[test]
     fn derives_child_sa_xfrm_keys_into_aead_slots_by_responder_direction() {
+        ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_aead(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesGcm16_256,
@@ -1334,6 +1353,7 @@ mod tests {
 
     #[test]
     fn derives_child_sa_xfrm_keys_into_encrypt_then_mac_slots() {
+        ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesCbc256,
@@ -1375,6 +1395,7 @@ mod tests {
 
     #[test]
     fn derives_encr_null_child_sa_into_linux_null_cipher_and_auth_slots() {
+        ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_authenticated_only(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2IntegrityAlgorithm::HmacSha2_256_128,
@@ -1432,6 +1453,7 @@ mod tests {
 
     #[test]
     fn child_sa_xfrm_key_derivation_errors_are_stable_and_redacted() {
+        ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_aead(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesGcm16_128,

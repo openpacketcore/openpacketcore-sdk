@@ -4,15 +4,17 @@ use async_trait::async_trait;
 
 use crate::capability::CapabilitySet;
 use crate::identity::{ProviderIdentity, ValidationState};
+use crate::ops::IkeCryptoOperations;
 use crate::selftest::{ModuleReadiness, SelfTestError, SelfTestOutcome};
 
 /// A cryptographic module that reports identity, capabilities, self-test
 /// outcome, and readiness.
 ///
 /// This trait is deliberately evidence-only: it exposes no key handles and no
-/// algorithm operations. Later slices bind TLS, IKEv2, entropy, and `opc-key`
-/// custody operations to a module that a [`crate::ProviderPolicy`] has
-/// admitted; nothing in this crate performs cryptography.
+/// algorithm operations. [`IkeCryptoModule`] composes this evidence surface
+/// with the IKEv2 operation traits so one exact object can be admitted and
+/// execute IKEv2 operations. TLS and `opc-key` custody bindings remain outside
+/// this slice; nothing in this crate itself performs cryptography.
 ///
 /// The name avoids `CryptoProvider`, which already means the IKEv2
 /// protected-payload opener in `opc-proto-ikev2`; consumers of both traits
@@ -53,3 +55,16 @@ pub trait CryptoModule: Send + Sync {
     /// effective set even while it remains advertised.
     fn readiness(&self) -> ModuleReadiness;
 }
+
+/// One cryptographic module that supplies both IKEv2 evidence and operations.
+///
+/// A process-level IKEv2 admission stores this composite trait object rather
+/// than unrelated evidence and operation objects. This structurally prevents
+/// a policy admission for one module from authorizing operations on another.
+pub trait IkeCryptoModule: CryptoModule + IkeCryptoOperations {}
+
+impl<T> IkeCryptoModule for T where T: CryptoModule + IkeCryptoOperations {}
+
+/// Compile-time proof that the composite module trait remains object-safe.
+#[allow(dead_code)]
+fn assert_ike_crypto_module_is_object_safe(_module: &dyn IkeCryptoModule) {}

@@ -20,6 +20,8 @@ use opc_proto_ikev2::{
 };
 use opc_protocol::{DecodeContext, UnknownIePolicy};
 
+mod support;
+
 const CURRENT_INITIATOR_SPI: u64 = 0x0102_0304_0506_0708;
 const CURRENT_RESPONDER_SPI: u64 = 0x1112_1314_1516_1718;
 const TRANSFORM_TYPE_ENCR: u8 = 1;
@@ -107,6 +109,7 @@ fn encrypt_then_mac_request_vector() -> Vec<u8> {
 }
 
 fn aead_profile() -> Ikev2SaInitCryptoProfile {
+    support::ensure_ike_crypto();
     Ikev2SaInitCryptoProfile::new_aead(
         Ikev2PrfAlgorithm::HmacSha2_256,
         Ikev2DhGroup::Ecp256,
@@ -116,6 +119,7 @@ fn aead_profile() -> Ikev2SaInitCryptoProfile {
 }
 
 fn encrypt_then_mac_profile() -> Ikev2SaInitCryptoProfile {
+    support::ensure_ike_crypto();
     Ikev2SaInitCryptoProfile::new_encrypt_then_mac(
         Ikev2PrfAlgorithm::HmacSha2_512,
         Ikev2DhGroup::Modp2048,
@@ -318,6 +322,7 @@ fn independent_encrypt_then_mac_vector_decodes_selects_and_builds_exact_response
 
 #[test]
 fn rekey_kdf_requires_each_group_fixed_width_shared_secret() {
+    support::ensure_ike_crypto();
     let nonce = [0x11; 16];
     for (group, expected_len) in [
         (Ikev2DhGroup::Modp2048, 256),

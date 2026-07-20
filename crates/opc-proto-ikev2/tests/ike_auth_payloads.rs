@@ -22,6 +22,8 @@ use opc_proto_ikev2::{
     IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
 };
 
+mod support;
+
 fn sa_body() -> Vec<u8> {
     build_ike_auth_sa_payload(&child_sa_payload_build()).expect("SA build")
 }
@@ -108,6 +110,7 @@ fn profile() -> Ikev2SaInitCryptoProfile {
 }
 
 fn key_material() -> Ikev2SaInitKeyMaterial {
+    support::ensure_ike_crypto();
     derive_ike_sa_init_key_material(
         profile(),
         [0x11; 8],

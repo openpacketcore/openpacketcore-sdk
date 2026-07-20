@@ -1,11 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+mod support;
+
 use opc_proto_ikev2::{
-    evaluate_ikev2_nat_detection, ikev2_nat_detection_hash, Ikev2NatDetectionEndpointStatus,
-    Ikev2NatDetectionObservedEndpoint, Ikev2NatDetectionOutcome, Ikev2NatDetectionPayloadError,
-    Ikev2NatDetectionPayloads, Ikev2NotifyPayload, IKEV2_NAT_DETECTION_HASH_LEN,
-    IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP, IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
-    IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+    evaluate_ikev2_nat_detection, ikev2_nat_detection_hash as sdk_nat_detection_hash,
+    Ikev2NatDetectionEndpointStatus, Ikev2NatDetectionObservedEndpoint, Ikev2NatDetectionOutcome,
+    Ikev2NatDetectionPayloadError, Ikev2NatDetectionPayloads, Ikev2NotifyPayload,
+    IKEV2_NAT_DETECTION_HASH_LEN, IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP,
+    IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
 };
 
 const INITIATOR_SPI: u64 = 0x0102_0304_0506_0708;
@@ -57,6 +59,16 @@ fn alternate_destination() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44)), 4500)
 }
 
+fn ikev2_nat_detection_hash(
+    initiator_spi: u64,
+    responder_spi: u64,
+    endpoint: SocketAddr,
+) -> [u8; IKEV2_NAT_DETECTION_HASH_LEN] {
+    support::ensure_ike_crypto();
+    sdk_nat_detection_hash(initiator_spi, responder_spi, endpoint)
+        .expect("explicitly admitted NAT-D hash computes")
+}
+
 fn natd_notify<'a>(
     notify_message_type: u16,
     notification_data: &'a [u8],
@@ -76,6 +88,7 @@ fn evaluate<'a>(
     source: SocketAddr,
     destination: SocketAddr,
 ) -> opc_proto_ikev2::Ikev2NatDetectionEvaluation {
+    support::ensure_ike_crypto();
     let mut payloads = Ikev2NatDetectionPayloads::new();
     for source_hash in source_hashes {
         payloads
@@ -101,6 +114,7 @@ fn evaluate<'a>(
         source.into(),
         destination.into(),
     )
+    .expect("explicitly admitted NAT-D evaluation computes")
 }
 
 #[test]
@@ -125,6 +139,7 @@ fn nat_detection_hash_matches_ipv4_and_ipv6_vectors() {
 
 #[test]
 fn no_nat_detection_payloads_are_unknown() {
+    support::ensure_ike_crypto();
     let payloads = Ikev2NatDetectionPayloads::new();
 
     let evaluation = evaluate_ikev2_nat_detection(
@@ -133,7 +148,8 @@ fn no_nat_detection_payloads_are_unknown() {
         RESPONDER_SPI,
         ipv4_source().into(),
         ipv4_destination().into(),
-    );
+    )
+    .expect("explicitly admitted NAT-D evaluation computes");
 
     assert_eq!(evaluation.outcome(), Ikev2NatDetectionOutcome::Unknown);
     assert_eq!(evaluation.code(), "ike_nat_detection_unknown");
@@ -246,6 +262,7 @@ fn missing_destination_hash_is_unknown() {
 
 #[test]
 fn wildcard_local_endpoint_is_unknown() {
+    support::ensure_ike_crypto();
     let evaluation = evaluate_ikev2_nat_detection(
         &Ikev2NatDetectionPayloads::from_notifies([
             natd_notify(IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, &IPV4_SOURCE_HASH),
@@ -262,7 +279,8 @@ fn wildcard_local_endpoint_is_unknown() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             500,
         )),
-    );
+    )
+    .expect("explicitly admitted NAT-D evaluation computes");
 
     assert_eq!(evaluation.outcome(), Ikev2NatDetectionOutcome::Unknown);
     assert_eq!(
@@ -275,6 +293,7 @@ fn wildcard_local_endpoint_is_unknown() {
 
 #[test]
 fn missing_local_endpoint_is_unknown() {
+    support::ensure_ike_crypto();
     let payloads = Ikev2NatDetectionPayloads::from_notifies([
         natd_notify(IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, &IPV4_SOURCE_HASH),
         natd_notify(
@@ -290,7 +309,8 @@ fn missing_local_endpoint_is_unknown() {
         RESPONDER_SPI,
         ipv4_source().into(),
         Ikev2NatDetectionObservedEndpoint::Missing,
-    );
+    )
+    .expect("explicitly admitted NAT-D evaluation computes");
 
     assert_eq!(evaluation.outcome(), Ikev2NatDetectionOutcome::Unknown);
     assert_eq!(
