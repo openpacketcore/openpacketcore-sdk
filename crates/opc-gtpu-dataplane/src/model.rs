@@ -171,7 +171,7 @@ impl GtpuV2DrainProof {
 }
 
 /// Request to remove one positively identified drained legacy v2 eBPF pin
-/// graph before provisioning the endpoint-bound v3 schema.
+/// graph before provisioning the current source-port-v4 schema.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DrainedV2TeardownRequest {
     device: GtpDevice,
@@ -236,7 +236,7 @@ pub enum DrainedV2TeardownRefusal {
 /// Stable progress classification for an incomplete teardown.
 ///
 /// Every value is safe to persist as operator evidence. A caller must retry
-/// the exact same request and must not provision v3 until it observes
+/// the exact same request and must not provision the current schema until it observes
 /// [`DrainedV2TeardownOutcome::Removed`] or
 /// [`DrainedV2TeardownOutcome::AlreadyAbsent`].
 #[non_exhaustive]

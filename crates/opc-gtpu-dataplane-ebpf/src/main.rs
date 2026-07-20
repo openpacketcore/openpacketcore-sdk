@@ -43,8 +43,11 @@ use aya_ebpf::{
 };
 use opc_gtpu_ebpf_common::{
     build_uplink_encap_with_dscp_and_source_port, classify_gtpu, classify_udp_checksum,
-    internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
-    marked_owner_wire_authorizes_uplink, uplink_non_encapsulation_drops,
+    downlink_frame_end, downlink_parse_ipv4_total_length, downlink_parse_payload_offset,
+    downlink_parse_teid, internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
+    marked_owner_wire_authorizes_uplink, pack_downlink_parse_result,
+    pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
+    pdp_commit_wire_authorizes_graph, uplink_non_encapsulation_drops,
     validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr, GtpuClass,
     GtpuEnvelopeBounds, Ipv4EnvelopeBounds, MarkedDownlinkPdr, UdpChecksumDisposition,
     UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey,
@@ -77,12 +80,12 @@ static GTPU_UPLINK_DSCP: HashMap<[u8; 4], [u8; UPLINK_DSCP_VALUE_LEN]> = HashMap
 static GTPU_ULM_DSCP: HashMap<[u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_DSCP_VALUE_LEN]> =
     HashMap::pinned(65536, 0);
 
-/// Optional selected uplink UDP source port: UE PAA -> big-endian port.
+/// Complete default-bearer commit authority, including source-port policy.
 #[map]
 static GTPU_UL_SPORT: HashMap<[u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]> =
     HashMap::pinned(65536, 0);
 
-/// Optional selected uplink UDP source port: `(UE PAA, skb mark)` -> port.
+/// Complete marked-bearer commit authority, including source-port policy.
 #[map]
 static GTPU_ULM_SPORT: HashMap<[u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]> =
     HashMap::pinned(65536, 0);
@@ -187,7 +190,35 @@ pub fn opc_gtpu_uplink(mut ctx: TcContext) -> i32 {
 
 #[classifier]
 pub fn opc_gtpu_downlink(mut ctx: TcContext) -> i32 {
-    try_downlink(&mut ctx).unwrap_or(TC_ACT_OK as i32)
+    let parsed = parse_downlink(&mut ctx);
+    let ipv4_total_length = downlink_parse_ipv4_total_length(parsed);
+    if ipv4_total_length == 0 {
+        return parsed as i32;
+    }
+    let Some(ip_end) = downlink_frame_end(ipv4_total_length) else {
+        return malformed_downlink();
+    };
+    if (ip_end as usize) < ctx.len() as usize {
+        // SAFETY: the parser proved that this end derives from the canonical
+        // IPv4 Total Length and does not exceed the skb. Keeping the trim in
+        // this frame preserves the checksum metadata transition through the
+        // subsequent front decapsulation helper.
+        if unsafe { bpf_skb_change_tail(ctx.skb.skb, ip_end, 0) } != 0 {
+            return malformed_downlink();
+        }
+    }
+    let Ok(version_ihl) = ctx.load::<u8>(ETH_HDR_LEN) else {
+        return malformed_downlink();
+    };
+    let Some(l4_offset) = usize::from(version_ihl & 0x0f)
+        .checked_mul(4)
+        .and_then(|length| ETH_HDR_LEN.checked_add(length))
+    else {
+        return malformed_downlink();
+    };
+    let payload_offset = usize::from(downlink_parse_payload_offset(parsed));
+    let teid = downlink_parse_teid(parsed);
+    authorize_and_decap_downlink(&mut ctx, teid, l4_offset, payload_offset)
 }
 
 /// Uplink: inner IPv4 packet routed to the S2b-U interface with
@@ -256,17 +287,15 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
     } else {
         0xff
     };
-    if mark != 0 {
+    let owner_ptr = if mark != 0 {
         let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(&marked_key) else {
             count(COUNTER_UL_FAR_MISS);
             return Ok(TC_ACT_SHOT as i32);
         };
-        // SAFETY: the hash value remains map-owned for this invocation and is
-        // read only by the allocation-free wire validator.
-        if !marked_owner_wire_authorizes_uplink(unsafe { &*owner_ptr }, &far, dscp_wire) {
-            return Ok(TC_ACT_SHOT as i32);
-        }
-    }
+        Some(owner_ptr)
+    } else {
+        None
+    };
     let dscp = if dscp_wire == 0xff {
         None
     } else {
@@ -277,20 +306,63 @@ fn try_uplink(ctx: &mut TcContext, mark: u32) -> Result<i32, ()> {
     } else {
         GTPU_ULM_SPORT.get_ptr(&marked_key)
     };
-    let source_port = if let Some(sport_ptr) = sport_ptr {
-        // SAFETY: the map value outlives this invocation and is read only.
-        let port = u16::from_be_bytes(unsafe { *sport_ptr });
-        if port == 0 {
-            // Port zero is reserved (RFC 768); a zeroed entry is corrupt
-            // adopted state and must drop rather than emit an invalid
-            // source port or silently fall back to 2152.
+    let Some(sport_ptr) = sport_ptr else {
+        // Every committed v4 bearer owns one explicit policy entry, including
+        // legacy 2152. Absence is durable-state corruption, never an implicit
+        // policy transition.
+        return Ok(TC_ACT_SHOT as i32);
+    };
+    // SAFETY: the map value outlives this invocation and is read only.
+    let commit = unsafe { &*sport_ptr };
+    let local_teid = [commit[0], commit[1], commit[2], commit[3]];
+    if mark == 0 {
+        if GTPU_DLM_PDR.get_ptr(&local_teid).is_some() {
             return Ok(TC_ACT_SHOT as i32);
         }
-        port
+        let Some(pdr_ptr) = GTPU_DOWNLINK_PDR.get_ptr(&local_teid) else {
+            return Ok(TC_ACT_SHOT as i32);
+        };
+        // SAFETY: the map value remains map-owned and read-only for this
+        // complete-graph comparison.
+        if DownlinkPdr::decode(unsafe { &*pdr_ptr }).ue_ip != inner_src {
+            return Ok(TC_ACT_SHOT as i32);
+        }
     } else {
-        // Absence is the explicit legacy policy: fixed source port 2152.
-        GTPU_UDP_PORT
+        if GTPU_DOWNLINK_PDR.get_ptr(&local_teid).is_some() {
+            return Ok(TC_ACT_SHOT as i32);
+        }
+        let Some(pdr_ptr) = GTPU_DLM_PDR.get_ptr(&local_teid) else {
+            return Ok(TC_ACT_SHOT as i32);
+        };
+        // SAFETY: the map value remains map-owned and read-only for this
+        // complete-graph comparison.
+        let pdr = MarkedDownlinkPdr::decode(unsafe { &*pdr_ptr });
+        if pdr.ue_ip != inner_src || pdr.bearer_mark != mark.to_be_bytes() {
+            return Ok(TC_ACT_SHOT as i32);
+        }
+    }
+    let Some(binding_ptr) = GTPU_DL_BIND.get_ptr(&local_teid) else {
+        return Ok(TC_ACT_SHOT as i32);
     };
+    // SAFETY: the map value remains map-owned and read-only. An Active commit
+    // authorizes uplink encapsulation only while every live component in both
+    // directions still matches the same record.
+    let binding = unsafe { &*binding_ptr };
+    if !pdp_commit_wire_authorizes_graph(commit, local_teid, &far, dscp_wire, binding) {
+        return Ok(TC_ACT_SHOT as i32);
+    }
+    if let Some(owner_ptr) = owner_ptr {
+        // SAFETY: the owner remains map-owned and read-only. Both halves are
+        // checked so an inconsistent owner/commit pair cannot authorize one
+        // direction of a marked context.
+        let owner = unsafe { &*owner_ptr };
+        if !marked_owner_wire_authorizes_uplink(owner, &far, dscp_wire)
+            || !marked_owner_wire_authorizes_downlink(owner, local_teid, binding)
+        {
+            return Ok(TC_ACT_SHOT as i32);
+        }
+    }
+    let source_port = u16::from_be_bytes([commit[64], commit[65]]);
     let encap = build_uplink_encap_with_dscp_and_source_port(&far, inner_len, dscp, source_port)
         .ok_or(())?;
 
@@ -732,75 +804,89 @@ fn udp_checksum_is_valid(ctx: &TcContext, bounds: UdpEnvelopeBounds) -> bool {
 /// Downlink: GTPv1-U G-PDU from the PGW on UDP/2152. Validate, look up the
 /// PDR by TEID, strip the outer headers, and hand the inner packet to the
 /// stack so routing and the XFRM output policy toward the UE apply.
-fn try_downlink(ctx: &mut TcContext) -> Result<i32, ()> {
-    let eth_proto = u16::from_be(ctx.load(12).map_err(|_| ())?);
+#[inline(never)]
+fn parse_downlink(ctx: &mut TcContext) -> u64 {
+    let Ok(eth_proto) = ctx.load::<u16>(12) else {
+        return u64::from(TC_ACT_OK as u32);
+    };
+    let eth_proto = u16::from_be(eth_proto);
     if eth_proto != ETH_P_IPV4 {
-        return Ok(TC_ACT_OK as i32);
+        return u64::from(TC_ACT_OK as u32);
     }
-    let version_ihl: u8 = ctx.load(ETH_HDR_LEN).map_err(|_| ())?;
+    let Ok(version_ihl) = ctx.load::<u8>(ETH_HDR_LEN) else {
+        return u64::from(TC_ACT_OK as u32);
+    };
     if version_ihl >> 4 != 4 {
-        return Ok(TC_ACT_OK as i32);
+        return u64::from(TC_ACT_OK as u32);
     }
     let Some(ip_header_len) = usize::from(version_ihl & 0x0F).checked_mul(4) else {
-        return Ok(TC_ACT_OK as i32);
+        return u64::from(TC_ACT_OK as u32);
     };
     if ip_header_len < 20 {
-        return Ok(TC_ACT_OK as i32);
+        return u64::from(TC_ACT_OK as u32);
     }
-    let frag = u16::from_be(ctx.load(ETH_HDR_LEN + 6).map_err(|_| ())?);
+    let Ok(frag) = ctx.load::<u16>(ETH_HDR_LEN + 6) else {
+        return u64::from(TC_ACT_OK as u32);
+    };
+    let frag = u16::from_be(frag);
     if frag & IPV4_FRAG_MASK != 0 {
         // Fragmented outer packets go to the stack for reassembly.
-        return Ok(TC_ACT_OK as i32);
+        return u64::from(TC_ACT_OK as u32);
     }
-    let protocol: u8 = ctx.load(ETH_HDR_LEN + 9).map_err(|_| ())?;
+    let Ok(protocol) = ctx.load::<u8>(ETH_HDR_LEN + 9) else {
+        return u64::from(TC_ACT_OK as u32);
+    };
     if protocol != IPV4_PROTO_UDP {
-        return Ok(TC_ACT_OK as i32);
+        return u64::from(TC_ACT_OK as u32);
     }
 
     let Some(l4_offset) = ETH_HDR_LEN.checked_add(ip_header_len) else {
-        return Ok(TC_ACT_OK as i32);
+        return u64::from(TC_ACT_OK as u32);
     };
     let Some(dport_offset) = l4_offset.checked_add(2) else {
-        return Ok(TC_ACT_OK as i32);
+        return u64::from(TC_ACT_OK as u32);
     };
-    let dport = u16::from_be(ctx.load(dport_offset).map_err(|_| ())?);
+    let Ok(dport) = ctx.load::<u16>(dport_offset) else {
+        return u64::from(TC_ACT_OK as u32);
+    };
+    let dport = u16::from_be(dport);
     if dport != GTPU_UDP_PORT {
-        return Ok(TC_ACT_OK as i32);
+        return u64::from(TC_ACT_OK as u32);
     }
 
     // From this point onward UDP/2152 identifies a GTP-U candidate. Every
     // malformed declaration or checksum fails closed before any PDR lookup.
     let Ok(total_length) = ctx.load::<u16>(ETH_HDR_LEN + 2) else {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     };
     let Ok(ipv4_bounds) =
         Ipv4EnvelopeBounds::parse(ctx.len() as usize, version_ihl, u16::from_be(total_length))
     else {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     };
     if ipv4_bounds.udp_offset() != l4_offset || !ipv4_header_checksum_is_valid(ctx, ipv4_bounds) {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     }
     let Ok(udp_length) = ctx.load::<u16>(l4_offset + 4) else {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     };
     let Ok(udp_bounds) = UdpEnvelopeBounds::parse(ipv4_bounds, u16::from_be(udp_length)) else {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     };
     if !udp_checksum_is_valid(ctx, udp_bounds) {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     }
 
     let gtp_offset = udp_bounds.gtp_offset();
     let Ok(gtp_header) = ctx.load::<[u8; GTPU_MANDATORY_HDR_LEN]>(gtp_offset) else {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     };
     let declared_gtp_length = u16::from_be_bytes([gtp_header[2], gtp_header[3]]);
     let Ok(gtp_bounds) = GtpuEnvelopeBounds::parse(udp_bounds, declared_gtp_length) else {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     };
     let (teid, gtp_length, has_opt, has_ext) = match classify_gtpu(&gtp_header) {
-        GtpuClass::NotGtpV1 | GtpuClass::NotGpdu => return Ok(TC_ACT_OK as i32),
+        GtpuClass::NotGtpV1 | GtpuClass::NotGpdu => return u64::from(TC_ACT_OK as u32),
         GtpuClass::Gpdu {
             teid,
             length,
@@ -810,34 +896,22 @@ fn try_downlink(ctx: &mut TcContext) -> Result<i32, ()> {
     };
 
     if gtp_length != declared_gtp_length {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     }
     let gtp_end = gtp_bounds.gtp_end();
 
-    if ipv4_bounds.ip_end() < ctx.len() as usize {
-        let Ok(ip_end) = u32::try_from(ipv4_bounds.ip_end()) else {
-            return Ok(malformed_downlink());
-        };
-        // SAFETY: `ip_end` was checked against skb length and derives from
-        // IPv4 Total Length. Trimming removes only layer-2 padding so it
-        // cannot survive front decapsulation as unauthenticated inner bytes.
-        if unsafe { bpf_skb_change_tail(ctx.skb.skb, ip_end, 0) } != 0 {
-            return Ok(malformed_downlink());
-        }
-    }
-
     let Some(mut payload_offset) = gtp_offset.checked_add(GTPU_MANDATORY_HDR_LEN) else {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     };
     if has_opt {
         let Some(optional_end) = payload_offset.checked_add(GTPU_OPT_LEN) else {
-            return Ok(malformed_downlink());
+            return u64::from(malformed_downlink() as u32);
         };
         if optional_end > gtp_end {
-            return Ok(malformed_downlink());
+            return u64::from(malformed_downlink() as u32);
         }
         let Ok(opt) = ctx.load::<[u8; GTPU_OPT_LEN]>(payload_offset) else {
-            return Ok(malformed_downlink());
+            return u64::from(malformed_downlink() as u32);
         };
         payload_offset = optional_end;
         if has_ext {
@@ -845,25 +919,25 @@ fn try_downlink(ctx: &mut TcContext) -> Result<i32, ()> {
             let mut walked = 0;
             while next_ext != 0 {
                 if walked == GTPU_MAX_EXT_HEADERS || payload_offset >= gtp_end {
-                    return Ok(malformed_downlink());
+                    return u64::from(malformed_downlink() as u32);
                 }
                 let Ok(ext_len_units) = ctx.load::<u8>(payload_offset) else {
-                    return Ok(malformed_downlink());
+                    return u64::from(malformed_downlink() as u32);
                 };
                 if ext_len_units == 0 {
-                    return Ok(malformed_downlink());
+                    return u64::from(malformed_downlink() as u32);
                 }
                 let Some(ext_len) = usize::from(ext_len_units).checked_mul(4) else {
-                    return Ok(malformed_downlink());
+                    return u64::from(malformed_downlink() as u32);
                 };
                 let Some(ext_end) = payload_offset.checked_add(ext_len) else {
-                    return Ok(malformed_downlink());
+                    return u64::from(malformed_downlink() as u32);
                 };
                 if ext_end > gtp_end {
-                    return Ok(malformed_downlink());
+                    return u64::from(malformed_downlink() as u32);
                 }
                 let Ok(next) = ctx.load::<u8>(ext_end - 1) else {
-                    return Ok(malformed_downlink());
+                    return u64::from(malformed_downlink() as u32);
                 };
                 payload_offset = ext_end;
                 next_ext = next;
@@ -872,16 +946,19 @@ fn try_downlink(ctx: &mut TcContext) -> Result<i32, ()> {
         }
     }
     if payload_offset >= gtp_end {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     }
     let Some(inner_minimum_end) = payload_offset.checked_add(20) else {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     };
     if inner_minimum_end > gtp_end {
-        return Ok(malformed_downlink());
+        return u64::from(malformed_downlink() as u32);
     }
 
-    authorize_and_decap_downlink(ctx, teid, l4_offset, payload_offset)
+    let Ok(payload_offset) = u16::try_from(payload_offset) else {
+        return u64::from(malformed_downlink() as u32);
+    };
+    pack_downlink_parse_result(u16::from_be(total_length), payload_offset, teid)
 }
 
 /// Authorize the complete downlink forwarding identity and perform decap.
@@ -896,20 +973,20 @@ fn authorize_and_decap_downlink(
     teid: [u8; 4],
     l4_offset: usize,
     payload_offset: usize,
-) -> Result<i32, ()> {
+) -> i32 {
     let legacy_pdr = GTPU_DOWNLINK_PDR.get_ptr(&teid);
     let marked_pdr = GTPU_DLM_PDR.get_ptr(&teid);
     let (pdr, output_mark, owner_selector) = match (legacy_pdr, marked_pdr) {
         (None, None) => {
             count(COUNTER_DL_UNKNOWN_TEID);
-            return Ok(TC_ACT_SHOT as i32);
+            return TC_ACT_SHOT as i32;
         }
         (Some(_), Some(_)) => {
             // A TEID must exist in exactly one schema. Treat externally
             // corrupted duplicate ownership as malformed rather than picking
             // a bearer nondeterministically.
             count(COUNTER_DL_MALFORMED);
-            return Ok(TC_ACT_SHOT as i32);
+            return TC_ACT_SHOT as i32;
         }
         (Some(pdr_ptr), None) => {
             // SAFETY: the map value outlives this program invocation and is
@@ -931,7 +1008,7 @@ fn authorize_and_decap_downlink(
             if pdr.bearer_mark == [0; 4] {
                 // Mark zero belongs exclusively to the legacy/default map.
                 count(COUNTER_DL_MALFORMED);
-                return Ok(TC_ACT_SHOT as i32);
+                return TC_ACT_SHOT as i32;
             }
             let selector = UplinkFarKey {
                 ue_ip: pdr.ue_ip,
@@ -944,19 +1021,19 @@ fn authorize_and_decap_downlink(
 
     let Some(binding_ptr) = GTPU_DL_BIND.get_ptr(&teid) else {
         count_binding_drop(COUNTER_DL_BINDING_INVALID);
-        return Ok(TC_ACT_SHOT as i32);
+        return TC_ACT_SHOT as i32;
     };
     // SAFETY: the hash value remains map-owned for this invocation and is
     // read only by the allocation-free wire validators below.
     let binding = unsafe { &*binding_ptr };
     let Ok(outer_peer) = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 12) else {
-        return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+        return binding_drop(DownlinkBindingMismatch::Invalid);
     };
     let Ok(outer_local) = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 16) else {
-        return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+        return binding_drop(DownlinkBindingMismatch::Invalid);
     };
     let Ok(source_port) = ctx.load::<u16>(l4_offset) else {
-        return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+        return binding_drop(DownlinkBindingMismatch::Invalid);
     };
     if let Err(reason) = validate_ipv4_downlink_binding_wire(
         binding,
@@ -965,35 +1042,77 @@ fn authorize_and_decap_downlink(
         packet_ifindex(ctx),
         u16::from_be(source_port),
     ) {
-        return Ok(binding_drop(reason));
+        return binding_drop(reason);
     }
     if let Some(selector) = owner_selector {
         let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(&selector) else {
-            return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+            return binding_drop(DownlinkBindingMismatch::Invalid);
         };
         // SAFETY: both map values remain map-owned and read-only for this
         // exact comparison. Publishing Active last means an old owner cannot
         // authorize a newly replaced binding during peer relocation.
         if !marked_owner_wire_authorizes_downlink(unsafe { &*owner_ptr }, teid, binding) {
-            return Ok(binding_drop(DownlinkBindingMismatch::Invalid));
+            return binding_drop(DownlinkBindingMismatch::Invalid);
         }
+    }
+    let commit_ptr = if let Some(selector) = owner_selector {
+        GTPU_ULM_SPORT.get_ptr(&selector)
+    } else {
+        GTPU_UL_SPORT.get_ptr(&pdr.ue_ip)
+    };
+    let Some(commit_ptr) = commit_ptr else {
+        return binding_drop(DownlinkBindingMismatch::Invalid);
+    };
+    let far_ptr = if let Some(selector) = owner_selector {
+        GTPU_ULM_FAR.get_ptr(&selector)
+    } else {
+        GTPU_UPLINK_FAR.get_ptr(&pdr.ue_ip)
+    };
+    let Some(far_ptr) = far_ptr else {
+        return binding_drop(DownlinkBindingMismatch::Invalid);
+    };
+    // SAFETY: the map value remains map-owned and read-only for this exact
+    // complete-graph comparison.
+    let far = UplinkFar::decode(unsafe { &*far_ptr });
+    let dscp_ptr = if let Some(selector) = owner_selector {
+        GTPU_ULM_DSCP.get_ptr(&selector)
+    } else {
+        GTPU_UPLINK_DSCP.get_ptr(&pdr.ue_ip)
+    };
+    let dscp_wire = if let Some(dscp_ptr) = dscp_ptr {
+        // SAFETY: the map value remains map-owned and is read only.
+        let value = unsafe { (*dscp_ptr)[0] };
+        if value > 63 {
+            return binding_drop(DownlinkBindingMismatch::Invalid);
+        }
+        value
+    } else {
+        0xff
+    };
+    // SAFETY: the map value remains map-owned and read-only. The one Active
+    // commit record is the cross-direction publication point for this graph.
+    let commit = unsafe { &*commit_ptr };
+    if pdp_commit_wire_authorized_source_port(commit, &far, dscp_wire).is_none()
+        || !pdp_commit_wire_authorizes_downlink(commit, teid, binding)
+    {
+        return binding_drop(DownlinkBindingMismatch::Invalid);
     }
 
     let Ok(inner_version_ihl) = ctx.load::<u8>(payload_offset) else {
         count(COUNTER_DL_MALFORMED);
-        return Ok(TC_ACT_SHOT as i32);
+        return TC_ACT_SHOT as i32;
     };
     if inner_version_ihl >> 4 != 4 {
         count(COUNTER_DL_MALFORMED);
-        return Ok(TC_ACT_SHOT as i32);
+        return TC_ACT_SHOT as i32;
     }
     let Ok(inner_dst) = ctx.load::<[u8; 4]>(payload_offset + 16) else {
         count(COUNTER_DL_MALFORMED);
-        return Ok(TC_ACT_SHOT as i32);
+        return TC_ACT_SHOT as i32;
     };
     if inner_dst != pdr.ue_ip {
         count(COUNTER_DL_DST_MISMATCH);
-        return Ok(TC_ACT_SHOT as i32);
+        return TC_ACT_SHOT as i32;
     }
 
     // Strip outer IPv4 + UDP + GTP-U (+ optional block and extension
@@ -1005,13 +1124,13 @@ fn authorize_and_decap_downlink(
         .is_err()
     {
         count(COUNTER_DL_MALFORMED);
-        return Ok(TC_ACT_SHOT as i32);
+        return TC_ACT_SHOT as i32;
     }
     // This boundary owns the complete mark. Zero is the authoritative
     // default bearer; a nonzero value selects one exact dedicated Child SA.
     ctx.set_mark(output_mark);
     count(COUNTER_DL_DECAP);
-    Ok(TC_ACT_OK as i32)
+    TC_ACT_OK as i32
 }
 
 #[cfg(not(test))]

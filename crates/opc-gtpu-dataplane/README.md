@@ -146,7 +146,7 @@ The eBPF adapter treats its held reconciler lease, exact tc program identity,
 and exact named-map identities as mutation authority. It reconstructs default
 and marked contexts only from a complete FAR/PDR/endpoint-binding/DSCP/active
 owner graph. A host-only default `(ifindex, UE PAA) -> local TEID` reverse index
-is rebuilt from validated pinned v3 state on adoption and maintained inside the
+is rebuilt from validated pinned current-schema state on adoption and maintained inside the
 same serialized publication/removal boundary. It is not a new datapath map and
 does not change the pinned schema. Partial graphs, transitional marked owners,
 index disagreement, changed observations, a second writer, or lost program/map
@@ -425,40 +425,60 @@ makes that choice explicit per PDP context.
 `GtpuUplinkSourcePortPolicy::LegacyServicePort` is the pre-feature behavior and
 emits exactly the legacy source/destination 2152 bytes.
 `GtpuUplinkSourcePortPolicy::selected(port)` persists one stable per-context
-port; the reserved port zero fails closed at construction, at the userspace map
-boundary, on restart adoption, and in the tc program itself.
+port. Port zero is reserved, and 2152 has the sole canonical representation
+`LegacyServicePort`; both invalid `Selected` values fail closed at the checked
+constructor or userspace map boundary.
 
 The eBPF backend owns additive `GTPU_UL_SPORT` (default bearers) and
-`GTPU_ULM_SPORT` (keyed by `(UE PAA, mark)`) maps holding the selected port
-big endian. An absent entry is the legacy policy, so pre-feature pinned state
-remains valid; the `OPC-SPORT-v4` schema marker proves both maps are pinned,
-and a committed v3 pin set migrates additively on attach or adoption. The
-selected port is staged before uplink routing exactly like DSCP, survives
-process restarts, is returned by PDP read-back, and is reported in conflict
-evidence only as the `UplinkSourcePortPolicy` field name. The uplink selection
-is independent of `downlink_source_port_policy`: the backend never assumes a
-peer returns traffic from the selected port.
+`GTPU_ULM_SPORT` (keyed by `(UE PAA, mark)`) maps. Each value is a fixed 68-byte
+commit record: its first 64 bytes use the marked-owner layout to bind the FAR,
+DSCP, local TEID, endpoint binding, and publication phase; bytes 64..66 hold the
+explicit big-endian source port, including legacy 2152; bytes 66..68 are zero.
+The record, rather than an individual component map, is the traffic authority.
+Userspace writes `Pending` first, mutates every component, and publishes
+`Active` last. Removal writes `Removing` first, deletes the components, and
+deletes the commit record last. Both tc directions accept only an `Active`
+record whose complete selected graph matches those committed bytes exactly.
 
-Consumers must require
+Restart recovery treats `Pending` and `Removing` identically as non-forwarding
+transactions: it validates their bounded ownership graph, removes every owned
+component to proven absence, and removes the commit record last. Recovery can
+resume after interruption at every mutation boundary. Current-process TEID
+reservations are established when the commit record is inserted and remain
+held until its final deletion, preventing a partially published transaction
+from colliding with another context.
+
+Before a populated v3 graph can run the v4 program, migration derives a complete
+legacy-2152 commit record for each already validated default and marked context,
+recovers any transitional record to absence, validates the complete graph,
+attaches the exact program, and only then commits `OPC-SPORT-v4`. Once v4 is
+committed, a missing, zero, malformed, unowned, or mixed record fails adoption
+and PDP read-back; both tc directions drop a packet whose exact complete context
+does not match its `Active` record. There is no runtime fallback to 2152. The
+selected port survives process restarts, is returned by PDP read-back, and is
+reported in conflict evidence only as the `UplinkSourcePortPolicy` field name.
+The uplink selection is independent of `downlink_source_port_policy`: the
+backend never assumes a peer returns traffic from the selected port.
+
+Consumers using the eBPF backend must require
 `GtpuProbe::uplink_source_port_selection == GtpuCapability::Available` before
-installing a non-legacy policy; the capability follows the same
-`Unknown`/`Missing` transitions as DSCP. The Linux `gtp`, mock, and unsupported
-backends report `Missing` and reject a non-legacy policy with
+installing any context because legacy is explicit state too; the capability
+follows the same `Unknown`/`Missing` transitions as DSCP. The Linux `gtp`, mock,
+and unsupported backends report `Missing` and reject a non-legacy policy with
 `UnsupportedFeature`, preserving their exact established behavior for the
 explicit legacy policy.
 
-One limitation is deliberate: unlike DSCP, the selected port is not embedded
-in the 64-byte marked-bearer owner journal, whose wire layout is frozen. A
-marked-sport entry lost individually (not with its map pin, which the v4
-schema marker proves) is therefore adopted silently and the bearer falls back
-to the spec-compliant legacy 2152 source port until PDP read-back reports the
-drift as an `UplinkSourcePortPolicy` mismatch. This fail-open direction is
-toward the standards-compliant legacy port only — never toward an arbitrary
-or zero port — and matches the default-bearer DSCP posture, where an orphan
-entry is likewise reconciled rather than journal-covered. The exclusive-writer
-boundary documented above remains the integrity boundary for all map state;
-extending the journal to cover the port would be an incompatible map-value
-change and is intentionally out of scope.
+The separate 64-byte marked-bearer owner journal remains wire-compatible for
+marked-context provenance. The 68-byte source-port-map commit record repeats
+that canonical owner layout and adds the source port, making it the common
+commit authority for default and marked contexts. For marked contexts, the
+owner journal and commit record must agree exactly. Every `Active` commit must
+have one complete canonical graph, and every graph must have one commit;
+missing, orphaned, or structurally inconsistent state blocks restart adoption
+before either hook changes. Runtime loss also makes read-back indeterminate and
+packet processing drop, so a map loss cannot silently change a bearer to legacy
+behavior. The exclusive-writer boundary documented above remains the integrity
+boundary for exact policy values.
 
 ### Pinned-map and live-program migration
 
@@ -480,8 +500,12 @@ canonical, and both current tc programs have been attached and read back by
 exact program ID. A committed marker with a missing required pin, an unknown
 marker, or a foreign tc occupant fails closed before Aya can recreate empty
 state. A positively absent current hook may be repaired. The v3-to-v4 step is
-purely additive: absent source-port entries select the legacy 2152 source
-port, so populated v3 session state upgrades in place.
+additive and resumable: after validating v3 state, the loader materializes a
+complete `Active` legacy-2152 commit record for every context before attaching
+the v4 program and committing the marker. Any transitional migration record is
+recovered to absence before migration resumes. A partial migration may contain
+only records derived exactly from the validated v3 graph; any selected, zero,
+malformed, orphaned, or mixed record fails closed.
 
 There is no implicit endpoint migration for populated older state. A committed
 v2 pin set is rejected with the redaction-safe `ebpf_endpoint_schema` error and
@@ -491,7 +515,7 @@ any retained PDR/FAR without an exact binding is indeterminate and fails before
 either hook changes. The SDK never invents `Any`, derives a peer from an
 untrusted packet, or labels endpoint-unbound forwarding state production-ready.
 
-#### Drained v2 teardown for v3 reprovisioning
+#### Drained v2 teardown for current-schema reprovisioning
 
 `GtpuDataplaneBackend::teardown_drained_v2` is the only supported SDK path for
 removing a committed endpoint-unbound v2 graph. It is an explicit maintenance
@@ -575,7 +599,7 @@ loop {
     }
 }
 
-// Only now may the caller provision the endpoint-bound v3 attachment.
+// Only now may the caller provision the current source-port-v4 attachment.
 # Ok(())
 # }
 ```
@@ -596,11 +620,12 @@ state reappears, cleanup stops with
 `Partial(PopulatedStateObserved)`; the caller must stop the writer and drain
 again before submitting the same request. Other `Partial` outcomes are durable
 progress classifications for an exact-request retry. `Refused` means the SDK
-made no intentional graph mutation. The caller may reprovision v3 only after
+made no intentional graph mutation. The caller may reprovision the current
+source-port-v4 schema only after
 `Removed` or `AlreadyAbsent`. While the proof pin remains, normal create and
 adopt preflight returns the typed `ebpf_legacy_v2_teardown_pending`
-indeterminate error instead of treating a proof-only crash state as fresh v3
-state.
+indeterminate error instead of treating a proof-only crash state as fresh
+source-port-v4 state.
 
 Hook ownership readback is authoritative only after an uninterrupted
 multipart rtnetlink dump completes with a zero status. Every data reply must
@@ -616,7 +641,7 @@ The identity authority for this path is the frozen
 `7d0c1b452ad562d4c8c286bf05a4c5308f6fd5b4c677cc3c2125b194860464a5`.
 Production code parses that object in userspace solely to identify the exact
 legacy programs, maps, relocations, and portable kernel tag candidates. It is
-never loaded, attached, or executed by the production v3 runtime: the frozen
+never loaded, attached, or executed by the production source-port-v4 runtime: the frozen
 bytes are private to a parse-only child module whose production API exposes
 only the derived, provenance-checked program tags. The privileged qualification
 test loads and attaches it without traffic in a fresh, ephemeral network
@@ -649,12 +674,12 @@ from commit `4fd43cf1465a46b6afa35348b2463fa9c497fce4`, with SHA-256
 `f31ccc2914f2fd61ae8f1e892e9ac0342f9e81350a4a065d5d8dcfcc9f7a943f`.
 The loader binds that object to the exact retained old map IDs and compares the
 live program name, type, tag, and complete map-ID set before replacement. The
-fixture is migration authority only; it is never selected as the running v3
+fixture is migration authority only; it is never selected as the running current
 datapath. CI verifies its hash and old-only program/map inventory.
 
 Classic-tc replacement uses Aya's atomic `attach_to_link` netlink path, not a
 detach-then-attach window. Both hook occupants are proven before either is
-touched. If the second replacement is uncertain, the first exact v3 hook is
+touched. If the second replacement is uncertain, the first exact current hook is
 retained and the exact old/current second hook is left for an idempotent retry;
 the migration returns `StateIndeterminate` instead of creating an empty live
 slot. The same retained, retryable rule applies if schema or runtime-state
@@ -712,7 +737,7 @@ object is embedded from
 `crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o`; the frozen v1 object is
 retained only for the exact automatic empty-graph migration proof described
 above, and the frozen v2 object is retained only for the explicit drained
-teardown identity proof. Neither legacy object runs as the v3 datapath.
+teardown identity proof. Neither legacy object runs as the current datapath.
 
 ## Status And Limits
 

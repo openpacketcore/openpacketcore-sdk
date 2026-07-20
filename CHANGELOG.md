@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the frozen historical v2 artifact to production. Unit failure-injection and an
   isolated, no-traffic privileged load of the hash-pinned v2 object prove
   refusal, real program-to-map binding, every partial phase, durable retry,
-  exact hook/pin cleanup, and subsequent fresh endpoint-bound v3 provisioning.
+  exact hook/pin cleanup, and subsequent fresh source-port-v4 provisioning.
   The proof is bound to its own kernel map ID and full ABI, and every retry
   revalidates recorded program tags against the frozen artifact and scans both
   hook directions for same-name extras or cross-direction legacy programs
@@ -103,18 +103,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GtpuUplinkSourcePortPolicy::LegacyServicePort` is the explicit pre-feature
   fixed-2152 behavior with byte-for-byte identical wire bytes;
   `GtpuUplinkSourcePortPolicy::selected(port)` persists one stable
-  per-context port in the new additive `GTPU_UL_SPORT`/`GTPU_ULM_SPORT` maps
-  (absence encodes the legacy policy, so pre-feature pinned state upgrades in
-  place under the new `OPC-SPORT-v4` schema marker). The reserved port zero
-  fails closed at policy construction, at the userspace map boundary, on
-  restart adoption, and in the tc program itself; the effective port is
-  carried through atomic reconciliation, restart adoption, and PDP read-back,
-  appears in conflict evidence only as the `UplinkSourcePortPolicy` field
-  name, and is redacted from `Debug`. The new
-  `GtpuProbe::uplink_source_port_selection` capability gates non-legacy
-  policies fail-closed; the Linux `gtp`, mock, and unsupported backends
-  report `Missing` and reject them. Downlink peer source-port validation
-   (`downlink_source_port_policy`) remains independently configurable.
+  per-context port in the new additive `GTPU_UL_SPORT`/`GTPU_ULM_SPORT` maps.
+  Each map value is a fixed 68-byte commit record containing the complete FAR,
+  DSCP, local TEID, endpoint binding, publication phase, and explicit
+  big-endian source port. Userspace writes `Pending` before component maps,
+  publishes `Active` last, writes `Removing` before deletion, and deletes the
+  commit record last. Both tc directions accept only an `Active` record whose
+  complete live graph matches exactly, so a crash-mixed or transitional graph
+  cannot carry traffic. Restart recovery removes a `Pending` or `Removing`
+  graph to proven absence, with the commit record removed last, and can resume
+  after interruption at every mutation boundary. Legacy is also stored
+  explicitly as 2152: pre-feature active contexts are materialized as complete
+  commit records before the v4 program or `OPC-SPORT-v4` marker becomes
+  authoritative. A missing, zero, malformed, unowned, or mixed committed-v4
+  record fails adoption/read-back and drops in both tc directions rather than
+  silently falling back. The reserved port zero and the redundant
+  `Selected(2152)` representation fail closed at policy construction or the
+  userspace map boundary; the effective port is carried through reconciliation,
+  restart adoption, and PDP read-back, appears in conflict evidence only as the
+  `UplinkSourcePortPolicy` field name, and is redacted from `Debug`. The new
+  `GtpuProbe::uplink_source_port_selection`
+  capability gates eBPF policy state fail-closed; the Linux `gtp`, mock, and
+  unsupported backends report `Missing` and reject non-legacy policies.
+  Downlink peer source-port validation (`downlink_source_port_policy`) remains
+  independently configurable.
 - **Validated-provider capability seam — `opc-crypto-provider`:** a new
   standalone crate defining the capability-reporting and key-custody boundary
   requested by #334 (slice 1 of 5). `CryptoCapability` enumerates the

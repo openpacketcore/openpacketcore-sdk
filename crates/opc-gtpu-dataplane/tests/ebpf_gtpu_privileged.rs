@@ -42,13 +42,16 @@
 
 #![cfg(target_os = "linux")]
 
+use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::io::{IoSliceMut, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -63,27 +66,29 @@ use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, DrainedV2TeardownOutcome, DrainedV2TeardownRefusal,
     DrainedV2TeardownRequest, DscpCodepoint, EbpfGtpuDataplaneBackend,
     EbpfGtpuDataplaneBackendConfig, GtpBearerMark, GtpDevice, GtpPdpContext, GtpVersion,
-    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuSourcePortPolicy, GtpuV2DrainProof,
-    GtpuUplinkSourcePortPolicy, PdpContextIndeterminateReason, PdpContextInstallOutcome,
-    PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
-    PdpContextSelectorOccupancy, PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
+    GtpuCapability, GtpuDataplaneBackend, GtpuError, GtpuSourcePortPolicy,
+    GtpuUplinkSourcePortPolicy, GtpuV2DrainProof, PdpContextIndeterminateReason,
+    PdpContextInstallOutcome, PdpContextLocalTeidSelector, PdpContextReadback,
+    PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
+    PdpContextUplinkSelector, RemovePdpContextRequest, Teid,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, DownlinkEndpointBinding,
-    DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner, MarkedBearerOwnerPhase, UplinkFar,
-    UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
-    COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
-    COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
-    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP,
-    COUNTER_UL_FAR_MISS, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
+    DownlinkPdr, GtpuEndpointAddress, MarkedBearerOwner, MarkedBearerOwnerPhase, PdpContextCommit,
+    UplinkFar, UplinkFarKey, COUNTER_DL_BINDING_FAMILY_MISMATCH,
+    COUNTER_DL_BINDING_INGRESS_MISMATCH, COUNTER_DL_BINDING_INVALID,
+    COUNTER_DL_BINDING_LOCAL_MISMATCH, COUNTER_DL_BINDING_PEER_MISMATCH,
+    COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH,
+    COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS,
+    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
     GTPU_MANDATORY_HDR_LEN, IPV4_MIN_HDR_LEN, MAP_CONFIG, MAP_COUNTERS,
     MAP_DOWNLINK_BINDING_COUNTERS, MAP_DOWNLINK_ENDPOINT_BINDING, MAP_DOWNLINK_MARK_PDR,
     MAP_DOWNLINK_PDR, MAP_MARKED_BEARER_OWNER, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
-    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT,
-    MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
-    PROG_DOWNLINK, PROG_UPLINK, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
-    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
-    UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_SOURCE_PORT,
+    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK,
+    UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
+    UPLINK_MARK_KEY_LEN, UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
@@ -238,38 +243,166 @@ struct TestNet {
     nft_table: String,
 }
 
+/// Executes one best-effort partial-provision cleanup command.
+trait PartialProvisionCleanupExecutor {
+    fn execute(&self, program: &str, args: &[&str]);
+}
+
+struct HostPartialProvisionCleanupExecutor;
+
+impl PartialProvisionCleanupExecutor for HostPartialProvisionCleanupExecutor {
+    fn execute(&self, program: &str, args: &[&str]) {
+        let _ = Command::new(program).args(args).output();
+    }
+}
+
 /// Best-effort cleanup for a test network whose provisioning panicked
-/// partway. Recorded child namespaces and root-netns veth ends are removed
-/// (deleting one veth end removes the pair), so a retry or a later test in
-/// the same process does not inherit wedged state. `TestNet::provision`
-/// disarms the guard once the complete topology exists; steady-state
-/// teardown stays with `TestNet::drop`.
-struct PartialProvisionCleanup {
+/// partway. An nft table is owned immediately after its successful creation;
+/// that table, recorded child namespaces, and root-netns veth ends are
+/// removed while the guard is armed (deleting one veth end removes the pair),
+/// so a retry or a later test in the same process does not inherit wedged
+/// state. `TestNet::provision` disarms the guard once the complete topology
+/// exists; steady-state teardown stays with `TestNet::drop`.
+struct PartialProvisionCleanup<Executor: PartialProvisionCleanupExecutor> {
     netns: Vec<String>,
     root_links: Vec<&'static str>,
+    nft_table: Option<String>,
+    executor: Executor,
     armed: bool,
 }
 
-impl PartialProvisionCleanup {
+impl PartialProvisionCleanup<HostPartialProvisionCleanupExecutor> {
+    fn new() -> Self {
+        Self::with_executor(HostPartialProvisionCleanupExecutor)
+    }
+}
+
+impl<Executor: PartialProvisionCleanupExecutor> PartialProvisionCleanup<Executor> {
+    fn with_executor(executor: Executor) -> Self {
+        Self {
+            netns: Vec::new(),
+            root_links: Vec::new(),
+            nft_table: None,
+            executor,
+            armed: true,
+        }
+    }
+
+    fn own_nft_table(&mut self, nft_table: &str) {
+        self.nft_table = Some(nft_table.to_owned());
+    }
+
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for PartialProvisionCleanup {
+impl<Executor: PartialProvisionCleanupExecutor> Drop for PartialProvisionCleanup<Executor> {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
+        if let Some(nft_table) = self.nft_table.as_deref() {
+            self.executor
+                .execute("nft", &["delete", "table", "inet", nft_table]);
+        }
         for link in &self.root_links {
-            let _ = Command::new("ip").args(["link", "del", link]).output();
+            self.executor.execute("ip", &["link", "del", link]);
         }
         for namespace in &self.netns {
-            let _ = Command::new("ip")
-                .args(["netns", "del", namespace])
-                .output();
+            self.executor.execute("ip", &["netns", "del", namespace]);
         }
     }
+}
+
+fn provision_nft_rules<Executor, Run>(
+    cleanup: &mut PartialProvisionCleanup<Executor>,
+    nft_table: &str,
+    mut run_command: Run,
+) where
+    Executor: PartialProvisionCleanupExecutor,
+    Run: FnMut(&str, &[&str]),
+{
+    run_command("nft", &["add", "table", "inet", nft_table]);
+    // From the first successful creation onward, every unwind path owns and
+    // removes the table. No chain or later topology command may run between
+    // creation and recording that ownership.
+    cleanup.own_nft_table(nft_table);
+    run_command(
+        "nft",
+        &[
+            "add",
+            "chain",
+            "inet",
+            nft_table,
+            "forward",
+            "{ type filter hook forward priority -300; policy accept; }",
+        ],
+    );
+    run_command(
+        "nft",
+        &[
+            "add",
+            "chain",
+            "inet",
+            nft_table,
+            "input",
+            "{ type filter hook input priority -300; policy accept; }",
+        ],
+    );
+}
+
+#[derive(Clone)]
+struct RecordingPartialProvisionCleanupExecutor {
+    commands: RecordedCleanupCommands,
+}
+
+type RecordedCleanupCommands = Rc<RefCell<Vec<(String, Vec<String>)>>>;
+
+impl PartialProvisionCleanupExecutor for RecordingPartialProvisionCleanupExecutor {
+    fn execute(&self, program: &str, args: &[&str]) {
+        self.commands.borrow_mut().push((
+            program.to_owned(),
+            args.iter().map(|argument| (*argument).to_owned()).collect(),
+        ));
+    }
+}
+
+#[test]
+fn partial_provision_cleanup_executes_nft_delete_after_chain_failure() {
+    let commands = Rc::new(RefCell::new(Vec::new()));
+    let recorded_commands = Rc::clone(&commands);
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let executor = RecordingPartialProvisionCleanupExecutor {
+            commands: recorded_commands,
+        };
+        let mut cleanup = PartialProvisionCleanup::with_executor(executor);
+        let mut attempt = 0_u8;
+        provision_nft_rules(&mut cleanup, "opc_gtpu_failure_probe", |_, _| {
+            attempt = attempt.saturating_add(1);
+            if attempt == 2 {
+                panic!("injected chain-creation failure");
+            }
+        });
+        cleanup.disarm();
+    }));
+
+    assert!(
+        result.is_err(),
+        "chain-creation failure must unwind provision"
+    );
+    assert_eq!(
+        commands.borrow().as_slice(),
+        &[(
+            "nft".to_owned(),
+            vec![
+                "delete".to_owned(),
+                "table".to_owned(),
+                "inet".to_owned(),
+                "opc_gtpu_failure_probe".to_owned(),
+            ],
+        )]
+    );
 }
 
 impl TestNet {
@@ -281,11 +414,7 @@ impl TestNet {
         let ue_ns = format!("opc-ue-{pid}-{sequence}");
         let pin_root = PathBuf::from(format!("/sys/fs/bpf/opc-gtpu-test-{pid}-{sequence}"));
         let nft_table = format!("opc_gtpu_{pid}_{sequence}");
-        let mut cleanup = PartialProvisionCleanup {
-            netns: Vec::new(),
-            root_links: Vec::new(),
-            armed: true,
-        };
+        let mut cleanup = PartialProvisionCleanup::new();
 
         run("ip", &["netns", "add", &auth_ns]);
         cleanup.netns.push(auth_ns.clone());
@@ -413,38 +542,17 @@ impl TestNet {
             fs::write(&path, "0").expect("relax rp_filter");
         }
 
-        run("nft", &["add", "table", "inet", &nft_table]);
-        run(
-            "nft",
-            &[
-                "add",
-                "chain",
-                "inet",
-                &nft_table,
-                "forward",
-                "{ type filter hook forward priority -300; policy accept; }",
-            ],
-        );
-        run(
-            "nft",
-            &[
-                "add",
-                "chain",
-                "inet",
-                &nft_table,
-                "input",
-                "{ type filter hook input priority -300; policy accept; }",
-            ],
-        );
+        provision_nft_rules(&mut cleanup, &nft_table, run);
 
-        cleanup.disarm();
-        Self {
+        let provisioned = Self {
             auth_ns,
             pgw_ns,
             ue_ns,
             pin_root,
             nft_table,
-        }
+        };
+        cleanup.disarm();
+        provisioned
     }
 
     fn require_forward_mark(&self, mark: u32) {
@@ -1523,8 +1631,8 @@ async fn exercise_outer_envelope_validation(
     .expect("canonical authenticated-source binding")
     .encode();
     let pin_dir = net.pin_root.join("s2bu");
-    let pgw_binding = replace_pinned_binding(&pin_dir, LOCAL_TEID, Some(authenticated_binding))
-        .expect("installed PGW binding");
+    let pgw_binding =
+        replace_pinned_default_binding_transaction(&pin_dir, LOCAL_TEID, authenticated_binding);
     let verified_payload = b"kernel-verified";
     let mut verified_frame = build_frame(verified_payload, &[], true, 0);
     verified_frame[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&AUTH_GTP_IP.octets());
@@ -1579,7 +1687,7 @@ async fn exercise_outer_envelope_validation(
         verified_after.downlink_unknown_teid, verified_before.downlink_unknown_teid,
         "kernel-verified malformed structure must not reach PDR lookup",
     );
-    replace_pinned_binding(&pin_dir, LOCAL_TEID, Some(pgw_binding));
+    replace_pinned_default_binding_transaction(&pin_dir, LOCAL_TEID, pgw_binding);
 
     let invalid_base = build_frame(b"invalid-envelope", &[], true, 0);
     let ip = ETH_HDR_LEN;
@@ -2163,6 +2271,89 @@ fn replace_pinned_binding(
     previous
 }
 
+fn replace_pinned_default_binding_transaction(
+    pin_dir: &std::path::Path,
+    local_teid: u32,
+    replacement: [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN],
+) -> [u8; DOWNLINK_ENDPOINT_BINDING_VALUE_LEN] {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_SOURCE_PORT))
+            .expect("open pinned default commit map"),
+    )
+    .expect("identify pinned default commit map");
+    let mut commits = BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned default commit map");
+    let key = UE_PAA.octets();
+    let encoded = commits.get(&key, 0).expect("read active default commit");
+    let active = PdpContextCommit::decode(&encoded);
+    assert!(active.is_valid(), "default commit must be canonical");
+    assert_eq!(
+        active.phase(),
+        MarkedBearerOwnerPhase::Active,
+        "default commit must be active before a test transaction"
+    );
+    assert_eq!(
+        active.local_teid(),
+        local_teid.to_be_bytes(),
+        "default commit must own the binding TEID"
+    );
+
+    let replacement_binding = DownlinkEndpointBinding::decode(&replacement);
+    let (GtpuEndpointAddress::Ipv4(replacement_peer), GtpuEndpointAddress::Ipv4(replacement_local)) = (
+        replacement_binding.peer_address(),
+        replacement_binding.local_address(),
+    ) else {
+        panic!("default test transaction requires an IPv4 endpoint binding");
+    };
+    let replacement_far = UplinkFar {
+        peer_ip: replacement_peer,
+        local_ip: replacement_local,
+        ..active.uplink_far()
+    };
+    let next = PdpContextCommit::new(
+        active.local_teid(),
+        replacement_far,
+        active.egress_dscp(),
+        replacement_binding,
+        active.uplink_source_port_policy(),
+        MarkedBearerOwnerPhase::Active,
+    )
+    .expect("replacement endpoint must produce a canonical active commit");
+
+    commits
+        .insert(
+            key,
+            active.with_phase(MarkedBearerOwnerPhase::Pending).encode(),
+            0,
+        )
+        .expect("publish pending default commit");
+    let far_map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_FAR)).expect("open pinned default FAR"),
+    )
+    .expect("identify pinned default FAR map");
+    let mut fars = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(far_map)
+        .expect("typed pinned default FAR map");
+    let previous_far = fars.get(&key, 0).expect("read live default FAR");
+    assert_eq!(
+        previous_far,
+        active.uplink_far().encode(),
+        "live FAR must match the active commit"
+    );
+    fars.insert(key, replacement_far.encode(), 0)
+        .expect("replace pinned default FAR");
+    let previous = replace_pinned_binding(pin_dir, local_teid, Some(replacement))
+        .expect("default binding must exist before a test transaction");
+    assert_eq!(
+        previous,
+        active.downlink_binding().encode(),
+        "live binding must match the active commit"
+    );
+    commits
+        .insert(key, next.encode(), 0)
+        .expect("publish active default commit last");
+    previous
+}
+
 fn set_marked_owner_phase(pin_dir: &std::path::Path, mark: u32, phase: MarkedBearerOwnerPhase) {
     let selector = UplinkFarKey {
         ue_ip: UE_PAA.octets(),
@@ -2195,9 +2386,47 @@ fn set_marked_owner_phase(pin_dir: &std::path::Path, mark: u32, phase: MarkedBea
         current.downlink_binding,
         phase,
     );
-    owners
-        .insert(selector, updated.encode(), 0)
-        .expect("atomically replace owner phase");
+    let commit_map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_MARK_SOURCE_PORT))
+            .expect("open pinned marked commit map"),
+    )
+    .expect("identify pinned marked commit map");
+    let mut commits =
+        BpfHashMap::<_, [u8; UPLINK_MARK_KEY_LEN], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(
+            commit_map,
+        )
+        .expect("typed pinned marked commit map");
+    let commit = PdpContextCommit::decode(
+        &commits
+            .get(&selector, 0)
+            .expect("read dedicated-bearer commit"),
+    );
+    assert!(
+        commit.is_valid(),
+        "commit must be canonical before phase test"
+    );
+    assert_eq!(
+        commit.marked_owner(),
+        current,
+        "owner journal and complete commit must agree before phase test"
+    );
+    let updated_commit = commit.with_phase(phase).encode();
+
+    if phase == MarkedBearerOwnerPhase::Active {
+        owners
+            .insert(selector, updated.encode(), 0)
+            .expect("replace marked-owner phase");
+        commits
+            .insert(selector, updated_commit, 0)
+            .expect("publish active marked commit last");
+    } else {
+        commits
+            .insert(selector, updated_commit, 0)
+            .expect("publish non-active marked commit first");
+        owners
+            .insert(selector, updated.encode(), 0)
+            .expect("replace marked-owner phase");
+    }
 }
 
 fn take_marked_far(pin_dir: &std::path::Path, mark: u32) -> [u8; UPLINK_FAR_VALUE_LEN] {
@@ -2232,6 +2461,47 @@ fn replace_pinned_source_port(
     ports
         .insert(UE_PAA.octets(), value, 0)
         .expect("replace pinned source-port entry");
+}
+
+fn take_pinned_source_port(pin_dir: &std::path::Path) -> [u8; UPLINK_SOURCE_PORT_VALUE_LEN] {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_UPLINK_SOURCE_PORT))
+            .expect("open pinned source-port map"),
+    )
+    .expect("identify pinned source-port map");
+    let mut ports = BpfHashMap::<_, [u8; 4], [u8; UPLINK_SOURCE_PORT_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned source-port map");
+    let value = ports
+        .get(&UE_PAA.octets(), 0)
+        .expect("read pinned source-port entry");
+    ports
+        .remove(&UE_PAA.octets())
+        .expect("remove pinned source-port entry");
+    value
+}
+
+fn replace_pinned_default_pdr(
+    pin_dir: &std::path::Path,
+    local_teid: u32,
+    value: Option<[u8; DOWNLINK_PDR_VALUE_LEN]>,
+) -> Option<[u8; DOWNLINK_PDR_VALUE_LEN]> {
+    let map = Map::from_map_data(
+        MapData::from_pin(pin_dir.join(MAP_DOWNLINK_PDR)).expect("open pinned downlink PDR"),
+    )
+    .expect("identify pinned downlink PDR map");
+    let mut pdrs = BpfHashMap::<_, [u8; 4], [u8; DOWNLINK_PDR_VALUE_LEN]>::try_from(map)
+        .expect("typed pinned downlink PDR map");
+    let key = local_teid.to_be_bytes();
+    let previous = pdrs.get(&key, 0).ok();
+    match value {
+        Some(value) => pdrs
+            .insert(key, value, 0)
+            .expect("replace pinned downlink PDR"),
+        None => {
+            let _ = pdrs.remove(&key);
+        }
+    }
+    previous
 }
 
 fn tc_program_id(direction: &str) -> u32 {
@@ -2344,6 +2614,9 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_UPLINK_MARK_DSCP,
                 MAP_UPLINK_SOURCE_PORT,
                 MAP_UPLINK_MARK_SOURCE_PORT,
+                MAP_DOWNLINK_PDR,
+                MAP_DOWNLINK_MARK_PDR,
+                MAP_DOWNLINK_ENDPOINT_BINDING,
                 MAP_MARKED_BEARER_OWNER,
                 MAP_COUNTERS,
                 MAP_CONFIG,
@@ -2359,6 +2632,12 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_DOWNLINK_PDR,
                 MAP_DOWNLINK_MARK_PDR,
                 MAP_DOWNLINK_ENDPOINT_BINDING,
+                MAP_UPLINK_FAR,
+                MAP_UPLINK_MARK_FAR,
+                MAP_UPLINK_DSCP,
+                MAP_UPLINK_MARK_DSCP,
+                MAP_UPLINK_SOURCE_PORT,
+                MAP_UPLINK_MARK_SOURCE_PORT,
                 MAP_DOWNLINK_BINDING_COUNTERS,
                 MAP_MARKED_BEARER_OWNER,
                 MAP_COUNTERS,
@@ -3158,7 +3437,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     assert_eq!(tc_program_id("ingress"), v1_downlink_id);
 
     // A create request with a different retained local address must fail
-    // before any config, marker, map-ID, or hook mutation. Loading the v3
+    // before any config, marker, map-ID, or hook mutation. Loading the current
     // object may create its additive empty pins, which is safe and expected.
     let rejected_migration =
         EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
@@ -3247,7 +3526,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     }
     fs::remove_dir_all(&v1_pin_dir).expect("drain endpoint-unbound v1 pins");
 
-    // --- Explicit drained bearer-v2 teardown before endpoint-v3. ---
+    // --- Explicit drained bearer-v2 teardown before source-port-v4. ---
     // A map-only same-shape namespace has no positive program-to-map binding
     // and must never be accepted as SDK-owned.
     create_drained_legacy_v2_pins(&v1_pin_dir);
@@ -3412,14 +3691,24 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     assert!(!tc_filters("egress").contains(PROG_UPLINK));
     assert!(!tc_filters("ingress").contains(PROG_DOWNLINK));
 
-    let mut v3_request = CreateGtpDeviceRequest::new("s2bu");
-    v3_request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
-    let v3_device = v2_maintenance.create_device(v3_request).await?;
+    let mut current_request = CreateGtpDeviceRequest::new("s2bu");
+    current_request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let current_device = v2_maintenance.create_device(current_request).await?;
     assert!(
         v1_pin_dir.join(MAP_DOWNLINK_ENDPOINT_BINDING).exists(),
-        "fresh provisioning after v2 teardown must create endpoint-v3 pins"
+        "fresh provisioning after v2 teardown must create the endpoint-binding pin"
     );
-    v2_maintenance.remove_device(&v3_device).await?;
+    assert!(
+        v1_pin_dir.join(MAP_UPLINK_SOURCE_PORT).exists()
+            && v1_pin_dir.join(MAP_UPLINK_MARK_SOURCE_PORT).exists(),
+        "fresh provisioning after v2 teardown must create source-port-v4 pins"
+    );
+    assert_eq!(
+        pinned_schema_marker(&v1_pin_dir),
+        UPLINK_SOURCE_PORT_SCHEMA_MARKER_VALUE,
+        "fresh provisioning after v2 teardown must commit source-port-v4"
+    );
+    v2_maintenance.remove_device(&current_device).await?;
     drop(v2_maintenance);
 
     // --- Static pin-path replacement safety. ---
@@ -3686,10 +3975,28 @@ async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
     );
     assert!(buffer[..len].ends_with(b"opc-uplink-sport"));
 
-    // A persisted zero port is corrupt adopted state: the tc program must
-    // drop fail closed rather than emit port zero or silently fall back to
-    // the legacy 2152 source port.
-    replace_pinned_source_port(&pin_dir, [0; 2]);
+    // Missing policy is corrupt committed v4 state: it must drop rather than
+    // silently transition this selected context to legacy 2152.
+    let committed = take_pinned_source_port(&pin_dir);
+    let encap_before = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    for _ in 0..3 {
+        let _ = ue_socket.send_to(b"opc-uplink-missing-policy", (REMOTE_HOST, 53));
+    }
+    expect_no_datagram(&pgw_socket);
+    assert_eq!(
+        pinned_counter(&pin_dir, COUNTER_UL_ENCAP),
+        encap_before,
+        "a missing source-port policy must drop before encapsulation accounting"
+    );
+
+    // Restore the captured exact authority before testing a separately
+    // corrupted policy. Missing authority is intentionally not reconstructed
+    // from component maps by the backend.
+    replace_pinned_source_port(&pin_dir, committed);
+    let mut zero_port = committed;
+    zero_port[64] = 0;
+    zero_port[65] = 0;
+    replace_pinned_source_port(&pin_dir, zero_port);
     let encap_before = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
     for _ in 0..3 {
         let _ = ue_socket.send_to(b"opc-uplink-dropped", (REMOTE_HOST, 53));
@@ -3701,7 +4008,39 @@ async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
         "a zero source-port entry must drop before encapsulation accounting"
     );
 
-    // Exact reconciliation through the backend restores the selected port.
+    // Restoring the record alone is insufficient: uplink authorization also
+    // requires the exact downlink half of the same committed graph.
+    replace_pinned_source_port(&pin_dir, committed);
+    let committed_binding = replace_pinned_binding(&pin_dir, LOCAL_TEID, None)
+        .ok_or("default binding must exist before whole-graph proof")?;
+    let encap_before = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    for _ in 0..3 {
+        let _ = ue_socket.send_to(b"opc-uplink-missing-binding", (REMOTE_HOST, 53));
+    }
+    expect_no_datagram(&pgw_socket);
+    assert_eq!(
+        pinned_counter(&pin_dir, COUNTER_UL_ENCAP),
+        encap_before,
+        "an incomplete downlink binding must gate uplink before encapsulation"
+    );
+    replace_pinned_binding(&pin_dir, LOCAL_TEID, Some(committed_binding));
+
+    let committed_pdr = replace_pinned_default_pdr(&pin_dir, LOCAL_TEID, None)
+        .ok_or("default PDR must exist before whole-graph proof")?;
+    let encap_before = pinned_counter(&pin_dir, COUNTER_UL_ENCAP);
+    for _ in 0..3 {
+        let _ = ue_socket.send_to(b"opc-uplink-missing-pdr", (REMOTE_HOST, 53));
+    }
+    expect_no_datagram(&pgw_socket);
+    assert_eq!(
+        pinned_counter(&pin_dir, COUNTER_UL_ENCAP),
+        encap_before,
+        "an incomplete downlink PDR must gate uplink before encapsulation"
+    );
+    replace_pinned_default_pdr(&pin_dir, LOCAL_TEID, Some(committed_pdr));
+
+    // The complete restored graph is authoritative again; an exact backend
+    // retry is then idempotent.
     backend.install_pdp_context(selected).await?;
     let (len, from) = send_until_received(
         || {
